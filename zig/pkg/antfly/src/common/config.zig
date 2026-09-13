@@ -79,6 +79,7 @@ pub const Config = struct {
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
     transaction_sessions: TransactionSessionConfig = .{},
+    ha: ?HAConfig = null,
     inference: InferenceConfig = .{},
     remote_content: ?RemoteContentConfig = null,
     connections: ConnectionsConfig = .{},
@@ -212,6 +213,63 @@ pub const Config = struct {
         max_count: usize = 1024,
         max_record_bytes: usize = 16 * 1024 * 1024,
         max_savepoints: usize = 64,
+    };
+
+    /// Hot-standby settings from the `ha` config section. Every field mirrors
+    /// an `antfly standalone --ha-*` flag; the runtime fills flags that were not
+    /// given from here, and `antfly ha --config` reads the same section to find
+    /// the node's HA state and admin endpoint. Enum-valued sync fields are kept
+    /// as strings and parsed by the runtime's flag parsers so both surfaces
+    /// accept exactly the same spellings.
+    pub const HAConfig = struct {
+        admin_url: ?[]const u8 = null,
+        admin_token_env: ?[]const u8 = null,
+        cluster_id: ?u64 = null,
+        shard_id: ?u64 = null,
+        table_id: ?u64 = null,
+        timeline_id: ?u64 = null,
+        epoch: ?u64 = null,
+        primary_log: ?[]const u8 = null,
+        primary_slots: ?[]const u8 = null,
+        primary_node_id: ?[]const u8 = null,
+        seed_capture_root: ?[]const u8 = null,
+        standby_log: ?[]const u8 = null,
+        standby_progress: ?[]const u8 = null,
+        standby_node_id: ?[]const u8 = null,
+        standby_upstream_url: ?[]const u8 = null,
+        standby_slot: ?[]const u8 = null,
+        sync_mode: ?[]const u8 = null,
+        sync_selection: ?[]const u8 = null,
+        sync_required: ?usize = null,
+        sync_standbys: []const []const u8 = &.{},
+        sync_failure: ?[]const u8 = null,
+        retention_max_lag_lsn: ?u64 = null,
+        retention_max_retained_bytes: ?u64 = null,
+        retention_max_retained_age_ns: ?u64 = null,
+        fence_wal: ?[]const u8 = null,
+        former_primary_log: ?[]const u8 = null,
+
+        pub fn wantsPrimary(self: HAConfig) bool {
+            return self.primary_log != null or self.primary_slots != null;
+        }
+
+        pub fn wantsStandby(self: HAConfig) bool {
+            return self.standby_log != null or self.standby_progress != null;
+        }
+
+        fn deinit(self: *HAConfig, alloc: std.mem.Allocator) void {
+            inline for (.{
+                "admin_url",       "admin_token_env",      "primary_log",  "primary_slots",
+                "primary_node_id", "seed_capture_root",    "standby_log",  "standby_progress",
+                "standby_node_id", "standby_upstream_url", "standby_slot", "sync_mode",
+                "sync_selection",  "sync_failure",         "fence_wal",    "former_primary_log",
+            }) |field| {
+                if (@field(self, field)) |value| alloc.free(value);
+            }
+            for (self.sync_standbys) |name| alloc.free(name);
+            if (self.sync_standbys.len > 0) alloc.free(self.sync_standbys);
+            self.* = undefined;
+        }
     };
 
     pub const InferenceConfig = struct {
@@ -807,6 +865,7 @@ pub const Config = struct {
             ),
             .storage = storage_config,
             .transaction_sessions = try transactionSessionConfigFromOpenApi(validated.value.transaction_sessions),
+            .ha = try haConfigFromOpenApi(alloc, validated.value.ha),
             .inference = if (validated.value.inference) |inference| .{
                 .api_url = if (inference.api_url) |url| (if (url.len > 0) try alloc.dupe(u8, url) else null) else null,
                 .api_key = try rawOptionalStringField(alloc, raw_root.get("inference"), "api_key"),
@@ -894,6 +953,78 @@ pub const Config = struct {
         };
     }
 
+    fn optionalOwnedString(alloc: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+        const raw = value orelse return null;
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return try alloc.dupe(u8, trimmed);
+    }
+
+    fn optionalNonNegativeU64(value: ?i64) !?u64 {
+        const raw = value orelse return null;
+        if (raw < 0) return error.InvalidConfig;
+        return @intCast(raw);
+    }
+
+    fn haConfigFromOpenApi(alloc: std.mem.Allocator, value: ?common_openapi.HAConfig) !?HAConfig {
+        const cfg = value orelse return null;
+        var out = HAConfig{};
+        errdefer out.deinit(alloc);
+        if (cfg.admin) |admin| {
+            out.admin_url = try optionalOwnedString(alloc, admin.url);
+            out.admin_token_env = try optionalOwnedString(alloc, admin.token_env);
+        }
+        if (cfg.identity) |identity| {
+            out.cluster_id = try optionalNonNegativeU64(identity.cluster_id);
+            out.shard_id = try optionalNonNegativeU64(identity.shard_id);
+            out.table_id = try optionalNonNegativeU64(identity.table_id);
+            out.timeline_id = try optionalNonNegativeU64(identity.timeline_id);
+            out.epoch = try optionalNonNegativeU64(identity.epoch);
+        }
+        if (cfg.primary) |primary| {
+            out.primary_log = try optionalOwnedString(alloc, primary.log);
+            out.primary_slots = try optionalOwnedString(alloc, primary.slots);
+            out.primary_node_id = try optionalOwnedString(alloc, primary.node_id);
+            out.seed_capture_root = try optionalOwnedString(alloc, primary.seed_capture_root);
+        }
+        if (cfg.standby) |standby| {
+            out.standby_log = try optionalOwnedString(alloc, standby.log);
+            out.standby_progress = try optionalOwnedString(alloc, standby.progress);
+            out.standby_node_id = try optionalOwnedString(alloc, standby.node_id);
+            out.standby_upstream_url = try optionalOwnedString(alloc, standby.upstream_url);
+            out.standby_slot = try optionalOwnedString(alloc, standby.slot);
+        }
+        if (cfg.sync) |sync| {
+            out.sync_mode = try optionalOwnedString(alloc, sync.mode);
+            out.sync_selection = try optionalOwnedString(alloc, sync.selection);
+            if (sync.required) |required| {
+                if (required < 1) return error.InvalidConfig;
+                out.sync_required = @intCast(required);
+            }
+            out.sync_failure = try optionalOwnedString(alloc, sync.failure);
+            if (sync.standbys) |standbys| {
+                var names = try std.ArrayListUnmanaged([]const u8).initCapacity(alloc, standbys.len);
+                errdefer {
+                    for (names.items) |name| alloc.free(name);
+                    names.deinit(alloc);
+                }
+                for (standbys) |name| {
+                    const owned = (try optionalOwnedString(alloc, name)) orelse return error.InvalidConfig;
+                    names.appendAssumeCapacity(owned);
+                }
+                out.sync_standbys = try names.toOwnedSlice(alloc);
+            }
+        }
+        if (cfg.retention) |retention| {
+            out.retention_max_lag_lsn = try optionalNonNegativeU64(retention.max_lag_lsn);
+            out.retention_max_retained_bytes = try optionalNonNegativeU64(retention.max_retained_bytes);
+            out.retention_max_retained_age_ns = try optionalNonNegativeU64(retention.max_retained_age_ns);
+        }
+        out.fence_wal = try optionalOwnedString(alloc, cfg.fence_wal);
+        out.former_primary_log = try optionalOwnedString(alloc, cfg.former_primary_log);
+        return out;
+    }
+
     fn validateStorageFromOpenApi(
         deployment_mode: DeploymentMode,
         root: std.json.ObjectMap,
@@ -965,6 +1096,7 @@ pub const Config = struct {
         self.metadata.deinit(self.registry.allocator);
         self.storage.deinit(self.registry.allocator);
         self.inference.deinit(self.registry.allocator);
+        if (self.ha) |*ha| ha.deinit(self.registry.allocator);
         self.transcribers.deinit();
         self.readers.deinit();
         self.text_to_speech.deinit();
@@ -3388,6 +3520,48 @@ test "common config rejects removed top-level storage backend fields" {
         \\    "lite": { "path": "./data.aflite", "unknown": true }
         \\  }
         \\}
+    ));
+}
+
+test "common config parses the ha section" {
+    const alloc = std.testing.allocator;
+    var cfg = try Config.parseFromSlice(alloc,
+        \\{
+        \\  "ha": {
+        \\    "admin": { "url": "http://127.0.0.1:8080", "token_env": "ANTFLY_HA_ADMIN_TOKEN" },
+        \\    "identity": { "cluster_id": 7, "timeline_id": 3, "epoch": 2 },
+        \\    "primary": { "log": "/var/lib/antfly/ha/primary.wal", "slots": "/var/lib/antfly/ha/slots", "node_id": "primary-a" },
+        \\    "sync": { "mode": "remote-apply", "selection": "all", "standbys": ["standby-a", "standby-b"], "failure": "block" },
+        \\    "retention": { "max_lag_lsn": 4096 },
+        \\    "fence_wal": "/var/lib/antfly/ha/fence.wal"
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+    const ha = cfg.ha.?;
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080", ha.admin_url.?);
+    try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", ha.admin_token_env.?);
+    try std.testing.expectEqual(@as(u64, 7), ha.cluster_id.?);
+    try std.testing.expect(ha.shard_id == null);
+    try std.testing.expectEqual(@as(u64, 3), ha.timeline_id.?);
+    try std.testing.expectEqual(@as(u64, 2), ha.epoch.?);
+    try std.testing.expectEqualStrings("/var/lib/antfly/ha/primary.wal", ha.primary_log.?);
+    try std.testing.expectEqualStrings("primary-a", ha.primary_node_id.?);
+    try std.testing.expect(ha.wantsPrimary());
+    try std.testing.expect(!ha.wantsStandby());
+    try std.testing.expectEqualStrings("remote-apply", ha.sync_mode.?);
+    try std.testing.expectEqual(@as(usize, 2), ha.sync_standbys.len);
+    try std.testing.expectEqualStrings("standby-b", ha.sync_standbys[1]);
+    try std.testing.expectEqual(@as(u64, 4096), ha.retention_max_lag_lsn.?);
+    try std.testing.expectEqualStrings("/var/lib/antfly/ha/fence.wal", ha.fence_wal.?);
+    try std.testing.expect(ha.former_primary_log == null);
+
+    var empty = try Config.parseFromSlice(alloc, "{}");
+    defer empty.deinit();
+    try std.testing.expect(empty.ha == null);
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{ "ha": { "identity": { "cluster_id": -1 } } }
     ));
 }
 

@@ -135,6 +135,11 @@ pub const GetHAStandbyStatusParams = struct {
     upstream_lsn: ?[]const u8 = null,
 };
 
+/// Parse the JSON request body for setHAStandbyUpstream.
+pub fn parseSetHAStandbyUpstreamBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyUpstreamRequest) {
+    return std.json.parseFromSlice(types.StandbyUpstreamRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for checkHAWrite.
 pub fn parseCheckHAWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.WriteCheckRequest) {
     return std.json.parseFromSlice(types.WriteCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -187,6 +192,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/ha/seed-lifecycle/receipts", .operation_id = "getHASeedLifecycleReceipts", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/ha/standby/bootstrap", .operation_id = "bootstrapHAStandby", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/ha/standby/status", .operation_id = "getHAStandbyStatus", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/ha/standby/upstream", .operation_id = "setHAStandbyUpstream", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/ha/watchdog-proof", .operation_id = "getHAWatchdogProof", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/ha/write/check", .operation_id = "checkHAWrite", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/maintenance/check", .operation_id = "startStorageCheck", .request_body = .none, .streaming_response = false },
@@ -232,6 +238,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "getHASeedLifecycleReceipts")) @compileError("ServerRouter: Impl missing required method 'getHASeedLifecycleReceipts'");
         if (!@hasDecl(Impl, "bootstrapHAStandby")) @compileError("ServerRouter: Impl missing required method 'bootstrapHAStandby'");
         if (!@hasDecl(Impl, "getHAStandbyStatus")) @compileError("ServerRouter: Impl missing required method 'getHAStandbyStatus'");
+        if (!@hasDecl(Impl, "setHAStandbyUpstream")) @compileError("ServerRouter: Impl missing required method 'setHAStandbyUpstream'");
         if (!@hasDecl(Impl, "getHAWatchdogProof")) @compileError("ServerRouter: Impl missing required method 'getHAWatchdogProof'");
         if (!@hasDecl(Impl, "checkHAWrite")) @compileError("ServerRouter: Impl missing required method 'checkHAWrite'");
         if (!@hasDecl(Impl, "startStorageCheck")) @compileError("ServerRouter: Impl missing required method 'startStorageCheck'");
@@ -275,6 +282,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/ha/seed-lifecycle/receipts", httpx.Handler.bind(self.impl, getHASeedLifecycleReceipts));
             try server.post("/ha/standby/bootstrap", httpx.Handler.bind(self.impl, bootstrapHAStandby));
             try server.get("/ha/standby/status", httpx.Handler.bind(self.impl, getHAStandbyStatus));
+            try server.post("/ha/standby/upstream", httpx.Handler.bind(self.impl, setHAStandbyUpstream));
             try server.get("/ha/watchdog-proof", httpx.Handler.bind(self.impl, getHAWatchdogProof));
             try server.post("/ha/write/check", httpx.Handler.bind(self.impl, checkHAWrite));
             try server.post("/maintenance/check", httpx.Handler.bind(self.impl, startStorageCheck));
@@ -455,6 +463,12 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.getHAStandbyStatus(ctx, query_params);
         }
 
+        /// Repoint a running standby at a different primary
+        /// POST /ha/standby/upstream
+        fn setHAStandbyUpstream(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.setHAStandbyUpstream(ctx);
+        }
+
         /// Get the runtime Lease watchdog capability proof
         /// GET /ha/watchdog-proof
         fn getHAWatchdogProof(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -528,6 +542,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn getHASeedLifecycleReceipts(self: *Impl, ctx: *httpx.Context, params: GetHASeedLifecycleReceiptsParams) !httpx.Response
 //   fn bootstrapHAStandby(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context, params: GetHAStandbyStatusParams) !httpx.Response
+//   fn setHAStandbyUpstream(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getHAWatchdogProof(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn checkHAWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn startStorageCheck(self: *Impl, ctx: *httpx.Context) !httpx.Response

@@ -224,6 +224,12 @@ func TestHAClientRejectsInvalidHAInputsLocally(t *testing.T) {
 		FailurePolicy: HASyncPolicyFailureFailClosed,
 		StandbyNames:  []string{"standby-a"},
 	}
+	validStandbyUpstream := StandbyUpstreamRequest{
+		Identity:    identity,
+		UpstreamUrl: "https://primary-b.example:5433",
+		SlotName:    "standby-a",
+		Reason:      "switchover",
+	}
 
 	tests := []struct {
 		name string
@@ -348,6 +354,51 @@ func TestHAClientRejectsInvalidHAInputsLocally(t *testing.T) {
 				body := validFence
 				body.OldPrimaryId = " primary-a"
 				_, err := client.AcquireFence(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "set standby upstream incomplete identity",
+			call: func() error {
+				body := validStandbyUpstream
+				body.Identity = HAIdentity{}
+				_, err := client.SetStandbyUpstream(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "set standby upstream missing scheme",
+			call: func() error {
+				body := validStandbyUpstream
+				body.UpstreamUrl = "primary-b.example:5433"
+				_, err := client.SetStandbyUpstream(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "set standby upstream unsupported scheme",
+			call: func() error {
+				body := validStandbyUpstream
+				body.UpstreamUrl = "ftp://primary-b.example:5433"
+				_, err := client.SetStandbyUpstream(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "set standby upstream padded url",
+			call: func() error {
+				body := validStandbyUpstream
+				body.UpstreamUrl = " https://primary-b.example:5433"
+				_, err := client.SetStandbyUpstream(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "set standby upstream invalid slot name",
+			call: func() error {
+				body := validStandbyUpstream
+				body.SlotName = "standby/a"
+				_, err := client.SetStandbyUpstream(context.Background(), body)
 				return err
 			},
 		},
@@ -525,6 +576,64 @@ func TestHAClientSeedWorkflowUsesAdminAPI(t *testing.T) {
 	}
 }
 
+func TestHAClientSetStandbyUpstreamUsesAdminAPI(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodPost)
+		}
+		if r.URL.Path != HAStandbyUpstreamPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAStandbyUpstreamPath)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll returned error: %v", err)
+		}
+		got := string(body)
+		if !strings.Contains(got, `"upstream_url":"https://primary-b.example:5433"`) ||
+			!strings.Contains(got, `"slot_name":"standby-a"`) ||
+			!strings.Contains(got, `"reason":"switchover"`) {
+			t.Fatalf("set standby upstream body = %s, want upstream url, slot, and reason", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haStandbyUpstreamResponseJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	resp, err := client.WithToken("test-token").SetStandbyUpstream(context.Background(), StandbyUpstreamRequest{
+		Identity: HAIdentity{
+			ClusterId:  100,
+			ShardId:    10,
+			TableId:    20,
+			TimelineId: 4,
+			Epoch:      6,
+		},
+		UpstreamUrl: "https://primary-b.example:5433",
+		SlotName:    "standby-a",
+		Reason:      "switchover",
+	})
+	if err != nil {
+		t.Fatalf("SetStandbyUpstream returned error: %v", err)
+	}
+	if resp.Action.ActionKind != HAActionKindStandbyUpstream || resp.Action.NodeId != "standby-a" {
+		t.Fatalf("standby upstream action = %#v, want standby upstream receipt", resp.Action)
+	}
+	if !resp.Changed || resp.Upstream.UpstreamUrl != "https://primary-b.example:5433" || resp.Upstream.SlotName != "standby-a" {
+		t.Fatalf("standby upstream response = %#v, want changed upstream evidence", resp)
+	}
+	if resp.Previous.UpstreamUrl != "https://primary-a.example:5433" || resp.Previous.SlotName != "standby-a" {
+		t.Fatalf("standby upstream previous = %#v, want prior upstream evidence", resp.Previous)
+	}
+}
+
 func TestHAClientAcquireFenceUsesAdminAPI(t *testing.T) {
 	t.Parallel()
 
@@ -595,6 +704,49 @@ func TestHAClientAcquireFenceUsesAdminAPI(t *testing.T) {
 		resp.Receipt.ParentTimelineId != 4 ||
 		resp.Receipt.ObservedLsn != 12 {
 		t.Fatalf("fence receipt = %#v, want promoted timeline fence evidence", resp.Receipt)
+	}
+}
+
+func TestHAClientAcquireFenceAllowsOmittedGeneration(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll returned error: %v", err)
+		}
+		got := string(body)
+		if strings.Contains(got, `"generation"`) {
+			t.Fatalf("fence acquire body = %s, want generation omitted when unset", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haFenceAcquireResponseJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	// Generation is intentionally left at its zero value: the server
+	// allocates the next generation when it is omitted from the request.
+	_, err = client.AcquireFence(context.Background(), FenceAcquireRequest{
+		Identity: HAIdentity{
+			ClusterId:  100,
+			ShardId:    10,
+			TableId:    20,
+			TimelineId: 4,
+			Epoch:      6,
+		},
+		OldPrimaryId:   "primary-a",
+		PromotedNodeId: "standby-a",
+		NewTimelineId:  5,
+		NewEpoch:       7,
+		RequiredLsn:    12,
+		ObservedLsn:    12,
+	})
+	if err != nil {
+		t.Fatalf("AcquireFence with omitted generation returned error: %v", err)
 	}
 }
 
@@ -1533,6 +1685,13 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 			}),
 		},
 		{
+			name: "set standby upstream",
+			got:  HASetStandbyUpstreamOperation(),
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewSetHAStandbyUpstreamRequest(server, oapi.SetHAStandbyUpstreamJSONRequestBody{})
+			}),
+		},
+		{
 			name: "acquire fence",
 			got:  HAAcquireFenceOperation(),
 			generated: generatedHAOperation(func(server string) (*http.Request, error) {
@@ -1732,6 +1891,12 @@ func TestHAReceiptExpectationsUseAdminAPIEnums(t *testing.T) {
 			name:      "bootstrap standby",
 			got:       HAStandbyBootstrapReceiptExpectation(),
 			wantKind:  "standby_bootstrap",
+			wantState: "applied",
+		},
+		{
+			name:      "set standby upstream",
+			got:       HAStandbyUpstreamReceiptExpectation(),
+			wantKind:  "standby_upstream",
 			wantState: "applied",
 		},
 		{
@@ -2223,6 +2388,88 @@ func TestValidateHAFenceResponse(t *testing.T) {
 	}
 }
 
+func TestValidateHAStandbyUpstreamResponse(t *testing.T) {
+	t.Parallel()
+
+	identity := HAIdentity{ClusterId: 100, ShardId: 10, TableId: 20, TimelineId: 4, Epoch: 6}
+	newUpstream := HAStandbyUpstream{UpstreamUrl: "https://primary-b.example:5433", SlotName: "standby-a"}
+	oldUpstream := HAStandbyUpstream{UpstreamUrl: "https://primary-a.example:5433", SlotName: "standby-a"}
+
+	changed := HAStandbyUpstreamResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "standby_upstream:standby-a",
+			ActionKind: HAActionKindStandbyUpstream,
+			Target:     "standby-a",
+			State:      HAActionStateApplied,
+			NodeId:     "standby-a",
+		},
+		Identity: identity,
+		Upstream: newUpstream,
+		Previous: oldUpstream,
+		Changed:  true,
+	}
+	if err := ValidateHAStandbyUpstreamResponse(changed); err != nil {
+		t.Fatalf("ValidateHAStandbyUpstreamResponse changed returned error: %v", err)
+	}
+
+	changedWithoutPrevious := changed
+	changedWithoutPrevious.Previous = HAStandbyUpstream{}
+	if err := ValidateHAStandbyUpstreamResponse(changedWithoutPrevious); err != nil {
+		t.Fatalf("ValidateHAStandbyUpstreamResponse changed without previous returned error: %v", err)
+	}
+
+	alreadyApplied := changed
+	alreadyApplied.Action.State = HAActionStateAlreadyApplied
+	alreadyApplied.Changed = false
+	alreadyApplied.Previous = newUpstream
+	if err := ValidateHAStandbyUpstreamResponse(alreadyApplied); err != nil {
+		t.Fatalf("ValidateHAStandbyUpstreamResponse unchanged returned error: %v", err)
+	}
+
+	unchangedWithoutPrevious := alreadyApplied
+	unchangedWithoutPrevious.Previous = HAStandbyUpstream{}
+	if err := ValidateHAStandbyUpstreamResponse(unchangedWithoutPrevious); err == nil || !strings.Contains(err.Error(), "without a previous upstream") {
+		t.Fatalf("unchanged without previous error = %v, want missing previous error", err)
+	}
+
+	unchangedWithMismatchedPrevious := alreadyApplied
+	unchangedWithMismatchedPrevious.Previous = oldUpstream
+	if err := ValidateHAStandbyUpstreamResponse(unchangedWithMismatchedPrevious); err == nil || !strings.Contains(err.Error(), "mismatched previous upstream") {
+		t.Fatalf("unchanged with mismatched previous error = %v, want mismatched previous error", err)
+	}
+
+	changedWithIdenticalPrevious := changed
+	changedWithIdenticalPrevious.Previous = newUpstream
+	if err := ValidateHAStandbyUpstreamResponse(changedWithIdenticalPrevious); err == nil || !strings.Contains(err.Error(), "unchanged previous upstream") {
+		t.Fatalf("changed with identical previous error = %v, want unchanged previous error", err)
+	}
+
+	missingIdentity := changed
+	missingIdentity.Identity = HAIdentity{}
+	if err := ValidateHAStandbyUpstreamResponse(missingIdentity); err == nil || !strings.Contains(err.Error(), "identity fields") {
+		t.Fatalf("missing identity error = %v, want identity fields error", err)
+	}
+
+	invalidUpstream := changed
+	invalidUpstream.Upstream.UpstreamUrl = ""
+	if err := ValidateHAStandbyUpstreamResponse(invalidUpstream); err == nil || !strings.Contains(err.Error(), "standby upstream fields") {
+		t.Fatalf("invalid upstream error = %v, want standby upstream fields error", err)
+	}
+
+	mismatchedTarget := changed
+	mismatchedTarget.Action.Target = "standby-b"
+	if err := ValidateHAStandbyUpstreamResponse(mismatchedTarget); err == nil || !strings.Contains(err.Error(), "does not match action target") {
+		t.Fatalf("mismatched action target error = %v, want action target mismatch error", err)
+	}
+
+	missingAction := changed
+	missingAction.Action.NodeId = ""
+	if err := ValidateHAStandbyUpstreamResponse(missingAction); err == nil || !strings.Contains(err.Error(), "action receipt") {
+		t.Fatalf("missing action receipt error = %v, want action receipt error", err)
+	}
+}
+
 func TestValidateHAPromotionResponses(t *testing.T) {
 	t.Parallel()
 
@@ -2428,6 +2675,29 @@ func TestValidateHAResponseEvidence(t *testing.T) {
 	}
 	if err := ValidateHAStandbyBootstrapResponseEvidence([]byte(strings.Replace(bootstrap, `,"checkpoint_lsn":10`, "", 1))); err == nil || !strings.Contains(err.Error(), "standby bootstrap field evidence") {
 		t.Fatalf("missing standby bootstrap evidence error = %v, want field evidence error", err)
+	}
+
+	standbyUpstream := `{"schema_version":1,"action":{"action_id":"standby_upstream:standby-a","action_kind":"standby_upstream","target":"standby-a","state":"applied","node_id":"standby-a"},"identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"upstream":{"upstream_url":"https://primary-b.example:5433","slot_name":"standby-a"},"previous":{"upstream_url":"https://primary-a.example:5433","slot_name":"standby-a"},"changed":true}`
+	if err := ValidateHAStandbyUpstreamResponseEvidence([]byte(standbyUpstream)); err != nil {
+		t.Fatalf("ValidateHAStandbyUpstreamResponseEvidence returned error: %v", err)
+	}
+	if err := ValidateHAStandbyUpstreamResponseEvidence([]byte(strings.Replace(standbyUpstream, `,"epoch":6`, "", 1))); err == nil || !strings.Contains(err.Error(), "identity field evidence") {
+		t.Fatalf("missing standby upstream identity evidence error = %v, want identity field evidence error", err)
+	}
+	if err := ValidateHAStandbyUpstreamResponseEvidence([]byte(strings.Replace(standbyUpstream, `"upstream":{"upstream_url":"https://primary-b.example:5433","slot_name":"standby-a"}`, `"upstream":{"upstream_url":"https://primary-b.example:5433"}`, 1))); err == nil || !strings.Contains(err.Error(), "standby upstream field evidence") {
+		t.Fatalf("missing standby upstream field evidence error = %v, want field evidence error", err)
+	}
+	if err := ValidateHAStandbyUpstreamResponseEvidence([]byte(strings.Replace(standbyUpstream, `,"changed":true`, "", 1))); err == nil || !strings.Contains(err.Error(), "changed field evidence") {
+		t.Fatalf("missing standby upstream changed evidence error = %v, want changed field evidence error", err)
+	}
+	unchangedWithoutPreviousEvidence := strings.Replace(standbyUpstream, `,"previous":{"upstream_url":"https://primary-a.example:5433","slot_name":"standby-a"}`, "", 1)
+	unchangedWithoutPreviousEvidence = strings.Replace(unchangedWithoutPreviousEvidence, `"changed":true`, `"changed":false`, 1)
+	if err := ValidateHAStandbyUpstreamResponseEvidence([]byte(unchangedWithoutPreviousEvidence)); err == nil || !strings.Contains(err.Error(), "previous field evidence") {
+		t.Fatalf("unchanged without previous evidence error = %v, want previous field evidence error", err)
+	}
+	partialPreviousEvidence := strings.Replace(standbyUpstream, `"previous":{"upstream_url":"https://primary-a.example:5433","slot_name":"standby-a"}`, `"previous":{"upstream_url":"https://primary-a.example:5433"}`, 1)
+	if err := ValidateHAStandbyUpstreamResponseEvidence([]byte(partialPreviousEvidence)); err == nil || !strings.Contains(err.Error(), "previous field evidence") {
+		t.Fatalf("partial previous evidence error = %v, want previous field evidence error", err)
 	}
 
 	fence := `{"schema_version":1,"action":{"action_id":"fence_acquire:standby-a","action_kind":"fence_acquire","target":"standby-a","state":"applied","node_id":"standby-a"},"receipt":{"identity":{"cluster_id":1,"shard_id":0,"table_id":0,"timeline_id":2,"epoch":3},"old_primary_id":"primary-a","promoted_node_id":"standby-a","parent_timeline_id":2,"parent_epoch":3,"new_timeline_id":4,"new_epoch":5,"required_lsn":8,"observed_lsn":8,"generation":9,"forced":false,"token":"fence-token","reason":""}}`
@@ -2963,6 +3233,35 @@ func haStandbyBootstrapResponseJSON() string {
 		"manifest_id":"manifest-a",
 		"backup_lsn":7,
 		"checkpoint_lsn":10
+	}`
+}
+
+func haStandbyUpstreamResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"action":{
+			"action_id":"standby_upstream:standby-a",
+			"action_kind":"standby_upstream",
+			"target":"standby-a",
+			"state":"applied",
+			"node_id":"standby-a"
+		},
+		"identity":{
+			"cluster_id":100,
+			"shard_id":10,
+			"table_id":20,
+			"timeline_id":4,
+			"epoch":6
+		},
+		"upstream":{
+			"upstream_url":"https://primary-b.example:5433",
+			"slot_name":"standby-a"
+		},
+		"previous":{
+			"upstream_url":"https://primary-a.example:5433",
+			"slot_name":"standby-a"
+		},
+		"changed":true
 	}`
 }
 

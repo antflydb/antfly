@@ -111,6 +111,13 @@ pub const OwnerJobCheckCommand = struct {
     request: owner_job_gate.Request,
 };
 
+pub const StandbyUpstreamCommand = struct {
+    upstream_url: []const u8,
+    slot_name: []const u8,
+    identity: standby_mod.Identity,
+    reason: []const u8 = "",
+};
+
 pub const RejoinAssessCommand = struct {
     former: rejoin.FormerPrimaryState,
     receipt: ?fencing.Receipt = null,
@@ -140,6 +147,7 @@ pub const Command = union(enum) {
     start_replication: replication_api.StartReplicationRequest,
     stream_once: StreamOnceCommand,
     standby_status_update: replication_api.StandbyStatusUpdateRequest,
+    standby_upstream: StandbyUpstreamCommand,
     primary_status: PrimaryStatusCommand,
     standby_status: StandbyStatusCommand,
     commit_check: CommitCheckCommand,
@@ -239,6 +247,11 @@ pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
     }
     if (std.mem.eql(u8, root, "standby")) {
         plan.command = try parseStandby(&cursor);
+        try cursor.expectEnd();
+        return plan;
+    }
+    if (std.mem.eql(u8, root, "follow")) {
+        plan.command = .{ .standby_upstream = try parseStandbyUpstream(&cursor) };
         try cursor.expectEnd();
         return plan;
     }
@@ -475,7 +488,67 @@ fn parseStandby(cursor: *Cursor) !Command {
     if (std.mem.eql(u8, subcommand, "ack") or std.mem.eql(u8, subcommand, "status-update")) {
         return .{ .standby_status_update = try parseStandbyStatusUpdate(cursor) };
     }
+    if (std.mem.eql(u8, subcommand, "upstream") or std.mem.eql(u8, subcommand, "follow")) {
+        return .{ .standby_upstream = try parseStandbyUpstream(cursor) };
+    }
     return error.UnknownStandbySubcommand;
+}
+
+/// Shared by `standby upstream` and the top-level `follow` alias: repoints a
+/// running standby's continuous-replication puller at a new upstream primary
+/// after a switchover, without a restart.
+fn parseStandbyUpstream(cursor: *Cursor) !StandbyUpstreamCommand {
+    var upstream_url: ?[]const u8 = null;
+    var slot_name: ?[]const u8 = null;
+    var identity = standby_mod.Identity{
+        .cluster_id = 0,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 0,
+        .epoch = 0,
+    };
+    var reason: []const u8 = "";
+
+    while (cursor.peek()) |arg| {
+        if (std.mem.eql(u8, arg, "--upstream-url")) {
+            _ = cursor.next();
+            upstream_url = try validateHAAdminURL(try cursor.value("--upstream-url"));
+        } else if (std.mem.eql(u8, arg, "--slot")) {
+            _ = cursor.next();
+            slot_name = try validateHASlotName(try cursor.value("--slot"));
+        } else if (std.mem.eql(u8, arg, "--cluster-id")) {
+            _ = cursor.next();
+            identity.cluster_id = try parseU64(try cursor.value("--cluster-id"));
+        } else if (std.mem.eql(u8, arg, "--shard-id")) {
+            _ = cursor.next();
+            identity.shard_id = try parseU64(try cursor.value("--shard-id"));
+        } else if (std.mem.eql(u8, arg, "--table-id")) {
+            _ = cursor.next();
+            identity.table_id = try parseU64(try cursor.value("--table-id"));
+        } else if (std.mem.eql(u8, arg, "--timeline-id")) {
+            _ = cursor.next();
+            identity.timeline_id = try parseU64(try cursor.value("--timeline-id"));
+        } else if (std.mem.eql(u8, arg, "--epoch")) {
+            _ = cursor.next();
+            identity.epoch = try parseU64(try cursor.value("--epoch"));
+        } else if (std.mem.eql(u8, arg, "--reason")) {
+            _ = cursor.next();
+            reason = try cursor.value("--reason");
+        } else {
+            break;
+        }
+    }
+
+    if (identity.cluster_id == 0) return error.ClusterIdMissing;
+    if (identity.timeline_id == 0) return error.TimelineIdMissing;
+    if (identity.epoch == 0) return error.EpochMissing;
+
+    return .{
+        .upstream_url = upstream_url orelse return error.InvalidHAAdminURL,
+        .slot_name = slot_name orelse return error.SlotNameMissing,
+        .identity = identity,
+        .reason = reason,
+    };
 }
 
 fn parseStandbyStatusUpdate(cursor: *Cursor) !replication_api.StandbyStatusUpdateRequest {
@@ -973,7 +1046,11 @@ fn parseOperator(
             .new_epoch = fence_new_epoch.?,
             .required_lsn = fence_required_lsn orelse return error.FenceRequiredLsnMissing,
             .observed_lsn = fence_observed_lsn orelse return error.FenceObservedLsnMissing,
-            .generation = fence_generation orelse return error.FenceGenerationMissing,
+            // Omitted generation defers to the fencing store's allocation
+            // (see `fencing.FenceRequest.generation`); a concrete receipt
+            // generation of 0 is still rejected downstream during receipt
+            // validation.
+            .generation = fence_generation orelse 0,
             .forced = fence_forced,
             .token = fence_token orelse return error.FenceTokenMissing,
             .reason = fence_reason,
@@ -1086,7 +1163,9 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
         .promoted_node_id = promoted_node_id orelse return error.PromotedNodeIdMissing,
         .new_timeline_id = new_timeline_id orelse return error.NewTimelineIdMissing,
         .new_epoch = new_epoch orelse return error.NewEpochMissing,
-        .generation = generation orelse return error.FenceGenerationMissing,
+        // Omitting `--generation` lets the node allocate the next
+        // generation itself; see `fencing.FenceRequest.generation`.
+        .generation = generation orelse 0,
         .required_lsn = required_lsn orelse return error.RequiredLsnMissing,
         .observed_lsn = observed_lsn orelse return error.ObservedLsnMissing,
         .force = force,
@@ -1967,6 +2046,113 @@ test "storage.ha admin cli parses fenced promotion request" {
     defer whole_instance.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 0), whole_instance.command.fence_acquire.identity.shard_id);
     try std.testing.expectEqual(@as(u64, 0), whole_instance.command.fence_acquire.identity.table_id);
+
+    // Omitting --generation lets the node allocate one itself; the CLI must
+    // not require the flag any more.
+    var omitted_generation = try parse(alloc, &.{
+        "fence",
+        "acquire",
+        "--cluster-id",
+        "1",
+        "--timeline-id",
+        "4",
+        "--epoch",
+        "5",
+        "--old-primary-id",
+        "primary-a",
+        "--promoted-node-id",
+        "standby-b",
+        "--new-timeline-id",
+        "6",
+        "--new-epoch",
+        "7",
+        "--required-lsn",
+        "100",
+        "--observed-lsn",
+        "99",
+    });
+    defer omitted_generation.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), omitted_generation.command.fence_acquire.generation);
+}
+
+test "storage.ha admin cli parses standby upstream and follow commands" {
+    const alloc = std.testing.allocator;
+
+    var upstream = try parse(alloc, &.{
+        "standby",
+        "upstream",
+        "--upstream-url",
+        "https://primary-b.antfly.svc:8080",
+        "--slot",
+        "standby-a",
+        "--cluster-id",
+        "100",
+        "--shard-id",
+        "10",
+        "--table-id",
+        "20",
+        "--timeline-id",
+        "2",
+        "--epoch",
+        "2",
+        "--reason",
+        "switchover",
+    });
+    defer upstream.deinit(alloc);
+    try std.testing.expectEqualStrings("https://primary-b.antfly.svc:8080", upstream.command.standby_upstream.upstream_url);
+    try std.testing.expectEqualStrings("standby-a", upstream.command.standby_upstream.slot_name);
+    try std.testing.expectEqual(@as(u64, 100), upstream.command.standby_upstream.identity.cluster_id);
+    try std.testing.expectEqual(@as(u64, 10), upstream.command.standby_upstream.identity.shard_id);
+    try std.testing.expectEqual(@as(u64, 20), upstream.command.standby_upstream.identity.table_id);
+    try std.testing.expectEqual(@as(u64, 2), upstream.command.standby_upstream.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), upstream.command.standby_upstream.identity.epoch);
+    try std.testing.expectEqualStrings("switchover", upstream.command.standby_upstream.reason);
+
+    // `antfly ha follow` is a top-level alias for `standby upstream` with the
+    // same flags, for operator ergonomics after a switchover.
+    var follow = try parse(alloc, &.{
+        "follow",
+        "--upstream-url",
+        "https://primary-b.antfly.svc:8080",
+        "--slot",
+        "standby-a",
+        "--cluster-id",
+        "100",
+        "--timeline-id",
+        "2",
+        "--epoch",
+        "2",
+    });
+    defer follow.deinit(alloc);
+    try std.testing.expectEqualStrings("https://primary-b.antfly.svc:8080", follow.command.standby_upstream.upstream_url);
+    try std.testing.expectEqualStrings("standby-a", follow.command.standby_upstream.slot_name);
+    try std.testing.expectEqualStrings("", follow.command.standby_upstream.reason);
+
+    try std.testing.expectError(error.InvalidHAAdminURL, parse(alloc, &.{
+        "follow",
+        "--upstream-url",
+        "not-a-url",
+        "--slot",
+        "standby-a",
+        "--cluster-id",
+        "100",
+        "--timeline-id",
+        "2",
+        "--epoch",
+        "2",
+    }));
+
+    try std.testing.expectError(error.ClusterIdMissing, parse(alloc, &.{
+        "follow",
+        "--upstream-url",
+        "https://primary-b.antfly.svc:8080",
+        "--slot",
+        "standby-a",
+        "--timeline-id",
+        "2",
+        "--epoch",
+        "2",
+    }));
 }
 
 test "storage.ha admin cli parses former primary rejoin assessment" {

@@ -36,6 +36,7 @@ const (
 	HABaseBackupsActivatePath         = HABaseBackupsPath + "/activate"
 	HASeedLifecycleReceiptsPath       = HAPath + "/seed-lifecycle/receipts"
 	HAStandbyBootstrapPath            = HAPath + "/standby/bootstrap"
+	HAStandbyUpstreamPath             = HAPath + "/standby/upstream"
 	HAFencePath                       = HAPath + "/fence"
 	HAFenceCurrentPath                = HAFencePath + "/current"
 	HAPromotionPath                   = HAPath + "/promotion"
@@ -115,6 +116,8 @@ type (
 	HAStandbyBootstrapResponse         = oapi.HAStandbyBootstrapResponse
 	HAStandbyStatusParams              = oapi.GetHAStandbyStatusParams
 	HAStandbyStatusResponse            = oapi.HAStandbyStatusResponse
+	HAStandbyUpstream                  = oapi.HAStandbyUpstream
+	HAStandbyUpstreamResponse          = oapi.HAStandbyUpstreamResponse
 	HASyncPolicy                       = oapi.HASyncPolicy
 	HASyncPolicyFailurePolicy          = oapi.HASyncPolicyFailurePolicy
 	HASyncPolicyMode                   = oapi.HASyncPolicyMode
@@ -140,6 +143,7 @@ type (
 	RejoinAssessRequest           = oapi.RejoinAssessRequest
 	ReplicationSlotCreateRequest  = oapi.ReplicationSlotCreateRequest
 	StandbyBootstrapRequest       = oapi.StandbyBootstrapRequest
+	StandbyUpstreamRequest        = oapi.StandbyUpstreamRequest
 	SeededSlotActivateRequest     = oapi.SeededSlotActivateRequest
 	SeedArtifactCaptureRequest    = oapi.SeedArtifactCaptureRequest
 	HASeedLifecycleReceiptParams  = oapi.GetHASeedLifecycleReceiptsParams
@@ -169,6 +173,7 @@ const (
 	HAActionKindReplicationSlotPause  = oapi.HAActionReceiptActionKindReplicationSlotPause
 	HAActionKindReplicationSlotResume = oapi.HAActionReceiptActionKindReplicationSlotResume
 	HAActionKindStandbyBootstrap      = oapi.HAActionReceiptActionKindStandbyBootstrap
+	HAActionKindStandbyUpstream       = oapi.HAActionReceiptActionKindStandbyUpstream
 
 	HAActionStateAlreadyApplied = oapi.HAActionReceiptStateAlreadyApplied
 	HAActionStateApplied        = oapi.HAActionReceiptStateApplied
@@ -768,6 +773,63 @@ func ValidateHAStandbyBootstrapResponseEvidence(raw []byte) error {
 	}
 	if response.BackupLsn == nil || response.CheckpointLsn == nil {
 		return fmt.Errorf("missing standby bootstrap field evidence")
+	}
+	return nil
+}
+
+func ValidateHAStandbyUpstreamResponse(response HAStandbyUpstreamResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing standby upstream schema_version")
+	}
+	if !HAActionReceiptPresent(response.Action) {
+		return fmt.Errorf("missing standby upstream action receipt")
+	}
+	if !HAIdentityComplete(response.Identity) {
+		return fmt.Errorf("missing standby upstream identity fields")
+	}
+	if !HAStandbyUpstreamComplete(response.Upstream) {
+		return fmt.Errorf("missing standby upstream fields")
+	}
+	if err := validateHAActionReceiptTarget(response.Action, HAStandbyUpstreamReceiptExpectation(), response.Upstream.SlotName, "standby upstream"); err != nil {
+		return err
+	}
+	previousPresent := response.Previous != (HAStandbyUpstream{})
+	if response.Changed {
+		if previousPresent && response.Previous == response.Upstream {
+			return fmt.Errorf("standby upstream response reports changed with an unchanged previous upstream")
+		}
+		return nil
+	}
+	// changed=false means the requested upstream already matched, so the
+	// standby must have had a continuous previous upstream identical to it.
+	if !previousPresent {
+		return fmt.Errorf("standby upstream response reports unchanged without a previous upstream")
+	}
+	if response.Previous != response.Upstream {
+		return fmt.Errorf("standby upstream response reports unchanged with a mismatched previous upstream")
+	}
+	return nil
+}
+
+func ValidateHAStandbyUpstreamResponseEvidence(raw []byte) error {
+	var response haStandbyUpstreamResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if !haFenceReceiptIdentityEvidenceComplete(response.Identity) {
+		return fmt.Errorf("missing standby upstream identity field evidence")
+	}
+	if !haStandbyUpstreamEvidenceComplete(response.Upstream) {
+		return fmt.Errorf("missing standby upstream field evidence")
+	}
+	if response.Changed == nil {
+		return fmt.Errorf("missing standby upstream changed field evidence")
+	}
+	if haStandbyUpstreamEvidencePresent(response.Previous) && !haStandbyUpstreamEvidenceComplete(response.Previous) {
+		return fmt.Errorf("missing standby upstream previous field evidence")
+	}
+	if !*response.Changed && !haStandbyUpstreamEvidenceComplete(response.Previous) {
+		return fmt.Errorf("missing standby upstream previous field evidence")
 	}
 	return nil
 }
@@ -1432,6 +1494,18 @@ type haStandbyBootstrapResponseEvidence struct {
 	CheckpointLsn *uint64 `json:"checkpoint_lsn"`
 }
 
+type haStandbyUpstreamEvidence struct {
+	UpstreamUrl *string `json:"upstream_url"`
+	SlotName    *string `json:"slot_name"`
+}
+
+type haStandbyUpstreamResponseEvidence struct {
+	Identity haFenceReceiptIdentityEvidence `json:"identity"`
+	Upstream haStandbyUpstreamEvidence      `json:"upstream"`
+	Previous haStandbyUpstreamEvidence      `json:"previous"`
+	Changed  *bool                          `json:"changed"`
+}
+
 type haFenceReceiptIdentityEvidence struct {
 	ClusterId  *uint64 `json:"cluster_id"`
 	ShardId    *uint64 `json:"shard_id"`
@@ -1534,6 +1608,23 @@ func haReplicationSlotEvidenceComplete(slot haReplicationSlotEvidence) bool {
 		slot.Active != nil &&
 		slot.ReseedRequired != nil &&
 		slot.CurrentLsn != nil
+}
+
+func haFenceReceiptIdentityEvidenceComplete(identity haFenceReceiptIdentityEvidence) bool {
+	return identity.ClusterId != nil &&
+		identity.ShardId != nil &&
+		identity.TableId != nil &&
+		identity.TimelineId != nil &&
+		identity.Epoch != nil
+}
+
+func haStandbyUpstreamEvidenceComplete(upstream haStandbyUpstreamEvidence) bool {
+	return upstream.UpstreamUrl != nil && strings.TrimSpace(*upstream.UpstreamUrl) != "" &&
+		upstream.SlotName != nil && strings.TrimSpace(*upstream.SlotName) != ""
+}
+
+func haStandbyUpstreamEvidencePresent(upstream haStandbyUpstreamEvidence) bool {
+	return upstream.UpstreamUrl != nil || upstream.SlotName != nil
 }
 
 func haFenceReceiptEvidenceComplete(receipt haFenceReceiptEvidence) bool {
@@ -2142,6 +2233,10 @@ func HAReplicationSlotComplete(slot HAReplicationSlot) bool {
 		slot.TimelineId > 0
 }
 
+func HAStandbyUpstreamComplete(upstream HAStandbyUpstream) bool {
+	return validHAIdentifier(upstream.SlotName) && validHTTPURL(upstream.UpstreamUrl)
+}
+
 func HAPrimaryStatusOperation() HAOperation {
 	return HAOperation{Method: http.MethodGet, Path: HAPrimaryStatusPath}
 }
@@ -2222,6 +2317,10 @@ func HABootstrapStandbyOperation() HAOperation {
 	return HAOperation{Method: http.MethodPost, Path: HAStandbyBootstrapPath}
 }
 
+func HASetStandbyUpstreamOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HAStandbyUpstreamPath}
+}
+
 func HAAcquireFenceOperation() HAOperation {
 	return HAOperation{Method: http.MethodPost, Path: HAFencePath}
 }
@@ -2286,6 +2385,20 @@ func validHAIdentifier(value string) bool {
 	return true
 }
 
+// validHTTPURL reports whether value is a non-empty, unpadded absolute URL
+// with an http or https scheme and a host, suitable for an HA standby
+// upstream base URL.
+func validHTTPURL(value string) bool {
+	if value == "" || strings.TrimSpace(value) != value {
+		return false
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	return parsed.Scheme == "http" || parsed.Scheme == "https"
+}
+
 func validSHA256Hex(value string) bool {
 	if len(value) != 64 {
 		return false
@@ -2332,6 +2445,10 @@ func HASeededSlotActivateReceiptExpectation() HAReceiptExpectation {
 
 func HAStandbyBootstrapReceiptExpectation() HAReceiptExpectation {
 	return HAReceiptExpectation{ActionKind: HAActionKindStandbyBootstrap, State: HAActionStateApplied}
+}
+
+func HAStandbyUpstreamReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindStandbyUpstream, State: HAActionStateApplied}
 }
 
 func HAFenceAcquireReceiptExpectation() HAReceiptExpectation {
@@ -2925,11 +3042,43 @@ func validateHASyncPolicyForRequest(operation string, policy HASyncPolicy) error
 	return validateHAIdentifierListForRequest(operation, "standby_names", policy.StandbyNames)
 }
 
+// validateHAFenceAcquireRequestForRequest validates the locally-checkable
+// fields of a fence acquisition/promotion request. It intentionally does not
+// require body.Generation to be set: the field is optional (oapi-codegen
+// renders it as a value uint64 with omitzero, so a zero value is
+// indistinguishable from "absent" on the wire), and the server allocates the
+// next generation itself when it is omitted. Callers whose fencing authority
+// is a Kubernetes Lease must still supply the exact Lease transition
+// generation; that requirement is enforced server-side, not here.
 func validateHAFenceAcquireRequestForRequest(operation string, body FenceAcquireRequest) error {
 	if err := validateHANodeIDForRequest(operation, "old_primary_id", body.OldPrimaryId); err != nil {
 		return err
 	}
 	return validateHANodeIDForRequest(operation, "promoted_node_id", body.PromotedNodeId)
+}
+
+func validateHAStandbyUpstreamRequestForRequest(operation string, body StandbyUpstreamRequest) error {
+	if err := validateHAIdentityForRequest(operation, "identity", body.Identity); err != nil {
+		return err
+	}
+	if err := validateHAUpstreamURLForRequest(operation, "upstream_url", body.UpstreamUrl); err != nil {
+		return err
+	}
+	return validateHAReplicationSlotNameForRequest(operation, body.SlotName)
+}
+
+func validateHAIdentityForRequest(operation string, field string, identity HAIdentity) error {
+	if HAIdentityComplete(identity) {
+		return nil
+	}
+	return fmt.Errorf("%s: invalid HA %s %+v", operation, field, identity)
+}
+
+func validateHAUpstreamURLForRequest(operation string, field string, value string) error {
+	if validHTTPURL(value) {
+		return nil
+	}
+	return fmt.Errorf("%s: invalid HA %s %q", operation, field, value)
 }
 
 func validateHARejoinAssessRequestForRequest(operation string, body RejoinAssessRequest) error {
@@ -3105,6 +3254,21 @@ func (c *HAClient) BootstrapStandbyResponse(ctx context.Context, body StandbyBoo
 
 func (c *HAClient) BootstrapStandby(ctx context.Context, body StandbyBootstrapRequest) (*HAStandbyBootstrapResponse, error) {
 	return haResponseValue(c.BootstrapStandbyResponse(ctx, body))
+}
+
+func (c *HAClient) SetStandbyUpstreamResponse(ctx context.Context, body StandbyUpstreamRequest) (*HAResponse[HAStandbyUpstreamResponse], error) {
+	if err := validateHAStandbyUpstreamRequestForRequest("set HA standby upstream", body); err != nil {
+		return nil, err
+	}
+	resp, err := c.client.SetHAStandbyUpstreamWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200ValidatedEvidence("set HA standby upstream", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAStandbyUpstreamResponse, ValidateHAStandbyUpstreamResponseEvidence)
+}
+
+func (c *HAClient) SetStandbyUpstream(ctx context.Context, body StandbyUpstreamRequest) (*HAStandbyUpstreamResponse, error) {
+	return haResponseValue(c.SetStandbyUpstreamResponse(ctx, body))
 }
 
 func (c *HAClient) AcquireFenceResponse(ctx context.Context, body FenceAcquireRequest) (*HAResponse[HAFenceResponse], error) {

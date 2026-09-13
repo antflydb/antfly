@@ -64,6 +64,24 @@ pub fn validateIdentity(identity: Identity) !void {
     if (identity.epoch == 0) return error.InvalidIdentity;
 }
 
+/// Returns the identity recorded by the newest durable progress record, or
+/// `null` when the progress WAL holds no records yet. This lets a caller that
+/// only knows the data directory (for example `antfly ha --data-dir`) recover
+/// the identity a standby was opened with instead of typing it. It does not
+/// validate progress monotonicity; `Standby.open` still does that.
+pub fn readPersistedIdentity(alloc: Allocator, progress_wal_path: [*:0]const u8, options: OpenOptions) !?Identity {
+    var progress_wal = try wal_mod.WAL.open(progress_wal_path, options.progress_wal_options);
+    defer progress_wal.close();
+    const entries = try progress_wal.iterateFrom(alloc, 1);
+    defer {
+        for (entries) |entry| alloc.free(entry.data);
+        alloc.free(entries);
+    }
+    var identity: ?Identity = null;
+    for (entries) |entry| identity = (try decodeProgressRecord(entry.data)).identity;
+    return identity;
+}
+
 pub const Progress = struct {
     received_lsn: u64 = 0,
     applied_lsn: u64 = 0,

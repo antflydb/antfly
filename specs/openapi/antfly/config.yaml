@@ -36,6 +36,8 @@ components:
           $ref: "#/components/schemas/StorageConfig"
         transaction_sessions:
           $ref: "#/components/schemas/TransactionSessionConfig"
+        ha:
+          $ref: "#/components/schemas/HAConfig"
         metadata:
           $ref: "#/components/schemas/MetadataInfo"
         inference:
@@ -1019,6 +1021,181 @@ components:
         - object
       default: local
 
+    HAConfig:
+      type: object
+      additionalProperties: false
+      description: |
+        Hot-standby replication settings for a standalone node. Every field
+        mirrors an `antfly standalone --ha-*` flag; a flag given on the command
+        line wins over the value here. `antfly ha --config <file>` reads the
+        same section to find the node's HA state and admin endpoint, so the
+        replication identity and paths are written once, in the same way a
+        PostgreSQL standby carries `primary_conninfo` in its configuration.
+      properties:
+        admin:
+          $ref: "#/components/schemas/HAAdminConfig"
+        identity:
+          $ref: "#/components/schemas/HAIdentityConfig"
+        primary:
+          $ref: "#/components/schemas/HAPrimaryConfig"
+        standby:
+          $ref: "#/components/schemas/HAStandbyConfig"
+        sync:
+          $ref: "#/components/schemas/HASyncConfig"
+        retention:
+          $ref: "#/components/schemas/HARetentionConfig"
+        fence_wal:
+          type: string
+          description: "Durable promotion fence WAL path (`--ha-fence-wal`)."
+        former_primary_log:
+          type: string
+          description: "Replication log a demoted primary rewinds in place (`--ha-former-primary-log`)."
+    HAAdminConfig:
+      type: object
+      additionalProperties: false
+      description: "How the HA admin API of this node is reached and authenticated."
+      properties:
+        url:
+          type: string
+          format: uri
+          description: |
+            URL where this node's HA admin API is reachable. Used as the default
+            target by `antfly ha` when no `--admin-url`, `--data-dir`, or local
+            handle flag is given. Not used by the server itself.
+          example: "http://127.0.0.1:8080"
+        token_env:
+          type: string
+          description: |
+            Name of the environment variable holding the admin bearer token. The
+            server requires `Authorization: Bearer <token>` on admin and HA
+            routes when set (`--admin-token-env`); `antfly ha` reads the same
+            variable to authenticate. Tokens never appear in configuration.
+          example: "ANTFLY_HA_ADMIN_TOKEN"
+    HAIdentityConfig:
+      type: object
+      additionalProperties: false
+      description: "Replication identity shared by the primary and its standbys."
+      properties:
+        cluster_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: "Replicated cluster id (`--ha-cluster-id`)."
+        shard_id:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          description: "Replicated shard id; 0 means the whole instance (`--ha-shard-id`)."
+        table_id:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          description: "Replicated table id; 0 means the whole instance (`--ha-table-id`)."
+        timeline_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: "Current timeline id (`--ha-timeline-id`)."
+        epoch:
+          type: integer
+          format: int64
+          minimum: 1
+          description: "Current epoch (`--ha-epoch`)."
+    HAPrimaryConfig:
+      type: object
+      additionalProperties: false
+      description: "Primary-role state. Setting `log` and `slots` enables the primary HA role."
+      properties:
+        log:
+          type: string
+          description: "Replication log path (`--ha-primary-log`)."
+        slots:
+          type: string
+          description: "Replication slot store path (`--ha-primary-slots`)."
+        node_id:
+          type: string
+          description: "Node id stamped into typed admin receipts (`--ha-primary-node-id`)."
+        seed_capture_root:
+          type: string
+          description: "Runtime-owned immutable seed generation root (`--ha-seed-capture-root`)."
+    HAStandbyConfig:
+      type: object
+      additionalProperties: false
+      description: "Standby-role state. Setting `log` and `progress` enables the standby HA role."
+      properties:
+        log:
+          type: string
+          description: "Received replication log path (`--ha-standby-log`)."
+        progress:
+          type: string
+          description: "Durable receive/apply progress WAL path (`--ha-standby-progress`)."
+        node_id:
+          type: string
+          description: "Node id stamped into typed admin receipts (`--ha-standby-node-id`)."
+        upstream_url:
+          type: string
+          format: uri
+          description: |
+            Primary URL to pull from (`--ha-standby-upstream-url`). This is the
+            initial upstream; `antfly ha follow` can repoint a running standby
+            without a restart.
+        slot:
+          type: string
+          description: "Replication slot name on the upstream (`--ha-standby-slot`)."
+    HASyncConfig:
+      type: object
+      additionalProperties: false
+      description: "Synchronous replication policy enforced by the primary."
+      properties:
+        mode:
+          type: string
+          enum: [async, remote-write, remote-apply]
+          default: remote-write
+          description: "`--ha-sync-mode`."
+        selection:
+          type: string
+          enum: [any, first, all]
+          default: any
+          description: "`--ha-sync-selection`."
+        required:
+          type: integer
+          minimum: 1
+          description: "Required standby acknowledgements; not allowed with `selection: all` (`--ha-sync-required`)."
+        standbys:
+          type: array
+          items:
+            type: string
+          description: "Standby names participating in the sync policy (`--ha-sync-standby`, repeatable)."
+        failure:
+          type: string
+          enum: [block, fail-closed, degrade-to-async]
+          default: block
+          description: "`--ha-sync-failure`."
+    HARetentionConfig:
+      type: object
+      additionalProperties: false
+      description: "Retention caps after which the primary marks lagging slots reseed-required. 0 disables a cap."
+      properties:
+        max_lag_lsn:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          description: "`--ha-retention-max-lag-lsn`."
+        max_retained_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          description: "`--ha-retention-max-retained-bytes`."
+        max_retained_age_ns:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          description: "`--ha-retention-max-retained-age-ns`."
     TransactionSessionConfig:
       type: object
       additionalProperties: false

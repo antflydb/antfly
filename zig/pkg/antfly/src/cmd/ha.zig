@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const antfly = @import("../cli_root.zig");
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const seed_activation_contract = @import("../storage/ha/seed_activation_contract.zig");
@@ -27,6 +28,24 @@ const control_only_storage_sources = storage_source_options.control_only;
 
 var test_path_counter: u64 = 0;
 
+/// Command output goes to stdout in production. Under the test runner stdout
+/// is the build server's IPC channel, so tests must never write to it: output
+/// is captured by `test_output_sink` when a test installs one and discarded
+/// otherwise.
+var test_output_sink: ?*std.Io.Writer = null;
+
+fn emit(io: std.Io, bytes: []const u8) void {
+    emitOrFail(io, bytes) catch {};
+}
+
+fn emitOrFail(io: std.Io, bytes: []const u8) !void {
+    if (builtin.is_test) {
+        const sink = test_output_sink orelse return;
+        return sink.writeAll(bytes);
+    }
+    try std.Io.File.stdout().writeStreamingAll(io, bytes);
+}
+
 const LocalOptions = struct {
     remote_url: ?[]const u8 = null,
     remote_token_env: ?[]const u8 = null,
@@ -38,10 +57,17 @@ const LocalOptions = struct {
     standby_node_id: ?[]const u8 = null,
     fence_wal: ?[]const u8 = null,
     former_primary_log: ?[]const u8 = null,
+    data_dir: ?[]const u8 = null,
+    config_path: ?[]const u8 = null,
     identity: IdentityOptions = .{},
 
     fn wantsPrimary(self: LocalOptions) bool {
         return self.primary_log != null or self.primary_slots != null;
+    }
+
+    fn hasLocalHandles(self: LocalOptions) bool {
+        return self.wantsPrimary() or self.wantsStandby() or
+            self.fence_wal != null or self.former_primary_log != null;
     }
 
     fn wantsStandby(self: LocalOptions) bool {
@@ -126,17 +152,31 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
     }
     var parsed = try parseLocalArgs(alloc, argv);
     defer parsed.deinit(alloc);
-    if (parsed.command_args.len == 0) return error.HaCommandMissing;
+    if (parsed.command_args.len == 0) {
+        printUsage("antfly");
+        return error.HaCommandMissing;
+    }
     if (std.mem.eql(u8, parsed.command_args[0], "artifact")) {
         if (parsed.options.remote_url != null or parsed.options.remote_token_env != null or
-            parsed.options.wantsPrimary() or parsed.options.wantsStandby() or
-            parsed.options.fence_wal != null or parsed.options.former_primary_log != null)
+            parsed.options.data_dir != null or parsed.options.hasLocalHandles())
         {
             return error.SeedArtifactCannotUseAdminHandles;
         }
         try runArtifactArgv(alloc, io, parsed.command_args[1..]);
         return;
     }
+
+    // Target resolution order: explicit flags, then environment, then the
+    // config file, then whatever --data-dir finds on disk.
+    try applyEnvironmentDefaults(&parsed.options, process_env);
+    var loaded_config = try applyConfigDefaults(alloc, io, &parsed.options);
+    defer if (loaded_config) |*cfg| cfg.deinit();
+    try applyEnvironmentDefaults(&parsed.options, process_env);
+
+    // Derived strings (data-dir paths) live for the rest of this call.
+    var derived_arena = std.heap.ArenaAllocator.init(alloc);
+    defer derived_arena.deinit();
+    try applyDataDir(derived_arena.allocator(), io, &parsed.options);
 
     if (parsed.options.remote_url) |remote_url| {
         if (parsed.options.wantsPrimary() or parsed.options.wantsStandby() or
@@ -148,12 +188,19 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
         defer if (bearer_token) |token| alloc.free(token);
         var executor = antfly.common.http.StdHttpExecutor.init(alloc, .{});
         defer executor.deinit();
+        if (std.mem.eql(u8, parsed.command_args[0], "switchover")) {
+            try runSwitchover(alloc, io, remote_url, parsed.command_args[1..], executor.executor(), .{
+                .bearer_token = bearer_token,
+            });
+            return;
+        }
         try runRemoteArgvWithOptions(alloc, io, remote_url, parsed.command_args, executor.executor(), .{
             .bearer_token = bearer_token,
         });
         return;
     }
     if (parsed.options.remote_token_env != null) return error.HaTokenEnvRequiresRemote;
+    if (std.mem.eql(u8, parsed.command_args[0], "switchover")) return error.SwitchoverRequiresAdminApi;
 
     var plan = try ha.admin_cli.parse(alloc, parsed.command_args);
     defer plan.deinit(alloc);
@@ -219,8 +266,8 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
     }, plan);
     defer rendered.deinit(alloc);
 
-    std.Io.File.stdout().writeStreamingAll(io, rendered.body) catch {};
-    std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
+    emit(io, rendered.body);
+    emit(io, "\n");
 }
 
 const ArtifactAction = enum { publish, restore, verify, activate, prune, gc_source, gc_target, delete_prefix };
@@ -420,7 +467,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                 .binding = binding,
                 .capture_receipt_sha256 = capture_receipt_sha256,
             }, .{});
-            std.Io.File.stdout().writeStreamingAll(io, "{\"verified\":true}\n") catch {};
+            emit(io, "{\"verified\":true}\n");
         },
         .activate => {
             const generation = options.generation orelse return error.SeedGenerationMissing;
@@ -729,8 +776,8 @@ fn readArtifactFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: 
 }
 
 fn writeArtifactResult(io: std.Io, body: []const u8) !void {
-    std.Io.File.stdout().writeStreamingAll(io, body) catch return error.SeedArtifactOutputFailed;
-    std.Io.File.stdout().writeStreamingAll(io, "\n") catch return error.SeedArtifactOutputFailed;
+    emitOrFail(io, body) catch return error.SeedArtifactOutputFailed;
+    emitOrFail(io, "\n") catch return error.SeedArtifactOutputFailed;
 }
 
 fn runRemoteArgv(
@@ -967,6 +1014,12 @@ fn executeTypedRemote(
             try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
+        .standby_upstream => |command| {
+            var out = try client.setStandbyUpstream(remote_url, try standbyUpstreamRequestOpenApi(command));
+            defer out.deinit(alloc);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
+            return true;
+        },
         .identify_system,
         .start_replication,
         .stream_once,
@@ -1012,9 +1065,326 @@ fn remoteCommandEndpointAllowed(command: ha.admin_cli.Command, output: ha.admin_
     };
 }
 
+/// Planned primary change. Composed entirely from typed admin routes; see
+/// `zig/HOT_STANDBY.md` ("switchover") for the sequence and its safety
+/// argument. The old primary is fenced before the boundary is read, so no
+/// write can land after the LSN the standby is required to reach.
+const SwitchoverOptions = struct {
+    to: []const u8,
+    new_upstream_url: ?[]const u8 = null,
+    followers: []const Follower = &.{},
+    generation: ?u64 = null,
+    max_lag_lsn: ?u64 = null,
+    wait_seconds: u64 = 60,
+    retained_from_lsn: u64 = 0,
+    reason: []const u8 = "planned switchover",
+    dry_run: bool = false,
+    output: ha.admin_cli.OutputFormat = .table,
+
+    const Follower = struct {
+        slot_name: []const u8,
+        url: []const u8,
+    };
+
+    fn deinit(self: *SwitchoverOptions, alloc: std.mem.Allocator) void {
+        alloc.free(self.followers);
+        self.* = undefined;
+    }
+
+    fn newUpstreamUrl(self: SwitchoverOptions) []const u8 {
+        return self.new_upstream_url orelse self.to;
+    }
+};
+
+fn parseSwitchoverArgs(alloc: std.mem.Allocator, argv: []const []const u8) !SwitchoverOptions {
+    var to: ?[]const u8 = null;
+    var options = SwitchoverOptions{ .to = "" };
+    var followers = std.ArrayListUnmanaged(SwitchoverOptions.Follower).empty;
+    errdefer followers.deinit(alloc);
+
+    var idx: usize = 0;
+    while (idx < argv.len) {
+        const arg = argv[idx];
+        idx += 1;
+        if (std.mem.eql(u8, arg, "--to")) {
+            to = try validateHAAdminURL(try value(argv, &idx, arg));
+        } else if (std.mem.eql(u8, arg, "--new-upstream-url")) {
+            options.new_upstream_url = try validateHAAdminURL(try value(argv, &idx, arg));
+        } else if (std.mem.eql(u8, arg, "--follower")) {
+            const raw = try value(argv, &idx, arg);
+            const split = std.mem.indexOfScalar(u8, raw, '=') orelse return error.SwitchoverFollowerInvalid;
+            const slot_name = raw[0..split];
+            if (!ha_validation.isIdentifier(slot_name)) return error.SwitchoverFollowerInvalid;
+            try followers.append(alloc, .{
+                .slot_name = slot_name,
+                .url = try validateHAAdminURL(raw[split + 1 ..]),
+            });
+        } else if (std.mem.eql(u8, arg, "--generation")) {
+            const generation = try parseU64(try value(argv, &idx, arg));
+            if (generation == 0) return error.SwitchoverGenerationInvalid;
+            options.generation = generation;
+        } else if (std.mem.eql(u8, arg, "--max-lag-lsn")) {
+            options.max_lag_lsn = try parseU64(try value(argv, &idx, arg));
+        } else if (std.mem.eql(u8, arg, "--wait-seconds")) {
+            options.wait_seconds = try parseU64(try value(argv, &idx, arg));
+        } else if (std.mem.eql(u8, arg, "--retained-from-lsn")) {
+            options.retained_from_lsn = try parseU64(try value(argv, &idx, arg));
+        } else if (std.mem.eql(u8, arg, "--reason")) {
+            options.reason = try value(argv, &idx, arg);
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            options.dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            options.output = .json;
+        } else if (std.mem.eql(u8, arg, "--table")) {
+            options.output = .table;
+        } else {
+            return error.UnknownSwitchoverOption;
+        }
+    }
+    options.to = to orelse return error.SwitchoverTargetMissing;
+    options.followers = try followers.toOwnedSlice(alloc);
+    return options;
+}
+
+fn identityEql(a: admin_api.openapi.HAIdentity, b: admin_api.openapi.HAIdentity) bool {
+    return a.cluster_id == b.cluster_id and a.shard_id == b.shard_id and a.table_id == b.table_id and
+        a.timeline_id == b.timeline_id and a.epoch == b.epoch;
+}
+
+fn reportSwitchoverStep(alloc: std.mem.Allocator, io: std.Io, output: ha.admin_cli.OutputFormat, step: []const u8, body: ?[]const u8) !void {
+    switch (output) {
+        .json => {
+            const line = try std.fmt.allocPrint(alloc, "{{\"step\":\"{s}\",\"response\":{s}}}\n", .{ step, body orelse "null" });
+            defer alloc.free(line);
+            emit(io, line);
+        },
+        else => {
+            const line = try std.fmt.allocPrint(alloc, "switchover {s}: ok\n", .{step});
+            defer alloc.free(line);
+            emit(io, line);
+        },
+    }
+}
+
+fn reportSwitchoverFailure(alloc: std.mem.Allocator, io: std.Io, output: ha.admin_cli.OutputFormat, step: []const u8, err: anyerror) void {
+    const line = switch (output) {
+        .json => std.fmt.allocPrint(alloc, "{{\"step\":\"{s}\",\"error\":\"{s}\"}}\n", .{ step, @errorName(err) }) catch return,
+        else => std.fmt.allocPrint(alloc, "switchover {s}: failed: {s}\n", .{ step, @errorName(err) }) catch return,
+    };
+    defer alloc.free(line);
+    emit(io, line);
+}
+
+fn runSwitchover(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    primary_url: []const u8,
+    argv: []const []const u8,
+    executor: http_common.RequestExecutor,
+    remote_options: RemoteOptions,
+) !void {
+    var options = try parseSwitchoverArgs(alloc, argv);
+    defer options.deinit(alloc);
+    var client = ha.http_client.Client.initWithOptions(alloc, executor, .{
+        .bearer_token = remote_options.bearer_token,
+    });
+
+    // 1. Preflight: read both nodes, write nothing.
+    var primary_out = try client.getPrimaryStatus(primary_url, .{});
+    defer primary_out.deinit(alloc);
+    const primary = primary_out.parsed.value.snapshot;
+    if (!std.mem.eql(u8, primary.role, "primary")) return error.SwitchoverSourceNotPrimary;
+    const boundary = try u64FromI64(primary.current_lsn);
+    if (boundary == 0) return error.SwitchoverPrimaryHasNoRecords;
+
+    var standby_out = try client.getStandbyStatus(options.to, boundary);
+    defer standby_out.deinit(alloc);
+    const standby = standby_out.parsed.value.snapshot;
+    if (!std.mem.eql(u8, standby.role, "standby")) return error.SwitchoverTargetNotStandby;
+    if (!identityEql(primary.identity, standby.identity)) return error.SwitchoverIdentityMismatch;
+    if (options.max_lag_lsn) |max_lag| {
+        const applied = try u64FromI64(standby.applied_lsn);
+        if (boundary > applied and boundary - applied > max_lag) return error.SwitchoverStandbyLagging;
+    }
+    try reportSwitchoverStep(alloc, io, options.output, "preflight-primary", primary_out.body);
+    try reportSwitchoverStep(alloc, io, options.output, "preflight-standby", standby_out.body);
+    if (options.dry_run) return;
+
+    const old_identity = primary.identity;
+    var fence_request = admin_api.openapi.FenceAcquireRequest{
+        .identity = old_identity,
+        .old_primary_id = primary.node_id,
+        .promoted_node_id = standby.node_id,
+        .new_timeline_id = try i64FromU64((try u64FromI64(old_identity.timeline_id)) + 1),
+        .new_epoch = try i64FromU64((try u64FromI64(old_identity.epoch)) + 1),
+        .generation = if (options.generation) |generation| try i64FromU64(generation) else null,
+        .required_lsn = primary.current_lsn,
+        .observed_lsn = primary.current_lsn,
+        .force = false,
+        .reason = options.reason,
+    };
+
+    // 2. Fence the old primary first; its write gate fails closed from here on.
+    var primary_fence = try client.acquireFence(primary_url, fence_request);
+    defer primary_fence.deinit(alloc);
+    const generation = primary_fence.parsed.value.receipt.generation;
+    try reportSwitchoverStep(alloc, io, options.output, "fence-primary", primary_fence.body);
+
+    // 3. Read the final boundary and wait for the standby to reach it.
+    var fenced_out = try client.getPrimaryStatus(primary_url, .{});
+    defer fenced_out.deinit(alloc);
+    const final_lsn_raw = fenced_out.parsed.value.snapshot.current_lsn;
+    const final_lsn = try u64FromI64(final_lsn_raw);
+    if (final_lsn < boundary) return error.SwitchoverBoundaryRegressed;
+    try waitForStandbyBoundary(alloc, io, &client, options.to, final_lsn, options.wait_seconds);
+    try reportSwitchoverStep(alloc, io, options.output, "boundary", fenced_out.body);
+
+    // 4. Fence the standby with the same generation, assess, promote.
+    fence_request.generation = generation;
+    fence_request.required_lsn = final_lsn_raw;
+    fence_request.observed_lsn = final_lsn_raw;
+    var standby_fence = try client.acquireFence(options.to, fence_request);
+    defer standby_fence.deinit(alloc);
+    try reportSwitchoverStep(alloc, io, options.output, "fence-standby", standby_fence.body);
+
+    var assess = try client.assessPromotion(options.to, .{
+        .required_lsn = final_lsn_raw,
+        .fencing_confirmed = true,
+        .force = false,
+        .use_current_fence = true,
+    });
+    defer assess.deinit(alloc);
+    const assessment = assess.parsed.value.assessment;
+    try reportSwitchoverStep(alloc, io, options.output, "assess", assess.body);
+    if (!assessment.can_promote or !std.mem.eql(u8, assessment.mode, "safe")) return error.SwitchoverPromotionNotSafe;
+
+    var promoted = try client.promoteWithCurrentFence(options.to);
+    defer promoted.deinit(alloc);
+    try reportSwitchoverStep(alloc, io, options.output, "promote", promoted.body);
+
+    // 5. Rejoin the old primary; 6. repoint followers. Both run after the
+    // role has moved, so a failure here is reported but does not undo the
+    // promotion; the caller re-runs the individual verb.
+    var incomplete = false;
+    rejoinFormerPrimary(alloc, io, &client, primary_url, options, primary.node_id, old_identity, final_lsn_raw) catch |err| {
+        incomplete = true;
+        reportSwitchoverFailure(alloc, io, options.output, "rejoin", err);
+    };
+    for (options.followers) |follower| {
+        followNewPrimary(alloc, io, &client, options, follower, primary.slots, old_identity, final_lsn) catch |err| {
+            incomplete = true;
+            reportSwitchoverFailure(alloc, io, options.output, follower.slot_name, err);
+        };
+    }
+    if (incomplete) return error.SwitchoverIncomplete;
+}
+
+fn waitForStandbyBoundary(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    client: *ha.http_client.Client,
+    standby_url: []const u8,
+    final_lsn: u64,
+    wait_seconds: u64,
+) !void {
+    const poll_interval_ms: u64 = 250;
+    var remaining = @max(wait_seconds, 1) * (1000 / poll_interval_ms);
+    while (true) {
+        var out = try client.getStandbyStatus(standby_url, final_lsn);
+        defer out.deinit(alloc);
+        const snapshot = out.parsed.value.snapshot;
+        const received = try u64FromI64(snapshot.received_lsn);
+        const applied = try u64FromI64(snapshot.applied_lsn);
+        const safe_read = try u64FromI64(snapshot.safe_read_lsn);
+        if (received >= final_lsn and applied >= final_lsn and safe_read >= final_lsn) return;
+        if (remaining == 0) return error.SwitchoverStandbyCatchUpTimeout;
+        remaining -= 1;
+        try io.sleep(.fromMilliseconds(poll_interval_ms), .awake);
+    }
+}
+
+fn rejoinFormerPrimary(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    client: *ha.http_client.Client,
+    primary_url: []const u8,
+    options: SwitchoverOptions,
+    former_node_id: []const u8,
+    old_identity: admin_api.openapi.HAIdentity,
+    final_lsn_raw: i64,
+) !void {
+    var fence = try client.currentFence(options.to);
+    defer fence.deinit(alloc);
+    if (!fence.parsed.value.held) return error.SwitchoverFenceMissing;
+    const receipt = fence.parsed.value.receipt orelse return error.SwitchoverFenceMissing;
+
+    const request = admin_api.openapi.RejoinAssessRequest{
+        .node_id = former_node_id,
+        .identity = old_identity,
+        .last_lsn = final_lsn_raw,
+        .retained_from_lsn = try i64FromU64(options.retained_from_lsn),
+        .allow_rewind_after_forced_promotion = false,
+        .receipt = receipt,
+    };
+    var assessed = try client.assessRejoin(primary_url, request);
+    defer assessed.deinit(alloc);
+    try reportSwitchoverStep(alloc, io, options.output, "rejoin-assess", assessed.body);
+    const action = assessed.parsed.value.assessment.action;
+    if (std.mem.eql(u8, action, "rewind")) {
+        // The old primary still owns its replication log while it runs in the
+        // primary role, and a log cannot be opened twice in one process, so
+        // `rejoin rewind` executes after the node restarts as a standby with
+        // `former_primary_log` configured. Report it as pending rather than
+        // attempting it here and failing on the lock.
+        try reportSwitchoverStep(alloc, io, options.output, "rejoin-rewind-pending", assessed.body);
+    } else if (std.mem.eql(u8, action, "reseed")) {
+        var reseeded = try client.reseedRejoin(options.to, request);
+        defer reseeded.deinit(alloc);
+        try reportSwitchoverStep(alloc, io, options.output, "rejoin-reseed", reseeded.body);
+    } else if (!std.mem.eql(u8, action, "already_current")) {
+        return error.SwitchoverRejoinRejected;
+    }
+}
+
+fn followNewPrimary(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    client: *ha.http_client.Client,
+    options: SwitchoverOptions,
+    follower: SwitchoverOptions.Follower,
+    old_slots: []const admin_api.openapi.HASlotSnapshot,
+    old_identity: admin_api.openapi.HAIdentity,
+    final_lsn: u64,
+) !void {
+    var initial_lsn = final_lsn;
+    for (old_slots) |slot| {
+        if (std.mem.eql(u8, slot.name, follower.slot_name)) {
+            initial_lsn = try u64FromI64(slot.received_lsn);
+            break;
+        }
+    }
+    // The new primary needs a slot for the follower; an existing slot is fine.
+    if (client.createReplicationSlot(options.to, follower.slot_name, initial_lsn)) |*created| {
+        var owned = created.*;
+        defer owned.deinit(alloc);
+        try reportSwitchoverStep(alloc, io, options.output, follower.slot_name, owned.body);
+    } else |err| switch (err) {
+        error.HaCommandConflict => {},
+        else => return err,
+    }
+    var repointed = try client.setStandbyUpstream(follower.url, .{
+        .identity = old_identity,
+        .upstream_url = options.newUpstreamUrl(),
+        .slot_name = follower.slot_name,
+        .reason = options.reason,
+    });
+    defer repointed.deinit(alloc);
+    try reportSwitchoverStep(alloc, io, options.output, follower.slot_name, repointed.body);
+}
+
 fn writeRemoteBody(io: std.Io, body: []const u8) void {
-    std.Io.File.stdout().writeStreamingAll(io, body) catch {};
-    std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
+    emit(io, body);
+    emit(io, "\n");
 }
 
 fn writeTypedRemoteBody(
@@ -1337,7 +1707,10 @@ fn fenceRequestOpenApi(request: ha.fencing.FenceRequest) !admin_api.openapi.Fenc
         .promoted_node_id = request.promoted_node_id,
         .new_timeline_id = try i64FromU64(request.new_timeline_id),
         .new_epoch = try i64FromU64(request.new_epoch),
-        .generation = try i64FromU64(request.generation),
+        // 0 is the in-process sentinel for "omitted: let the node allocate
+        // the next generation itself" (see `ha.fencing.FenceRequest.generation`);
+        // the wire field is optional and must not carry a literal 0.
+        .generation = if (request.generation == 0) null else try i64FromU64(request.generation),
         .required_lsn = try i64FromU64(request.required_lsn),
         .observed_lsn = try i64FromU64(request.observed_lsn),
         .force = request.force,
@@ -1374,6 +1747,15 @@ fn rejoinRequestOpenApi(command: ha.admin_cli.RejoinAssessCommand) !admin_api.op
     };
 }
 
+fn standbyUpstreamRequestOpenApi(command: ha.admin_cli.StandbyUpstreamCommand) !admin_api.openapi.StandbyUpstreamRequest {
+    return .{
+        .identity = try adminIdentity(command.identity),
+        .upstream_url = command.upstream_url,
+        .slot_name = command.slot_name,
+        .reason = if (command.reason.len == 0) null else command.reason,
+    };
+}
+
 fn recordKindName(kind: ha.replication_record.RecordKind) ![]const u8 {
     return switch (kind) {
         .batch_mutation => "batch_mutation",
@@ -1407,6 +1789,17 @@ fn zPath(alloc: std.mem.Allocator, path: []const u8) ![:0]u8 {
     return try alloc.dupeZ(u8, path);
 }
 
+fn flagMatches(arg: []const u8, spellings: []const []const u8) bool {
+    for (spellings) |spelling| {
+        if (std.mem.eql(u8, arg, spelling)) return true;
+    }
+    return false;
+}
+
+/// Local options come first; the first token that is not a recognized local
+/// option starts the admin command. A literal `--` is accepted and skipped for
+/// compatibility with older scripts but is not required. The `--ha-*` spellings
+/// are compatibility aliases for the unprefixed flags.
 fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
     var options = LocalOptions{};
     var command_start: usize = 0;
@@ -1416,56 +1809,59 @@ fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArg
         if (std.mem.eql(u8, arg, "--")) {
             command_start += 1;
             break;
-        } else if (std.mem.eql(u8, arg, "--ha-url")) {
+        } else if (flagMatches(arg, &.{ "--admin-url", "--ha-url" })) {
             command_start += 1;
-            options.remote_url = try validateHAAdminURL(try value(argv, &command_start, "--ha-url"));
-        } else if (std.mem.eql(u8, arg, "--ha-token-env")) {
+            options.remote_url = try validateHAAdminURL(try value(argv, &command_start, arg));
+        } else if (flagMatches(arg, &.{ "--admin-token-env", "--ha-token-env" })) {
             command_start += 1;
-            options.remote_token_env = try validateHAAdminTokenEnvName(try value(argv, &command_start, "--ha-token-env"));
-        } else if (std.mem.eql(u8, arg, "--ha-token") or
-            std.mem.eql(u8, arg, "--token") or
-            std.mem.eql(u8, arg, "--ha-token-file"))
-        {
+            options.remote_token_env = try validateHAAdminTokenEnvName(try value(argv, &command_start, arg));
+        } else if (flagMatches(arg, &.{ "--admin-token", "--admin-token-file", "--ha-token", "--ha-token-file", "--token" })) {
             return error.HAAdminRawTokenFlagUnsupported;
+        } else if (std.mem.eql(u8, arg, "--data-dir")) {
+            command_start += 1;
+            options.data_dir = try validateHAPath(try value(argv, &command_start, arg), .data_dir);
+        } else if (std.mem.eql(u8, arg, "--config")) {
+            command_start += 1;
+            options.config_path = try validateConfigPath(try value(argv, &command_start, arg));
         } else if (std.mem.eql(u8, arg, "--primary-log")) {
             command_start += 1;
-            options.primary_log = try validateHAPath(try value(argv, &command_start, "--primary-log"), .primary_log);
+            options.primary_log = try validateHAPath(try value(argv, &command_start, arg), .primary_log);
         } else if (std.mem.eql(u8, arg, "--primary-slots")) {
             command_start += 1;
-            options.primary_slots = try validateHAPath(try value(argv, &command_start, "--primary-slots"), .primary_slots);
+            options.primary_slots = try validateHAPath(try value(argv, &command_start, arg), .primary_slots);
         } else if (std.mem.eql(u8, arg, "--primary-node-id")) {
             command_start += 1;
-            options.primary_node_id = try validateHANodeID(try value(argv, &command_start, "--primary-node-id"), .primary);
+            options.primary_node_id = try validateHANodeID(try value(argv, &command_start, arg), .primary);
         } else if (std.mem.eql(u8, arg, "--standby-log")) {
             command_start += 1;
-            options.standby_log = try validateHAPath(try value(argv, &command_start, "--standby-log"), .standby_log);
+            options.standby_log = try validateHAPath(try value(argv, &command_start, arg), .standby_log);
         } else if (std.mem.eql(u8, arg, "--standby-progress")) {
             command_start += 1;
-            options.standby_progress = try validateHAPath(try value(argv, &command_start, "--standby-progress"), .standby_progress);
+            options.standby_progress = try validateHAPath(try value(argv, &command_start, arg), .standby_progress);
         } else if (std.mem.eql(u8, arg, "--standby-node-id")) {
             command_start += 1;
-            options.standby_node_id = try validateHANodeID(try value(argv, &command_start, "--standby-node-id"), .standby);
+            options.standby_node_id = try validateHANodeID(try value(argv, &command_start, arg), .standby);
         } else if (std.mem.eql(u8, arg, "--fence-wal")) {
             command_start += 1;
-            options.fence_wal = try validateHAPath(try value(argv, &command_start, "--fence-wal"), .fence_wal);
+            options.fence_wal = try validateHAPath(try value(argv, &command_start, arg), .fence_wal);
         } else if (std.mem.eql(u8, arg, "--former-primary-log")) {
             command_start += 1;
-            options.former_primary_log = try validateHAPath(try value(argv, &command_start, "--former-primary-log"), .former_primary_log);
-        } else if (std.mem.eql(u8, arg, "--ha-cluster-id")) {
+            options.former_primary_log = try validateHAPath(try value(argv, &command_start, arg), .former_primary_log);
+        } else if (flagMatches(arg, &.{ "--cluster-id", "--ha-cluster-id" })) {
             command_start += 1;
-            options.identity.cluster_id = try parseU64(try value(argv, &command_start, "--ha-cluster-id"));
-        } else if (std.mem.eql(u8, arg, "--ha-shard-id")) {
+            options.identity.cluster_id = try parseU64(try value(argv, &command_start, arg));
+        } else if (flagMatches(arg, &.{ "--shard-id", "--ha-shard-id" })) {
             command_start += 1;
-            options.identity.shard_id = try parseU64(try value(argv, &command_start, "--ha-shard-id"));
-        } else if (std.mem.eql(u8, arg, "--ha-table-id")) {
+            options.identity.shard_id = try parseU64(try value(argv, &command_start, arg));
+        } else if (flagMatches(arg, &.{ "--table-id", "--ha-table-id" })) {
             command_start += 1;
-            options.identity.table_id = try parseU64(try value(argv, &command_start, "--ha-table-id"));
-        } else if (std.mem.eql(u8, arg, "--ha-timeline-id")) {
+            options.identity.table_id = try parseU64(try value(argv, &command_start, arg));
+        } else if (flagMatches(arg, &.{ "--timeline-id", "--ha-timeline-id" })) {
             command_start += 1;
-            options.identity.timeline_id = try parseU64(try value(argv, &command_start, "--ha-timeline-id"));
-        } else if (std.mem.eql(u8, arg, "--ha-epoch")) {
+            options.identity.timeline_id = try parseU64(try value(argv, &command_start, arg));
+        } else if (flagMatches(arg, &.{ "--epoch", "--ha-epoch" })) {
             command_start += 1;
-            options.identity.epoch = try parseU64(try value(argv, &command_start, "--ha-epoch"));
+            options.identity.epoch = try parseU64(try value(argv, &command_start, arg));
         } else {
             break;
         }
@@ -1476,6 +1872,175 @@ fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArg
         .options = options,
         .command_args = command_args,
     };
+}
+
+/// Layout of hot-standby state under a standalone data directory. This is the
+/// layout the Kubernetes operator provisions; `antfly standalone` accepts the
+/// same paths through its `--ha-*` flags.
+pub const data_dir_layout = struct {
+    pub const primary_log = "ha/primary.wal";
+    pub const primary_slots = "ha/slots";
+    pub const standby_log = "ha/standby.wal";
+    pub const standby_progress = "ha/standby-progress.wal";
+    pub const fence_wal = "ha/fence.wal";
+};
+
+fn pathExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+fn joinDataDirPath(alloc: std.mem.Allocator, data_dir: []const u8, relative: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ data_dir, relative });
+}
+
+/// Resolves `--data-dir` into local handles and identity. Only state that
+/// already exists under `<data-dir>/ha/` is used; this never creates files.
+/// Explicit path and identity flags take precedence over derived values.
+/// Identity is read from the standby progress WAL when a standby is present,
+/// otherwise from the newest primary replication record.
+fn applyDataDir(alloc: std.mem.Allocator, io: std.Io, options: *LocalOptions) !void {
+    const data_dir = options.data_dir orelse return;
+    if (options.remote_url != null or options.remote_token_env != null) return error.HaRemoteCannotUseLocalHandles;
+
+    var found_any = options.hasLocalHandles();
+
+    if (options.primary_log == null and options.primary_slots == null) {
+        const primary_log = try joinDataDirPath(alloc, data_dir, data_dir_layout.primary_log);
+        const primary_slots = try joinDataDirPath(alloc, data_dir, data_dir_layout.primary_slots);
+        if (pathExists(io, primary_log) and pathExists(io, primary_slots)) {
+            options.primary_log = primary_log;
+            options.primary_slots = primary_slots;
+            found_any = true;
+        }
+    }
+    if (options.standby_log == null and options.standby_progress == null) {
+        const standby_log = try joinDataDirPath(alloc, data_dir, data_dir_layout.standby_log);
+        const standby_progress = try joinDataDirPath(alloc, data_dir, data_dir_layout.standby_progress);
+        if (pathExists(io, standby_log) and pathExists(io, standby_progress)) {
+            options.standby_log = standby_log;
+            options.standby_progress = standby_progress;
+            found_any = true;
+        }
+    }
+    if (options.fence_wal == null) {
+        const fence_wal = try joinDataDirPath(alloc, data_dir, data_dir_layout.fence_wal);
+        if (pathExists(io, fence_wal)) {
+            options.fence_wal = fence_wal;
+            found_any = true;
+        }
+    }
+    if (!found_any) return error.HADataDirNoHAState;
+
+    const needs_identity = options.identity.cluster_id == null or
+        options.identity.shard_id == null or options.identity.table_id == null or
+        options.identity.timeline_id == null or options.identity.epoch == null;
+    if (!needs_identity) return;
+    if (!options.wantsPrimary() and !options.wantsStandby()) return;
+
+    var derived: ?ha.standby.Identity = null;
+    if (options.wantsStandby()) {
+        const progress_path = try zPath(alloc, options.standby_progress orelse return error.StandbyProgressMissing);
+        derived = try ha.standby.readPersistedIdentity(alloc, progress_path.ptr, .{});
+    }
+    if (derived == null and options.wantsPrimary()) {
+        const log_path = try zPath(alloc, options.primary_log orelse return error.PrimaryLogMissing);
+        derived = try ha.primary.readPersistedIdentity(alloc, log_path.ptr, .{});
+    }
+    const identity = derived orelse return error.HADataDirIdentityUnavailable;
+    if (options.identity.cluster_id == null) options.identity.cluster_id = identity.cluster_id;
+    if (options.identity.shard_id == null) options.identity.shard_id = identity.shard_id;
+    if (options.identity.table_id == null) options.identity.table_id = identity.table_id;
+    if (options.identity.timeline_id == null) options.identity.timeline_id = identity.timeline_id;
+    if (options.identity.epoch == null) options.identity.epoch = identity.epoch;
+}
+
+fn validateConfigPath(path: []const u8) ![]const u8 {
+    return switch (ha_validation.classifyHAString(path)) {
+        .ok => path,
+        .missing => error.HAConfigPathMissing,
+        .padded => error.HAConfigPathInvalid,
+    };
+}
+
+/// Applies the `ha` section of the server config file named by `--config`.
+/// When no target was chosen yet, `ha.admin.url` makes the command remote
+/// (the node is running and owns its files); otherwise the section's paths
+/// and identity become the local handles. `ha.admin.token_env` supplies the
+/// token variable for any remote target that lacks one. The loaded config is
+/// returned so the borrowed strings stay valid for the rest of the command.
+fn applyConfigDefaults(alloc: std.mem.Allocator, io: std.Io, options: *LocalOptions) !?antfly.common.config.Config {
+    const path = options.config_path orelse return null;
+    var cfg = try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(alloc, io, path, null, .standalone);
+    errdefer cfg.deinit();
+    const ha_cfg = cfg.ha orelse return cfg;
+
+    const no_target = options.remote_url == null and options.data_dir == null and !options.hasLocalHandles();
+    if (no_target) {
+        if (ha_cfg.admin_url) |url| {
+            options.remote_url = try validateHAAdminURL(url);
+        } else {
+            if (ha_cfg.primary_log) |v| options.primary_log = try validateHAPath(v, .primary_log);
+            if (ha_cfg.primary_slots) |v| options.primary_slots = try validateHAPath(v, .primary_slots);
+            if (ha_cfg.primary_node_id) |v| options.primary_node_id = try validateHANodeID(v, .primary);
+            if (ha_cfg.standby_log) |v| options.standby_log = try validateHAPath(v, .standby_log);
+            if (ha_cfg.standby_progress) |v| options.standby_progress = try validateHAPath(v, .standby_progress);
+            if (ha_cfg.standby_node_id) |v| options.standby_node_id = try validateHANodeID(v, .standby);
+            if (ha_cfg.fence_wal) |v| options.fence_wal = try validateHAPath(v, .fence_wal);
+            if (ha_cfg.former_primary_log) |v| options.former_primary_log = try validateHAPath(v, .former_primary_log);
+        }
+    }
+    if (options.remote_url != null and options.remote_token_env == null) {
+        if (ha_cfg.admin_token_env) |name| options.remote_token_env = try validateHAAdminTokenEnvName(name);
+    }
+    if (options.hasLocalHandles()) {
+        if (options.identity.cluster_id == null) options.identity.cluster_id = ha_cfg.cluster_id;
+        if (options.identity.shard_id == null) options.identity.shard_id = ha_cfg.shard_id;
+        if (options.identity.table_id == null) options.identity.table_id = ha_cfg.table_id;
+        if (options.identity.timeline_id == null) options.identity.timeline_id = ha_cfg.timeline_id;
+        if (options.identity.epoch == null) options.identity.epoch = ha_cfg.epoch;
+    }
+    return cfg;
+}
+
+/// Environment lookup seam so defaults can be tested without touching the
+/// process environment.
+const EnvLookup = struct {
+    ctx: ?*const anyopaque = null,
+    getFn: *const fn (ctx: ?*const anyopaque, name: [:0]const u8) ?[]const u8,
+
+    fn get(self: EnvLookup, name: [:0]const u8) ?[]const u8 {
+        return self.getFn(self.ctx, name);
+    }
+};
+
+fn processEnvGet(_: ?*const anyopaque, name: [:0]const u8) ?[]const u8 {
+    const raw = std.c.getenv(name.ptr) orelse return null;
+    return std.mem.span(raw);
+}
+
+const process_env = EnvLookup{ .getFn = processEnvGet };
+
+pub const default_admin_url_env = "ANTFLY_HA_ADMIN_URL";
+pub const default_admin_token_env = "ANTFLY_HA_ADMIN_TOKEN";
+
+/// Fills in the admin URL from `ANTFLY_HA_ADMIN_URL` when no target was given,
+/// and the token environment variable name from `ANTFLY_HA_ADMIN_TOKEN` when a
+/// remote target is in use and that variable is set. Local handles and
+/// `--data-dir` always win over the environment, so a configured default URL
+/// never turns a local-file command into an HTTP call.
+fn applyEnvironmentDefaults(options: *LocalOptions, env: EnvLookup) !void {
+    if (options.remote_url == null and options.data_dir == null and !options.hasLocalHandles()) {
+        if (env.get(default_admin_url_env)) |raw| {
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            if (trimmed.len > 0) options.remote_url = try validateHAAdminURL(trimmed);
+        }
+    }
+    if (options.remote_url != null and options.remote_token_env == null) {
+        if (env.get(default_admin_token_env)) |raw| {
+            if (std.mem.trim(u8, raw, " \t\r\n").len > 0) options.remote_token_env = default_admin_token_env;
+        }
+    }
 }
 
 fn value(argv: []const []const u8, idx: *usize, flag: []const u8) ![]const u8 {
@@ -1518,6 +2083,7 @@ const HAPathField = enum {
     standby_progress,
     fence_wal,
     former_primary_log,
+    data_dir,
 };
 
 fn validateHAPath(path: []const u8, field: HAPathField) ![]const u8 {
@@ -1530,6 +2096,7 @@ fn validateHAPath(path: []const u8, field: HAPathField) ![]const u8 {
             .standby_progress => error.StandbyProgressMissing,
             .fence_wal => error.FenceWalMissing,
             .former_primary_log => error.FormerPrimaryLogMissing,
+            .data_dir => error.HADataDirMissing,
         },
         .padded => return haPathInvalidError(field),
     }
@@ -1545,6 +2112,7 @@ fn haPathInvalidError(field: HAPathField) anyerror {
         .standby_progress => error.HAStandbyProgressInvalid,
         .fence_wal => error.HAFenceWalInvalid,
         .former_primary_log => error.HAFormerPrimaryLogInvalid,
+        .data_dir => error.HADataDirInvalid,
     };
 }
 
@@ -1595,39 +2163,60 @@ fn parseU64(raw: []const u8) !u64 {
 
 fn printUsage(argv0: []const u8) void {
     std.debug.print(
-        \\usage: {s} ha [local options] -- <ha command>
+        \\usage: {s} ha [target options] <command> [command options]
         \\
-        \\local options:
-        \\  --ha-url URL
-        \\  --ha-token-env NAME
-        \\  --primary-log PATH
-        \\  --primary-slots PATH
-        \\  --primary-node-id NODE
-        \\  --standby-log PATH
-        \\  --standby-progress PATH
-        \\  --standby-node-id NODE
-        \\  --fence-wal PATH
-        \\  --former-primary-log PATH
-        \\  --ha-cluster-id N
-        \\  --ha-shard-id N
-        \\  --ha-table-id N
-        \\  --ha-timeline-id N
-        \\  --ha-epoch N
+        \\Manage hot-standby replication for a standalone Antfly node.
+        \\
+        \\Target (pick one):
+        \\  --data-dir DIR            Open the node's local HA state under DIR/ha/
+        \\                            (primary.wal, slots, standby.wal,
+        \\                            standby-progress.wal, fence.wal). Paths and
+        \\                            identity are read from the files that exist.
+        \\  --admin-url URL           Send the command to a running node's HA admin
+        \\                            endpoint. Defaults to $ANTFLY_HA_ADMIN_URL.
+        \\  --admin-token-env NAME    Environment variable holding the admin bearer
+        \\                            token. Defaults to ANTFLY_HA_ADMIN_TOKEN when
+        \\                            that variable is set. Raw token flags are
+        \\                            refused.
+        \\  --config PATH             Read the server config file's `ha` section:
+        \\                            `ha.admin.url` makes the command remote, else
+        \\                            its paths and identity become local handles.
+        \\
+        \\Explicit local handles (override --data-dir, or use without it):
+        \\  --primary-log PATH  --primary-slots PATH  --primary-node-id NODE
+        \\  --standby-log PATH  --standby-progress PATH  --standby-node-id NODE
+        \\  --fence-wal PATH    --former-primary-log PATH
+        \\  --cluster-id N --shard-id N --table-id N --timeline-id N --epoch N
+        \\                            Identity of the local logs; only needed when
+        \\                            it cannot be read from the files themselves.
+        \\
+        \\The --ha-* spellings (--ha-url, --ha-token-env, --ha-cluster-id, ...) are
+        \\accepted for compatibility. A literal "--" before the command is optional.
+        \\
+        \\commands:
+        \\  status primary|standby    Replication status of this node
+        \\  slot list|create|drop|pause|resume
+        \\  seed begin|finish|bootstrap
+        \\  fence current|acquire
+        \\  promote [assess] [--current-fence]
+        \\  rejoin assess|rewind|reseed
+        \\  follow --upstream-url URL --slot NAME --cluster-id N --timeline-id N --epoch N
+        \\                            Repoint this standby at another primary (remote only)
+        \\  switchover --to URL [--follower SLOT=URL ...] [--generation N]
+        \\             [--wait-seconds N] [--max-lag-lsn N] [--dry-run] [--json]
+        \\                            Planned primary change: fence, wait, promote,
+        \\                            rejoin, follow (remote only; target is the primary)
+        \\  stream once, commit append|check, read check, write check, owner-job check
+        \\  artifact publish|restore|verify|activate|prune|gc-source|gc-target
         \\
         \\examples:
+        \\  {s} ha --data-dir /var/lib/antfly status primary
+        \\  {s} ha --admin-url http://127.0.0.1:8081 status standby
+        \\  {s} ha --admin-url http://127.0.0.1:8081 promote assess --current-fence
+        \\  {s} ha --admin-url http://primary:8080 switchover --to http://standby-a:8080 --follower standby-b=http://standby-b:8080
         \\  {s} ha artifact publish --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --manifest /source/manifest.afha --content-root /source/content
-        \\  {s} ha artifact restore --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --staging-root /target/seed --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
-        \\  {s} ha artifact activate --generation seed-standby-a-42 --slot standby-a --staging-root /target/.antfly-ha/staging --target-root /target --target-local-node-id 2 --target-replica-id 1 --ha-cluster-id 1 --ha-shard-id 0 --ha-table-id 0 --ha-timeline-id 1 --ha-epoch 1 --minimum-checkpoint-lsn 42
-        \\  {s} ha artifact prune --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --retain-generations 2
-        \\  {s} ha artifact gc-source --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --capture-root /source/.antfly-ha/captures --retain-generations 2 --protect-generation seed-standby-a-41
-        \\  {s} ha artifact gc-target --target-root /target --slot-activation-receipt /checkpoint/seeded-slot-activation.json --retain-generations 2 --protect-generation seed-standby-a-41
-        \\  {s} ha --ha-url http://127.0.0.1:8081 --ha-token-env ANTFLY_HA_ADMIN_TOKEN -- status primary
-        \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- slot list
-        \\  {s} ha --standby-log /var/lib/antfly/ha/standby.wal --standby-progress /var/lib/antfly/ha/progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- status standby
-        \\  {s} ha --primary-log /var/lib/antfly/ha/primary.wal --primary-slots /var/lib/antfly/ha/slots --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- write check --role primary
-        \\  {s} ha --standby-log /var/lib/antfly/ha/standby.wal --standby-progress /var/lib/antfly/ha/progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- owner-job check --role standby --kind derived-effect-writer
         \\
-    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0, argv0, argv0 });
 }
 
 test "ha cmd parses local handles before admin command" {
@@ -2296,6 +2885,8 @@ test "ha cmd remote commands prefer typed admin routes" {
         "2",
         "--new-epoch",
         "3",
+        "--generation",
+        "1",
         "--required-lsn",
         "1",
         "--observed-lsn",
@@ -2488,6 +3079,8 @@ test "ha cmd remote direct promotion uses typed admin route" {
         "2",
         "--new-epoch",
         "3",
+        "--generation",
+        "1",
         "--required-lsn",
         "1",
         "--observed-lsn",
@@ -2640,6 +3233,507 @@ test "ha cmd streams local primary WAL into durable standby state" {
         try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().applied_lsn);
         try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().safe_read_lsn);
     }
+}
+
+test "ha cmd accepts unprefixed target and identity flag spellings" {
+    const alloc = std.testing.allocator;
+
+    var remote = try parseLocalArgs(alloc, &.{
+        "--admin-url",       "http://127.0.0.1:8081",
+        "--admin-token-env", "ANTFLY_HA_ADMIN_TOKEN",
+        "status",            "primary",
+    });
+    defer remote.deinit(alloc);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8081", remote.options.remote_url.?);
+    try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", remote.options.remote_token_env.?);
+    try std.testing.expectEqual(@as(usize, 2), remote.command_args.len);
+    try std.testing.expectEqualStrings("status", remote.command_args[0]);
+
+    var local = try parseLocalArgs(alloc, &.{
+        "--primary-log",   "/var/lib/antfly/ha/primary.wal",
+        "--primary-slots", "/var/lib/antfly/ha/slots",
+        "--cluster-id",    "10",
+        "--shard-id",      "20",
+        "--table-id",      "30",
+        "--timeline-id",   "1",
+        "--epoch",         "2",
+        "slot",            "list",
+    });
+    defer local.deinit(alloc);
+    const identity = try local.options.primaryIdentity();
+    try std.testing.expectEqual(@as(u64, 10), identity.cluster_id);
+    try std.testing.expectEqual(@as(u64, 20), identity.shard_id);
+    try std.testing.expectEqual(@as(u64, 30), identity.table_id);
+    try std.testing.expectEqual(@as(u64, 1), identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), identity.epoch);
+    try std.testing.expectEqual(@as(usize, 2), local.command_args.len);
+    try std.testing.expectEqualStrings("slot", local.command_args[0]);
+    try std.testing.expectEqualStrings("list", local.command_args[1]);
+}
+
+test "ha cmd keeps admin command flags after the verb regardless of separator" {
+    const alloc = std.testing.allocator;
+
+    var with_separator = try parseLocalArgs(alloc, &.{ "--fence-wal", "/tmp/fence.wal", "--", "fence", "acquire", "--epoch", "3" });
+    defer with_separator.deinit(alloc);
+    var without_separator = try parseLocalArgs(alloc, &.{ "--fence-wal", "/tmp/fence.wal", "fence", "acquire", "--epoch", "3" });
+    defer without_separator.deinit(alloc);
+
+    for ([_]ParsedArgs{ with_separator, without_separator }) |parsed| {
+        try std.testing.expectEqualStrings("/tmp/fence.wal", parsed.options.fence_wal.?);
+        try std.testing.expect(parsed.options.identity.epoch == null);
+        try std.testing.expectEqual(@as(usize, 4), parsed.command_args.len);
+        try std.testing.expectEqualStrings("fence", parsed.command_args[0]);
+        try std.testing.expectEqualStrings("--epoch", parsed.command_args[2]);
+    }
+}
+
+test "ha cmd rejects unprefixed raw token flags" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.HAAdminRawTokenFlagUnsupported, parseLocalArgs(alloc, &.{
+        "--admin-url",   "http://127.0.0.1:8081",
+        "--admin-token", "secret-token",
+        "status",        "primary",
+    }));
+    try std.testing.expectError(error.HAAdminRawTokenFlagUnsupported, parseLocalArgs(alloc, &.{
+        "--admin-url",        "http://127.0.0.1:8081",
+        "--admin-token-file", "/run/secrets/ha-token",
+        "status",             "primary",
+    }));
+}
+
+test "ha cmd parses and validates the data dir target" {
+    const alloc = std.testing.allocator;
+
+    var parsed = try parseLocalArgs(alloc, &.{ "--data-dir", "/var/lib/antfly", "status", "primary" });
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualStrings("/var/lib/antfly", parsed.options.data_dir.?);
+    try std.testing.expect(!parsed.options.hasLocalHandles());
+
+    try std.testing.expectError(error.HADataDirInvalid, parseLocalArgs(alloc, &.{ "--data-dir", "relative/dir", "status", "primary" }));
+    try std.testing.expectError(error.HADataDirInvalid, parseLocalArgs(alloc, &.{ "--data-dir", "/var/lib/antfly/../antfly", "status", "primary" }));
+    try std.testing.expectError(error.HADataDirMissing, parseLocalArgs(alloc, &.{ "--data-dir", " ", "status", "primary" }));
+}
+
+const TestEnv = struct {
+    url: ?[]const u8 = null,
+    token: ?[]const u8 = null,
+
+    fn lookup(self: *const TestEnv) EnvLookup {
+        return .{ .ctx = @ptrCast(self), .getFn = get };
+    }
+
+    fn get(ctx: ?*const anyopaque, name: [:0]const u8) ?[]const u8 {
+        const self: *const TestEnv = @ptrCast(@alignCast(ctx.?));
+        if (std.mem.eql(u8, name, default_admin_url_env)) return self.url;
+        if (std.mem.eql(u8, name, default_admin_token_env)) return self.token;
+        return null;
+    }
+};
+
+test "ha cmd defaults admin url and token env from the environment" {
+    const env = TestEnv{ .url = "http://127.0.0.1:8081", .token = "secret" };
+
+    var bare = LocalOptions{};
+    try applyEnvironmentDefaults(&bare, env.lookup());
+    try std.testing.expectEqualStrings("http://127.0.0.1:8081", bare.remote_url.?);
+    try std.testing.expectEqualStrings(default_admin_token_env, bare.remote_token_env.?);
+
+    var explicit_env_name = LocalOptions{ .remote_url = "http://127.0.0.1:9000", .remote_token_env = "OTHER_TOKEN" };
+    try applyEnvironmentDefaults(&explicit_env_name, env.lookup());
+    try std.testing.expectEqualStrings("http://127.0.0.1:9000", explicit_env_name.remote_url.?);
+    try std.testing.expectEqualStrings("OTHER_TOKEN", explicit_env_name.remote_token_env.?);
+
+    var local = LocalOptions{ .primary_log = "/var/lib/antfly/ha/primary.wal" };
+    try applyEnvironmentDefaults(&local, env.lookup());
+    try std.testing.expect(local.remote_url == null);
+    try std.testing.expect(local.remote_token_env == null);
+
+    var data_dir = LocalOptions{ .data_dir = "/var/lib/antfly" };
+    try applyEnvironmentDefaults(&data_dir, env.lookup());
+    try std.testing.expect(data_dir.remote_url == null);
+
+    const no_token = TestEnv{ .url = "http://127.0.0.1:8081", .token = " " };
+    var url_only = LocalOptions{};
+    try applyEnvironmentDefaults(&url_only, no_token.lookup());
+    try std.testing.expectEqualStrings("http://127.0.0.1:8081", url_only.remote_url.?);
+    try std.testing.expect(url_only.remote_token_env == null);
+
+    const bad_url = TestEnv{ .url = "not-a-url" };
+    var invalid = LocalOptions{};
+    try std.testing.expectError(error.HAAdminURLInvalid, applyEnvironmentDefaults(&invalid, bad_url.lookup()));
+}
+
+test "ha cmd applies the config file ha section as a target" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
+    const remote_path = try allocPrintPath(alloc, "config", "remote.json", nonce);
+    defer alloc.free(remote_path);
+    const local_path = try allocPrintPath(alloc, "config", "local.json", nonce);
+    defer alloc.free(local_path);
+    defer std.Io.Dir.cwd().deleteFile(io, remote_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, local_path) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = remote_path, .data =
+        \\{"ha":{"admin":{"url":"http://127.0.0.1:8081","token_env":"ANTFLY_HA_ADMIN_TOKEN"},
+        \\ "primary":{"log":"/var/lib/antfly/ha/primary.wal","slots":"/var/lib/antfly/ha/slots"}}}
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = local_path, .data =
+        \\{"ha":{"identity":{"cluster_id":10,"shard_id":20,"table_id":30,"timeline_id":1,"epoch":2},
+        \\ "primary":{"log":"/var/lib/antfly/ha/primary.wal","slots":"/var/lib/antfly/ha/slots","node_id":"primary-a"},
+        \\ "fence_wal":"/var/lib/antfly/ha/fence.wal"}}
+    });
+
+    // admin.url wins over local paths when nothing else picked a target.
+    {
+        var options = LocalOptions{ .config_path = remote_path };
+        var cfg = (try applyConfigDefaults(alloc, io, &options)).?;
+        defer cfg.deinit();
+        try std.testing.expectEqualStrings("http://127.0.0.1:8081", options.remote_url.?);
+        try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", options.remote_token_env.?);
+        try std.testing.expect(!options.hasLocalHandles());
+    }
+    // Without admin.url the section's paths and identity become local handles.
+    {
+        var options = LocalOptions{ .config_path = local_path };
+        var cfg = (try applyConfigDefaults(alloc, io, &options)).?;
+        defer cfg.deinit();
+        try std.testing.expect(options.remote_url == null);
+        try std.testing.expectEqualStrings("/var/lib/antfly/ha/primary.wal", options.primary_log.?);
+        try std.testing.expectEqualStrings("primary-a", options.primary_node_id.?);
+        try std.testing.expectEqualStrings("/var/lib/antfly/ha/fence.wal", options.fence_wal.?);
+        const identity = try options.primaryIdentity();
+        try std.testing.expectEqual(@as(u64, 10), identity.cluster_id);
+        try std.testing.expectEqual(@as(u64, 20), identity.shard_id);
+        try std.testing.expectEqual(@as(u64, 2), identity.epoch);
+    }
+    // An explicit target keeps the config out of the way, except for the token env name.
+    {
+        var options = LocalOptions{ .config_path = remote_path, .remote_url = "http://10.0.0.5:8081" };
+        var cfg = (try applyConfigDefaults(alloc, io, &options)).?;
+        defer cfg.deinit();
+        try std.testing.expectEqualStrings("http://10.0.0.5:8081", options.remote_url.?);
+        try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", options.remote_token_env.?);
+    }
+    {
+        var options = LocalOptions{ .config_path = remote_path, .data_dir = "/var/lib/antfly" };
+        var cfg = (try applyConfigDefaults(alloc, io, &options)).?;
+        defer cfg.deinit();
+        try std.testing.expect(options.remote_url == null);
+        try std.testing.expect(!options.hasLocalHandles());
+    }
+    // Explicit identity flags win over the section.
+    {
+        var options = LocalOptions{ .config_path = local_path, .identity = .{ .epoch = 7 } };
+        var cfg = (try applyConfigDefaults(alloc, io, &options)).?;
+        defer cfg.deinit();
+        try std.testing.expectEqual(@as(u64, 7), options.identity.epoch.?);
+        try std.testing.expectEqual(@as(u64, 10), options.identity.cluster_id.?);
+    }
+
+    try std.testing.expectError(error.HAConfigPathMissing, parseLocalArgs(alloc, &.{ "--config", " ", "status", "primary" }));
+    try std.testing.expectError(error.HAConfigPathInvalid, parseLocalArgs(alloc, &.{ "--config", " cfg.json", "status", "primary" }));
+}
+
+test "ha cmd derives local handles and identity from the data dir" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
+    const data_dir = try allocPrintPath(alloc, "data-dir", "root", nonce);
+    defer alloc.free(data_dir);
+    std.Io.Dir.cwd().deleteTree(io, data_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, data_dir) catch {};
+    const ha_dir = try std.fmt.allocPrint(alloc, "{s}/ha", .{data_dir});
+    defer alloc.free(ha_dir);
+    try std.Io.Dir.cwd().createDirPath(io, ha_dir);
+
+    // An empty data dir has no HA state to open.
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var empty = LocalOptions{ .data_dir = data_dir };
+        try std.testing.expectError(error.HADataDirNoHAState, applyDataDir(arena.allocator(), io, &empty));
+    }
+
+    // Provision a primary the explicit way, with one durable record so the
+    // identity is recoverable from the log.
+    const primary_log = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ data_dir, data_dir_layout.primary_log });
+    defer alloc.free(primary_log);
+    const primary_slots = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ data_dir, data_dir_layout.primary_slots });
+    defer alloc.free(primary_slots);
+    try runArgv(alloc, io, &.{
+        "--primary-log",   primary_log,
+        "--primary-slots", primary_slots,
+        "--cluster-id",    "10",
+        "--shard-id",      "20",
+        "--table-id",      "30",
+        "--timeline-id",   "1",
+        "--epoch",         "2",
+        "--table",         "commit",
+        "append",          "--payload",
+        "one",             "--sync-mode",
+        "async",
+    });
+
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var options = LocalOptions{ .data_dir = data_dir };
+        try applyDataDir(arena.allocator(), io, &options);
+        try std.testing.expectEqualStrings(primary_log, options.primary_log.?);
+        try std.testing.expectEqualStrings(primary_slots, options.primary_slots.?);
+        try std.testing.expect(options.standby_log == null);
+        try std.testing.expect(options.fence_wal == null);
+        const identity = try options.primaryIdentity();
+        try std.testing.expectEqual(@as(u64, 10), identity.cluster_id);
+        try std.testing.expectEqual(@as(u64, 20), identity.shard_id);
+        try std.testing.expectEqual(@as(u64, 30), identity.table_id);
+        try std.testing.expectEqual(@as(u64, 1), identity.timeline_id);
+        try std.testing.expectEqual(@as(u64, 2), identity.epoch);
+    }
+
+    // Explicit identity flags win over the derived identity.
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var options = LocalOptions{ .data_dir = data_dir, .identity = .{ .cluster_id = 10, .timeline_id = 1, .epoch = 7 } };
+        try applyDataDir(arena.allocator(), io, &options);
+        try std.testing.expectEqual(@as(u64, 7), options.identity.epoch.?);
+        try std.testing.expectEqual(@as(u64, 20), options.identity.shard_id.?);
+    }
+
+    // The whole command works end to end with just the data dir.
+    {
+        var captured: std.Io.Writer.Allocating = .init(alloc);
+        defer captured.deinit();
+        test_output_sink = &captured.writer;
+        defer test_output_sink = null;
+        try runArgv(alloc, io, &.{ "--data-dir", data_dir, "--table", "status", "primary" });
+        try std.testing.expect(std.mem.indexOf(u8, captured.written(), "cluster_id") != null);
+    }
+
+    // A remote target and a data dir are mutually exclusive.
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var options = LocalOptions{ .data_dir = data_dir, .remote_url = "http://127.0.0.1:8081" };
+        try std.testing.expectError(error.HaRemoteCannotUseLocalHandles, applyDataDir(arena.allocator(), io, &options));
+    }
+}
+
+test "ha cmd parses switchover options" {
+    const alloc = std.testing.allocator;
+    var options = try parseSwitchoverArgs(alloc, &.{
+        "--to",           "http://standby-a:8080",
+        "--follower",     "standby-b=http://standby-b:8080",
+        "--follower",     "standby-c=http://standby-c:8080",
+        "--generation",   "7",
+        "--max-lag-lsn",  "10",
+        "--wait-seconds", "5",
+        "--reason",       "maintenance",
+        "--json",
+    });
+    defer options.deinit(alloc);
+    try std.testing.expectEqualStrings("http://standby-a:8080", options.to);
+    try std.testing.expectEqualStrings("http://standby-a:8080", options.newUpstreamUrl());
+    try std.testing.expectEqual(@as(usize, 2), options.followers.len);
+    try std.testing.expectEqualStrings("standby-c", options.followers[1].slot_name);
+    try std.testing.expectEqualStrings("http://standby-c:8080", options.followers[1].url);
+    try std.testing.expectEqual(@as(u64, 7), options.generation.?);
+    try std.testing.expectEqual(@as(u64, 10), options.max_lag_lsn.?);
+    try std.testing.expectEqual(@as(u64, 5), options.wait_seconds);
+    try std.testing.expectEqualStrings("maintenance", options.reason);
+    try std.testing.expectEqual(ha.admin_cli.OutputFormat.json, options.output);
+
+    try std.testing.expectError(error.SwitchoverTargetMissing, parseSwitchoverArgs(alloc, &.{"--dry-run"}));
+    try std.testing.expectError(error.SwitchoverFollowerInvalid, parseSwitchoverArgs(alloc, &.{ "--to", "http://s:1", "--follower", "http://no-slot:8080" }));
+    try std.testing.expectError(error.SwitchoverGenerationInvalid, parseSwitchoverArgs(alloc, &.{ "--to", "http://s:1", "--generation", "0" }));
+    try std.testing.expectError(error.UnknownSwitchoverOption, parseSwitchoverArgs(alloc, &.{ "--to", "http://s:1", "--force" }));
+    try std.testing.expectError(error.HAAdminURLInvalid, parseSwitchoverArgs(alloc, &.{ "--to", "standby-a:8080" }));
+}
+
+test "ha cmd switchover requires a remote target" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.SwitchoverRequiresAdminApi, runArgv(alloc, std.testing.io, &.{
+        "--fence-wal", "/tmp/fence.wal", "switchover", "--to", "http://standby:8080",
+    }));
+}
+
+const HostRoutingExecutor = struct {
+    routes: []const Route,
+
+    const Route = struct {
+        prefix: []const u8,
+        executor: http_common.RequestExecutor,
+    };
+
+    fn executor(self: *HostRoutingExecutor) http_common.RequestExecutor {
+        return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+    }
+
+    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const self: *HostRoutingExecutor = @ptrCast(@alignCast(ptr));
+        for (self.routes) |route| {
+            if (std.mem.startsWith(u8, req.uri, route.prefix)) return try route.executor.execute(alloc, req);
+        }
+        return error.TestUnexpectedHost;
+    }
+};
+
+const FakeFollowerHook = struct {
+    upstream_url: ?[]u8 = null,
+    slot_name: ?[]u8 = null,
+    alloc: std.mem.Allocator,
+
+    fn hook(self: *FakeFollowerHook) ha.http_admin.Server.StandbyUpstreamHook {
+        return .{ .ptr = self, .run_fn = FakeFollowerHook.run };
+    }
+
+    fn deinit(self: *FakeFollowerHook) void {
+        if (self.upstream_url) |url| self.alloc.free(url);
+        if (self.slot_name) |slot| self.alloc.free(slot);
+    }
+
+    fn run(ptr: *anyopaque, _: std.mem.Allocator, upstream_url: []const u8, slot_name: []const u8, expected: ha.standby.Identity) anyerror!ha.http_admin.Server.StandbyUpstreamResult {
+        const self: *FakeFollowerHook = @ptrCast(@alignCast(ptr));
+        self.upstream_url = try self.alloc.dupe(u8, upstream_url);
+        self.slot_name = try self.alloc.dupe(u8, slot_name);
+        return .{ .identity = expected, .previous = null, .changed = true };
+    }
+};
+
+test "ha cmd switchover fences promotes rejoins and repoints followers" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const primary_paths = try testPaths(alloc, "switchover-primary");
+    defer primary_paths.deinit(alloc);
+    const standby_paths = try testPaths(alloc, "switchover-standby");
+    defer standby_paths.deinit(alloc);
+    const follower_paths = try testPaths(alloc, "switchover-follower");
+    defer follower_paths.deinit(alloc);
+
+    // Seed a primary with one durable record, a slot for the standby, and
+    // stream it so the standby is exactly caught up.
+    try runArgv(alloc, io, &.{
+        "--primary-log",   primary_paths.primary_log,
+        "--primary-slots", primary_paths.primary_slots,
+        "--cluster-id",    "10",
+        "--shard-id",      "20",
+        "--table-id",      "30",
+        "--timeline-id",   "1",
+        "--epoch",         "2",
+        "--table",         "slot",
+        "create",          "standby-a",
+        "--initial-lsn",   "0",
+    });
+    try runArgv(alloc, io, &.{
+        "--primary-log",   primary_paths.primary_log,
+        "--primary-slots", primary_paths.primary_slots,
+        "--cluster-id",    "10",
+        "--shard-id",      "20",
+        "--table-id",      "30",
+        "--timeline-id",   "1",
+        "--epoch",         "2",
+        "--table",         "commit",
+        "append",          "--payload",
+        "one",             "--sync-mode",
+        "async",
+    });
+    try runArgv(alloc, io, &.{
+        "--primary-log",      primary_paths.primary_log,
+        "--primary-slots",    primary_paths.primary_slots,
+        "--standby-log",      standby_paths.standby_log,
+        "--standby-progress", standby_paths.standby_progress,
+        "--cluster-id",       "10",
+        "--shard-id",         "20",
+        "--table-id",         "30",
+        "--timeline-id",      "1",
+        "--epoch",            "2",
+        "--table",            "stream",
+        "once",               "--slot",
+        "standby-a",
+    });
+
+    var primary = try ha.primary.Primary.open(alloc, primary_paths.primary_log.ptr, primary_paths.primary_slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    var primary_fence = try ha.fencing.Store.open(alloc, primary_paths.fence_wal.ptr, .{});
+    defer primary_fence.close();
+    var primary_server = ha.http_admin.Server.init(alloc, .{
+        .primary = &primary,
+        .primary_node_id = "primary-a",
+        .fence_store = &primary_fence,
+    });
+    defer primary_server.deinit();
+
+    var standby = try ha.standby.Standby.open(alloc, standby_paths.standby_log.ptr, standby_paths.standby_progress.ptr, testIdentity(), .{});
+    defer standby.close();
+    var standby_fence = try ha.fencing.Store.open(alloc, standby_paths.fence_wal.ptr, .{});
+    defer standby_fence.close();
+    var standby_server = ha.http_admin.Server.init(alloc, .{
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+        .fence_store = &standby_fence,
+    });
+    defer standby_server.deinit();
+
+    var follower = try ha.standby.Standby.open(alloc, follower_paths.standby_log.ptr, follower_paths.standby_progress.ptr, testIdentity(), .{});
+    defer follower.close();
+    var follower_hook = FakeFollowerHook{ .alloc = alloc };
+    defer follower_hook.deinit();
+    var follower_server = ha.http_admin.Server.initWithOptions(alloc, .{
+        .standby = &follower,
+        .standby_node_id = "standby-b",
+    }, .{ .standby_upstream = follower_hook.hook() });
+    defer follower_server.deinit();
+
+    var router = HostRoutingExecutor{ .routes = &.{
+        .{ .prefix = "http://primary.test", .executor = primary_server.executor() },
+        .{ .prefix = "http://standby.test", .executor = standby_server.executor() },
+        .{ .prefix = "http://follower.test", .executor = follower_server.executor() },
+    } };
+    var recorder = RecordingExecutor.init(alloc, router.executor());
+    defer recorder.deinit();
+
+    var captured: std.Io.Writer.Allocating = .init(alloc);
+    defer captured.deinit();
+    test_output_sink = &captured.writer;
+    defer test_output_sink = null;
+
+    try runSwitchover(alloc, io, "http://primary.test", &.{
+        "--to",           "http://standby.test",
+        "--follower",     "standby-b=http://follower.test",
+        "--wait-seconds", "5",
+        "--json",
+    }, recorder.executor(), .{});
+
+    // Both nodes hold one fence with the allocated generation and the new timeline.
+    const primary_receipt = primary_fence.currentBorrowed() orelse return error.TestExpectedEqual;
+    const standby_receipt = standby_fence.currentBorrowed() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), primary_receipt.generation);
+    try std.testing.expectEqual(@as(u64, 1), standby_receipt.generation);
+    try std.testing.expectEqual(@as(u64, 2), standby_receipt.new_timeline_id);
+    try std.testing.expectEqual(@as(u64, 3), standby_receipt.new_epoch);
+    try std.testing.expectEqual(@as(u64, 1), standby_receipt.required_lsn);
+
+    // The follower was repointed at the new primary with its own slot.
+    try std.testing.expectEqualStrings("http://standby.test", follower_hook.upstream_url.?);
+    try std.testing.expectEqualStrings("standby-b", follower_hook.slot_name.?);
+
+    // Every step reported a receipt, in order.
+    const out = captured.written();
+    const steps = [_][]const u8{ "preflight-primary", "preflight-standby", "fence-primary", "boundary", "fence-standby", "assess", "promote", "rejoin-assess", "rejoin-rewind-pending", "standby-b" };
+    var cursor: usize = 0;
+    for (steps) |step| {
+        const needle = try std.fmt.allocPrint(alloc, "{{\"step\":\"{s}\"", .{step});
+        defer alloc.free(needle);
+        const at = std.mem.indexOfPos(u8, out, cursor, needle) orelse {
+            std.debug.print("missing step {s} in:\n{s}\n", .{ step, out });
+            return error.TestExpectedEqual;
+        };
+        cursor = at + needle.len;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"error\"") == null);
 }
 
 test "ha cmd compiles" {

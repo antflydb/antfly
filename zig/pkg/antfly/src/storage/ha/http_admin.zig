@@ -135,6 +135,53 @@ pub const Server = struct {
         }
     };
 
+    /// Value returned by `StandbyUpstreamHook.run`. Mirrors the shape of
+    /// `admin_api.HAStandbyUpstreamResponse` without depending on the
+    /// generated OpenAPI types so the runtime implementation only needs to
+    /// import the HA storage packages it already depends on.
+    pub const StandbyUpstreamPrevious = struct {
+        upstream_url: []const u8,
+        slot_name: []const u8,
+    };
+
+    pub const StandbyUpstreamResult = struct {
+        identity: standby_mod.Identity,
+        /// Upstream in effect before this request. `null` when the standby
+        /// had no continuous upstream configured (for example, a
+        /// bootstrap-only standby with no background puller).
+        previous: ?StandbyUpstreamPrevious,
+        /// False when the requested upstream already matched, which makes
+        /// retries idempotent.
+        changed: bool,
+    };
+
+    /// Runtime-owned hook that repoints the standby's continuous-replication
+    /// puller at a new upstream primary without a restart. Modeled on
+    /// `SeedCaptureHook` above: the callback runs synchronously while this
+    /// request already holds `ha_state_mutex` (see `AuthOptions.state_mutex`
+    /// and `handleOperation`), so the implementation MUST NOT try to acquire
+    /// that mutex again — `std.atomic.Mutex` is not reentrant.
+    pub const StandbyUpstreamHook = struct {
+        ptr: *anyopaque,
+        run_fn: *const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            upstream_url: []const u8,
+            slot_name: []const u8,
+            expected_identity: standby_mod.Identity,
+        ) anyerror!StandbyUpstreamResult,
+
+        pub fn run(
+            self: StandbyUpstreamHook,
+            alloc: Allocator,
+            upstream_url: []const u8,
+            slot_name: []const u8,
+            expected_identity: standby_mod.Identity,
+        ) !StandbyUpstreamResult {
+            return self.run_fn(self.ptr, alloc, upstream_url, slot_name, expected_identity);
+        }
+    };
+
     pub const AuthOptions = struct {
         pub const LeaseWatchdogProofSource = struct {
             ptr: *const anyopaque,
@@ -168,6 +215,7 @@ pub const Server = struct {
         standby_status_extras: ?StandbyStatusExtras = null,
         state_mutex: ?*std.atomic.Mutex = null,
         seed_capture: ?SeedCaptureHook = null,
+        standby_upstream: ?StandbyUpstreamHook = null,
         lifecycle_receipts: ?LifecycleReceipts = null,
         lease_watchdog_proof: ?LeaseWatchdogProofSource = null,
         repair_receipt: ?RepairReceiptSink = null,
@@ -315,6 +363,9 @@ pub const Server = struct {
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_standby_bootstrap)) {
                     return try self.handleAdminBootstrapStandby(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_standby_upstream)) {
+                    return try self.handleAdminSetStandbyUpstream(req);
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
                     return try self.handleAdminAcquireFence(req);
@@ -1071,6 +1122,63 @@ pub const Server = struct {
             },
             else => unreachable,
         };
+    }
+
+    /// `antfly ha follow` repoints a running standby's continuous-replication
+    /// puller at a new primary after a switchover, without a restart. The
+    /// request's `identity` is a precondition compared against the standby's
+    /// current identity: a mismatch fails closed with 409 rather than
+    /// silently repointing a standby to the wrong upstream. The node must
+    /// also fail closed when it is not a configured standby (no hook wired,
+    /// or `self.ctx.standby` is unset) or has already promoted.
+    fn handleAdminSetStandbyUpstream(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA standby upstream request");
+        var parsed = admin_api.server.parseSetHAStandbyUpstreamBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA standby upstream request");
+        defer parsed.deinit();
+
+        const identity = adminIdentityFromOpenApi(parsed.value.identity) catch {
+            return try textResponse(self.alloc, 400, "invalid HA standby upstream request");
+        };
+        if (!validation.isIdentifier(parsed.value.slot_name)) {
+            return try textResponse(self.alloc, 400, "invalid HA standby upstream request");
+        }
+        if (!validation.isHTTPURLWithHostNoHiddenWhitespace(parsed.value.upstream_url)) {
+            return try textResponse(self.alloc, 400, "invalid HA standby upstream request");
+        }
+
+        _ = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
+        const hook = self.auth.standby_upstream orelse return try textResponse(self.alloc, 409, "StandbyUpstreamUnavailable");
+        const node_id = self.standbyNodeID() orelse return try textResponse(self.alloc, 409, "StandbyNodeIDUnavailable");
+
+        const result = hook.run(self.alloc, parsed.value.upstream_url, parsed.value.slot_name, identity) catch |err| {
+            return try textResponse(self.alloc, standbyUpstreamErrorStatus(err), @errorName(err));
+        };
+
+        const action_id = try std.fmt.allocPrint(self.alloc, "standby_upstream:{s}", .{parsed.value.slot_name});
+        defer self.alloc.free(action_id);
+        return try self.handleTypedJson(admin_api.HAStandbyUpstreamResponse{
+            .schema_version = 1,
+            .action = .{
+                .action_id = action_id,
+                .action_kind = "standby_upstream",
+                .target = parsed.value.slot_name,
+                .state = if (result.changed) "applied" else "already_applied",
+                .node_id = node_id,
+            },
+            .identity = try adminIdentity(result.identity),
+            .upstream = .{
+                .upstream_url = parsed.value.upstream_url,
+                .slot_name = parsed.value.slot_name,
+            },
+            .previous = if (result.previous) |previous| .{
+                .upstream_url = previous.upstream_url,
+                .slot_name = previous.slot_name,
+            } else null,
+            .changed = result.changed,
+        });
     }
 
     fn handleAdminFenceCurrent(self: *Server) !http_operation.OwnedResponse {
@@ -2008,6 +2116,7 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups_activate) or
         std.mem.eql(u8, path, admin_api.routes.ha_seed_lifecycle_receipts) or
         std.mem.eql(u8, path, admin_api.routes.ha_standby_bootstrap) or
+        std.mem.eql(u8, path, admin_api.routes.ha_standby_upstream) or
         std.mem.eql(u8, path, admin_api.routes.ha_fence) or
         std.mem.eql(u8, path, admin_api.routes.ha_fence_current) or
         std.mem.eql(u8, path, admin_api.routes.ha_promotion) or
@@ -2213,7 +2322,14 @@ fn adminFenceRequestFromOpenApi(request: admin_api.FenceAcquireRequest) !fencing
         .promoted_node_id = request.promoted_node_id,
         .new_timeline_id = try positiveUint64FromJson(request.new_timeline_id),
         .new_epoch = try positiveUint64FromJson(request.new_epoch),
-        .generation = try positiveUint64FromJson(request.generation),
+        // `generation` is optional on the wire: omitting it means "the node
+        // allocates the next generation itself" (see the doc comment on
+        // `fencing.FenceRequest.generation`). The fence route already runs
+        // under `primary_fence_barrier`'s exclusive lease and
+        // `ha_state_mutex` (see `handleOperation`), so the fencing store's
+        // read-modify-write allocation of the next generation is serialized
+        // with any concurrent fence/promotion request.
+        .generation = if (request.generation) |value| try positiveUint64FromJson(value) else 0,
         .required_lsn = try positiveUint64FromJson(request.required_lsn),
         .observed_lsn = try uint64FromJson(request.observed_lsn),
         .force = request.force,
@@ -2431,6 +2547,24 @@ fn positiveUint64FromJson(value: i64) !u64 {
     return parsed;
 }
 
+/// `/ha/standby/upstream` treats an identity mismatch as a 409 precondition
+/// failure (the standby is real and reachable, but not the one the caller
+/// thinks it is) rather than the 400 `commandErrorStatus` gives the same
+/// error names for malformed-request contexts like fence/rejoin receipt
+/// validation. Every other error still goes through the shared mapping so
+/// those other routes keep their existing status codes.
+fn standbyUpstreamErrorStatus(err: anyerror) u16 {
+    return switch (err) {
+        error.WrongCluster,
+        error.WrongShard,
+        error.WrongTable,
+        error.WrongTimeline,
+        error.WrongEpoch,
+        => 409,
+        else => commandErrorStatus(err),
+    };
+}
+
 fn commandErrorStatus(err: anyerror) u16 {
     return switch (err) {
         error.PrimaryUnavailable,
@@ -2457,6 +2591,9 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.StandbyAlreadyBootstrapped,
         error.SyncPolicyUnsatisfied,
         error.NonMonotonicFenceGeneration,
+        error.HAStandbyNotConfigured,
+        error.HAStandbyAlreadyPromoted,
+        error.StandbyUpstreamUnavailable,
         => 409,
         error.HASeedCaptureAlreadyInProgress,
         error.HASeedSnapshotRuntimeBusy,
@@ -3827,6 +3964,28 @@ test "storage.ha http admin rejects invalid fence request identity and bounds" {
     }
 }
 
+test "storage.ha http admin allocates fence generation when omitted from typed request" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "fence-omitted-generation");
+    defer paths.deinit(alloc);
+
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+    var server = Server.init(alloc, .{ .fence_store = &fence_store });
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_fence,
+        .content_type = "application/json",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"omitted-generation\"}",
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try expectContains(response.body, "\"generation\":1");
+}
+
 test "storage.ha http admin accepts whole instance identity" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "whole-instance-identity");
@@ -4317,6 +4476,233 @@ test "storage.ha http admin rejects invalid standby node id in typed status" {
     }
 }
 
+const FakeStandbyUpstreamHook = struct {
+    result: anyerror!Server.StandbyUpstreamResult,
+    called: bool = false,
+    seen_upstream_url: []const u8 = "",
+    seen_slot_name: []const u8 = "",
+    seen_identity: standby_mod.Identity = undefined,
+
+    fn run(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        upstream_url: []const u8,
+        slot_name: []const u8,
+        expected_identity: standby_mod.Identity,
+    ) anyerror!Server.StandbyUpstreamResult {
+        _ = alloc;
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.called = true;
+        self.seen_upstream_url = upstream_url;
+        self.seen_slot_name = slot_name;
+        self.seen_identity = expected_identity;
+        return self.result;
+    }
+
+    fn hook(self: *@This()) Server.StandbyUpstreamHook {
+        return .{ .ptr = self, .run_fn = FakeStandbyUpstreamHook.run };
+    }
+};
+
+const standby_upstream_request_body =
+    "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1}," ++
+    "\"upstream_url\":\"https://primary-b.antfly.svc:8080\",\"slot_name\":\"standby-a\",\"reason\":\"follow\"}";
+
+test "storage.ha http admin applies typed standby upstream swap" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "standby-upstream-swap");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var fake = FakeStandbyUpstreamHook{
+        .result = .{
+            .identity = identity,
+            .previous = .{ .upstream_url = "https://primary-a.antfly.svc:8080", .slot_name = "standby-a" },
+            .changed = true,
+        },
+    };
+    var server = Server.initWithOptions(alloc, .{
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+    }, .{ .standby_upstream = fake.hook() });
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_standby_upstream,
+        .content_type = "application/json",
+        .body = standby_upstream_request_body,
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expect(fake.called);
+    try std.testing.expectEqualStrings("https://primary-b.antfly.svc:8080", fake.seen_upstream_url);
+    try std.testing.expectEqualStrings("standby-a", fake.seen_slot_name);
+    try expectContains(response.body, "\"action_kind\":\"standby_upstream\"");
+    try expectContains(response.body, "\"state\":\"applied\"");
+    try expectContains(response.body, "\"node_id\":\"standby-a\"");
+    try expectContains(response.body, "\"upstream_url\":\"https://primary-b.antfly.svc:8080\"");
+    try expectContains(response.body, "\"previous\":{\"upstream_url\":\"https://primary-a.antfly.svc:8080\"");
+    try expectContains(response.body, "\"changed\":true");
+}
+
+test "storage.ha http admin reports unchanged standby upstream as idempotent" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "standby-upstream-idempotent");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var fake = FakeStandbyUpstreamHook{
+        .result = .{
+            .identity = identity,
+            .previous = .{ .upstream_url = "https://primary-b.antfly.svc:8080", .slot_name = "standby-a" },
+            .changed = false,
+        },
+    };
+    var server = Server.initWithOptions(alloc, .{
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+    }, .{ .standby_upstream = fake.hook() });
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_standby_upstream,
+        .content_type = "application/json",
+        .body = standby_upstream_request_body,
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try expectContains(response.body, "\"state\":\"already_applied\"");
+    try expectContains(response.body, "\"changed\":false");
+}
+
+test "storage.ha http admin rejects standby upstream identity mismatch as conflict" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "standby-upstream-mismatch");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var fake = FakeStandbyUpstreamHook{ .result = error.WrongShard };
+    var server = Server.initWithOptions(alloc, .{
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+    }, .{ .standby_upstream = fake.hook() });
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_standby_upstream,
+        .content_type = "application/json",
+        .body = standby_upstream_request_body,
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 409), response.status);
+    try expectContains(response.body, "WrongShard");
+}
+
+test "storage.ha http admin rejects standby upstream without a wired hook" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "standby-upstream-no-hook");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var server = Server.init(alloc, .{
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+    });
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_standby_upstream,
+        .content_type = "application/json",
+        .body = standby_upstream_request_body,
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 409), response.status);
+    try expectContains(response.body, "StandbyUpstreamUnavailable");
+}
+
+test "storage.ha http admin rejects standby upstream when node is not a standby" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{});
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_standby_upstream,
+        .content_type = "application/json",
+        .body = standby_upstream_request_body,
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 409), response.status);
+    try expectContains(response.body, "StandbyUnavailable");
+}
+
+test "storage.ha http admin rejects malformed standby upstream requests" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "standby-upstream-invalid");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var fake = FakeStandbyUpstreamHook{ .result = error.WrongShard };
+    var server = Server.initWithOptions(alloc, .{
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+    }, .{ .standby_upstream = fake.hook() });
+    defer server.deinit();
+
+    var empty = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_standby_upstream,
+        .content_type = "application/json",
+        .body = "",
+    });
+    defer empty.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), empty.status);
+
+    var bad_url = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_standby_upstream,
+        .content_type = "application/json",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"upstream_url\":\"not-a-url\",\"slot_name\":\"standby-a\"}",
+    });
+    defer bad_url.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), bad_url.status);
+    try std.testing.expect(!fake.called);
+
+    var bad_slot = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_standby_upstream,
+        .content_type = "application/json",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"upstream_url\":\"https://primary-b.antfly.svc:8080\",\"slot_name\":\"standby a\"}",
+    });
+    defer bad_slot.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), bad_slot.status);
+    try std.testing.expect(!fake.called);
+}
+
 test "storage.ha http admin returns method errors for generated admin routes" {
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, .{});
@@ -4381,6 +4767,7 @@ test "storage.ha http admin implemented admin routes are documented" {
         .{ .method = "POST", .path = admin_api.routes.ha_base_backups },
         .{ .method = "POST", .path = admin_api.routes.ha_base_backups_finish },
         .{ .method = "POST", .path = admin_api.routes.ha_standby_bootstrap },
+        .{ .method = "POST", .path = admin_api.routes.ha_standby_upstream },
         .{ .method = "POST", .path = admin_api.routes.ha_fence },
         .{ .method = "POST", .path = admin_api.routes.ha_promotion_assess },
         .{ .method = "POST", .path = admin_api.routes.ha_promotion_current_fence },

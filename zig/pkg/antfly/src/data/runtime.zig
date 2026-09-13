@@ -3932,6 +3932,14 @@ pub const HAStandbyReplicationConfig = struct {
     executor: ?antfly.common.http.RequestExecutor = null,
 };
 
+/// A previously-live upstream/slot pair retired by `setHAStandbyUpstream`.
+/// Owned by `DataServer` and freed only at `deinit`; see
+/// `ha_standby_upstream_retired`.
+const HAStandbyUpstreamRetired = struct {
+    upstream_url: []u8,
+    slot_name: []u8,
+};
+
 pub const HAStandbyReplicationOptions = antfly.ha.http_replication_client.ReplicateOptions;
 pub const HAStandbyReplicationResult = antfly.ha.http_replication_client.Result;
 pub const HAStandbyReplicationLoopResult = antfly.ha.http_replication_client.LoopResult;
@@ -5009,6 +5017,17 @@ pub const DataServer = struct {
     ha_standby_replication_last_attempt_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_next_attempt_ns: std.atomic.Value(u64) = .init(0),
+    /// True once `setHAStandbyUpstream` has swapped `ha_cfg.standby_replication`
+    /// at least once. Distinguishes the initial caller-owned upstream/slot
+    /// strings (not ours to free) from later swaps' self-allocated
+    /// replacements (retired below and freed at `deinit`).
+    ha_standby_upstream_swapped: bool = false,
+    /// Strings replaced by `setHAStandbyUpstream`. A replication round may
+    /// still be holding an unlocked copy of the old config mid-fetch (see
+    /// `runHAStandbyReplicationRound`), so a swap must never free the
+    /// strings it replaces; they are retired here and freed only at
+    /// `deinit`, once no round can still be reading them.
+    ha_standby_upstream_retired: std.ArrayListUnmanaged(HAStandbyUpstreamRetired) = .empty,
     query_async_limit: std.Io.Limit,
     work_cost_port: ?DataServerWorkCostPort = null,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
@@ -5901,8 +5920,20 @@ pub const DataServer = struct {
     }
 
     fn runHAStandbyReplicationRound(self: *DataServer) !void {
-        const cfg = self.ha_cfg.standby_replication orelse return;
+        // `standby_replication` is a value (struct-of-slices) that
+        // `setHAStandbyUpstream` swaps under `ha_state_mutex` (see below).
+        // Reading it unlocked here would race: this round would capture a
+        // now-stale copy of the config concurrently with a swap freeing the
+        // strings it points at once they are no longer the "current" pair.
+        // Taking the snapshot under the same lock the swap uses makes this
+        // round's view of the config atomic with respect to concurrent
+        // swaps, matching how `openPromotedPrimaryFromStandbyIfReady` clears
+        // this same field under lock during promotion.
         lockAtomic(&self.ha_state_mutex);
+        const cfg = self.ha_cfg.standby_replication orelse {
+            self.ha_state_mutex.unlock();
+            return;
+        };
         const promoted = self.openPromotedPrimaryFromStandbyIfReady(cfg) catch |err| {
             self.ha_state_mutex.unlock();
             return err;
@@ -5927,6 +5958,88 @@ pub const DataServer = struct {
             );
         }
         self.recordHAStandbyReplicationSuccess();
+    }
+
+    /// Repoints this standby's continuous-replication puller at a new
+    /// upstream primary and slot, without a restart. This is the runtime
+    /// side of `antfly ha follow` / `POST /admin/v1/ha/standby/upstream`.
+    ///
+    /// Must be called with `ha_state_mutex` already held by the caller
+    /// (the HTTP admin dispatch loop holds it for the whole request; see
+    /// `http_admin.Server.handleOperation`). `std.atomic.Mutex` is not
+    /// reentrant, so this method must never try to lock it itself.
+    pub fn setHAStandbyUpstream(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        upstream_url: []const u8,
+        slot_name: []const u8,
+        expected: antfly.ha.standby.Identity,
+    ) !antfly.ha.http_admin.Server.StandbyUpstreamResult {
+        const ctx = self.ha_cfg.admin_context orelse return error.HAStandbyNotConfigured;
+        // Promotion clears `ctx.standby` (see `openPromotedPrimaryFromStandbyIfReady`)
+        // as the very first step of adopting the promoted primary, so a null
+        // standby here means this node already promoted rather than "was
+        // never a standby".
+        const standby = ctx.standby orelse return error.HAStandbyAlreadyPromoted;
+        const cfg = self.ha_cfg.standby_replication orelse return error.HAStandbyNotConfigured;
+
+        const current_identity = standby.snapshot().identity;
+        if (current_identity.cluster_id != expected.cluster_id) return error.WrongCluster;
+        if (current_identity.shard_id != expected.shard_id) return error.WrongShard;
+        if (current_identity.table_id != expected.table_id) return error.WrongTable;
+        if (current_identity.timeline_id != expected.timeline_id) return error.WrongTimeline;
+        if (current_identity.epoch != expected.epoch) return error.WrongEpoch;
+
+        const previous: antfly.ha.http_admin.Server.StandbyUpstreamPrevious = .{
+            .upstream_url = cfg.upstream_base_uri,
+            .slot_name = cfg.slot_name,
+        };
+
+        if (std.mem.eql(u8, cfg.upstream_base_uri, upstream_url) and std.mem.eql(u8, cfg.slot_name, slot_name)) {
+            return .{ .identity = current_identity, .previous = previous, .changed = false };
+        }
+
+        const owned_upstream = try alloc.dupe(u8, upstream_url);
+        errdefer alloc.free(owned_upstream);
+        const owned_slot = try alloc.dupe(u8, slot_name);
+        errdefer alloc.free(owned_slot);
+
+        // The strings this swap replaces may still be in use by a
+        // replication round that copied `cfg` before this swap took the
+        // lock (rounds release the lock during their network I/O; see
+        // `runHAStandbyReplicationRound`). Only retire strings we
+        // previously allocated ourselves; the very first pair belongs to
+        // whoever configured continuous replication (standalone runtime
+        // config, CLI flags, etc.) and is never ours to free.
+        if (self.ha_standby_upstream_swapped) {
+            try self.ha_standby_upstream_retired.append(self.alloc, .{
+                .upstream_url = @constCast(cfg.upstream_base_uri),
+                .slot_name = @constCast(cfg.slot_name),
+            });
+        }
+        self.ha_standby_upstream_swapped = true;
+
+        self.ha_cfg.standby_replication.?.upstream_base_uri = owned_upstream;
+        self.ha_cfg.standby_replication.?.slot_name = owned_slot;
+
+        // Make the next round pull from the new upstream immediately
+        // instead of waiting out any backoff accumulated against the old,
+        // now-abandoned upstream.
+        self.clearHAStandbyReplicationError();
+        self.clearHAStandbyReplicationRetry();
+
+        return .{ .identity = current_identity, .previous = previous, .changed = true };
+    }
+
+    fn setHAStandbyUpstreamCallback(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        upstream_url: []const u8,
+        slot_name: []const u8,
+        expected: antfly.ha.standby.Identity,
+    ) anyerror!antfly.ha.http_admin.Server.StandbyUpstreamResult {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.setHAStandbyUpstream(alloc, upstream_url, slot_name, expected);
     }
 
     fn openPromotedPrimaryFromStandbyIfReady(self: *DataServer, cfg: HAStandbyReplicationConfig) !bool {
@@ -5971,11 +6084,24 @@ pub const DataServer = struct {
         self.ha_cfg.admin_context.?.standby = null;
         if (self.ha_admin_server) |*server| {
             server.ctx.standby = null;
+            server.auth.standby_upstream = null;
         }
 
         self.ha_promoted_primary = promoted_primary;
         const promoted_primary_handle = &self.ha_promoted_primary.?;
         self.ha_cfg.internal_primary = promoted_primary_handle;
+        // If `setHAStandbyUpstream` ever swapped this standby's upstream,
+        // the currently active pair is our own allocation (see
+        // `ha_standby_upstream_swapped`) and must be retired rather than
+        // dropped, since a replication round may still be reading it.
+        if (self.ha_cfg.standby_replication) |active_cfg| {
+            if (self.ha_standby_upstream_swapped) {
+                self.ha_standby_upstream_retired.append(self.alloc, .{
+                    .upstream_url = @constCast(active_cfg.upstream_base_uri),
+                    .slot_name = @constCast(active_cfg.slot_name),
+                }) catch {};
+            }
+        }
         self.ha_cfg.standby_replication = null;
         const promoted_node_id = self.ha_cfg.admin_context.?.standby_node_id;
         self.ha_cfg.admin_context.?.primary = promoted_primary_handle;
@@ -6877,6 +7003,10 @@ pub const DataServer = struct {
                         .last_success_ns = haStandbyReplicationLastSuccessNsCallback,
                         .replication_failures_total = haStandbyReplicationFailuresTotalCallback,
                     },
+                    .standby_upstream = if (ctx.standby != null) .{
+                        .ptr = self,
+                        .run_fn = DataServer.setHAStandbyUpstreamCallback,
+                    } else null,
                 });
                 api_server_cfg.ha_admin_executor = self.ha_admin_server.?.operationExecutor();
             }
@@ -7391,6 +7521,20 @@ pub const DataServer = struct {
         if (self.ha_admin_server) |*server| server.deinit();
         if (self.ha_promoted_primary) |*primary| primary.close();
         if (self.ha_standby_replication_http_executor) |*executor| executor.deinit();
+        // Safe only now: every replication round has been quiesced above, so
+        // no in-flight round can still hold an unlocked copy of a retired
+        // upstream/slot pair. See `ha_standby_upstream_retired`.
+        if (self.ha_cfg.standby_replication) |cfg| {
+            if (self.ha_standby_upstream_swapped) {
+                self.alloc.free(@constCast(cfg.upstream_base_uri));
+                self.alloc.free(@constCast(cfg.slot_name));
+            }
+        }
+        for (self.ha_standby_upstream_retired.items) |retired| {
+            self.alloc.free(retired.upstream_url);
+            self.alloc.free(retired.slot_name);
+        }
+        self.ha_standby_upstream_retired.deinit(self.alloc);
         // Stop source-owned work while Raft and the provisioned caches are
         // still available. Cached DB callbacks are detached only after every
         // possible writer has reached this quiescent boundary.
@@ -34215,6 +34359,180 @@ fn consumerTests() type {
             try std.testing.expect(server.ha_promoted_primary != null);
             try std.testing.expect(server.ha_cfg.admin_context.?.standby == null);
             try std.testing.expect(server.ha_cfg.admin_context.?.primary != null);
+        }
+
+        test "data server setHAStandbyUpstream swaps the upstream a replication round uses" {
+            const alloc = std.testing.allocator;
+            const FakeStatus = struct {
+                fn iface() antfly.public_api.http_server.StatusSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .status = status,
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return .{ .metadata_group_id = 1, .metrics = .{} };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                        .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                        .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                        .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+            };
+            const FakeCatalog = struct {
+                fn iface() antfly.public_api.table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return try FakeStatus.adminSnapshot(undefined);
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+            };
+
+            const nonce = platform_time.monotonicNs();
+            const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-follow-root-{d}", .{nonce});
+            defer alloc.free(replica_root_raw);
+            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            defer alloc.free(replica_root);
+            const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-follow-log-{d}", .{nonce});
+            defer alloc.free(standby_log_raw);
+            const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+            defer alloc.free(standby_log);
+            const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-follow-progress-{d}", .{nonce});
+            defer alloc.free(standby_progress_raw);
+            const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+            defer alloc.free(standby_progress);
+
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+            const identity: antfly.ha.standby.Identity = .{
+                .cluster_id = 100,
+                .shard_id = 77,
+                .table_id = 7,
+                .timeline_id = 1,
+                .epoch = 1,
+            };
+            var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, identity, .{});
+            defer standby.close();
+
+            var server = DataServer.initFromLocalMetadataSources(alloc, .{
+                .replica_root_dir = replica_root,
+                .ha = .{
+                    .admin_context = .{
+                        .standby = &standby,
+                        .standby_node_id = "standby-a",
+                    },
+                    .standby_replication = .{
+                        .upstream_base_uri = "http://primary-a.internal.test",
+                        .slot_name = "standby-a",
+                    },
+                },
+            }, FakeCatalog.iface(), FakeStatus.iface());
+            defer server.deinit();
+
+            // Not-configured: no continuous-replication config at all.
+            {
+                var unconfigured = DataServer.initFromLocalMetadataSources(alloc, .{
+                    .replica_root_dir = replica_root,
+                    .ha = .{
+                        .admin_context = .{
+                            .standby = &standby,
+                            .standby_node_id = "standby-a",
+                        },
+                    },
+                }, FakeCatalog.iface(), FakeStatus.iface());
+                defer unconfigured.deinit();
+                try std.testing.expectError(
+                    error.HAStandbyNotConfigured,
+                    unconfigured.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-a", identity),
+                );
+            }
+
+            // Already promoted: no standby handle in the admin context.
+            {
+                var promoted = DataServer.initFromLocalMetadataSources(alloc, .{
+                    .replica_root_dir = replica_root,
+                    .ha = .{
+                        .admin_context = .{},
+                        .standby_replication = .{
+                            .upstream_base_uri = "http://primary-a.internal.test",
+                            .slot_name = "standby-a",
+                        },
+                    },
+                }, FakeCatalog.iface(), FakeStatus.iface());
+                defer promoted.deinit();
+                try std.testing.expectError(
+                    error.HAStandbyAlreadyPromoted,
+                    promoted.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-a", identity),
+                );
+            }
+
+            // Identity mismatch fails closed rather than repointing a
+            // standby that is not the one the caller thinks it is.
+            var wrong_identity = identity;
+            wrong_identity.shard_id = identity.shard_id + 1;
+            try std.testing.expectError(
+                error.WrongShard,
+                server.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-a", wrong_identity),
+            );
+
+            // Idempotent retry: requesting the already-effective upstream and
+            // slot reports changed=false without mutating anything.
+            const unchanged = try server.setHAStandbyUpstream(alloc, "http://primary-a.internal.test", "standby-a", identity);
+            try std.testing.expect(!unchanged.changed);
+            try std.testing.expectEqualStrings("http://primary-a.internal.test", server.ha_cfg.standby_replication.?.upstream_base_uri);
+
+            // A real swap changes the URL/slot the next replication round
+            // will use and reports the previous pair.
+            const swapped = try server.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-b", identity);
+            try std.testing.expect(swapped.changed);
+            try std.testing.expectEqualStrings("http://primary-a.internal.test", swapped.previous.?.upstream_url);
+            try std.testing.expectEqualStrings("standby-a", swapped.previous.?.slot_name);
+            try std.testing.expectEqualStrings("http://primary-b.internal.test", server.ha_cfg.standby_replication.?.upstream_base_uri);
+            try std.testing.expectEqualStrings("standby-b", server.ha_cfg.standby_replication.?.slot_name);
+
+            // A second swap must retire (not free) the first swap's owned
+            // strings, since a round may still be reading them; see
+            // `ha_standby_upstream_retired`.
+            const swapped_again = try server.setHAStandbyUpstream(alloc, "http://primary-c.internal.test", "standby-c", identity);
+            try std.testing.expect(swapped_again.changed);
+            try std.testing.expectEqualStrings("http://primary-b.internal.test", swapped_again.previous.?.upstream_url);
+            try std.testing.expectEqual(@as(usize, 1), server.ha_standby_upstream_retired.items.len);
         }
 
         test "data server resumes HA standby replication from durable progress after restart" {

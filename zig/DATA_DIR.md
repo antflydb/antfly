@@ -24,6 +24,12 @@ marker applies to the whole directory tree, not to an individual node mode.
     catalog.txt
     snapshots/
 
+  ha/                      (only when hot standby is configured)
+    primary.wal
+    slots
+    standby.wal
+    standby-progress.wal
+    fence.wal
 ```
 
 ## Design
@@ -47,6 +53,13 @@ directories as standalone metadata, data, and inference nodes.
 - `data/replicas/` stores hosted data group table state.
 - `data/catalog.txt` stores the data replica catalog.
 - `data/snapshots/` stores data raft snapshot transport payloads.
+
+`ha/` holds hot-standby replication state when a node runs as a primary or a
+standby: the primary replication log and slot store, the standby receive log
+and progress WAL, and the fence WAL. `antfly standalone` takes these paths
+through its `--ha-*` flags; the Kubernetes operator provisions exactly this
+layout under the data root, and `antfly ha --data-dir <data-dir>` opens
+whichever of these files exist and reads the log identity from them.
 
 Table database snapshots are a lower-level DB artifact and remain adjacent to
 the database path as `<db_path>.snapshots/<snapshot-id>/...`.

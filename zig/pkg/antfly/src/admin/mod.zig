@@ -24,6 +24,7 @@ pub const BaseBackupStartRequest = openapi.BaseBackupStartRequest;
 pub const BaseBackupManifestPathRequest = openapi.BaseBackupManifestPathRequest;
 pub const SeedArtifactCaptureRequest = openapi.SeedArtifactCaptureRequest;
 pub const StandbyBootstrapRequest = openapi.StandbyBootstrapRequest;
+pub const StandbyUpstreamRequest = openapi.StandbyUpstreamRequest;
 pub const SeededSlotActivateRequest = openapi.SeededSlotActivateRequest;
 pub const HASyncPolicy = openapi.HASyncPolicy;
 pub const CommitCheckRequest = openapi.CommitCheckRequest;
@@ -55,6 +56,8 @@ pub const HASeedLifecycleReceiptEvent = openapi.HASeedLifecycleReceiptEvent;
 pub const HASeedLifecycleReceiptInventoryResponse = openapi.HASeedLifecycleReceiptInventoryResponse;
 pub const HARuntimeLifecycleObservation = openapi.HARuntimeLifecycleObservation;
 pub const HAStandbyBootstrapResponse = openapi.HAStandbyBootstrapResponse;
+pub const HAStandbyUpstream = openapi.HAStandbyUpstream;
+pub const HAStandbyUpstreamResponse = openapi.HAStandbyUpstreamResponse;
 pub const HASeededSlotActivateResponse = openapi.HASeededSlotActivateResponse;
 pub const HAFenceResponse = openapi.HAFenceResponse;
 pub const HACurrentFenceResponse = openapi.HACurrentFenceResponse;
@@ -222,6 +225,12 @@ test "admin facade preserves HA slot seed and fence schema fields" {
     inline for (ha_standby_bootstrap_response_fields) |name| {
         try expectFacadeStructField(HAStandbyBootstrapResponse, name);
     }
+    inline for (ha_standby_upstream_fields) |name| {
+        try expectFacadeStructField(HAStandbyUpstream, name);
+    }
+    inline for (ha_standby_upstream_response_fields) |name| {
+        try expectFacadeStructField(HAStandbyUpstreamResponse, name);
+    }
     inline for (ha_fence_receipt_fields) |name| {
         try expectFacadeStructField(HAFenceReceipt, name);
     }
@@ -238,6 +247,7 @@ const ha_contract_type_names = [_][]const u8{
     "BaseBackupStartRequest",
     "BaseBackupManifestPathRequest",
     "StandbyBootstrapRequest",
+    "StandbyUpstreamRequest",
     "SeededSlotActivateRequest",
     "HASyncPolicy",
     "CommitCheckRequest",
@@ -263,6 +273,8 @@ const ha_contract_type_names = [_][]const u8{
     "HABaseBackupBeginResponse",
     "HABaseBackupFinishResponse",
     "HAStandbyBootstrapResponse",
+    "HAStandbyUpstream",
+    "HAStandbyUpstreamResponse",
     "HASeededSlotActivateResponse",
     "HAFenceResponse",
     "HACurrentFenceResponse",
@@ -575,6 +587,20 @@ const ha_standby_bootstrap_response_fields = [_][]const u8{
     "manifest_id",
     "backup_lsn",
     "checkpoint_lsn",
+};
+
+const ha_standby_upstream_fields = [_][]const u8{
+    "upstream_url",
+    "slot_name",
+};
+
+const ha_standby_upstream_response_fields = [_][]const u8{
+    "schema_version",
+    "action",
+    "identity",
+    "upstream",
+    "previous",
+    "changed",
 };
 
 const ha_fence_receipt_fields = [_][]const u8{

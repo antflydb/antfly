@@ -1958,6 +1958,7 @@ pub fn runFromIterator(
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
+    if (loaded_config) |*cfg| try applyHAConfigDefaults(alloc, &cli, cfg);
 
     antfly.common.config.Config.validateServerTlsConfig(if (loaded_config) |*cfg| cfg.tls else null) catch |err| {
         std.log.err("standalone startup rejected configured tls: built-in server TLS is unsupported; terminate TLS at a trusted reverse proxy", .{});
@@ -4594,6 +4595,48 @@ fn resolvePublicListener(cli: CliConfig) antfly.metadata.runtime.ListenerConfig 
         .bind_host = cli.bind_host orelse "127.0.0.1",
         .bind_port = cli.bind_port orelse default_public_port,
     };
+}
+
+/// Fills HA flags that were not given on the command line from the config
+/// file's `ha` section. Command-line flags always win, so operator-generated
+/// argument lists keep their exact meaning; the section only removes the need
+/// to repeat the same paths and identity on every invocation. Strings borrow
+/// from `cfg`, which outlives `cli` in `run`.
+fn applyHAConfigDefaults(alloc: std.mem.Allocator, cli: *CliConfig, cfg: *const antfly.common.config.Config) !void {
+    const ha = cfg.ha orelse return;
+    if (cli.admin_token_env == null) cli.admin_token_env = ha.admin_token_env;
+    if (cli.ha_cluster_id == null) cli.ha_cluster_id = ha.cluster_id;
+    if (cli.ha_shard_id == null) cli.ha_shard_id = ha.shard_id;
+    if (cli.ha_table_id == null) cli.ha_table_id = ha.table_id;
+    if (cli.ha_timeline_id == null) cli.ha_timeline_id = ha.timeline_id;
+    if (cli.ha_epoch == null) cli.ha_epoch = ha.epoch;
+    if (cli.ha_primary_log == null) cli.ha_primary_log = ha.primary_log;
+    if (cli.ha_primary_slots == null) cli.ha_primary_slots = ha.primary_slots;
+    if (cli.ha_primary_node_id == null) cli.ha_primary_node_id = ha.primary_node_id;
+    if (cli.ha_seed_capture_root == null) cli.ha_seed_capture_root = ha.seed_capture_root;
+    if (cli.ha_standby_log == null) cli.ha_standby_log = ha.standby_log;
+    if (cli.ha_standby_progress == null) cli.ha_standby_progress = ha.standby_progress;
+    if (cli.ha_standby_node_id == null) cli.ha_standby_node_id = ha.standby_node_id;
+    if (cli.ha_standby_upstream_url == null) cli.ha_standby_upstream_url = ha.standby_upstream_url;
+    if (cli.ha_standby_slot == null) cli.ha_standby_slot = ha.standby_slot;
+    if (cli.ha_fence_wal == null) cli.ha_fence_wal = ha.fence_wal;
+    if (cli.ha_former_primary_log == null) cli.ha_former_primary_log = ha.former_primary_log;
+    if (cli.ha_sync_mode == null) {
+        if (ha.sync_mode) |raw| cli.ha_sync_mode = try parseHASyncDurabilityMode(raw);
+    }
+    if (cli.ha_sync_selection == null) {
+        if (ha.sync_selection) |raw| cli.ha_sync_selection = try parseHASyncStandbySelection(raw);
+    }
+    if (cli.ha_sync_required == null) cli.ha_sync_required = ha.sync_required;
+    if (cli.ha_sync_failure_policy == null) {
+        if (ha.sync_failure) |raw| cli.ha_sync_failure_policy = try parseHASyncFailurePolicy(raw);
+    }
+    if (cli.ha_sync_standby_names.items.len == 0) {
+        for (ha.sync_standbys) |name| try cli.ha_sync_standby_names.append(alloc, name);
+    }
+    if (cli.ha_retention_max_lag_lsn == null) cli.ha_retention_max_lag_lsn = ha.retention_max_lag_lsn;
+    if (cli.ha_retention_max_retained_bytes == null) cli.ha_retention_max_retained_bytes = ha.retention_max_retained_bytes;
+    if (cli.ha_retention_max_retained_age_ns == null) cli.ha_retention_max_retained_age_ns = ha.retention_max_retained_age_ns;
 }
 
 fn haPrimaryRequested(cli: CliConfig) bool {
@@ -8942,4 +8985,42 @@ test "runtime lease watchdog prefers a DNS-verified Kubernetes API host and reta
     const overridden_endpoint = try haLeaseAPIEndpoint(&env);
     try std.testing.expectEqualStrings("kubernetes.default.svc.cluster.local", overridden_endpoint.host);
     try std.testing.expectEqualStrings("443", overridden_endpoint.port);
+}
+
+test "standalone fills ha flags from the config ha section without overriding flags" {
+    const alloc = std.testing.allocator;
+    var cfg = try antfly.common.config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "ha": {
+        \\    "admin": { "token_env": "ANTFLY_HA_ADMIN_TOKEN" },
+        \\    "identity": { "cluster_id": 7, "shard_id": 1, "timeline_id": 3, "epoch": 2 },
+        \\    "primary": { "log": "/data/ha/primary.wal", "slots": "/data/ha/slots", "node_id": "primary-a" },
+        \\    "sync": { "mode": "remote-apply", "selection": "all", "standbys": ["standby-a"], "failure": "degrade-to-async" },
+        \\    "retention": { "max_lag_lsn": 4096 },
+        \\    "fence_wal": "/data/ha/fence.wal"
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+
+    var cli = CliConfig{ .ha_epoch = 9, .ha_primary_node_id = "flag-primary" };
+    defer cli.deinit(alloc);
+    try applyHAConfigDefaults(alloc, &cli, &cfg);
+
+    try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", cli.admin_token_env.?);
+    try std.testing.expectEqual(@as(u64, 7), cli.ha_cluster_id.?);
+    try std.testing.expectEqual(@as(u64, 1), cli.ha_shard_id.?);
+    try std.testing.expectEqual(@as(u64, 3), cli.ha_timeline_id.?);
+    try std.testing.expectEqual(@as(u64, 9), cli.ha_epoch.?);
+    try std.testing.expectEqualStrings("/data/ha/primary.wal", cli.ha_primary_log.?);
+    try std.testing.expectEqualStrings("flag-primary", cli.ha_primary_node_id.?);
+    try std.testing.expect(haPrimaryRequested(cli));
+    try std.testing.expect(!haStandbyRequested(cli));
+    try std.testing.expectEqual(antfly.ha.primary.DurabilityMode.remote_apply, cli.ha_sync_mode.?);
+    try std.testing.expectEqual(antfly.ha.primary.StandbySelection.all, cli.ha_sync_selection.?);
+    try std.testing.expectEqual(antfly.ha.primary.FailurePolicy.degrade_to_async, cli.ha_sync_failure_policy.?);
+    try std.testing.expectEqual(@as(usize, 1), cli.ha_sync_standby_names.items.len);
+    try std.testing.expectEqual(@as(u64, 4096), cli.ha_retention_max_lag_lsn.?);
+    try std.testing.expectEqualStrings("/data/ha/fence.wal", cli.ha_fence_wal.?);
+    try std.testing.expect(cli.ha_standby_log == null);
 }

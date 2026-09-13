@@ -71,7 +71,7 @@ design for each lives in its own document.
 | Mode | Availability mechanism | Design |
 | --- | --- | --- |
 | `embedded` (`lite`) | Single writer; durability is the fsync policy on the `.aflite` file. No replication. | [LITE.md](LITE.md) |
-| `standalone` | Optional Postgres-style hot standby: WAL streaming to a replica with fenced promotion, managed by `antfly ha` and the operator. | [HOT_STANDBY.md](HOT_STANDBY.md) |
+| `standalone` | Optional Postgres-style hot standby: WAL streaming to a replica with fenced promotion, planned switchover (`antfly ha switchover`), and runtime repointing of standbys (`antfly ha follow`), managed by `antfly ha` and the operator. | [HOT_STANDBY.md](HOT_STANDBY.md) |
 | `distributed` | Raft replication per shard and for metadata; quorum consensus, online shard splits, cross-shard transactions. | [DB.md](DB.md), [raft/RAFT.md](pkg/antfly/src/raft/RAFT.md) |
 | `serverless` | Durable state in object storage; compute is stateless and replaceable. | [SERVERLESS.md](SERVERLESS.md) |
 

@@ -626,6 +626,38 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
+  /ha/standby/upstream:
+    post:
+      tags: [ha]
+      operationId: setHAStandbyUpstream
+      summary: Repoint a running standby at a different primary
+      description: |
+        Atomically replaces the upstream URL and replication slot a running
+        standby pulls from, without restarting the process. The request carries
+        the identity the caller expects the standby to have; the swap is
+        rejected with 409 when the standby's current identity differs, so a
+        stale operator cannot repoint a node that has since been promoted or
+        reseeded. The next replication round pulls from the new upstream. This
+        is the `follow` step of a switchover.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StandbyUpstreamRequest"
+      responses:
+        "200":
+          description: Upstream replaced.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAStandbyUpstreamResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /ha/fence:
     post:
       tags: [ha]
@@ -1356,7 +1388,6 @@ components:
         - promoted_node_id
         - new_timeline_id
         - new_epoch
-        - generation
         - required_lsn
         - observed_lsn
         - force
@@ -1380,7 +1411,14 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: Exact Kubernetes Lease transition generation authorizing this fence.
+          description: |
+            Fence generation authorizing this fence. When the fencing authority is
+            a Kubernetes Lease this is the exact Lease transition generation and
+            must be supplied. When omitted, the node allocates the next
+            generation itself: the current durable fence generation plus one, or
+            1 when no fence exists. Allocation is only permitted when the node
+            is not configured with an external fencing authority, so a
+            Lease-managed cluster cannot be fenced by an unauthorized caller.
         required_lsn:
           type: integer
           format: uint64
@@ -1395,6 +1433,55 @@ components:
         reason:
           type: string
           default: ""
+    StandbyUpstreamRequest:
+      type: object
+      required: [identity, upstream_url, slot_name]
+      additionalProperties: false
+      properties:
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+          description: Identity the standby is expected to have right now. Mismatch rejects the swap.
+        upstream_url:
+          type: string
+          format: uri
+          minLength: 1
+          description: Base URL of the primary to pull from.
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        reason:
+          type: string
+          default: ""
+    HAStandbyUpstream:
+      type: object
+      required: [upstream_url, slot_name]
+      additionalProperties: false
+      properties:
+        upstream_url:
+          type: string
+          format: uri
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+    HAStandbyUpstreamResponse:
+      type: object
+      required: [schema_version, action, identity, upstream, changed]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        upstream:
+          $ref: "#/components/schemas/HAStandbyUpstream"
+        previous:
+          $ref: "#/components/schemas/HAStandbyUpstream"
+          description: Upstream in effect before this request. Absent when the standby had no continuous upstream configured.
+        changed:
+          type: boolean
+          description: False when the requested upstream already matched, which makes retries idempotent.
     HAFenceReceipt:
       type: object
       required:
@@ -1627,6 +1714,7 @@ components:
             - rejoin_assess
             - rejoin_rewind
             - rejoin_reseed
+            - standby_upstream
           description: Typed HA action that produced this response.
         target:
           type: string

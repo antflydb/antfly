@@ -71,8 +71,13 @@ pub const FenceRequest = struct {
     promoted_node_id: []const u8,
     new_timeline_id: u64,
     new_epoch: u64,
-    /// Exact external fencing-authority generation. For Kubernetes Lease
-    /// fencing this is spec.leaseTransitions, not a node-local counter.
+    /// Exact external fencing-authority generation, or the in-process
+    /// sentinel `0` meaning "omitted: let the node allocate the next
+    /// generation itself" (held receipt's generation + 1, or 1 if no fence
+    /// is currently held). `0` must never appear as a wire value — it only
+    /// exists for callers with no independent generation source. Kubernetes
+    /// Lease fencing must still supply the exact spec.leaseTransitions
+    /// value rather than omitting it.
     generation: u64,
     required_lsn: u64,
     observed_lsn: u64,
@@ -180,7 +185,21 @@ pub const Store = struct {
         try self.applyReceipt(receipt);
     }
 
-    pub fn acquirePromotionFence(self: *Store, request: FenceRequest) !Receipt {
+    pub fn acquirePromotionFence(self: *Store, request_in: FenceRequest) !Receipt {
+        var request = request_in;
+        if (request.generation == 0) {
+            if (self.current_receipt) |*held| {
+                if (sameFenceIgnoringGeneration(held.receipt, request)) {
+                    const cloned = try held.clone(self.alloc);
+                    return cloned.receipt;
+                }
+                request.generation = std.math.add(u64, held.receipt.generation, 1) catch
+                    return error.NonMonotonicFenceGeneration;
+            } else {
+                request.generation = 1;
+            }
+        }
+
         try validateFenceRequest(request);
         if (request.observed_lsn < request.required_lsn and !request.force) return error.FenceRequiresForce;
 
@@ -328,6 +347,23 @@ fn sameFence(receipt: Receipt, request: FenceRequest) bool {
         receipt.new_timeline_id == request.new_timeline_id and
         receipt.new_epoch == request.new_epoch and
         receipt.generation == request.generation and
+        receipt.required_lsn == request.required_lsn and
+        receipt.observed_lsn == request.observed_lsn and
+        receipt.forced == request.force and
+        std.mem.eql(u8, receipt.old_primary_id, request.old_primary_id) and
+        std.mem.eql(u8, receipt.promoted_node_id, request.promoted_node_id);
+}
+
+/// Like `sameFence`, but ignores `generation`. Used to detect a retry of an
+/// omitted-generation request (an already-held receipt whose non-generation
+/// fields exactly match the incoming request), so the retry can be answered
+/// with the previously-minted receipt instead of allocating a new
+/// generation and double-fencing.
+fn sameFenceIgnoringGeneration(receipt: Receipt, request: FenceRequest) bool {
+    return receipt.parent_timeline_id == request.identity.timeline_id and
+        receipt.parent_epoch == request.identity.epoch and
+        receipt.new_timeline_id == request.new_timeline_id and
+        receipt.new_epoch == request.new_epoch and
         receipt.required_lsn == request.required_lsn and
         receipt.observed_lsn == request.observed_lsn and
         receipt.forced == request.force and
@@ -825,6 +861,116 @@ test "storage.ha fencing rejects invalid durable receipt fields on replay" {
     }
 
     try std.testing.expectError(error.InvalidFenceToken, Store.open(alloc, path.ptr, .{}));
+}
+
+test "storage.ha fencing allocates generation 1 when omitted on empty store" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "omitted-empty");
+    defer alloc.free(path);
+
+    var store = try Store.open(alloc, path.ptr, .{});
+    defer store.close();
+
+    var request = baseRequest();
+    request.generation = 0;
+    const receipt = try store.acquirePromotionFence(request);
+    defer freeReceipt(alloc, receipt);
+    try std.testing.expectEqual(@as(u64, 1), receipt.generation);
+}
+
+test "storage.ha fencing allocates held generation plus one for omitted chained fence" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "omitted-chained");
+    defer alloc.free(path);
+
+    var store = try Store.open(alloc, path.ptr, .{});
+    defer store.close();
+
+    const first = try store.acquirePromotionFence(baseRequest());
+    defer freeReceipt(alloc, first);
+    try std.testing.expectEqual(@as(u64, 7), first.generation);
+
+    var chained = baseRequest();
+    chained.identity.timeline_id = 2;
+    chained.identity.epoch = 2;
+    chained.old_primary_id = "standby-b";
+    chained.promoted_node_id = "standby-c";
+    chained.new_timeline_id = 3;
+    chained.new_epoch = 3;
+    chained.generation = 0;
+    const next = try store.acquirePromotionFence(chained);
+    defer freeReceipt(alloc, next);
+    try std.testing.expectEqual(@as(u64, 8), next.generation);
+}
+
+test "storage.ha fencing omitted generation retry is idempotent" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "omitted-retry");
+    defer alloc.free(path);
+
+    var store = try Store.open(alloc, path.ptr, .{});
+    defer store.close();
+
+    var request = baseRequest();
+    request.generation = 0;
+    const first = try store.acquirePromotionFence(request);
+    defer freeReceipt(alloc, first);
+    try std.testing.expectEqual(@as(u64, 1), first.generation);
+
+    const retry = try store.acquirePromotionFence(request);
+    defer freeReceipt(alloc, retry);
+    try std.testing.expectEqual(first.generation, retry.generation);
+    try std.testing.expectEqualStrings(first.token, retry.token);
+}
+
+test "storage.ha fencing rejects stale explicit generation after omitted allocation" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "stale-explicit");
+    defer alloc.free(path);
+
+    var store = try Store.open(alloc, path.ptr, .{});
+    defer store.close();
+
+    var omitted = baseRequest();
+    omitted.generation = 0;
+    const first = try store.acquirePromotionFence(omitted);
+    defer freeReceipt(alloc, first);
+    try std.testing.expectEqual(@as(u64, 1), first.generation);
+
+    var stale = baseRequest();
+    stale.identity.timeline_id = 2;
+    stale.identity.epoch = 2;
+    stale.old_primary_id = "standby-b";
+    stale.promoted_node_id = "standby-c";
+    stale.new_timeline_id = 3;
+    stale.new_epoch = 3;
+    stale.generation = 1;
+    try std.testing.expectError(error.NonMonotonicFenceGeneration, store.acquirePromotionFence(stale));
+}
+
+test "storage.ha fencing rejects generation allocation overflow" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "overflow");
+    defer alloc.free(path);
+
+    var store = try Store.open(alloc, path.ptr, .{});
+    defer store.close();
+
+    var max_gen = baseRequest();
+    max_gen.generation = std.math.maxInt(u64);
+    const first = try store.acquirePromotionFence(max_gen);
+    defer freeReceipt(alloc, first);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), first.generation);
+
+    var chained = baseRequest();
+    chained.identity.timeline_id = 2;
+    chained.identity.epoch = 2;
+    chained.old_primary_id = "standby-b";
+    chained.promoted_node_id = "standby-c";
+    chained.new_timeline_id = 3;
+    chained.new_epoch = 3;
+    chained.generation = 0;
+    try std.testing.expectError(error.NonMonotonicFenceGeneration, store.acquirePromotionFence(chained));
 }
 
 test "storage.ha fencing receipt drives standby promotion" {

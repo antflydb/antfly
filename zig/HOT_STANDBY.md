@@ -594,11 +594,17 @@ When `adminTokenSecretRef` is used, the referenced Secret key should be required
 (`optional: false`) so pods do not start without the admin token. Kubernetes
 should inject both process environments from Secrets; the operator should not
 need direct Secret read permissions merely to call the HA admin API.
-For human or break-glass operations, `antfly ha --ha-url <url>` with
-`--ha-token-env ANTFLY_HA_ADMIN_TOKEN` should resolve the token from the
-operator/admin environment and send the same bearer header to typed admin
-routes. Do not add a raw token CLI flag; tokens should not be exposed through
-process argv.
+For human or break-glass operations, `antfly ha --admin-url <url> <command>`
+resolves the bearer token from the environment variable named by
+`--admin-token-env` (default `ANTFLY_HA_ADMIN_TOKEN` when that variable is set)
+and sends it to the typed admin routes. `ANTFLY_HA_ADMIN_URL` supplies the
+default admin URL when no target flag is given. On the node itself,
+`antfly ha --data-dir <dir> <command>` opens the local HA state under
+`<dir>/ha/` directly and reads the log identity from the files, so no path or
+identity flags are needed. The `--ha-url`, `--ha-token-env`, and `--ha-*`
+identity spellings remain accepted as aliases, and the `--` separator before
+the command is optional. Do not add a raw token CLI flag; tokens should not be
+exposed through process argv.
 If the operator ever uses a CLI-backed HA admin Job for compatibility or
 pod-local workflows against an authenticated admin endpoint, it should pass
 `--ha-token-env` only when `spec.highAvailability.admin.tokenEnvVar` is
@@ -778,6 +784,198 @@ synchronous commit policies, hard-to-misuse fencing, promotion/timeline
 switch/former-primary repair, standby freshness controls, WAL retention and
 reseed status, auth, auditability, metrics, runbooks, format compatibility
 tests, black-box e2e, operator e2e, and crash/simulation coverage.
+
+## Operator CLI and Configuration
+
+This section records the design of the `antfly ha` command and the `ha` config
+section as they exist after the v0.2.1 ergonomics pass. The goal was the
+PostgreSQL shape: identity and paths are written once, tools derive everything
+else from the data directory or the config file, and the verbs an operator
+types match the vocabulary of `pg_ctl promote`, `pg_rewind`, `repmgr standby
+follow`, and `patronictl switchover`. The command keeps its `ha` noun; the four
+availability modes are summarized in `STORAGE.md`, and `ha` is the only one
+with hand-operated verbs.
+
+### Target resolution
+
+Every `antfly ha` invocation resolves exactly one target before the verb runs.
+Local targets open the node's WAL, slot store, and fence store directly and are
+meant for a stopped node or break-glass repair; remote targets speak to a
+running node's `/admin/v1/ha` API and are the normal path. Precedence, highest
+first:
+
+1. Explicit flags: `--admin-url` (remote) or any local handle flag
+   (`--primary-log`, `--standby-log`, `--fence-wal`, ...). The `--ha-*` spellings
+   are accepted as aliases.
+2. Environment: `ANTFLY_HA_ADMIN_URL` supplies a remote target when no flag
+   chose one; `ANTFLY_HA_ADMIN_TOKEN`, when set, supplies the token variable for
+   any remote target that lacks `--admin-token-env`. This follows the
+   `ANTFLY_URL`/`ANTFLY_TOKEN` convention of the data-plane CLI.
+3. Config file: `--config <file>` reads the server's `ha` section. If it names
+   `ha.admin.url`, the command is remote, because a node with a configured admin
+   endpoint is expected to be running and to own its files. Otherwise the
+   section's paths and identity become local handles. `ha.admin.token_env`
+   fills the token variable for any remote target.
+4. Data directory: `--data-dir <dir>` opens whatever HA state exists under
+   `<dir>/ha/` (see the layout below). Nothing is created; a directory with no
+   HA state is an error rather than an empty database.
+
+Local handles and `--data-dir` always win over a remote default, so a
+configured or environment-supplied admin URL can never turn a local-file
+command into an HTTP call by surprise. Raw token flags (`--admin-token`,
+`--token`, `--*-token-file`) are refused at parse time; tokens reach the CLI
+only through the environment. The literal `--` before the verb, which older
+scripts and the operator's generated command lines still emit, is accepted and
+ignored.
+
+### Identity
+
+Every replication log and progress WAL records the identity it was written
+under (cluster, shard, table, timeline, epoch). `--data-dir` and the local
+config path read that identity back instead of requiring the five identity
+flags: a standby's identity comes from the newest record in its progress WAL
+(`standby.readPersistedIdentity`), a primary's from the newest replication
+record (`primary.readPersistedIdentity`). Explicit identity flags override the
+derived values field by field, which is what recovery procedures need when the
+files disagree with the operator's intent. A fresh primary with no records has
+no identity to read and must be given one, exactly as `antfly standalone`
+requires on first start.
+
+### Data directory layout
+
+`antfly ha --data-dir` and the Kubernetes operator agree on one layout under
+the data root, documented in `DATA_DIR.md`:
+
+```text
+<data-dir>/ha/
+  primary.wal            primary replication log
+  slots                  replication slot store
+  standby.wal            standby receive log
+  standby-progress.wal   standby durable progress
+  fence.wal              promotion fence store
+```
+
+Role is inferred from which files exist: primary if `primary.wal` and `slots`
+are present, standby if `standby.wal` and `standby-progress.wal` are present,
+and a node that has been promoted in place may legitimately have both. The
+former-primary log used by `rejoin rewind` is not derived because it is the
+primary log itself and opening it twice in one process would contend for the
+same lock; `rewind` runs against a stopped node with an explicit
+`--former-primary-log`.
+
+### The `ha` config section
+
+`specs/openapi/antfly/config.yaml` defines `HAConfig`, mirrored one-to-one onto
+the `antfly standalone --ha-*` flags:
+
+```yaml
+ha:
+  admin:     { url: http://127.0.0.1:8080, token_env: ANTFLY_HA_ADMIN_TOKEN }
+  identity:  { cluster_id: 1, shard_id: 0, table_id: 0, timeline_id: 1, epoch: 1 }
+  primary:   { log: /antflydb/ha/primary.wal, slots: /antflydb/ha/slots, node_id: primary-a }
+  standby:   { log: ..., progress: ..., node_id: standby-a, upstream_url: http://primary:8080, slot: standby-a }
+  sync:      { mode: remote-write, selection: any, required: 1, standbys: [standby-a], failure: block }
+  retention: { max_lag_lsn: 0, max_retained_bytes: 0, max_retained_age_ns: 0 }
+  fence_wal: /antflydb/ha/fence.wal
+  former_primary_log: /antflydb/ha/primary.wal
+```
+
+`antfly standalone --config` fills any HA flag it was not given from this
+section; a flag on the command line always wins, so the operator's generated
+argument lists keep their exact meaning and the section removes repetition
+rather than changing precedence. `admin.token_env` is the same variable the
+server requires for bearer authentication and the CLI reads to authenticate, so
+the token itself never appears in configuration. The startup-gate flags used by
+seed activation (`--ha-startup-*`) are deliberately not mirrored: they are
+per-generation evidence the operator computes, not durable configuration.
+
+### Fence generation allocation
+
+`POST /ha/fence` no longer requires `generation`. When the field is omitted the
+fence store allocates the next generation itself: the held receipt's generation
+plus one, or 1 when no fence exists. Two rules keep this safe:
+
+- **Idempotent retries.** A retried omitted-generation request whose other
+  fields match the held receipt returns that receipt instead of minting a new
+  fence. Without this, a lost response followed by a retry would double-fence,
+  and a caller that also advanced timeline and epoch could double-promote.
+- **Authority stays external where one exists.** Allocation is a node-local
+  counter. Under a Kubernetes Lease authority the generation must remain the
+  exact Lease transition, so the operator's plan-to-argv path still fails with
+  `FenceGenerationMissing` when `fencing_authority` is `kubernetes_lease`, and
+  the Lease watchdog still requires a positive `leaseTransitions`. Allocation
+  exists for standalone and human-driven deployments that have no Lease.
+
+Allocation happens inside `fencing.Store.acquirePromotionFence`, which already
+runs under the fence barrier and the HA state mutex, so the read of the held
+generation and the append of the new receipt are one critical section.
+
+### `follow`: repointing a standby without a restart
+
+A standby's upstream was fixed at process start; the puller read it immutably
+every round and the only way to move a standby to a new primary was a pod
+restart with new flags. `POST /ha/standby/upstream` (`antfly ha follow
+--upstream-url <url> --slot <name>`) replaces the upstream URL and slot a
+running standby pulls from. The request carries the identity the caller expects
+the standby to have; a mismatch is rejected with the existing `WrongTimeline`,
+`WrongEpoch`, and sibling errors (409), so a stale operator cannot repoint a node
+that has since been promoted or reseeded. A request that matches the current
+upstream returns `changed: false`, which makes retries idempotent. The node
+fails closed when it is not a configured standby or has already promoted. The
+swap also fixed a latent race: the replication round used to copy the upstream
+config before taking the state mutex and then use its slices across unlocked
+network I/O; the read now happens under the lock and superseded strings are
+retired only when no round can hold them.
+
+### `switchover`: planned primary change
+
+The operator's promotion chain is a failover chain: it is unreachable while the
+primary is healthy. `antfly ha switchover --to <standby-admin-url>` is the
+planned counterpart, composed entirely from existing typed routes plus
+`follow`. It is zero-loss without a drain endpoint because it fences the old
+primary first and only then reads the boundary:
+
+1. **Preflight, no writes.** Read `status primary` on the target and `status
+   standby` on `--to`. Refuse unless both report the same cluster, shard,
+   table, timeline, and epoch, the standby is active and not reseed-required,
+   and its lag is within `--max-lag-lsn`.
+2. **Fence the old primary.** `POST /ha/fence` on the primary with
+   `new_timeline_id = t+1`, `new_epoch = e+1`, `required_lsn = observed_lsn =
+   current_lsn`, `promoted_node_id` = the standby's node id, and `generation`
+   from `--generation` or allocated by the node. The primary's write gate fails
+   closed on the matching receipt; no further writes can land.
+3. **Wait for the boundary.** Re-read the fenced primary's final LSN and poll
+   the standby until received, applied, and safe-read LSNs reach it (bounded by
+   `--wait-timeout`). Writes that landed between preflight and the fence are
+   shipped normally; nothing is lost because nothing can be written after the
+   fence.
+4. **Fence and promote the standby.** `POST /ha/fence` on the standby with the
+   same fields and the same generation as the primary's receipt (so both nodes
+   hold one fence), then `POST /ha/promotion/assess` with `required_lsn` set to
+   the final LSN and `use_current_fence`, requiring mode `safe`, then
+   `POST /ha/promotion/current-fence`.
+5. **Assess the old primary's rejoin.** Read `fence/current` from the new
+   primary and `POST /ha/rejoin/assess` on the old one with the receipt. A
+   quiesced switchover forks exactly at the boundary, so the verdict is
+   `rewind`. The rewind itself is not executed here: the old node still owns
+   its replication log while it runs in the primary role, and a log cannot be
+   opened twice in one process, so `POST /ha/rejoin/rewind` runs after the
+   node restarts in the standby role with `former_primary_log` configured. The
+   CLI reports the step as `rejoin-rewind-pending`. If the verdict is `reseed`,
+   `POST /ha/rejoin/reseed` on the new primary marks the slot immediately.
+6. **Follow.** Every URL given with `--follower` receives `POST
+   /ha/standby/upstream` pointing at `--new-upstream-url` (default `--to`),
+   with the pre-switchover identity as the precondition.
+
+Failure between steps 2 and 4 leaves the old primary fenced and read-only,
+which is the safe side: the operator can retry the switchover once the standby
+catches up, or promote with `force` knowingly. The CLI prints each step's
+typed receipt so the sequence is auditable, and `--dry-run` stops after
+preflight. Two limits remain and are listed under Open work: the demoted
+primary keeps running in the primary role until it is restarted with
+`ha.standby.*` configuration (the operator does this by rolling the pod), at
+which point its pending rewind runs, and the Kubernetes operator does not yet
+plan a switchover itself.
 
 ## Test Strategy
 
@@ -1238,3 +1436,16 @@ described in [Implementation](#implementation):
   `go/pkg/operator/docs/operations/hot-standby-ha.md`, but further work to
   make edge cases boring (for example, richer degraded-state guidance) can
   continue without changing the core contract.
+- **Operator-planned switchover**: `antfly ha switchover` composes the planned
+  sequence from typed routes, but the Kubernetes operator still plans only
+  failover; a `spec`-driven planned switchover that reuses the same steps and
+  the new `standby/upstream` route is the next automation step.
+- **Role change without restart**: a demoted primary stays in the primary
+  role, still owning its replication log, until it restarts with
+  `ha.standby.*` configuration; only then can its rewind run. A runtime role
+  switch would need the promotion handoff machinery to run in reverse and a
+  way to hand the log from the primary owner to the rewind path.
+- **Drain endpoint**: the switchover relies on fencing to stop writes and then
+  reads the final LSN. An explicit "stop accepting writes and report the final
+  LSN" call would let the CLI report the boundary before fencing; it is not
+  required for correctness.

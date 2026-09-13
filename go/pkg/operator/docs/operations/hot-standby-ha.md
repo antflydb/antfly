@@ -61,9 +61,13 @@ the operator pod through `spec.highAvailability.admin.tokenEnvVar`. Use
 `spec.standalone.envFrom` only when the same Secret is already being injected for
 other runtime configuration.
 
-When using CLI commands, pass `--ha-token-env ANTFLY_HA_ADMIN_TOKEN`. Do not
-put raw tokens in command-line flags because argv can be exposed through process
-inspection and job history.
+When using CLI commands against a running node, pass `--admin-url <url>`; the
+token is read from `ANTFLY_HA_ADMIN_TOKEN` when that variable is set, or from
+the variable named by `--admin-token-env`. On the node itself,
+`antfly ha --data-dir /antflydb status primary` opens the local HA state without
+any path or identity flags. Do not put raw tokens in command-line flags because
+argv can be exposed through process inspection and job history. The older
+`--ha-url` and `--ha-token-env` spellings still work.
 
 ## Daily Checks
 
@@ -306,6 +310,66 @@ assessment, standby promotion, primary-route update, and former-primary repair.
 Safe promotion and forced lossy promotion must produce distinct receipts. A
 forced promotion should be treated as an explicit RPO decision, not as the
 default failure path.
+
+## Planned Switchover
+
+Use a planned switchover when the primary is healthy and you want to move the
+primary role to a standby for maintenance, a node replacement, or a zone move.
+The operator's automatic promotion path is failover only and stays out of the
+way while the primary is reachable, so a planned change is driven from the CLI:
+
+```bash
+antfly ha --admin-url http://primary-a:8080 switchover \
+  --to http://standby-a:8080 \
+  --follower http://standby-b:8080 \
+  --wait-timeout 60s
+```
+
+The command runs the sequence described in `zig/HOT_STANDBY.md` under
+"switchover": preflight both nodes without writing, fence the old primary so
+writes stop, wait for the standby to reach the primary's final LSN, fence and
+promote the standby with the same fence generation, run the former-primary
+rejoin assessment (rewind is reported as pending until the old node restarts as
+a standby; reseed is applied immediately), and repoint each `--follower` at the
+new primary.
+Every step prints its typed receipt; add `--json` to capture them for the change
+record and `--dry-run` to stop after preflight.
+
+Fence generation: with Kubernetes Lease fencing, pass `--generation` with the
+Lease's current transition value. Without a Lease authority, omit it and the
+primary allocates the next generation; the CLI reuses that generation when it
+fences the standby so both nodes hold one fence.
+
+If the command fails after the primary was fenced, the old primary is read-only
+and no data was lost. Either rerun the switchover once the standby has caught
+up, or promote with `force` as an explicit RPO decision. After a successful
+switchover, roll the former primary's pod into the standby role (the operator
+does this from `spec.highAvailability.runtime.standby`) with
+`former_primary_log` configured, then run `antfly ha rejoin rewind` against it;
+a running primary owns its log, so the rewind cannot happen before the restart.
+
+### Repointing a standby
+
+A standby can be moved to a different primary without a restart:
+
+```bash
+antfly ha --admin-url http://standby-b:8080 follow \
+  --upstream-url http://standby-a:8080 --slot standby-b \
+  --cluster-id 1 --timeline-id 3 --epoch 3
+```
+
+The identity flags are a precondition: the request is rejected with a 409 if
+the standby's current timeline or epoch differs, so a stale runbook step cannot
+repoint a node that has since been promoted or reseeded. Repeating the same
+request is a no-op (`changed: false`).
+
+### Using the config file
+
+`antfly ha --config /etc/antfly/config.json` reads the server's `ha` section.
+When it names `ha.admin.url` the command targets that endpoint and reads the
+token from the variable in `ha.admin.token_env`; otherwise the section's paths
+and identity are used as local handles. On a node with the standard layout,
+`antfly ha --data-dir /antflydb status primary` needs no flags at all.
 
 ## Former Primary Return
 

@@ -742,6 +742,27 @@ pub const Primary = struct {
     }
 };
 
+/// Returns the identity carried by the newest record in the primary
+/// replication log, or `null` when the log is empty. Every replication record
+/// embeds the cluster, shard, table, timeline, and epoch it was written under,
+/// so the last record is the current identity of the log. Used by
+/// `antfly ha --data-dir` to avoid typing identity flags.
+pub fn readPersistedIdentity(alloc: Allocator, log_path: [*:0]const u8, options: OpenOptions) !?Identity {
+    var log = try replication_log.ReplicationLog.open(log_path, options.replication_log_options);
+    defer log.close();
+    const last_lsn = log.lastLsn();
+    if (last_lsn == 0) return null;
+    var entry = (try log.entryAt(alloc, last_lsn)) orelse return null;
+    defer entry.deinit(alloc);
+    return .{
+        .cluster_id = entry.record.cluster_id,
+        .shard_id = entry.record.shard_id,
+        .table_id = entry.record.table_id,
+        .timeline_id = entry.record.timeline_id,
+        .epoch = entry.record.epoch,
+    };
+}
+
 fn validateSlotName(name: []const u8) !void {
     if (!validation.isIdentifier(name)) return error.InvalidSlotName;
 }

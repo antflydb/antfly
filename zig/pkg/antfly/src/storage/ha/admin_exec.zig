@@ -95,6 +95,25 @@ pub const RejoinReseedResult = struct {
     reseed: rejoin.ReseedResult,
 };
 
+pub const PreviousStandbyUpstream = struct {
+    upstream_url: []const u8,
+    slot_name: []const u8,
+};
+
+/// `standby upstream` / `follow` has no local execution path (see `execute`
+/// below): it always runs remote-only, through the typed admin HTTP route.
+/// This result and its renderers exist so `Result`'s render switches stay
+/// exhaustive and so a caller that already has a parsed
+/// `admin_api.HAStandbyUpstreamResponse` can format it consistently with
+/// every other HA command.
+pub const StandbyUpstreamResult = struct {
+    upstream_url: []const u8,
+    slot_name: []const u8,
+    identity: standby_mod.Identity,
+    previous: ?PreviousStandbyUpstream = null,
+    changed: bool,
+};
+
 pub const Result = union(enum) {
     identify_system: replication_api.IdentifySystemResponse,
     slot: admin.SlotResult,
@@ -105,6 +124,7 @@ pub const Result = union(enum) {
     start_replication: replication_api.StartReplicationResponse,
     stream_once: session.Result,
     standby_status_update: replication_api.StandbyStatusUpdateResponse,
+    standby_upstream: StandbyUpstreamResult,
     primary_status: status.PrimarySnapshot,
     standby_status: status.StandbySnapshot,
     primary_metrics: metrics.PrimaryMetrics,
@@ -208,6 +228,10 @@ fn renderJsonWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Res
         },
         .promote_current_fence => |promotion_result| try renderPromotionJsonAlloc(alloc, promotion_result),
         .promote => |promotion_result| try renderPromotionJsonAlloc(alloc, promotion_result),
+        .standby_upstream => |outcome| blk: {
+            const node_id = standbyActionNodeID(maybe_ctx) orelse return error.StandbyNodeIDUnavailable;
+            break :blk try renderStandbyUpstreamJsonAlloc(alloc, node_id, outcome);
+        },
         .rejoin_assess => |assessment| try renderRejoinAssessJsonAlloc(alloc, assessment),
         .rejoin_rewind => |rewind_result| try renderRejoinRewindJsonAlloc(alloc, rewind_result),
         .rejoin_reseed => |reseed_result| {
@@ -386,6 +410,28 @@ fn renderPromotionJsonAlloc(alloc: Allocator, result: admin.FencedPromotionResul
         .fence_generation = try adminI64(result.fence_generation),
         .fence_token = result.fence_token,
         .forced = result.forced,
+    }, .{});
+}
+
+fn renderStandbyUpstreamJsonAlloc(alloc: Allocator, node_id: []const u8, result: StandbyUpstreamResult) ![]u8 {
+    const action_id = try std.fmt.allocPrint(alloc, "standby_upstream:{s}", .{result.slot_name});
+    defer alloc.free(action_id);
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HAStandbyUpstreamResponse{
+        .schema_version = 1,
+        .action = adminActionReceipt(
+            action_id,
+            "standby_upstream",
+            result.slot_name,
+            if (result.changed) "applied" else "already_applied",
+            node_id,
+        ),
+        .identity = try adminIdentity(result.identity),
+        .upstream = .{ .upstream_url = result.upstream_url, .slot_name = result.slot_name },
+        .previous = if (result.previous) |previous| .{
+            .upstream_url = previous.upstream_url,
+            .slot_name = previous.slot_name,
+        } else null,
+        .changed = result.changed,
     }, .{});
 }
 
@@ -838,6 +884,25 @@ fn renderTableWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Re
             try appendOptionalLine(alloc, &out, "last_error", response.last_error);
             try appendU64Line(alloc, &out, "current_lsn", response.current_lsn);
         },
+        .standby_upstream => |outcome| {
+            const node_id = standbyActionNodeID(maybe_ctx);
+            try appendActionReceiptLines(
+                alloc,
+                &out,
+                "standby_upstream",
+                outcome.slot_name,
+                if (outcome.changed) "applied" else "already_applied",
+                node_id,
+            );
+            try appendIdentityLines(alloc, &out, "identity", outcome.identity);
+            try appendLine(alloc, &out, "upstream.upstream_url", outcome.upstream_url);
+            try appendLine(alloc, &out, "upstream.slot_name", outcome.slot_name);
+            if (outcome.previous) |previous| {
+                try appendLine(alloc, &out, "previous.upstream_url", previous.upstream_url);
+                try appendLine(alloc, &out, "previous.slot_name", previous.slot_name);
+            }
+            try appendBoolLine(alloc, &out, "changed", outcome.changed);
+        },
         .primary_status => |snapshot| try appendPrimarySnapshotLines(alloc, &out, snapshot),
         .standby_status => |snapshot| try appendStandbySnapshotLines(alloc, &out, snapshot),
         .primary_metrics => |snapshot| try appendPrimaryMetricsLines(alloc, &out, snapshot),
@@ -1000,6 +1065,13 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         .standby_status_update => |request| .{
             .standby_status_update = try admin.updateStandbyProgress(try requirePrimary(ctx), request),
         },
+        // `standby upstream` / `follow` repoints the runtime's own
+        // continuous-replication puller, which this local/CLI execution
+        // path has no handle to (there is no `*DataServer` here, only the
+        // narrower HA primitives in `Context`). It is remote-only: routed
+        // through `POST /admin/v1/ha/standby/upstream` via
+        // `http_client.setStandbyUpstream`, never through this executor.
+        .standby_upstream => return error.StandbyUpstreamRequiresAdminApi,
         .primary_status => |command| try executePrimaryStatus(alloc, try requirePrimary(ctx), command),
         .standby_status => |command| executeStandbyStatus(try requireStandby(ctx), command),
         .commit_check => |command| .{
@@ -1339,6 +1411,7 @@ fn resultName(result: Result) []const u8 {
         .start_replication => "start_replication",
         .stream_once => "stream_once",
         .standby_status_update => "standby_status_update",
+        .standby_upstream => "standby_upstream",
         .primary_status => "primary_status",
         .standby_status => "standby_status",
         .primary_metrics => "primary_metrics",

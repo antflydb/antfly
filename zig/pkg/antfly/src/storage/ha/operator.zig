@@ -174,6 +174,11 @@ pub const AdminCommandOptions = struct {
     fence_token: ?[]const u8 = null,
     force: bool = false,
     reason: []const u8 = "operator",
+    /// The auto-failover fencing authority in effect. Only `.kubernetes_lease`
+    /// requires an explicit `fence_generation` (it must carry the exact
+    /// spec.leaseTransitions value); every other authority may omit it and
+    /// let the storage node allocate the next generation itself.
+    fencing_authority: FencingAuthority = .none,
 };
 
 pub const AdminCommand = struct {
@@ -704,8 +709,12 @@ pub fn adminCommandForAction(
             try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_timeline_id orelse return error.NewTimelineIdMissing});
             try appendArg(alloc, &argv, "--new-epoch");
             try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_epoch orelse return error.NewEpochMissing});
-            try appendArg(alloc, &argv, "--generation");
-            try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.fence_generation orelse return error.FenceGenerationMissing});
+            if (options.fence_generation) |fence_generation| {
+                try appendArg(alloc, &argv, "--generation");
+                try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{fence_generation});
+            } else if (options.fencing_authority == .kubernetes_lease) {
+                return error.FenceGenerationMissing;
+            }
             try appendArg(alloc, &argv, "--required-lsn");
             try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{action.target_lsn orelse return error.RequiredLsnMissing});
             try appendArg(alloc, &argv, "--observed-lsn");
@@ -741,8 +750,12 @@ pub fn adminCommandForAction(
                 try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_timeline_id orelse return error.NewTimelineIdMissing});
                 try appendArg(alloc, &argv, "--new-epoch");
                 try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_epoch orelse return error.NewEpochMissing});
-                try appendArg(alloc, &argv, "--generation");
-                try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.fence_generation orelse return error.FenceGenerationMissing});
+                if (options.fence_generation) |fence_generation| {
+                    try appendArg(alloc, &argv, "--generation");
+                    try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{fence_generation});
+                } else if (options.fencing_authority == .kubernetes_lease) {
+                    return error.FenceGenerationMissing;
+                }
                 try appendArg(alloc, &argv, "--required-lsn");
                 try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{action.target_lsn orelse return error.RequiredLsnMissing});
                 try appendArg(alloc, &argv, "--observed-lsn");
@@ -804,7 +817,9 @@ fn appendFormerPrimaryRejoinCommand(
     const promoted_node_id = options.promoted_node_id orelse return error.PromotedNodeIdMissing;
     const new_timeline_id = options.new_timeline_id orelse return error.NewTimelineIdMissing;
     const new_epoch = options.new_epoch orelse return error.NewEpochMissing;
-    const fence_generation = options.fence_generation orelse return error.FenceGenerationMissing;
+    if (options.fence_generation == null and options.fencing_authority == .kubernetes_lease) {
+        return error.FenceGenerationMissing;
+    }
     const fence_token = options.fence_token orelse return error.FenceTokenMissing;
 
     try appendArg(alloc, argv, "--fence-old-primary-id");
@@ -823,8 +838,10 @@ fn appendFormerPrimaryRejoinCommand(
     try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{target_lsn});
     try appendArg(alloc, argv, "--fence-observed-lsn");
     try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{target_lsn});
-    try appendArg(alloc, argv, "--fence-generation");
-    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{fence_generation});
+    if (options.fence_generation) |fence_generation| {
+        try appendArg(alloc, argv, "--fence-generation");
+        try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{fence_generation});
+    }
     try appendArg(alloc, argv, "--fence-token");
     try appendArg(alloc, argv, fence_token);
     try appendArg(alloc, argv, "--fence-reason");
@@ -2251,6 +2268,46 @@ test "storage.ha operator renders executable admin command for fenced promotion"
     try std.testing.expectEqual(@as(u64, 12), fence.required_lsn);
     try std.testing.expectEqual(@as(u64, 12), fence.observed_lsn);
     try std.testing.expectEqualStrings("operator-approved", fence.reason);
+}
+
+test "storage.ha operator omits fence generation flag when fencing authority is not kubernetes lease" {
+    const alloc = std.testing.allocator;
+    const identity = primary_mod.Identity{ .cluster_id = 100, .shard_id = 10, .table_id = 20, .timeline_id = 1, .epoch = 1 };
+
+    var acquire = (try adminCommandForAction(alloc, .{
+        .kind = .acquire_fence,
+        .standby_name = "standby-a",
+        .target_lsn = 12,
+        .reason = "AutomaticFailoverReady",
+    }, identity, .{
+        .old_primary_id = "primary-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .reason = "operator-approved",
+    })).?;
+    defer acquire.deinit(alloc);
+
+    for (acquire.argv) |arg| {
+        try std.testing.expect(!std.mem.eql(u8, arg, "--generation"));
+    }
+}
+
+test "storage.ha operator requires explicit fence generation for kubernetes lease authority" {
+    const alloc = std.testing.allocator;
+    const identity = primary_mod.Identity{ .cluster_id = 100, .shard_id = 10, .table_id = 20, .timeline_id = 1, .epoch = 1 };
+
+    try std.testing.expectError(error.FenceGenerationMissing, adminCommandForAction(alloc, .{
+        .kind = .acquire_fence,
+        .standby_name = "standby-a",
+        .target_lsn = 12,
+        .reason = "AutomaticFailoverReady",
+    }, identity, .{
+        .old_primary_id = "primary-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .reason = "operator-approved",
+        .fencing_authority = .kubernetes_lease,
+    }));
 }
 
 test "storage.ha operator plans former primary demotion without fence" {

@@ -84,8 +84,8 @@ pub const FenceAcquireRequest = struct {
     promoted_node_id: HANodeID,
     new_timeline_id: i64,
     new_epoch: i64,
-    /// Exact Kubernetes Lease transition generation authorizing this fence.
-    generation: i64,
+    /// Fence generation authorizing this fence. When the fencing authority is a Kubernetes Lease this is the exact Lease transition generation and must be supplied. When omitted, the node allocates the next generation itself: the current durable fence generation plus one, or 1 when no fence exists. Allocation is only permitted when the node is not configured with an external fencing authority, so a Lease-managed cluster cannot be fenced by an unauthorized caller.
+    generation: ?i64 = null,
     required_lsn: i64,
     observed_lsn: i64,
     force: bool,
@@ -98,7 +98,7 @@ pub const FenceAcquireRequest = struct {
         .{ "promoted_node_id", "promoted_node_id", false },
         .{ "new_timeline_id", "new_timeline_id", false },
         .{ "new_epoch", "new_epoch", false },
-        .{ "generation", "generation", false },
+        .{ "generation", "generation", true },
         .{ "required_lsn", "required_lsn", false },
         .{ "observed_lsn", "observed_lsn", false },
         .{ "force", "force", false },
@@ -125,8 +125,10 @@ pub const FenceAcquireRequest = struct {
         try jw.write(self.new_timeline_id);
         try jw.objectField("new_epoch");
         try jw.write(self.new_epoch);
-        try jw.objectField("generation");
-        try jw.write(self.generation);
+        if (self.generation) |value| {
+            try jw.objectField("generation");
+            try jw.write(value);
+        }
         try jw.objectField("required_lsn");
         try jw.write(self.required_lsn);
         try jw.objectField("observed_lsn");
@@ -1125,6 +1127,59 @@ pub const HAStandbyStatusResponse = struct {
     snapshot: HAStandbySnapshot,
 };
 
+pub const HAStandbyUpstream = struct {
+    upstream_url: []const u8,
+    slot_name: HASlotName,
+};
+
+pub const HAStandbyUpstreamResponse = struct {
+    schema_version: i64,
+    action: HAActionReceipt,
+    identity: HAIdentity,
+    upstream: HAStandbyUpstream,
+    /// Upstream in effect before this request. Absent when the standby had no continuous upstream configured.
+    previous: ?HAStandbyUpstream = null,
+    /// False when the requested upstream already matched, which makes retries idempotent.
+    changed: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "action", "action", false },
+        .{ "identity", "identity", false },
+        .{ "upstream", "upstream", false },
+        .{ "previous", "previous", true },
+        .{ "changed", "changed", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("upstream");
+        try jw.write(self.upstream);
+        if (self.previous) |value| {
+            try jw.objectField("previous");
+            try jw.write(value);
+        }
+        try jw.objectField("changed");
+        try jw.write(self.changed);
+        try jw.endObject();
+    }
+};
+
 pub const HASyncPolicy = struct {
     /// Durability mode to require before acknowledging the commit.
     mode: []const u8,
@@ -1486,6 +1541,46 @@ pub const StandbyBootstrapRequest = struct {
                 try jw.objectField("content_root");
                 try jw.write(value);
             },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const StandbyUpstreamRequest = struct {
+    /// Identity the standby is expected to have right now. Mismatch rejects the swap.
+    identity: HAIdentity,
+    /// Base URL of the primary to pull from.
+    upstream_url: []const u8,
+    slot_name: HASlotName,
+    reason: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "identity", "identity", false },
+        .{ "upstream_url", "upstream_url", false },
+        .{ "slot_name", "slot_name", false },
+        .{ "reason", "reason", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("upstream_url");
+        try jw.write(self.upstream_url);
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
         }
         try jw.endObject();
     }

@@ -373,6 +373,24 @@ pub const Client = struct {
         return result;
     }
 
+    /// Repoints a running standby's continuous-replication puller at a new
+    /// upstream primary and slot, without a restart. Backs `antfly ha follow`.
+    pub fn setStandbyUpstream(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.StandbyUpstreamRequest,
+    ) !ParsedOutput(admin_api.HAStandbyUpstreamResponse) {
+        var result = try self.postJson(
+            admin_api.HAStandbyUpstreamResponse,
+            base_uri,
+            admin_api.routes.ha_standby_upstream,
+            request,
+        );
+        errdefer result.deinit(self.alloc);
+        try validateStandbyUpstreamResponse(result.parsed.value, request);
+        return result;
+    }
+
     pub fn acquireFence(
         self: *Client,
         base_uri: []const u8,
@@ -797,6 +815,51 @@ fn validateStandbyBootstrapResponse(response: admin_api.HAStandbyBootstrapRespon
     if (response.backup_lsn <= 0 or response.checkpoint_lsn <= 0) return error.AdminSeedResponseMismatch;
 }
 
+fn validateStandbyUpstreamResponse(
+    response: admin_api.HAStandbyUpstreamResponse,
+    request: admin_api.StandbyUpstreamRequest,
+) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminStandbyUpstreamResponseMismatch);
+    // `receiptStateMatches` already treats "already_applied" as satisfying
+    // an "applied" expectation, which covers both the real-swap and the
+    // idempotent-retry (changed=false) outcomes.
+    try validateActionReceipt(response.action, "standby_upstream", "applied", request.slot_name, error.AdminStandbyUpstreamResponseMismatch);
+    try validateIdentity(response.identity, error.AdminStandbyUpstreamResponseMismatch);
+    if (response.identity.cluster_id != request.identity.cluster_id or
+        response.identity.shard_id != request.identity.shard_id or
+        response.identity.table_id != request.identity.table_id or
+        response.identity.timeline_id != request.identity.timeline_id or
+        response.identity.epoch != request.identity.epoch)
+    {
+        return error.AdminStandbyUpstreamResponseMismatch;
+    }
+    if (response.upstream.upstream_url.len == 0 or !validation.isIdentifier(response.upstream.slot_name)) {
+        return error.AdminStandbyUpstreamResponseMismatch;
+    }
+    if (!std.mem.eql(u8, response.upstream.upstream_url, request.upstream_url) or
+        !std.mem.eql(u8, response.upstream.slot_name, request.slot_name))
+    {
+        return error.AdminStandbyUpstreamResponseMismatch;
+    }
+    if (response.previous) |previous| {
+        if (previous.upstream_url.len == 0 or !validation.isIdentifier(previous.slot_name)) {
+            return error.AdminStandbyUpstreamResponseMismatch;
+        }
+        if (!response.changed and
+            (!std.mem.eql(u8, previous.upstream_url, request.upstream_url) or
+                !std.mem.eql(u8, previous.slot_name, request.slot_name)))
+        {
+            // changed=false is only valid as an idempotent retry: the
+            // "previous" pair must be exactly what we asked for.
+            return error.AdminStandbyUpstreamResponseMismatch;
+        }
+    } else if (!response.changed) {
+        // No previous upstream but also no change is a contradiction: an
+        // unconfigured upstream can never already equal the request.
+        return error.AdminStandbyUpstreamResponseMismatch;
+    }
+}
+
 fn validateFenceReceipt(receipt: admin_api.HAFenceReceipt) !void {
     try validateIdentity(receipt.identity, error.AdminFenceResponseMismatch);
     if (!validation.isIdentifier(receipt.old_primary_id) or !validation.isIdentifier(receipt.promoted_node_id) or receipt.token.len == 0) {
@@ -826,9 +889,15 @@ fn validateFenceResponse(response: admin_api.HAFenceResponse, request: admin_api
         response.receipt.identity.timeline_id != request.new_timeline_id or
         response.receipt.identity.epoch != request.new_epoch or
         response.receipt.parent_timeline_id != request.identity.timeline_id or
-        response.receipt.parent_epoch != request.identity.epoch or
-        response.receipt.generation != request.generation)
+        response.receipt.parent_epoch != request.identity.epoch)
     {
+        return error.AdminFenceResponseMismatch;
+    }
+    // An omitted generation asks the node to allocate one; the receipt then
+    // carries whatever it allocated, which only has to be positive.
+    if (request.generation) |generation| {
+        if (response.receipt.generation != generation) return error.AdminFenceResponseMismatch;
+    } else if (response.receipt.generation < 1) {
         return error.AdminFenceResponseMismatch;
     }
     if (!std.mem.eql(u8, response.receipt.promoted_node_id, request.promoted_node_id)) return error.AdminFenceResponseMismatch;
@@ -1801,6 +1870,71 @@ test "storage.ha http client round trips typed seed operations" {
     try std.testing.expectEqualStrings("base-http-client", bootstrap.parsed.value.manifest_id);
     try std.testing.expectEqual(@as(i64, 2), bootstrap.parsed.value.checkpoint_lsn);
     try std.testing.expectEqual(@as(u64, 3), standby.nextReceiveLsn());
+}
+
+test "storage.ha http client round trips typed standby upstream operations" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "typed-standby-upstream");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    const FakeHook = struct {
+        fn run(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            upstream_url: []const u8,
+            slot_name: []const u8,
+            expected_identity: standby_mod.Identity,
+        ) anyerror!http_admin.Server.StandbyUpstreamResult {
+            const current_identity = testIdentity();
+            if (expected_identity.shard_id != current_identity.shard_id) return error.WrongShard;
+            const changed = !std.mem.eql(u8, upstream_url, "http://primary-a.internal.test") or
+                !std.mem.eql(u8, slot_name, "standby-a");
+            return .{
+                .identity = current_identity,
+                .previous = .{ .upstream_url = "http://primary-a.internal.test", .slot_name = "standby-a" },
+                .changed = changed,
+            };
+        }
+    };
+    var fake_hook_state: u8 = 0;
+    var server = http_admin.Server.initWithOptions(alloc, .{
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+    }, .{ .standby_upstream = .{ .ptr = &fake_hook_state, .run_fn = FakeHook.run } });
+    defer server.deinit();
+    var client = Client.init(alloc, server.executor());
+
+    var swapped = try client.setStandbyUpstream("http://ha-admin.test", .{
+        .identity = testAdminIdentity(),
+        .upstream_url = "http://primary-b.internal.test",
+        .slot_name = "standby-a",
+        .reason = "switchover",
+    });
+    defer swapped.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 1), swapped.parsed.value.schema_version);
+    try std.testing.expectEqualStrings("http://primary-b.internal.test", swapped.parsed.value.upstream.upstream_url);
+    try std.testing.expect(swapped.parsed.value.changed);
+    try std.testing.expectEqualStrings("http://primary-a.internal.test", swapped.parsed.value.previous.?.upstream_url);
+
+    var unchanged = try client.setStandbyUpstream("http://ha-admin.test", .{
+        .identity = testAdminIdentity(),
+        .upstream_url = "http://primary-a.internal.test",
+        .slot_name = "standby-a",
+    });
+    defer unchanged.deinit(alloc);
+    try std.testing.expect(!unchanged.parsed.value.changed);
+
+    var wrong_identity = testAdminIdentity();
+    wrong_identity.shard_id += 1;
+    try std.testing.expectError(error.HaCommandConflict, client.setStandbyUpstream("http://ha-admin.test", .{
+        .identity = wrong_identity,
+        .upstream_url = "http://primary-c.internal.test",
+        .slot_name = "standby-a",
+    }));
 }
 
 test "storage.ha http client round trips typed safety operations" {

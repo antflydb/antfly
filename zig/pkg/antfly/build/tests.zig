@@ -2223,10 +2223,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
+    // The root file-imports cli_root.zig, which reaches storage and runtime
+    // sources that need the same module graph as the full test module.
+    test_imports.configure(b, ha_cli_test_mod, true, true);
+    ha_cli_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     ha_cli_test_mod.addImport("antfly-zig", antfly_mod);
     const ha_cli_tests = b.addTest(.{
         .root_module = ha_cli_test_mod,
-        .filters = &.{"ha cmd artifact"},
+        .filters = &.{"ha cmd"},
     });
     const run_ha_cli_tests = b.addRunArtifact(ha_cli_tests);
     ha_test_step.dependOn(&run_ha_cli_tests.step);
