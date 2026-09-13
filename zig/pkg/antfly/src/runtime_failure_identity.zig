@@ -50,6 +50,7 @@ const mappings = [_]Mapping{
     .{ .status = .index_not_found, .err = error.IndexNotFound },
     .{ .status = .identity_read_generation_changed, .err = error.IdentityReadGenerationChanged },
     .{ .status = .timeout, .err = error.Timeout },
+    .{ .status = .read_index_timeout, .err = error.ReadIndexTimeout },
     .{ .status = .table_visibility_timeout, .err = error.TableVisibilityTimeout },
     .{ .status = .cancelled, .err = error.Cancelled },
     .{ .status = .canceled, .err = error.Canceled },

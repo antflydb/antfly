@@ -363,6 +363,7 @@ pub const Detail = enum(c_int) {
     graph_metric_action_partial_outcome,
     index_generation_mismatch,
     generation_transition_active,
+    read_index_timeout,
 };
 
 pub const Status = extern struct {
@@ -478,6 +479,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedVersion => status(.unsupported, .unsupported_version),
         error.UnsupportedPlatform => status(.unsupported, .unsupported_platform),
         error.Timeout => status(.timeout, .timeout),
+        error.ReadIndexTimeout => status(.timeout, .read_index_timeout),
         error.DeadlineExceeded => status(.timeout, .deadline_exceeded),
         error.PreDecisionDeadlineExceeded => status(.timeout, .pre_decision_deadline_exceeded),
         error.ConnectionTimeout => status(.timeout, .connection_timeout),
@@ -831,6 +833,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_exact_sort => "UnsupportedExactSort",
         .unsupported_version => "UnsupportedVersion",
         .timeout => "Timeout",
+        .read_index_timeout => "ReadIndexTimeout",
         .connection_timeout => "ConnectionTimeout",
         .connection_timed_out => "ConnectionTimedOut",
         .cancelled => "Cancelled",
@@ -1081,6 +1084,8 @@ test "transaction capacity rejection retains a permanent public status" {
 }
 
 test "stable status preserves public boundary semantics" {
+    try std.testing.expectEqual(error.ReadIndexTimeout, errorFromStatus(statusFromError(error.ReadIndexTimeout)));
+    try std.testing.expectEqual(@intFromEnum(Code.timeout), statusFromError(error.ReadIndexTimeout).code);
     try std.testing.expectEqual(error.GenerationTransitionActive, errorFromStatus(statusFromError(error.GenerationTransitionActive)));
     try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
     try std.testing.expectEqual(error.IndexGenerationMismatch, errorFromStatus(statusFromError(error.IndexGenerationMismatch)));

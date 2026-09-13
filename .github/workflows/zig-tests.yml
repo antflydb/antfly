@@ -1068,6 +1068,8 @@ jobs:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
       ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
+      # Permit the diagnostic debugger to attach to disposable test children.
+      ANTFLY_E2E_NATIVE_STACKS: "1"
       ANTFLY_CI_TRACE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
