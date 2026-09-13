@@ -1111,6 +1111,7 @@ components:
 
     ModelRef:
       type: object
+      additionalProperties: false
       description: |
         Model reference used by startup preload and model-loading configuration.
         When a preload selects an explicit backend, that warmed session also

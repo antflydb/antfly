@@ -377,6 +377,15 @@ pub const MaskedBceWithLogitsAttrs = struct {
     reduction: MaskedBceReduction = .mean,
 };
 
+/// Two-row projection through a frozen tied language-model head. The backend
+/// preserves the resident BF16 projection contract while avoiding a
+/// vocabulary-wide output. Only d_hidden is defined by the custom VJP.
+pub const SelectedTiedHeadAttrs = struct {
+    in_dim: u32,
+    vocab_size: u32,
+    frozen_weight: bool = false,
+};
+
 // ── Node ───────────────────────────────────────────────────────────────
 
 /// Discriminated union of all ops in the graph IR.
@@ -462,6 +471,8 @@ pub const OpCode = union(enum) {
     fused_argmax_last_row: ArgmaxAttrs,
     fused_softmax: SoftmaxAttrs,
     fused_log_softmax: SoftmaxAttrs,
+    fused_selected_tied_head_logits: SelectedTiedHeadAttrs,
+    fused_selected_tied_head_backward: SelectedTiedHeadAttrs,
     fused_masked_bce_with_logits_loss: MaskedBceWithLogitsAttrs,
     fused_masked_bce_with_logits_backward: MaskedBceWithLogitsAttrs,
 

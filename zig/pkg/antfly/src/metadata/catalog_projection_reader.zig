@@ -934,10 +934,12 @@ test "catalog projection waiter retries a shorter builder timeout" {
     const Worker = struct {
         reader: *CatalogProjectionReader,
         source: CatalogProjectionReader.Source,
-        deadline_ns: u64,
+        timeout_ns: u64,
+        deadline_ns: u64 = 0,
         failure: ?anyerror = null,
 
         fn run(self: *@This()) void {
+            self.deadline_ns = platform_time.monotonicNs() + self.timeout_ns;
             var snapshot = self.reader.routingSnapshot(std.testing.allocator, 91, self.source, self.deadline_ns) catch |err| {
                 self.failure = err;
                 return;
@@ -952,18 +954,20 @@ test "catalog projection waiter retries a shorter builder timeout" {
     var short = Worker{
         .reader = &reader,
         .source = fake.source(),
-        .deadline_ns = platform_time.monotonicNs() + 20 * std.time.ns_per_ms,
+        .timeout_ns = std.time.ns_per_s,
     };
     var short_thread = try std.testing.io.concurrent(Worker.run, .{&short});
     defer {
         fake.release_first.set(std.Options.debug_io);
         short_thread.await(std.testing.io);
     }
-    fake.first_entered.waitUncancelable(std.Options.debug_io);
+    try fake.first_entered.waitTimeout(std.Options.debug_io, .{
+        .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
+    });
     var patient = Worker{
         .reader = &reader,
         .source = fake.source(),
-        .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
+        .timeout_ns = 5 * std.time.ns_per_s,
     };
     var patient_thread = try std.testing.io.concurrent(Worker.run, .{&patient});
     defer {
@@ -980,7 +984,9 @@ test "catalog projection waiter retries a shorter builder timeout" {
         if (platform_time.monotonicNs() >= waiter_deadline) return error.TestUnexpectedResult;
         platform_clock.Clock.real().sleepMs(1);
     }
-    platform_clock.Clock.real().sleepMs(25);
+    while (platform_time.monotonicNs() < short.deadline_ns) {
+        platform_clock.Clock.real().sleepMs(1);
+    }
     fake.release_first.set(std.Options.debug_io);
     short_thread.await(std.testing.io);
     patient_thread.await(std.testing.io);
@@ -1025,10 +1031,13 @@ test "catalog projection timeout does not publish a late build" {
     const Worker = struct {
         reader: *CatalogProjectionReader,
         source: CatalogProjectionReader.Source,
-        deadline_ns: u64,
+        deadline_ns: u64 = 0,
         failure: ?anyerror = null,
 
         fn run(self: *@This()) void {
+            // Start the budget on the worker, not before scheduling it. The
+            // parent releases capture only after this deadline expires.
+            self.deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
             var snapshot = self.reader.routingSnapshot(std.testing.allocator, 91, self.source, self.deadline_ns) catch |err| {
                 self.failure = err;
                 return;
@@ -1043,11 +1052,20 @@ test "catalog projection timeout does not publish a late build" {
     var worker = Worker{
         .reader = &reader,
         .source = fake.source(),
-        .deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_ms,
     };
     var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
-    fake.entered.waitUncancelable(std.Options.debug_io);
-    platform_clock.Clock.real().sleepMs(20);
+    defer {
+        fake.proceed.set(std.Options.debug_io);
+        thread.await(std.testing.io);
+    }
+    // A worker that exits before capture must fail the test instead of
+    // leaving the harness blocked on an event that can never be signaled.
+    try fake.entered.waitTimeout(std.Options.debug_io, .{
+        .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
+    });
+    while (platform_time.monotonicNs() < worker.deadline_ns) {
+        platform_clock.Clock.real().sleepMs(1);
+    }
     fake.proceed.set(std.Options.debug_io);
     thread.await(std.testing.io);
 

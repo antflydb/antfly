@@ -4424,6 +4424,7 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
         try std.testing.expectEqualStrings("Origin", stream.headers.get("Vary").?);
         try std.testing.expectEqualStrings("stream-request", stream.headers.get("X-Request-ID").?);
         try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", stream.contentType().?);
+        if (!http2) try std.testing.expectEqualStrings("close", stream.headers.get(HeaderName.CONNECTION).?);
         try std.testing.expectEqualStrings("event: done\ndata: {}\n\n", stream.body.?);
         var cookies: usize = 0;
         for (stream.headers.iterator()) |header| {

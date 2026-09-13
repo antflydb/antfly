@@ -378,6 +378,8 @@ fn waitForRequestWatchdog(io: Io, stop: *const std.atomic.Value(u32), cancellati
         if (cancellation) |signal| {
             if (signal.isCancelled()) return .cancelled;
         }
+        // Cancellation is the only futex error. Do not inspect the runtime-local
+        // error tag returned by a borrowed I/O executor from another archive.
         Io.futexWaitTimeout(
             io,
             u32,
@@ -387,9 +389,7 @@ fn waitForRequestWatchdog(io: Io, stop: *const std.atomic.Value(u32), cancellati
                 .clock = .awake,
                 .raw = .fromMilliseconds(@intCast(wait_ms)),
             } },
-        ) catch |err| switch (err) {
-            error.Canceled => return .stopped,
-        };
+        ) catch return .stopped;
     }
 }
 
