@@ -4345,7 +4345,12 @@ pub fn storageOwnerOpen(
     defer if (!success) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
-        .db = db_mod.DB.open(alloc, path, open_options) catch |err| return storageOwnerStatusFromError(err),
+        .db = db_mod.DB.open(alloc, path, open_options) catch |err| {
+            std.log.err("storage owner open failed table={s} group_id={} err={s}", .{
+                table_name, request.group_id, @errorName(err),
+            });
+            return storageOwnerStatusFromError(err);
+        },
         .storage_owner_path = owned_path,
         .storage_owner_table_name = owned_table_name,
         .storage_owner_group_id = request.group_id,

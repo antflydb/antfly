@@ -115913,6 +115913,49 @@ test "db text compaction preserves ordinal filters across reopen" {
     }
 }
 
+test "db provisioning reopen preserves an older encoding of the same schema epoch" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-schema-format-retry");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}}}}
+    ;
+    var parsed = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    // The text projection still uses the deployed document-schema format.
+    // This default schema has no capability-only fields to exclude.
+    const original = try schema_mod.serializeTextProjectionSchema(alloc, runtime_schema);
+    defer alloc.free(original);
+    const versioned_key = try schema_mod.schemaVersionKeyAlloc(alloc, 0);
+    defer alloc.free(versioned_key);
+    const active_key = "\x00\x00__metadata__:schema";
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_json);
+        try db.core.store.put(active_key, original);
+        try db.core.store.put(versioned_key, original);
+    }
+    for (0..3) |_| {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_optional_runtimes = false,
+            .schema_before_index_load = .{ .runtime_schema = runtime_schema, .public_schema_json = schema_json },
+        });
+        defer db.close();
+        try std.testing.expect(try schema_mod.schemasEqual(alloc, runtime_schema, db.core.schema.?));
+        for ([_][]const u8{ active_key, versioned_key }) |key| {
+            const actual = try db.core.store.get(alloc, key);
+            defer alloc.free(actual);
+            try std.testing.expectEqualSlices(u8, original, actual);
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "doc:1", .value = "{\"text\":\"still writable\"}" }} });
+    }
+}
+
 test "db provisioning schema is persisted before configured full text indexes open" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");

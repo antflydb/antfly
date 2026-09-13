@@ -25,6 +25,16 @@ session remained active; it now drives later wakeups and verifies completion.
 Pressure cleanup also now respects the detached reader-validation reservation.
 No ownership default or experimental-policy default is promoted here.
 
+After merging `origin/main`, the saved-1M gate exposed a schema-open failure
+before query timing: the fixture's ASCH V12 runtime schema and the current V13
+encoding represented the same logical epoch, but immutable-version validation
+compared raw bytes. Format-only retries now compare complete decoded runtime
+schemas and preserve the existing active/history bytes; changed runtime or
+public validation contracts remain rejected at the same logical version.
+This uses the schema decoder's existing supported formats, without adding
+vector-store format compatibility. The failed arm is retained as recovery
+evidence and is excluded from performance results.
+
 ## September 13 UTC: remaining GC costs investigated
 
 The [follow-up exploration](../.benchmark-results/vector-store-gc-followup-exploration-20260913/README.md)
