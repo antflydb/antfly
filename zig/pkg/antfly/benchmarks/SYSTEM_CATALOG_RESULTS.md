@@ -1296,8 +1296,9 @@ of that inventory through the default server configuration.
 The applied command shrinks from 8,210,124 to 1,044 bytes. The new bounded binary
 envelope reuses the StoreRecord codec and excludes HTTP-only embedding activity.
 Admission reads affected groups through covering references; apply checks the
-exact cursor again. A full report repairs unknown bases after snapshot install;
-ordinary reopen preserves the cursor and payload atomically. Empty deltas with
+exact cursor again. This version incorrectly discarded cursors during snapshot installation;
+the snapshot-plus-suffix divergence is corrected in the following section.
+Ordinary reopen preserves the cursor and payload atomically. Empty deltas with
 unchanged headers retain their cursor without generating a Raft entry. Exact
 replays acknowledge the prior commit, while stale bases and incarnations cannot
 overwrite it. These semantics are tested through the real HTTP/Raft path.
@@ -1346,3 +1347,85 @@ The additional repository-wide license-header check reports pre-existing header
 drift (984 files before normalization, 982 remaining). The two short headers in
 files touched by this follow-up were normalized; all follow-up files now match
 their canonical headers. No runtime behavior changed in that cleanup.
+
+## Group-local reports, bounded activity and concurrent admission
+
+Implementation `dfaff83e8` fixes snapshot cursor loss, makes admitted header/cursor
+preconditions mandatory in report commands, patches affected storage pages and
+retains unchanged per-group cache payloads. It replaces whole-runtime telemetry
+with bounded identity/counter batches and replaces the exclusive catalog report
+lock with per-store lanes plus a shared gate released before apply waits.
+Merge `cff4ef7be` includes main `a3515eb85` (owned physical-usage snapshots).
+
+[Raw component and cluster results](system_catalog_group_local_workloads_2026_09_12.json)
+include binary hashes, source provenance and limitations. The paired measurements
+below precede the merge so both sides use main `3ea6fcead`. Components use Zig
+0.16.0 ReleaseFast and `c_allocator`; the cluster binaries use Debug. Runs were
+sequential after task-owned builds/tests finished. Unrelated host activity and
+thermal state were uncontrolled. Numbers are observations, not timing assertions.
+
+| Component at 10,000 groups, p50 | Reference path | New path |
+| --- | ---: | ---: |
+| Apply one group's Raft facts | 16.297 ms full report | 0.168 ms sparse report |
+| Clone/publish/release runtime cache view | 5.230 ms full refresh | 2.107 ms sparse refresh |
+| Encode all embedding activity samples | 25.757 ms whole runtime reports | 3.402 ms compact batches |
+| Activity HTTP bytes, all samples | 39,048,908 | 2,944,534 |
+
+Sparse apply was 0.131/0.152/0.168 ms at 100/1,000/10,000 groups. The previous
+sparse implementation recorded 0.199/0.472/5.019 ms in the preceding experiment;
+that historical comparison is separate from the paired full/sparse comparison
+above. The new runtime-change case was 0.179 ms at 10,000 groups. It still rewrites
+one 64-slot page (59,417 WAL bytes). Raft command size is 1,125 bytes, including
+the mandatory admitted header and cursor. Allocation metadata is touched only
+when group inventory changes; directory maintenance is limited to page liveness
+changes. Full repair continues to walk the inventory.
+
+The cache fixture has one embedding index per runtime group. Full refresh made
+90,037 allocations versus 32 for sparse refresh. These measurements include input
+cloning and lease construction/release, excluding storage reads. Sparse refresh
+retains nested payloads, but its flat arrays and group maps remain proportional
+to the store's inventory; the 2.107 ms result is not an O(1) publication claim.
+
+The activity fixture includes every sample, with no durable changes. At 10,000
+groups, all samples fit in 20 requests of at most 150,798 bytes. The reference
+request exceeds the default 32 MiB limit; this is an encoding comparison, not a
+successful oversized HTTP call. Full baseline JSON still has the ordinary HTTP
+limit. The compact activity format bounds sample counts and identity strings;
+telemetry validates against retained committed identities without loading whole
+store reports or holding catalog/runtime locks during cache updates.
+
+The application workload uses three real metadata replicas, three data nodes,
+and eight synthetic non-live reporting stores with 100 groups each. Setup waits
+for accepted registrations to apply. Each case sends 240 reports while another
+client performs 30 namespace create/drop pairs. All requests succeeded. These
+measurements include client HTTP and metadata-leader discovery overhead and do
+not discard warmup samples.
+
+| Cluster workload | Before | After |
+| --- | ---: | ---: |
+| Runtime-change reports/s | 23.57 | 72.96 |
+| Runtime-change report p95 | 990.84 ms | 163.50 ms |
+| Concurrent namespace create/drop p95 | 1,186.69 ms | 202.98 ms |
+| Activity-only reports/s | 37.05 | 161.98 |
+| Activity-only report p95 | 635.02 ms | 79.37 ms |
+| Concurrent namespace create/drop p95 | 1,053.64 ms | 132.01 ms |
+
+Snapshot coverage now applies an identical committed log suffix to uninterrupted
+and snapshot-restored replicas, verifies their cursors and group state, then
+accepts a successor delta on the recovered replica and compares logical snapshots.
+Additional regressions cover sparse removal/reuse/reopen, stale full-repair
+admission, retained payload ownership under allocation failure, bounded group
+invalidation, multiple activity batches, oversized batches and unknown identities.
+
+The exact merged binary also completed the same 480-report/60-DDL-pair
+workload without failures. Its runtime-change and activity-only throughput
+was 75.11/138.30 reports/s, with report p95 152.74/79.02 ms and concurrent DDL
+p95 166.85/135.82 ms. The artifact retains its binary hash separately.
+
+Merged validation: 84 storage, 37 catalog, nine catalog transport, 129 metadata
+service and 60 catalog API test executions passed (selections overlap). The
+server build and all 21 distributed-status/system-catalog E2Es passed. The
+pre-merge component target passed all 22 test executions. Ruff, Zig formatting
+and whitespace checks passed. Standalone E2Es initially stopped at the disk
+headroom preflight; clearing obsolete local build artifacts restored headroom,
+and the subsequent complete run passed without changing production disk guards.
