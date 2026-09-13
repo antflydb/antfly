@@ -29,7 +29,9 @@ The earlier six-unit release baseline is recorded in
 [COMPILATION_EXPERIMENTS.md](COMPILATION_EXPERIMENTS.md), including Actions runs
 `31643584514` and `31645335108`. Those runs predate this integration; their
 compiler timings and memory reservations are historical, not measurements of
-the current source roots. Release performance must be remeasured in CI.
+the current source roots. The matched x86_64 GNU release measurement below
+updates admission claims only for that measured profile; ARM64/musl and GPU
+profiles still need their own release measurements.
 
 ## Main goal
 
@@ -169,8 +171,11 @@ and run step's duration and available peak-memory measurements.
 
 `max_rss` claims govern compilation admission. There are no artificial archive
 ordering dependencies; independent compilations can run concurrently when the
-runner has sufficient memory. Release memory measurements from the earlier
-layout below are historical baselines, not measurements of this revision.
+runner has sufficient memory. `pkg/antfly/build/runtime_memory.zig` owns the
+admission policy separately from runtime construction. Its lightweight tests
+check that measured storage/inference compilations fit together and that
+unmeasured hosts, CPU features, targets, modes, backend settings, and sanitizer
+settings retain conservative reservations.
 
 `python3 tools/check_storage_compilation.py --report storage-compilation.json`
 checks the real compiler in an isolated source overlay. It measures cold and
@@ -210,6 +215,62 @@ the principal implementations. The self-module `antfly_source_root` alias
 selects those sources without giving overlapping files a second Zig module
 identity. Some shared storage leaf files remain lexically reachable by control;
 the source-mutation matrix does not prove independence for every leaf file.
+
+### Cold x86_64 Linux release scheduling (2026-09-12)
+
+Two fresh-cache builds used source `83cd076bf` on the same isolated build pod,
+with only runtime compilation reservations changed. The pod used the Actions
+runner image, an AMD EPYC 7B13 host, a 7.5 CPU request, a 24 GiB memory limit,
+and the normal 22 GiB Zig admission budget. Both builds used Zig 0.16.0,
+`-Dcpu=baseline -Doptimize=ReleaseFast -Dstrip=true -Dcuda=false
+-Dcuda-artifacts=fatbin -Dantfly-version=release-measure -j8`, and built
+`antfly capi capi-smoke`. Local and global Zig caches were empty and separate
+for each run. This measures scheduling on one fixed source revision, not the
+cumulative effect of the PR's other changes.
+
+| Measurement | Conservative reservations | Measured reservations |
+| --- | ---: | ---: |
+| Elapsed build time | 72m44s | 27m01s |
+| Process-tree CPU time | 87m52s | 78m15s |
+| Sampled peak process-tree RSS | 5.93 GiB | 13.08 GiB |
+| Storage compilation begins | 29m26s | 45s |
+| Inference compilation begins | 56m28s | 45s |
+| Antfly executable size | 115,997,560 bytes | 115,997,560 bytes |
+
+Both builds passed all 43 steps, including C API smoke execution, and produced
+the same executable SHA-256:
+`2d5b4d04edc973a7356863a657b46be1068816511d5c515a1572c1f882eee9fe`.
+The elapsed reduction was 62.9%. This is one paired measurement on a shared
+node; CPU frequency and other tenants were not controlled, and total CPU time
+also varied. The directly observed scheduling improvement is that storage and
+inference overlap instead of being serialized by a combined 36 GiB claim.
+RSS was sampled every 0.5 seconds by summing build descendants; shared pages
+can be counted more than once and this is not the cgroup's total memory use.
+
+| Runtime archive | Largest sampled compiler RSS across the pair | New claim |
+| --- | ---: | ---: |
+| Storage | 5.73 GiB | 8 GiB |
+| Inference | 4.09 GiB | 8 GiB |
+| Distributed | 3.48 GiB | 5 GiB |
+| API | 3.05 GiB | 5 GiB |
+| Serverless | 2.65 GiB | 4 GiB |
+| CLI | 1.25 GiB | 2 GiB |
+| Enrichment | 0.80 GiB | 2 GiB |
+
+These claims apply only to native x86_64 Linux hosts building baseline x86_64
+GNU, stripped ReleaseFast, with CPU inference and no thread sanitizer. Other
+profiles keep their previous claims. Reservations remain admission estimates,
+not hard per-process memory limits. After installing the final policy helper,
+a warm build reused every compiler output and reran the C API smoke test; the
+policy itself also passed its native Linux unit test.
+
+The Actions unit job at `8e67d155f` completed its build/test step in 34m38s
+([job 103640717903](https://github.com/antflydb/antfly/actions/runs/34726182022/job/103640717903)),
+after the previous run hit its 60-minute watchdog. That run failed in two
+obsolete restore fixture setups, so it is not a passing full-suite benchmark.
+Its build-tool tests took six seconds; the expensive cache matrix remains in
+`zig-full`. Test execution still contributes materially to the base job:
+`storage-support-tests` alone ran for approximately ten minutes.
 
 ### Boundary runtime cost
 

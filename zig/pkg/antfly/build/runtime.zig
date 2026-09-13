@@ -24,19 +24,9 @@ pub const RuntimeArtifactRole = enum {
     standalone,
 };
 
-pub const RuntimeLibraryUnit = enum {
-    api_kernel,
-    distributed,
-    storage_kernel,
-    enrichment_compute,
-    // Serverless/lake execution is a large, independently deployable graph.
-    // Keep it out of the PIC storage kernel so LLVM never has to optimize the
-    // two closures as one ARM64 ReleaseFast compilation unit.
-    serverless,
-    inference,
-    // Remote/client commands do not own storage or server runtimes.
-    cli,
-};
+const runtime_memory = @import("runtime_memory.zig");
+pub const RuntimeLibraryUnit = runtime_memory.RuntimeLibraryUnit;
+const runtimeCompileMaxRss = runtime_memory.runtimeCompileMaxRss;
 
 // Static archives must be presented from consumers to providers. The
 // distributed/application unit calls into both the API kernel and inference
@@ -84,6 +74,7 @@ pub const AddRuntimeOptions = struct {
     strip: bool,
     link_libc: bool,
     sanitize_thread: bool,
+    cpu_inference: bool = false,
     runtime_artifact_role: ?RuntimeArtifactRole,
     structlog_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
@@ -199,42 +190,14 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
                 b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
             .root_module = role_mod,
             .linkage = .static,
-            .max_rss = switch (unit) {
-                // Claims conservatively cover clean production ReleaseFast
-                // peaks measured for both aarch64-linux-musl and explicit
-                // aarch64-macos (including Metal and Accelerate). They are
-                // scheduling reservations, not hard process limits. A larger
-                // budget can overlap more units while a smaller cgroup
-                // automatically schedules only the subset that fits.
-                // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
-                // platform frameworks. Linux ARM64 reached 4.99 GB in the
-                // v0.2.1-rc0 release build, while the integrated HA API kernel
-                // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
-                // build. Reserve 10 GiB so the scheduler serializes competing
-                // roots instead of discarding a successful production build.
-                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
-                // Physical storage now compiles separately from distributed
-                // coordination. Retain the split kernel's conservative 20 GiB
-                // reservation; the former monolithic 24/22 GiB measurements
-                // do not describe either of these independent artifacts.
-                .storage_kernel => 20 * 1024 * 1024 * 1024,
-                .distributed => 11 * 1024 * 1024 * 1024,
-                .enrichment_compute => 4 * 1024 * 1024 * 1024,
-                // This is deliberately a separate non-PIC product unit. The
-                // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
-                // the 10 GiB reservation keeps it serialized with the macOS
-                // storage kernel until both release runners confirm that.
-                .serverless => 10 * 1024 * 1024 * 1024,
-                // The broad aarch64-macOS ReleaseFast inference root now
-                // reaches roughly 13.6 GB after storage/runtime integration.
-                // Reserve enough headroom for mode-dependent IR; the build
-                // scheduler can overlap whichever roots fit without forcing
-                // callers to serialize the whole build.
-                .inference => 16 * 1024 * 1024 * 1024,
-                // Clean aarch64-macOS ReleaseFast codegen currently peaks
-                // around 2.23 GB, just above the former 2 GiB reservation.
-                .cli => 3 * 1024 * 1024 * 1024,
-            },
+            .max_rss = runtimeCompileMaxRss(unit, .{
+                .host = b.graph.host.result,
+                .target = target.result,
+                .optimize = optimize,
+                .strip = strip,
+                .cpu_inference = options.cpu_inference,
+                .sanitize_thread = sanitize_thread,
+            }),
         });
         const runtime_unit_step = b.step(
             b.fmt("runtime-unit-{s}", .{@tagName(unit)}),

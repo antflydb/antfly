@@ -114,6 +114,7 @@ fn cloneStorageOwnerDescriptor(
     return .{ .descriptor = .{
         .lsm_root_generation = descriptor.lsm_root_generation,
         .identity = descriptor.identity,
+        .table_storage = descriptor.table_storage,
         .schema_json = schema_json,
         .indexes_json = try alloc.dupe(u8, descriptor.indexes_json),
     } };
@@ -427,6 +428,7 @@ fn consumerTests() type {
         test "raft batch round trips deterministic storage owner descriptor" {
             const descriptor = descriptor_contract.Descriptor{
                 .lsm_root_generation = 9,
+                .table_storage = .{ .dense_embeddings = .vector_store },
                 .identity = .{ .table_id = 7, .shard_id = 42, .range_id = 4200 },
                 .schema_json = "{\"fields\":{\"title\":{\"type\":\"string\"}}}",
                 .indexes_json = "{\"title\":{\"type\":\"full_text\"}}",
@@ -444,6 +446,7 @@ fn consumerTests() type {
             const actual = decoded.storage_owner_descriptor orelse return error.TestExpectedEqual;
             try std.testing.expectEqual(descriptor.lsm_root_generation, actual.descriptor.lsm_root_generation);
             try std.testing.expect(actual.descriptor.identity.eql(descriptor.identity));
+            try std.testing.expectEqualDeep(descriptor.table_storage, actual.descriptor.table_storage);
             try std.testing.expectEqualStrings(descriptor.schema_json, actual.descriptor.schema_json);
             try std.testing.expectEqualStrings(descriptor.indexes_json, actual.descriptor.indexes_json);
         }

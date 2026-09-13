@@ -1768,6 +1768,7 @@ pub const TableGroupDescriptorProjection = struct {
     doc_identity_range_id: u64,
     schema_json: []u8,
     indexes_json: []u8,
+    table_storage: ?@import("../common/table_storage.zig").Settings,
 
     pub fn deinit(self: *TableGroupDescriptorProjection, alloc: std.mem.Allocator) void {
         alloc.free(self.schema_json);
@@ -1831,6 +1832,7 @@ pub fn tableGroupDescriptorProjection(
                 metadata_table_manager.rangeDocIdentityRangeId(range),
                 table.schema_json,
                 table.indexes_json,
+                table.storage,
             );
         }
     }
@@ -1849,6 +1851,7 @@ pub fn tableGroupDescriptorProjection(
             identity.range_id,
             transition.table_contract.schema_json,
             transition.table_contract.indexes_json,
+            null,
         );
     }
     for (admin.merge_transitions) |transition| {
@@ -1866,6 +1869,7 @@ pub fn tableGroupDescriptorProjection(
             identity.range_id,
             transition.table_contract.schema_json,
             transition.table_contract.indexes_json,
+            null,
         );
     }
     return null;
@@ -1887,6 +1891,7 @@ fn descriptorProjectionFromRoutingSnapshot(
             metadata_table_manager.rangeDocIdentityRangeId(range),
             table.schema_json,
             table.indexes_json,
+            table.storage,
         );
     }
     return null;
@@ -1899,11 +1904,13 @@ fn descriptorProjectionFromValues(
     doc_identity_range_id: u64,
     schema_json: []const u8,
     indexes_json: []const u8,
+    table_storage: ?@import("../common/table_storage.zig").Settings,
 ) !TableGroupDescriptorProjection {
     const owned_schema_json = try alloc.dupe(u8, schema_json);
     errdefer alloc.free(owned_schema_json);
     return .{
         .table_id = table_id,
+        .table_storage = table_storage,
         .doc_identity_shard_id = doc_identity_shard_id,
         .doc_identity_range_id = doc_identity_range_id,
         .schema_json = owned_schema_json,
@@ -3357,6 +3364,7 @@ fn consumerTests() type {
                     .schema_json = "{\"type\":\"object\"}",
                     .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
                     .placement_role = "data",
+                    .storage = .{ .dense_embeddings = .vector_store },
                 }};
                 const compact_tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
                 const ranges = [_]metadata_table_manager.RangeRecord{.{
@@ -3423,6 +3431,7 @@ fn consumerTests() type {
                 "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
                 projection.indexes_json,
             );
+            try std.testing.expectEqual(.vector_store, projection.table_storage.?.dense_embeddings);
             try std.testing.expectEqual(@as(u64, 17), projection.doc_identity_shard_id);
             try std.testing.expectEqual(@as(u64, 71), projection.doc_identity_range_id);
         }

@@ -32,4 +32,5 @@ pub const Descriptor = struct {
     identity: Identity,
     schema_json: []const u8 = "",
     indexes_json: []const u8 = "",
+    table_storage: ?@import("../common/table_storage.zig").Settings = null,
 };

@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 52;
+pub const abi_version: u32 = 53;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -910,6 +910,34 @@ pub const RuntimeHooksConfig = extern struct {
     promotion_owner_fn: ?PromotionOwnerFn = null,
 };
 
+/// Unspecified legacy callers retain the persisted table policy. Explicit
+/// policies are installed before loading indexes and checked against disk.
+pub const DenseEmbeddingStorage = enum(u32) {
+    persisted = 0,
+    primary_lsm = 1,
+    vector_store = 2,
+    _,
+};
+
+/// One synchronous committed target advance, before write acknowledgement.
+/// Names and JSON are borrowed for this call only; the callback must not
+/// reenter the owner. Empty JSON means unknown scope; `[]` means known empty.
+/// Allocation failure must deliver unknown scope, never drop the fence.
+/// The context remains borrowed until owner close has drained its callbacks.
+pub const TargetAdvanceFn = *const fn (
+    ctx: ?*anyopaque,
+    table_name: BorrowedBytes,
+    group_id: u64,
+    sequence: u64,
+    has_sequence: u8,
+    identities_json: BorrowedBytes,
+) callconv(.c) void;
+
+pub const TargetObserver = extern struct {
+    ctx: ?*anyopaque = null,
+    notify: ?TargetAdvanceFn = null,
+};
+
 pub const OpenRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -925,6 +953,8 @@ pub const OpenRequest = extern struct {
     identity_range_id: u64 = 0,
     schema_json: BorrowedBytes = .{},
     indexes_json: BorrowedBytes = .{},
+    dense_embedding_storage: DenseEmbeddingStorage = .persisted,
+    target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
     runtime_hooks: RuntimeHooksConfig = .{},
 };

@@ -88,6 +88,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         path: []u8,
         schema_json: []u8,
         indexes_json: []u8,
+        table_storage: ?@import("../common/table_storage.zig").Settings = null,
         generation: u64,
         identity: descriptor_contract.Identity,
 
@@ -97,6 +98,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .identity = self.identity,
                 .schema_json = self.schema_json,
                 .indexes_json = self.indexes_json,
+                .table_storage = self.table_storage,
             };
         }
 
@@ -115,6 +117,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         identity: Identity,
         schema_json: []u8,
         indexes_json: []u8,
+        table_storage: ?@import("../common/table_storage.zig").Settings = null,
         owner: client.Owner,
         active_users: usize = 0,
         /// Writer preference for structural reconciliation. Once an exclusive
@@ -1246,12 +1249,12 @@ pub const ProvisionedKernelOwnerSource = struct {
             defer parsed.deinit();
             var status = try parsed.value.clone(alloc);
             status.group_id = group_id;
-            status.metadata = .{
-                .updated_at_ns = platform_time.monotonicNs(),
-                .source = .live_writer_publish,
-                .freshness = .fresh,
-                .lsm_root_generation = lease.entry.generation,
-            };
+            // Retain the provider's source-target proof; replacing metadata
+            // with defaults would erase the sequence sampled with these stats.
+            status.metadata.updated_at_ns = platform_time.monotonicNs();
+            status.metadata.source = .live_writer_publish;
+            status.metadata.freshness = .fresh;
+            status.metadata.lsm_root_generation = lease.entry.generation;
             break :observed status;
         } else null;
         errdefer if (observed) |*status| status.deinit(alloc);
@@ -1485,6 +1488,33 @@ pub const ProvisionedKernelOwnerSource = struct {
         return total_steps;
     }
 
+    fn targetAdvanced(
+        ptr: ?*anyopaque,
+        table_name: abi.BorrowedBytes,
+        group_id: u64,
+        sequence: u64,
+        has_sequence: u8,
+        identities_json: abi.BorrowedBytes,
+    ) callconv(.c) void {
+        const cache: *runtime_status.TableRuntimeSnapshotCache = @ptrCast(@alignCast(ptr orelse return));
+        const target_sequence: ?u64 = if (has_sequence != 0) sequence else null;
+        if (identities_json.len == 0) {
+            cache.markGroupTargetObservationPending(table_name.slice(), group_id, target_sequence);
+            return;
+        }
+        var identities = std.json.parseFromSlice(
+            []db_types.IndexTargetVisibility,
+            cache.alloc,
+            identities_json.slice(),
+            .{ .ignore_unknown_fields = true },
+        ) catch {
+            cache.markGroupTargetObservationPending(table_name.slice(), group_id, target_sequence);
+            return;
+        };
+        defer identities.deinit();
+        cache.markIndexTargetsObservationPending(table_name.slice(), group_id, identities.value, sequence);
+    }
+
     pub fn withRuntimeStatusCache(self: *ProvisionedKernelOwnerSource, cache: *runtime_status.TableRuntimeSnapshotCache) *ProvisionedKernelOwnerSource {
         self.runtime_status_cache = cache;
         return self;
@@ -1583,6 +1613,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .path = path,
             .schema_json = projection.schema_json,
             .indexes_json = projection.indexes_json,
+            .table_storage = projection.table_storage,
             .generation = self.visibleRootGeneration(group_id),
             .identity = .{
                 .table_id = projection.table_id,
@@ -1906,7 +1937,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 entry.generation != descriptor.generation or
                 !entry.identity.eql(descriptor.identity) or
                 !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
-                !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json))
+                !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
+                !std.meta.eql(entry.table_storage, descriptor.table_storage))
             {
                 return null;
             }
@@ -2033,7 +2065,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 return error.StorageKernelOwnerTransitionRequired;
             }
             if (!std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
-                !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json))
+                !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
+                !std.meta.eql(entry.table_storage, descriptor.table_storage))
             {
                 // Catalog definition changes do not necessarily publish a new
                 // physical root generation. An API lease is not the only DB
@@ -2080,6 +2113,14 @@ pub const ProvisionedKernelOwnerSource = struct {
             .identity_range_id = descriptor.identity.range_id,
             .schema_json = .fromSlice(descriptor.schema_json),
             .indexes_json = .fromSlice(descriptor.indexes_json),
+            .dense_embedding_storage = if (descriptor.table_storage) |settings| switch (settings.dense_embeddings) {
+                .primary_lsm => .primary_lsm,
+                .vector_store => .vector_store,
+            } else .persisted,
+            .target_observer = if (self.runtime_status_cache) |cache| .{
+                .ctx = cache,
+                .notify = targetAdvanced,
+            } else .{},
             .transaction_recovery = self.transactionRecoveryConfig(),
             .runtime_hooks = self.runtimeHooksConfig(),
         });
@@ -2091,6 +2132,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .identity = descriptor.identity,
             .schema_json = owned_schema_json,
             .indexes_json = owned_indexes_json,
+            .table_storage = descriptor.table_storage,
             .owner = owner,
             .active_users = 1,
             .exclusive_pending = false,

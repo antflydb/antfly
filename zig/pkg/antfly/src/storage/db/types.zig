@@ -4557,3 +4557,24 @@ test "graph metric index stats cleanup owns nested status payloads" {
     statuses[0].build_pages[0] = .{};
     statuses[0].build_pages[0].cursor = try alloc.dupe(u8, "page-cursor");
 }
+
+/// Exact durable identity affected by a source-target advance. Names are
+/// borrowed for the synchronous callback. An empty slice with
+/// `target_scope_known = false` means the producer could not prove scope and
+/// consumers must conservatively fence the whole group.
+pub const IndexTargetVisibility = struct {
+    pub const ServingSetEffect = enum {
+        /// This commit may add or replace members, but cannot remove a
+        /// previously searchable member from this exact incarnation.
+        additive_only,
+        /// This commit contains a delete, overwrite, or another mutation
+        /// whose authoritative projection may have lower cardinality.
+        may_reduce,
+    };
+
+    index_name: []const u8,
+    kind: IndexKind,
+    incarnation: u64,
+    config_hash: u64,
+    serving_set_effect: ServingSetEffect = .may_reduce,
+};

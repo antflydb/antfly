@@ -1064,26 +1064,7 @@ pub const IndexRepairVisibility = struct {
     action_required: bool = false,
 };
 
-/// Exact durable identity affected by a source-target advance. Names are
-/// borrowed for the synchronous callback. An empty slice with
-/// `target_scope_known = false` means the producer could not prove scope and
-/// consumers must conservatively fence the whole group.
-pub const IndexTargetVisibility = struct {
-    pub const ServingSetEffect = enum {
-        /// This commit may add or replace members, but cannot remove a
-        /// previously searchable member from this exact incarnation.
-        additive_only,
-        /// This commit contains a delete, overwrite, or another mutation
-        /// whose authoritative projection may have lower cardinality.
-        may_reduce,
-    };
-
-    index_name: []const u8,
-    kind: types.IndexKind,
-    incarnation: u64,
-    config_hash: u64,
-    serving_set_effect: ServingSetEffect = .may_reduce,
-};
+pub const IndexTargetVisibility = types.IndexTargetVisibility;
 
 pub const QueryVisibilityEvent = struct {
     change: QueryVisibilityChange,
@@ -126636,7 +126617,7 @@ test "db restore dense artifact completion retires an obsolete invalid-generatio
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, shadow_base, .{}));
 }
 
-test "db restore final artifact rebuild seals an exact in-memory bulk generation" {
+test "db restore final artifact recount preserves an exact native generation" {
     const alloc = std.testing.allocator;
     var test_directory = try TestDirectory.init("db");
     defer test_directory.cleanup();
@@ -126720,17 +126701,11 @@ test "db restore final artifact rebuild seals an exact in-memory bulk generation
         const dense = db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
         expected_active = dense.index.stats().active_count;
         try std.testing.expect(expected_active > 0);
-        try dense.index.beginBulkIngestSession();
-        const checkpoint = try db.core.loadProjectionCheckpoint(alloc, "dense_idx");
-        try db.core.saveProjectionCheckpoint("dense_idx", .{
-            .applied_sequence = checkpoint.applied_sequence,
-            .status = .rebuilding,
-            .generation = checkpoint.generation,
-            .config_hash = checkpoint.config_hash,
-        });
-
+        // Native-v2 already has exact published coverage. Repair the missing
+        // durable counter without inventing an unowned bulk session or
+        // rebuilding the active root; the fresh owner below proves durability.
         const repaired = try db.repairRestoreDenseArtifactCoverageFromFinalArtifacts(alloc);
-        try std.testing.expectEqual(@as(usize, expected_active), repaired.rebuilt);
+        try std.testing.expectEqual(@as(usize, 0), repaired.rebuilt);
         try std.testing.expect(repaired.made_progress);
         const completed_checkpoint = try db.core.loadProjectionCheckpoint(alloc, "dense_idx");
         try std.testing.expectEqual(apply_state.ProjectionStatus.clean, completed_checkpoint.status);
@@ -126796,7 +126771,16 @@ test "db restore durability proof retries reopen-only dense debt" {
             7001,
         );
         try DB.markRestoreRuntimeRepairCompleteWithIo(alloc, std.testing.io, std.mem.span(path));
-        try db.core.index_manager.resetDenseIndexForArtifactRebuild("dense_idx");
+        // Leave valid native authority with a stale completion watermark.
+        // Resetting its selected directory would manufacture a corrupt root,
+        // which restore must reject rather than treat as recoverable debt.
+        const checkpoint = try db.core.loadProjectionCheckpoint(alloc, "dense_idx");
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = 0,
+            .status = .rebuilding,
+            .generation = checkpoint.generation,
+            .config_hash = checkpoint.config_hash,
+        });
         try db.sync(true);
         try db.syncIndexes(true);
     }

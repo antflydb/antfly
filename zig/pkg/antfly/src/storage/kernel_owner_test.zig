@@ -309,6 +309,107 @@ test "opaque storage context owns Lite system namespaces auth and table owners" 
     context.deinit();
 }
 
+test "opaque storage owner preserves source-vector policy and status across reopen" {
+    const alloc = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-source-vectors");
+    defer directory.cleanup();
+    const path = std.mem.span(directory.path().ptr);
+    for ([_]abi.DenseEmbeddingStorage{ .vector_store, .persisted }, 0..) |policy, iteration| {
+        var owner = try client.Owner.open(.{
+            .path = .fromSlice(path),
+            .table_name = .fromSlice("docs"),
+            .group_id = 7001,
+            .dense_embedding_storage = policy,
+            .indexes_json = .fromSlice("{\"model\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}"),
+        });
+        defer owner.deinit();
+        if (iteration == 0) {
+            var response = try owner.batchJson("docs",
+                \\{"inserts":{"a":{"_embeddings":{"model":[1,0,0]}}},"sync_level":"full_index"}
+            );
+            defer response.deinit();
+        }
+        // Observe immediately after reopen, before a query or write could
+        // initialize a missing source store or repair its cached accounting.
+        var response = try ownerStatusEventually(&owner);
+        defer response.deinit();
+        const Status = struct {
+            source_vectors: ?struct { retained_payloads: u64 } = null,
+        };
+        var parsed = try std.json.parseFromSlice(Status, alloc, response.bytes(), .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const source = parsed.value.source_vectors orelse return error.MissingSourceVectorStatus;
+        try std.testing.expect(source.retained_payloads > 0);
+    }
+    var invalid_owner: ?*anyopaque = null;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_open(&.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .dense_embedding_storage = @enumFromInt(999),
+    }, &invalid_owner));
+    try std.testing.expect(invalid_owner == null);
+}
+
+test "opaque storage owner fences exact source targets before acknowledging writes" {
+    const Observer = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        additive: std.atomic.Value(bool) = .init(false),
+        reducing: std.atomic.Value(bool) = .init(false),
+        invalid: std.atomic.Value(bool) = .init(false),
+        fn notify(ptr: ?*anyopaque, table: abi.BorrowedBytes, group: u64, sequence: u64, has_sequence: u8, json: abi.BorrowedBytes) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (!std.mem.eql(u8, table.slice(), "docs") or group != 7001 or has_sequence == 0 or sequence == 0) self.invalid.store(true, .release);
+            var targets = std.json.parseFromSlice([]@import("db/types.zig").IndexTargetVisibility, std.heap.page_allocator, json.slice(), .{}) catch {
+                self.invalid.store(true, .release);
+                return;
+            };
+            defer targets.deinit();
+            for (targets.value) |target| {
+                if (!std.mem.eql(u8, target.index_name, "model")) continue;
+                switch (target.serving_set_effect) {
+                    .additive_only => self.additive.store(true, .release),
+                    .may_reduce => self.reducing.store(true, .release),
+                }
+            }
+            _ = self.calls.fetchAdd(1, .release);
+        }
+    };
+    var observer = Observer{};
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-target-observer");
+    defer directory.cleanup();
+    var owner = try client.Owner.open(.{
+        .path = .fromSlice(std.mem.span(directory.path().ptr)),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7001,
+        .indexes_json = .fromSlice("{\"model\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}"),
+        .target_observer = .{ .ctx = &observer, .notify = Observer.notify },
+    });
+    defer owner.deinit();
+    var inserted = try owner.batchJson("docs", "{\"inserts\":{\"a\":{\"_embeddings\":{\"model\":[1,0,0]}}},\"sync_level\":\"full_index\"}");
+    defer inserted.deinit();
+    try std.testing.expect(observer.calls.load(.acquire) > 0);
+    try std.testing.expect(observer.additive.load(.acquire));
+    var deleted = try owner.batchJson("docs", "{\"deletes\":[\"a\"],\"sync_level\":\"full_index\"}");
+    defer deleted.deinit();
+    try std.testing.expect(observer.reducing.load(.acquire));
+    try std.testing.expect(!observer.invalid.load(.acquire));
+}
+
+fn ownerStatusEventually(owner: *client.Owner) !client.Response {
+    const time = @import("antfly_platform").time;
+    const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        return owner.runtimeStatusJson("docs") catch |err| switch (err) {
+            error.StorageBusy => {
+                if (time.monotonicNs() >= deadline) return err;
+                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 test "opaque storage owner performs coarse batch and query on one live DB" {
     const path = "/tmp/antfly-storage-kernel-owner-batch-query";
     const backup_root = "/tmp/antfly-storage-kernel-owner-backups";

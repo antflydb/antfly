@@ -1334,6 +1334,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .strip = strip,
         .link_libc = link_libc,
         .sanitize_thread = sanitize_thread,
+        .cpu_inference = !inference_enable_cuda and !inference_enable_metal and !inference_enable_onnx,
         .runtime_artifact_role = runtime_artifact_role,
         .structlog_mod = structlog_mod,
         .platform_mod = platform_mod,

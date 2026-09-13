@@ -639,6 +639,7 @@ const Handle = struct {
     lite_inference_status: ?lite_backend.InferenceStatus = null,
     storage_owner_path: ?[]u8 = null,
     storage_owner_managed_config: local_write.OwnerManagedConfig = .{},
+    storage_owner_target_observer: kernel_owner_abi.TargetObserver = .{},
     storage_owner_table_name: ?[]u8 = null,
     storage_owner_group_id: u64 = 0,
     storage_owner_root_generation: u64 = 0,
@@ -4217,6 +4218,25 @@ pub fn storageOwnerLocalTransition(
     return .ok;
 }
 
+fn storageOwnerTargetAdvanced(
+    ptr: *anyopaque,
+    table_name: []const u8,
+    group_id: u64,
+    _: ?*db_mod.DB,
+    event: db_mod.QueryVisibilityEvent,
+) void {
+    if (event.change != .target_advanced) return;
+    const handle: *Handle = @ptrCast(@alignCast(ptr));
+    const observer = handle.storage_owner_target_observer;
+    const notify = observer.notify orelse return;
+    const identities_json = if (event.target_scope_known)
+        std.json.Stringify.valueAlloc(handle.alloc, event.target_indexes, .{}) catch null
+    else
+        null;
+    defer if (identities_json) |json| handle.alloc.free(json);
+    notify(observer.ctx, .fromSlice(table_name), group_id, event.target_sequence orelse 0, @intFromBool(event.target_sequence != null), .fromSlice(identities_json orelse ""));
+}
+
 pub fn storageOwnerOpen(
     request: *const kernel_owner_abi.OpenRequest,
     out_owner: *?*anyopaque,
@@ -4237,6 +4257,8 @@ pub fn storageOwnerOpen(
         null;
     const owner_context = asStorageOwnerContext(request.context);
     const alloc = if (owner_context) |context| context.alloc else std.heap.c_allocator;
+    if ((request.target_observer.ctx == null) != (request.target_observer.notify == null))
+        return .invalid_argument;
     const recovery_config = request.transaction_recovery;
     if (recovery_config.enabled != 0) {
         if (recovery_config.callback_ctx == null or recovery_config.resolve_participant_fn == null)
@@ -4291,6 +4313,12 @@ pub fn storageOwnerOpen(
     const prepared_schema = local_write.prepareOwnerSchemaBeforeIndexLoad(alloc, request.schema_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     defer local_write.freeOwnerSchemaBeforeIndexLoad(alloc, prepared_schema);
     var open_options = db_mod.OpenOptions{
+        .table_storage = switch (request.dense_embedding_storage) {
+            .persisted => null,
+            .primary_lsm => .{ .dense_embeddings = .primary_lsm },
+            .vector_store => .{ .dense_embeddings = .vector_store },
+            _ => return .invalid_argument,
+        },
         .schema_before_index_load = prepared_schema,
         .lsm_cache = if (owner_context) |context| &context.resources.lsm_cache else null,
         .hbc_cache = if (owner_context) |context| &context.resources.hbc_cache else null,
@@ -4325,8 +4353,15 @@ pub fn storageOwnerOpen(
         .storage_owner_context = owner_context,
         .storage_owner_transaction_recovery = recovery,
         .storage_owner_runtime_hooks = runtime_hooks,
+        .storage_owner_target_observer = request.target_observer,
     };
     defer if (!success) handle.db.close();
+    if (request.target_observer.notify != null) handle.db.setQueryVisibilityHook(.{
+        .ptr = handle,
+        .table_name = owned_table_name,
+        .group_id = request.group_id,
+        .on_change = storageOwnerTargetAdvanced,
+    });
     // Configuration can start DB-owned workers. Publish their pointers only
     // after the DB occupies its final address, and drain them on failure.
     local_write.configureStorageKernelOwnerDb(
@@ -6129,6 +6164,7 @@ pub fn storageOwnerRuntimeStatusJson(
 
     var status = runtime_status.LocalTableRuntimeStatus{
         .group_id = handle.storage_owner_group_id,
+        .source_vectors = handle.db.sourceVectorStats(),
         .created_at_millis = (handle.db.getGroupCreatedAtMillis(
             handle.alloc,
             handle.storage_owner_group_id,
