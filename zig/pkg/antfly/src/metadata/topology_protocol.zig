@@ -169,3 +169,18 @@ test "range membership is order independent and table scoped" {
     try rhs.add(303);
     try std.testing.expect(!lhs.finish(7).eql(rhs.finish(7)));
 }
+
+/// Replicated proof that this exact incarnation and membership can decode a
+/// protocol. Terms are deliberately excluded: elections do not undo activation.
+pub const Activation = struct {
+    version: u16,
+    incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    member_count: u32,
+    membership_fingerprint: @import("reallocation_request.zig").MembershipFingerprint,
+
+    pub fn satisfies(self: @This(), required: @This()) bool {
+        return self.version >= required.version and self.member_count == required.member_count and
+            std.meta.eql(self.incarnation, required.incarnation) and
+            std.meta.eql(self.membership_fingerprint, required.membership_fingerprint);
+    }
+};

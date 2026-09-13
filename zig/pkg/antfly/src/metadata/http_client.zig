@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const snapshot_transfer = @import("snapshot_transfer.zig");
 const store_report_update = @import("store_report_update.zig");
 const system_catalog = @import("../system_catalog/domain.zig");
 const ant_json = @import("antfly-json");
@@ -245,6 +246,41 @@ pub const MetadataHttpClient = struct {
 
     pub fn fetchSnapshot(self: *MetadataHttpClient, base_uri: []const u8) !std.json.Parsed(metadata_api.AdminSnapshot) {
         return try self.fetchSnapshotWithBudget(base_uri, null);
+    }
+
+    pub fn fetchPagedSnapshot(self: *MetadataHttpClient, base_uri: []const u8, control: bool, linearizable: bool, budget: ?RequestBudget) !std.json.Parsed(metadata_api.AdminSnapshot) {
+        const uri = try join(self.alloc, base_uri, snapshot_transfer.path);
+        defer self.alloc.free(uri);
+        var request: snapshot_transfer.Request = .{ .control = control, .linearizable = linearizable };
+        defer if (request.token != 0) {
+            request.release = true;
+            const body = std.json.Stringify.valueAlloc(self.alloc, request, .{}) catch null;
+            if (body) |bytes| {
+                defer self.alloc.free(bytes);
+                var response = self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .timeout_ms = 1000 }, budget) catch null;
+                if (response) |*value| value.deinit(self.alloc);
+            }
+        };
+        var bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer bytes.deinit(self.alloc);
+        var total: ?usize = null;
+        while (true) {
+            const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+            defer self.alloc.free(body);
+            var response = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms }, budget);
+            defer response.deinit(self.alloc);
+            if (response.status == 413) return error.ResourceRequestTooLarge;
+            if (response.status == 503 and response.header(http_common.metadata_not_leader_header) == null) return error.ResourceTemporarilyUnavailable;
+            try mapResponseStatus(response, error.InvalidRequest, error.UnsupportedOperation, error.CatalogGenerationChanged);
+            const token = try std.fmt.parseInt(u64, response.header("X-Antfly-Snapshot-Token") orelse return error.InvalidResponse, 10);
+            const size = try std.fmt.parseInt(usize, response.header("X-Antfly-Snapshot-Bytes") orelse return error.InvalidResponse, 10);
+            if (token == 0 or (request.token != 0 and request.token != token) or (total != null and total.? != size) or size > snapshot_transfer.max_snapshot_bytes or response.body.len > snapshot_transfer.page_bytes or response.body.len == 0 or bytes.items.len + response.body.len > size) return error.InvalidResponse;
+            request.token = token;
+            total = size;
+            try bytes.appendSlice(self.alloc, response.body);
+            if (bytes.items.len == size) return parseJson(metadata_api.AdminSnapshot, self.alloc, bytes.items);
+            request.offset = bytes.items.len;
+        }
     }
 
     pub fn fetchSnapshotWithBudget(

@@ -39,6 +39,7 @@ pub const ActivitySample = struct {
 /// A null base establishes a full inventory. Cursors acknowledge applied state.
 pub const Update = struct {
     version: u16 = 1,
+    telemetry_only: bool = false,
     sequence: u64,
     base: ?Cursor = null,
     report: metadata.StoreStatusReport,
@@ -47,6 +48,7 @@ pub const Update = struct {
     activity: []const ActivitySample = &.{},
 
     pub fn validate(self: Update, alloc: std.mem.Allocator) !void {
+        if (self.telemetry_only and (self.base == null or self.report.group_statuses.len != 0 or self.report.runtime_statuses.len != 0 or self.removed_groups.len != 0)) return error.InvalidStoreReporterFence;
         if (self.version != 1 or self.sequence == 0 or self.report.reporter_incarnation == 0 or self.report.runtime_reference) return error.InvalidStoreReporterFence;
         if (self.report.store_id == 0) return error.InvalidNodeID;
         if (!metadata.reporterFenceValid(self.report.reporter_incarnation, self.report.status_generation) or
@@ -442,4 +444,130 @@ test "store report workload benchmark compact activity batches" {
             std.debug.print("ACTIVITY_BENCH groups={d} compact={} p50_ms={d:.3} total_http_bytes={d} max_request_bytes={d} requests={d}\n", .{ count, compact, @as(f64, @floatFromInt(elapsed[4])) / 1e6, total_bytes, max_bytes, requests });
         }
     }
+}
+
+/// Bounded owned outbox generation. Only the pending generation is coalesced;
+/// a worker finishes its in-flight generation so busy producers cannot starve
+/// the tail of a large inventory. Payload ownership is independent of reports.
+pub const ActivityCollection = struct {
+    pub const max_samples = 16384;
+    pub const max_payload_bytes = 4 * 1024 * 1024;
+    arena: std.heap.ArenaAllocator,
+    update: Update,
+    selected: std.ArrayListUnmanaged(ActivitySample) = .empty,
+    payload_bytes: usize = 0,
+
+    pub fn create(alloc: std.mem.Allocator, report: metadata.StoreStatusReport, samples: []const ActivitySample, cursor: Cursor, rotation: *usize) !*@This() {
+        const sequence = try std.math.add(u64, cursor.sequence, 1);
+        const self = try alloc.create(@This());
+        self.* = .{ .arena = std.heap.ArenaAllocator.init(alloc), .update = .{
+            .telemetry_only = true,
+            .sequence = sequence,
+            .base = cursor,
+            .report = .{
+                .store_id = report.store_id,
+                .reporter_incarnation = report.reporter_incarnation,
+                .status_generation = report.status_generation,
+                .embedding_activity_protocol_version = report.embedding_activity_protocol_version,
+                .embedding_activity_sequence = report.embedding_activity_sequence,
+            },
+        } };
+        errdefer self.destroy(alloc);
+        if (samples.len != 0) {
+            const window_start = rotation.* % samples.len;
+            for (0..@min(samples.len, max_samples)) |i| {
+                if (!try self.append(samples[(window_start + i) % samples.len])) break;
+            }
+            rotation.* = (window_start + self.selected.items.len) % samples.len;
+        }
+        return self;
+    }
+    pub fn destroy(self: *@This(), alloc: std.mem.Allocator) void {
+        self.arena.deinit();
+        alloc.destroy(self);
+    }
+    fn append(self: *@This(), item: ActivitySample) !bool {
+        const size = @sizeOf(ActivitySample) + item.index_name.len + item.index_kind.len;
+        if (self.selected.items.len == max_samples or self.payload_bytes + size > max_payload_bytes) return false;
+        const a = self.arena.allocator();
+        var owned = item;
+        owned.index_name = try a.dupe(u8, item.index_name);
+        owned.index_kind = try a.dupe(u8, item.index_kind);
+        try self.selected.append(a, owned);
+        self.payload_bytes += size;
+        self.update.activity = self.selected.items;
+        return true;
+    }
+    pub fn mergeOlder(self: *@This(), old: *const @This()) !void {
+        if (old.update.report.reporter_incarnation != self.update.report.reporter_incarnation or
+            old.update.report.status_generation != self.update.report.status_generation) return;
+        const a = self.arena.allocator();
+        var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+        for (self.selected.items) |item| try seen.put(a, identity(item), {});
+        for (old.update.activity) |item| {
+            if (seen.contains(identity(item))) continue;
+            if (!try self.append(item)) break;
+        }
+    }
+    fn identity(sample: ActivitySample) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var integers: [40]u8 = undefined;
+        std.mem.writeInt(u64, integers[0..8], sample.group_id, .little);
+        std.mem.writeInt(u64, integers[8..16], sample.coverage_generation, .little);
+        std.mem.writeInt(u64, integers[16..24], sample.coverage_config_hash, .little);
+        std.mem.writeInt(u64, integers[24..32], sample.index_name.len, .little);
+        std.mem.writeInt(u64, integers[32..40], sample.index_kind.len, .little);
+        hash.update(&integers);
+        hash.update(sample.index_name);
+        hash.update(sample.index_kind);
+        return hash.finalResult();
+    }
+};
+
+test "system catalog telemetry outbox coalesces quiet indexes and owns payloads across failures" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var rotation: usize = 0;
+            var report: metadata.StoreStatusReport = .{ .store_id = 1, .reporter_incarnation = 7, .status_generation = 1, .embedding_activity_protocol_version = 2, .embedding_activity_sequence = 1 };
+            const cursor: Cursor = .{ .reporter_incarnation = 7, .sequence = 1, .digest = @splat(0) };
+            var samples = [_]ActivitySample{
+                .{ .group_id = 10, .index_name = "dense", .index_kind = "embeddings", .activity = .{ .epoch = 1, .sample_sequence = 1 } },
+                .{ .group_id = 20, .index_name = "quiet", .index_kind = "embeddings", .activity = .{ .epoch = 1, .sample_sequence = 1 } },
+            };
+            const old = try ActivityCollection.create(a, report, &samples, cursor, &rotation);
+            defer old.destroy(a);
+            report.embedding_activity_sequence = 2;
+            samples[0].activity.sample_sequence = 2;
+            const next = try ActivityCollection.create(a, report, samples[0..1], cursor, &rotation);
+            defer next.destroy(a);
+            try next.mergeOlder(old);
+            try std.testing.expectEqual(@as(usize, 2), next.update.activity.len);
+            try std.testing.expectEqual(@as(u64, 2), next.update.activity[0].activity.sample_sequence);
+            try std.testing.expectEqualStrings("quiet", next.update.activity[1].index_name);
+            try std.testing.expect(next.update.activity[1].index_name.ptr != old.update.activity[1].index_name.ptr);
+            try next.update.validate(a);
+            report.status_generation = 2;
+            const replacement = try ActivityCollection.create(a, report, samples[0..1], cursor, &rotation);
+            defer replacement.destroy(a);
+            try replacement.mergeOlder(old);
+            try std.testing.expectEqual(@as(usize, 1), replacement.update.activity.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "system catalog telemetry outbox rotates beyond its bounded window" {
+    const a = std.testing.allocator;
+    const samples = try a.alloc(ActivitySample, ActivityCollection.max_samples + 1);
+    defer a.free(samples);
+    for (samples, 0..) |*sample, i| sample.* = .{ .group_id = i + 1, .index_name = "dense", .index_kind = "embeddings", .activity = .{} };
+    var rotation: usize = 0;
+    const cursor: Cursor = .{ .reporter_incarnation = 7, .sequence = 1, .digest = @splat(0) };
+    const first = try ActivityCollection.create(a, .{ .store_id = 1 }, samples, cursor, &rotation);
+    defer first.destroy(a);
+    try std.testing.expect(first.update.activity.len <= ActivityCollection.max_samples);
+    try std.testing.expect(first.payload_bytes <= ActivityCollection.max_payload_bytes);
+    const second = try ActivityCollection.create(a, .{ .store_id = 1 }, samples, cursor, &rotation);
+    defer second.destroy(a);
+    try std.testing.expectEqual(first.update.activity.len + 1, second.update.activity[0].group_id);
 }

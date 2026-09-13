@@ -458,9 +458,16 @@ HTTP request. A delta names its exact acknowledged base; both admission and appl
 check that fence. Responses acknowledge committed state, so an exact retry after a
 lost response is idempotent. Stale bases cause a full-inventory repair, never a
 best-effort patch. Unsupported peers use the existing full/reference endpoints.
-An empty delta with an unchanged header returns the existing applied cursor,
-including for telemetry-only requests; acknowledging a transport sequence alone
-does not require a Raft entry.
+An empty delta with an unchanged header returns the existing applied cursor;
+acknowledging a transport sequence alone does not require a Raft entry.
+
+Once every protected metadata member demonstrates protocol 8 support, command 57
+persists the activated version with the cluster incarnation and membership
+fingerprint. Elections and reopen reuse that proof; a membership change requires
+fresh validation. The activation row is included in Raft snapshots. Proposal
+admission rechecks the observed term and membership under the catalog gate before
+committing activation. Upgrade-required errors retain their typed runtime ABI and
+HTTP 426 contract rather than becoming an untransportable runtime failure.
 
 The acknowledged baseline retains the last transmitted observation clocks for
 unchanged groups. Local clock coalescing therefore cannot keep delaying the
@@ -475,14 +482,26 @@ lanes. A shared catalog gate protects admission/proposal ordering; it is release
 before waiting for Raft apply. Different stores and unrelated table DDL can make
 progress concurrently. Membership and protocol changes retain exclusive ordering.
 
-Volatile embedding activity uses compact identity/counter samples in the HTTP
-envelope. A collection is delivered in batches of at most 512 samples; names and
-kinds are bounded to 1,024 bytes each. All batches retain owner and index sample
-fences. Batches from one collection may share an owner sequence; per-index sample
-ordering rejects older samples. Validation pins immutable group leaves, checks
-index identities and coverage generations, and updates the telemetry cache outside
-the catalog/runtime locks. Activity never enters Raft. Full inventory JSON still
-has the normal HTTP body limit; bounded telemetry does not change that contract.
+Volatile embedding activity uses a separate bounded outbox and background delivery
+job. The durable publisher commits its acknowledged baseline and enqueues counters
+without waiting for their delivery. One collection may be in flight and one is
+pending. New pending collections coalesce by exact group/index/coverage identity,
+retaining unsent observations for quiet indexes. An in-flight collection completes
+so frequent updates cannot starve its tail. Owner shutdown drains the delivery
+worker before freeing its payloads. Failed delivery marks activity dirty for a
+later fresh collection and cannot fail a durable heartbeat.
+
+Each outbox generation retains at most 16,384 samples and 4 MiB of sample structs
+and names, plus bounded arena/container overhead. Larger inventories rotate through
+successive windows. HTTP batches contain at most 512 samples; names and kinds are
+bounded to 1,024 bytes each. `telemetry_only` requests cannot contain durable group
+changes or removals. They use locally committed owner/index identities and sample
+fences, without a read-index barrier, catalog admission gate, or durable cursor
+comparison. Their response echoes the delivery base; it does not acknowledge a
+new durable report. The active leader pins immutable group leaves, validates index
+identities and coverage generations, and updates its volatile cache. Activity never
+enters Raft. Full inventory upload JSON still has the normal HTTP body limit;
+bounded telemetry and paged downloads do not change that contract.
 
 Sparse apply locates affected pages through group references. It reads/rebuilds
 only those membership and component pages. A free-space bitmap per page supports
@@ -498,10 +517,13 @@ Committed notifications retain affected group IDs through commit and coalesce up
 to 32 IDs per store before falling back to a full refresh. Refcounted immutable
 report payloads are owned per group; a sparse cache publication loads changed
 components and retains untouched leaves. Header updates share both components;
-reference heartbeats replace group facts and share runtime observations. Flat
-StoreRecord views still copy report structs and group maps when a component
-changes, but do not clone unchanged nested payloads. Retained
-admission leases survive publication, deletion and snapshot replacement. A store-ID
+reference heartbeats replace group facts and share runtime observations. A
+persistent radix tree copies at most 17 small nodes for a changed 64-bit group ID;
+counts and capability summaries update along that path. Sparse publication neither
+rebuilds a group map nor sorts or flattens the whole inventory. Consumers requesting
+a flat StoreRecord array materialize it once per component under its own mutex.
+That O(G) read cost is measured separately from publication. Retained admission
+leases survive publication, deletion and snapshot replacement. A store-ID
 index selects reporting stores under the runtime lock. After releasing the lock,
 admission borrows their pinned records and compares each observation once.
 Only accepted replacements allocate owned report payloads. Repeated reports for
@@ -594,3 +616,29 @@ only after commit or exact receipt verification. HTTP renders that result withou
 a second name lookup or read barrier. Concurrent rename, drop, and name reuse
 therefore cannot substitute another identity in an admitted mutation response.
 An unknown receipt still returns the existing ambiguous outcome contract.
+
+
+## Bounded metadata control reads
+
+Data-node control reads retain table/range identity, peer headers, placement and
+transition state, and group facts referenced by ranges, placement intents, splits,
+or merges. They do not fetch peer index diagnostics. The control projection pins
+the same immutable catalog and store components used by reconciliation. Public
+administrative consumers use a separate diagnostic cache, so compact control reads
+cannot hide remote index status.
+
+`POST /internal/v1/snapshots/read` transfers an immutable encoded view in pages of
+at most 512 KiB. A token names one capture; the client checks token and total size
+on every page and publishes only the fully decoded view after authority checks.
+Control and diagnostic transfers share this transport. A completed client releases
+its token; abandoned tokens expire after 30 seconds. Retention is bounded to 32
+transfers and 128 MiB per server, with at most 64 MiB for one encoded view. Captures
+are serialized independently of the page-cache mutex. The encoder sizes its output
+before allocation. Capacity exhaustion returns 503 and oversized views return 413;
+data-node control loops back off rather than terminate on these conditions.
+
+This is bounded whole-view transfer, not a claim of constant-memory reconstruction:
+a client still materializes the complete compact view, and diagnostic export still
+owns the full diagnostic payload. A changed or expired transfer is restarted as a
+whole; pages from different captures are never combined. Full initial uploads and
+the diagnostic export ceiling remain explicit capacity limits.

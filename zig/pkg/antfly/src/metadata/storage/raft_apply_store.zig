@@ -220,6 +220,7 @@ const RestoreJobWrite = struct { key: []const u8, value: []const u8 };
 
 pub const TransitionCommand = union(enum) {
     /// Versioned system catalog request, applied atomically with any table topology.
+    activate_topology_protocol: []const u8,
     apply_system_catalog: []const u8,
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
     upsert_node: metadata.NodeRecord,
@@ -344,7 +345,7 @@ pub const TransitionCommand = union(enum) {
 
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
-            .apply_system_catalog, .apply_store_report_update => |bytes| alloc.free(bytes),
+            .activate_topology_protocol, .apply_system_catalog, .apply_store_report_update => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -4662,6 +4663,22 @@ pub const RaftApplyStore = struct {
         if (bytes.len != 48) return error.InvalidCatalogRecord;
         return .{ .reporter_incarnation = std.mem.readInt(u64, bytes[0..8], .little), .sequence = std.mem.readInt(u64, bytes[8..16], .little), .digest = bytes[16..48].* };
     }
+    fn topologyActivationKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
+        return std.fmt.bufPrint(buf, "\x00\x00__metadata__:topology_activation_v1:{d}", .{group_id});
+    }
+
+    pub fn topologyActivation(self: *RaftApplyStore, group_id: u64) !?topology_protocol.Activation {
+        var key_buf: [160]u8 = undefined;
+        const bytes = self.store.get(self.alloc, try topologyActivationKeyForGroup(&key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, bytes, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub fn reportCursor(self: *RaftApplyStore, group_id: u64, store_id: u64) !?store_report_update.Cursor {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
@@ -5501,6 +5518,7 @@ pub const RaftApplyStore = struct {
     const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
     const MetadataSnapshotProjection = enum {
         system_catalog,
+        topology_activation,
         metadata_incarnation,
         split_transition,
         merge_transition,
@@ -5535,6 +5553,7 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
         .{ .projection = .metadata_incarnation, .key = .{ .point = metadataIncarnationKeyForGroup } },
         .{ .projection = .split_transition, .key = .{ .prefix = splitTransitionPrefixForGroup } },
@@ -5571,6 +5590,7 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) u32 {
         return switch (tag) {
+            .activate_topology_protocol => metadataSnapshotProjectionBit(.topology_activation),
             .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) |
                 metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
@@ -6006,6 +6026,16 @@ pub const RaftApplyStore = struct {
     fn applyTransitionCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand) !void {
         try validateTransitionCommandDataGroupIds(command);
         switch (command) {
+            .activate_topology_protocol => |bytes| {
+                var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, bytes, .{});
+                defer parsed.deinit();
+                const activation = parsed.value;
+                if (activation.version == 0 or activation.version > topology_protocol.current_version or activation.member_count == 0) return error.InvalidMetadataTransitionEncoding;
+                var key_buf: [160]u8 = undefined;
+                const incarnation_bytes = try txn.get(try metadataIncarnationKeyForGroup(&key_buf, group_id));
+                if (!std.meta.eql((try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation, activation.incarnation)) return;
+                try txn.put(try topologyActivationKeyForGroup(&key_buf, group_id), bytes);
+            },
             .apply_system_catalog => |bytes| try self.applySystemCatalogTxn(txn, group_id, bytes),
             .apply_store_report_update => |bytes| try self.applyStoreReportUpdateTxn(txn, group_id, bytes),
             .initialize_metadata_incarnation => |incarnation| {
@@ -8743,6 +8773,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    activate_topology_protocol = 57,
     apply_system_catalog = 54,
     upsert_store_heartbeat = 55,
     apply_store_report_update = 56,
@@ -8806,6 +8837,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
 
     try out.appendSlice(alloc, transition_magic);
     switch (command) {
+        .activate_topology_protocol => |bytes| {
+            if (bytes.len > 1024) return error.InvalidMetadataTransitionEncoding;
+            try out.append(alloc, @intFromEnum(TransitionTag.activate_topology_protocol));
+            try appendRequiredString(alloc, &out, bytes);
+        },
         .apply_store_report_update => |bytes| {
             if (bytes.len > max_store_report_update_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @intFromEnum(TransitionTag.apply_store_report_update));
@@ -9117,6 +9153,10 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
     pos += 1;
 
     return switch (tag) {
+        .activate_topology_protocol => blk: {
+            if (encoded.len > 1040) return error.InvalidMetadataTransitionEncoding;
+            break :blk .{ .activate_topology_protocol = try readRequiredString(alloc, encoded, &pos) };
+        },
         .apply_store_report_update => blk: {
             if (encoded.len > max_store_report_update_bytes + 16) return error.CatalogCommandTooLarge;
             const bytes = try readRequiredString(alloc, encoded, &pos);
@@ -19240,4 +19280,50 @@ test "system catalog admission header and cursor fence concurrent full repairs" 
     defer alloc.free(stale_cursor);
     try applyTestReportUpdate(&store, stale_cursor);
     try std.testing.expectEqualDeep(cursor, (try store.reportCursor(21, 20)).?);
+}
+
+test "metadata raft apply store topology activation survives snapshots and fences membership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/topology-activation", .{tmp.sub_path});
+    defer a.free(root);
+    const target_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/topology-target", .{tmp.sub_path});
+    defer a.free(target_root);
+    const group_id = group_ids.main_metadata_group_id;
+    const incarnation: metadata_incarnation.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const proof: topology_protocol.Activation = .{ .version = topology_protocol.current_version, .incarnation = incarnation, .member_count = 3, .membership_fingerprint = @splat(7) };
+    const proof_bytes = try std.json.Stringify.valueAlloc(a, proof, .{});
+    defer a.free(proof_bytes);
+    const initialize = try encodeTransitionCommand(a, .{ .initialize_metadata_incarnation = incarnation });
+    defer a.free(initialize);
+    const activate = try encodeTransitionCommand(a, .{ .activate_topology_protocol = proof_bytes });
+    defer a.free(activate);
+    const entries = try raft_state_machine.encodeCommittedEntries(a, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = initialize },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = activate },
+    });
+    defer a.free(entries);
+    const snapshot = blk: {
+        var source = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer source.deinit();
+        try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 2, .entries_bytes = entries });
+        try std.testing.expect((try source.topologyActivation(group_id)).?.satisfies(proof));
+        break :blk try source.snapshotBuilder().buildSnapshot(a, group_id);
+    };
+    defer a.free(snapshot);
+    var reopened = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer reopened.deinit();
+    try std.testing.expect((try reopened.topologyActivation(group_id)).?.satisfies(proof));
+    var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+    defer target.deinit();
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group_id, 2, snapshot));
+    const installed = (try target.topologyActivation(group_id)).?;
+    try std.testing.expect(installed.satisfies(proof));
+    var changed = proof;
+    changed.membership_fingerprint[0] ^= 1;
+    try std.testing.expect(!installed.satisfies(changed));
+    changed = proof;
+    changed.incarnation[0] = '2';
+    try std.testing.expect(!installed.satisfies(changed));
 }

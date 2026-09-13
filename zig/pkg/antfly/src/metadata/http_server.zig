@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const snapshot_transfer = @import("snapshot_transfer.zig");
 const store_report_update = @import("store_report_update.zig");
 const system_catalog = @import("../system_catalog/domain.zig");
 const system_catalog_operations = @import("../system_catalog/operations.zig");
@@ -109,6 +110,7 @@ pub const AdminSource = struct {
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.AdminSnapshot = null,
         runtime_topology: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataRuntimeTopology = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
+        control_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
@@ -569,6 +571,7 @@ pub const AdminSource = struct {
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
                 .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,
+                .control_snapshot = metadataHttpServiceControlSnapshot,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
@@ -1158,6 +1161,10 @@ pub const AdminSource = struct {
         return try svc.runtimeTopology();
     }
 
+    fn metadataHttpServiceControlSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return svc.controlSnapshot();
+    }
     fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return try svc.adminSnapshot();
@@ -1617,18 +1624,21 @@ pub const MetadataHttpServer = struct {
     /// timeout while still honoring any shorter ingress or forwarded budget.
     const max_routing_request_budget_ms: u64 = 5_000;
 
+    alloc: std.mem.Allocator = std.heap.page_allocator,
+    transfers: snapshot_transfer.Cache = .{},
     source: AdminSource,
     internal_service_auth_capability: ?[]const u8 = null,
 
     pub fn init(alloc: std.mem.Allocator, cfg: MetadataHttpServerConfig, source: AdminSource) MetadataHttpServer {
-        _ = alloc;
         return .{
+            .alloc = alloc,
             .source = source,
             .internal_service_auth_capability = cfg.internal_service_auth_capability,
         };
     }
 
     pub fn deinit(self: *MetadataHttpServer) void {
+        self.transfers.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1636,6 +1646,7 @@ pub const MetadataHttpServer = struct {
     /// routes. Unknown paths are rejected by httpx and never enter the
     /// metadata operation layer.
     pub fn registerRoutes(self: *MetadataHttpServer, server: *httpx.Server) !void {
+        try server.post(snapshot_transfer.path, httpx.Handler.bind(self, metadataSnapshotPage));
         try server.get(routes.Routes.health, httpx.Handler.bind(self, metadataHealth));
         try server.get(routes.Routes.head, httpx.Handler.bind(self, metadataHead));
         try server.get(routes.Routes.capabilities, httpx.Handler.bind(self, metadataCapabilities));
@@ -2159,6 +2170,48 @@ pub const MetadataHttpServer = struct {
             try ctx.setHeader("X-Antfly-Internal-Service-Auth", capability);
         }
         return self.trackedJson(ctx, result);
+    }
+
+    fn metadataSnapshotPage(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        return self.metadataSnapshotPageImpl(ctx) catch |err| switch (err) {
+            error.ResourceRequestTooLarge => ctx.status(413).text("snapshot exceeds transfer budget"),
+            error.ResourceTemporarilyUnavailable => blk: {
+                try ctx.setHeader("Retry-After", "1");
+                break :blk ctx.status(503).text("snapshot transfer capacity exhausted");
+            },
+            error.InvalidRequest => ctx.status(400).text("invalid snapshot request"),
+            else => metadataReadError(ctx, err),
+        };
+    }
+    fn metadataSnapshotPageImpl(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        var parsed = std.json.parseFromSlice(snapshot_transfer.Request, ctx.allocator, (try ctx.body()) orelse "{}", .{}) catch return error.InvalidRequest;
+        defer parsed.deinit();
+        var request = parsed.value;
+        if (request.token == 0) {
+            if (request.offset != 0 or request.release) return ctx.status(400).text("invalid snapshot offset");
+            // Only one capture may allocate a large encoding at a time. The
+            // page cache lock is never held while capturing metadata.
+            self.transfers.capture_mutex.lockUncancelable(std.Options.debug_io);
+            defer self.transfers.capture_mutex.unlock(std.Options.debug_io);
+            var snapshot = if (request.linearizable)
+                try self.source.linearizableSnapshot(requestContext(ctx))
+            else if (request.control and self.source.vtable.control_snapshot != null)
+                try self.source.vtable.control_snapshot.?(self.source.ptr)
+            else
+                try self.source.adminSnapshot();
+            defer self.source.freeAdminSnapshot(&snapshot);
+            const bytes = try snapshot_transfer.encode(self.alloc, snapshot);
+            errdefer self.alloc.free(bytes);
+            request.token = try self.transfers.install(self.alloc, bytes, platform_time.monotonicNs());
+        }
+        const page = self.transfers.read(self.alloc, ctx.allocator, request, platform_time.monotonicNs()) catch |err| {
+            if (request.release and err == error.CatalogGenerationChanged) return ctx.status(204).text("");
+            if (err == error.CatalogGenerationChanged) return ctx.status(409).text("snapshot transfer expired");
+            return err;
+        };
+        try ctx.setHeader("X-Antfly-Snapshot-Token", try std.fmt.allocPrint(ctx.allocator, "{d}", .{page.token}));
+        try ctx.setHeader("X-Antfly-Snapshot-Bytes", try std.fmt.allocPrint(ctx.allocator, "{d}", .{page.total}));
+        return ctx.status(200).text(page.bytes);
     }
 
     fn metadataSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {

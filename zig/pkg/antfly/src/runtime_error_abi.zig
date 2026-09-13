@@ -381,6 +381,7 @@ pub const Detail = enum(c_int) {
     catalog_command_too_large,
     invalid_catalog_record,
     catalog_id_exhausted,
+    table_topology_protocol_upgrade_required,
 };
 
 pub const Status = extern struct {
@@ -398,6 +399,7 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.TableTopologyProtocolUpgradeRequired => status(.unavailable, .table_topology_protocol_upgrade_required),
         error.DatabaseNotFound => status(.not_found, .database_not_found),
         error.NamespaceNotFound => status(.not_found, .namespace_not_found),
         error.TablespaceNotFound => status(.not_found, .tablespace_not_found),
@@ -782,6 +784,7 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .table_topology_protocol_upgrade_required => "TableTopologyProtocolUpgradeRequired",
         .database_not_found => "DatabaseNotFound",
         .namespace_not_found => "NamespaceNotFound",
         .tablespace_not_found => "TablespaceNotFound",
@@ -1257,7 +1260,7 @@ test "generation capacity retains retryability across the runtime boundary" {
 }
 
 test "system catalog errors retain their stable runtime boundary classification" {
-    const errors = [_]anyerror{ error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
+    const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
     for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
 }
 

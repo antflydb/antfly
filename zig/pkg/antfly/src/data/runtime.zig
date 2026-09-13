@@ -4587,6 +4587,11 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
     // control loop.
     if (antfly.metadata.authority.isRetryableError(err)) return true;
     return switch (err) {
+        error.StreamTooLong,
+        error.ResponseTooLarge,
+        error.ResourceRequestTooLarge,
+        error.ResourceTemporarilyUnavailable,
+        error.CatalogGenerationChanged,
         error.HttpConnectionClosing,
         error.ConnectionResetByPeer,
         error.ConnectionRefused,
@@ -5637,6 +5642,10 @@ pub const DataServer = struct {
     store_status_generation: std.atomic.Value(u64) = .init(1),
     store_report_publisher: store_report_update.Publisher = .{},
     store_report_publish_mutex: std.Io.Mutex = .init,
+    telemetry_mutex: std.atomic.Mutex = .unlocked,
+    telemetry_pending: ?*PendingTelemetry = null,
+    telemetry_active: bool = false,
+    telemetry_rotation: usize = 0,
     store_report_update_retry_at_ms: u64 = 0,
     metadata_bootstrap_retry_mutex: std.atomic.Mutex = .unlocked,
     metadata_bootstrap_retry_attempts: u32 = 0,
@@ -8211,6 +8220,8 @@ pub const DataServer = struct {
         self.provisioned_index_repair_terminal_log_groups.deinit(self.alloc);
         self.provisioned_index_repair_cancel_groups.deinit(self.alloc);
         self.provisioned_index_repair_routes.deinit(self.alloc);
+        if (self.telemetry_pending) |pending| pending.destroy(self.alloc);
+        self.telemetry_pending = null;
         self.store_report_publisher.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
         self.provisioned_storage.deinit();
@@ -15466,6 +15477,89 @@ pub const DataServer = struct {
         }
     }
 
+    // One pending collection and one in flight bound memory independently of
+    // report frequency. New collections replace unsent samples; oversized
+    // inventories rotate fairly through a bounded window on subsequent rounds.
+    const PendingTelemetry = store_report_update.ActivityCollection;
+
+    fn enqueueTelemetry(self: *DataServer, report: antfly.metadata.table_manager.StoreStatusReport, samples: []const store_report_update.ActivitySample, cursor: store_report_update.Cursor) !void {
+        if (samples.len == 0 or self.background_jobs_shutdown.load(.acquire)) return;
+        const runtime = try self.ensureBackendRuntime();
+        const owner_id = try self.dataServerBackgroundOwnerId(runtime);
+        const pending = try PendingTelemetry.create(self.alloc, report, samples, cursor, &self.telemetry_rotation);
+        errdefer pending.destroy(self.alloc);
+        lockAtomic(&self.telemetry_mutex);
+        var telemetry_locked = true;
+        defer if (telemetry_locked) self.telemetry_mutex.unlock();
+        if (self.telemetry_pending) |old| {
+            // Retain unsent observations for quiet indexes; a newer collection
+            // may contain only the subset whose counters changed. Coalesce by
+            // exact index identity instead of losing the rest of that subset.
+            if (old.update.report.reporter_incarnation == report.reporter_incarnation and
+                old.update.report.status_generation == report.status_generation)
+            {
+                if (old.update.report.embedding_activity_sequence > report.embedding_activity_sequence) {
+                    pending.destroy(self.alloc);
+                    return;
+                }
+                try pending.mergeOlder(old);
+            }
+            old.destroy(self.alloc);
+        }
+        self.telemetry_pending = pending;
+        const launch = !self.telemetry_active;
+        if (launch) self.telemetry_active = true;
+        telemetry_locked = false;
+        self.telemetry_mutex.unlock();
+        if (launch) runtime.durable_jobs.submit(.{
+            .owner_id = owner_id,
+            .class = .maintenance,
+            .ptr = self,
+            .run = runTelemetryDelivery,
+            .deinit = deinitTelemetryDelivery,
+        }) catch |err| {
+            lockAtomic(&self.telemetry_mutex);
+            self.telemetry_active = false;
+            self.telemetry_pending = null;
+            self.telemetry_mutex.unlock();
+            return err;
+        };
+    }
+
+    fn deinitTelemetryDelivery(_: *anyopaque) void {}
+
+    fn runTelemetryDelivery(ptr: *anyopaque) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        while (true) {
+            lockAtomic(&self.telemetry_mutex);
+            const pending = self.telemetry_pending;
+            self.telemetry_pending = null;
+            if (pending == null) self.telemetry_active = false;
+            self.telemetry_mutex.unlock();
+            const current = pending orelse return;
+            defer current.destroy(self.alloc);
+            var offset: usize = 0;
+            while (offset < current.update.activity.len and !self.background_jobs_shutdown.load(.acquire)) {
+                const end = @min(offset + store_report_update.max_activity_samples, current.update.activity.len);
+                var batch = current.update;
+                batch.activity = current.update.activity[offset..end];
+                self.sendTelemetryBatch(batch) catch |err| {
+                    self.embedding_activity_status_dirty.store(true, .release);
+                    std.log.warn("telemetry delivery deferred err={s}", .{@errorName(err)});
+                    break;
+                };
+                offset = end;
+            }
+        }
+    }
+
+    fn sendTelemetryBatch(self: *DataServer, batch: store_report_update.Update) !void {
+        const remote = self.remote_metadata orelse return;
+        const bytes = try stringifyJsonAlloc(self.alloc, batch);
+        defer self.alloc.free(bytes);
+        _ = try remote.reportNodeUpdate(batch.report.store_id, bytes);
+    }
+
     fn publishStoreReportUpdate(self: *DataServer, report: antfly.metadata.table_manager.StoreStatusReport, retain_runtime: bool) !bool {
         const remote = self.remote_metadata orelse return false;
         self.store_report_publish_mutex.lockUncancelable(remote.io);
@@ -15476,7 +15570,7 @@ pub const DataServer = struct {
             var prepared = try self.store_report_publisher.prepare(self.alloc, report, attempt != 0, retain_runtime);
             defer prepared.deinit(self.alloc);
             const activity = prepared.update.activity;
-            prepared.update.activity = activity[0..@min(activity.len, store_report_update.max_activity_samples)];
+            prepared.update.activity = &.{};
             const body = try stringifyJsonAlloc(prepared.arena.allocator(), prepared.update);
             const cursor = remote.reportNodeUpdate(report.store_id, body) catch |err| switch (err) {
                 error.StoreReportBaseMismatch => if (attempt == 0) continue else return err,
@@ -15496,19 +15590,10 @@ pub const DataServer = struct {
                 prepared.update.removed_groups.len == 0;
             if (!retained_base and (cursor.sequence != prepared.update.sequence or cursor.reporter_incarnation != report.reporter_incarnation or !std.mem.eql(u8, &digest, &cursor.digest))) return error.InvalidStoreReporterFence;
             self.store_report_publisher.commit(self.alloc, &prepared, cursor);
-            var offset = prepared.update.activity.len;
-            while (offset < activity.len) {
-                const end = @min(activity.len, offset + store_report_update.max_activity_samples);
-                self.store_report_publisher.sequence = try std.math.add(u64, self.store_report_publisher.sequence, 1);
-                var batch: store_report_update.Update = .{ .sequence = self.store_report_publisher.sequence, .base = cursor, .report = prepared.update.report, .activity = activity[offset..end] };
-                batch.report.group_statuses = &.{};
-                batch.report.runtime_statuses = &.{};
-                const batch_body = try stringifyJsonAlloc(self.alloc, batch);
-                defer self.alloc.free(batch_body);
-                const observed = try remote.reportNodeUpdate(report.store_id, batch_body);
-                if (!std.meta.eql(cursor, observed)) return error.StoreReportBaseMismatch;
-                offset = end;
-            }
+            self.enqueueTelemetry(report, activity, cursor) catch |err| {
+                self.embedding_activity_status_dirty.store(true, .release);
+                std.log.warn("telemetry enqueue deferred err={s}", .{@errorName(err)});
+            };
             remote.supports_runtime_reference.store(true, .release);
             return true;
         }
@@ -19490,6 +19575,9 @@ const RemoteMetadataSource = struct {
     metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation = null,
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
+    diagnostic_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
+    diagnostic_snapshot_at_ms: u64 = 0,
+    diagnostic_snapshot_generation: u64 = 0,
     cached_snapshot_at_ms: u64 = 0,
     cached_routing_snapshot: ?*RoutingSnapshotCacheEntry = null,
     cached_routing_snapshot_at_ms: u64 = 0,
@@ -19588,6 +19676,7 @@ const RemoteMetadataSource = struct {
         if (self.http_executors.len > 0) self.alloc.free(self.http_executors);
         if (self.request_executors.len > 0) self.alloc.free(self.request_executors);
         lockAtomic(&self.cache_mutex);
+        if (self.diagnostic_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         if (self.cached_routing_snapshot) |snapshot| snapshot.release(self.alloc);
         if (self.authoritative_routing_generation) |generation| generation.release();
@@ -20383,7 +20472,7 @@ const RemoteMetadataSource = struct {
                 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
                 var metadata_client = self.metadataClient(arena.allocator());
-                var parsed = metadata_client.fetchLinearizableSnapshot(self.base_uris[index], budget) catch |err| {
+                var parsed = metadata_client.fetchPagedSnapshot(self.base_uris[index], false, true, budget) catch |err| {
                     if (err == error.UnsupportedOperation) {
                         self.noteLinearizableSnapshotUnsupported(index, self.awakeNs());
                         unsupported_count += 1;
@@ -20506,7 +20595,7 @@ const RemoteMetadataSource = struct {
             defer arena.deinit();
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
-            var parsed = metadata_client.fetchSnapshotWithBudget(self.base_uris[index], budget) catch |err| {
+            var parsed = metadata_client.fetchPagedSnapshot(self.base_uris[index], true, false, budget) catch |err| {
                 if (err == error.Cancelled or err == error.Timeout) return err;
                 last_err = err;
                 continue;
@@ -20537,9 +20626,44 @@ const RemoteMetadataSource = struct {
         return remoteSystemCatalog(ptr, alloc, .{}, .export_snapshot);
     }
 
+    fn cachedDiagnosticSnapshot(self: *RemoteMetadataSource) !?antfly.metadata_api.AdminSnapshot {
+        const now_ms = self.awakeMs();
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        if (self.diagnostic_snapshot_generation == self.snapshot_fence_generation and
+            now_ms -| self.diagnostic_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms)
+        {
+            if (self.diagnostic_snapshot) |snapshot| return try cloneAdminSnapshotOwned(self.alloc, snapshot);
+        }
+        return null;
+    }
+
     fn remoteAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
-        return try self.fetchSnapshot();
+        if (try self.cachedDiagnosticSnapshot()) |snapshot| return snapshot;
+        lockAtomic(&self.cache_mutex);
+        const generation = self.snapshot_fence_generation;
+        self.cache_mutex.unlock();
+        var result = try self.withMetadataApiClient(antfly.metadata_api.AdminSnapshot, struct {
+            fn call(source: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, uri: []const u8, _: void) !antfly.metadata_api.AdminSnapshot {
+                var parsed = try client.fetchPagedSnapshot(uri, false, false, null);
+                defer parsed.deinit();
+                try source.acceptMetadataIdentity(parsed.value.status.metadata_group_id, parsed.value.status.metadata_incarnation);
+                return cloneAdminSnapshotOwned(source.alloc, parsed.value);
+            }
+        }.call, {});
+        errdefer freeAdminSnapshotOwned(self.alloc, &result);
+        const now_ms = self.awakeMs();
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        if (generation == self.snapshot_fence_generation) {
+            const copy = try cloneAdminSnapshotOwned(self.alloc, result);
+            if (self.diagnostic_snapshot) |*old| freeAdminSnapshotOwned(self.alloc, old);
+            self.diagnostic_snapshot = copy;
+            self.diagnostic_snapshot_at_ms = now_ms;
+            self.diagnostic_snapshot_generation = generation;
+        }
+        return result;
     }
 
     fn remoteCatalogIdentity(ptr: *anyopaque) !antfly.metadata_api.CatalogIdentity {
@@ -21056,7 +21180,7 @@ const RemoteMetadataSource = struct {
 
     fn remoteCachedAdminSnapshot(ptr: *anyopaque) !?antfly.metadata_api.AdminSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
-        return try self.cachedSnapshot();
+        return self.cachedDiagnosticSnapshot();
     }
 
     fn remoteFreeAdminSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.AdminSnapshot) void {

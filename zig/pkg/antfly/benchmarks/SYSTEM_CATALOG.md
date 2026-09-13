@@ -351,3 +351,36 @@ group and delivers all 1,000/10,000 samples in batches of at most 512. It report
 both aggregate bytes and the maximum request size, rather than treating a smaller
 single batch as the full workload. Component times exclude HTTP and Raft network
 latency; the cluster workload includes them.
+
+
+### Failover, large control views, and independent telemetry
+
+Run `test_catalog_resilience.py` with the catalog E2Es to verify that an activated
+three-voter cluster continues sparse reports and namespace DDL after its leader
+stops. The same module registers a 10,000-group synthetic non-live store, reads
+complete diagnostics through bounded pages, and performs public DDL over multiple
+control rounds while asserting that every real data node remains alive.
+
+From `zig/`, run the delivery workload with:
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_catalog_resilience.py \
+  --groups 10000 --samples 12 --warmup 2 --output /tmp/catalog-resilience.json
+```
+
+This uses three metadata replicas and three real data processes. The synthetic
+store has one embedding index per group and does not participate in placement.
+It compares complete multi-batch collections through durable admission and the
+independent telemetry path on the same binary, alongside namespace create/drop
+pairs. Two warmup collections and DDL pairs are discarded. Export timings are cold
+observations, not steady-state latency comparisons. Every real data node must
+remain alive; a successful HTTP benchmark with terminated data nodes is invalid.
+These synthetic group IDs are outside the catalog, so the compact control view
+contains no group facts for that store. Actual placements and active transition
+groups remain in control views.
+
+The component target also prints `GROUP_CACHE_FIRST_READER_BENCH`. Pair it with
+`GROUP_CACHE_BENCH`: sparse publication now retains a persistent tree, while the
+first flat-view consumer pays the explicit O(G) materialization cost. Subsequent
+readers reuse that array. Do not attribute the publication speedup to whole-view
+reads or durable persistence, which have separate measurements.
