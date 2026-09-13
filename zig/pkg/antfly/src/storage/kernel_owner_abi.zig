@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 53;
+pub const abi_version: u32 = 54;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -249,7 +249,7 @@ pub const LocalQueryReturnMode = enum(u32) {
     member = 5,
 };
 
-/// Scalar execution details that are not losslessly represented by the
+/// Request-local execution details that are not losslessly represented by the
 /// existing public/distributed JSON envelope. They are applied only when
 /// `enabled` is set, after parsing and before DB execution.
 pub const LocalQueryExecutionOptions = extern struct {
@@ -258,6 +258,9 @@ pub const LocalQueryExecutionOptions = extern struct {
     _reserved0: [2]u8 = @splat(0),
     return_mode: LocalQueryReturnMode = .parent,
     max_chunks_per_parent: u32 = 0,
+    /// Presentation only; never used for storage lookup or authorization.
+    /// Borrowed through this synchronous call and response serialization.
+    response_table_name: BorrowedBytes = .{},
 };
 
 /// One complete local query against a DB owned by the storage archive. The DB

@@ -158,6 +158,7 @@ comptime {
     _ = @import("enrichment.zig");
     _ = @import("filesystem_capacity.zig");
     _ = @import("generation_publication.zig");
+    _ = @import("ha/seed_materialization.zig");
     _ = @import("ha/admin.zig");
     _ = @import("ha/admin_cli.zig");
     _ = @import("ha/admin_exec.zig");

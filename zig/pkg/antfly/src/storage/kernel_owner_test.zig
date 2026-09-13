@@ -607,6 +607,20 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     const query_json =
         \\{"query":{"match_all":{}},"limit":10}
     ;
+    // A catalog label crosses both compiled archives without changing the
+    // physical owner target. Serialization finishes before its borrowed storage
+    // can be released; the response owns its public name.
+    var labeled = label_scope: {
+        const label = try std.testing.allocator.dupe(u8, "tenant.public.events");
+        defer std.testing.allocator.free(label);
+        const response = try owner.queryJsonWithOptions("docs", query_json, .{
+            .execution = @import("local_query_controls.zig").executionOptions(.{ .response_table_name = label }),
+        });
+        @memset(label, 0xaa);
+        break :label_scope response;
+    };
+    defer labeled.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, labeled.bytes(), "\"table\":\"tenant.public.events\"") != null);
     try std.testing.expectError(error.Timeout, owner.queryJsonWithOptions("docs", query_json, .{
         .execution_deadline_ns = 1,
     }));
@@ -1544,9 +1558,9 @@ test "opaque metadata apply owner preserves semantic error identity" {
         .commit_index = 7,
         .entries_bytes = "not-projectable-entries",
     });
-    const latest = (try store.latestBatch(91)) orelse return error.TestExpectedEqual;
+    const latest = (try store.latestCheckpoint(91)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 7), latest.commit_index);
-    try std.testing.expectEqualStrings("not-projectable-entries", latest.entries_bytes);
+    try std.testing.expectEqual(@as(usize, "not-projectable-entries".len), latest.input_bytes);
     try std.testing.expectError(
         error.AppliedSnapshotIndexMismatch,
         snapshots.prepareSnapshot(91, 8),

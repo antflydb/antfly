@@ -2228,19 +2228,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .execution_deadline_ns = req.execution_deadline_ns,
             .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
             .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
-            .execution = .{
-                .enabled = 1,
-                .include_stored = @intFromBool(req.include_stored),
-                .return_mode = switch (req.return_mode) {
-                    .parent => .parent,
-                    .chunk => .chunk,
-                    .parent_with_chunks => .parent_with_chunks,
-                    .unit => .unit,
-                    .unit_with_chunks => .unit_with_chunks,
-                    .member => .member,
-                },
-                .max_chunks_per_parent = req.max_chunks_per_parent,
-            },
+            .execution = @import("../storage/local_query_controls.zig").executionOptions(req),
         });
         errdefer response.deinit();
         try table_reads.checkQueryDeadline(req);

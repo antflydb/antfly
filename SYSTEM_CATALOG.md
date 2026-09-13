@@ -660,6 +660,10 @@ it never reaches through the boundary to a backend cursor. The apply progress
 contract carries a fixed-size checkpoint, without retaining replay bytes in the
 client. Sparse projection notifications preserve changed-group IDs and separate
 group/runtime invalidation flags through the synchronous callback boundary.
+Query execution options carry the catalog's public response label through both
+compiled archives. The label is borrowed until serialization completes and never
+selects a storage owner or grants authorization; responses own their encoded
+names. A shared options adapter keeps the two query entry points consistent.
 
 Portable HA seed catalog validation lives with the storage-free seed topology
 contract, so both distributed capture and physical materialization enforce the
