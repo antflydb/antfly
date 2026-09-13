@@ -62,12 +62,17 @@ type AntflyClusterReconciler struct {
 	client.Client
 	// BoundaryReader bypasses the controller cache for fencing decisions whose
 	// correctness depends on a current Lease/workload/Pod snapshot.
-	BoundaryReader        client.Reader
-	Scheme                *runtime.Scheme
-	AutoScaler            *AutoScaler
-	KubeClient            kubernetes.Interface
-	NodeStatsFetcher      func(context.Context, string) (*kubeletStatsSummary, error)
-	HTTPClient            *http.Client
+	BoundaryReader   client.Reader
+	Scheme           *runtime.Scheme
+	AutoScaler       *AutoScaler
+	KubeClient       kubernetes.Interface
+	NodeStatsFetcher func(context.Context, string) (*kubeletStatsSummary, error)
+	HTTPClient       *http.Client
+	// HAAdminPathStyle selects which spelling of the hot-standby admin API the
+	// operator sends. The zero value keeps the pre-0.3 /admin/v1/ha paths;
+	// the binary defaults to adminsdk.PathStyleAuto, which negotiates per
+	// server so mixed-version clusters keep working during an upgrade.
+	HAAdminPathStyle      adminsdk.PathStyle
 	Recorder              events.EventRecorder
 	ManageInferencePools  bool
 	DefaultInferenceImage string
@@ -1295,6 +1300,21 @@ type dataNodeShutdownStatus struct {
 	Blocked         bool   `json:"blocked,omitempty"`
 	BlockedReason   string `json:"blocked_reason,omitempty"`
 	Message         string `json:"message,omitempty"`
+}
+
+// ParseHAAdminPathStyle maps the --ha-admin-path-style flag value onto the
+// SDK setting: "auto" (negotiate per server), "legacy" (/admin/v1/ha), or
+// "canonical" (/admin/v1/standby).
+func ParseHAAdminPathStyle(value string) (adminsdk.PathStyle, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "auto":
+		return adminsdk.PathStyleAuto, nil
+	case "legacy":
+		return adminsdk.PathStyleLegacy, nil
+	case "canonical":
+		return adminsdk.PathStyleCanonical, nil
+	}
+	return adminsdk.PathStyleLegacy, fmt.Errorf("unknown HA admin path style %q (want auto, legacy, or canonical)", value)
 }
 
 func (r *AntflyClusterReconciler) httpClient() *http.Client {
@@ -7851,6 +7871,7 @@ func (r *AntflyClusterReconciler) haAdminSDKClient(cluster *antflyv1.AntflyClust
 	if err != nil {
 		return nil, err
 	}
+	client.WithPathStyle(r.HAAdminPathStyle)
 	token, err := r.haAdminBearerToken(cluster)
 	if err != nil {
 		return nil, err

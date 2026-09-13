@@ -1,16 +1,19 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/admin/oapi"
 )
@@ -361,13 +364,187 @@ type PathStyle int
 
 const (
 	// PathStyleLegacy sends requests to /admin/v1/ha/... . This is the
-	// default for this release. It will flip to PathStyleCanonical in the
-	// release after 0.3 servers (which understand /admin/v1/standby/...)
-	// become the minimum supported server version.
+	// zero value and the default for this release; PathStyleAuto is the
+	// recommended setting and the one the Kubernetes operator uses.
 	PathStyleLegacy PathStyle = iota
 	// PathStyleCanonical sends requests to /admin/v1/standby/... .
 	PathStyleCanonical
+	// PathStyleAuto negotiates: it sends the canonical /admin/v1/standby/...
+	// path first and, on a 404 that looks like an unrouted path rather than
+	// a missing resource, retries the legacy /admin/v1/ha/... spelling once.
+	// Whichever spelling answers is remembered for the client and, keyed by
+	// base URL, for later clients in the same process, so a short-lived
+	// client (one per reconcile, say) does not pay the probe every time. A
+	// remembered spelling is re-probed only when it starts returning
+	// unrouted 404s, which covers a server rollback.
+	PathStyleAuto
 )
+
+// negotiatedPathStyles remembers, per normalized admin base URL, which
+// spelling a server answered under PathStyleAuto.
+var negotiatedPathStyles sync.Map
+
+// ResetNegotiatedPathStyles forgets every spelling remembered by
+// PathStyleAuto. Intended for tests that reuse a base URL across servers.
+func ResetNegotiatedPathStyles() {
+	negotiatedPathStyles.Range(func(key, _ any) bool {
+		negotiatedPathStyles.Delete(key)
+		return true
+	})
+}
+
+// pathNegotiator holds a client's PathStyleAuto state.
+type pathNegotiator struct {
+	mu       sync.Mutex
+	cacheKey string
+	style    PathStyle
+	pinned   bool
+}
+
+func newPathNegotiator(cacheKey string) *pathNegotiator {
+	n := &pathNegotiator{cacheKey: cacheKey, style: PathStyleCanonical}
+	if cached, ok := negotiatedPathStyles.Load(cacheKey); ok {
+		n.style = cached.(PathStyle)
+		n.pinned = true
+	}
+	return n
+}
+
+func (n *pathNegotiator) current() (PathStyle, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.style, n.pinned
+}
+
+func (n *pathNegotiator) pin(style PathStyle) {
+	n.mu.Lock()
+	n.style = style
+	n.pinned = true
+	n.mu.Unlock()
+	negotiatedPathStyles.Store(n.cacheKey, style)
+}
+
+// pathNegotiatingDoer wraps the HTTP doer the generated client uses and
+// implements PathStyleAuto. The generated client always builds canonical
+// paths; this doer rewrites and retries them as the negotiation dictates.
+type pathNegotiatingDoer struct {
+	inner  oapi.HttpRequestDoer
+	client *StandbyClient
+}
+
+func (d *pathNegotiatingDoer) Do(req *http.Request) (*http.Response, error) {
+	c := d.client
+	if c == nil || c.pathStyle != PathStyleAuto || req == nil || req.URL == nil {
+		return d.inner.Do(req)
+	}
+	legacyPath, ok := legacyAdminRequestPath(req.URL.Path)
+	if !ok {
+		return d.inner.Do(req)
+	}
+	canonicalPath := req.URL.Path
+	pathFor := func(style PathStyle) string {
+		if style == PathStyleLegacy {
+			return legacyPath
+		}
+		return canonicalPath
+	}
+
+	first, pinned := c.negotiator.current()
+	firstReq := req
+	if first == PathStyleLegacy {
+		firstReq = requestWithPath(req, legacyPath)
+	}
+	resp, err := d.inner.Do(firstReq)
+	if err != nil {
+		return resp, err
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		if !pinned {
+			c.negotiator.pin(first)
+		}
+		return resp, nil
+	}
+
+	// A 404 means either the spelling is unknown to this server or the
+	// resource is genuinely absent. Once a spelling is pinned, only an
+	// unrouted-looking body triggers a re-probe, so a real SlotNotFound
+	// does not cost an extra round trip.
+	body, restored := peekBody(resp)
+	if !restored || (pinned && !looksUnrouted(body)) {
+		return resp, nil
+	}
+	other := PathStyleLegacy
+	if first == PathStyleLegacy {
+		other = PathStyleCanonical
+	}
+	retryReq, ok := replayableRequestWithPath(req, pathFor(other))
+	if !ok {
+		return resp, nil
+	}
+	retryResp, retryErr := d.inner.Do(retryReq)
+	if retryErr != nil || retryResp.StatusCode == http.StatusNotFound {
+		if retryResp != nil && retryResp.Body != nil {
+			_ = retryResp.Body.Close()
+		}
+		return resp, nil
+	}
+	_ = resp.Body.Close()
+	c.negotiator.pin(other)
+	return retryResp, nil
+}
+
+// requestWithPath returns a shallow clone of req addressed at path. The body
+// is shared, so the clone must be the only one sent.
+func requestWithPath(req *http.Request, path string) *http.Request {
+	clone := req.Clone(req.Context())
+	clone.URL.Path = path
+	if clone.URL.RawPath != "" {
+		clone.URL.RawPath = path
+	}
+	return clone
+}
+
+// replayableRequestWithPath is requestWithPath for a request whose body may
+// already have been consumed; it reports false when the body cannot be
+// replayed.
+func replayableRequestWithPath(req *http.Request, path string) (*http.Request, bool) {
+	clone := requestWithPath(req, path)
+	if req.Body == nil || req.Body == http.NoBody {
+		return clone, true
+	}
+	if req.GetBody == nil {
+		return nil, false
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, false
+	}
+	clone.Body = body
+	return clone, true
+}
+
+// peekBody reads a response body so it can be inspected and then restores it
+// for the caller.
+func peekBody(resp *http.Response) ([]byte, bool) {
+	if resp.Body == nil {
+		return nil, true
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+	if err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return body, false
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return body, true
+}
+
+// looksUnrouted reports whether a 404 body reads like a router miss rather
+// than a typed resource error such as SlotNotFound.
+func looksUnrouted(body []byte) bool {
+	text := strings.ToLower(strings.TrimSpace(string(body)))
+	return text == "" || strings.Contains(text, "not found") || strings.HasPrefix(text, "404")
+}
 
 // StandbyClient is a typed client for the stable /admin/v1/standby API
 // (still /admin/v1/ha by default this release; see PathStyle).
@@ -376,6 +553,7 @@ type StandbyClient struct {
 	editors    []oapi.RequestEditorFn
 	authEditor oapi.RequestEditorFn
 	pathStyle  PathStyle
+	negotiator *pathNegotiator
 }
 
 // rebuildEditors recomputes the request editor chain from the client's
@@ -400,34 +578,38 @@ func legacyPathStyleEditor(_ context.Context, req *http.Request) error {
 	if req == nil || req.URL == nil {
 		return nil
 	}
-	rewrite := func(path string) (string, bool) {
-		// Standby-role routes dropped their redundant segment with the new
-		// prefix, so they are not a plain prefix swap.
-		switch path {
-		case StandbyStatusPath:
-			return HAStandbyStatusPath, true
-		case StandbyBootstrapPath:
-			return HAStandbyBootstrapPath, true
-		case StandbyUpstreamPath:
-			return HAStandbyUpstreamPath, true
-		}
-		if path == StandbyPath {
-			return HAPath, true
-		}
-		if strings.HasPrefix(path, StandbyPath+"/") {
-			return HAPath + strings.TrimPrefix(path, StandbyPath), true
-		}
-		return path, false
-	}
-	if newPath, ok := rewrite(req.URL.Path); ok {
+	if newPath, ok := legacyAdminRequestPath(req.URL.Path); ok {
 		req.URL.Path = newPath
 	}
 	if req.URL.RawPath != "" {
-		if newRawPath, ok := rewrite(req.URL.RawPath); ok {
+		if newRawPath, ok := legacyAdminRequestPath(req.URL.RawPath); ok {
 			req.URL.RawPath = newRawPath
 		}
 	}
 	return nil
+}
+
+// legacyAdminRequestPath maps a canonical /admin/v1/standby/... request path
+// onto its legacy /admin/v1/ha/... spelling. It reports false for paths
+// outside the standby admin surface.
+func legacyAdminRequestPath(path string) (string, bool) {
+	// Standby-role routes dropped their redundant segment with the new
+	// prefix, so they are not a plain prefix swap.
+	switch path {
+	case StandbyStatusPath:
+		return HAStandbyStatusPath, true
+	case StandbyBootstrapPath:
+		return HAStandbyBootstrapPath, true
+	case StandbyUpstreamPath:
+		return HAStandbyUpstreamPath, true
+	}
+	if path == StandbyPath {
+		return HAPath, true
+	}
+	if strings.HasPrefix(path, StandbyPath+"/") {
+		return HAPath + strings.TrimPrefix(path, StandbyPath), true
+	}
+	return path, false
 }
 
 // StandbyOperation identifies a stable /admin/v1/ha method and full admin path.
@@ -2840,23 +3022,25 @@ func StandbyIsRetryable(err error) bool {
 // server root, an explicit /admin/v1 admin API root, or the /admin/v1/ha HA
 // root advertised to operators.
 func NewStandbyClient(baseURL string, httpClient *http.Client) (*StandbyClient, error) {
-	opts := []oapi.ClientOption{}
+	var doer oapi.HttpRequestDoer = http.DefaultClient
 	if httpClient != nil {
-		opts = append(opts, oapi.WithHTTPClient(httpClient))
+		doer = httpClient
 	}
-	return newStandbyClientWithOptions(baseURL, opts...)
+	return newStandbyClientWithDoer(baseURL, doer)
 }
 
-func newStandbyClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*StandbyClient, error) {
+func newStandbyClientWithDoer(baseURL string, doer oapi.HttpRequestDoer) (*StandbyClient, error) {
 	normalizedBaseURL, err := normalizeAdminBaseURL(baseURL)
 	if err != nil {
 		return nil, err
 	}
-	client, err := oapi.NewClientWithResponses(normalizedBaseURL, opts...)
+	negotiating := &pathNegotiatingDoer{inner: doer}
+	client, err := oapi.NewClientWithResponses(normalizedBaseURL, oapi.WithHTTPClient(negotiating))
 	if err != nil {
 		return nil, err
 	}
-	c := &StandbyClient{client: client, pathStyle: PathStyleLegacy}
+	c := &StandbyClient{client: client, pathStyle: PathStyleLegacy, negotiator: newPathNegotiator(normalizedBaseURL)}
+	negotiating.client = c
 	c.rebuildEditors()
 	return c, nil
 }
@@ -2877,8 +3061,9 @@ func (c *StandbyClient) WithToken(token string) *StandbyClient {
 }
 
 // WithPathStyle selects whether the client sends requests to the legacy
-// /admin/v1/ha prefix (PathStyleLegacy, the default this release) or the
-// canonical /admin/v1/standby prefix (PathStyleCanonical).
+// /admin/v1/ha prefix (PathStyleLegacy, the default this release), the
+// canonical /admin/v1/standby prefix (PathStyleCanonical), or negotiates
+// per server (PathStyleAuto, recommended).
 func (c *StandbyClient) WithPathStyle(style PathStyle) *StandbyClient {
 	c.pathStyle = style
 	c.rebuildEditors()
@@ -2908,6 +3093,9 @@ func normalizeAdminBaseURL(baseURL string) (string, error) {
 	trimmed := strings.TrimRight(baseURL, "/")
 	if strings.HasSuffix(trimmed, HAPath) {
 		return strings.TrimSuffix(trimmed, HAPath) + adminV1Path, nil
+	}
+	if strings.HasSuffix(trimmed, StandbyPath) {
+		return strings.TrimSuffix(trimmed, StandbyPath) + adminV1Path, nil
 	}
 	return strings.TrimSuffix(trimmed, adminV1Path) + adminV1Path, nil
 }

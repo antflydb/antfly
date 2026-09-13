@@ -835,8 +835,13 @@ The old CLI name (`antfly ha`), the old config key (`ha:`), the old admin API
 paths (`/admin/v1/ha/...`, `/ha/v1/health`, `/ha/v1/ready`), and the old
 environment variable names (`ANTFLY_HA_ADMIN_URL`, `ANTFLY_HA_ADMIN_TOKEN`)
 all continue to work for one minor release and are scheduled for removal in
-0.4. The Kubernetes operator keeps using the old admin API paths and
-environment variable names until its minimum supported server version is 0.3.
+0.4. Every client negotiates rather than assuming: the CLI, a replicating
+standby, and the Kubernetes operator (Go SDK `PathStyleAuto`, the operator's
+`--ha-admin-path-style=auto` default) send the canonical path first and fall
+back to the old spelling once on an unrouted 404, remembering the answer per
+peer. Either side of a primary/standby pair, or of an operator/server pair,
+can therefore be upgraded first. The operator keeps reading its own token from
+`ANTFLY_HA_ADMIN_TOKEN`.
 
 ### Target resolution
 

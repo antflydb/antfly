@@ -16,9 +16,14 @@ Use the typed admin API for normal automation:
 | `/internal/v1` | Runtime-to-runtime replication traffic only |
 
 The old `/admin/v1/ha` paths and the `antfly ha` command name still work as
-aliases for one minor release. The Kubernetes operator's Go implementation
-continues to call the old `/admin/v1/ha` paths and read `ANTFLY_HA_ADMIN_TOKEN`
-until its minimum supported server version is 0.3.
+aliases for one minor release. The Kubernetes operator negotiates the spelling
+per server (`--ha-admin-path-style=auto`, the default): it sends the
+`/admin/v1/standby` path first and, if a node answers with an unrouted 404,
+retries the old spelling once and remembers the answer for that node's URL.
+Mixed-version clusters therefore keep working through a rolling upgrade, and
+nothing has to be flipped when 0.3 becomes the minimum server. `legacy` and
+`canonical` force one spelling for troubleshooting. The operator still reads
+its own token from `ANTFLY_HA_ADMIN_TOKEN`.
 
 The Kubernetes operator lives in `go/pkg/operator` and should use the Go SDK
 admin wrapper generated from `specs/openapi/antfly/admin.yaml`. It should not

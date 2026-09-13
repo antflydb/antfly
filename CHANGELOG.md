@@ -36,11 +36,13 @@ All notable changes to Antfly will be documented in this file.
   `/ha/v1/...`, and `/internal/v1/ha/...` paths are served as aliases for one
   minor release, and the CLI and a replicating standby fall back to them once
   when they meet a 0.2 server, so either side of a pair may be upgraded first.
-  The Kubernetes operator keeps calling the old paths until its minimum
-  supported server version is 0.3.
+  The Kubernetes operator negotiates per server (`--ha-admin-path-style`,
+  default `auto`) instead of waiting for a minimum server version.
 - **Schemas renamed `HA*` -> `Standby*`** — in the admin and internal OpenAPI
   specs and the generated SDKs. The Go SDK keeps every `HA*` name as a
-  deprecated alias and defaults to the legacy path style for this release.
+  deprecated alias, adds `PathStyleAuto` (canonical first, one fallback to the
+  old spelling, remembered per base URL), and keeps the legacy style as its
+  zero-value default for this release.
 - **Operator metrics** — dual-emitted under both the `ha` and `standby`
   subsystems during the deprecation window.
 - **`storage/hot_standby` package** — the Zig package moved from

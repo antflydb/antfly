@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -3886,5 +3887,182 @@ func TestDeprecatedHAAliasesResolveToStandbyTypes(t *testing.T) {
 	var canonical StandbyResponse[int] = resp
 	if canonical.Value != resp.Value || *canonical.Value != 42 {
 		t.Fatalf("HAResponse[int] alias round-trip = %#v, want Value pointing at 42", canonical)
+	}
+}
+
+const standbyAutoSlotCreateJSON = `{
+	"schema_version":1,
+	"slot_action":"create",
+	"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-a"},
+	"slot":{"slot_name":"standby-a","timeline_id":1,"restart_lsn":7,"received_lsn":7,"applied_lsn":7,"safe_read_lsn":7,"active":true,"reseed_required":false,"current_lsn":7}
+}`
+
+// legacyOnlyStandbyServer emulates a 0.2 server: canonical paths are unrouted
+// and only the /admin/v1/ha spelling answers.
+func legacyOnlyStandbyServer(t *testing.T, counts map[string]int) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		counts[r.URL.Path]++
+		mu.Unlock()
+		if strings.HasPrefix(r.URL.Path, StandbyPath) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case HAPrimaryStatusPath:
+			_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+		case HAReplicationSlotsPath:
+			body, _ := io.ReadAll(r.Body)
+			if !strings.Contains(string(body), `"slot_name":"standby-a"`) {
+				http.Error(w, "body was not replayed: "+string(body), http.StatusBadRequest)
+				return
+			}
+			_, _ = fmt.Fprint(w, standbyAutoSlotCreateJSON)
+		default:
+			http.Error(w, "SlotNotFound", http.StatusNotFound)
+		}
+	}))
+}
+
+func TestStandbyClientPathStyleAutoStaysCanonicalWhenServed(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if !strings.HasPrefix(r.URL.Path, StandbyPath) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto)
+	for i := 0; i < 2; i++ {
+		if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+			t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+		}
+	}
+	if len(paths) != 2 || paths[0] != StandbyPrimaryStatusPath || paths[1] != StandbyPrimaryStatusPath {
+		t.Fatalf("paths = %v, want two canonical requests and no legacy probe", paths)
+	}
+	if style, pinned := client.negotiator.current(); style != PathStyleCanonical || !pinned {
+		t.Fatalf("negotiated style = %v pinned=%v, want canonical pinned", style, pinned)
+	}
+}
+
+func TestStandbyClientPathStyleAutoFallsBackToLegacyOnce(t *testing.T) {
+	t.Parallel()
+
+	counts := map[string]int{}
+	server := legacyOnlyStandbyServer(t, counts)
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto).WithToken("test-token")
+	for i := 0; i < 3; i++ {
+		if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+			t.Fatalf("PrimaryStatusResponse %d returned error: %v", i, err)
+		}
+	}
+	if counts[StandbyPrimaryStatusPath] != 1 {
+		t.Fatalf("canonical probes = %d, want exactly one before pinning legacy", counts[StandbyPrimaryStatusPath])
+	}
+	if counts[HAPrimaryStatusPath] != 3 {
+		t.Fatalf("legacy requests = %d, want 3", counts[HAPrimaryStatusPath])
+	}
+	if style, pinned := client.negotiator.current(); style != PathStyleLegacy || !pinned {
+		t.Fatalf("negotiated style = %v pinned=%v, want legacy pinned", style, pinned)
+	}
+
+	// A later client for the same base URL starts on the remembered spelling.
+	second, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	second.WithPathStyle(PathStyleAuto)
+	if _, err := second.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("second PrimaryStatusResponse returned error: %v", err)
+	}
+	if counts[StandbyPrimaryStatusPath] != 1 {
+		t.Fatalf("canonical probes after cached client = %d, want still 1", counts[StandbyPrimaryStatusPath])
+	}
+}
+
+func TestStandbyClientPathStyleAutoReplaysRequestBodyOnFallback(t *testing.T) {
+	t.Parallel()
+
+	counts := map[string]int{}
+	server := legacyOnlyStandbyServer(t, counts)
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto)
+	resp, err := client.CreateReplicationSlot(context.Background(), ReplicationSlotCreateRequest{SlotName: "standby-a", InitialLsn: 7})
+	if err != nil {
+		t.Fatalf("CreateReplicationSlot returned error: %v", err)
+	}
+	if resp.Slot.SlotName != "standby-a" {
+		t.Fatalf("SlotName = %q, want standby-a", resp.Slot.SlotName)
+	}
+	if counts[StandbyReplicationSlotsPath] != 1 || counts[HAReplicationSlotsPath] != 1 {
+		t.Fatalf("counts = %v, want one canonical probe and one legacy replay", counts)
+	}
+}
+
+func TestStandbyClientPathStyleAutoDoesNotReprobeTypedNotFound(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if !strings.HasPrefix(r.URL.Path, StandbyPath) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == StandbyPrimaryStatusPath {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+			return
+		}
+		http.Error(w, "SlotNotFound", http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto)
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	before := len(paths)
+	if _, err := client.PauseReplicationSlot(context.Background(), "missing"); err == nil {
+		t.Fatalf("PauseReplicationSlot for a missing slot succeeded")
+	}
+	if got := paths[before:]; len(got) != 1 || !strings.HasPrefix(got[0], StandbyPath) {
+		t.Fatalf("requests for typed 404 = %v, want a single canonical request and no legacy retry", got)
 	}
 }
