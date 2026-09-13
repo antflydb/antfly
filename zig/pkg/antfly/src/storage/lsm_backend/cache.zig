@@ -1366,13 +1366,24 @@ test "cache pending load waiter survives finish removal" {
 
     var waiter = Waiter{};
     var thread = try std.testing.io.concurrent(Waiter.run, .{ &waiter, &cache });
-    sleepNs(10 * std.time.ns_per_ms);
-    cache.finishLoad("run-1", 1, 1, .run_table_index);
-    thread.await(std.testing.io);
+    {
+        defer {
+            cache.finishLoad("run-1", 1, 1, .run_table_index);
+            thread.await(std.testing.io);
+        }
+        // Observe the waiter before removing the pending load. A fixed sleep
+        // can expire before the concurrent task starts on a busy CI runner.
+        // beginLoad increments waits under the same lock used by finishLoad,
+        // so removal cannot overtake the wait registration after this point.
+        var attempts: usize = 0;
+        while (cache.snapshotStats().run_table_index.waits == 0 and attempts < 10_000) : (attempts += 1) {
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(cache.snapshotStats().run_table_index.waits > 0);
+    }
 
     if (waiter.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), cache.pendingLoadCountForTests());
-    try std.testing.expect(cache.snapshotStats().run_table_index.waits > 0);
 }
 
 test "cache accounts table index prefix bloom filters" {
