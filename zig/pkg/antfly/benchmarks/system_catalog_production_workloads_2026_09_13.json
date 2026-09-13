@@ -9,7 +9,10 @@
   "provenance": {
     "base_commit": "2d34e2e794724d96bb6bbda2520d76a495813d4c",
     "implementation_commit": "34d56fd81",
-    "note": "Measurements precede storage-boundary merge; resilience binary precedes final outbox ownership and authoritative paging refinements. Final merged-source verification is recorded separately."
+    "note": "Measurements precede storage-boundary merge; resilience binary precedes final outbox ownership and authoritative paging refinements. Final merged-source verification is recorded separately.",
+    "final_server_source_commit": "821b5007bc0fcd7de646cf14c81f2a6f172a7826",
+    "merged_main_commit": "c1a39a3aeb65e62d9e4494c5b785a028e4520c5d",
+    "final_harness_sha256": "0114b4855b799cb4b995766eaf370fa4a591b514ace693fab3af51a14429824c"
   },
   "limitations": [
     "Single developer machine; not production capacity claims.",
@@ -17,7 +20,9 @@
     "Snapshot transfers are single cold captures, not steady-state latency samples.",
     "Telemetry comparison uses two request modes on the same binary, not two different release binaries.",
     "Sparse publication excludes lazy flat-array materialization; first-reader cost is reported separately.",
-    "Outbox limits bound logical sample payload; allocator and coalescing map overhead is additional."
+    "Outbox limits bound logical sample payload; allocator and coalescing map overhead is additional.",
+    "The final merged run did not reproduce the earlier concurrent DDL improvement: DDL p50/p95 were 122.499/509.424 ms for normal admission and 147.054/862.871 ms for independent telemetry. Twelve samples per mode give a noisy tail estimate; p95 is the maximum observation.",
+    "Baseline application and cache materialization remain inventory-sized; readiness is outside steady-state measurements, and early catalog requests can return retryable NotLeader during this work."
   ],
   "component_rows": [
     "COLLECTION_BENCH groups=100 indexed=false p50_ms=0.007000",
@@ -218,5 +223,169 @@
         }
       ]
     }
+  },
+  "final_merged_cluster": {
+    "binary_sha256": "71612cd75974e1af9d599350f53ca07d762bfa42be028f225e489c9fdd507117",
+    "workload": {
+      "startup_ms": 3923.240500036627,
+      "setup_ms": 8240.496458,
+      "baseline_readiness": {
+        "elapsed_ms": 1814.742584247142,
+        "attempts": 4,
+        "leader_index": 1,
+        "term": 1
+      },
+      "metadata_nodes": 3,
+      "real_data_nodes": 3,
+      "groups": 10000,
+      "indexes_per_group": 1,
+      "warmup": 2,
+      "snapshot_transfers": [
+        {
+          "control": true,
+          "elapsed_ms": 701.828,
+          "bytes": 8035,
+          "pages": 1,
+          "max_page_bytes": 8035
+        },
+        {
+          "control": false,
+          "elapsed_ms": 1766.751791,
+          "bytes": 46148032,
+          "pages": 89,
+          "max_page_bytes": 524288
+        }
+      ],
+      "scenarios": [
+        {
+          "independent_telemetry": false,
+          "collection": {
+            "samples": 12,
+            "p50_ms": 638.178292,
+            "p95_ms": 761.593375,
+            "max_ms": 761.593375
+          },
+          "collection_raw_ms": [
+            642.705042,
+            512.107208,
+            633.294667,
+            562.171958,
+            743.439459,
+            686.442083,
+            752.770917,
+            626.400834,
+            761.593375,
+            689.492625,
+            633.651542,
+            556.996
+          ],
+          "namespace_create_drop": {
+            "samples": 12,
+            "p50_ms": 122.49864600000001,
+            "p95_ms": 509.423792,
+            "max_ms": 509.423792
+          },
+          "namespace_raw_ms": [
+            509.423792,
+            79.954667,
+            117.848208,
+            312.83075,
+            126.149292,
+            106.558416,
+            105.098708,
+            110.018292,
+            162.438833,
+            396.148959,
+            369.7215,
+            118.848
+          ]
+        },
+        {
+          "independent_telemetry": true,
+          "collection": {
+            "samples": 12,
+            "p50_ms": 130.7093125,
+            "p95_ms": 282.215417,
+            "max_ms": 282.215417
+          },
+          "collection_raw_ms": [
+            132.461,
+            142.554875,
+            128.957625,
+            282.215417,
+            119.799042,
+            127.427375,
+            135.94375,
+            137.090166,
+            141.109709,
+            128.827584,
+            120.161416,
+            119.688292
+          ],
+          "namespace_create_drop": {
+            "samples": 12,
+            "p50_ms": 147.0535205,
+            "p95_ms": 862.87125,
+            "max_ms": 862.87125
+          },
+          "namespace_raw_ms": [
+            130.7695,
+            132.034334,
+            133.408625,
+            131.159875,
+            761.256625,
+            134.69775,
+            862.87125,
+            120.744333,
+            278.204375,
+            257.920541,
+            159.409291,
+            738.8695
+          ]
+        }
+      ]
+    }
+  },
+  "setup_failures": [
+    {
+      "attempt": 1,
+      "phase": "tenant creation after full baseline",
+      "failure": "HTTP 503 NotLeader",
+      "measured_samples": 0
+    },
+    {
+      "attempt": 2,
+      "phase": "first normal-admission warmup namespace creation",
+      "failure": "HTTP 503 NotLeader",
+      "measured_samples": 0
+    }
+  ],
+  "setup_resolution": "Create the tenant before loading the large inventory, then explicitly wait for all metadata terms to agree, a single stable leader, and successful public catalog reads for at least one second. Record this setup duration separately. Measured requests do not retry. Cold full-baseline materialization produced approximately two-second metadata rounds in aborted attempts.",
+  "validation": {
+    "server_build_steps": "69/69",
+    "final_e2e": {
+      "passed": 28,
+      "failed": 0,
+      "skipped": 0,
+      "elapsed_seconds": 150.01
+    },
+    "focused_test_executions": {
+      "catalog_api": 62,
+      "catalog": 39,
+      "catalog_transport": 19,
+      "store_reports": 87,
+      "metadata_service": 131,
+      "data_catalog": 14,
+      "compiled_storage_contracts": 36,
+      "ha_seed": 2,
+      "graph_provenance": 1
+    },
+    "note": "Selections overlap and were run at the corresponding implementation revisions. The final server and compiled-owner contracts include the public-label ABI fix. This is not a full repository suite.",
+    "component_benchmark_executions_before_main_merge": 23,
+    "generated_sources_check": "passed",
+    "storage_test_inventory_audit": "passed",
+    "python_audit_unit_tests": 17,
+    "ruff": "passed",
+    "zig_format_and_diff_check": "passed"
   }
 }

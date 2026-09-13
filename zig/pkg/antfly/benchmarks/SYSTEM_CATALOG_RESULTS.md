@@ -1465,3 +1465,47 @@ with no page above 512 KiB. Synthetic groups were outside actual table placement
 so the compact size is not a claim that 10,000 active shard placements fit in
 8 KiB. Cold capture timings were 1,952 ms and 983 ms respectively and should not
 be interpreted as steady-state latency improvements.
+
+
+### Final compiled-storage integration
+
+The final Debug server matches source `821b5007b`, with main `c1a39a3ae`
+merged. Its binary SHA-256 and every sample are retained in the raw artifact.
+The same three-metadata/three-data-node workload completed with 12 measured
+collections after two warmups in each mode. No measured requests retried.
+
+| Operation | Normal report admission p50 / p95 | Independent telemetry p50 / p95 |
+| --- | --- | --- |
+| Complete 10,000-index collection | 638.178 / 761.593 ms | 130.709 / 282.215 ms |
+| Concurrent namespace create + drop | 122.499 / 509.424 ms | 147.054 / 862.871 ms |
+
+Independent delivery improved median collection time by 4.88× in this run.
+Concurrent DDL did **not** improve; these 12-sample tail estimates are noisy,
+and p95 is the maximum observation. This result does not establish a DDL latency
+win or a production throughput limit. Both modes issue the same number of
+collections and DDL pairs, starting together; their completion times differ.
+
+All three data nodes remained alive. The compact control view was 8,035 bytes
+in one page; diagnostics were 46,148,032 bytes in 89 pages, at most 512 KiB each.
+Cold capture timings were 701.828 ms and 1,766.752 ms respectively. The inventory
+still consists of synthetic groups outside authoritative table placements.
+
+Two earlier attempts aborted before measured samples with HTTP 503 `NotLeader`:
+once during tenant creation after baseline upload, and once during the first
+warmup DDL. Logs showed roughly two-second metadata rounds while materializing
+the full inventory. The harness now creates the tenant before baseline upload
+and explicitly waits for metadata leadership and successful catalog reads to
+stabilize. It records readiness separately (1,814.743 ms in the successful run),
+within 8,240.496 ms of total setup after server startup. Initial baseline apply
+and full cache reads remain inventory-sized; this experiment does not claim to
+remove their transient availability cost.
+
+Final verification passed all 28 selected E2Es in 150.01 seconds, with no skips,
+and all 69 server/storage-contract build steps. Focused catalog/API/transport/
+report selections passed 207 executions; metadata service passed 131, data
+catalog 14, compiled storage contracts 36, HA seed two, and BFS provenance one.
+Selections overlap and were checked as the corresponding changes landed. The
+storage inventory audit, generated-source checks, 17 Python audit tests, Ruff,
+Zig formatting, and whitespace checks passed. The native restore, graph path,
+diagnostic ownership, report recovery, and public-name regressions found while
+integrating main were fixed without weakening shutdown or disk-space guards.

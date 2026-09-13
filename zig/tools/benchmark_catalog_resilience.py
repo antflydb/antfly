@@ -22,10 +22,67 @@ from conftest import internal_service_headers
 from test_catalog_resilience import read_pages, register_reporter
 
 
+def wait_for_catalog_ready(api, cluster):
+    """Exclude initial full-baseline apply and any resulting election from timing."""
+    started = time.monotonic()
+    deadline = started + 30
+    stable_since = None
+    previous = None
+    attempts = 0
+    last = None
+    while time.monotonic() < deadline:
+        attempts += 1
+        statuses = cluster.metadata_statuses()
+        leaders = [
+            item
+            for item in statuses
+            if item.get("status", {}).get("metadata_raft_role") == "leader"
+        ]
+        identity = None
+        if len(leaders) == 1:
+            leader = leaders[0]
+            term = leader["status"]["metadata_raft_term"]
+            if all(
+                item.get("status", {}).get("metadata_raft_term") == term
+                for item in statuses
+            ):
+                identity = (leader["index"], term)
+        try:
+            response = api.session.get(
+                api.base + "/databases/telemetry_bench", timeout=5
+            )
+            ready = response.ok
+            last = {"status": response.status_code, "leader": identity}
+        except requests.RequestException as error:
+            ready = False
+            last = {"error": str(error), "leader": identity}
+        now = time.monotonic()
+        if identity is not None and ready:
+            if identity != previous or stable_since is None:
+                stable_since = now
+            elif now - stable_since >= 1:
+                return identity[0], {
+                    "elapsed_ms": (now - started) * 1000,
+                    "attempts": attempts,
+                    "leader_index": identity[0],
+                    "term": identity[1],
+                }
+        else:
+            stable_since = None
+        previous = identity
+        time.sleep(0.1)
+    raise RuntimeError(f"catalog did not become ready after baseline apply: {last}")
+
+
 def run(args):
     with server(args.binary.resolve(), "cluster") as (api, startup, c):
-        report, cursor, leader = register_reporter(c, args.groups)
+        setup_started = time.perf_counter_ns()
+        # Establish the tenant and catalog protocol before introducing the large
+        # baseline. Bootstrap/apply work is separate from steady-state telemetry
+        # and namespace mutation measurements; measured requests never retry.
         api.request("POST", "/databases/telemetry_bench", {})
+        report, cursor, leader = register_reporter(c, args.groups)
+        leader, readiness = wait_for_catalog_ready(api, c)
         views = []
         for control in (True, False):
             started = time.perf_counter_ns()
@@ -40,6 +97,7 @@ def run(args):
                 }
             )
             del snapshot
+        setup_ms = (time.perf_counter_ns() - setup_started) / 1e6
         results = []
         patch = {**report, "group_statuses": [], "runtime_statuses": []}
         sequence = 2
@@ -122,6 +180,8 @@ def run(args):
             )
         return {
             "startup_ms": startup,
+            "setup_ms": setup_ms,
+            "baseline_readiness": readiness,
             "metadata_nodes": 3,
             "real_data_nodes": 3,
             "groups": args.groups,

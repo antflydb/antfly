@@ -384,3 +384,13 @@ The component target also prints `GROUP_CACHE_FIRST_READER_BENCH`. Pair it with
 first flat-view consumer pays the explicit O(G) materialization cost. Subsequent
 readers reuse that array. Do not attribute the publication speedup to whole-view
 reads or durable persistence, which have separate measurements.
+
+
+The resilience harness establishes the tenant before loading its large baseline,
+then waits for stable metadata leadership and successful catalog reads. It records
+startup, baseline readiness, setup, cold snapshot transfer, warmup, and measured
+work separately. Setup reads may retry within a 30-second readiness budget;
+measured telemetry and namespace requests never retry. Both workers start
+together and perform the configured number of collections/pairs. Their elapsed
+work windows can differ. Preserve failed setup attempts and mixed latency results
+when recording a run; see the final compiled-storage results for an example.
