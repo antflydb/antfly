@@ -30,6 +30,7 @@ usage() {
   echo "  --resume                 Restart/query an existing run root" >&2
   echo "  --resume-concurrent      Run the configured concurrent-search curve after warm resume" >&2
   echo "  --resume-concurrent-only Skip cold/warm serial passes and run only the concurrent curve" >&2
+  echo "  --load-only              Measure fresh ingestion/readiness only; not full qualification" >&2
   echo "  --diagnostic-profile-only  Skip the official client lifecycle during a resume A/B" >&2
   echo "  --label-suffix SUFFIX    Unique suffix required by --resume" >&2
   echo "" >&2
@@ -93,6 +94,7 @@ native_hbc=0
 vector_blocks=${VDBBENCH_VECTOR_BLOCKS:-0}
 vector_block_encoding=${VDBBENCH_VECTOR_BLOCK_ENCODING:-float16}
 diagnostic_profile_only=0
+load_only=0
 centroid_directory_mode=${VDBBENCH_HBC_CENTROID_DIRECTORY_MODE:-}
 flat_probe_count=${VDBBENCH_HBC_FLAT_PROBE_COUNT:-}
 posting_idle_max_postings=${ANTFLY_DENSE_POSTING_IDLE_MAX_POSTINGS_PER_INDEX:-}
@@ -124,11 +126,17 @@ while [[ $# -gt 0 ]]; do
     --resume) resume_after_live=1; shift ;;
     --resume-concurrent) resume_concurrent=1; shift ;;
     --resume-concurrent-only) resume_after_live=1; resume_concurrent=1; resume_concurrent_only=1; shift ;;
+    --load-only) load_only=1; shift ;;
     --diagnostic-profile-only) diagnostic_profile_only=1; shift ;;
     --label-suffix) [[ $# -ge 2 ]] || usage; label_suffix=$2; shift 2 ;;
     *) usage ;;
   esac
 done
+
+if [[ "$load_only" == "1" && ( "$resume_after_live" == "1" || "$diagnostic_profile_only" == "1" ) ]]; then
+  echo "--load-only requires a fresh run and excludes resume/profile-only modes" >&2
+  exit 2
+fi
 
 if [[ -z "$vdbbench_python" ]]; then
   vdbbench_python=$vdbbench_root/.venv/bin/python
@@ -168,6 +176,7 @@ if [[ -n "$posting_idle_max_postings" ]]; then
 fi
 
 live_label="antfly-qualification-online-live${label_suffix}"
+before_restart_label="antfly-qualification-before-restart${label_suffix}"
 cold_label="antfly-qualification-reopened-cold${label_suffix}"
 warm_label="antfly-qualification-reopened-warm${label_suffix}"
 concurrent_label="antfly-qualification-reopened-concurrent${label_suffix}"
@@ -283,7 +292,7 @@ if [[ -n "$dense_embeddings" ]]; then
   python3 "$script_dir/prepare_vdbbench_vector_source.py" "$vdbbench_root" "$vdbbench_client_root"
 fi
 if [[ "$resume_after_live" != "1" ]]; then
-  python3 - "$run_root/run-config.json" "$repo_root" "$antfly_bin" "$vdbbench_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$centroid_directory_mode" "$flat_probe_count" <<'PY'
+  python3 - "$run_root/run-config.json" "$repo_root" "$antfly_bin" "$vdbbench_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$centroid_directory_mode" "$flat_probe_count" "$load_only" <<'PY'
 import hashlib
 import json
 import os
@@ -316,6 +325,7 @@ experiment_environment_names = (
     vector_block_encoding,
     centroid_directory_mode,
     flat_probe_count,
+    load_only,
 ) = sys.argv[1:]
 antfly_git_head = subprocess.check_output(
     ["git", "-C", repo_root, "rev-parse", "HEAD"], text=True
@@ -353,6 +363,7 @@ with open(out_path, "w", encoding="utf-8") as handle:
             "centroid_directory_mode": centroid_directory_mode or None,
             "flat_centroid_probe_count": int(flat_probe_count) if flat_probe_count else None,
             "load_lifecycle": "public_api_online_incremental",
+            "load_only": load_only == "1",
             "builder": "server_selected; do not assume recursive from client batch size",
             "experiment_environment": {
                 name: os.environ[name]
@@ -854,6 +865,20 @@ mark_phase server_start
 start_server antfly-initial.log
 start_rss_sampler "$run_root/rss-live.tsv"
 start_metrics_sampler "$run_root/metrics-live.prom"
+if [[ "$load_only" == "1" ]]; then
+  mark_phase load_only_start
+  run_vdbbench "$live_label" --drop-old --load --skip-search-concurrent --skip-search-serial \
+    >"$run_root/vdbbench-live.log" 2>&1
+  validate_vdbbench_result "$live_label" "$expected_docs" 0 ""
+  wait_public_index_ready ""
+  mark_phase load_only_ready
+  curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-load-ready.txt"
+  stop_rss_sampler "$run_root/rss-live.tsv" "$run_root/rss-live.json"
+  stop_metrics_sampler
+  # Deliberately omit qualification-summary.json: this diagnostic cannot
+  # satisfy the full workload/recovery gate used by scale qualification.
+  exit 0
+fi
 mark_phase live_load_and_query_start
 run_vdbbench "$live_label" --drop-old --load --search-concurrent --search-serial \
   >"$run_root/vdbbench-live.log" 2>&1
@@ -896,6 +921,13 @@ capture_footprint_once \
 stop_rss_sampler "$run_root/rss-live.tsv" "$run_root/rss-live.json"
 stop_metrics_sampler
 
+# Churn restores source vectors but may change ANN topology. Measure the same
+# immutable dataset immediately before shutdown to isolate recovery quality.
+mark_phase before_restart_query_begin
+ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$before_restart_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
+  >"$run_root/vdbbench-before-restart.log" 2>&1
+validate_vdbbench_result "$before_restart_label" 0 1
+mark_phase before_restart_query_end
 mark_phase restart_begin
 stop_server
 mark_phase shutdown_complete
@@ -914,6 +946,18 @@ ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$warm_label" --skip-drop-old --s
   >"$run_root/vdbbench-reopened-warm.log" 2>&1
 validate_vdbbench_result "$warm_label" 0 1
 mark_phase reopened_warm_query_end
+python3 - "$script_dir" "$run_root" "$before_restart_label" "$cold_label" "$warm_label" <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from summarize_vdbbench_qualification import result_rows
+from validate_vdbbench_result import restart_recall_comparison
+root = Path(sys.argv[2])
+comparison = restart_recall_comparison(result_rows(root), *sys.argv[3:])
+(root / "restart-recall.json").write_text(json.dumps(comparison, indent=2) + "\n")
+if not comparison["qualified"]:
+    raise SystemExit("recall changed across restart on unchanged data; see restart-recall.json")
+PY
 run_public_profile ""
 validate_native_lifecycle
 curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-after-restart.txt"

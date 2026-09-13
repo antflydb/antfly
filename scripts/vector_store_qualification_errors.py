@@ -6,7 +6,7 @@ from pathlib import Path
 
 def inspect_workload_errors(root: Path):
     required = [root / "vdbbench-live.log", root / "antfly-initial.log"]
-    paths = sorted({*required, *root.glob("antfly-*.log")})
+    paths = sorted({*required, root / "vdbbench-framework.log", *root.glob("antfly-*.log")})
     counts = Counter()
     examples = []
     for path in paths:
@@ -19,6 +19,10 @@ def inspect_workload_errors(root: Path):
                     kind = "client_insert_error"
                 elif "Insert failed," in line:
                     kind = "client_insert_retry"
+                elif "VectorDB search_embedding error:" in line:
+                    kind = "client_query_error"
+                elif "public table query read failed" in line or "public table query execution failed" in line:
+                    kind = "server_query_error"
                 elif "public table batch failed" in line:
                     kind = "server_batch_error"
                 elif "VectorPayloadStorePoisoned" in line:

@@ -15319,48 +15319,48 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
-    pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
-        if (!self.local_db_mutex.tryLock()) return 0;
+    pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !db_mod.DB.PostingRefreshProgress {
+        if (!self.local_db_mutex.tryLock()) return .{ .pending = true };
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
         var lease_alloc: std.mem.Allocator = std.heap.page_allocator;
         defer {
             for (leases.items) |*lease| lease.deinit(lease_alloc);
             leases.deinit(lease_alloc);
         }
+        var total: db_mod.DB.PostingRefreshProgress = .{};
         {
             defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return 0;
+            const cache = self.write_cache orelse return .{};
             lease_alloc = cache.alloc;
             for (cache.entries.items) |entry| {
-                if (entry.bulk_ingest_session_open) continue;
-                if (entry.db.hasActiveDenseBulkWork()) continue;
+                if (entry.bulk_ingest_session_open or entry.db.hasActiveDenseBulkWork()) {
+                    total.pending = true;
+                    continue;
+                }
                 try cache.appendMaintenanceLease(&leases, entry);
             }
         }
-        var total_steps: usize = 0;
         for (leases.items) |lease| {
-            // A dependency chain can expose only one newly repairable posting
-            // per transaction. One pass per one-second timer wake made a
-            // settled 50K load spend minutes at 99.9% readiness even though
-            // each repair itself took little CPU. Drain a bounded burst while
-            // releasing the DB apply fence between passes. Foreground work can
-            // therefore become visible to shouldDeferOptionalPostingMaintenance
-            // on the next pass, while an idle corpus advances up to 64 links or
-            // 50 ms per wake instead of one.
+            // Release the apply fence between resumable pages. Count scanning
+            // as progress, and retain deferral separately from a clean sweep.
             const burst_start_ns = platform_time.monotonicNs();
             const max_passes: usize = 64;
             const max_elapsed_ns: u64 = 50 * std.time.ns_per_ms;
             var pass: usize = 0;
+            var pending = true;
             while (pass < max_passes and platform_time.monotonicNs() -| burst_start_ns < max_elapsed_ns) : (pass += 1) {
-                const progressed = lease.db.runDensePostingReadinessMaintenanceForIdle() catch |err| {
+                const page = lease.db.refreshDensePostingPayloadPageBestEffort() catch |err| {
                     std.log.warn("dense posting maintenance round failed: {}", .{err});
                     break;
                 };
-                total_steps += progressed;
-                if (progressed == 0) break;
+                total.repaired += page.repaired;
+                total.scanned += page.scanned;
+                pending = page.pending;
+                if (!pending or page.scanned == 0 or page.yield_after_page) break;
             }
+            total.pending = total.pending or pending;
         }
-        return total_steps;
+        return total;
     }
 
     pub fn runVectorBlockMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {

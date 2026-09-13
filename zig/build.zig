@@ -3229,6 +3229,12 @@ pub fn build(b: *std.Build) void {
     const run_vector_kernel_tests = b.addRunArtifact(vector_kernel_tests);
     b.step("lib-vector-kernel-test", "Run standalone quantizer kernel tests (no external recall fixtures)").dependOn(&run_vector_kernel_tests.step);
 
+    const packing_bench_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_query_packing.zig"), .target = target, .optimize = optimize });
+    packing_bench_mod.addImport("antfly_vector", vector_mod);
+    const packing_bench = b.addExecutable(.{ .name = "bench-query-packing", .root_module = packing_bench_mod });
+    const run_packing_bench = b.addRunArtifact(packing_bench);
+    b.step("bench-query-packing", "Compare exact query bitplane packing and complete scoring kernels").dependOn(&run_packing_bench.step);
+
     const subgroup_scan_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_subgroup_scan.zig"), .target = target, .optimize = optimize });
     subgroup_scan_mod.addImport("antfly_vector", vector_mod);
     subgroup_scan_mod.addImport("antfly_vector_index", vectorindex_mod);
@@ -7961,6 +7967,7 @@ pub fn build(b: *std.Build) void {
         "logical inference slices can charge only physical host memory",
         "batch release accounting errors fail closed",
         "single release and observer mismatch cannot debit unrelated memory",
+        "resource identity ledgers bound tombstones across churn and reject stale owners",
         "bounded oversized progress cannot bypass aggregate host memory",
         "resource manager observes over-budget external usage",
         "identity-aware cache admission rejects growth and always permits shrink",
@@ -9823,6 +9830,15 @@ pub fn build(b: *std.Build) void {
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
 
+    const vector_payload_bench_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_bench.zig", target, .ReleaseFast, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    vector_payload_bench_mod.addImport("bloom", bloom_mod);
+    vector_payload_bench_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    vector_payload_bench_mod.addImport("antfly-json", json_mod);
+    vector_payload_bench_mod.addImport("structlog", structlog_mod);
+    const vector_payload_bench = b.addExecutable(.{ .name = "vector-payload-bench", .root_module = vector_payload_bench_mod });
+    const install_vector_payload_bench = b.addInstallArtifact(vector_payload_bench, .{});
+    b.step("vector-payload-bench", "Build real-file source payload and hash benchmarks").dependOn(&install_vector_payload_bench.step);
+
     const vector_payload_test_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     vector_payload_test_mod.addImport("bloom", bloom_mod);
     vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -10037,6 +10053,8 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly-json", json_mod);
     index_manager_test_mod.addImport("antfly_scraping", scraping_mod);
     index_manager_test_mod.addImport("antfly_image", image_mod);
+    index_manager_test_mod.addImport("antfly_pdf", pdf_mod);
+    index_manager_test_mod.addImport("httpx", httpx_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     index_manager_test_mod.addImport("antfly_reader_config", reader_config_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);
@@ -11718,6 +11736,16 @@ pub fn build(b: *std.Build) void {
 
     const hbc_isolate_step = b.step("hbc-isolate", "Build and install hbc_isolate");
     hbc_isolate_step.dependOn(&b.addInstallArtifact(hbc_isolate, .{}).step);
+
+    const build_quality_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench_build_quality.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    build_quality_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
+    const build_quality = b.addExecutable(.{ .name = "bench_build_quality", .root_module = build_quality_mod });
+    const build_quality_step = b.step("bench-build-quality", "Build bounded-bootstrap held-out recall benchmark");
+    build_quality_step.dependOn(&b.addInstallArtifact(build_quality, .{}).step);
 
     const dense_stack_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/dense_stack_bench.zig"),

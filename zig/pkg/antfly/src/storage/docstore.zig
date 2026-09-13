@@ -557,6 +557,23 @@ pub const DocStore = struct {
             return try self.getManySorted(keys, values);
         }
 
+        /// Keep physical references in the transaction arena. Resolve payloads
+        /// into bounded scratch and visit them only after source locks retire.
+        pub fn consumeDenseManySorted(self: *Txn, alloc: Allocator, keys: []const []const u8, values: []?[]const u8, dims: usize, sink: artifact_payload.DenseSink) !artifact_payload.DenseReadStats {
+            const session = self.payload_session orelse return error.Unsupported;
+            const started = platform_time.monotonicNs();
+            if (self.probe) |*probe| {
+                try probe.getManySortedWithBlockCacheAdmission(keys, values, .transient);
+            } else {
+                try self.getManySortedPhysical(keys, values);
+            }
+            const primary_done = platform_time.monotonicNs();
+            var stats = try session.consumeDenseMany(alloc, keys, values, dims, sink);
+            stats.primary_lookup_ns += primary_done -| started;
+            stats.payload_consume_ns += platform_time.monotonicNs() -| primary_done;
+            return stats;
+        }
+
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
@@ -637,6 +654,18 @@ pub const DocStore = struct {
             raw: ?*LmdbTransaction = null,
             dbi: LmdbDbi = undefined,
             runtime: ?*backend_erased.Batch = null,
+
+            pub fn consumeDenseManySorted(self: @This(), alloc: Allocator, keys: []const []const u8, values: []?[]const u8, dims: usize, sink: artifact_payload.DenseSink) !artifact_payload.DenseReadStats {
+                const session = self.payload_session orelse return error.Unsupported;
+                if (keys.len != values.len) return error.InvalidArgument;
+                const started = platform_time.monotonicNs();
+                try self.runtime.?.getManySorted(keys, values);
+                const primary_done = platform_time.monotonicNs();
+                var stats = try session.consumeDenseMany(alloc, keys, values, dims, sink);
+                stats.primary_lookup_ns += primary_done -| started;
+                stats.payload_consume_ns += platform_time.monotonicNs() -| primary_done;
+                return stats;
+            }
 
             pub fn get(self: @This(), key: []const u8) ![]const u8 {
                 if (supports_lmdb) {

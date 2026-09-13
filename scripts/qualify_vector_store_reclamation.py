@@ -80,12 +80,16 @@ def main():
         print("reclamation start", name, flush=True)
         if sys.platform == "darwin":
             subprocess.run(
-                ["cp", "-cR", str(source / "data"), str(output / "data")], check=True
+                ["/bin/cp", "-cR", str(source / "data"), str(output / "data")], check=True
             )
         else:
             shutil.copytree(source / "data", output / "data")
-        environment = configure(
-            os.environ.copy(), arm["refinement"], arm["mode"] == "candidate"
+        # Ownership comparisons keep common read settings in both modes.
+        # Only refinement experiments replace those settings with a treatment.
+        environment = (
+            configure(os.environ.copy(), arm["refinement"], arm["mode"] == "candidate")
+            if arm["refinement"] is not None
+            else os.environ.copy()
         )
         if {k: environment.get(k) for k in arm["refinement_environment"]} != arm[
             "refinement_environment"
@@ -135,11 +139,27 @@ def main():
                 command, env=environment, stdout=log, stderr=subprocess.STDOUT
             )
             resident_at = None
+            status_ready_at = None
+            sampler = None
+            if sys.platform == "darwin":
+                sampler = subprocess.Popen([
+                    sys.executable, "-B", str(Path(__file__).with_name("sample_macos_process_memory.py")),
+                    "--pid", str(process.pid), "--output", str(output / "resources.jsonl"),
+                    "--seconds", str(args.timeout + 60),
+                ], stdout=subprocess.DEVNULL)
             try:
                 while time.monotonic() - started < args.timeout:
                     if process.poll() is not None:
                         raise RuntimeError("reclamation server exited: " + name)
                     try:
+                        if status_ready_at is None:
+                            index = get_json(f"http://127.0.0.1:{args.port}/db/v1/tables/vdbbench/indexes/vec")
+                            status = index.get("status") or {}
+                            if not status.get("readiness", {}).get("complete") or status.get("searchable_vectors") != expected or status.get("rebuilding"):
+                                time.sleep(1)
+                                continue
+                            status_ready_at = time.monotonic()
+                            result["status_ready_seconds"] = status_ready_at - started
                         if resident_at is None:
                             # Metadata probes can use ephemeral handles. Admit
                             # the normal resident query runtime once, then leave
@@ -155,7 +175,9 @@ def main():
                                 ).encode(),
                                 headers={"Content-Type": "application/json"},
                             )
+                            query_started = time.monotonic()
                             query = get_json(request, timeout=180)
+                            result["first_query_seconds"] = time.monotonic() - query_started
                             (output / "resident-query.json").write_text(
                                 json.dumps(query, indent=2) + "\n"
                             )
@@ -188,7 +210,11 @@ def main():
                         and source_stats.get("unresolved_primary_commits") == 0
                         and source_stats.get("active_sessions") == 0
                     )
-                    if clean:
+                    # LSM-owned tables have no source inventory to reclaim.
+                    # They still pass the same serving and idle-memory checks.
+                    if arm.get("table_mode", arm["mode"]) == "primary_lsm":
+                        clean = not source_stats
+                    if clean and time.monotonic() - resident_at >= 30:
                         # This inventory is captured under the source lock and
                         # there are no concurrent writes. Subsequent metadata
                         # probes may omit stats after resident-cache eviction;
@@ -226,6 +252,12 @@ def main():
                 if not result["qualified"]:
                     result["error"] = "reclamation did not settle before timeout"
             finally:
+                if sampler is not None:
+                    sampler.terminate()
+                    sampler.wait(timeout=10)
+                    result["resource_sampler_exit_code"] = sampler.returncode
+                    if sampler.returncode != 0:
+                        result.update(qualified=False, error="resource sampler failed")
                 process.terminate()
                 try:
                     process.wait(timeout=60)

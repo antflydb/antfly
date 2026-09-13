@@ -5383,6 +5383,46 @@ export interface components {
             collection_publish_ns?: number;
             /**
              * Format: int64
+             * @description Time preparing and sorting immutable collection input outside source and DB apply locks.
+             */
+            collection_plan_outside_lock_ns?: number;
+            /**
+             * Format: int64
+             * @description Time validating staged immutable readers outside source and DB apply locks.
+             */
+            collection_reader_prepare_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest detached immutable reader validation step.
+             */
+            collection_max_reader_prepare_ns?: number;
+            /**
+             * Format: int64
+             * @description Staged immutable readers validated before publication.
+             */
+            collection_readers_prepared?: number;
+            /**
+             * Format: int64
+             * @description Time retiring old collection owners and known obsolete files outside source and DB apply locks.
+             */
+            collection_retire_outside_lock_ns?: number;
+            /**
+             * Format: int64
+             * @description Verified collections that deferred copying because reclamation benefit was small.
+             */
+            collection_copy_deferrals?: number;
+            /**
+             * Format: int64
+             * @description Verified obsolete payload bytes retained by the copy-cost policy.
+             */
+            collection_deferred_obsolete_bytes?: number;
+            /**
+             * Format: int64
+             * @description Process-monotonic reclamation scheduling deadline translated from the durable wall-clock deadline; not a completion guarantee.
+             */
+            collection_reclaim_deadline_ns?: number;
+            /**
+             * Format: int64
              * @description Longest locked publication step.
              */
             collection_max_publish_ns?: number;

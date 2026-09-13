@@ -4861,6 +4861,38 @@ components:
           type: integer
           format: int64
           description: Locked publication time including directory refresh, inventory, receipts and reclamation.
+        collection_plan_outside_lock_ns:
+          type: integer
+          format: int64
+          description: Time preparing and sorting immutable collection input outside source and DB apply locks.
+        collection_reader_prepare_ns:
+          type: integer
+          format: int64
+          description: Time validating staged immutable readers outside source and DB apply locks.
+        collection_max_reader_prepare_ns:
+          type: integer
+          format: int64
+          description: Longest detached immutable reader validation step.
+        collection_readers_prepared:
+          type: integer
+          format: int64
+          description: Staged immutable readers validated before publication.
+        collection_retire_outside_lock_ns:
+          type: integer
+          format: int64
+          description: Time retiring old collection owners and known obsolete files outside source and DB apply locks.
+        collection_copy_deferrals:
+          type: integer
+          format: int64
+          description: Verified collections that deferred copying because reclamation benefit was small.
+        collection_deferred_obsolete_bytes:
+          type: integer
+          format: int64
+          description: Verified obsolete payload bytes retained by the copy-cost policy.
+        collection_reclaim_deadline_ns:
+          type: integer
+          format: int64
+          description: Process-monotonic reclamation scheduling deadline translated from the durable wall-clock deadline; not a completion guarantee.
         collection_max_publish_ns:
           type: integer
           format: int64

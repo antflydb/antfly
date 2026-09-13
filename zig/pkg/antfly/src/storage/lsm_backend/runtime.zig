@@ -3095,10 +3095,16 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+            return self.getManySortedWithStats(keys, values, true);
+        }
+
+        fn getManySortedWithStats(self: *@This(), keys: []const []const u8, values: []?[]const u8, record_batch: bool) !void {
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
-            self.backend.recordGetManySorted(keys.len);
-            self.backend.recordGetManySortedLocality(keys);
+            if (record_batch) {
+                self.backend.recordGetManySorted(keys.len);
+                self.backend.recordGetManySortedLocality(keys);
+            }
 
             var result: BatchCursorReadResult = .{};
             if (self.stable_point_view) {
@@ -3239,7 +3245,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     result.add(unresolved_result);
                 }
             }
-            self.backend.recordGetManySortedResults(result.hits, result.misses);
+            if (record_batch) self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
 
         /// Apply a per-read block-cache policy without changing namespace
@@ -4015,59 +4021,28 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (miss_count > 0) {
                 const miss_values = try self.metadata_allocator.alloc(?[]const u8, miss_count);
                 defer self.metadata_allocator.free(miss_values);
-                if (miss_count > max_current_batch_read_keys_per_backend_lock) {
-                    const locked = lockBackend(BackendType, self.backend);
-                    defer unlockBackend(BackendType, self.backend, locked);
-                    var layout = try CurrentReadLayout(BackendType).init(self.backend, self.allocator);
-                    defer layout.deinit();
-
-                    var offset: usize = 0;
-                    while (offset < miss_count) {
-                        const end = @min(offset + max_current_batch_read_keys_per_backend_lock, miss_count);
-                        const plan = chooseMultiGetPlan(miss_keys[offset..end], .current_live);
-                        recordMultiGetPlan(self.backend, plan);
-                        const result = switch (plan) {
-                            .cursor => try readManySortedCurrentWithLayoutLocked(BackendType, self.backend, &layout, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                            .sorted_by_run => try readManySortedByRunFromSnapshot(
-                                self.backend,
-                                &self.backend.mutable,
-                                layout.immutable_memtables,
-                                layout.runs,
-                                layout.l0_groups,
-                                layout.levels,
-                                self.allocator,
-                                null,
-                                &self.held_values,
-                                self.namespace,
-                                miss_keys[offset..end],
-                                miss_values[offset..end],
-                                true,
-                            ),
-                            .point => try readManySortedCurrentWithLayoutLocked(BackendType, self.backend, &layout, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                        };
-                        hits += result.hits;
-                        misses += result.misses;
-                        offset = end;
-                    }
-                } else {
-                    var offset: usize = 0;
-                    while (offset < miss_count) {
-                        const end = @min(offset + max_current_batch_read_keys_per_backend_lock, miss_count);
-                        const plan = chooseMultiGetPlan(miss_keys[offset..end], .current_live);
-                        recordMultiGetPlan(self.backend, plan);
-                        const result = blk: {
-                            const locked = lockBackend(BackendType, self.backend);
-                            defer unlockBackend(BackendType, self.backend, locked);
-                            break :blk switch (plan) {
-                                .cursor => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                                .sorted_by_run => try readManyCurrentSortedPointByRunLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                                .point => try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                            };
-                        };
-                        hits += result.hits;
-                        misses += result.misses;
-                        offset = end;
-                    }
+                // Select mutable values and pin immutable generations under
+                // the writer lock, then read/decode blocks outside it. Holding
+                // the lock here disabled bounded parallel point reads and
+                // serialized ingestion behind ANN split payload lookups.
+                var probe = try BoundProbeTxn(BackendType).open(self.backend, self.namespace);
+                defer probe.abort();
+                // Write reads select the current mutable and immutable view
+                // together, even if the backend was empty when probe opened.
+                probe.stable_point_view = false;
+                try probe.getManySortedWithStats(miss_keys[0..miss_count], miss_values, false);
+                for (miss_values) |*value| {
+                    const present = value.* orelse {
+                        misses += 1;
+                        continue;
+                    };
+                    // The write transaction owns returned values beyond the
+                    // probe's pinned-block lifetime, including across writes.
+                    const owned = try self.allocator.dupe(u8, present);
+                    errdefer self.allocator.free(owned);
+                    try self.held_values.append(self.allocator, owned);
+                    value.* = owned;
+                    hits += 1;
                 }
                 for (miss_values, 0..) |maybe_value, miss_index| {
                     values[miss_indexes[miss_index]] = maybe_value;

@@ -289,13 +289,29 @@ fn borrowCachedNodeHandle(self: anytype, node_id: u64) !?CachedNodeReadHandle(@T
     return null;
 }
 
-fn borrowSearchCachedNodeHandle(self: anytype, node_id: u64) !?CachedNodeReadHandle(@TypeOf(self)) {
+// Check on both sides of a retained borrow. A publisher may replace a cache
+// entry between the first epoch observation and acquiring its cache lock.
+// Old MVCC readers must use their leased storage instead of a current cache.
+fn searchCacheUsableForTxn(self: anytype, txn: anytype) bool {
     const Index = comptime childType(@TypeOf(self));
-    if (comptime @hasDecl(Index, "borrowCachedNodeForSearch")) {
-        if (self.borrowCachedNodeForSearch(node_id)) |borrowed| return .{ .borrowed = borrowed };
-        return null;
+    const Txn = comptime childType(@TypeOf(txn));
+    if (comptime @hasDecl(Index, "beginSearchCacheFill") and @hasField(Txn, "cache_fill_epoch")) {
+        const expected = txn.cache_fill_epoch orelse return false;
+        return self.beginSearchCacheFill() == expected;
     }
-    return try borrowCachedNodeHandle(self, node_id);
+    return true;
+}
+
+fn borrowSearchCachedNodeHandle(self: anytype, txn: anytype, node_id: u64) !?CachedNodeReadHandle(@TypeOf(self)) {
+    if (!searchCacheUsableForTxn(self, txn)) return null;
+    const Index = comptime childType(@TypeOf(self));
+    var cached: CachedNodeReadHandle(@TypeOf(self)) = if (comptime @hasDecl(Index, "borrowCachedNodeForSearch"))
+        .{ .borrowed = self.borrowCachedNodeForSearch(node_id) orelse return null }
+    else
+        (try borrowCachedNodeHandle(self, node_id)) orelse return null;
+    if (searchCacheUsableForTxn(self, txn)) return cached;
+    cached.deinit(self.alloc);
+    return null;
 }
 
 fn loadSearchNodeFromStorage(self: anytype, txn: anytype, node_id: u64) !types.Node {
@@ -304,6 +320,38 @@ fn loadSearchNodeFromStorage(self: anytype, txn: anytype, node_id: u64) !types.N
         return try self.loadSearchNodeFromStorage(txn, node_id);
     }
     return try self.loadNodeFromStorage(txn, node_id);
+}
+
+test "search cache publication during borrow releases the newer entry" {
+    const Index = struct {
+        const Self = @This();
+        alloc: Allocator,
+        epoch: u64 = 0,
+        publish_during_borrow: bool = true,
+        releases: usize = 0,
+        pub const BorrowedNode = struct {
+            owner: *Self,
+            pub fn deinit(self: *@This()) void {
+                self.owner.releases += 1;
+            }
+        };
+        pub fn beginSearchCacheFill(self: *@This()) ?u64 {
+            return self.epoch;
+        }
+        pub fn borrowCachedNodeForSearch(self: *@This(), _: u64) ?BorrowedNode {
+            if (self.publish_during_borrow) self.epoch += 2;
+            return .{ .owner = self };
+        }
+    };
+    var index: Index = .{ .alloc = std.testing.allocator };
+    var txn = struct { cache_fill_epoch: ?u64 = 0 }{};
+    try std.testing.expect((try borrowSearchCachedNodeHandle(&index, &txn, 1)) == null);
+    try std.testing.expectEqual(@as(usize, 1), index.releases);
+    txn.cache_fill_epoch = index.epoch;
+    index.publish_during_borrow = false;
+    var current = (try borrowSearchCachedNodeHandle(&index, &txn, 1)).?;
+    current.deinit(index.alloc);
+    try std.testing.expectEqual(@as(usize, 2), index.releases);
 }
 
 const SearchCacheFill = struct {
@@ -366,10 +414,13 @@ fn cacheMetadataAfterLoad(self: anytype, vector_id: u64, metadata: []const u8, f
     return try self.cacheMetadata(vector_id, metadata);
 }
 
-fn borrowCachedVectorHandle(self: anytype, vector_id: u64) ?CachedVectorReadHandle(@TypeOf(self)) {
+fn borrowCachedVectorHandle(self: anytype, txn: anytype, vector_id: u64) ?CachedVectorReadHandle(@TypeOf(self)) {
+    if (!searchCacheUsableForTxn(self, txn)) return null;
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "borrowCachedVector")) {
-        if (self.borrowCachedVector(vector_id)) |borrowed| return .{ .borrowed = borrowed };
+        var cached: CachedVectorReadHandle(@TypeOf(self)) = .{ .borrowed = self.borrowCachedVector(vector_id) orelse return null };
+        if (searchCacheUsableForTxn(self, txn)) return cached;
+        cached.deinit();
     }
     return null;
 }
@@ -379,7 +430,8 @@ const VectorCacheFill = struct {
     epoch: ?u64,
 };
 
-fn beginVectorCacheFillIfSupported(self: anytype, vector_id: u64) VectorCacheFill {
+fn beginVectorCacheFillIfSupported(self: anytype, txn: anytype, vector_id: u64) VectorCacheFill {
+    if (!searchCacheUsableForTxn(self, txn)) return .{ .guarded = true, .epoch = null };
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "beginVectorCacheFill")) {
         return .{ .guarded = true, .epoch = self.beginVectorCacheFill(vector_id) };
@@ -387,7 +439,8 @@ fn beginVectorCacheFillIfSupported(self: anytype, vector_id: u64) VectorCacheFil
     return .{ .guarded = false, .epoch = null };
 }
 
-fn cacheVectorAfterLoad(self: anytype, vector_id: u64, vector: []const f32, fill: VectorCacheFill) ![]const f32 {
+fn cacheVectorAfterLoad(self: anytype, txn: anytype, vector_id: u64, vector: []const f32, fill: VectorCacheFill) ![]const f32 {
+    if (!searchCacheUsableForTxn(self, txn)) return vector;
     const Index = comptime childType(@TypeOf(self));
     if (fill.guarded) {
         const epoch = fill.epoch orelse return vector;
@@ -428,10 +481,13 @@ fn shouldSeedRetainedVectorCacheOnSkipStore(self: anytype) bool {
     return true;
 }
 
-fn borrowCachedMetadataHandle(self: anytype, vector_id: u64) ?CachedMetadataReadHandle(@TypeOf(self)) {
+fn borrowCachedMetadataHandle(self: anytype, txn: anytype, vector_id: u64) ?CachedMetadataReadHandle(@TypeOf(self)) {
+    if (!searchCacheUsableForTxn(self, txn)) return null;
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "borrowCachedMetadata")) {
-        if (self.borrowCachedMetadata(vector_id)) |borrowed| return .{ .borrowed = borrowed };
+        var cached: CachedMetadataReadHandle(@TypeOf(self)) = .{ .borrowed = self.borrowCachedMetadata(vector_id) orelse return null };
+        if (searchCacheUsableForTxn(self, txn)) return cached;
+        cached.deinit();
     }
     return null;
 }
@@ -466,7 +522,7 @@ fn loadNodeReadHandleProfiledWithCachePolicy(
 ) !CachedNodeReadHandle(@TypeOf(self)) {
     const lookup_start = now_fn();
     if (use_cache) {
-        if (try borrowSearchCachedNodeHandle(self, node_id)) |cached| {
+        if (try borrowSearchCachedNodeHandle(self, txn, node_id)) |cached| {
             profile.node_cache_lookup_ns += elapsed_fn(lookup_start);
             return cached;
         }
@@ -498,7 +554,7 @@ fn loadNodeReadHandleWithCachePolicy(
     comptime use_cache: bool,
 ) !CachedNodeReadHandle(@TypeOf(self)) {
     if (use_cache) {
-        if (try borrowSearchCachedNodeHandle(self, node_id)) |cached| return cached;
+        if (try borrowSearchCachedNodeHandle(self, txn, node_id)) |cached| return cached;
     }
 
     const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
@@ -627,6 +683,18 @@ pub fn loadQuantizedReadHandleProfiled(
     );
 }
 
+fn borrowSearchCachedQuantizedHandle(self: anytype, txn: anytype, node_id: u64) !?CachedQuantizedReadHandle(@TypeOf(self)) {
+    if (!searchCacheUsableForTxn(self, txn)) return null;
+    const Index = comptime childType(@TypeOf(self));
+    var cached: CachedQuantizedReadHandle(@TypeOf(self)) = if (comptime @hasDecl(Index, "borrowCachedQuantized"))
+        .{ .borrowed = self.borrowCachedQuantized(node_id) orelse return null }
+    else
+        .{ .owned = (try self.getCachedQuantizedClone(node_id)) orelse return null };
+    if (searchCacheUsableForTxn(self, txn)) return cached;
+    cached.deinit(self.alloc);
+    return null;
+}
+
 fn loadQuantizedReadHandleProfiledWithCachePolicy(
     self: anytype,
     txn: anytype,
@@ -639,41 +707,24 @@ fn loadQuantizedReadHandleProfiledWithCachePolicy(
     elapsed_fn: fn (u64) u64,
     is_not_found: fn (anyerror) bool,
 ) !?CachedQuantizedReadHandle(@TypeOf(self)) {
-    const Index = comptime childType(@TypeOf(self));
     const lookup_start = now_fn();
     if (try loadNativeQuantizedReadView(self, txn, node_id, is_root, expected_count)) |native| {
         profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
         return .{ .native_borrowed = native };
     }
-    if (use_cache and comptime @hasDecl(Index, "borrowCachedQuantized")) {
-        if (self.borrowCachedQuantized(node_id)) |borrowed| {
-            profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
-            var handle = borrowed;
-            const cached = handle.ptr();
-            validateQuantizedSet(self, cached, expected_count) catch |err| {
-                handle.deinit();
-                switch (err) {
-                    error.Corrupted => {
-                        self.invalidateQuantizedCache(node_id);
-                        return null;
-                    },
-                }
+    if (use_cache) {
+        if (try borrowSearchCachedQuantizedHandle(self, txn, node_id)) |cached| {
+            var handle = cached;
+            validateQuantizedSet(self, handle.ptr(), expected_count) catch {
+                handle.deinit(self.alloc);
+                self.invalidateQuantizedCache(node_id);
+                return null;
             };
-            return .{ .borrowed = borrowed };
+            profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
+            return handle;
         }
-        profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
-    } else {
-        if (use_cache) {
-            if (try self.getCachedQuantizedClone(node_id)) |cached| {
-                profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
-                validateQuantizedSet(self, &cached, expected_count) catch |err| switch (err) {
-                    error.Corrupted => self.invalidateQuantizedCache(node_id),
-                };
-                if (try self.getCachedQuantizedClone(node_id)) |valid| return .{ .owned = valid };
-            }
-        }
-        profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
     }
+    profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
 
     const start = now_fn();
     const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
@@ -697,30 +748,17 @@ pub fn loadQuantizedReadHandle(
     expected_count: usize,
     is_not_found: fn (anyerror) bool,
 ) !?CachedQuantizedReadHandle(@TypeOf(self)) {
-    const Index = comptime childType(@TypeOf(self));
     if (try loadNativeQuantizedReadView(self, txn, node_id, is_root, expected_count)) |native| {
         return .{ .native_borrowed = native };
     }
-    if (comptime @hasDecl(Index, "borrowCachedQuantized")) {
-        if (self.borrowCachedQuantized(node_id)) |borrowed| {
-            var handle = borrowed;
-            const cached = handle.ptr();
-            validateQuantizedSet(self, cached, expected_count) catch |err| {
-                handle.deinit();
-                switch (err) {
-                    error.Corrupted => {
-                        self.invalidateQuantizedCache(node_id);
-                        return null;
-                    },
-                }
-            };
-            return .{ .borrowed = borrowed };
-        }
-    } else if (try self.getCachedQuantizedClone(node_id)) |cached| {
-        validateQuantizedSet(self, &cached, expected_count) catch |err| switch (err) {
-            error.Corrupted => self.invalidateQuantizedCache(node_id),
+    if (try borrowSearchCachedQuantizedHandle(self, txn, node_id)) |cached| {
+        var handle = cached;
+        validateQuantizedSet(self, handle.ptr(), expected_count) catch {
+            handle.deinit(self.alloc);
+            self.invalidateQuantizedCache(node_id);
+            return null;
         };
-        if (try self.getCachedQuantizedClone(node_id)) |valid| return .{ .owned = valid };
+        return handle;
     }
 
     const fill = searchCacheFillForTxn(self, txn);
@@ -1147,7 +1185,7 @@ pub fn getVector(self: anytype, txn: anytype, vector_id: u64) ![]f32 {
 }
 
 pub fn getVectorInto(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
-    if (borrowCachedVectorHandle(self, vector_id)) |cached_handle| {
+    if (borrowCachedVectorHandle(self, txn, vector_id)) |cached_handle| {
         var handle = cached_handle;
         defer handle.deinit();
         const cached = handle.view();
@@ -1155,11 +1193,11 @@ pub fn getVectorInto(self: anytype, txn: anytype, vector_id: u64, scratch: []f32
         @memcpy(scratch[0..cached.len], cached);
         return scratch[0..cached.len];
     }
-    const fill = beginVectorCacheFillIfSupported(self, vector_id);
+    const fill = beginVectorCacheFillIfSupported(self, txn, vector_id);
     var key_buf: [10]u8 = undefined;
     const data = try self.getNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, vector_id));
     const view = try vectorViewFromRaw(data, scratch);
-    return try cacheVectorAfterLoad(self, vector_id, view, fill);
+    return try cacheVectorAfterLoad(self, txn, vector_id, view, fill);
 }
 
 pub fn getVectorIntoUncached(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
@@ -1173,25 +1211,19 @@ pub fn getVectorViewOrScratch(self: anytype, txn: anytype, vector_id: u64, scrat
 }
 
 pub fn getVectorViewOrScratchWithCursor(self: anytype, cursor: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
-    if (borrowCachedVectorHandle(self, vector_id)) |cached_handle| {
-        var handle = cached_handle;
-        defer handle.deinit();
-        const cached = handle.view();
-        if (cached.len > scratch.len) return error.BufferTooSmall;
-        @memcpy(scratch[0..cached.len], cached);
-        return scratch[0..cached.len];
-    }
-    const fill = beginVectorCacheFillIfSupported(self, vector_id);
+    _ = self;
+    // A cursor does not carry a transaction-bound cache epoch. Consume its
+    // snapshot directly; a miss-time token cannot certify an older cursor.
     var key_buf: [10]u8 = undefined;
     const key = hbc.encodeVecKey(&key_buf, vector_id);
     const entry = (try cursor.seekAtOrAfter(key)) orelse return error.NotFound;
     if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
     const view = try vectorViewFromRaw(entry.value, scratch);
-    return try cacheVectorAfterLoad(self, vector_id, view, fill);
+    return view;
 }
 
 pub fn getVectorScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
-    if (borrowCachedVectorHandle(self, vector_id)) |cached_handle| {
+    if (borrowCachedVectorHandle(self, txn, vector_id)) |cached_handle| {
         var handle = cached_handle;
         defer handle.deinit();
         const cached = handle.view();
@@ -1199,11 +1231,11 @@ pub fn getVectorScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []
         @memcpy(scratch[0..cached.len], cached);
         return scratch[0..cached.len];
     }
-    const fill = beginVectorCacheFillIfSupported(self, vector_id);
+    const fill = beginVectorCacheFillIfSupported(self, txn, vector_id);
     var key_buf: [10]u8 = undefined;
     const data = try self.getNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, vector_id));
     const view = try vectorViewFromRaw(data, scratch);
-    return try cacheVectorAfterLoad(self, vector_id, view, fill);
+    return try cacheVectorAfterLoad(self, txn, vector_id, view, fill);
 }
 
 pub fn vectorViewFromRaw(data: []const u8, scratch: []f32) ![]const f32 {
@@ -1568,9 +1600,9 @@ pub fn saveExistingNodeBodyWithAddedVectorsOptions(
         if (try updateQuantizedWithAddedVectors(self, txn, node, transformed_vectors, added_count, now_fn, elapsed_fn, quant_start)) {
             posting_payload_refreshed = node.is_leaf;
         } else {
-            try refreshQuantizedWithOptions(self, txn, node, options, nowNsU64Fixed, elapsedSinceU64Fixed);
+            const refreshed = try refreshQuantizedWithOptionsResult(self, txn, node, options, nowNsU64Fixed, elapsedSinceU64Fixed);
             self.write_profile.refresh_quantized_ns += elapsed_fn(quant_start);
-            posting_payload_refreshed = node.is_leaf;
+            posting_payload_refreshed = node.is_leaf and (!self.config.use_quantization or refreshed);
         }
     }
     if (node.is_leaf) {
@@ -1627,14 +1659,14 @@ pub fn saveNodeBodyInternal(
             if (try updateQuantizedWithAddedVector(self, txn, node, v, now_fn, elapsed_fn, quant_start)) {
                 posting_payload_refreshed = node.is_leaf;
             } else {
-                try refreshQuantizedWithOptions(self, txn, node, options, nowNsU64Fixed, elapsedSinceU64Fixed);
+                const refreshed = try refreshQuantizedWithOptionsResult(self, txn, node, options, nowNsU64Fixed, elapsedSinceU64Fixed);
                 self.write_profile.refresh_quantized_ns += elapsed_fn(quant_start);
-                posting_payload_refreshed = node.is_leaf;
+                posting_payload_refreshed = node.is_leaf and (!self.config.use_quantization or refreshed);
             }
         } else {
-            try refreshQuantizedWithOptions(self, txn, node, options, nowNsU64Fixed, elapsedSinceU64Fixed);
+            const refreshed = try refreshQuantizedWithOptionsResult(self, txn, node, options, nowNsU64Fixed, elapsedSinceU64Fixed);
             self.write_profile.refresh_quantized_ns += elapsed_fn(quant_start);
-            posting_payload_refreshed = node.is_leaf;
+            posting_payload_refreshed = node.is_leaf and (!self.config.use_quantization or refreshed);
         }
     }
     if (node.is_leaf) {
@@ -2695,8 +2727,20 @@ fn searchProfiledRequestAttempt(
     var scratch_handle = try self.acquireSearchScratch();
     profile.scratch_acquire_ns += elapsed_fn_u64(scratch_start);
     const scratch = &scratch_handle.scratch;
+    const ScratchAdmission = struct {
+        index: @TypeOf(self),
+        handle: @TypeOf(&scratch_handle),
+        fn reserve(context: *anyopaque, target: u64) !void {
+            const admission: *@This() = @ptrCast(@alignCast(context));
+            if (comptime @hasDecl(Index, "reserveSearchScratchBytes"))
+                try admission.index.reserveSearchScratchBytes(admission.handle, target);
+        }
+    };
+    var scratch_admission = ScratchAdmission{ .index = self, .handle = &scratch_handle };
+    scratch.admission = .{ .context = &scratch_admission, .reserve = ScratchAdmission.reserve };
     scratch.global_subgroups.reset();
     defer {
+        scratch.admission = null;
         scratch.global_subgroups.reset();
         if (exhaustive_coverage) scratch.clearExhaustiveWorkspace(self.alloc);
         if (comptime @hasDecl(Index, "refreshSearchScratchAccounting")) {
@@ -3399,6 +3443,15 @@ fn loadStableSearchPublishedSnapshot(
     cancellation: ?search_types.CancellationToken,
 ) !SearchPublishedSnapshot {
     const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "boundSearchView")) {
+        if (self.boundSearchView()) |view| return .{
+            .root_node = view.root_node,
+            .active_count = view.active_count,
+            .node_count = view.node_count,
+            .publish_generation = view.publish_generation,
+            .routing_generation = view.routing_generation,
+        };
+    }
     if (comptime !@hasDecl(Index, "publishedGeneration")) {
         return .{
             .root_node = searchRootNode(self),
@@ -3692,7 +3745,7 @@ fn addChildCandidatesFromIds(
 
     for (child_ids) |child_id| {
         if (use_search_cache) {
-            if (try borrowSearchCachedNodeHandle(self, child_id)) |cached_handle| {
+            if (try borrowSearchCachedNodeHandle(self, txn, child_id)) |cached_handle| {
                 defer {
                     var handle = cached_handle;
                     handle.deinit(self.alloc);
@@ -4504,7 +4557,7 @@ fn scoreLeafMemberIds(
     for (scoring_member_ids, 0..) |member_id, i| {
         if (i % 256 == 0) try search_types.checkCancelled(req);
         if (use_search_cache) {
-            if (borrowCachedVectorHandle(self, member_id)) |cached_handle| {
+            if (borrowCachedVectorHandle(self, txn, member_id)) |cached_handle| {
                 profile.vector_cache_hits += 1;
                 var handle = cached_handle;
                 defer handle.deinit();
@@ -4779,6 +4832,17 @@ fn rerankResultsWithCachePolicy(
         var external_scored = false;
         const Index = comptime childType(@TypeOf(self));
         if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalRerankCandidatesSortedWithScratch")) bounded: {
+            if (comptime @hasDecl(Index, "externalBoundedScoringAvailable")) {
+                // Posting-local bounds require no source load. Preserve their
+                // full-shell boundary refinement even without native f16.
+                for (rerank_positions) |position| {
+                    if (!ranked_items[position].bounded_projection) {
+                        if (!self.externalBoundedScoringAvailable(txn)) break :bounded;
+                        break;
+                    }
+                }
+            }
+
             // Candidate admission is ordered by the RaBitQ plane, while this
             // pass replaces those estimates with the tighter float16 plane.
             // RaBitQ's stochastic error interval is a rerank-selection policy,
@@ -5671,9 +5735,9 @@ fn loadVectorIdsSortedWithScratchWithCachePolicy(
         for (vector_ids, 0..) |vector_id, slot| {
             const slot_scratch = batch_scratch[slot * dims ..][0..dims];
             vector_views[slot] = if (!use_cache and comptime @hasDecl(Index, "getVectorIntoUncached"))
-                self.getVectorIntoUncached(txn, vector_id, slot_scratch) catch &.{}
+                self.getVectorIntoUncached(txn, vector_id, slot_scratch) catch |err| try missingVectorOrError(err)
             else
-                self.getVectorInto(txn, vector_id, slot_scratch) catch &.{};
+                self.getVectorInto(txn, vector_id, slot_scratch) catch |err| try missingVectorOrError(err);
         }
         return;
     }
@@ -5684,9 +5748,9 @@ fn loadVectorIdsSortedWithScratchWithCachePolicy(
         for (vector_ids, 0..) |vector_id, slot| {
             const slot_scratch = batch_scratch[slot * dims ..][0..dims];
             vector_views[slot] = if (!use_cache and comptime @hasDecl(Index, "getVectorIntoUncached"))
-                self.getVectorIntoUncached(txn, vector_id, slot_scratch) catch &.{}
+                self.getVectorIntoUncached(txn, vector_id, slot_scratch) catch |err| try missingVectorOrError(err)
             else
-                self.getVectorInto(txn, vector_id, slot_scratch) catch &.{};
+                self.getVectorInto(txn, vector_id, slot_scratch) catch |err| try missingVectorOrError(err);
         }
         return;
     }
@@ -5694,7 +5758,7 @@ fn loadVectorIdsSortedWithScratchWithCachePolicy(
     var lookup_count: usize = 0;
     for (vector_ids, 0..) |vector_id, slot| {
         if (use_cache) {
-            if (borrowCachedVectorHandle(self, vector_id)) |cached_handle| {
+            if (borrowCachedVectorHandle(self, txn, vector_id)) |cached_handle| {
                 var handle = cached_handle;
                 defer handle.deinit();
                 const cached = handle.view();
@@ -5714,7 +5778,7 @@ fn loadVectorIdsSortedWithScratchWithCachePolicy(
             .item_index = slot,
             .vector_id = vector_id,
             .key = key,
-            .vector_cache_fill_epoch = if (use_cache) beginVectorCacheFillIfSupported(self, vector_id).epoch else 0,
+            .vector_cache_fill_epoch = if (use_cache) beginVectorCacheFillIfSupported(self, txn, vector_id).epoch else 0,
         };
         lookup_count += 1;
     }
@@ -5738,7 +5802,7 @@ fn loadVectorIdsSortedWithScratchWithCachePolicy(
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
         if (use_cache) {
-            if (borrowCachedVectorHandle(self, lookups[i].vector_id)) |cached_handle| {
+            if (borrowCachedVectorHandle(self, txn, lookups[i].vector_id)) |cached_handle| {
                 var handle = cached_handle;
                 defer handle.deinit();
                 const cached = handle.view();
@@ -5763,7 +5827,7 @@ fn loadVectorIdsSortedWithScratchWithCachePolicy(
         }
         if (use_cache) {
             const guarded = comptime @hasDecl(Index, "beginVectorCacheFill");
-            vector_views[lookups[i].item_index] = try cacheVectorAfterLoad(self, lookups[i].vector_id, view, .{
+            vector_views[lookups[i].item_index] = try cacheVectorAfterLoad(self, txn, lookups[i].vector_id, view, .{
                 .guarded = guarded,
                 .epoch = lookups[i].vector_cache_fill_epoch,
             });
@@ -5798,6 +5862,11 @@ pub fn loadVectorIdsSortedWithScratchForTest(
         scratch,
         batch_scratch,
     );
+}
+
+fn missingVectorOrError(err: anyerror) ![]const f32 {
+    if (err == error.NotFound) return &.{};
+    return err;
 }
 
 fn loadTransformedVectorIdsIntoMatrix(
@@ -6566,7 +6635,7 @@ fn populateMetadataBatchedWithScratch(
     for (results.items.items, 0..) |item, index| {
         if (item.metadata != null) continue;
         if (use_cache) {
-            if (borrowCachedMetadataHandle(self, item.vector_id)) |cached_handle| {
+            if (borrowCachedMetadataHandle(self, txn, item.vector_id)) |cached_handle| {
                 var handle = cached_handle;
                 defer handle.deinit();
                 results.items.items[index].metadata = try self.alloc.dupe(u8, handle.view());
@@ -6649,7 +6718,7 @@ fn memberMatchesRequestWithCachePolicy(
     }
     if (req.filter_prefix.len > 0) {
         if (use_cache) {
-            if (borrowCachedMetadataHandle(self, vector_id)) |cached_handle| {
+            if (borrowCachedMetadataHandle(self, txn, vector_id)) |cached_handle| {
                 var handle = cached_handle;
                 defer handle.deinit();
                 if (!std.mem.startsWith(u8, handle.view(), req.filter_prefix)) return false;
@@ -8173,7 +8242,7 @@ fn tryUpdateExistingVectorInLeafTxnOptions(
     if (!nodeHasMember(existing_leaf.members, vector_id)) return false;
 
     const previous_transformed = blk_previous: {
-        const previous_vector = self.getVectorScratch(txn, vector_id, previous_vector_storage) catch |err| switch (err) {
+        const previous_vector = getPreviousVectorForMutationScratch(self, txn, vector_id, previous_vector_storage) catch |err| switch (err) {
             error.NotFound => break :blk_previous null,
             else => return err,
         };
@@ -8186,7 +8255,8 @@ fn tryUpdateExistingVectorInLeafTxnOptions(
     posting.PostingStore.noteVectorsChanged(&existing_leaf);
     if (shouldDeferPostingCentroidRefresh(self, &existing_leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
-    } else if (previous_transformed) |old_transformed| {
+    } else if (previous_transformed != null and existing_leaf.posting_state.mutation_version -| existing_leaf.posting_state.centroid_version <= 1) {
+        const old_transformed = previous_transformed.?;
         const delta_storage = try self.alloc.alloc(f32, self.config.dims);
         defer self.alloc.free(delta_storage);
         for (delta_storage, 0..) |*delta, i| delta.* = effective_transformed[i] - old_transformed[i];
@@ -8229,7 +8299,7 @@ fn tryCoalesceExistingVectorInLeafTxnOptions(
     }
 
     const previous_transformed = blk_previous: {
-        const previous_vector = self.getVectorScratch(txn, vector_id, previous_vector_storage) catch |err| switch (err) {
+        const previous_vector = getPreviousVectorForMutationScratch(self, txn, vector_id, previous_vector_storage) catch |err| switch (err) {
             error.NotFound => break :blk_previous null,
             else => return err,
         };
@@ -8246,10 +8316,18 @@ fn tryCoalesceExistingVectorInLeafTxnOptions(
     } else {
         try appendUniqueU64(self.alloc, deferred_recompute_leaf_ids, leaf_id);
     }
-    var leaf = try loadNode(self, txn, leaf_id);
-    defer leaf.deinit(self.alloc);
-    try appendUniqueU64(self.alloc, deferred_ancestor_centroid_refresh_ids, leaf.parent);
+    // Later updates may merge this leaf or remove/reparent its ancestors.
+    // Resolve the final parent when draining the batch, rather than retaining
+    // an ancestor that no longer belongs to the committed topology.
+    try appendUniqueU64(self.alloc, deferred_ancestor_centroid_refresh_ids, leaf_id);
     return true;
+}
+
+fn getPreviousVectorForMutationScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "getPreviousVectorForMutationScratch"))
+        return self.getPreviousVectorForMutationScratch(txn, vector_id, scratch);
+    return getVectorScratch(self, txn, vector_id, scratch);
 }
 
 fn existingVectorMatchesNoOp(
@@ -8266,7 +8344,7 @@ fn existingVectorMatchesNoOp(
     } else if (next_metadata.len != 0) {
         return false;
     }
-    const existing_vector = getVectorScratch(self, txn, vector_id, scratch) catch |err| switch (err) {
+    const existing_vector = getPreviousVectorForMutationScratch(self, txn, vector_id, scratch) catch |err| switch (err) {
         error.NotFound => return false,
         else => return err,
     };
@@ -9183,6 +9261,7 @@ pub fn batchApplyOptions(
     errdefer abortVectorCacheMutationsIfSupported(self);
 
     var insert_options = options;
+    insert_options.recompute_coalesced_centroids = true;
     // Replacement batches change membership before adding vectors back. Do
     // not repeatedly rewrite or append to quantized payloads whose centroid
     // and membership changed earlier in this transaction. Queue every source
@@ -10833,15 +10912,37 @@ pub fn refreshQuantizedWithOptions(
     now_fn: fn () u64,
     elapsed_fn: fn (u64) u64,
 ) !void {
-    if (!self.config.use_quantization) return;
-    if (node.centroid.len == 0) return;
+    _ = try refreshQuantizedWithOptionsResult(self, txn, node, options, now_fn, elapsed_fn);
+}
+
+/// Rebuild and publish freshness in the same transaction. Callers that save
+/// the complete node themselves use refreshQuantizedWithOptions instead.
+pub fn rebuildQuantizedNodeWithOptions(self: anytype, txn: anytype, node: *types.Node, options: anytype, now_fn: fn () u64, elapsed_fn: fn (u64) u64) !void {
+    if (!try refreshQuantizedWithOptionsResult(self, txn, node, options, now_fn, elapsed_fn)) return;
+    if (node.is_leaf) {
+        posting.PostingStore.notePayloadRefreshed(node);
+        try posting.PostingStore.saveState(self, txn, node.id, node.posting_state);
+        try self.cacheNode(node);
+    }
+}
+
+fn refreshQuantizedWithOptionsResult(
+    self: anytype,
+    txn: anytype,
+    node: *const types.Node,
+    options: anytype,
+    now_fn: fn () u64,
+    elapsed_fn: fn (u64) u64,
+) !bool {
+    if (!self.config.use_quantization) return false;
+    if (node.centroid.len == 0) return false;
 
     var key_buf: [10]u8 = undefined;
     const count = if (node.is_leaf) node.members.len else node.children.len;
     if (count == 0) {
         self.deleteNamespaced(txn, .quant, hbc.encodeQuantKey(&key_buf, node.id)) catch {};
         self.invalidateQuantizedCache(node.id);
-        return;
+        return false;
     }
 
     const dims: usize = @intCast(self.metadata.dims);
@@ -10850,10 +10951,11 @@ pub fn refreshQuantizedWithOptions(
 
     const load_start = now_fn();
     if (node.is_leaf) {
-        posting.PostingStore.loadTransformedVectorsForQuantizedRefresh(self, txn, node, vectors, options) catch {
+        posting.PostingStore.loadTransformedVectorsForQuantizedRefresh(self, txn, node, vectors, options) catch |err| {
+            if (err != error.NotFound) return err;
             self.deleteNamespaced(txn, .quant, hbc.encodeQuantKey(&key_buf, node.id)) catch {};
             self.invalidateQuantizedCache(node.id);
-            return;
+            return false;
         };
         const load_elapsed = elapsed_fn(load_start);
         self.write_profile.quantized_vector_load_ns += load_elapsed;
@@ -10876,7 +10978,7 @@ pub fn refreshQuantizedWithOptions(
     if (node.is_leaf) {
         try posting.PostingStore.refreshQuantizedPayload(self, txn, node, vectors, now_fn, elapsed_fn);
         if (usesNonQuantizedPayload(node)) noteSplitWorkspaceLeafPayloadCoverage(self, node.members);
-        return;
+        return true;
     }
 
     if (try self.getCachedQuantizedClone(node.id)) |cached_value| {
@@ -10892,7 +10994,7 @@ pub fn refreshQuantizedWithOptions(
                     const store_start = now_fn();
                     try saveQuantized(self, txn, node.id, &fresh, now_fn, elapsed_fn);
                     self.write_profile.quantized_store_ns += elapsed_fn(store_start);
-                    return;
+                    return true;
                 }
                 set.vectors.dims = @intCast(dims);
                 set.vectors.count = @intCast(count);
@@ -10907,7 +11009,7 @@ pub fn refreshQuantizedWithOptions(
                 try self.cacheQuantized(node.id, &cached);
                 noteMutatedCachedQuantized(self, node.id);
                 self.write_profile.quantized_store_ns += elapsed_fn(store_start);
-                return;
+                return true;
             },
             .rabit => |*set| {
                 if (usesNonQuantizedPayload(node)) {
@@ -10924,7 +11026,7 @@ pub fn refreshQuantizedWithOptions(
                     const store_start = now_fn();
                     try saveQuantized(self, txn, node.id, &fresh, now_fn, elapsed_fn);
                     self.write_profile.quantized_store_ns += elapsed_fn(store_start);
-                    return;
+                    return true;
                 }
                 const compute_start = now_fn();
                 try self.quantizer.quantizeInto(set, node.centroid, vectors, count);
@@ -10934,7 +11036,7 @@ pub fn refreshQuantizedWithOptions(
                 try self.cacheQuantized(node.id, &cached);
                 noteMutatedCachedQuantized(self, node.id);
                 self.write_profile.quantized_store_ns += elapsed_fn(store_start);
-                return;
+                return true;
             },
         }
     }
@@ -10955,6 +11057,7 @@ pub fn refreshQuantizedWithOptions(
     const store_start = now_fn();
     try saveQuantized(self, txn, node.id, &qs, now_fn, elapsed_fn);
     self.write_profile.quantized_store_ns += elapsed_fn(store_start);
+    return true;
 }
 
 pub fn batchInsertWithMetadataTxnOptions(
@@ -10980,6 +11083,7 @@ pub fn batchInsertWithMetadataTxnOptions(
     }
     var deferred_ancestor_centroid_refresh_ids = std.ArrayListUnmanaged(u64).empty;
     defer deferred_ancestor_centroid_refresh_ids.deinit(self.alloc);
+    var membership_changed = options.recompute_coalesced_centroids;
     for (items) |item| {
         self.write_profile.insert_calls += 1;
         const effective_transformed = blk: {
@@ -11048,19 +11152,26 @@ pub fn batchInsertWithMetadataTxnOptions(
             }
         }
 
+        membership_changed = true;
         try self.insertWithMetadataTxnOptions(txn, item.vector_id, item.vector, item.transformed, item.metadata, transformed_vector, options);
     }
 
     for (deferred_leaf_centroid_deltas.items) |entry| {
+        // A missing previous version already schedules this leaf for a single
+        // final reconstruction. Do not save it twice or apply a partial delta.
+        if (std.mem.indexOfScalar(u64, deferred_recompute_leaf_ids.items, entry.leaf_id) != null) continue;
         var leaf = loadNode(self, txn, entry.leaf_id) catch |err| {
             if (isNotFoundGeneric(err)) continue;
             return err;
         };
         defer leaf.deinit(self.alloc);
+        if (!leaf.is_leaf) continue;
         const mutate_start = nowNsU64Fixed();
         posting.PostingStore.noteVectorsChanged(&leaf);
         if (shouldDeferPostingCentroidRefresh(self, &leaf)) {
             self.write_profile.posting_lazy_centroid_deferrals += 1;
+        } else if (membership_changed or leaf.posting_state.mutation_version -| leaf.posting_state.centroid_version > 1) {
+            try posting.PostingStore.recomputeCentroid(self, txn, &leaf);
         } else applyLeafCentroidDelta(self, &leaf, entry.delta_sum) catch {
             try posting.PostingStore.recomputeCentroid(self, txn, &leaf);
         };
@@ -11074,6 +11185,7 @@ pub fn batchInsertWithMetadataTxnOptions(
             return err;
         };
         defer leaf.deinit(self.alloc);
+        if (!leaf.is_leaf) continue;
         const mutate_start = nowNsU64Fixed();
         posting.PostingStore.noteVectorsChanged(&leaf);
         if (shouldDeferPostingCentroidRefresh(self, &leaf)) {
@@ -11085,7 +11197,17 @@ pub fn batchInsertWithMetadataTxnOptions(
         self.write_profile.insert_mutate_leaf_ns += elapsedSinceU64Fixed(mutate_start);
     }
 
-    for (deferred_ancestor_centroid_refresh_ids.items) |parent_id| {
+    var refreshed_parents = std.ArrayListUnmanaged(u64).empty;
+    defer refreshed_parents.deinit(self.alloc);
+    for (deferred_ancestor_centroid_refresh_ids.items) |leaf_id| {
+        var leaf = loadNode(self, txn, leaf_id) catch |err| {
+            if (isNotFoundGeneric(err)) continue;
+            return err;
+        };
+        defer leaf.deinit(self.alloc);
+        const parent_id = leaf.parent;
+        if (parent_id == 0 or std.mem.indexOfScalar(u64, refreshed_parents.items, parent_id) != null) continue;
+        try refreshed_parents.append(self.alloc, parent_id);
         if (self.config.lazy_posting_maintenance) {
             if (parent_id != 0) self.write_profile.posting_lazy_ancestor_deferrals += 1;
             continue;
@@ -12363,7 +12485,7 @@ fn rebuildQuantizedSubtree(self: anytype, txn: anytype, node_id: u64) !void {
             try rebuildQuantizedSubtree(self, txn, child_id);
         }
     }
-    try self.refreshQuantized(txn, &node);
+    try rebuildQuantizedNodeWithOptions(self, txn, &node, .{}, nowNsU64Fixed, elapsedSinceU64Fixed);
 }
 
 fn deferQuantizedRebuild(options: anytype) bool {
