@@ -298,7 +298,7 @@ pub const Scenario = struct {
         try sink.add("maintenance", logical);
         if (state.graph) |*graph| {
             var status = try graph.graphMetricStatus("metric");
-            defer status.deinit(sink.allocator);
+            defer status.deinit(graph.alloc);
             const encoded = try std.json.Stringify.valueAlloc(sink.allocator, status, .{});
             defer sink.allocator.free(encoded);
             try sink.add("metric", encoded);
@@ -311,7 +311,7 @@ pub const Scenario = struct {
 
             if (state.family == 3) {
                 var paired = try graph.graphMetricStatus("hub");
-                defer paired.deinit(sink.allocator);
+                defer paired.deinit(graph.alloc);
                 const pair_json = try std.json.Stringify.valueAlloc(sink.allocator, paired, .{});
                 defer sink.allocator.free(pair_json);
                 try sink.add("paired-metric", pair_json);
@@ -611,7 +611,11 @@ fn CollectingScenario(comptime Base: type) type {
         pub const evaluate = Base.evaluate;
         pub const done = Base.done;
         fn inspect(world: *World, allocator: std.mem.Allocator) !void {
-            var sink = vopr.collector.Sink.init(allocator, 0);
+            // Collector output may have a shorter lifetime than the live
+            // world. Keep its allocator distinct to catch ownership mistakes.
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            var sink = vopr.collector.Sink.init(arena.allocator(), 0);
             defer sink.deinit();
             try Base.collect(world, &sink);
             try std.testing.expect(sink.records.items.len > 0);
@@ -640,8 +644,11 @@ fn verifyDiagnostics(comptime Selected: type, allocator: std.mem.Allocator, arti
             const transition = artifact.transitions.items[prefix - 1].id;
             if (transition != id(.claim) and transition != id(.lose) and transition != id(.reclaim)) continue;
         }
-        var collected = try vopr.debugger.collectAt(Selected, allocator, artifact, prefix);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var collected = vopr.collector.Sink.init(arena.allocator(), prefix);
         defer collected.deinit();
+        try vopr.runner.collectAt(Selected, allocator, artifact, prefix, &collected);
         try std.testing.expect(collected.records.items.len > 0);
     }
     var replayed = try vopr.replay.exact(CollectingScenario(Selected), allocator, artifact);
@@ -672,9 +679,9 @@ test "index maintenance VOPR boundary histories permit normal completion and lat
             if (mode == 0 and family == .degree) try std.testing.expectEqual(@as(usize, 6), choices.advanced);
             var replayed = try vopr.replay.exact(Scenario, allocator, &artifact);
             defer replayed.deinit();
-            // Full prefix diagnostics once per owner keeps the base check
-            // bounded; the family matrix still exactly replays every history.
-            if (mode == 1 and family == .degree) try verifyDiagnostics(Scenario, allocator, &artifact);
+            // Exercise both the single metric and paired HITS allocations,
+            // including initial, acquired, reclaimed and terminal prefixes.
+            if (mode == 1 and (family == .degree or family == .hits_authority)) try verifyDiagnostics(Scenario, allocator, &artifact);
         }
     }
     var owner = try @import("domain_vopr.zig").recordNamed(allocator, "index-ownership", 1);
