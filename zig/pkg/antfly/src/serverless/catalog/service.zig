@@ -14,24 +14,39 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
 const progress_store_mod = @import("progress_store.zig");
-const document_projection = @import("../document_projection.zig");
-const document_segment_mod = @import("../document_segment/mod.zig");
+const document_facts = @import("../build/document_facts.zig");
+const document_facts_builder = @import("../build/document_facts_builder.zig");
+const graph_page_store = @import("../graph_segment/page_store.zig");
+const graph_page_tree = @import("../graph_segment/page_tree.zig");
+const read_lease = @import("../manifest/read_lease.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const query_mod = @import("../query/mod.zig");
-const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const builder_mod = @import("../build/builder.zig");
+const graph_metric_policy = @import("../build/graph_metric_policy.zig");
+const graph_metric_config = @import("../build/graph_metric_config.zig");
+const graph_metric_segment = @import("../graph_metric_segment/mod.zig");
+const lake_graph_metric = @import("../build/lake_graph_metric.zig");
 const impact_planner = @import("../build/impact_planner.zig");
 const external_source_manifest = @import("../build/external_source_manifest.zig");
+const external_metadata = @import("../build/external_publication_metadata.zig");
 const publication_plan = @import("../build/publication_plan.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
 const search_sources = @import("../search_sources.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
+const work_lease = @import("../build/work_lease.zig");
+const InventoryPublication = struct {
+    artifacts: *artifacts_mod.ArtifactStore,
+    cancellation: CancellationToken,
+    maintenance: ?maintenance_cancellation.Token = null,
+};
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("../build/vector_index.zig");
 const tables_api = @import("../../api/tables.zig");
@@ -43,6 +58,101 @@ const PublicationPlanPurpose = enum {
     status,
     publication,
 };
+
+const GraphMetricReadiness = struct {
+    configured: usize = 0,
+    pending: usize = 0,
+    rejected: usize = 0,
+};
+
+fn graphMetricReadinessAlloc(alloc: Allocator, manifest: ?manifest_mod.Manifest, indexes_json: []const u8) !GraphMetricReadiness {
+    const current = graph_metric_policy.materializerFingerprint(.{});
+    const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, indexes_json);
+    defer graph_metric_config.freeIndexSpecs(alloc, specs);
+    var readiness = GraphMetricReadiness{};
+    for (specs) |spec| {
+        const graph_artifact = if (manifest) |value|
+            findManifestNamedArtifact(value, .graph_segment, spec.index_name)
+        else
+            null;
+        for (spec.configs) |config| {
+            readiness.configured += 1;
+            const value = manifest orelse {
+                readiness.pending += 1;
+                continue;
+            };
+            const name = try graph_metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
+            defer alloc.free(name);
+            const artifact = findManifestNamedArtifact(value, .graph_metric_segment, name) orelse {
+                readiness.pending += 1;
+                continue;
+            };
+            const source_digest = if (graph_artifact) |graph_ref| blk: {
+                artifacts_mod.validateSha256ArtifactIdentity(graph_ref.artifact_id, graph_ref.checksum) catch break :blk null;
+                break :blk artifacts_mod.sha256DigestFromChecksum(graph_ref.checksum) catch null;
+            } else null;
+            const current_artifact = artifact.metadata_version == graph_metric_segment.wire_version and
+                artifact.graph_metric_control_len != 0 and
+                artifact.graph_metric_routing_footer_len != 0 and
+                artifact.materializer_fingerprint == current and
+                artifact.graph_metric_config_fingerprint == lake_graph_metric.configFingerprint(config) and
+                source_digest != null and
+                std.mem.eql(u8, &source_digest.?, &artifact.graph_metric_source_checksum);
+            if (!current_artifact) {
+                readiness.pending += 1;
+                continue;
+            }
+            if (artifact.graph_metric_materialization_state == .rejected) readiness.rejected += 1;
+        }
+    }
+    return readiness;
+}
+
+fn graphMetricMaterializationStaleAlloc(alloc: Allocator, manifest: manifest_mod.Manifest, indexes_json: []const u8) !bool {
+    return (try graphMetricReadinessAlloc(alloc, manifest, indexes_json)).pending != 0;
+}
+
+test "serverless catalog schedules idle graph metric policy upgrades from manifest metadata" {
+    var artifacts = [_]manifest_mod.ArtifactRef{
+        .{
+            .kind = .graph_segment,
+            .name = "graph_idx",
+            .artifact_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .byte_len = 1,
+            .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+        .{
+            .kind = .graph_metric_segment,
+            .name = "9:graph_idx4:rank",
+            .artifact_id = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .byte_len = 1,
+            .checksum = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .materializer_fingerprint = 0,
+        },
+    };
+    var manifest = manifest_mod.Manifest{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = &artifacts,
+    };
+    const indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}";
+    try std.testing.expect(try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
+    const specs = try graph_metric_config.parseIndexSpecsAlloc(std.testing.allocator, indexes_json);
+    defer graph_metric_config.freeIndexSpecs(std.testing.allocator, specs);
+    artifacts[1].metadata_version = graph_metric_segment.wire_version;
+    artifacts[1].materializer_fingerprint = graph_metric_policy.materializerFingerprint(.{});
+    artifacts[1].graph_metric_control_len = 1;
+    artifacts[1].graph_metric_routing_footer_len = 1;
+    artifacts[1].graph_metric_config_fingerprint = lake_graph_metric.configFingerprint(specs[0].configs[0]);
+    artifacts[1].graph_metric_source_checksum = @splat(0xaa);
+    try std.testing.expect(!try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
+    manifest.artifacts = manifest.artifacts[0..0];
+    try std.testing.expect(try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
+}
 
 fn ensureSchemaWritesAllowedAlloc(alloc: Allocator, schema_json: []const u8) !void {
     var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(alloc, schema_json)) orelse return;
@@ -59,6 +169,7 @@ pub const CatalogService = struct {
     builder: *builder_mod.Builder,
     store: *catalog_store.CatalogStore,
     external_source_plan_resolver: ?publication_plan.ExternalSourcePlanResolver = null,
+    facts_read_leases: read_lease.Cache = .{},
 
     pub fn init(
         alloc: Allocator,
@@ -263,8 +374,13 @@ pub const CatalogService = struct {
     }
 
     pub fn buildStatus(self: *CatalogService, namespace: []const u8) !catalog_types.BuildStatus {
+        return self.buildStatusUntil(namespace, null);
+    }
+
+    pub fn buildStatusUntil(self: *CatalogService, namespace: []const u8, cancellation: ?maintenance_cancellation.Token) !catalog_types.BuildStatus {
+        try maintenance_cancellation.check(cancellation);
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
-        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .status);
+        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .status, null);
         defer plan.deinit(self.alloc);
         const effective_policy = plan.policy;
         var published_head = try self.loadPublishedHeadAlloc(namespace);
@@ -274,20 +390,22 @@ pub const CatalogService = struct {
             manifest.wal_end_lsn
         else
             0;
-        const materialized_search_sources: search_sources.PublishedSearchSources = if (published_head.manifest) |manifest|
+        var materialized_search_sources: search_sources.PublishedSearchSources = if (published_head.manifest) |manifest|
             try search_sources.clonePublishedSearchSourcesAlloc(
                 self.alloc,
                 manifest.stats.published_search_sources,
             )
         else
             .{};
-        const materialized_derived_outputs: search_sources.MaterializedDerivedOutputs = if (published_head.manifest) |manifest|
+        errdefer search_sources.deinitPublishedSearchSources(self.alloc, &materialized_search_sources);
+        var materialized_derived_outputs: search_sources.MaterializedDerivedOutputs = if (published_head.manifest) |manifest|
             try search_sources.cloneMaterializedDerivedOutputsAlloc(
                 self.alloc,
                 manifest.stats.derived_outputs,
             )
         else
             .{};
+        errdefer search_sources.deinitMaterializedDerivedOutputs(self.alloc, &materialized_derived_outputs);
         const latest_wal_lsn = try self.wal.latestLsn(namespace);
         const pending_records = latest_wal_lsn -| published_wal_end_lsn;
         const versions = try self.manifests.listVersionsAlloc(namespace);
@@ -334,15 +452,20 @@ pub const CatalogService = struct {
                 .background_compaction
             else
                 .none;
-        const enrichment_completion = try enrichmentCompletionAlloc(self.alloc, self.artifacts, self.manifests, namespace, head_version, effective_policy);
+        const enrichment_completion = try enrichmentCompletionAlloc(self, namespace, head_version, effective_policy, plan.table_definition.indexes_json, cancellation);
         const pipeline = enrichment_pipeline.builtinPipelineForPolicy(effective_policy);
         const enrichment_active_stage = chooseActiveEnrichmentStage(pipeline, enrichment_completion);
-        const enrichment_head_version = if (enrichment_active_stage) |stage|
-            try self.progress.getEnrichmentStageHeadVersion(namespace, stage)
+        var atomic_enrichment_progress = if (enrichment_active_stage) |stage|
+            try self.progress.getEnrichmentStageProgress(namespace, stage)
         else
             null;
-        const enrichment_doc_offset = if (enrichment_active_stage) |stage|
-            (try self.progress.getEnrichmentStageDocOffset(namespace, stage)) orelse 0
+        defer if (atomic_enrichment_progress) |*value| value.deinit(self.progress.allocator);
+        const enrichment_head_version = if (atomic_enrichment_progress) |value|
+            value.head_version
+        else
+            null;
+        const enrichment_doc_offset = if (atomic_enrichment_progress) |value|
+            value.doc_offset
         else
             0;
         const enrichment_in_progress =
@@ -381,10 +504,11 @@ pub const CatalogService = struct {
         var predicted_pending_wal_enrichment_stage: ?catalog_types.EnrichmentStage = null;
         var predicted_pending_wal_enrichment_document_count: u64 = 0;
         if (pending_records > 0 and !plan.forceRepublishFromHead()) {
-            if (try self.builder.predictPendingWalPublicationActionsAlloc(
+            if (try self.builder.predictPendingWalPublicationActionsAllocUntil(
                 namespace,
                 effective_policy.vector_distance_metric,
                 plan,
+                cancellation,
             )) |predicted_value| {
                 var predicted = predicted_value;
                 defer predicted.deinit(self.alloc);
@@ -469,15 +593,53 @@ pub const CatalogService = struct {
         defer freeIndexConfigPublicationStatuses(self.alloc, index_config_actions);
         const head_republish_recommended = plan.forceRepublishFromHead();
         const pending_materialization_rebuild =
-            !head_republish_recommended and
-            (plan.artifact_actions.any() or plan.derived_output_actions.any());
+            pending_materialization_families.any() or
+            (!head_republish_recommended and
+                hasPendingMaterialization(plan, published_head.manifest));
+        const graph_metric_readiness: GraphMetricReadiness = if (plan.external_materialization) |external| .{
+            .configured = external.graph_metrics_configured,
+            .pending = external.graph_metrics_pending,
+            .rejected = external.graph_metrics_rejected,
+        } else try graphMetricReadinessAlloc(
+            self.alloc,
+            published_head.manifest,
+            plan.table_definition.indexes_json,
+        );
+
+        const owned_namespace = try self.alloc.dupe(u8, namespace);
+        errdefer self.alloc.free(owned_namespace);
+        var published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(
+            self.alloc,
+            plan.targets.published_search_sources,
+        );
+        errdefer search_sources.deinitPublishedSearchSources(self.alloc, &published_search_sources);
+        const owned_index_config_actions = try cloneIndexConfigPublicationStatusesAlloc(self.alloc, index_config_actions);
+        errdefer freeIndexConfigPublicationStatuses(self.alloc, owned_index_config_actions);
+        const head_full_text_index_actions = try cloneCatalogFullTextIndexActionsAlloc(self.alloc, head_actions.full_text_index_actions);
+        errdefer freeCatalogActions(self.alloc, head_full_text_index_actions);
+        const head_vector_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.vector_index_actions);
+        errdefer freeCatalogActions(self.alloc, head_vector_index_actions);
+        const head_sparse_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.sparse_index_actions);
+        errdefer freeCatalogActions(self.alloc, head_sparse_index_actions);
+        const head_graph_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.graph_index_actions);
+        errdefer freeCatalogActions(self.alloc, head_graph_index_actions);
+        const full_text_index_actions = try cloneFullTextIndexActionsAlloc(self.alloc, plan.full_text_index_actions);
+        errdefer freeCatalogActions(self.alloc, full_text_index_actions);
+        const vector_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.vector_index_actions);
+        errdefer freeCatalogActions(self.alloc, vector_index_actions);
+        const sparse_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.sparse_index_actions);
+        errdefer freeCatalogActions(self.alloc, sparse_index_actions);
+        const graph_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.graph_index_actions);
+        errdefer freeCatalogActions(self.alloc, graph_index_actions);
+        const vector_compaction_driver_index_name = if (vector_compaction.driver_index_name) |value|
+            try self.alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (vector_compaction_driver_index_name) |value| self.alloc.free(value);
 
         return .{
-            .namespace = try self.alloc.dupe(u8, namespace),
-            .published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(
-                self.alloc,
-                plan.targets.published_search_sources,
-            ),
+            .namespace = owned_namespace,
+            .published_search_sources = published_search_sources,
             .materialized_search_sources = materialized_search_sources,
             .materialized_derived_outputs = materialized_derived_outputs,
             .head_version = head_version,
@@ -494,12 +656,15 @@ pub const CatalogService = struct {
             .document_lineage_versions = head_document_lineage_versions,
             .head_republish_recommended = head_republish_recommended,
             .pending_materialization_rebuild = pending_materialization_rebuild,
+            .graph_metrics_configured = graph_metric_readiness.configured,
+            .graph_metrics_pending = graph_metric_readiness.pending,
+            .graph_metrics_rejected = graph_metric_readiness.rejected,
             .pending_materialization_families = pending_materialization_families,
             .head_artifact_actions = head_actions.artifact_actions,
-            .head_full_text_index_actions = try cloneCatalogFullTextIndexActionsAlloc(self.alloc, head_actions.full_text_index_actions),
-            .head_vector_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.vector_index_actions),
-            .head_sparse_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.sparse_index_actions),
-            .head_graph_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.graph_index_actions),
+            .head_full_text_index_actions = head_full_text_index_actions,
+            .head_vector_index_actions = head_vector_index_actions,
+            .head_sparse_index_actions = head_sparse_index_actions,
+            .head_graph_index_actions = head_graph_index_actions,
             .head_derived_output_actions = head_actions.derived_output_actions,
             .artifact_actions = .{
                 .document_segment = @enumFromInt(@intFromEnum(plan.artifact_actions.document_segment)),
@@ -508,11 +673,11 @@ pub const CatalogService = struct {
                 .sparse_vector = @enumFromInt(@intFromEnum(plan.artifact_actions.sparse_vector)),
                 .graph = @enumFromInt(@intFromEnum(plan.artifact_actions.graph)),
             },
-            .index_config_actions = try cloneIndexConfigPublicationStatusesAlloc(self.alloc, index_config_actions),
-            .full_text_index_actions = try cloneFullTextIndexActionsAlloc(self.alloc, plan.full_text_index_actions),
-            .vector_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.vector_index_actions),
-            .sparse_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.sparse_index_actions),
-            .graph_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.graph_index_actions),
+            .index_config_actions = owned_index_config_actions,
+            .full_text_index_actions = full_text_index_actions,
+            .vector_index_actions = vector_index_actions,
+            .sparse_index_actions = sparse_index_actions,
+            .graph_index_actions = graph_index_actions,
             .derived_output_actions = .{
                 .chunk_preview = @enumFromInt(@intFromEnum(plan.derived_output_actions.chunk_preview)),
                 .chunk_embeddings = @enumFromInt(@intFromEnum(plan.derived_output_actions.chunk_embeddings)),
@@ -526,7 +691,7 @@ pub const CatalogService = struct {
             .mutation_tail_compaction_recommended = mutation_tail_compaction_recommended,
             .vector_compaction_recommended = vector_compaction_recommended,
             .mutation_tail_resolution = mutation_tail_resolution,
-            .vector_compaction_driver_index_name = if (vector_compaction.driver_index_name) |value| try self.alloc.dupe(u8, value) else null,
+            .vector_compaction_driver_index_name = vector_compaction_driver_index_name,
             .vector_compaction_distance_metric = vector_compaction.metric,
             .vector_cluster_count = vector_compaction.cluster_count,
             .vector_target_cluster_count = vector_target_cluster_count,
@@ -673,20 +838,72 @@ pub const CatalogService = struct {
     }
 
     pub fn buildNamespace(self: *CatalogService, namespace: []const u8) !builder_mod.BuildResult {
+        return try self.buildNamespaceGuarded(namespace, null);
+    }
+
+    pub fn buildNamespaceWithCancellation(self: *CatalogService, namespace: []const u8, cancellation: CancellationToken) !builder_mod.BuildResult {
+        try cancellation.check();
+        var fallback: ?std.Io.Threaded = if (self.builder.io == null) std.Io.Threaded.init(self.alloc, .{}) else null;
+        defer if (fallback) |*value| value.deinit();
+        return self.buildNamespaceGuardedUntil(namespace, null, .{ .io = self.builder.io orelse fallback.?.io(), .cooperative = cancellation });
+    }
+
+    pub fn buildNamespaceGuarded(
+        self: *CatalogService,
+        namespace: []const u8,
+        publication_guard: ?@import("../build/work_lease.zig").PublicationGuard,
+    ) !builder_mod.BuildResult {
+        return try self.buildNamespaceGuardedUntil(namespace, publication_guard, null);
+    }
+
+    pub fn buildNamespaceGuardedUntil(
+        self: *CatalogService,
+        namespace: []const u8,
+        publication_guard: ?@import("../build/work_lease.zig").PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !builder_mod.BuildResult {
+        var fallback: ?std.Io.Threaded = if (self.builder.io == null and cancellation == null) std.Io.Threaded.init(self.alloc, .{}) else null;
+        defer if (fallback) |*value| value.deinit();
+        const io = if (cancellation) |token| token.io else self.builder.io orelse fallback.?.io();
+        try maintenance_cancellation.check(cancellation);
+        if (publication_guard == null) {
+            var nonce: [16]u8 = undefined;
+            io.random(&nonce);
+            const owner = std.fmt.bytesToHex(&nonce, .lower);
+            var held = (try work_lease.acquireHeld(try self.progress.workLeaseProvider(), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse return error.WorkLeaseLost;
+            defer _ = held.release() catch false;
+            return self.buildNamespaceGuardedUntil(namespace, held.guard(), held.cancellation(cancellation orelse .{ .io = io }));
+        }
+        var protection = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
+        const protected = protection.token(io);
+        var bridge = maintenance_cancellation.GraphBridge{ .maintenance = protected };
+        var scoped = self.artifacts.*;
+        scoped.upload_scope = .{ .domain = graph_page_store.PageStore.namespaceDomain(namespace), .attempt = try builder_mod.graphPublicationAttempt(publication_guard, namespace, io) };
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
-        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication);
+        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication, .{ .artifacts = &scoped, .cancellation = bridge.token(), .maintenance = protected });
         defer plan.deinit(self.alloc);
-        return try self.builder.publishNamespaceWithMetricAndPlan(
+        return try self.builder.publishNamespaceWithMetricAndPlanGuardedUntil(
             namespace,
             policy.vector_distance_metric,
             plan,
+            publication_guard,
+            protected,
         );
     }
 
     pub fn buildTable(self: *CatalogService, table_name: []const u8) !builder_mod.BuildResult {
+        return try self.buildTableWithCancellation(table_name, .none);
+    }
+
+    pub fn buildTableWithCancellation(
+        self: *CatalogService,
+        table_name: []const u8,
+        cancellation: CancellationToken,
+    ) !builder_mod.BuildResult {
+        try cancellation.check();
         const namespace = try self.resolveTableNamespaceAlloc(table_name);
         defer self.alloc.free(namespace);
-        return try self.buildNamespace(namespace);
+        return try self.buildNamespaceWithCancellation(namespace, cancellation);
     }
 
     pub fn tableBuildStatus(self: *CatalogService, table_name: []const u8) !catalog_types.BuildStatus {
@@ -721,19 +938,21 @@ pub const CatalogService = struct {
         self: *CatalogService,
         namespace: []const u8,
         table: catalog_types.TableNamespaceRecord,
+        publication: InventoryPublication,
+        previous_artifacts: []const manifest_mod.ArtifactRef,
     ) !?external_source_manifest.Plan {
         var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json)) orelse return null;
         defer binding.deinit(self.alloc);
-        const resolver = self.external_source_plan_resolver orelse {
-            if (binding.binding.snapshot_mode.requiresDiscoveryPin()) {
-                return error.ExternalSourcePlanResolverUnavailable;
-            }
-            return null;
-        };
+        // A user pin selects data; it does not supply the immutable inventory
+        // required to publish it. Every external binding needs a resolved plan.
+        const resolver = self.external_source_plan_resolver orelse return error.ExternalSourcePlanResolverUnavailable;
         return try resolver.resolveAlloc(self.alloc, .{
             .namespace = namespace,
             .table_name = table.table_name,
             .binding = binding.binding,
+            .artifacts = publication.artifacts,
+            .previous_artifacts = previous_artifacts,
+            .cancellation = publication.cancellation,
         });
     }
 
@@ -742,13 +961,35 @@ pub const CatalogService = struct {
         namespace: []const u8,
         policy: catalog_types.NamespacePolicy,
         purpose: PublicationPlanPurpose,
+        publication: ?InventoryPublication,
     ) !publication_plan.TablePublicationPlan {
         const tables = try self.listTablesAlloc(self.alloc);
         defer self.freeTables(self.alloc, tables);
         for (tables) |table| {
             if (!std.mem.eql(u8, table.namespace, namespace)) continue;
             const effective_policy = effectivePolicyForTable(policy, table.indexes_json) catch return error.InvalidTableIndexMetadata;
-            var targets: builder_mod.Builder.PublicationTargets = if (table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}"))
+            var external_binding = try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
+            defer if (external_binding) |*binding| binding.deinit(self.alloc);
+            const default_indexes = table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}");
+            // External targets always come from explicit declarations,
+            // including graph-only and whitespace-empty configurations.
+            var targets: builder_mod.Builder.PublicationTargets = if (external_binding != null) external: {
+                const graph_names = try builder_mod.listGraphIndexNamesAlloc(self.alloc, table.indexes_json);
+                defer {
+                    for (graph_names) |name| self.alloc.free(name);
+                    self.alloc.free(graph_names);
+                }
+                break :external .{
+                    .published_search_sources = try search_sources.publishedSearchSourcesForTableDefinitionWithDefaultsAlloc(
+                        self.alloc,
+                        table.schema_json,
+                        table.read_schema_json,
+                        table.indexes_json,
+                        .explicit_only,
+                    ),
+                    .include_graph = graph_names.len != 0,
+                };
+            } else if (default_indexes)
                 .{
                     .published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(self.alloc, search_sources.defaultPublishedSearchSources()),
                     .include_graph = true,
@@ -770,6 +1011,8 @@ pub const CatalogService = struct {
             defer published_head.deinit(self.alloc);
             if (published_head.manifest) |manifest| {
                 const head_version = published_head.manifest_version;
+                metadata_republish.external_schema_changed = external_binding != null and
+                    !std.mem.eql(u8, manifest.stats.schema_json, table.schema_json);
 
                 const impact = try impact_planner.planAlloc(self.alloc, .{
                     .before_schema_json = manifest.stats.schema_json,
@@ -781,7 +1024,7 @@ pub const CatalogService = struct {
                     .before_policy = manifest.stats.policy,
                     .after_policy = effective_policy,
                 });
-                const completion = try enrichmentCompletionAlloc(self.alloc, self.artifacts, self.manifests, namespace, head_version, effective_policy);
+                const completion = try enrichmentCompletionAlloc(self, namespace, head_version, effective_policy, table.indexes_json, if (publication) |context| context.maintenance else null);
                 const can_republish_chunk_preview = impact.rebuild_chunk_preview and
                     (!effective_policy.chunk_preview_enabled or completion.chunk_preview_complete);
                 const can_republish_chunk_embeddings = impact.rebuild_chunk_embeddings and
@@ -795,7 +1038,11 @@ pub const CatalogService = struct {
                     manifest.stats.indexes_json,
                     table.indexes_json,
                 );
-                metadata_republish.published_search_sources_changed = !publishedSearchSourcesMatch(
+                // Inventory publication cannot fulfill managed sidecar
+                // readiness. Preserve configured targets and pending status,
+                // but let the lake sidecar workflow materialize them instead
+                // of repeatedly publishing an identical remote inventory.
+                metadata_republish.published_search_sources_changed = !isExternalManifest(manifest) and !publishedSearchSourcesMatch(
                     targets.published_search_sources,
                     manifest.stats.published_search_sources,
                 );
@@ -807,6 +1054,16 @@ pub const CatalogService = struct {
                 metadata_republish.chunk_preview_policy_changed = can_republish_chunk_preview;
                 metadata_republish.chunk_embeddings_policy_changed = can_republish_chunk_embeddings;
                 metadata_republish.rerank_terms_policy_changed = can_republish_rerank_terms;
+                metadata_republish.graph_metric_policy_changed = !isExternalManifest(manifest) and
+                    try graphMetricMaterializationStaleAlloc(self.alloc, manifest, table.indexes_json);
+                // Pending indexes are interpreted under their published policy.
+                // Even an incomplete newly enabled stage needs this publication
+                // before its worker can discover work. Derived-output readiness
+                // must not gate the policy/index transition itself.
+                const before_facts_policy = try document_facts_builder.fingerprint(self.alloc, manifest.stats.policy, manifest.stats.indexes_json);
+                const after_facts_policy = try document_facts_builder.fingerprint(self.alloc, effective_policy, table.indexes_json);
+                metadata_republish.document_facts_policy_changed = !isExternalManifest(manifest) and
+                    !std.mem.eql(u8, &before_facts_policy, &after_facts_policy);
 
                 const full_text_index_actions = try planFullTextIndexActionsAlloc(
                     self.alloc,
@@ -843,7 +1100,10 @@ pub const CatalogService = struct {
 
                 const artifact_actions: publication_plan.ArtifactActions = .{
                     .document_segment = if (findManifestArtifactIndex(manifest, .document_segment) != null) .reuse else .rebuild,
-                    .full_text = publication_plan.collapseFullTextArtifactAction(full_text_index_actions, findManifestArtifactIndex(manifest, .text_segment) != null, .rebuild),
+                    .full_text = if (external_binding != null and targets.published_search_sources.findText() == null)
+                        .drop
+                    else
+                        publication_plan.collapseFullTextArtifactAction(full_text_index_actions, findManifestArtifactIndex(manifest, .text_segment) != null, .rebuild),
                     .dense_vector = if (targets.published_search_sources.findVector() == null)
                         .drop
                     else
@@ -862,12 +1122,10 @@ pub const CatalogService = struct {
                         ),
                     .graph = if (!targets.include_graph)
                         .drop
+                    else if (findManifestArtifactIndex(manifest, .graph_segment) != null)
+                        .reuse
                     else
-                        publication_plan.collapseNamedArtifactAction(
-                            graph_index_actions,
-                            findManifestArtifactIndex(manifest, .graph_segment) != null,
-                            if (impact.rebuild_graph) .rebuild else .reuse,
-                        ),
+                        .rebuild,
                 };
                 const derived_output_actions: publication_plan.DerivedOutputActions = .{
                     .chunk_preview = if (!effective_policy.chunk_preview_enabled)
@@ -903,12 +1161,12 @@ pub const CatalogService = struct {
                 );
                 errdefer table_definition.deinit(self.alloc);
                 var external_source_plan = if (purpose == .publication)
-                    try self.externalSourcePlanForTableAlloc(namespace, table)
+                    try self.externalSourcePlanForTableAlloc(namespace, table, publication.?, manifest.artifacts)
                 else
                     null;
                 errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
-                return .{
+                var plan: publication_plan.TablePublicationPlan = .{
                     .targets = targets,
                     .policy = effective_policy,
                     .table_definition = table_definition,
@@ -921,6 +1179,8 @@ pub const CatalogService = struct {
                     .graph_index_actions = graph_index_actions,
                     .derived_output_actions = derived_output_actions,
                 };
+                if (external_binding != null) try applyExternalReadinessAlloc(self.alloc, &plan, manifest);
+                return plan;
             }
 
             const full_text_index_actions = try planFullTextIndexActionsAlloc(
@@ -963,12 +1223,12 @@ pub const CatalogService = struct {
             );
             errdefer table_definition.deinit(self.alloc);
             var external_source_plan = if (purpose == .publication)
-                try self.externalSourcePlanForTableAlloc(namespace, table)
+                try self.externalSourcePlanForTableAlloc(namespace, table, publication.?, &.{})
             else
                 null;
             errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
-            return .{
+            var plan: publication_plan.TablePublicationPlan = .{
                 .targets = targets,
                 .policy = effective_policy,
                 .table_definition = table_definition,
@@ -976,7 +1236,10 @@ pub const CatalogService = struct {
                 .metadata_republish = metadata_republish,
                 .artifact_actions = .{
                     .document_segment = .rebuild,
-                    .full_text = publication_plan.collapseFullTextArtifactAction(full_text_index_actions, false, .rebuild),
+                    .full_text = if (external_binding != null and targets.published_search_sources.findText() == null)
+                        .drop
+                    else
+                        publication_plan.collapseFullTextArtifactAction(full_text_index_actions, false, .rebuild),
                     .dense_vector = if (targets.published_search_sources.findVector() == null)
                         .drop
                     else
@@ -995,6 +1258,8 @@ pub const CatalogService = struct {
                 .sparse_index_actions = sparse_index_actions,
                 .graph_index_actions = graph_index_actions,
             };
+            if (external_binding != null) try applyExternalReadinessAlloc(self.alloc, &plan, null);
+            return plan;
         }
         return .{
             .targets = .{
@@ -1056,6 +1321,72 @@ pub const CatalogService = struct {
         return try self.store.setPolicy(namespace, policy);
     }
 };
+
+/// Status and publication share the same metadata-only external reconciliation.
+/// Managed namespace adjacency aliases never stand in for external projections.
+fn applyExternalReadinessAlloc(alloc: Allocator, plan: *publication_plan.TablePublicationPlan, current: ?manifest_mod.Manifest) !void {
+    var reconciliation = try external_metadata.planAlloc(alloc, current, plan.*);
+    defer reconciliation.deinit(alloc);
+    for (plan.full_text_index_actions) |*entry| {
+        entry.action = reconciliation.action(.text_segment, entry.name);
+    }
+    inline for (.{ .{ "vector_index_actions", manifest_mod.ArtifactKind.vector_segment }, .{ "sparse_index_actions", manifest_mod.ArtifactKind.sparse_segment }, .{ "graph_index_actions", manifest_mod.ArtifactKind.graph_segment } }) |field| {
+        for (@field(plan, field[0])) |*entry| {
+            entry.action = reconciliation.action(field[1], entry.name);
+        }
+    }
+    plan.artifact_actions = .{
+        .document_segment = .reuse,
+        .full_text = reconciliation.familyAction(.text_segment),
+        .dense_vector = reconciliation.familyAction(.vector_segment),
+        .sparse_vector = reconciliation.familyAction(.sparse_segment),
+        .graph = reconciliation.familyAction(.graph_segment),
+    };
+    // External row sources do not run the managed document enrichment queue.
+    // Its policy defaults must not invent chunk/rerank recomputations here;
+    // the external dependency planner owns sidecar readiness instead.
+    plan.derived_output_actions = .{};
+    // Validate metric readiness against the compatible retained graph, not a
+    // same-named old projection which metadata publication would discard.
+    var retained_manifest = current;
+    if (retained_manifest) |*manifest| manifest.artifacts = reconciliation.retained_refs;
+    const metrics_ready = try graphMetricReadinessAlloc(alloc, retained_manifest, plan.table_definition.indexes_json);
+    plan.external_materialization = .{
+        .pending = reconciliation.hasOutstandingWork() or metrics_ready.pending != 0,
+        .graph_metrics_configured = metrics_ready.configured,
+        .graph_metrics_pending = metrics_ready.pending,
+        .graph_metrics_rejected = metrics_ready.rejected,
+    };
+}
+
+/// Actions describe intended publication; a declarative drop is outstanding
+/// work only while there is something to remove. Keep this separate from
+/// ArtifactActions.any(), which is also used as an execution summary.
+fn hasPendingMaterialization(plan: publication_plan.TablePublicationPlan, current: ?manifest_mod.Manifest) bool {
+    if (plan.external_materialization) |external| {
+        if (external.pending) return true;
+    } else {
+        inline for (.{ .{ "document_segment", manifest_mod.ArtifactKind.document_segment }, .{ "full_text", manifest_mod.ArtifactKind.text_segment }, .{ "dense_vector", manifest_mod.ArtifactKind.vector_segment }, .{ "sparse_vector", manifest_mod.ArtifactKind.sparse_segment }, .{ "graph", manifest_mod.ArtifactKind.graph_segment } }) |field| {
+            switch (@field(plan.artifact_actions, field[0])) {
+                .rebuild => return true,
+                .drop => if (current) |manifest| {
+                    if (findManifestArtifactIndex(manifest, field[1]) != null) return true;
+                },
+                .reuse => {},
+            }
+        }
+    }
+    inline for (.{ "chunk_preview", "chunk_embeddings", "rerank_terms" }) |field| {
+        switch (@field(plan.derived_output_actions, field)) {
+            .recompute => return true,
+            .drop => if (current) |manifest| {
+                if (manifest.stats.derived_outputs.containsKind(@field(search_sources.DerivedOutputKind, field))) return true;
+            },
+            .reuse => {},
+        }
+    }
+    return false;
+}
 
 fn cloneFullTextIndexActionsAlloc(
     alloc: Allocator,
@@ -1178,6 +1509,11 @@ fn freeNamedArtifactActions(alloc: Allocator, items: []publication_plan.NamedArt
 }
 
 fn freeIndexConfigPublicationStatuses(alloc: Allocator, items: []catalog_types.IndexConfigPublicationStatus) void {
+    for (items) |*item| item.deinit(alloc);
+    if (items.len > 0) alloc.free(items);
+}
+
+fn freeCatalogActions(alloc: Allocator, items: anytype) void {
     for (items) |*item| item.deinit(alloc);
     if (items.len > 0) alloc.free(items);
 }
@@ -1545,8 +1881,13 @@ fn planNamedIndexActionsAlloc(
     while (after_it.next()) |entry| {
         if (!isNamedIndexKindValue(entry.value_ptr.*, kind)) continue;
         const action: publication_plan.ArtifactAction = blk: {
+            // Graph aliases select the same canonical namespace adjacency.
+            // Index definitions/metric policy still require a manifest update,
+            // but cannot invalidate its document-derived physical root. WAL
+            // prediction separately promotes this action for changed facts.
+            if (kind == .graph) break :blk if (current_artifact_count != 0) .reuse else .rebuild;
             if (before_object.get(entry.key_ptr.*)) |before_value| {
-                if (isNamedIndexKindValue(before_value, kind) and jsonValueEql(entry.value_ptr.*, before_value)) {
+                if (isNamedIndexKindValue(before_value, kind) and namedIndexConfigEql(entry.value_ptr.*, before_value, kind)) {
                     break :blk .reuse;
                 }
             }
@@ -1556,7 +1897,8 @@ fn planNamedIndexActionsAlloc(
             }
             break :blk .rebuild;
         };
-        try actions.append(alloc, .{
+        try actions.ensureUnusedCapacity(alloc, 1);
+        actions.appendAssumeCapacity(.{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .action = action,
         });
@@ -1566,7 +1908,8 @@ fn planNamedIndexActionsAlloc(
     while (before_it.next()) |entry| {
         if (!isNamedIndexKindValue(entry.value_ptr.*, kind)) continue;
         if (after_object.get(entry.key_ptr.*) != null) continue;
-        try actions.append(alloc, .{
+        try actions.ensureUnusedCapacity(alloc, 1);
+        actions.appendAssumeCapacity(.{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .action = .drop,
         });
@@ -1741,7 +2084,7 @@ fn findEquivalentRenamedIndexName(
     while (before_it.next()) |entry| {
         if (!isNamedIndexKindValue(entry.value_ptr.*, kind)) continue;
         if (after_object.get(entry.key_ptr.*) != null) continue;
-        if (!jsonValueEql(entry.value_ptr.*, target_value)) continue;
+        if (!namedIndexConfigEql(entry.value_ptr.*, target_value, kind)) continue;
         if (match != null) return null;
         match = entry.key_ptr.*;
     }
@@ -1799,7 +2142,8 @@ fn planFullTextIndexActionsAlloc(
             .document_plus_artifact
         else
             .document;
-        try actions.append(alloc, .{
+        try actions.ensureUnusedCapacity(alloc, 1);
+        actions.appendAssumeCapacity(.{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .action = action,
             .source_mode = source_mode,
@@ -1811,7 +2155,8 @@ fn planFullTextIndexActionsAlloc(
     while (before_it.next()) |entry| {
         if (!isFullTextIndexValue(entry.value_ptr.*)) continue;
         if (after_object.get(entry.key_ptr.*) != null) continue;
-        try actions.append(alloc, .{
+        try actions.ensureUnusedCapacity(alloc, 1);
+        actions.appendAssumeCapacity(.{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .action = .drop,
             .source_mode = if (hasFullTextSourceArtifact(entry.value_ptr.*)) .artifact_only else .document,
@@ -1914,6 +2259,74 @@ fn jsonValueEql(lhs: std.json.Value, rhs: std.json.Value) bool {
     };
 }
 
+fn namedIndexConfigEql(lhs: std.json.Value, rhs: std.json.Value, kind: NamedSearchSourceKind) bool {
+    if (kind != .graph) return jsonValueEql(lhs, rhs);
+    if (lhs != .object or rhs != .object) return false;
+    var lhs_count: usize = 0;
+    var lhs_it = lhs.object.iterator();
+    while (lhs_it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "metrics")) continue;
+        lhs_count += 1;
+        const other = rhs.object.get(entry.key_ptr.*) orelse return false;
+        if (!jsonValueEql(entry.value_ptr.*, other)) return false;
+    }
+    var rhs_count: usize = 0;
+    var rhs_it = rhs.object.iterator();
+    while (rhs_it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "metrics")) rhs_count += 1;
+    }
+    return lhs_count == rhs_count;
+}
+
+test "serverless named graph planning reuses topology for metric-only changes" {
+    const actions = try planNamedIndexActionsAlloc(
+        std.testing.allocator,
+        "{\"graph_idx\":{\"type\":\"graph\",\"field\":\"edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}",
+        "{\"graph_idx\":{\"type\":\"graph\",\"field\":\"edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":40}}}}",
+        .graph,
+        1,
+    );
+    defer freeNamedArtifactActions(std.testing.allocator, actions);
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, actions[0].action);
+}
+
+test "serverless named graph planning unwinds every failed allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: Allocator) !void {
+            const actions = try planNamedIndexActionsAlloc(a, "{\"old\":{\"type\":\"graph\"}}", "{\"a\":{\"type\":\"graph\"},\"b\":{\"type\":\"graph\"},\"c\":{\"type\":\"graph\"},\"d\":{\"type\":\"graph\"},\"e\":{\"type\":\"graph\"},\"f\":{\"type\":\"graph\"},\"g\":{\"type\":\"graph\"},\"h\":{\"type\":\"graph\"}}", .graph, 1);
+            defer freeNamedArtifactActions(a, actions);
+        }
+    }.run, .{});
+}
+
+test "serverless named graph planning treats aliases separately from canonical storage" {
+    const a = std.testing.allocator;
+    const graph = "{\"g\":{\"type\":\"graph\"}}";
+    const two = "{\"g\":{\"type\":\"graph\"},\"alias\":{\"type\":\"graph\",\"edge_types\":[\"links\"]}}";
+    for ([_]struct { before: []const u8, after: []const u8, roots: usize, expected: publication_plan.ArtifactAction }{
+        .{ .before = "{}", .after = graph, .roots = 1, .expected = .reuse },
+        .{ .before = graph, .after = two, .roots = 1, .expected = .reuse },
+        .{ .before = graph, .after = "{\"renamed\":{\"type\":\"graph\",\"edge_types\":[\"other\"]}}", .roots = 2, .expected = .reuse },
+        .{ .before = graph, .after = graph, .roots = 0, .expected = .rebuild },
+        .{ .before = "{}", .after = graph, .roots = 0, .expected = .rebuild },
+    }) |case| {
+        const actions = try planNamedIndexActionsAlloc(a, case.before, case.after, .graph, case.roots);
+        defer freeNamedArtifactActions(a, actions);
+        var live: usize = 0;
+        for (actions) |action| {
+            if (action.action == .drop) continue;
+            live += 1;
+            try std.testing.expectEqual(case.expected, action.action);
+        }
+        try std.testing.expect(live != 0);
+    }
+    const removed = try planNamedIndexActionsAlloc(a, graph, "{}", .graph, 1);
+    defer freeNamedArtifactActions(a, removed);
+    try std.testing.expectEqual(@as(usize, 1), removed.len);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.drop, removed[0].action);
+}
+
 fn publishedSearchSourcesMatch(
     lhs: search_sources.PublishedSearchSources,
     rhs: search_sources.PublishedSearchSources,
@@ -1999,128 +2412,172 @@ fn isStageComplete(completion: EnrichmentCompletion, stage: catalog_types.Enrich
 }
 
 fn enrichmentCompletionAlloc(
-    alloc: Allocator,
-    artifacts: *artifacts_mod.ArtifactStore,
-    manifests: *manifest_mod.ManifestStore,
+    self: *CatalogService,
     namespace: []const u8,
     head_version: u64,
     policy: catalog_types.NamespacePolicy,
+    indexes_json: []const u8,
+    cancellation: ?maintenance_cancellation.Token,
 ) !EnrichmentCompletion {
     if (head_version == 0) return .{};
-    var manifest = try manifests.getAlloc(namespace, head_version);
-    defer manifest.deinit(alloc);
-    const docs = loadPublishedDocumentsForEnrichmentAlloc(alloc, artifacts, manifest) catch return .{};
-    defer query_mod.freeMaterializedDocuments(alloc, docs);
+    // Pin before resolving the manifest; a concurrent retirement must either
+    // observe this reader or reject it. Never turn an unreadable source into
+    // "enrichment complete".
+    const pin = try self.facts_read_leases.acquire(self.progress, namespace, head_version);
+    const ReadCheck = struct {
+        pin: read_lease.Lease,
+        cancellation: ?maintenance_cancellation.Token,
+        fn check(ptr: *const anyopaque) !void {
+            const state: *const @This() = @ptrCast(@alignCast(ptr));
+            try state.pin.check();
+            try maintenance_cancellation.check(state.cancellation);
+        }
+        fn cancelled(ptr: *const anyopaque) bool {
+            check(ptr) catch return true;
+            return false;
+        }
+    };
+    const check = ReadCheck{ .pin = pin, .cancellation = cancellation };
+    const token = CancellationToken{ .ptr = &check, .check_fn = ReadCheck.check, .is_cancelled_fn = ReadCheck.cancelled };
+    try token.check();
+    var manifest = try self.manifests.getAlloc(namespace, head_version);
+    defer manifest.deinit(self.alloc);
+    // Read-only external inventories have no managed document bodies or WAL
+    // enrichment queue. Their lake sidecars are built from the pinned source,
+    // not from document facts. Do not mistake that valid layout for corruption.
+    if (isExternalManifest(manifest)) return .{};
+    const idx = findArtifactIndex(manifest, .document_facts) orelse return error.DocumentFactsNotFound;
+    for (manifest.artifacts[idx + 1 ..]) |artifact| if (artifact.kind == .document_facts) return error.InvalidDocumentFactsRoot;
+    var reads: u64 = (builder_mod.GraphBuildLimits{}).max_input_bytes;
+    var writes: u64 = 0;
+    var pages = graph_page_store.PageStore{
+        .domain = graph_page_store.PageStore.namespaceDomain(namespace),
+        .artifacts = self.artifacts,
+        .remaining_read_bytes = &reads,
+        .remaining_write_bytes = &writes,
+        .cancellation = token,
+    };
+    const root = try document_facts.loadRoot(self.alloc, &pages, manifest.artifacts[idx]);
+    if (root.wal_end_lsn != manifest.wal_end_lsn or root.document_count != manifest.stats.document_count) return error.DocumentFactsSourceChanged;
+    const result = try enrichmentCompletionFromFactsAlloc(self.alloc, &pages, root, policy, indexes_json);
+    try token.check();
+    return result;
+}
 
-    var lexical_pending: u64 = 0;
-    var chunk_pending: u64 = 0;
-    var chunk_embeddings_pending: u64 = 0;
-    var rerank_pending: u64 = 0;
-    for (docs) |doc| {
-        var projection = document_projection.parseAlloc(alloc, doc.body) catch continue;
-        defer projection.deinit(alloc);
-        if (policy.enrichment_enabled and (projection.lexical_sparse_version == null or projection.lexical_sparse_version.? < policy.enrichment_pipeline_version)) {
-            lexical_pending += 1;
-        }
-        if (policy.chunk_preview_enabled and (projection.chunk_preview_version == null or projection.chunk_preview_version.? < policy.chunk_preview_pipeline_version)) {
-            chunk_pending += 1;
-        }
-        if (policy.chunk_embeddings_enabled and (projection.chunk_embeddings_version == null or projection.chunk_embeddings_version.? < policy.chunk_embeddings_pipeline_version)) {
-            chunk_embeddings_pending += 1;
-        }
-        if (policy.rerank_terms_enabled and (projection.rerank_terms_version == null or projection.rerank_terms_version.? < policy.rerank_terms_pipeline_version)) {
-            rerank_pending += 1;
-        }
-    }
-    return .{
-        .lexical_sparse_complete = !policy.enrichment_enabled or lexical_pending == 0,
-        .lexical_sparse_pending_documents = lexical_pending,
-        .chunk_preview_complete = !policy.chunk_preview_enabled or chunk_pending == 0,
-        .chunk_preview_pending_documents = chunk_pending,
-        .chunk_embeddings_complete = !policy.chunk_embeddings_enabled or chunk_embeddings_pending == 0,
-        .chunk_embeddings_pending_documents = chunk_embeddings_pending,
-        .rerank_terms_complete = !policy.rerank_terms_enabled or rerank_pending == 0,
-        .rerank_terms_pending_documents = rerank_pending,
+fn isExternalManifest(manifest: manifest_mod.Manifest) bool {
+    const source = manifest.base_source orelse return false;
+    return switch (source) {
+        .external_parquet, .external_iceberg, .external_lance => true,
+        else => false,
     };
 }
 
-fn loadPublishedDocumentsForEnrichmentAlloc(
+fn enrichmentCompletionFromFactsAlloc(
     alloc: Allocator,
-    artifacts: *artifacts_mod.ArtifactStore,
-    manifest: manifest_mod.Manifest,
-) ![]query_mod.QueryMaterializedDocument {
-    const document_index = findArtifactIndex(manifest, .document_segment) orelse return error.DocumentSegmentNotFound;
-    const payload = try artifacts.getAlloc(manifest.artifacts[document_index].artifact_id);
-    defer alloc.free(payload);
-    const entries = try document_segment_mod.decodeAlloc(alloc, payload);
-    defer document_segment_mod.freeEntries(alloc, entries);
-    const base_docs = try allocMaterializedDocumentsForEnrichment(alloc, entries);
-    errdefer query_mod.freeMaterializedDocuments(alloc, base_docs);
-
-    const mutation_index = findArtifactIndex(manifest, .mutation_segment) orelse return base_docs;
-    const mutation_payload = try artifacts.getAlloc(manifest.artifacts[mutation_index].artifact_id);
-    defer alloc.free(mutation_payload);
-    const mutation_entries = try segment_mod.decodeAlloc(alloc, mutation_payload);
-    defer segment_mod.freeEntries(alloc, mutation_entries);
-    const overlay = try allocMaterializerMutationsForEnrichment(alloc, mutation_entries);
-    defer freeMaterializerMutationsForEnrichment(alloc, overlay);
-    const docs = try query_mod.materializeDocumentsOverBaseAlloc(alloc, base_docs, overlay);
-    query_mod.freeMaterializedDocuments(alloc, base_docs);
-    return docs;
+    pages: *graph_page_store.PageStore,
+    root: document_facts.Root,
+    policy: catalog_types.NamespacePolicy,
+    indexes_json: []const u8,
+) !EnrichmentCompletion {
+    if (!policy.enrichment_enabled and !policy.chunk_preview_enabled and
+        !policy.chunk_embeddings_enabled and !policy.rerank_terms_enabled) return .{};
+    var pending: [4]u64 = root.counts[3..7].*;
+    if (try document_facts_builder.needsRebuild(alloc, root, policy, indexes_json)) {
+        // Only a real change to facts semantics needs bodies. Stream that
+        // exceptional read with bounded memory and the same admission budget
+        // as publication, rather than rebuilding a second document array.
+        pending = @splat(0);
+        var context = try document_facts_builder.Context.init(alloc, policy, indexes_json);
+        defer context.deinit();
+        var cursor = try graph_page_tree.Cursor.init(alloc, pages.store(), root.page, "", null);
+        defer cursor.deinit();
+        var count: u64 = 0;
+        while (try cursor.next()) |record| {
+            try pages.cancellation.check();
+            const fact = try document_facts.Fact.decode(record.value);
+            const body = try document_facts.readBodyAlloc(alloc, pages, fact.body);
+            defer alloc.free(body);
+            const flags = try context.flags(.{
+                .doc_id = @constCast(record.key),
+                .body = body,
+                .last_lsn = fact.last_lsn,
+                .last_timestamp_ns = fact.last_timestamp_ns,
+            });
+            for (&pending, 0..) |*value, bit| {
+                if (flags.pending & (@as(u4, 1) << @intCast(bit)) != 0) value.* += 1;
+            }
+            count += 1;
+        }
+        if (count != root.document_count) return error.InvalidDocumentFactsRoot;
+    }
+    return .{
+        .lexical_sparse_complete = pending[0] == 0,
+        .lexical_sparse_pending_documents = pending[0],
+        .chunk_preview_complete = pending[1] == 0,
+        .chunk_preview_pending_documents = pending[1],
+        .chunk_embeddings_complete = pending[2] == 0,
+        .chunk_embeddings_pending_documents = pending[2],
+        .rerank_terms_complete = pending[3] == 0,
+        .rerank_terms_pending_documents = pending[3],
+    };
 }
 
-fn allocMaterializedDocumentsForEnrichment(
-    alloc: Allocator,
-    entries: []const document_segment_mod.Entry,
-) ![]query_mod.QueryMaterializedDocument {
-    const docs = try alloc.alloc(query_mod.QueryMaterializedDocument, entries.len);
-    errdefer alloc.free(docs);
-    var initialized: usize = 0;
-    errdefer {
-        for (docs[0..initialized]) |*doc| doc.deinit(alloc);
-    }
-    for (entries, 0..) |entry, idx| {
-        docs[idx] = .{
-            .doc_id = try alloc.dupe(u8, entry.doc_id),
-            .body = try alloc.dupe(u8, entry.body),
-            .last_lsn = entry.last_lsn,
-            .last_timestamp_ns = entry.last_timestamp_ns,
-        };
-        initialized += 1;
-    }
-    return docs;
-}
+test "serverless catalog facts completion uses exact counters and authoritative policy refresh" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/facts-completion", .{tmp.sub_path});
+    defer alloc.free(path);
+    var fs = try artifacts_mod.FsStore.init(alloc, path);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    var pages = graph_page_store.PageStore{
+        .domain = graph_page_store.PageStore.namespaceDomain("docs"),
+        .attempt = @splat(1),
+        .artifacts = &artifacts,
+        .remaining_read_bytes = &reads,
+        .remaining_write_bytes = &writes,
+    };
+    const policy = catalog_types.NamespacePolicy{ .enrichment_enabled = true };
+    const initial = [_]query_mod.QueryMaterializedDocument{
+        .{ .doc_id = @constCast("a"), .body = @constCast("{\"text\":\"alpha\"}"), .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("b"), .body = @constCast("{\"text\":\"bravo\"}"), .last_lsn = 2, .last_timestamp_ns = 2 },
+    };
+    const first = try document_facts_builder.publishAlloc(alloc, &pages, null, &initial, null, policy, "{}", 2);
+    defer alloc.free(first.artifact_id);
+    defer alloc.free(first.checksum);
+    const a_body = "{\"text\":\"alpha\",\"_enrichment\":{\"lexical_sparse_version\":1}}";
+    const a_docs = [_]query_mod.QueryMaterializedDocument{.{ .doc_id = @constCast("a"), .body = @constCast(a_body), .last_lsn = 3, .last_timestamp_ns = 3 }};
+    const a_mutations = [_]query_mod.QueryMaterializerMutation{.{ .doc_id = @constCast("a"), .body = @constCast(a_body), .kind = .upsert, .lsn = 3, .timestamp_ns = 3 }};
+    const second = try document_facts_builder.publishAlloc(alloc, &pages, first, &a_docs, &a_mutations, policy, "{}", 3);
+    defer alloc.free(second.artifact_id);
+    defer alloc.free(second.checksum);
+    const b_body = "{\"text\":\"bravo\",\"other\":\"new\"}";
+    const b_docs = [_]query_mod.QueryMaterializedDocument{.{ .doc_id = @constCast("b"), .body = @constCast(b_body), .last_lsn = 4, .last_timestamp_ns = 4 }};
+    const b_mutations = [_]query_mod.QueryMaterializerMutation{.{ .doc_id = @constCast("b"), .body = @constCast(b_body), .kind = .upsert, .lsn = 4, .timestamp_ns = 4 }};
+    const third = try document_facts_builder.publishAlloc(alloc, &pages, second, &b_docs, &b_mutations, policy, "{}", 4);
+    defer alloc.free(third.artifact_id);
+    defer alloc.free(third.checksum);
+    const root = try document_facts.loadRoot(alloc, &pages, third);
 
-fn allocMaterializerMutationsForEnrichment(
-    alloc: Allocator,
-    entries: []const segment_mod.Entry,
-) ![]query_mod.QueryMaterializerMutation {
-    const mutations = try alloc.alloc(query_mod.QueryMaterializerMutation, entries.len);
-    errdefer alloc.free(mutations);
-    var initialized: usize = 0;
-    errdefer freeMaterializerMutationsForEnrichment(alloc, mutations[0..initialized]);
-    for (entries, 0..) |entry, idx| {
-        mutations[idx] = .{
-            .lsn = entry.lsn,
-            .timestamp_ns = entry.timestamp_ns,
-            .kind = entry.kind,
-            .doc_id = try alloc.dupe(u8, entry.doc_id),
-            .body = if (entry.body) |body| try alloc.dupe(u8, body) else null,
-        };
-        initialized += 1;
-    }
-    return mutations;
-}
-
-fn freeMaterializerMutationsForEnrichment(
-    alloc: Allocator,
-    mutations: []query_mod.QueryMaterializerMutation,
-) void {
-    for (mutations) |mutation| {
-        alloc.free(mutation.doc_id);
-        if (mutation.body) |body| alloc.free(body);
-    }
-    alloc.free(mutations);
+    // No flat document segment or mutation segment exists, and no page/body
+    // reads are admitted: unchanged semantics must use the exact root tuple.
+    reads = 0;
+    const current = try enrichmentCompletionFromFactsAlloc(alloc, &pages, root, policy, "{}");
+    try std.testing.expectEqual(@as(u64, 1), current.lexical_sparse_pending_documents);
+    try std.testing.expect(!current.lexical_sparse_complete);
+    var upgraded = policy;
+    upgraded.enrichment_pipeline_version = 2;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, enrichmentCompletionFromFactsAlloc(alloc, &pages, root, upgraded, "{}"));
+    reads = 1024 * 1024;
+    const refreshed = try enrichmentCompletionFromFactsAlloc(alloc, &pages, root, upgraded, "{}");
+    try std.testing.expectEqual(@as(u64, 2), refreshed.lexical_sparse_pending_documents);
+    var disabled = policy;
+    disabled.enrichment_enabled = false;
+    const complete = try enrichmentCompletionFromFactsAlloc(alloc, &pages, root, disabled, "{}");
+    try std.testing.expect(complete.lexical_sparse_complete);
 }
 
 const VectorCompactionSignal = struct {
@@ -2191,7 +2648,7 @@ fn vectorCompactionSignalAlloc(
     return if (found) signal else .{};
 }
 
-test "vector compaction signal aggregates named vector artifacts" {
+test "serverless vector compaction signal aggregates named vector artifacts" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2281,7 +2738,7 @@ test "vector compaction signal aggregates named vector artifacts" {
     try std.testing.expectEqualStrings("semantic_b", signal.driver_index_name.?);
 }
 
-test "vector compaction signal uses driver artifact metrics" {
+test "serverless vector compaction signal uses driver artifact metrics" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2405,7 +2862,7 @@ test "vector compaction signal uses driver artifact metrics" {
     try std.testing.expectEqual(@as(u32, 9), signal.shortlist_multiplier);
 }
 
-test "vector compaction signal ignores artifacts whose adaptive policy is a no-op" {
+test "serverless vector compaction signal ignores artifacts whose adaptive policy is a no-op" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2525,7 +2982,7 @@ fn findArtifactIndex(manifest: manifest_mod.Manifest, kind: manifest_mod.Artifac
     return null;
 }
 
-test "catalog service tracks namespaces and reports build status" {
+test "serverless catalog service tracks namespaces and reports build status" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2618,12 +3075,16 @@ test "catalog service tracks namespaces and reports build status" {
     try std.testing.expect(!after.publish_recommended);
     try std.testing.expectEqual(catalog_types.MutationTailResolution.none, after.mutation_tail_resolution);
     try std.testing.expectEqual(@as(usize, 1), after.retained_versions);
-    try std.testing.expectEqual(@as(usize, 3), after.retained_artifacts);
+    var published = try manifest_store.getAlloc("docs", after.head_version);
+    defer published.deinit(alloc);
+    try std.testing.expect(findManifestArtifactIndex(published, .document_facts) != null);
+    try std.testing.expect(findManifestArtifactIndex(published, .graph_segment) != null);
+    try std.testing.expectEqual(published.artifacts.len, after.retained_artifacts);
     try std.testing.expect(!after.compaction_recommended);
     try std.testing.expect(after.enrichment_complete);
 }
 
-test "catalog service stores per-namespace policy" {
+test "serverless catalog service stores per-namespace policy" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2691,7 +3152,7 @@ test "catalog service stores per-namespace policy" {
     try std.testing.expectEqual(@as(u32, 2), updated.enrichment_pipeline_version);
 }
 
-test "catalog service exposes table records over serving namespaces" {
+test "serverless catalog service exposes table records over serving namespaces" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2775,7 +3236,7 @@ test "catalog service exposes table records over serving namespaces" {
     try std.testing.expectEqualStrings("sparse_idx", after_build.materialized_search_sources.findSparse().?.index_name);
 }
 
-test "catalog service republishes head when table index metadata changes without new wal" {
+test "serverless catalog service republishes head when table index metadata changes without new wal" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2875,7 +3336,7 @@ test "catalog service republishes head when table index metadata changes without
     try std.testing.expect(!after.publish_recommended);
 }
 
-test "catalog service republishes head when derived output policy changes without new wal" {
+test "serverless catalog service republishes head when derived output policy changes without new wal" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2921,7 +3382,7 @@ test "catalog service republishes head when derived output policy changes withou
         .{ .chunk_preview_enabled = true },
         "{\"default_type\":\"doc\"}",
         "",
-        "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3}}",
+        "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"distance_metric\":\"cosine\"}}",
     ));
 
     var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
@@ -2971,9 +3432,39 @@ test "catalog service republishes head when derived output policy changes withou
     try std.testing.expectEqual(@as(u64, 1), after.published_wal_end_lsn);
     try std.testing.expect(!after.materialized_derived_outputs.containsKind(.chunk_preview));
     try std.testing.expect(!after.publish_recommended);
+
+    // Incomplete stages must refresh the maintained pending indexes too. In
+    // particular lexical sparse has no derived-output republish flag of its
+    // own, and waiting for a stage to complete before publishing its policy
+    // would deadlock its worker against the old empty pending index.
+    _ = try catalog.setPolicy("docs", .{ .enrichment_enabled = true, .enrichment_pipeline_version = 2, .chunk_preview_enabled = true, .chunk_preview_pipeline_version = 2 });
+    var enabled = try catalog.buildStatus("docs");
+    defer enabled.deinit(alloc);
+    try std.testing.expect(enabled.publish_recommended);
+    var refresh = try catalog.buildTable("docs");
+    defer refresh.deinit(alloc);
+    try std.testing.expect(refresh.published);
+    try std.testing.expectEqual(@as(u64, 1), refresh.wal_end_lsn);
+    var refreshed = try manifest_store.getAlloc("docs", refresh.version);
+    defer refreshed.deinit(alloc);
+    var reads: u64 = 4096;
+    var writes: u64 = 0;
+    var pages = graph_page_store.PageStore{
+        .domain = graph_page_store.PageStore.namespaceDomain("docs"),
+        .artifacts = &artifact_store,
+        .remaining_read_bytes = &reads,
+        .remaining_write_bytes = &writes,
+    };
+    const root = try document_facts.loadRoot(alloc, &pages, refreshed.artifacts[findArtifactIndex(refreshed, .document_facts).?]);
+    try std.testing.expectEqual(@as(u64, 1), root.counts[3]);
+    try std.testing.expectEqual(@as(u64, 1), root.counts[4]);
+    try std.testing.expect(root.pending_pages[0] != null and root.pending_pages[1] != null);
+    var stable = try catalog.buildStatus("docs");
+    defer stable.deinit(alloc);
+    try std.testing.expect(!stable.publish_recommended);
 }
 
-test "catalog service republishes head when graph index metadata changes without new wal" {
+test "serverless catalog service republishes head when graph index metadata changes without new wal" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3049,7 +3540,7 @@ test "catalog service republishes head when graph index metadata changes without
         "docs",
         "{\"default_type\":\"doc\"}",
         "",
-        "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"graph_idx\":{\"type\":\"graph\"}}",
+        "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"distance_metric\":\"cosine\"},\"graph_idx\":{\"type\":\"graph\"}}",
     ));
 
     var status = try catalog.buildStatus("docs");
@@ -3058,8 +3549,8 @@ test "catalog service republishes head when graph index metadata changes without
     try std.testing.expectEqual(catalog_types.NextPublishReason.head_republish, status.next_publish_reason.?);
     try std.testing.expect(status.head_republish_recommended);
     try std.testing.expect(!status.pending_materialization_rebuild);
-    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, status.artifact_actions.graph);
-    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, findNamedArtifactAction(status.graph_index_actions, "graph_idx").?);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, status.artifact_actions.graph);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findNamedArtifactAction(status.graph_index_actions, "graph_idx").?);
 
     var rebuild = try catalog.buildTable("docs");
     defer rebuild.deinit(alloc);
@@ -3072,10 +3563,37 @@ test "catalog service republishes head when graph index metadata changes without
     try std.testing.expectEqual(@as(u64, 2), after.head_version);
     try std.testing.expectEqual(@as(u64, 1), after.published_wal_end_lsn);
     try std.testing.expect(!after.publish_recommended);
-    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, findNamedArtifactAction(after.head_graph_index_actions, "graph_idx").?);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findNamedArtifactAction(after.head_graph_index_actions, "graph_idx").?);
+
+    var aliased = try manifest_store.getAlloc("docs", 2);
+    defer aliased.deinit(alloc);
+    const canonical_id = first_manifest.artifacts[findManifestArtifactIndex(first_manifest, .graph_segment).?].artifact_id;
+    try std.testing.expectEqualStrings(canonical_id, findManifestNamedArtifact(aliased, .graph_segment, "graph_idx").?.artifact_id);
+
+    // Removing the final public alias does not remove the namespace's default
+    // graph: aliases and canonical physical storage have separate lifetimes.
+    try std.testing.expect(try catalog.setTableDefinition(
+        "docs",
+        "{\"default_type\":\"doc\"}",
+        "",
+        "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"distance_metric\":\"cosine\"}}",
+    ));
+    var dropping = try catalog.buildStatus("docs");
+    defer dropping.deinit(alloc);
+    try std.testing.expect(dropping.head_republish_recommended);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, dropping.artifact_actions.graph);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.drop, findNamedArtifactAction(dropping.graph_index_actions, "graph_idx").?);
+    var dropped = try catalog.buildTable("docs");
+    defer dropped.deinit(alloc);
+    try std.testing.expect(dropped.published);
+    var unnamed = try manifest_store.getAlloc("docs", dropped.version);
+    defer unnamed.deinit(alloc);
+    const retained_graph = unnamed.artifacts[findManifestArtifactIndex(unnamed, .graph_segment).?];
+    try std.testing.expectEqualStrings(canonical_id, retained_graph.artifact_id);
+    try std.testing.expectEqualStrings("", retained_graph.name);
 }
 
-test "catalog service republishes head when dense index config changes without renaming source" {
+test "serverless catalog service republishes head when dense index config changes without renaming source" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3187,7 +3705,7 @@ test "catalog service republishes head when dense index config changes without r
     try std.testing.expect(!std.mem.eql(u8, first_vector.artifact_id, second_vector.artifact_id));
 }
 
-test "catalog service reports chunk embeddings changes as pending materialization rebuilds" {
+test "serverless catalog service reports chunk embeddings changes as pending materialization rebuilds" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3251,9 +3769,11 @@ test "catalog service reports chunk embeddings changes as pending materializatio
 
     var status = try catalog.buildStatus("docs");
     defer status.deinit(alloc);
-    try std.testing.expect(!status.head_republish_recommended);
+    // Publish the new pending index first, while keeping derived readiness
+    // explicitly pending until the worker has produced embeddings.
+    try std.testing.expect(status.head_republish_recommended);
     try std.testing.expect(status.pending_materialization_rebuild);
-    try std.testing.expect(!status.publish_recommended);
+    try std.testing.expect(status.publish_recommended);
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, status.artifact_actions.dense_vector);
     try std.testing.expectEqual(catalog_types.DerivedOutputPublicationAction.recompute, status.derived_output_actions.chunk_embeddings);
     try std.testing.expectEqual(catalog_types.DerivedOutputResolution.pending_materialization, status.derived_output_resolutions.chunk_embeddings);
@@ -3261,7 +3781,7 @@ test "catalog service reports chunk embeddings changes as pending materializatio
     try std.testing.expect(!status.pending_materialization_families.dense_vector);
 }
 
-test "catalog service republishes head when chunk embeddings are already materialized" {
+test "serverless catalog service republishes head when chunk embeddings are already materialized" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3339,7 +3859,7 @@ test "catalog service republishes head when chunk embeddings are already materia
     try std.testing.expect(!status.pending_materialization_families.chunk_embeddings);
 }
 
-test "catalog service republishes head when chunk preview is already materialized" {
+test "serverless catalog service republishes head when chunk preview is already materialized" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3417,7 +3937,7 @@ test "catalog service republishes head when chunk preview is already materialize
     try std.testing.expect(!status.pending_materialization_families.chunk_preview);
 }
 
-test "catalog service republishes head when rerank terms are already materialized" {
+test "serverless catalog service republishes head when rerank terms are already materialized" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3495,7 +4015,7 @@ test "catalog service republishes head when rerank terms are already materialize
     try std.testing.expect(!status.pending_materialization_families.rerank_terms);
 }
 
-test "catalog service reports named vector and sparse publication actions" {
+test "serverless catalog service reports named vector and sparse publication actions" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3572,7 +4092,7 @@ test "catalog service reports named vector and sparse publication actions" {
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, findNamedArtifactAction(status.sparse_index_actions, "sparse_b").?);
 }
 
-test "catalog service defers small publish tails while enrichment is still in progress" {
+test "serverless catalog service defers small publish tails while enrichment is still in progress" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3626,8 +4146,7 @@ test "catalog service defers small publish tails while enrichment is still in pr
     var build_first = try builder.publishNamespace("docs");
     defer build_first.deinit(alloc);
 
-    try std.testing.expect(try progress_store.compareAndSwapEnrichmentHeadVersion("docs", null, 1));
-    try std.testing.expect(try progress_store.compareAndSwapEnrichmentDocOffset("docs", null, 0));
+    try std.testing.expect(try progress_store.compareAndSwapEnrichmentStageProgress("docs", .lexical_sparse, null, .{ .head_version = 1, .doc_offset = 0, .pipeline_version = 1 }));
 
     const derived = [_]api_types.DocumentMutation{
         .{ .kind = .upsert, .doc_id = "doc-a", .body = "{\"text\":\"alpha bravo\",\"sparse_embedding\":{\"alpha\":0.5,\"bravo\":0.5},\"_enrichment\":{\"lexical_sparse\":true,\"lexical_sparse_version\":1}}" },
@@ -3655,7 +4174,7 @@ test "catalog service defers small publish tails while enrichment is still in pr
     try std.testing.expectEqual(@as(u64, 0), status.enrichment_doc_offset);
 }
 
-test "catalog service advances active enrichment stage to rerank terms" {
+test "serverless catalog service advances active enrichment stage to rerank terms" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3723,7 +4242,7 @@ test "catalog service advances active enrichment stage to rerank terms" {
     try std.testing.expectEqual(catalog_types.EnrichmentStage.rerank_terms, status.enrichment_active_stage.?);
 }
 
-test "catalog service uses stage-specific publish thresholds for later enrichment stages" {
+test "serverless catalog service uses stage-specific publish thresholds for later enrichment stages" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3798,7 +4317,7 @@ test "catalog service uses stage-specific publish thresholds for later enrichmen
     try std.testing.expect(!status.materialized_derived_outputs.containsKind(.rerank_terms));
 }
 
-test "catalog service recommends compaction only while head still contains mutation segments" {
+test "serverless catalog service recommends compaction only while head still contains mutation segments" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3873,7 +4392,7 @@ test "catalog service recommends compaction only while head still contains mutat
     try std.testing.expect(!after.compaction_recommended);
 }
 
-test "catalog service recommends compaction based on document base lineage after pruning" {
+test "serverless catalog service recommends compaction based on document base lineage after pruning" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3935,6 +4454,15 @@ test "catalog service recommends compaction based on document base lineage after
     }
 
     var pruner = @import("../build/retention.zig").Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    // Publication pins are shared read rights and remain valid after the
+    // writer returns. Test eventual pruning once those rights have expired.
+    const lease = @import("../manifest/read_lease.zig");
+    const gc_now = @import("antfly_platform").time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
+    pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
+        fn now(ptr: *const anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+    }.now };
     var result = try pruner.pruneNamespace("docs", 2);
     defer result.deinit(alloc);
 
@@ -3952,7 +4480,7 @@ test "catalog service recommends compaction based on document base lineage after
     try std.testing.expect(status.next_document_publish_mode == null);
 }
 
-test "catalog service reports mutation tail resolved by next inline rebase publish" {
+test "serverless catalog service reports mutation tail resolved by next inline rebase publish" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4033,7 +4561,7 @@ test "catalog service reports mutation tail resolved by next inline rebase publi
     try std.testing.expectEqual(catalog_types.MutationTailResolution.next_publish_inline_rebase, status.mutation_tail_resolution);
 }
 
-test "catalog service reports versioned full text migration actions" {
+test "serverless catalog service reports versioned full text migration actions" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4105,7 +4633,7 @@ test "catalog service reports versioned full text migration actions" {
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, findFullTextIndexAction(status.full_text_index_actions, "full_text_index_v1").?);
 }
 
-test "catalog service reports versioned full text cutover drop actions" {
+test "serverless catalog service reports versioned full text cutover drop actions" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4177,7 +4705,7 @@ test "catalog service reports versioned full text cutover drop actions" {
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findFullTextIndexAction(status.full_text_index_actions, "full_text_index_v1").?);
 }
 
-test "catalog service reports head publication actions for wal partial reuse" {
+test "serverless catalog service reports head publication actions for wal partial reuse" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4255,7 +4783,7 @@ test "catalog service reports head publication actions for wal partial reuse" {
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findNamedArtifactAction(status.head_sparse_index_actions, "sparse_idx").?);
 }
 
-test "catalog service predicts wal partial reuse before publish" {
+test "serverless catalog service predicts wal partial reuse before publish" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4333,7 +4861,7 @@ test "catalog service predicts wal partial reuse before publish" {
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findNamedArtifactAction(status.sparse_index_actions, "sparse_idx").?);
 }
 
-test "catalog service predicts graph index reuse before publish when graph projection is unchanged" {
+test "serverless catalog service predicts graph index reuse before publish when graph projection is unchanged" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4405,7 +4933,7 @@ test "catalog service predicts graph index reuse before publish when graph proje
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findNamedArtifactAction(status.graph_index_actions, "graph_idx").?);
 }
 
-test "catalog service predicts graph index rebuild before publish when graph projection changes" {
+test "serverless catalog service predicts graph index rebuild before publish when graph projection changes" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4477,7 +5005,7 @@ test "catalog service predicts graph index rebuild before publish when graph pro
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, findNamedArtifactAction(status.graph_index_actions, "graph_idx").?);
 }
 
-test "catalog service predicts derived output recomputes from pending wal when enrichment is enabled" {
+test "serverless catalog service predicts derived output recomputes from pending wal when enrichment is enabled" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4557,7 +5085,7 @@ test "catalog service predicts derived output recomputes from pending wal when e
     try std.testing.expect(!status.pending_materialization_families.sparse_vector);
 }
 
-test "catalog service predicts lexical sparse enrichment stage from pending wal" {
+test "serverless catalog service predicts lexical sparse enrichment stage from pending wal" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4638,7 +5166,7 @@ test "catalog service predicts lexical sparse enrichment stage from pending wal"
     try std.testing.expect(!status.pending_materialization_families.chunk_preview);
 }
 
-test "catalog service marks pending wal enrichment as ready to publish when threshold is met" {
+test "serverless catalog service marks pending wal enrichment as ready to publish when threshold is met" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4715,7 +5243,7 @@ test "catalog service marks pending wal enrichment as ready to publish when thre
     try std.testing.expect(status.pending_materialization_families.chunk_preview);
 }
 
-test "catalog service reports chunk-augmented full text status without chunk preview policy" {
+test "serverless catalog service reports chunk-augmented full text status without chunk preview policy" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4772,7 +5300,7 @@ test "catalog service reports chunk-augmented full text status without chunk pre
     try std.testing.expectEqual(false, status.chunk_preview_enabled);
 }
 
-test "catalog service marks chunk-backed full text as waiting on chunk preview materialization" {
+test "serverless catalog service marks chunk-backed full text as waiting on chunk preview materialization" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4847,7 +5375,7 @@ test "catalog service marks chunk-backed full text as waiting on chunk preview m
     try std.testing.expect(status.pending_materialization_families.full_text);
 }
 
-test "catalog service auto-enables chunk embeddings for chunked embedding indexes" {
+test "serverless catalog service auto-enables chunk embeddings for chunked embedding indexes" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4919,17 +5447,144 @@ test "serverless catalog service fails closed for current external binding witho
     var catalog: CatalogService = undefined;
     catalog.alloc = alloc;
     catalog.external_source_plan_resolver = null;
+    var unused_artifacts: artifacts_mod.ArtifactStore = undefined;
     try std.testing.expectError(
         error.ExternalSourcePlanResolverUnavailable,
-        catalog.externalSourcePlanForTableAlloc("events", table),
+        catalog.externalSourcePlanForTableAlloc("events", table, .{ .artifacts = &unused_artifacts, .cancellation = .none }, &.{}),
     );
+}
+
+test "serverless external readiness shares exact publication bindings and actual presence" {
+    const a = std.testing.allocator;
+    var current = try external_metadata.testing.fixtureAlloc(a, 16384);
+    defer current.deinit(a);
+    for (current.artifacts) |*ref| {
+        if (ref.kind == .graph_metric_segment) ref.materializer_fingerprint = graph_metric_policy.materializerFingerprint(.{});
+    }
+    const Helpers = struct {
+        fn plan(alloc: Allocator, manifest: manifest_mod.Manifest, indexes: []const u8) !publication_plan.TablePublicationPlan {
+            var out = publication_plan.TablePublicationPlan{ .targets = .{ .published_search_sources = .{} } };
+            errdefer out.deinit(alloc);
+            out.policy = manifest.stats.policy;
+            out.table_definition = try publication_plan.tableDefinitionSnapshotAlloc(alloc, manifest.stats.schema_json, manifest.stats.read_schema_json, indexes);
+            out.full_text_index_actions = try planFullTextIndexActionsAlloc(alloc, manifest.stats.schema_json, manifest.stats.schema_json, manifest.stats.indexes_json, indexes);
+            out.vector_index_actions = try planNamedIndexActionsAlloc(alloc, manifest.stats.indexes_json, indexes, .vector, countManifestArtifactsOfKind(manifest, .vector_segment));
+            out.graph_index_actions = try planNamedIndexActionsAlloc(alloc, manifest.stats.indexes_json, indexes, .graph, countManifestArtifactsOfKind(manifest, .graph_segment));
+            try applyExternalReadinessAlloc(alloc, &out, manifest);
+            return out;
+        }
+    };
+    var ready = try Helpers.plan(a, current, current.stats.indexes_json);
+    defer ready.deinit(a);
+    try std.testing.expect(!hasPendingMaterialization(ready, current));
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, ready.full_text_index_actions[0].action);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, ready.vector_index_actions[0].action);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, ready.graph_index_actions[0].action);
+    try std.testing.expectEqual(@as(usize, 0), ready.external_materialization.?.graph_metrics_pending);
+    ready.policy.chunk_preview_enabled = true;
+    ready.policy.chunk_embeddings_enabled = true;
+    ready.policy.rerank_terms_enabled = true;
+    ready.derived_output_actions = .{ .chunk_preview = .recompute, .chunk_embeddings = .recompute, .rerank_terms = .recompute };
+    try applyExternalReadinessAlloc(a, &ready, current);
+    try std.testing.expect(!hasPendingMaterialization(ready, current));
+    try std.testing.expect(!ready.derived_output_actions.any());
+
+    // Metadata can be current while individual physical indexes are missing.
+    // Another graph projection must not satisfy the newly configured graph.
+    const changed = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"other\"},\"vec\":{\"type\":\"embeddings\",\"field\":\"other_vector\",\"dimension\":3},\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\"},\"g2\":{\"type\":\"graph\",\"field\":\"other_edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}";
+    var changing = try Helpers.plan(a, current, changed);
+    defer changing.deinit(a);
+    var metadata_only = try external_metadata.reconcileAlloc(a, current, changing);
+    defer metadata_only.deinit(a);
+    var missing = try Helpers.plan(a, metadata_only, changed);
+    defer missing.deinit(a);
+    try std.testing.expect(hasPendingMaterialization(missing, metadata_only));
+    try std.testing.expectEqual(publication_plan.ArtifactAction.rebuild, missing.full_text_index_actions[0].action);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.rebuild, missing.vector_index_actions[0].action);
+    for (missing.graph_index_actions) |entry| {
+        try std.testing.expectEqual(if (std.mem.eql(u8, entry.name, "graph_idx")) publication_plan.ArtifactAction.reuse else .rebuild, entry.action);
+    }
+    try std.testing.expectEqual(publication_plan.ArtifactAction.rebuild, missing.artifact_actions.graph);
+    try std.testing.expectEqual(@as(usize, 1), missing.external_materialization.?.graph_metrics_pending);
+
+    var dropping = try Helpers.plan(a, current, "{}");
+    defer dropping.deinit(a);
+    try std.testing.expect(hasPendingMaterialization(dropping, current));
+    var empty = try external_metadata.reconcileAlloc(a, current, dropping);
+    defer empty.deinit(a);
+    var converged = try Helpers.plan(a, empty, "{}");
+    defer converged.deinit(a);
+    try std.testing.expect(!hasPendingMaterialization(converged, empty));
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, converged.artifact_actions.graph);
+
+    const AllocationExercise = struct {
+        fn run(alloc: Allocator, manifest: manifest_mod.Manifest, indexes: []const u8) !void {
+            var plan = try Helpers.plan(alloc, manifest, indexes);
+            defer plan.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, current.stats.indexes_json });
+    try std.testing.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, "{}" });
+}
+
+test "serverless materialization readiness distinguishes absent drops from real work" {
+    var plan = publication_plan.TablePublicationPlan{
+        .targets = .{ .published_search_sources = .{} },
+        .artifact_actions = .{ .document_segment = .reuse, .full_text = .reuse, .dense_vector = .drop, .sparse_vector = .drop, .graph = .drop },
+        .derived_output_actions = .{ .chunk_preview = .drop, .chunk_embeddings = .drop, .rerank_terms = .drop },
+    };
+    try std.testing.expect(!hasPendingMaterialization(plan, null));
+    var current = try external_metadata.testing.fixtureAlloc(std.testing.allocator, 1);
+    defer current.deinit(std.testing.allocator);
+    try std.testing.expect(hasPendingMaterialization(plan, current));
+    plan.artifact_actions.dense_vector = .reuse;
+    plan.artifact_actions.graph = .reuse;
+    try std.testing.expect(!hasPendingMaterialization(plan, current));
+    plan.derived_output_actions.chunk_preview = .recompute;
+    try std.testing.expect(hasPendingMaterialization(plan, current));
 }
 
 test "serverless catalog status stays local and write admission rejects read-only external tables" {
     const alloc = std.testing.allocator;
+    const NoArtifactAccess = struct {
+        calls: usize = 0,
+        fn denied(ptr: *anyopaque) error{UnexpectedArtifactAccess} {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedArtifactAccess;
+        }
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn put(ptr: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.store.ArtifactMetadata {
+            return denied(ptr);
+        }
+        fn putScoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.store.ArtifactMetadata {
+            return denied(ptr);
+        }
+        fn get(ptr: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return denied(ptr);
+        }
+        fn range(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
+            return denied(ptr);
+        }
+        fn stat(ptr: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.store.ArtifactMetadata {
+            return denied(ptr);
+        }
+        fn delete(ptr: *anyopaque, _: []const u8) !void {
+            return denied(ptr);
+        }
+        fn store(self: *@This(), a: Allocator) artifacts_mod.ArtifactStore {
+            return .{ .allocator = a, .ptr = self, .vtable = &.{ .deinit = deinit, .put = put, .put_scoped = putScoped, .get_alloc = get, .get_range_alloc = range, .stat = stat, .delete = delete } };
+        }
+    };
     const current_schema =
         \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","snapshot":"current","schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
+    const pinned_schema = try std.mem.replaceOwned(u8, alloc, current_schema, "\"snapshot\":\"current\"", "\"snapshot\":{\"mode\":\"object_version_digest\",\"digest\":\"discovered-snapshot\"}");
+    defer alloc.free(pinned_schema);
+    const iceberg_current = try std.mem.replaceOwned(u8, alloc, current_schema, "\"format\":\"parquet\"", "\"format\":\"iceberg\"");
+    defer alloc.free(iceberg_current);
+    const iceberg_pinned = try std.mem.replaceOwned(u8, alloc, iceberg_current, "\"snapshot\":\"current\"", "\"snapshot\":{\"mode\":\"snapshot_id\",\"id\":\"31\"}");
+    defer alloc.free(iceberg_pinned);
 
     var artifact_root_buf: [256]u8 = undefined;
     var manifest_root_buf: [256]u8 = undefined;
@@ -4965,12 +5620,192 @@ test "serverless catalog status stays local and write admission rejects read-onl
     defer catalog.deinit();
     try std.testing.expect(try catalog.ensureTableWithDefinition("events", 1, .{}, current_schema, "", "{}"));
 
+    var initial_targets = try catalog.publicationPlanForNamespaceAlloc("events", .{}, .status, null);
+    defer initial_targets.deinit(alloc);
+    try std.testing.expect(initial_targets.targets.published_search_sources.findText() == null);
+    try std.testing.expect(!initial_targets.targets.include_graph);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, initial_targets.artifact_actions.full_text);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, initial_targets.artifact_actions.document_segment);
+    try std.testing.expect(!initial_targets.external_materialization.?.pending);
+
     var status = try catalog.tableBuildStatus("events");
     defer status.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 0), status.latest_wal_lsn);
     try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureTableWritesAllowed("events"));
     try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureNamespaceWritesAllowed("events"));
     try std.testing.expectError(error.ExternalSourcePlanResolverUnavailable, catalog.buildTable("events"));
+
+    // A selector is not a resolved inventory. Neither current nor explicit
+    // pins may create a partial external HEAD without the resolver capability.
+    {
+        const actual_artifacts = artifact_store;
+        defer artifact_store = actual_artifacts;
+        var denied: NoArtifactAccess = .{};
+        artifact_store = denied.store(alloc);
+        for ([_][]const u8{ current_schema, pinned_schema, iceberg_current, iceberg_pinned }) |schema| {
+            _ = try catalog.setTableDefinition("events", schema, "", "{}");
+            var local_status = try catalog.tableBuildStatus("events");
+            defer local_status.deinit(alloc);
+            try std.testing.expectError(error.ExternalSourcePlanResolverUnavailable, catalog.buildTable("events"));
+            const versions = try manifest_store.listVersionsAlloc("events");
+            defer alloc.free(versions);
+            try std.testing.expectEqual(@as(usize, 0), versions.len);
+            try std.testing.expectError(error.FileNotFound, progress_store.getHead("events"));
+        }
+        try std.testing.expectEqual(@as(usize, 0), denied.calls);
+    }
+    _ = try catalog.setTableDefinition("events", current_schema, "", "{}");
+
+    const ScopedResolver = struct {
+        progress: *progress_store_mod.ProgressStore,
+        shared_artifacts: *artifacts_mod.ArtifactStore,
+        io: std.Io,
+        fn resolve(ptr: *anyopaque, a: Allocator, request: publication_plan.ExternalSourcePlanResolveRequest) !external_source_manifest.Plan {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.shared_artifacts.upload_scope == null);
+            const scope = request.artifacts.upload_scope orelse return error.ExternalInventoryPublicationScopeRequired;
+            try std.testing.expectEqual(graph_page_store.PageStore.namespaceDomain(request.namespace), scope.domain);
+            var contender = try work_lease.acquireHeld(try self.progress.workLeaseProvider(), self.io, request.namespace, "discovery-contender", 30 * std.time.ns_per_s);
+            defer if (contender) |*held| {
+                _ = held.release() catch false;
+            };
+            if (contender != null) return error.ExternalInventoryResolvedWithoutLease;
+            try request.cancellation.check();
+            const published = try @import("../build/external_source_publish.zig").publishInventoryAlloc(a, request.artifacts, request.binding, .{
+                .format = .parquet,
+                .source_id = @constCast(request.binding.table_id),
+                .source_uri = @constCast(request.binding.source_uri),
+                .snapshot_id = @constCast("discovered-snapshot"),
+                .schema_fingerprint = @constCast(request.binding.schema_fingerprint),
+                .files = &.{},
+            }, .{ .artifact_name = "events.external-files", .previous_artifacts = request.previous_artifacts, .cancellation = request.cancellation });
+            errdefer {
+                var owned = published;
+                owned.deinit(a);
+            }
+            for (request.previous_artifacts) |prior| {
+                if (prior.kind == .external_base_source) try std.testing.expectEqualStrings(prior.artifact_id, published.plan.artifacts[0].artifact_id);
+            }
+            return published.plan;
+        }
+    };
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    builder.setIo(io_impl.io());
+    var resolver = ScopedResolver{ .progress = &progress_store, .shared_artifacts = &artifact_store, .io = io_impl.io() };
+    catalog.setExternalSourcePlanResolver(.{ .ptr = &resolver, .vtable = &.{ .resolve = ScopedResolver.resolve } });
+    var published = try catalog.buildTable("events");
+    defer published.deinit(alloc);
+    try std.testing.expect(published.published);
+    var head = try manifest_store.getAlloc("events", published.version);
+    defer head.deinit(alloc);
+    const inventory = head.artifacts[findManifestArtifactIndex(head, .external_base_source).?];
+    const scope = (try artifacts_mod.store.uploadScopeFromArtifactId(inventory.artifact_id)).?;
+    try std.testing.expectEqual(head.publication_fencing_token, scope.fencingToken());
+    var unchanged = try catalog.buildTable("events");
+    defer unchanged.deinit(alloc);
+    if (unchanged.published) return error.UnexpectedExternalRepublish;
+    // Metadata changes still publish, but must not manufacture an empty local
+    // document/facts snapshot or lose the authenticated remote inventory.
+    try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", "{}"));
+    var metadata = try catalog.buildTable("events");
+    defer metadata.deinit(alloc);
+    try std.testing.expect(metadata.published);
+    var metadata_head = try manifest_store.getAlloc("events", metadata.version);
+    defer metadata_head.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), metadata_head.artifacts.len);
+    try std.testing.expectEqual(manifest_mod.ArtifactKind.external_base_source, metadata_head.artifacts[0].kind);
+    try std.testing.expectEqualStrings(inventory.artifact_id, metadata_head.artifacts[0].artifact_id);
+    try std.testing.expectEqualStrings("{}", metadata_head.stats.read_schema_json);
+    var metadata_unchanged = try catalog.buildTable("events");
+    defer metadata_unchanged.deinit(alloc);
+    try std.testing.expect(!metadata_unchanged.published);
+    var converged_status = try catalog.tableBuildStatus("events");
+    defer converged_status.deinit(alloc);
+    try std.testing.expect(!converged_status.head_republish_recommended);
+    try std.testing.expect(!converged_status.pending_materialization_rebuild);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, converged_status.artifact_actions.document_segment);
+
+    const graph_indexes = "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}";
+    // Selector intent must publish even without a text index to incidentally
+    // trigger schema migration. It then converges without inventory churn.
+    for ([_][]const u8{ "{}", graph_indexes }) |indexes| {
+        try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", indexes));
+        var initial_selection = try catalog.buildTable("events");
+        defer initial_selection.deinit(alloc);
+        for ([_][]const u8{ pinned_schema, current_schema }) |schema| {
+            try std.testing.expect(try catalog.setTableDefinition("events", schema, "{}", indexes));
+            var selection_plan = try catalog.publicationPlanForNamespaceAlloc("events", .{}, .status, null);
+            defer selection_plan.deinit(alloc);
+            try std.testing.expect(selection_plan.metadata_republish.external_schema_changed);
+            try std.testing.expect(selection_plan.forceRepublishFromHead());
+            var selection = try catalog.buildTable("events");
+            defer selection.deinit(alloc);
+            try std.testing.expect(selection.published);
+            var selected_head = try manifest_store.getAlloc("events", selection.version);
+            defer selected_head.deinit(alloc);
+            try std.testing.expectEqualStrings(schema, selected_head.stats.schema_json);
+            try std.testing.expectEqualStrings(inventory.artifact_id, selected_head.artifacts[findManifestArtifactIndex(selected_head, .external_base_source).?].artifact_id);
+            var selection_unchanged = try catalog.buildTable("events");
+            defer selection_unchanged.deinit(alloc);
+            try std.testing.expect(!selection_unchanged.published);
+        }
+    }
+    try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", "{}"));
+    var reset_indexes = try catalog.buildTable("events");
+    defer reset_indexes.deinit(alloc);
+    try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", graph_indexes));
+    var configured = try catalog.buildTable("events");
+    defer configured.deinit(alloc);
+    try std.testing.expect(configured.published);
+    var configured_unchanged = try catalog.buildTable("events");
+    defer configured_unchanged.deinit(alloc);
+    try std.testing.expect(!configured_unchanged.published);
+    var configured_status = try catalog.tableBuildStatus("events");
+    defer configured_status.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), configured_status.graph_metrics_configured);
+    try std.testing.expectEqual(@as(usize, 1), configured_status.graph_metrics_pending);
+    // Target planning must use the same explicit-index contract as lake
+    // reconciliation, independent of JSON whitespace or unrelated indexes.
+    for ([_]struct { json: []const u8, graph: bool }{
+        .{ .json = "{}", .graph = false },
+        .{ .json = "{ }", .graph = false },
+        .{ .json = graph_indexes, .graph = true },
+    }) |case| {
+        try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", case.json));
+        var target_plan = try catalog.publicationPlanForNamespaceAlloc("events", .{}, .status, null);
+        defer target_plan.deinit(alloc);
+        try std.testing.expect(target_plan.targets.published_search_sources.findText() == null);
+        try std.testing.expectEqual(case.graph, target_plan.targets.include_graph);
+        try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, target_plan.artifact_actions.full_text);
+        try std.testing.expectEqual(case.graph, target_plan.external_materialization.?.pending);
+    }
+
+    // The same capability requirement holds for metadata republishing an
+    // existing external HEAD. In particular, never turn its absent WAL into
+    // an empty managed document snapshot or drop its authenticated inventory.
+    {
+        const actual_artifacts = artifact_store;
+        defer artifact_store = actual_artifacts;
+        var denied: NoArtifactAccess = .{};
+        artifact_store = denied.store(alloc);
+        catalog.external_source_plan_resolver = null;
+        const before_head = try progress_store.getHead("events");
+        const before_versions = try manifest_store.listVersionsAlloc("events");
+        defer alloc.free(before_versions);
+        for ([_][]const u8{ current_schema, pinned_schema, iceberg_current, iceberg_pinned }) |schema| {
+            _ = try catalog.setTableDefinition("events", schema, "", "{}");
+            var local_status = try catalog.tableBuildStatus("events");
+            defer local_status.deinit(alloc);
+            try std.testing.expect(local_status.head_republish_recommended);
+            try std.testing.expectError(error.ExternalSourcePlanResolverUnavailable, catalog.buildTable("events"));
+            try std.testing.expectEqual(before_head, try progress_store.getHead("events"));
+            const after_versions = try manifest_store.listVersionsAlloc("events");
+            defer alloc.free(after_versions);
+            try std.testing.expectEqualSlices(u64, before_versions, after_versions);
+        }
+        try std.testing.expectEqual(@as(usize, 0), denied.calls);
+    }
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

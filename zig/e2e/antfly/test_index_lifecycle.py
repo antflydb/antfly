@@ -1146,6 +1146,12 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
             or latest_status.get("replay_catch_up_required") is not False
             or latest_status.get("catch_up_active") is not False
             or latest_status.get("catch_up_phase") != "idle"
+            # Replay can settle just before the native exact-vector
+            # generation publishes. That short finalization window is real
+            # readiness work and correctly keeps backfill_active true; wait
+            # for the complete public lifecycle edge instead of asserting on
+            # the first replay-only snapshot.
+            or latest_status.get("backfill_active") is not False
             or source_coverage.get("observation_complete") is not True
         ):
             return None
@@ -2099,14 +2105,34 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     )
     assert recovered is not None
 
-    recovered_query = stateful_api.query_table(
-        table_name,
-        {
-            "semantic_search": "alpha concept",
-            "indexes": [index_name],
-            "limit": 2,
-        },
+    def query_recovered_index():
+        try:
+            return stateful_api.query_table(
+                table_name,
+                {
+                    "semantic_search": "alpha concept",
+                    "indexes": [index_name],
+                    "limit": 2,
+                },
+            )
+        except requests.HTTPError as exc:
+            response = exc.response
+            if response is None or response.status_code != 503:
+                raise
+            try:
+                unavailable = response.json()
+            except ValueError:
+                unavailable = {}
+            if unavailable.get("code") != "index_rebuilding":
+                raise
+            return None
+
+    recovered_query = wait_until(
+        query_recovered_index,
+        timeout_s=30.0,
+        interval_s=0.5,
     )
+    assert recovered_query is not None
     assert _response_hit_ids(recovered_query)[0] == "doc:a"
 
 

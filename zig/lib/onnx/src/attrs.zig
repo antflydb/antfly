@@ -18,7 +18,7 @@
 // in onnx-gomlx's GetIntAttrOr / GetFloatAttrOr / etc.
 
 const std = @import("std");
-const proto = @import("proto.zig");
+const proto = @import("onnx_data").proto;
 
 const AttributeProto = proto.AttributeProto;
 const TensorProto = proto.TensorProto;

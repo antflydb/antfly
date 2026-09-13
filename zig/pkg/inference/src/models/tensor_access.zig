@@ -22,7 +22,7 @@ const weight_source_mod = @import("weight_source.zig");
 const manifest_mod = @import("manifest.zig");
 const tensor_store_mod = @import("tensor_store.zig");
 const c_file = @import("../util/c_file.zig");
-const onnx_graph = @import("onnx_graph");
+const onnx_data = @import("onnx_data");
 
 pub const Encoding = union(enum) {
     dense: DType,
@@ -285,10 +285,10 @@ pub const OnnxInitializerAccess = struct {
         base_dir: []const u8,
         prefix: []const u8,
         bytes: []u8,
-        model: onnx_graph.Model,
+        model: onnx_data.ModelProto,
 
         fn deinit(self: *OnnxFile, allocator: std.mem.Allocator) void {
-            self.model.deinit();
+            self.model.deinit(allocator);
             allocator.free(self.bytes);
             allocator.free(self.prefix);
             allocator.free(self.base_dir);
@@ -352,10 +352,10 @@ pub const OnnxInitializerAccess = struct {
             errdefer allocator.free(prefix);
             const bytes = try c_file.readFileMax(allocator, spec.path, std.math.maxInt(usize));
             errdefer allocator.free(bytes);
-            const model = try onnx_graph.parseWithBaseDir(allocator, bytes, base_dir);
+            const model = try onnx_data.proto.parseModelProto(allocator, bytes);
             errdefer {
                 var owned = model;
-                owned.deinit();
+                owned.deinit(allocator);
             }
 
             self.files[file_index] = .{
@@ -367,7 +367,7 @@ pub const OnnxInitializerAccess = struct {
             };
             initialized_files += 1;
 
-            const graph = self.files[file_index].model.onnx.graph orelse continue;
+            const graph = self.files[file_index].model.graph orelse continue;
             for (graph.initializers, 0..) |initializer, initializer_index| {
                 const local_name = try inferInitializerExportName(allocator, &graph, initializer.name) orelse try allocator.dupe(u8, initializer.name);
                 defer allocator.free(local_name);
@@ -395,9 +395,9 @@ pub const OnnxInitializerAccess = struct {
     fn getRecordImpl(self: *OnnxInitializerAccess, allocator: std.mem.Allocator, name: []const u8) !Record {
         const entry = self.findEntry(name) orelse return error.TensorNotFound;
         const file = &self.files[entry.file_index];
-        const graph = file.model.onnx.graph orelse return error.TensorNotFound;
+        const graph = file.model.graph orelse return error.TensorNotFound;
         const initializer = &graph.initializers[entry.initializer_index];
-        const raw = try onnx_graph.tensor.extractNativeBytesWithExternal(allocator, initializer, file.model.base_dir);
+        const raw = try onnx_data.tensor.extractNativeBytesWithExternal(allocator, initializer, file.base_dir);
         errdefer allocator.free(raw);
         const shape = try allocator.dupe(i64, initializer.dims);
         errdefer allocator.free(shape);
@@ -445,7 +445,7 @@ pub fn isOnnxInitializerAccess(access: TensorAccess) bool {
 
 fn inferInitializerExportName(
     allocator: std.mem.Allocator,
-    graph: *const onnx_graph.proto.GraphProto,
+    graph: *const onnx_data.proto.GraphProto,
     initializer_name: []const u8,
 ) !?[]const u8 {
     if (try inferPyTorchParameterExportName(allocator, initializer_name)) |name| return name;
@@ -489,7 +489,7 @@ fn inferPyTorchParameterExportName(
 
 fn inferDownsampleReductionExportName(
     allocator: std.mem.Allocator,
-    graph: *const onnx_graph.proto.GraphProto,
+    graph: *const onnx_data.proto.GraphProto,
     initializer_name: []const u8,
 ) !?[]const u8 {
     const matmul_output = findMatMulOutputForInitializer(graph, initializer_name) orelse return null;
@@ -500,7 +500,7 @@ fn inferDownsampleReductionExportName(
 
 fn inferGlinerCountEmbedExportName(
     allocator: std.mem.Allocator,
-    graph: *const onnx_graph.proto.GraphProto,
+    graph: *const onnx_data.proto.GraphProto,
     initializer_name: []const u8,
 ) !?[]const u8 {
     for (graph.nodes) |node| {
@@ -528,7 +528,7 @@ fn inferGlinerCountEmbedExportName(
     return null;
 }
 
-fn expandOutputFeedsGlinerCountGru(graph: *const onnx_graph.proto.GraphProto, expand_output: []const u8) bool {
+fn expandOutputFeedsGlinerCountGru(graph: *const onnx_data.proto.GraphProto, expand_output: []const u8) bool {
     for (graph.nodes) |node| {
         if (!std.mem.eql(u8, node.op_type, "GRU")) continue;
         if (!nodeReferencesFragment(node, "count_embed")) continue;
@@ -537,7 +537,7 @@ fn expandOutputFeedsGlinerCountGru(graph: *const onnx_graph.proto.GraphProto, ex
     return false;
 }
 
-fn nodeReferencesFragment(node: onnx_graph.proto.NodeProto, fragment: []const u8) bool {
+fn nodeReferencesFragment(node: onnx_data.proto.NodeProto, fragment: []const u8) bool {
     for (node.inputs) |input| {
         if (std.mem.indexOf(u8, input, fragment) != null) return true;
     }
@@ -547,7 +547,7 @@ fn nodeReferencesFragment(node: onnx_graph.proto.NodeProto, fragment: []const u8
     return false;
 }
 
-fn findLayerNormBeforeStageForInput(graph: *const onnx_graph.proto.GraphProto, input_name: []const u8) ?usize {
+fn findLayerNormBeforeStageForInput(graph: *const onnx_data.proto.GraphProto, input_name: []const u8) ?usize {
     for (graph.nodes) |node| {
         if (!std.mem.eql(u8, node.op_type, "LayerNormalization")) continue;
         if (node.inputs.len < 2) continue;
@@ -582,11 +582,11 @@ test "infers no-bias CLAP downsample reduction MatMul names" {
         "audio_encoder.layers.1.blocks.0.layernorm_before.bias",
     };
     var norm_outputs = [_][]const u8{"layer_norm_6"};
-    var nodes = [_]onnx_graph.proto.NodeProto{
+    var nodes = [_]onnx_data.proto.NodeProto{
         .{ .inputs = &matmul_inputs, .outputs = &matmul_outputs, .op_type = "MatMul" },
         .{ .inputs = &norm_inputs, .outputs = &norm_outputs, .op_type = "LayerNormalization" },
     };
-    const graph = onnx_graph.proto.GraphProto{ .nodes = &nodes };
+    const graph = onnx_data.proto.GraphProto{ .nodes = &nodes };
     const name = try inferDownsampleReductionExportName(allocator, &graph, "val_984") orelse return error.TestUnexpectedResult;
     defer allocator.free(name);
     try std.testing.expectEqualStrings("audio_encoder.layers.0.downsample.reduction.weight", name);
@@ -598,11 +598,11 @@ test "infers ONNX MatMul names with underscore bias" {
     var matmul_outputs = [_][]const u8{"matmul_out"};
     var add_inputs = [_][]const u8{ "matmul_out", "count_embed.transformer.transformer.layers.0.self_attn.in_proj_bias" };
     var add_outputs = [_][]const u8{"add_out"};
-    var nodes = [_]onnx_graph.proto.NodeProto{
+    var nodes = [_]onnx_data.proto.NodeProto{
         .{ .inputs = &matmul_inputs, .outputs = &matmul_outputs, .op_type = "MatMul" },
         .{ .inputs = &add_inputs, .outputs = &add_outputs, .op_type = "Add" },
     };
-    const graph = onnx_graph.proto.GraphProto{ .nodes = &nodes };
+    const graph = onnx_data.proto.GraphProto{ .nodes = &nodes };
     const name = try inferInitializerExportName(allocator, &graph, "onnx::MatMul_1") orelse return error.TestUnexpectedResult;
     defer allocator.free(name);
     try std.testing.expectEqualStrings("count_embed.transformer.transformer.layers.0.self_attn.in_proj_weight", name);
@@ -614,11 +614,11 @@ test "infers GLiNER count embedding ONNX helper names" {
     var expand_outputs = [_][]const u8{"/count_embed/Expand_output_0"};
     var gru_inputs = [_][]const u8{ "/count_embed/Expand_output_0", "onnx::GRU_W", "onnx::GRU_R", "onnx::GRU_B", "", "h0" };
     var gru_outputs = [_][]const u8{"/count_embed/gru/GRU_output_0"};
-    var nodes = [_]onnx_graph.proto.NodeProto{
+    var nodes = [_]onnx_data.proto.NodeProto{
         .{ .inputs = &expand_inputs, .outputs = &expand_outputs, .op_type = "Expand" },
         .{ .inputs = &gru_inputs, .outputs = &gru_outputs, .op_type = "GRU" },
     };
-    const graph = onnx_graph.proto.GraphProto{ .nodes = &nodes };
+    const graph = onnx_data.proto.GraphProto{ .nodes = &nodes };
 
     const pos_name = try inferInitializerExportName(allocator, &graph, "onnx::Expand_1") orelse return error.TestUnexpectedResult;
     defer allocator.free(pos_name);
@@ -637,7 +637,7 @@ test "infers GLiNER count embedding ONNX helper names" {
     try std.testing.expectEqualStrings("count_embed.gru.bias", b_name);
 }
 
-fn findMatMulOutputForInitializer(graph: *const onnx_graph.proto.GraphProto, initializer_name: []const u8) ?[]const u8 {
+fn findMatMulOutputForInitializer(graph: *const onnx_data.proto.GraphProto, initializer_name: []const u8) ?[]const u8 {
     for (graph.nodes) |node| {
         if (!std.mem.eql(u8, node.op_type, "MatMul")) continue;
         if (node.outputs.len == 0) continue;
@@ -648,7 +648,7 @@ fn findMatMulOutputForInitializer(graph: *const onnx_graph.proto.GraphProto, ini
     return null;
 }
 
-fn findAddBiasForMatMulOutput(graph: *const onnx_graph.proto.GraphProto, matmul_output: []const u8) ?[]const u8 {
+fn findAddBiasForMatMulOutput(graph: *const onnx_data.proto.GraphProto, matmul_output: []const u8) ?[]const u8 {
     for (graph.nodes) |node| {
         if (!std.mem.eql(u8, node.op_type, "Add")) continue;
         if (node.inputs.len < 2) continue;
@@ -722,7 +722,7 @@ fn defaultOnnxPrefix(path: []const u8) []const u8 {
     return "";
 }
 
-fn onnxDType(dtype: onnx_graph.DataType) !DType {
+fn onnxDType(dtype: onnx_data.DataType) !DType {
     return switch (dtype) {
         .float32 => .f32,
         .float16 => .f16,
@@ -833,12 +833,12 @@ test "onnx initializer access reads prefixed dense bytes" {
     var dims = [_]i64{ 2, 2 };
     const values = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const raw = std.mem.sliceAsBytes(&values);
-    var initializers = [_]onnx_graph.TensorProto{
+    var initializers = [_]onnx_data.TensorProto{
         .{ .name = "embeddings.weight", .dims = &dims, .data_type = .float32, .raw_data = raw },
     };
-    const graph_proto = onnx_graph.GraphProto{ .initializers = &initializers };
-    const model_proto = onnx_graph.ModelProto{ .graph = graph_proto };
-    const model_bytes = try onnx_graph.serializeModel(allocator, &model_proto);
+    const graph_proto = onnx_data.GraphProto{ .initializers = &initializers };
+    const model_proto = onnx_data.ModelProto{ .graph = graph_proto };
+    const model_bytes = try onnx_data.serializeModel(allocator, &model_proto);
     defer allocator.free(model_bytes);
 
     const onnx_path = try std.fs.path.join(allocator, &.{ dir_path, "text_model.onnx" });

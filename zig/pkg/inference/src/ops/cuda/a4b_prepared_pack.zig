@@ -472,6 +472,7 @@ pub fn verify(
 /// most `requested_workers` independent read streams run concurrently across
 /// all shards; this operation intentionally retains no userspace copies.
 pub fn prefetchInstalled(
+    io: std.Io,
     allocator: std.mem.Allocator,
     model_path: []const u8,
     source_artifact_path: []const u8,
@@ -512,6 +513,7 @@ pub fn prefetchInstalled(
     const workers: usize = @min(@as(usize, requested), owned_paths.len);
     var next_path: std.atomic.Value(usize) = .init(0);
     const State = struct {
+        io: std.Io,
         allocator: std.mem.Allocator,
         paths: []const []u8,
         next_path: *std.atomic.Value(usize),
@@ -522,7 +524,7 @@ pub fn prefetchInstalled(
             while (true) {
                 const index = self.next_path.fetchAdd(1, .monotonic);
                 if (index >= self.paths.len) return;
-                const result = c_file.prefetchFile(self.allocator, self.paths[index], 1) catch |err| {
+                const result = c_file.prefetchFile(self.io, self.allocator, self.paths[index], 1) catch |err| {
                     self.failure = err;
                     return;
                 };
@@ -535,17 +537,13 @@ pub fn prefetchInstalled(
     };
     const states = try allocator.alloc(State, workers);
     defer allocator.free(states);
-    const threads = try allocator.alloc(std.Thread, workers);
-    defer allocator.free(threads);
-    var spawned: usize = 0;
-    defer for (threads[0..spawned]) |thread| thread.join();
-    for (states, 0..) |*state, index| {
-        state.* = .{ .allocator = allocator, .paths = owned_paths, .next_path = &next_path };
-        threads[index] = try std.Thread.spawn(.{}, State.run, .{state});
-        spawned += 1;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (states) |*state| {
+        state.* = .{ .io = io, .allocator = allocator, .paths = owned_paths, .next_path = &next_path };
+        group.async(io, State.run, .{state});
     }
-    for (threads[0..spawned]) |thread| thread.join();
-    spawned = 0;
+    try group.await(io);
     var bytes: u64 = 0;
     for (states) |state| {
         if (state.failure) |err| return err;
@@ -604,9 +602,14 @@ test "prepared pack validates source identity geometry bounds and shards" {
     try std.testing.expectError(error.A4bPreparedPackGeometryMismatch, load(allocator, root, source_path, wrong));
     const verified = try verify(allocator, root, source_path, geometry);
     try std.testing.expectEqual(@as(usize, 2), verified.shard_count);
-    const prefetched = (try prefetchInstalled(allocator, root, source_path, 4)).?;
-    try std.testing.expectEqual(@as(usize, 2), prefetched.shard_count);
-    try std.testing.expectEqual(@as(u64, a.len + b.len), prefetched.bytes);
+    var inline_io = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer inline_io.deinit();
+    for ([_]std.Io{ std.testing.io, inline_io.io() }) |io| {
+        const prefetched = (try prefetchInstalled(io, allocator, root, source_path, 4)).?;
+        try std.testing.expectEqual(@as(usize, 2), prefetched.shard_count);
+        try std.testing.expectEqual(@as(u64, a.len + b.len), prefetched.bytes);
+        try std.testing.expectEqual(@as(u8, 2), prefetched.workers);
+    }
 }
 
 test "prepared pack digest helper is stable" {

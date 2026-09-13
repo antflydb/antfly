@@ -40,18 +40,14 @@ const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 
 // Qualification evidence is valid only for the exact generated candidate,
 // handwritten baseline, and backend-specific qualification implementation.
-// The build graph hashes the checked-in source files once; runtime keys carry
-// those identities without embedding or repeatedly hashing multi-megabyte
-// sources during model load.
-const unavailable_source_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
-const metal_jit_baseline_implementation_sha256 = if (@hasDecl(build_options, "metal_jit_baseline_implementation_sha256"))
-    build_options.metal_jit_baseline_implementation_sha256
-else
-    unavailable_source_sha256;
-const metal_jit_qualification_implementation_sha256 = if (@hasDecl(build_options, "metal_jit_qualification_implementation_sha256"))
-    build_options.metal_jit_qualification_implementation_sha256
-else
-    unavailable_source_sha256;
+// A cached host generator hashes the enabled backend's declared inputs.
+// Disabled-backend unit tests cannot produce live qualification evidence.
+const metal_identity = if (build_options.enable_metal) @import("metal_jit_identity") else struct {
+    pub const baseline = "0" ** 64;
+    pub const qualification = "0" ** 64;
+};
+const metal_jit_baseline_implementation_sha256 = metal_identity.baseline;
+const metal_jit_qualification_implementation_sha256 = metal_identity.qualification;
 const metal_jit_max_observed_shapes_per_format = 16;
 const metal_jit_quant_format_count = 12;
 const metal_jit_max_fixture_bytes = 256 * 1024 * 1024;

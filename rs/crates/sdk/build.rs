@@ -13,6 +13,7 @@ fn main() {
     // heterogeneous error response schemas. Preprocess the spec to fix both.
     strip_non_json_media_types(&mut spec);
     unify_error_response_schemas(&mut spec);
+    normalize_mutation_success_transport(&mut spec);
     mark_openapi_code_fences_as_text(&mut spec);
 
     let openapi: openapiv3::OpenAPI =
@@ -27,10 +28,73 @@ fn main() {
     let mut code = prettyplease::unparse(&ast);
     inject_create_index_validation(&mut code);
     inject_create_table_validation(&mut code);
+    inject_mutation_success_decoding(&mut code);
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("client.rs");
     fs::write(&out_path, code).expect("failed to write generated client");
+}
+
+// Keep the public wire contract intact. Progenitor requires homogeneous success
+// types, so generate raw transport branches and replace only their decoders with
+// our status-directed typed decoder (including the bodyless DELETE response).
+fn normalize_mutation_success_transport(spec: &mut serde_yaml::Value) {
+    for methods in spec["paths"].as_mapping_mut().unwrap().values_mut() {
+        for operation in methods.as_mapping_mut().unwrap().values_mut() {
+            let Some(id) = operation.get("operationId").and_then(|id| id.as_str()) else {
+                continue;
+            };
+            if !["createTable", "dropTable", "updateSchema", "patchSchema"].contains(&id) {
+                continue;
+            }
+            for (status, response) in operation["responses"].as_mapping_mut().unwrap() {
+                let status = status.as_str().unwrap_or_default();
+                if !status.starts_with('2') {
+                    continue;
+                }
+                *response = serde_yaml::from_str("description: Mutation success\ncontent:\n  application/octet-stream:\n    schema:\n      type: string\n      format: binary\n").unwrap();
+            }
+        }
+    }
+}
+
+fn inject_mutation_success_decoding(code: &mut String) {
+    for method in [
+        "create_table",
+        "drop_table",
+        "update_schema",
+        "patch_schema",
+    ] {
+        let anchor = format!("    pub async fn {method}<'a>(");
+        let start = code.find(&anchor).expect("mutation method must exist");
+        let end = code[start + anchor.len()..]
+            .find("    pub async fn ")
+            .map(|offset| start + anchor.len() + offset)
+            .unwrap_or(code.len());
+        let original = &code[start..end];
+        assert_eq!(original.matches("ResponseValue<ByteStream>").count(), 1);
+        assert_eq!(
+            original
+                .matches("Ok(ResponseValue::stream(response))")
+                .count(),
+            2
+        );
+        let (typ, empty) = if method == "drop_table" {
+            ("()", "Some(())")
+        } else {
+            ("types::Table", "None")
+        };
+        let rewritten = original
+            .replace(
+                "ResponseValue<ByteStream>",
+                &format!("ResponseValue<crate::MutationOutcome<{typ}>>"),
+            )
+            .replace(
+                "Ok(ResponseValue::stream(response))",
+                &format!("crate::decode_mutation_response(response, {empty}).await"),
+            );
+        code.replace_range(start..end, &rewritten);
+    }
 }
 
 /// Progenitor cannot express Antfly's cross-field OpenAPI extensions. Keep the

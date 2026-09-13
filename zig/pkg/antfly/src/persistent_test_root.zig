@@ -14,4 +14,5 @@
 
 test {
     _ = @import("storage/persistent.zig");
+    _ = @import("storage/persistent_vopr.zig");
 }

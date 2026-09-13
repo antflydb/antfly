@@ -32,6 +32,8 @@ pub const chunker = @import("inference_chunker");
 pub const pipelines = @import("pipelines/pipelines.zig");
 pub const extractors = @import("extractors/mod.zig");
 pub const server = if (build_options.skip_openapi) struct {} else @import("server/server.zig");
+pub const executor_microbatch = @import("server/executor_microbatch.zig");
+pub const tensor_microbatch = @import("server/tensor_microbatch.zig");
 pub const cache = @import("cache/cache.zig");
 pub const singleflight = @import("cache/singleflight.zig");
 pub const registry = @import("registry/registry.zig");
@@ -110,6 +112,8 @@ test {
     _ = @import("pipelines/gemma4_channels.zig");
     _ = extractors;
     _ = server;
+    _ = executor_microbatch;
+    _ = tensor_microbatch;
     _ = cache;
     _ = singleflight;
     _ = registry;
@@ -131,6 +135,7 @@ test {
     _ = architectures.qwen3vl_projector;
     _ = architectures.qwen3vl_reranker;
     _ = @import("architectures/gpt.zig");
+    _ = @import("architectures/florence.zig");
     _ = @import("architectures/gemma4_runtime.zig");
     _ = @import("architectures/gemma4_projector.zig");
     _ = @import("embedding_trace.zig");

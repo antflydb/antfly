@@ -23,161 +23,23 @@ const runtime_backend = @import("../../runtime_backend.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
-const platform_time = @import("antfly_platform").time;
+pub const VisibilityWait = runtime_types.VisibilityWait;
 
-pub const VisibilityWait = struct {
-    cancellation: types.CancellationToken = .none,
-    deadline_ns: ?u64 = null,
-
-    pub fn check(self: @This()) !void {
-        if (self.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
-        if (self.deadline_ns) |deadline_ns| {
-            if (platform_time.monotonicNs() >= deadline_ns) return error.EnrichmentWaitTimeout;
-        }
-    }
-};
-
-const ApplyFnType = *const fn (ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) anyerror!bool;
-const PersistFnType = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) anyerror!bool;
-const TruncateFnType = *const fn (ctx: *anyopaque, sequence: u64) anyerror!void;
-const BeginCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!void;
-const FinishCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) anyerror!void;
-const CanAdvanceToTargetFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
-const AppliedSequenceAdvancedFnType = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
-
-const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
-    pub const RuntimeError = error{AsyncWorkerFailed};
-    pub const ApplyFn = ApplyFnType;
-    pub const PersistFn = PersistFnType;
-    pub const TruncateFn = TruncateFnType;
-    pub const BeginCatchUpFn = BeginCatchUpFnType;
-    pub const FinishCatchUpFn = FinishCatchUpFnType;
-    pub const CanAdvanceToTargetFn = CanAdvanceToTargetFnType;
-    pub const AppliedSequenceAdvancedFn = AppliedSequenceAdvancedFnType;
-
-    pub const DerivedRuntime = struct {
-        pub fn init(
-            alloc: Allocator,
-            replay_source: replay_source_mod.Source,
-            ctx: *anyopaque,
-            apply_fn: ApplyFnType,
-            persist_fn: PersistFnType,
-            truncate_fn: TruncateFnType,
-            begin_catch_up_fn: ?BeginCatchUpFnType,
-            finish_catch_up_fn: ?FinishCatchUpFnType,
-            can_advance_to_target_fn: ?CanAdvanceToTargetFnType,
-            applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFnType,
-            resource_manager: ?*resource_manager_mod.ResourceManager,
-        ) @This() {
-            _ = alloc;
-            _ = replay_source;
-            _ = ctx;
-            _ = apply_fn;
-            _ = persist_fn;
-            _ = truncate_fn;
-            _ = begin_catch_up_fn;
-            _ = finish_catch_up_fn;
-            _ = can_advance_to_target_fn;
-            _ = applied_sequence_advanced_fn;
-            _ = resource_manager;
-            return .{};
-        }
-
-        pub fn deinit(self: *@This()) void {
-            self.* = undefined;
-        }
-
-        pub fn hasWorkers(_: *@This()) bool {
-            return false;
-        }
-
-        pub fn failIfUnhealthy(_: *@This()) !void {}
-
-        pub fn addWorker(self: *@This(), name: []const u8, kind: index_manager_mod.ManagedIndexRef, applied_sequence: u64) !void {
-            _ = self;
-            _ = name;
-            _ = kind;
-            _ = applied_sequence;
-            return error.UnsupportedPlatform;
-        }
-
-        pub fn removeWorker(self: *@This(), name: []const u8) void {
-            _ = self;
-            _ = name;
-        }
-
-        pub fn appliedSequence(self: *@This(), name: []const u8) ?u64 {
-            _ = self;
-            _ = name;
-            return null;
-        }
-
-        pub fn snapshotStats(_: *@This()) types.DerivedWorkerStats {
-            return .{};
-        }
-
-        pub fn notifySequence(self: *@This(), sequence: u64) void {
-            _ = self;
-            _ = sequence;
-        }
-
-        pub fn notifyIndexes(self: *@This(), sequence: u64, index_names: []const []const u8) void {
-            _ = self;
-            _ = sequence;
-            _ = index_names;
-        }
-
-        pub fn notifyExceptKind(self: *@This(), sequence: u64, excluded_kind: types.IndexKind) void {
-            _ = self;
-            _ = sequence;
-            _ = excluded_kind;
-        }
-
-        pub fn forceSequence(self: *@This(), sequence: u64) void {
-            _ = self;
-            _ = sequence;
-        }
-
-        pub fn trackBacklogBytes(self: *@This(), sequence: u64, bytes: u64) !void {
-            _ = self;
-            _ = sequence;
-            _ = bytes;
-        }
-
-        pub fn backlogThrottleTargetSequence(_: *@This()) ?u64 {
-            return null;
-        }
-
-        pub fn releaseBacklogThrough(self: *@This(), sequence: u64) void {
-            _ = self;
-            _ = sequence;
-        }
-
-        pub fn waitForAll(self: *@This(), sequence: u64) !void {
-            _ = self;
-            _ = sequence;
-            return error.UnsupportedPlatform;
-        }
-
-        pub fn waitForIndexes(self: *@This(), sequence: u64, index_names: []const []const u8) !void {
-            _ = self;
-            _ = sequence;
-            _ = index_names;
-            return error.UnsupportedPlatform;
-        }
-    };
-} else @import("async_runtime.zig");
+const runtime_types = @import("runtime_types.zig");
 const derived_worker = @import("derived_worker.zig");
 const io_threaded_runtime_mod = @import("io_threaded_runtime.zig");
 
-pub const ApplyFn = async_runtime_mod.ApplyFn;
-pub const PersistFn = async_runtime_mod.PersistFn;
-pub const TruncateFn = async_runtime_mod.TruncateFn;
-pub const BeginCatchUpFn = async_runtime_mod.BeginCatchUpFn;
-pub const FinishCatchUpFn = async_runtime_mod.FinishCatchUpFn;
-pub const CanAdvanceToTargetFn = async_runtime_mod.CanAdvanceToTargetFn;
-pub const AppliedSequenceAdvancedFn = async_runtime_mod.AppliedSequenceAdvancedFn;
-pub const RuntimeError = async_runtime_mod.RuntimeError;
+pub const ApplyFn = runtime_types.ApplyFn;
+pub const PersistFn = runtime_types.PersistFn;
+pub const TruncateFn = runtime_types.TruncateFn;
+pub const BeginCatchUpFn = runtime_types.BeginCatchUpFn;
+pub const FinishCatchUpFn = runtime_types.FinishCatchUpFn;
+pub const CanAdvanceToTargetFn = runtime_types.CanAdvanceToTargetFn;
+pub const AppliedSequenceAdvancedFn = runtime_types.AppliedSequenceAdvancedFn;
+pub const RuntimeError = runtime_types.RuntimeError;
+pub const CatchUpSessionToken = runtime_types.CatchUpSessionToken;
+pub const CatchUpFinishResult = runtime_types.CatchUpFinishResult;
+pub const BacklogAdmission = backlog_tracker_mod.Tracker.Admission;
 
 pub const Backend = runtime_backend.Backend;
 
@@ -202,6 +64,8 @@ pub const Executor = struct {
         notify_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
         notify_except_kind: *const fn (ptr: *anyopaque, sequence: u64, excluded_kind: types.IndexKind) void,
         force_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
+        admit_backlog_bytes: *const fn (ptr: *anyopaque, bytes: u64) anyerror!BacklogAdmission,
+        commit_backlog_admission: *const fn (ptr: *anyopaque, sequence: u64, admission: *BacklogAdmission) void,
         track_backlog_bytes: *const fn (ptr: *anyopaque, sequence: u64, bytes: u64) anyerror!void,
         backlog_throttle_target_sequence: *const fn (ptr: *anyopaque) ?u64,
         release_backlog_through: *const fn (ptr: *anyopaque, sequence: u64) void,
@@ -263,6 +127,14 @@ pub const Executor = struct {
 
     pub fn trackBacklogBytes(self: *Executor, sequence: u64, bytes: u64) !void {
         return try self.vtable.track_backlog_bytes(self.ptr, sequence, bytes);
+    }
+
+    pub fn admitBacklogBytes(self: *Executor, bytes: u64) !BacklogAdmission {
+        return try self.vtable.admit_backlog_bytes(self.ptr, bytes);
+    }
+
+    pub fn commitBacklogAdmission(self: *Executor, sequence: u64, admission: *BacklogAdmission) void {
+        self.vtable.commit_backlog_admission(self.ptr, sequence, admission);
     }
 
     pub fn backlogThrottleTargetSequence(self: *Executor) ?u64 {
@@ -417,6 +289,14 @@ const ManualRuntime = struct {
         return try self.backlog.track(self.alloc, sequence, bytes);
     }
 
+    fn admitBacklogBytes(self: *ManualRuntime, bytes: u64) !BacklogAdmission {
+        return try self.backlog.admit(self.alloc, bytes);
+    }
+
+    fn commitBacklogAdmission(self: *ManualRuntime, sequence: u64, admission: *BacklogAdmission) void {
+        self.backlog.commitAdmission(sequence, admission);
+    }
+
     fn backlogThrottleTargetSequence(self: *ManualRuntime) ?u64 {
         return self.backlog.throttleTargetSequence();
     }
@@ -432,8 +312,23 @@ const ManualRuntime = struct {
         return true;
     }
 
-    fn catchUpWorker(self: *ManualRuntime, worker: *ManualWorker) !derived_worker.CatchUpStats {
-        return try derived_worker.catchUpIndexWithOptions(
+    const CatchUpResult = struct {
+        stats: derived_worker.CatchUpStats,
+        token: CatchUpSessionToken,
+    };
+
+    fn catchUpWorker(self: *ManualRuntime, worker: *ManualWorker) !CatchUpResult {
+        const token = if (self.begin_catch_up_fn) |begin_catch_up|
+            try begin_catch_up(self.ctx, worker.kind)
+        else
+            CatchUpSessionToken{};
+        var catch_up_open = true;
+        errdefer {
+            if (catch_up_open) if (self.finish_catch_up_fn) |finish_catch_up| {
+                _ = finish_catch_up(self.ctx, worker.kind, token, worker.applied_sequence, false) catch {};
+            };
+        }
+        const stats = try derived_worker.catchUpIndexWithOptions(
             self.alloc,
             self.replay_source,
             worker.kind,
@@ -442,11 +337,10 @@ const ManualRuntime = struct {
             self.apply_fn,
             .{
                 .resource_manager = self.backlog.resource_manager,
-                .catch_up_ctx = self.ctx,
-                .begin_catch_up_fn = self.begin_catch_up_fn,
-                .finish_catch_up_fn = self.finish_catch_up_fn,
             },
         );
+        catch_up_open = false;
+        return .{ .stats = stats, .token = token };
     }
 
     fn waitForAll(self: *ManualRuntime, sequence: u64, wait: VisibilityWait) !void {
@@ -455,7 +349,14 @@ const ManualRuntime = struct {
             if (worker.target_sequence <= worker.applied_sequence) continue;
             try wait.check();
 
-            const stats = try self.catchUpWorker(worker);
+            const result = try self.catchUpWorker(worker);
+            var session_open = true;
+            defer {
+                if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
+                    _ = finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+                };
+            }
+            const stats = result.stats;
             try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
@@ -464,10 +365,17 @@ const ManualRuntime = struct {
                 worker.target_sequence
             else
                 worker.applied_sequence;
+            session_open = false;
+            const finish_result = if (self.finish_catch_up_fn) |finish_catch_up|
+                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true)
+            else
+                CatchUpFinishResult{};
             if (caught_up_sequence > worker.applied_sequence) {
-                while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
-                    try wait.check();
-                    std.atomic.spinLoopHint();
+                if (!finish_result.applied_sequence_persisted) {
+                    while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
+                        try wait.check();
+                        std.atomic.spinLoopHint();
+                    }
                 }
                 worker.applied_sequence = caught_up_sequence;
                 if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
@@ -489,7 +397,14 @@ const ManualRuntime = struct {
             if (worker.target_sequence <= worker.applied_sequence) continue;
             try wait.check();
 
-            const stats = try self.catchUpWorker(worker);
+            const result = try self.catchUpWorker(worker);
+            var session_open = true;
+            defer {
+                if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
+                    _ = finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+                };
+            }
+            const stats = result.stats;
             try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
@@ -498,10 +413,17 @@ const ManualRuntime = struct {
                 worker.target_sequence
             else
                 worker.applied_sequence;
+            session_open = false;
+            const finish_result = if (self.finish_catch_up_fn) |finish_catch_up|
+                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true)
+            else
+                CatchUpFinishResult{};
             if (caught_up_sequence > worker.applied_sequence) {
-                while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
-                    try wait.check();
-                    std.atomic.spinLoopHint();
+                if (!finish_result.applied_sequence_persisted) {
+                    while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
+                        try wait.check();
+                        std.atomic.spinLoopHint();
+                    }
                 }
                 worker.applied_sequence = caught_up_sequence;
                 if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
@@ -579,6 +501,8 @@ const manual_vtable = Executor.VTable{
     .notify_indexes = manualNotifyIndexes,
     .notify_except_kind = manualNotifyExceptKind,
     .force_sequence = manualForceSequence,
+    .admit_backlog_bytes = manualAdmitBacklogBytes,
+    .commit_backlog_admission = manualCommitBacklogAdmission,
     .track_backlog_bytes = manualTrackBacklogBytes,
     .backlog_throttle_target_sequence = manualBacklogThrottleTargetSequence,
     .release_backlog_through = manualReleaseBacklogThrough,
@@ -649,6 +573,16 @@ fn manualTrackBacklogBytes(ptr: *anyopaque, sequence: u64, bytes: u64) !void {
     return try runtime.trackBacklogBytes(sequence, bytes);
 }
 
+fn manualAdmitBacklogBytes(ptr: *anyopaque, bytes: u64) !BacklogAdmission {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    return try runtime.admitBacklogBytes(bytes);
+}
+
+fn manualCommitBacklogAdmission(ptr: *anyopaque, sequence: u64, admission: *BacklogAdmission) void {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    runtime.commitBacklogAdmission(sequence, admission);
+}
+
 fn manualBacklogThrottleTargetSequence(ptr: *anyopaque) ?u64 {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
     return runtime.backlogThrottleTargetSequence();
@@ -690,6 +624,7 @@ fn initIoThreaded(
     if (backend_runtime) |bg| {
         const io_impl = bg.io_impl orelse return error.MissingBackendRuntimeIo;
         runtime.* = io_threaded_runtime_mod.DerivedRuntime.initBorrowed(alloc, io_impl, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
+        runtime.scheduler = try bg.maintenanceScheduler();
     } else {
         runtime.* = try io_threaded_runtime_mod.DerivedRuntime.init(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
     }
@@ -712,6 +647,8 @@ const io_threaded_vtable = Executor.VTable{
     .notify_indexes = ioThreadedNotifyIndexes,
     .notify_except_kind = ioThreadedNotifyExceptKind,
     .force_sequence = ioThreadedForceSequence,
+    .admit_backlog_bytes = ioThreadedAdmitBacklogBytes,
+    .commit_backlog_admission = ioThreadedCommitBacklogAdmission,
     .track_backlog_bytes = ioThreadedTrackBacklogBytes,
     .backlog_throttle_target_sequence = ioThreadedBacklogThrottleTargetSequence,
     .release_backlog_through = ioThreadedReleaseBacklogThrough,
@@ -785,6 +722,16 @@ fn ioThreadedTrackBacklogBytes(ptr: *anyopaque, sequence: u64, bytes: u64) !void
     return try runtime.trackBacklogBytes(sequence, bytes);
 }
 
+fn ioThreadedAdmitBacklogBytes(ptr: *anyopaque, bytes: u64) !BacklogAdmission {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    return try runtime.admitBacklogBytes(bytes);
+}
+
+fn ioThreadedCommitBacklogAdmission(ptr: *anyopaque, sequence: u64, admission: *BacklogAdmission) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.commitBacklogAdmission(sequence, admission);
+}
+
 fn ioThreadedBacklogThrottleTargetSequence(ptr: *anyopaque) ?u64 {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return runtime.backlogThrottleTargetSequence();
@@ -797,10 +744,10 @@ fn ioThreadedReleaseBacklogThrough(ptr: *anyopaque, sequence: u64) void {
 
 fn ioThreadedWaitForAll(ptr: *anyopaque, sequence: u64, wait: VisibilityWait) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
-    return try runtime.waitForAllWithVisibilityWait(sequence, wait.cancellation, wait.deadline_ns);
+    return try runtime.waitForAllWithVisibilityWait(sequence, wait);
 }
 
 fn ioThreadedWaitForIndexes(ptr: *anyopaque, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
-    return try runtime.waitForIndexesWithVisibilityWait(sequence, index_names, wait.cancellation, wait.deadline_ns);
+    return try runtime.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
 }

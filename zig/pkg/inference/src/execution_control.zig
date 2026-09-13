@@ -117,6 +117,18 @@ pub const InferenceExecutionControl = struct {
     /// in a driver.
     hard_cancellation: ?HardCancellationBoundary = null,
 
+    /// Borrow this control for structured image work. The caller must retain
+    /// it until all preprocessing workers have joined.
+    pub fn imageWorkControl(self: *const InferenceExecutionControl) @import("antfly_image").work_control.Control {
+        const Adapter = struct {
+            fn check(raw: ?*const anyopaque) !void {
+                const control: *const InferenceExecutionControl = @ptrCast(@alignCast(raw.?));
+                try control.check();
+            }
+        };
+        return .{ .context = self, .check_fn = Adapter.check };
+    }
+
     pub fn check(self: InferenceExecutionControl) !void {
         if (self.check_fn) |check_fn| try check_fn(self.ptr);
         if (self.cancellation) |token| {
@@ -159,7 +171,7 @@ pub const InferenceExecutionControl = struct {
                 std.atomic.spinLoopHint();
                 spins += 1;
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
         self.check() catch |err| {

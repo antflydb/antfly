@@ -423,6 +423,14 @@ pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
 }
 
 pub fn decodeHeader(data: []const u8) !Header {
+    const header = try decodeHeaderPrefix(data);
+    if (data.len != header_len + @as(usize, header.payload_len)) return error.InvalidArtifactPayload;
+    return header;
+}
+
+/// Parse the envelope without requiring its payload. This does not validate
+/// payload presence or contents; full artifact readers must use decodeHeader.
+pub fn decodeHeaderPrefix(data: []const u8) !Header {
     if (data.len < header_len) return error.InvalidArtifactHeader;
     if (!std.mem.eql(u8, data[0..magic.len], &magic)) return error.InvalidArtifactMagic;
 
@@ -452,7 +460,6 @@ pub fn decodeHeader(data: []const u8) !Header {
     const payload_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += @sizeOf(u32);
     if (pos != header_len) return error.InvalidArtifactHeader;
-    if (data.len != header_len + @as(usize, payload_len)) return error.InvalidArtifactPayload;
 
     return .{
         .version = version,

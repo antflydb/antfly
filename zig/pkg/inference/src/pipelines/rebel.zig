@@ -113,6 +113,13 @@ pub const RebelPipeline = struct {
     tokenizer: tokenizer_mod.Tokenizer,
     config: RebelConfig,
 
+    /// Returns the exact (post-truncation) encoder length used for one input.
+    pub fn inputTokenCount(self: *RebelPipeline, text: []const u8) !usize {
+        const token_ids = try self.tokenizer.encode(self.allocator, text);
+        defer self.allocator.free(token_ids);
+        return @min(token_ids.len, self.config.max_length);
+    }
+
     pub fn recognizeBatch(self: *RebelPipeline, texts: []const []const u8) ![][]Entity {
         const extracted = try self.extractRelationsBatch(texts, null, null);
         errdefer deinitEntityBatches(self.allocator, extracted.entities);

@@ -59,6 +59,9 @@ pub const ExtractionConfig = struct {
     include_spans: bool = false,
     cluster_gap: usize = 0,
     cleanup_model: ?*const cleanup_model_mod.CleanupHead = null,
+    /// Resolved executor ceiling. Enforced after concrete schema prompt
+    /// construction, where exact tokenizer lengths are available.
+    max_input_tokens_per_item: ?usize = null,
 };
 
 pub const ExtractedFieldValue = struct {
@@ -203,6 +206,11 @@ pub fn extractBatch(
         const labels = try allocator.alloc([]const u8, schema.fields.len);
         defer allocator.free(labels);
         for (schema.fields, 0..) |field, i| labels[i] = field.name;
+
+        if (config.max_input_tokens_per_item) |limit| {
+            const input_tokens = try pipeline.maxExtractionInputTokens(texts, labels, null);
+            if (input_tokens > limit) return error.InferenceInputTokensExceeded;
+        }
 
         const entity_batches = try pipeline.recognizeBatch(texts, labels);
         defer {

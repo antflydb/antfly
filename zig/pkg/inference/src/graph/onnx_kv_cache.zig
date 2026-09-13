@@ -42,27 +42,50 @@ pub const KvCache = struct {
 
     pub fn replace(self: *KvCache, allocator: std.mem.Allocator, output_info: []const TensorInfo, outputs_opt: ?[]Tensor) !void {
         _ = output_info;
-        if (self.tensors.len > 0) {
+        return self.replaceImpl(allocator, outputs_opt, false);
+    }
+
+    /// Merged seq2seq exports can emit empty cross-attention outputs after
+    /// prefill. Those outputs mean reuse the request's immutable encoder K/V.
+    pub fn replaceSeq2Seq(self: *KvCache, allocator: std.mem.Allocator, outputs: []Tensor) !void {
+        return self.replaceImpl(allocator, outputs, true);
+    }
+
+    fn replaceImpl(self: *KvCache, allocator: std.mem.Allocator, outputs_opt: ?[]Tensor, preserve_cross: bool) !void {
+        const outputs = outputs_opt orelse {
             for (self.tensors) |*tensor| tensor.deinit();
-            allocator.free(self.tensors);
+            if (self.tensors.len > 0) allocator.free(self.tensors);
             self.tensors = &.{};
-        }
-        const outputs = outputs_opt orelse return;
-        self.pending_outputs = null;
+            return;
+        };
 
         var count: usize = 0;
         for (outputs) |tensor| {
             if (std.mem.startsWith(u8, tensor.name, "present.")) count += 1;
         }
         const tensors = try allocator.alloc(Tensor, count);
+        // Allocation is the last fallible operation: failure leaves both the
+        // old cache and the caller/pending output ownership unchanged.
         var idx: usize = 0;
         for (outputs, 0..) |tensor, out_idx| {
             if (!std.mem.startsWith(u8, tensor.name, "present.")) continue;
-            tensors[idx] = tensor;
+            var moved = tensor;
+            if (preserve_cross and tensor.data.len == 0 and std.mem.indexOf(u8, tensor.name, ".encoder.") != null) {
+                for (self.tensors) |*old| {
+                    if (!std.mem.eql(u8, old.name, tensor.name)) continue;
+                    moved = old.*;
+                    old.* = old.borrowedView(old.name);
+                    break;
+                }
+            }
+            tensors[idx] = moved;
             idx += 1;
-            outputs[out_idx].owns_data = false;
-            outputs[out_idx].owns_shape = false;
+            if (moved.data.ptr == tensor.data.ptr and moved.shape.ptr == tensor.shape.ptr)
+                outputs[out_idx] = tensor.borrowedView(tensor.name);
         }
+        self.pending_outputs = null;
+        for (self.tensors) |*tensor| tensor.deinit();
+        if (self.tensors.len > 0) allocator.free(self.tensors);
         freeTensorSlice(allocator, outputs);
         self.tensors = tensors;
     }
@@ -137,15 +160,7 @@ pub fn findTensor(tensors: []const Tensor, present_name: []const u8) ?Tensor {
 }
 
 pub fn borrowTensor(name: []const u8, source: Tensor) Tensor {
-    return .{
-        .data = source.data,
-        .dtype = source.dtype,
-        .shape = source.shape,
-        .name = name,
-        .allocator = source.allocator,
-        .owns_data = false,
-        .owns_shape = false,
-    };
+    return source.borrowedView(name);
 }
 
 pub fn appendPastInputs(

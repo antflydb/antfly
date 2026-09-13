@@ -17,3 +17,6 @@ const public_table_http = @import("api/public_table_http.zig");
 test {
     _ = public_table_http;
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

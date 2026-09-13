@@ -35,7 +35,6 @@ def test_readyz(base_url):
         "rerankers",
         "chunkers",
         "generators",
-        "classifiers",
         "rewriters",
         "readers",
         "transcribers",

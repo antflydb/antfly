@@ -304,9 +304,16 @@ test "inference admission synchronizes embedded and HTTP callers" {
     };
 
     var q = InferenceAdmission.init(4);
-    var threads: [4]std.Thread = undefined;
-    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Worker.run, .{&q});
-    for (&threads) |*thread| thread.join();
+    var threads: [4]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+    }
+    for (&threads) |*thread| {
+        thread.* = try std.testing.io.concurrent(Worker.run, .{&q});
+        started_tasks += 1;
+    }
+    for (&threads) |*thread| thread.await(std.testing.io);
 
     try std.testing.expectEqual(@as(usize, 0), q.inFlightRequests());
     try std.testing.expectEqual(@as(usize, 0), q.inFlightUnits());

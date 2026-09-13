@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const backend = @import("backend.zig");
-const db_mod = @import("../db/db.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const group_ids = @import("../../common/group_ids.zig");
 
 const Allocator = std.mem.Allocator;
@@ -27,6 +27,7 @@ pub const Connection = struct {
 
     pub const Options = struct {
         fsync: bool = true,
+        writer_lock_marker: []const u8 = "",
     };
 
     pub fn open(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode) !Connection {
@@ -65,6 +66,7 @@ pub const Connection = struct {
         var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{
             .exclusive = exclusive,
             .no_sync = !opts.fsync,
+            .writer_lock_marker = opts.writer_lock_marker,
         });
         errdefer lite_backend.deinit();
 

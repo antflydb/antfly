@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     InferenceEmbeddingServer,
@@ -41,7 +42,6 @@ from conftest import (
 )
 from helpers import wait_until
 from port_reservations import find_free_port
-
 
 # enrichment_runtime.zig permits six worker attempts, each containing six
 # provider attempts. Inline sleeps total 7.75s per worker attempt; the five
@@ -231,6 +231,56 @@ def test_table_create_list_get_drop(cli):
         pytest.fail(f"table {table} still present after drop")
 
 
+def assert_cli_indexes_survive_restart(cli, cli_server, table: str) -> None:
+    # A partial published generation is the restart availability unit. The
+    # same exact incarnations must be admitted promptly after reopen while
+    # any remaining source coverage continues in the background.
+    before_restart = {
+        name: parse_json(cli("index", "get", "--table", table, "--index", name).stdout)[
+            "status"
+        ]["incarnation"]
+        for name in ("title_body", "thumbnail")
+    }
+    cli_server.restart()
+
+    def same_incarnations_are_queryable() -> dict | None:
+        statuses = {
+            name: parse_json(
+                cli("index", "get", "--table", table, "--index", name).stdout
+            )["status"]
+            for name in before_restart
+        }
+        if all(
+            status["incarnation"] == before_restart[name]
+            and status["readiness"]["queryable"] is True
+            for name, status in statuses.items()
+        ):
+            return statuses
+        return None
+
+    restarted = wait_until(
+        same_incarnations_are_queryable, timeout_s=8.0, interval_s=0.05
+    )
+    if restarted is None:
+        restart_diagnostics = {}
+        for name, expected_incarnation in before_restart.items():
+            status = parse_json(
+                cli("index", "get", "--table", table, "--index", name).stdout
+            )["status"]
+            restart_diagnostics[name] = {
+                "expected_incarnation": expected_incarnation,
+                "incarnation": status.get("incarnation"),
+                "readiness": status.get("readiness"),
+                "source_coverage": status.get("source_coverage"),
+                "publication": status.get("publication"),
+                "searchable_vectors": status.get("searchable_vectors"),
+                "runtime_present": status.get("runtime_present"),
+                "runtime_fresh": status.get("runtime_fresh"),
+                "repair": status.get("repair"),
+            }
+        pytest.fail(json.dumps(restart_diagnostics, indent=2, sort_keys=True))
+
+
 def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
     cli, cli_server, cli_inference_servers, cli_media_server, tmp_path
 ):
@@ -260,7 +310,6 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             },
         }
     )
-    tiny_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII="
     records = tmp_path / "quickstart.jsonl"
     records.write_text(
         "\n".join(
@@ -284,8 +333,6 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         )
         + "\n"
     )
-
-    later_wait: subprocess.Popen[str] | None = None
 
     try:
         cli(
@@ -398,6 +445,27 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         assert "pending_reasons=" in text_wait.stdout
         assert "complete_blockers=" in text_wait.stdout
 
+        # The first searchable artifact may belong to either source. Exact
+        # ranking across the two-document corpus requires complete publication,
+        # just as the image query below waits for complete before asserting it.
+        # Retain the partial milestone above as its own CLI contract.
+        text_complete = cli(
+            "index",
+            "wait",
+            "--table",
+            table,
+            "--index",
+            "title_body",
+            "--until",
+            "complete",
+            "--timeout",
+            "20s",
+            "--poll-interval",
+            "25ms",
+            timeout_s=30.0,
+        )
+        assert "Index title_body (embeddings) reached complete:" in text_complete.stdout
+
         text_query = cli(
             "query",
             "--table",
@@ -411,7 +479,13 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         )
         assert_no_unexpected_semantic_warning(text_query, "title_body")
         text_hits = parse_json(text_query.stdout)["responses"][0]["hits"]["hits"]
-        assert text_hits[0]["_id"] == "doc:alpha"
+        assert text_hits and text_hits[0]["_id"] == "doc:alpha", (
+            f"complete semantic query did not return Alpha\n"
+            f"partial wait: {text_wait.stdout}\n"
+            f"complete wait: {text_complete.stdout}\n"
+            f"query: {text_query.stdout}\nstderr: {text_query.stderr}\n"
+            f"index: {cli('index', 'get', '--table', table, '--index', 'title_body').stdout}"
+        )
 
         # Reproduce the documented live-add path while another managed index
         # is actively awaiting inference. Activation/control work must bypass
@@ -703,6 +777,128 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         image_hits = parse_json(image_query.stdout)["responses"][0]["hits"]["hits"]
         assert image_hits[0]["_id"] == "doc:alpha"
 
+        assert_cli_indexes_survive_restart(cli, cli_server, table)
+
+        rag = cli(
+            "agents",
+            "retrieval",
+            "--table",
+            table,
+            "--semantic-search",
+            "alpha concept",
+            "--indexes",
+            "title_body",
+            "--prompt",
+            "Summarize the alpha document",
+            "--fields",
+            "title,body",
+            "--limit",
+            "1",
+            "--reranker",
+            json.dumps(
+                {
+                    "provider": "antfly",
+                    "model": "test-reranker",
+                    "url": reranker_url,
+                    "field": "body",
+                    "top_n": 1,
+                }
+            ),
+            "--pruner",
+            json.dumps({"min_score_ratio": 0.01}),
+            "--generator",
+            json.dumps(
+                {
+                    "provider": "antfly",
+                    "model": "local-generator",
+                    "api_url": generator_url,
+                    "api_key": "test-key",
+                }
+            ),
+            "--generate",
+            "--no-streaming",
+            timeout_s=60.0,
+        )
+        assert_no_unexpected_semantic_warning(rag, "title_body")
+        rag_result = parse_json(rag.stdout)
+        assert rag_result["status"] == "completed"
+        assert rag_result["generation"]
+        assert rag_result["hits"][0]["_id"] == "doc:alpha"
+    finally:
+        embedder_server.release_delay()
+        cli("table", "drop", "--table", table, check=False)
+
+
+def test_cli_index_wait_survives_retry_exhaustion_and_restart(
+    cli, cli_server, cli_inference_servers
+):
+    """Exhaust real provider backoff, then recover without losing index availability."""
+    table = f"cli_retry_exhaustion_{time.time_ns()}"
+    embedder_url = cli_server.cli_inference_urls["embedder"]
+    embedder_server = cli_inference_servers["embedder_server"]
+    tiny_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII="
+    later_wait: subprocess.Popen[str] | None = None
+
+    try:
+        cli("table", "create", "--table", table, "--shards", "1")
+        for name, template, model in (
+            ("title_body", "{{title}} {{body}}", "antfly-embed-v1"),
+            (
+                "thumbnail",
+                "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
+                "antflydb/clipclap",
+            ),
+        ):
+            cli(
+                "index",
+                "create",
+                "--table",
+                table,
+                "--index",
+                name,
+                "--type",
+                "embeddings",
+                "--coverage-policy",
+                "partial",
+                "--template",
+                template,
+                "--embedder",
+                json.dumps(
+                    {"provider": "antfly", "model": model, "api_url": embedder_url}
+                ),
+            )
+        cli(
+            "insert",
+            "--table",
+            table,
+            "--key",
+            "doc:healthy",
+            "--document",
+            json.dumps(
+                {
+                    "title": "Healthy image",
+                    "body": "initial usable image",
+                    "thumbnail_url": tiny_png,
+                }
+            ),
+        )
+        for name in ("title_body", "thumbnail"):
+            cli(
+                "index",
+                "wait",
+                "--table",
+                table,
+                "--index",
+                name,
+                "--until",
+                "complete",
+                "--timeout",
+                "20s",
+                "--poll-interval",
+                "25ms",
+                timeout_s=30.0,
+            )
+
         # A retry-exhausted ClipClap request is a per-source terminal outcome,
         # not a table-wide worker failure. This is the production quickstart
         # edge: the text and image indexes share one resident enrichment owner
@@ -851,101 +1047,10 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             in later_stdout
         )
 
-        # A partial published generation is the restart availability unit. The
-        # same exact incarnations must be admitted promptly after reopen while
-        # any remaining source coverage continues in the background.
-        before_restart = {
-            name: parse_json(
-                cli("index", "get", "--table", table, "--index", name).stdout
-            )["status"]["incarnation"]
-            for name in ("title_body", "thumbnail")
-        }
-        cli_server.restart()
-
-        def same_incarnations_are_queryable() -> dict | None:
-            statuses = {
-                name: parse_json(
-                    cli("index", "get", "--table", table, "--index", name).stdout
-                )["status"]
-                for name in before_restart
-            }
-            if all(
-                status["incarnation"] == before_restart[name]
-                and status["readiness"]["queryable"] is True
-                for name, status in statuses.items()
-            ):
-                return statuses
-            return None
-
-        restarted = wait_until(
-            same_incarnations_are_queryable, timeout_s=8.0, interval_s=0.05
-        )
-        if restarted is None:
-            restart_diagnostics = {}
-            for name, expected_incarnation in before_restart.items():
-                status = parse_json(
-                    cli("index", "get", "--table", table, "--index", name).stdout
-                )["status"]
-                restart_diagnostics[name] = {
-                    "expected_incarnation": expected_incarnation,
-                    "incarnation": status.get("incarnation"),
-                    "readiness": status.get("readiness"),
-                    "source_coverage": status.get("source_coverage"),
-                    "publication": status.get("publication"),
-                    "searchable_vectors": status.get("searchable_vectors"),
-                    "runtime_present": status.get("runtime_present"),
-                    "runtime_fresh": status.get("runtime_fresh"),
-                    "repair": status.get("repair"),
-                }
-            pytest.fail(json.dumps(restart_diagnostics, indent=2, sort_keys=True))
-
-        rag = cli(
-            "agents",
-            "retrieval",
-            "--table",
-            table,
-            "--semantic-search",
-            "alpha concept",
-            "--indexes",
-            "title_body",
-            "--prompt",
-            "Summarize the alpha document",
-            "--fields",
-            "title,body",
-            "--limit",
-            "1",
-            "--reranker",
-            json.dumps(
-                {
-                    "provider": "antfly",
-                    "model": "test-reranker",
-                    "url": reranker_url,
-                    "field": "body",
-                    "top_n": 1,
-                }
-            ),
-            "--pruner",
-            json.dumps({"min_score_ratio": 0.01}),
-            "--generator",
-            json.dumps(
-                {
-                    "provider": "antfly",
-                    "model": "local-generator",
-                    "api_url": generator_url,
-                    "api_key": "test-key",
-                }
-            ),
-            "--generate",
-            "--no-streaming",
-            timeout_s=60.0,
-        )
-        assert_no_unexpected_semantic_warning(rag, "title_body")
-        rag_result = parse_json(rag.stdout)
-        assert rag_result["status"] == "completed"
-        assert rag_result["generation"]
-        assert rag_result["hits"][0]["_id"] == "doc:alpha"
+        assert_cli_indexes_survive_restart(cli, cli_server, table)
     finally:
         embedder_server.release_delay()
+        embedder_server.release_transient_embedding_failures()
         if later_wait is not None and later_wait.poll() is None:
             later_wait.terminate()
             try:

@@ -11,6 +11,7 @@
 const std = @import("std");
 
 pub const TableRecord = struct {
+    storage: @import("table_storage.zig").Settings = .{},
     table_id: u64,
     name: []const u8,
     description: []const u8 = "",

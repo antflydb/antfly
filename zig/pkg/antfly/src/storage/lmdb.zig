@@ -61,10 +61,7 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
 }
 
 fn backoffWriterLockRetry() void {
-    std.Thread.yield() catch {};
-    if (@hasDecl(std.Thread, "sleep")) {
-        std.Thread.sleep(writer_lock_retry_sleep_ns);
-    }
+    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_lock_retry_sleep_ns)), .awake) catch {};
 }
 
 fn lockWrapperEnvironment(env: *Environment) void {
@@ -2494,7 +2491,7 @@ test "zig backend wrapper shares one environment across concurrent reader and wr
                     self.err = err;
                     return;
                 };
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
 
@@ -2518,7 +2515,7 @@ test "zig backend wrapper shares one environment across concurrent reader and wr
                     },
                 };
                 _ = self.env.commitStatsSnapshot();
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -2533,10 +2530,11 @@ test "zig backend wrapper shares one environment across concurrent reader and wr
     var writer = Worker{ .env = &env, .iterations = 128 };
     var reader = Worker{ .env = &env, .iterations = 256 };
 
-    const writer_thread = try std.Thread.spawn(.{}, Worker.runWriter, .{&writer});
-    const reader_thread = try std.Thread.spawn(.{}, Worker.runReader, .{&reader});
-    writer_thread.join();
-    reader_thread.join();
+    var writer_thread = try std.testing.io.concurrent(Worker.runWriter, .{&writer});
+    defer writer_thread.await(std.testing.io);
+    var reader_thread = try std.testing.io.concurrent(Worker.runReader, .{&reader});
+    writer_thread.await(std.testing.io);
+    reader_thread.await(std.testing.io);
 
     if (writer.err) |err| return err;
     if (reader.err) |err| return err;
@@ -2902,6 +2900,28 @@ fn cleanupTmp(path: [*:0]const u8) void {
 }
 
 const SimTests = lmdb_sim_test.namespace(@This());
+
+pub const VoprDifferentialAction = SimTests.DifferentialAction;
+pub const VoprScheduledAction = SimTests.ScheduledAction;
+pub const VoprSnapshotSummary = SimTests.SnapshotSummary;
+pub const VoprCrashOutcome = SimTests.CrashOutcome;
+pub const VoprCommitPhase = SimTests.CommitPhase;
+
+pub fn replayVoprDifferential(
+    allocator: std.mem.Allocator,
+    actions: []const VoprScheduledAction,
+) !VoprSnapshotSummary {
+    return SimTests.replayVoprDifferential(allocator, actions);
+}
+
+pub fn replayVoprCrash(
+    allocator: std.mem.Allocator,
+    prelude_actions: []const VoprDifferentialAction,
+    crash_action: VoprDifferentialAction,
+    phase: VoprCommitPhase,
+) !VoprCrashOutcome {
+    return SimTests.replayVoprCrash(allocator, prelude_actions, crash_action, phase);
+}
 
 test "LMDB replay fixtures stay green" {
     try SimTests.runReplayFixtures(std.testing.allocator);

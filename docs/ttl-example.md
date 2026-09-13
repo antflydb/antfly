@@ -10,17 +10,21 @@ The TTL feature allows you to configure automatic expiration for documents in a 
 
 ### Basic TTL Configuration
 
-Configure TTL when creating a table with a `ttl` policy:
+Configure TTL when creating a table (`POST /db/v1/tables/{tableName}`) with a
+`ttl` policy under `schema`:
 
 ```json
 {
-  "name": "my_table",
-  "ttl": {"duration": "7d"},
-  "document_schemas": {
-    "default": {
-      "type": "object",
-      "properties": {
-        "data": {"type": "string"}
+  "schema": {
+    "ttl": {"duration": "7d"},
+    "document_schemas": {
+      "default": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "data": {"type": "string"}
+          }
+        }
       }
     }
   }
@@ -38,19 +42,22 @@ You can specify a custom timestamp field as the TTL reference:
 
 ```json
 {
-  "name": "my_table",
-  "ttl": {
-    "duration": "24h",
-    "field": "created_at"
-  },
-  "document_schemas": {
-    "default": {
-      "type": "object",
-      "properties": {
-        "created_at": {"type": "string", "format": "date-time"},
-        "data": {"type": "string"}
-      },
-      "required": ["created_at"]
+  "schema": {
+    "ttl": {
+      "duration": "24h",
+      "field": "created_at"
+    },
+    "document_schemas": {
+      "default": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "created_at": {"type": "string", "format": "date-time"},
+            "data": {"type": "string"}
+          },
+          "required": ["created_at"]
+        }
+      }
     }
   }
 }
@@ -83,7 +90,7 @@ When documents are inserted:
 
 ```bash
 # Insert document (using default _timestamp)
-curl -X POST http://localhost:8080/db/v1/my_table/batch \
+curl -X POST http://localhost:8080/db/v1/tables/my_table/batch \
   -H "Content-Type: application/json" \
   -d '{
     "inserts": {
@@ -127,9 +134,15 @@ You can extend the TTL for a document without modifying it:
 - Very efficient - no document rewrite needed
 - Perfect for session management and activity-based expiration
 
-```go
-// Example: Extend TTL on every access
-db.ExtendTTL(ctx, []byte("session:12345"), time.Now())
+```bash
+# Example: Extend TTL on every access by rewriting the TTL reference field
+curl -X POST http://localhost:8080/db/v1/tables/sessions/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inserts": {
+      "session:12345": {"last_accessed": "2025-01-01T12:30:00Z"}
+    }
+  }'
 ```
 
 ## Example: Session Storage
@@ -138,20 +151,23 @@ Use TTL for automatic session cleanup:
 
 ```json
 {
-  "name": "sessions",
-  "ttl": {
-    "duration": "1h",
-    "field": "last_accessed"
-  },
-  "document_schemas": {
-    "session": {
-      "type": "object",
-      "properties": {
-        "user_id": {"type": "string"},
-        "last_accessed": {"type": "string", "format": "date-time"},
-        "data": {"type": "object"}
-      },
-      "required": ["user_id", "last_accessed"]
+  "schema": {
+    "ttl": {
+      "duration": "1h",
+      "field": "last_accessed"
+    },
+    "document_schemas": {
+      "session": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "user_id": {"type": "string"},
+            "last_accessed": {"type": "string", "format": "date-time"},
+            "data": {"type": "object"}
+          },
+          "required": ["user_id", "last_accessed"]
+        }
+      }
     }
   }
 }
@@ -165,15 +181,18 @@ Use TTL for automatic log rotation:
 
 ```json
 {
-  "name": "events",
-  "ttl": {"duration": "30d"},
-  "document_schemas": {
-    "event": {
-      "type": "object",
-      "properties": {
-        "event_type": {"type": "string"},
-        "timestamp": {"type": "string", "format": "date-time"},
-        "data": {"type": "object"}
+  "schema": {
+    "ttl": {"duration": "30d"},
+    "document_schemas": {
+      "event": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "event_type": {"type": "string"},
+            "timestamp": {"type": "string", "format": "date-time"},
+            "data": {"type": "object"}
+          }
+        }
       }
     }
   }
@@ -288,7 +307,7 @@ Documents are deleted in batches of 1000:
 - **Speedup**: ~100-1000x faster depending on document size
 
 **Query Filtering Performance:**
-- Single Pebble Get operation (~microseconds)
+- Single point lookup (~microseconds)
 - No impact on query latency
 - Scales to millions of documents
 

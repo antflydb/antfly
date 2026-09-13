@@ -102,6 +102,15 @@ pub fn chunkTextWithConfigJson(
     return chunks;
 }
 
+pub fn chunkTextWithConfigJsonAndProvider(
+    alloc: Allocator,
+    text: []const u8,
+    config_json: []const u8,
+    _: anytype,
+) ![]Chunk {
+    return try chunkTextWithConfigJson(alloc, text, config_json);
+}
+
 pub fn freeChunks(alloc: Allocator, chunks: []Chunk) void {
     for (chunks) |*chunk| chunk.deinit(alloc);
     alloc.free(chunks);

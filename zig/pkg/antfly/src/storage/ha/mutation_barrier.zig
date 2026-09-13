@@ -158,20 +158,13 @@ pub const MutationBarrier = struct {
         self.resource_mutex.unlock();
         self.reader_gate.unlock();
         if (builtin.os.tag != .freestanding and !builtin.single_threaded) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
     }
 };
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    var attempts: usize = 0;
-    while (!mutex.tryLock()) : (attempts += 1) {
-        if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
-            std.atomic.spinLoopHint();
-        } else {
-            std.Thread.yield() catch {};
-        }
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 test "storage.ha mutation barrier excludes capture while a mutation lease is held" {

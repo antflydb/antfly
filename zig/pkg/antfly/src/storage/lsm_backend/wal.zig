@@ -217,7 +217,7 @@ pub fn appendStateWithOptionsResult(
     sync: bool,
     options: AppendOptions,
 ) !AppendResult {
-    if (state.entries.items.len == 0) return .{};
+    if (state.entryCount() == 0) return .{};
 
     const payload_len = encodedPayloadLen(state);
     var record = try allocator.alloc(u8, record_header_len + payload_len);
@@ -1735,8 +1735,9 @@ fn replaceFileAtomically(storage: storage_io.Storage, allocator: Allocator, path
 }
 
 fn encodePayload(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), state: anytype) !void {
-    try appendInt(out, allocator, u32, @intCast(state.entries.items.len));
-    for (state.entries.items) |entry| {
+    try appendInt(out, allocator, u32, @intCast(state.entryCount()));
+    for (0..state.entryCount()) |entry_index| {
+        const entry = state.entryAt(entry_index);
         const ns = entry.namespace_name orelse "";
         const flags: u8 = @as(u8, @intFromBool(entry.tombstone)) |
             (@as(u8, @intFromBool(entry.namespace_name != null)) << 1);
@@ -1753,8 +1754,9 @@ fn encodePayload(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), state: 
 
 fn encodePayloadIntoSlice(out: []u8, state: anytype) !void {
     var pos: usize = 0;
-    writeIntToPayload(out, &pos, u32, @intCast(state.entries.items.len));
-    for (state.entries.items) |entry| {
+    writeIntToPayload(out, &pos, u32, @intCast(state.entryCount()));
+    for (0..state.entryCount()) |entry_index| {
+        const entry = state.entryAt(entry_index);
         const ns = entry.namespace_name orelse "";
         const flags: u8 = @as(u8, @intFromBool(entry.tombstone)) |
             (@as(u8, @intFromBool(entry.namespace_name != null)) << 1);
@@ -1785,7 +1787,8 @@ fn writeIntToPayload(out: []u8, pos: *usize, comptime T: type, value: T) void {
 
 fn encodedPayloadLen(state: anytype) usize {
     var total: usize = @sizeOf(u32);
-    for (state.entries.items) |entry| {
+    for (0..state.entryCount()) |entry_index| {
+        const entry = state.entryAt(entry_index);
         const ns = entry.namespace_name orelse "";
         total += entry_header_len + ns.len + entry.key.len + entry.value.len;
     }

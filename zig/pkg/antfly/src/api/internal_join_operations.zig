@@ -33,17 +33,37 @@ pub const Operations = struct {
     reads: ?table_reads.TableReadSource = null,
 
     fn mapExecutionError(err: anyerror) Error {
+        if (distributed_join.normalizeDistributedJoinOperationalError(err) == error.DistributedQueryUnavailable)
+            return error.Unavailable;
         return switch (err) {
+            error.Canceled, error.Cancelled => error.Canceled,
+            error.DeadlineExceeded => error.DeadlineExceeded,
             error.InvalidQueryRequest => error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => error.UnsupportedQueryRequest,
-            error.TableNotFound, error.UnknownGroup => error.NotFound,
-            error.Timeout, error.DeadlineExceeded, error.CatalogRoutingSnapshotTimeout => error.Timeout,
-            error.Cancelled, error.Canceled => error.Canceled,
+            error.TableNotFound => error.NotFound,
+            error.Timeout, error.CatalogRoutingSnapshotTimeout => error.Timeout,
             error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => error.Unavailable,
             error.TopologyChanged => error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
-            else => error.Internal,
+            else => {
+                std.log.err("internal distributed join execution failed err={}", .{err});
+                return error.Internal;
+            },
         };
+    }
+
+    /// Bind transport-neutral request lifetime to every internal worker
+    /// execution. `join_context` is process-scoped; cancellation and deadlines
+    /// are request-scoped and must never be lost when crossing this boundary.
+    fn requestJoinContext(context: distributed_join.JoinContext, request: operation.RequestContext) distributed_join.JoinContext {
+        var out = context.withDeadlineFrom(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io });
+        if (context.execution_deadline_ns) |deadline| {
+            out.execution_deadline_ns = if (out.execution_deadline_ns) |converted| @min(deadline, converted) else deadline;
+        }
+        if (request.cancellation.ptr != null and request.cancellation.is_cancelled_fn != null) {
+            out = out.withCancellation(request.cancellation);
+        }
+        return out;
     }
 
     fn executionDependencies(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64) Error!struct {
@@ -69,6 +89,7 @@ pub const Operations = struct {
         job_id: u64,
     ) Error!JobState {
         try request.ensureActive();
+        if (self.join_context) |context| self.job_store.setContext(context);
         const encoded = (self.job_store.loadJoinJobStateSnapshot(alloc, job_id) catch return error.Internal) orelse
             return error.NotFound;
         defer alloc.free(encoded);
@@ -92,7 +113,7 @@ pub const Operations = struct {
         try request.ensureActive();
         const deps = try self.executionDependencies(alloc, request, group_id);
         return distributed_join.executeJoinFinalizeWorkerLocalTyped(
-            deps.context,
+            requestJoinContext(deps.context, request),
             self.job_store,
             alloc,
             deps.reads,
@@ -113,7 +134,7 @@ pub const Operations = struct {
         try request.ensureActive();
         const deps = try self.executionDependencies(alloc, request, group_id);
         return distributed_join.executeJoinRowsLocalTyped(
-            deps.context,
+            requestJoinContext(deps.context, request),
             alloc,
             deps.reads,
             group_id,
@@ -133,7 +154,7 @@ pub const Operations = struct {
         try request.ensureActive();
         const deps = try self.executionDependencies(alloc, request, group_id);
         return distributed_join.executeJoinUnmatchedLocalTyped(
-            deps.context,
+            requestJoinContext(deps.context, request),
             alloc,
             deps.reads,
             group_id,
@@ -153,7 +174,7 @@ pub const Operations = struct {
         try request.ensureActive();
         const deps = try self.executionDependencies(alloc, request, group_id);
         return distributed_join.executeJoinPartitionWorkerLocalTyped(
-            deps.context,
+            requestJoinContext(deps.context, request),
             self.job_store,
             alloc,
             deps.reads,
@@ -163,6 +184,16 @@ pub const Operations = struct {
         ) catch |err| return mapExecutionError(err);
     }
 };
+
+test "internal join maps resource and ownership failures to unavailable" {
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.DistributedQueryUnavailable));
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.ResourceBudgetExceeded));
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.PersistentDescriptorAdmissionExhausted));
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.UnknownGroup));
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.NotLeader));
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.SendFailed));
+    try std.testing.expectEqual(error.NotFound, Operations.mapExecutionError(error.TableNotFound));
+}
 
 test "internal join job state is callable without an HTTP request" {
     const alloc = std.testing.allocator;

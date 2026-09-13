@@ -1,7 +1,8 @@
-# DB Contract And Roadmap
+# DB Contract
 
 This note is the DB-layer landing page for contract decisions, storage backend
-boundaries, and local-shard execution roadmap work.
+boundaries, and local-shard execution design. Genuinely unshipped work is
+consolidated in [Open work](#open-work) at the end of this file.
 
 For the canonical enrichment architecture and artifact identity contract, see
 [ENRICHMENTS.md](ENRICHMENTS.md).
@@ -1383,19 +1384,17 @@ shared compat corpus:
 This keeps ordinary batch predicates and transactional predicates on one
 versioning model.
 
-## Next Async Boundary
+## Derived Work Log And Projection Checkpoints
 
-The async index/enrichment manager should sit between document preprocessing and
-derived index mutation.
-
-The intended flow is:
+The async index/enrichment manager sits between document preprocessing and
+derived index mutation:
 
 1. parse and extract once
 2. commit base docs
 3. append one batch-shaped derived-work record
 4. let per-index workers advance watermarks from that log
 
-The derived log should be sequence-based and idempotent. Rebuild-from-docstore
+The derived log is sequence-based and idempotent. Rebuild-from-docstore
 remains the fallback, not the normal replay path.
 
 Once every managed index has advanced past a sequence, the derived log may be
@@ -1427,39 +1426,40 @@ projection effects. A separate applied-sequence row is not enough unless the
 write protocol can prove that, after a crash, the sequence never advances beyond
 the durable projection data visible to queries.
 
-Planned shape by projection type:
+Shape by projection type:
 
-- dense/HBC: publish the applied sequence, status, generation, and config
-  identity in the HBC metadata record; mirror the same checkpoint into the
-  shared sidecar for common status APIs and non-HBC tooling
-- full-text, sparse, graph, and algebraic indexes: store the applied sequence in
-  each index manifest or LSM/runtime-store manifest and publish it with the
-  visible root
-- enrichments: checkpoint each enrichment scope only after every source change
+- dense/HBC: publishes the applied sequence, status, generation, and config
+  identity in the HBC metadata record; the same checkpoint is mirrored into the
+  shared sidecar for common status APIs and non-HBC tooling — shipped
+- enrichments: checkpoints each enrichment scope only after every source change
   through the sequence has a durable artifact, durable skip, or durable
   failure/repair record; external model side effects make clean versus degraded
-  status part of the contract
-- artifact counters: maintain per-index target/completed counters
+  status part of the contract — shipped
+- artifact counters: dense artifact target/completed counters are maintained
   incrementally on artifact put/delete so coverage checks are O(1) during
-  normal startup; corpus-wide recounts are repair tooling
+  normal startup, with corpus-wide recounts reserved for repair tooling —
+  shipped for dense; extending the same incremental-counter treatment to other
+  index types is tracked in [Open work](#open-work)
+- full-text, sparse, graph, and algebraic indexes: storing the applied
+  sequence in each index manifest or LSM/runtime-store manifest and publishing
+  it with the visible root is not yet done — see [Open work](#open-work)
 
-Implementation plan:
+A shared `ProjectionCheckpoint` format (applied sequence, status, generation,
+config identity, and compatibility version) and the storage helpers that read,
+validate, and atomically publish a checkpoint with its owning projection
+artifact are implemented. Dense was migrated first: the HBC metadata publish
+path carries the checkpoint, dense catch-up advances it only after durable
+artifact/root publication, and a clean restart trusts the checkpoint plus
+replays the derived-log tail. Enrichment progress uses the same checkpoint
+semantics so a scope reports clean, degraded, or repair-required rather than
+only "last sequence seen". Normal-startup dense artifact recounts have been
+replaced by incremental counters, with full-store scans reserved for explicit
+repair paths. Read-cache churn is reduced so tail replay only invalidates
+query state when a visible root, generation, or config actually changes.
 
-1. Add a shared `ProjectionCheckpoint` format with applied sequence, status,
-   generation, config identity, and compatibility version.
-2. Add storage helpers that read, validate, and atomically publish a checkpoint
-   with the owning projection artifact.
-3. Migrate dense first: extend the HBC metadata publish path, make dense catchup
-   advance the checkpoint only after durable artifact/root publication, and make
-   clean restart trust the checkpoint plus replay the derived-log tail.
-4. Move full-text, sparse, graph, and algebraic managed indexes onto the same
-   checkpoint API through their existing typed index ownership boundaries.
-5. Convert enrichment progress to checkpoint semantics so a scope can report
-   clean, degraded, or repair-required rather than only "last sequence seen".
-6. Replace normal-startup dense artifact recounts with incremental counters and
-   reserve full-store scans for explicit repair paths.
-7. Reduce read-cache churn so tail replay only invalidates query state when a
-   visible root, generation, or config actually changes.
+Moving full-text, sparse, graph, and algebraic managed indexes onto the same
+checkpoint API through their existing typed index ownership boundaries has not
+happened yet; see [Open work](#open-work).
 
 Current implementation notes:
 
@@ -1490,19 +1490,9 @@ Current implementation notes:
   the full 256-record/2s coalesce window or 5s session-idle ceiling; those
   ceilings remain available for large hot-ingest backlogs.
 
-Acceptance criteria:
-
-- clean restart with no new writes opens queryable projections without a primary
-  document-store scan
-- startup work is proportional to the derived-log tail, not corpus size
-- crash tests around checkpoint publication never expose a sequence ahead of
-  durable projection effects
-- repair markers, incompatible metadata, and corrupted checkpoints still force
-  rebuild or degraded status
-- enrichment failures do not advance a clean checkpoint past missing durable
-  outcomes
-- metrics expose checkpoint applied sequence, status, replay tail size, and
-  repair-scan counts per projection
+The acceptance bar for this contract (clean-restart behavior, crash safety,
+repair-marker handling, and checkpoint metrics) is tracked in
+[Open work](#open-work).
 
 ## Runtime Ownership
 
@@ -1729,29 +1719,23 @@ backend-specific extensions, not required backend-neutral semantics. The neutral
 contract should cover correctness, durability policy, visibility, range access,
 and split/export/import semantics.
 
-### Backend Migration Plan
+### Backend Contract Adoption
 
-1. Freeze the boundary.
-   - keep non-backend code off direct POSIX where practical
-   - document transaction, scan, durability, and visibility semantics
-   - identify higher-level files that still depend on backend details
-2. Define shared backend types.
-   - shared durability enum
-   - shared backend options
-   - shared namespace concept
-   - shared write-batch capability
-   - explicit transaction and cursor capability surface
-   - backend-independent error mapping where possible
-3. Move higher layers to the contract.
-   - first adopters are `docstore.zig`, `persistent.zig`, and `wal.zig`
-   - then reduce direct transaction threading in `hbc_adapter.zig`,
-     `persistent.zig`, `docstore.zig`, and `index_manager.zig`
-4. Keep proving the abstraction with multiple backends.
-   - LMDB remains the mmap/single-writer backend
-   - in-memory KV stays useful for tests and constrained environments
-   - durable prefix/LSM is the portable backend direction
+The boundary is frozen: non-backend code stays off direct POSIX where
+practical, transaction/scan/durability/visibility semantics are documented
+above, and shared backend types exist (a shared durability enum, backend
+options, namespace concept, write-batch capability, an explicit
+transaction/cursor capability surface, and backend-independent error mapping
+where possible).
 
-The likely Zig shape is intentionally narrow:
+Higher layers have moved onto the contract: `docstore.zig`, `persistent.zig`,
+and `wal.zig` were the first adopters, and `hbc_adapter.zig` now carries
+almost no direct LMDB calls. The abstraction is proven across three concrete
+backends: LMDB remains the mmap/single-writer backend, in-memory KV stays
+useful for tests and constrained environments, and a durable prefix/LSM
+backend is the portable backend direction.
+
+The Zig shape stayed intentionally narrow:
 
 - a small backend module with shared option and durability enums
 - a vtable-backed runtime object for environment open/close, transaction begin,
@@ -1765,81 +1749,6 @@ Specialized engines such as the text persistent index, HBC, sparse, and graph
 reverse index may continue to carry backend assumptions while the primary DB
 store remains backend-selectable. Replatforming them onto the same backend
 family is a follow-on decision, not a blocker for the primary store contract.
-
-## Local Shard Backend Roadmap
-
-The local-shard migration target is to make `ZigCoreDB` the real backend while
-keeping the Go `DB` interface stable for callers above `StoreDB`.
-
-The migration rule:
-
-1. keep the Go `DB` interface stable
-2. move the hot local data plane fully into Zig
-3. keep distributed orchestration in Go
-4. keep local control methods typed, not generic JSON
-
-Treat the Go `DB` interface as three layers:
-
-1. hot data plane
-   - `Get`
-   - `Scan`
-   - `Batch`
-   - `Search`
-2. local control plane
-   - `Open` and `Close`
-   - range and split-state methods
-   - schema/index control
-   - snapshot, split, and finalize
-3. higher-level local features
-   - transactions
-   - graph traversal
-   - enrichment entrypoints
-
-Current state:
-
-- `Batch` already uses a typed binary C boundary
-- `Search` has hot binary paths for dense kNN and simple text match
-- `Get` and `Scan` have narrower Zig bridge fast paths than before
-- remaining overhead is mostly Go rebuilding generic request or response
-  structures around the Zig engine
-
-### Data Plane Migration
-
-Phase 1: finish the hot data plane.
-
-- keep `Batch` on the typed C ABI path
-- make `Search` binary-by-default internally, with fallback for rich legacy
-  shapes
-- keep shrinking `Get` and `Scan` result-shaping overhead
-- add batch/multi-search support once single-request hot paths are stable
-
-Acceptance:
-
-- local dense/text search no longer pays generic JSON overhead
-- `Get`, `Scan`, `Batch`, and narrowed `Search` cross the Go/Zig boundary in
-  compact typed formats
-
-Phase 2: port the local control plane.
-
-- keep typed methods for `Open`, `SetRange`, `GetRange`, split-state CRUD,
-  `AddIndex`, `DeleteIndex`, `UpdateSchema`, `Snapshot`, `Split`, and
-  `FinalizeSplit`
-- expose dedicated C API entrypoints instead of generic payloads
-- keep Go as a thin shim over Zig C API
-
-Acceptance:
-
-- `ZigCoreDB` is mostly a binding layer, not a compatibility adapter
-
-Phase 3: port remaining local features where profiling says it matters.
-
-- transaction lifecycle and local recovery
-- graph edge and traversal ops
-- enrichment/local derived-batch entrypoints
-
-The rule is to move these only when they are local-engine work, not distributed
-coordinator work. Go keeps raft/distributed ownership; Zig owns local shard
-execution for the bulk of `DB`.
 
 ## Hot-Path Search Wire
 
@@ -1865,77 +1774,50 @@ Principles:
 
 ### Dense Search Wire
 
-Objective:
-
-- remove JSON request build and generic result rebuild for dense search
-
-Plan:
-
-1. add a binary dense request/response codec in Zig C API
-2. expose a dense wire entrypoint from
-   [pkg/antfly/src/capi/db.zig](pkg/antfly/src/capi/db.zig)
-3. add the matching Go-side codec in the zigdb bridge
-4. route the narrowed dense path through binary wire first
-5. keep the current JSON path as fallback
-
-Acceptance:
-
-- local dense search no longer marshals JSON on the hot path
-- the Go adapter no longer rebuilds generic hit payloads before constructing
-  `vectorindex.SearchResult`
+A binary dense request/response codec lives in the Zig C API, exposed as a
+dense wire entrypoint from
+[pkg/antfly/src/capi/db.zig](pkg/antfly/src/capi/db.zig)
+(`antfly_db_search_dense_wire`), with a matching Go-side codec in the zigdb
+bridge. The narrowed dense path routes through the binary wire first, with the
+JSON path kept as fallback. Local dense search no longer marshals JSON on the
+hot path, and the Go adapter no longer rebuilds generic hit payloads before
+constructing `vectorindex.SearchResult`.
 
 ### Simple Full-Text Search Wire
 
-Objective:
+A binary request/response codec covers `query_string`, `match`, `term`, and
+`match_phrase` (`antfly_db_search_text_match_wire`, `_text_term_wire`,
+`_text_match_phrase_wire` in `capi/db.zig`), limited to the first slice with no
+stored fields, aggregations, graph, explicit sort, or cursor. The narrowed
+simple-text path routes through the binary wire first, with JSON kept as
+fallback for richer full-text shapes. Local simple full-text search no longer
+pays JSON/base64 overhead on the hot path, and small full-text searches are no
+longer dominated by bridge overhead.
 
-- remove JSON request build and generic result rebuild for simple full-text
+### Search Wire Framing
 
-Plan:
+The internal search wire has a fixed `magic`/`version`/`op`/`flags` header,
+append-only evolution rules, and variable-width data in trailing blobs
+referenced by offset/length. Batch/multi-search support on top of this framing
+is not implemented yet; see [Open work](#open-work).
 
-1. add a binary request/response codec for `query_string`, `match`, `term`, and
-   `match_phrase`
-2. limit the first slice to no stored fields, aggregations, graph, explicit
-   sort, or cursor
-3. route the narrowed simple text path through the binary wire first
-4. keep JSON fallback for richer full-text shapes
+## Shard Split Contract
 
-Acceptance:
+Shard splitting avoids paying for full logical copy plus index rebuild on
+every split:
 
-- local simple full-text search no longer pays JSON/base64 overhead on the hot
-  path
-- small full-text searches are no longer dominated by bridge overhead
+1. child shard creation avoids logical KV replay where possible
+2. index handoff avoids full reindex where possible
+3. mixed-range cleanup happens only where strictly necessary
 
-### Search Wire Evolution
-
-The internal search wire should have:
-
-- `magic`
-- `version`
-- `op`
-- `flags`
-- append-only evolution rules
-- variable-width data in trailing blobs referenced by offset/length
-- batch/multi-search support once single-search hot paths are stable
-
-## Shard Split Roadmap
-
-Shard splitting should be cheap enough that the system stops paying for full
-logical copy plus index rebuild on every split.
-
-The roadmap optimizes:
-
-1. child shard creation without logical KV replay where possible
-2. index handoff without full reindex where possible
-3. mixed-range cleanup only where strictly necessary
-
-The current state after recent split work:
+Current state:
 
 - child docstore creation is page-level on Zig LMDB
 - parent docstore reclaim is page-level on Zig LMDB
 - text indexes use segment handoff and mixed-segment rewrite instead of full
   child rebuild and per-doc parent text deletion
-- the next remaining split cost classes are non-text indexes, especially dense
-  vector indexes
+- the remaining split cost classes are non-text indexes, especially dense
+  vector indexes and sparse postings — see [Open work](#open-work)
 
 Principles:
 
@@ -2050,166 +1932,150 @@ state.
 
 ### Text Segment Handoff
 
-Text index split should classify active segments using persisted key-range
-metadata instead of rescanning the source docstore.
-
-Required metadata:
-
-- `min_doc_key`
-- `max_doc_key`
-
-Split behavior:
+Text index split classifies active segments using persisted key-range
+metadata (`min_doc_key`, `max_doc_key`) instead of rescanning the source
+docstore:
 
 - `right-only` segments are copied unchanged to the child active manifest
 - `left-only` segments stay in the parent unchanged
 - `mixed` segments are rewritten into left and right replacement segments
 - the original mixed segment is retired from both manifests
 
-Mixed-segment rewrite can be driven from the segment blob itself using
+Mixed-segment rewrite is driven from the segment blob itself using
 `SegmentReader.storedDocDecompressed(...)` and
 `buildTextSegmentFromDocuments(...)`, without rescanning the main docstore.
-
-Temporary filtered mixed segments may be useful as an optimization layer: install
-a mixed segment with a shard-side filter bitmap, finish the split cheaply, then
+Temporary filtered mixed segments are a useful optimization layer: install a
+mixed segment with a shard-side filter bitmap, finish the split cheaply, then
 let later compaction produce clean segment ownership.
 
-Acceptance:
-
-- child text indexes are built mostly by manifest/segment handoff
-- only mixed segments are rebuilt
-- split can defer clean mixed-segment rewrite when correctness is preserved
+Child text indexes are built mostly by manifest/segment handoff, only mixed
+segments are rebuilt, and a split can defer clean mixed-segment rewrite when
+correctness is preserved.
 
 ### Page-Level LMDB Child Image
 
-The child shard's main LMDB image should be built without logical KV replay.
+The child shard's main LMDB image is built without logical KV replay: open a
+read snapshot on the source env, descend once to the split key, clone fully
+right-hand subtrees page-for-page into a fresh child env image, rebuild only
+the mixed branch spine and split leaf, and emit fresh child meta and freeDB
+state. The current scope covers the unnamed main DB only, prioritizes
+correctness, and keeps parent cleanup separate from child image construction.
+The child docstore image is created from pages/subtrees rather than logical
+key replay, and only the mixed path is rebuilt logically.
 
-Plan:
+Parent finalize avoiding whole-range logical prune where metadata or page
+structure can answer the same question, and reclaiming retired page ranges
+and retired segment manifests, is tracked in [Open work](#open-work).
 
-1. open a read snapshot on the source env
-2. descend once to the split key
-3. clone fully right-hand subtrees page-for-page into a fresh child env image
-4. rebuild only the mixed branch spine and split leaf
-5. emit fresh child meta and freeDB state
+### Graph Split
 
-First version scope:
+Graph split uses edge ownership and direct reverse-index rebuild instead of
+generic doc replay: child graph split rebuilds reverse state directly from
+owned outgoing edge keys, no longer depends on generic doc replay for
+destination rebuild, and graph boundary coverage checks that reverse rebuild
+respects split ownership bounds.
 
-- unnamed main DB only
-- correctness first
-- parent cleanup stays separate
+Dense vector split and sparse index split are not yet at the same point; see
+[Open work](#open-work).
 
-Acceptance:
+## Open work
 
-- child docstore image is created from pages/subtrees, not logical key replay
-- only the mixed path is rebuilt logically
+This section consolidates genuinely unshipped or unconfirmed work from across
+this document.
 
-Parent finalize should later avoid whole-range logical prune where metadata or
-page structure can answer the same question, and should reclaim retired page
-ranges and retired segment manifests cleanly.
+### Local shard Go/Zig data-plane boundary
 
-### Dense Vector Split
+The document previously described a migration target of making `ZigCoreDB`
+the real local-shard backend while keeping a `StoreDB`-fronted Go `DB`
+interface stable for callers, with a three-phase data-plane migration (finish
+the hot data plane, port the local control plane, port remaining local
+features). Neither `ZigCoreDB` nor `StoreDB` appears anywhere in the current
+Go tree — only in this document and a historical TLA+ spec — so this section
+cannot be confirmed as either shipped or still the live target architecture.
+The closest living analog is `go/pkg/antflylite`, which has a typed `Batch`
+and binary `DenseSearchWire`/`TextMatchWire`/etc. wire types consuming the
+`antfly_db_search_*_wire` C API (see [Hot-Path Search
+Wire](#hot-path-search-wire) above), but it is a single-node embedded DB with
+no range/split-state surface, not a distributed local shard. This needs
+maintainer confirmation before the roadmap language can be reconciled one way
+or the other.
 
-Dense vector indexes should reuse existing HBC structure where possible instead
-of rebuilding the child from scratch.
+### Search wire batch/multi-search support
 
-Use [HBC.md](HBC.md)
-for HBC-specific write routing, search/rerank boundaries, vector ownership, and
-bulk-build strategy. This section owns the DB-level split sequencing and
-handoff requirements.
+Batch/multi-search support on top of the existing search-wire framing (see
+[Search Wire Framing](#search-wire-framing)) is not implemented.
 
-Recommendation:
+### Dense vector split
 
-- do not default to a full child rebuild from vectors
-- classify existing HBC subtrees
-- hand off fully right-hand subtrees unchanged
-- rebuild only mixed subtrees
-- use a bulk-build heuristic only inside mixed subtree rebuilds
+Dense vector indexes are intended to reuse existing HBC structure where
+possible instead of rebuilding the child from scratch (see [HBC.md](HBC.md)
+for HBC-specific write routing, search/rerank boundaries, vector ownership,
+and bulk-build strategy; this section owns DB-level split sequencing and
+handoff requirements).
 
-Relevant storage already exists in:
+Relevant storage exists in `hbc_nodes`, `hbc_quant`, `hbc_vecs`, and
+`hbc_meta`. Node/subtree split-range metadata is implemented in
+`hbc_adapter.zig`, and `splitPlanningStats(...)`, `buildSplitReusePlan(...)`,
+`estimateSplitRebuildWork(...)`, and split-member collection are wired into
+[bench/vectors/hbc_bench.zig](bench/vectors/hbc_bench.zig). DB split
+destination rebuilds child dense indexes directly from HBC split-member plans
+and skips generic dense doc replay for handed-off child docs.
 
-- `hbc_nodes`
-- `hbc_quant`
-- `hbc_vecs`
-- `hbc_meta`
+However, synthetic HBC workloads are a warning: `kmeans` produced almost
+entirely mixed subtrees, `hilbert` was only slightly better, and measured
+full-rebuild and mixed-rebuild costs were nearly identical because there were
+effectively no reusable right-only dense subtrees. Batched child rebuild
+dropped dense rebuild cost sharply even without subtree reuse. A first
+doc-key-local leaf split heuristic slightly reduced mixed frontier for
+`kmeans`, but did not create reusable right-only subtrees; treat it as a
+secondary tuning lever rather than the main dense split strategy. The target
+of child dense split mostly reusing existing HBC subtrees, with full child
+vector reinsertion no longer the default split path, is not yet met.
 
-Plan:
+### Sparse index split
 
-1. persist node/subtree routing metadata in
-   [pkg/antfly/src/storage/hbc_adapter.zig](pkg/antfly/src/storage/hbc_adapter.zig)
-   with `min_doc_key`, `max_doc_key`, and possibly `member_count`
-2. classify nodes/subtrees as left-only, right-only, or mixed
-3. hand off right-only subtrees by copying node records, quantized blobs, raw
-   vectors, and attach metadata
-4. rebuild only mixed subtrees for the child and parent
-5. use bulk-build only for mixed subtree rebuilds when needed
+Sparse indexes are intended to progress from forward-entry handoff to
+block/postings handoff, treating sparse index data more like text than dense
+HBC: add shardable postings/block metadata, hand off fully right-only postings
+blocks, and rewrite only mixed blocks.
 
-Current status:
+Current status: direct split handoff copies child-side `fwd`/`rev` coverage
+unchanged but rebuilds postings from source chunks while preserving
+doc-number mappings — this is not yet true block/postings handoff. Sparse
+posting chunks and sparse terms do persist per-chunk and term-level key-range
+metadata, fully right-only sparse chunks are copied raw into the child index,
+only mixed chunks fall back to filtered rebuild, and split-time generic
+indexing can skip sparse docs already handed off (`zig build sparse-test`
+covers Zig sparse unit behavior). The remaining gap is replacing the
+from-source-chunks postings rebuild with real persisted postings/block
+routing metadata.
 
-- node/subtree split-range metadata is implemented in `hbc_adapter.zig`
-- `splitPlanningStats(...)`, `buildSplitReusePlan(...)`,
-  `estimateSplitRebuildWork(...)`, and split-member collection are wired into
-  [bench/vectors/hbc_bench.zig](bench/vectors/hbc_bench.zig)
-- synthetic HBC workloads are a warning: `kmeans` produced almost entirely
-  mixed subtrees, `hilbert` was only slightly better, and measured full-rebuild
-  and mixed-rebuild costs were nearly identical because there were effectively
-  no reusable right-only dense subtrees
-- batched child rebuild dropped dense rebuild cost sharply even without subtree
-  reuse
-- a first doc-key-local leaf split heuristic slightly reduced mixed frontier
-  for `kmeans`, but did not create reusable right-only subtrees; treat it as a
-  secondary tuning lever rather than the main dense split strategy
-- DB split destination rebuilds child dense indexes directly from HBC
-  split-member plans and skips generic dense doc replay for handed-off child
-  docs
+### Remaining DB roadmap items
 
-Acceptance:
-
-- child dense split mostly reuses existing HBC subtrees
-- mixed rebuild cost scales with boundary-crossing structure, not full child
-  size
-- full child vector reinsertion is no longer the default split path
-
-### Sparse And Graph Split
-
-Sparse indexes should progress from forward-entry handoff to block/postings
-handoff.
-
-Sparse direction:
-
-- treat sparse index data more like text than dense HBC
-- add shardable postings/block metadata
-- hand off fully right-only postings blocks
-- rewrite only mixed blocks
-
-Sparse current status:
-
-- direct split handoff copies child-side `fwd` / `rev` coverage unchanged and
-  rebuilds postings from source chunks while preserving doc-number mappings
-- sparse posting chunks persist per-chunk key-range metadata
-- sparse terms persist term-level key-range metadata
-- fully right-only sparse chunks are copied raw into the child index
-- only mixed chunks fall back to filtered rebuild
-- split-time generic indexing can skip sparse docs already handed off
-- `zig build sparse-test` covers Zig sparse unit behavior
-
-Graph split should use edge ownership and direct reverse-index rebuild instead
-of generic doc replay.
-
-Graph current status:
-
-- child graph split rebuilds reverse state directly from owned outgoing edge
-  keys
-- graph split no longer depends on generic doc replay for destination rebuild
-- graph boundary coverage checks that reverse rebuild respects split ownership
-  bounds
-
-### Immediate DB Roadmap
-
-1. keep backend-neutral DB behavior covered across LMDB, memory, and durable LSM
-2. use `hbc_bench` split planning output on more realistic dense datasets
-3. prototype dense subtree handoff for clearly right-only cases while assuming
-   mixed rebuild remains important
-4. replace sparse live chunk planning with persisted postings/block routing
-   metadata across larger sparse datasets
-5. add a smaller durable split prepare/equivalence target instead of relying on
-   the heavyweight DB split bench for debugging
-6. keep graph split on the direct ownership path and broaden correctness checks
+- keep backend-neutral DB behavior covered across LMDB, memory, and durable LSM
+- use `hbc_bench` split planning output on more realistic dense datasets
+- prototype dense subtree handoff for clearly right-only cases while assuming
+  mixed rebuild remains important
+- replace sparse live chunk planning with persisted postings/block routing
+  metadata across larger sparse datasets
+- add a smaller durable split prepare/equivalence target instead of relying on
+  the heavyweight DB split bench for debugging
+- keep graph split on the direct ownership path and broaden correctness checks
+- move full-text, sparse, graph, and algebraic managed indexes onto the
+  shared `ProjectionCheckpoint` API (see [Derived Work Log And Projection
+  Checkpoints](#derived-work-log-and-projection-checkpoints) above)
+- extend incremental artifact target/completed counters beyond dense to other
+  index types
+- validate the projection-checkpoint acceptance bar: clean restart with no
+  new writes opens queryable projections without a primary document-store
+  scan; startup work is proportional to the derived-log tail, not corpus
+  size; crash tests around checkpoint publication never expose a sequence
+  ahead of durable projection effects; repair markers, incompatible metadata,
+  and corrupted checkpoints still force rebuild or degraded status;
+  enrichment failures do not advance a clean checkpoint past missing durable
+  outcomes; metrics expose checkpoint applied sequence, status, replay tail
+  size, and repair-scan counts per projection
+- parent finalize avoiding whole-range logical prune where metadata or page
+  structure can answer the same question, and reclaiming retired page ranges
+  and retired segment manifests cleanly (see [Page-Level LMDB Child
+  Image](#page-level-lmdb-child-image) above)

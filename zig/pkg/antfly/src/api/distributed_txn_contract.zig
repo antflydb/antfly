@@ -32,6 +32,7 @@ pub const status_server_response_reserve_ms: u32 = 50;
 /// never serialized directly across the wire.
 pub const PreDecisionContext = struct {
     deadline_ns: ?u64 = null,
+    deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
     cancellation: db_types.CancellationToken = .none,
 };
 

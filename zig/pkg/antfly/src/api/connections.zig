@@ -33,7 +33,7 @@ const list_models = @import("../inference/list_models.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
-const runtime_memory_abi = @import("../runtime_memory_abi.zig");
+const runtime_memory_abi = @import("runtime_memory_abi");
 const backups_api = @import("backups.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1106,7 +1106,12 @@ fn resolveModels(
         {
             if (sources.antfly_provider) |provider| {
                 if (provider.list_models_json) |list_fn| {
-                    if (list_fn(provider.ptr, arena)) |body| {
+                    if (managed_embedder.AntflyProviderBoundary.call(
+                        "list_models_json",
+                        provider.boundary_dispatch,
+                        list_fn,
+                        .{ provider.ptr, arena },
+                    )) |body| {
                         const result = try list_models.parseAntflyModels(arena, body);
                         outcomes[i] = .{ .ok = true, .models = result.models };
                     } else |err| {
@@ -1817,7 +1822,7 @@ test "inference connection invocation forwards streaming and deadline through st
             self.invoked = true;
             self.saw_deadline = context.deadline_ns != 0;
             const stream = context.stream;
-            if (stream.start.?(stream.context, 200) != .ok or
+            if (stream.start.?(stream.context, 200, runtime_http_abi.Bytes.init("text/event-stream; charset=utf-8"), .{}) != .ok or
                 stream.write.?(stream.context, runtime_http_abi.Bytes.init("data: linked\n\n")) != .ok or
                 stream.close.?(stream.context) != .ok)
             {
@@ -1833,7 +1838,7 @@ test "inference connection invocation forwards streaming and deadline through st
         started: bool = false,
         closed: bool = false,
 
-        fn start(raw: ?*anyopaque, status: u16) callconv(.c) runtime_http_abi.CallbackStatus {
+        fn start(raw: ?*anyopaque, status: u16, _: runtime_http_abi.Bytes, _: runtime_http_abi.HeaderList) callconv(.c) runtime_http_abi.CallbackStatus {
             const self: *@This() = @ptrCast(@alignCast(raw orelse return .failed));
             self.started = status == 200;
             return .ok;

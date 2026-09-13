@@ -60,6 +60,28 @@ pub const DecoderCrossCache = struct {
     keys: []CT,
     values: []CT,
 
+    /// Views may borrow their source (CUDA) or retain it (Metal). In either
+    /// case the owning cache must outlive this descriptor set.
+    fn prefix(self: DecoderCrossCache, cb: *const ComputeBackend, allocator: std.mem.Allocator, rows: usize, cols: usize) !DecoderCrossCache {
+        const keys = try allocator.alloc(CT, self.keys.len);
+        errdefer allocator.free(keys);
+        const values = try allocator.alloc(CT, self.values.len);
+        errdefer allocator.free(values);
+        var key_count: usize = 0;
+        var value_count: usize = 0;
+        errdefer {
+            for (keys[0..key_count]) |tensor| cb.free(tensor);
+            for (values[0..value_count]) |tensor| cb.free(tensor);
+        }
+        for (self.keys, self.values, 0..) |key, value, layer| {
+            keys[layer] = try cb.sliceRows2D(allocator, key, 0, rows, cols);
+            key_count += 1;
+            values[layer] = try cb.sliceRows2D(allocator, value, 0, rows, cols);
+            value_count += 1;
+        }
+        return .{ .keys = keys, .values = values };
+    }
+
     pub fn deinit(self: *DecoderCrossCache, cb: *const ComputeBackend, allocator: std.mem.Allocator) void {
         for (self.keys) |key| cb.free(key);
         for (self.values) |value| cb.free(value);
@@ -170,20 +192,445 @@ test "Florence cache preparation cancels between layers and releases partial ten
 }
 
 pub const DecoderIncrementalCache = struct {
+    /// Full backing allocations remain owned even when logical rows shrink.
     cross: DecoderCrossCache,
+    cross_active: ?DecoderCrossCache = null,
     self: DecoderSelfCache,
     encoder_mask: []i64,
     self_mask: []i64,
     batch: usize,
     enc_seq: usize,
 
+    fn attentionCross(self: *const DecoderIncrementalCache) DecoderCrossCache {
+        return self.cross_active orelse self.cross;
+    }
+
     pub fn deinit(self: *DecoderIncrementalCache, cb: *const ComputeBackend, allocator: std.mem.Allocator) void {
+        if (self.cross_active) |*active| active.deinit(cb, allocator);
         self.cross.deinit(cb, allocator);
         self.self.deinit(cb, allocator);
         allocator.free(self.encoder_mask);
         allocator.free(self.self_mask);
     }
 };
+
+/// Remove completed decoder rows while preserving their original relative
+/// order. Preallocated device caches are compacted in place, copying only the
+/// populated self-attention prefix rather than reallocating every layer's full
+/// decode capacity. Other cache layouts retain the transactional row-gather
+/// fallback. Device backends can therefore shrink decoder and LM-head batch
+/// dimensions as soon as pages reach EOS without a second full KV-cache peak.
+pub fn compactDecoderIncrementalCache(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    cache: *DecoderIncrementalCache,
+    retained_rows: []const u32,
+) !bool {
+    if (retained_rows.len == 0 or retained_rows.len > cache.batch) return error.InvalidInputShape;
+    if (retained_rows.len == cache.batch) return true;
+    const expected_encoder_mask_len = std.math.mul(usize, cache.batch, cache.enc_seq) catch
+        return error.InvalidInputShape;
+    if (cache.batch == 0 or cache.enc_seq == 0 or
+        cache.cross.keys.len != config.decoder_layers or
+        cache.cross.values.len != config.decoder_layers or
+        cache.self.keys.len != config.decoder_layers or
+        cache.self.values.len != config.decoder_layers or
+        cache.encoder_mask.len != expected_encoder_mask_len or
+        cache.self_mask.len == 0 or cache.self_mask.len % cache.batch != 0 or
+        (cache.self.preallocated and cache.self.len > cache.self.capacity)) return error.InvalidInputShape;
+    var previous: ?u32 = null;
+    for (retained_rows) |row| {
+        if (row >= cache.batch or (previous != null and row <= previous.?)) return error.InvalidInputShape;
+        previous = row;
+    }
+
+    if (cache.self.preallocated and cb.supportsCopyRows2D()) {
+        return compactPreallocatedDecoderIncrementalCacheInPlace(
+            cb,
+            allocator,
+            config,
+            cache,
+            retained_rows,
+        );
+    }
+
+    const old_batch = cache.batch;
+    const old_enc_seq = cache.enc_seq;
+    const next_batch = retained_rows.len;
+    const cross_rows = std.math.mul(usize, next_batch, cache.enc_seq) catch return error.InvalidInputShape;
+    const cross_row_ids = try allocator.alloc(u32, cross_rows);
+    defer allocator.free(cross_row_ids);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        for (0..cache.enc_seq) |token| {
+            const source = std.math.add(
+                usize,
+                std.math.mul(usize, source_batch, cache.enc_seq) catch return error.InvalidInputShape,
+                token,
+            ) catch return error.InvalidInputShape;
+            cross_row_ids[dst_batch * cache.enc_seq + token] = std.math.cast(u32, source) orelse
+                return error.InvalidInputShape;
+        }
+    }
+
+    const self_row_stride = if (cache.self.preallocated) cache.self.capacity else cache.self.len;
+    if (self_row_stride == 0) return error.InvalidInputShape;
+    const self_rows = std.math.mul(usize, next_batch, self_row_stride) catch return error.InvalidInputShape;
+    const self_row_ids = try allocator.alloc(u32, self_rows);
+    defer allocator.free(self_row_ids);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        for (0..self_row_stride) |token| {
+            const source = std.math.add(
+                usize,
+                std.math.mul(usize, source_batch, self_row_stride) catch return error.InvalidInputShape,
+                token,
+            ) catch return error.InvalidInputShape;
+            self_row_ids[dst_batch * self_row_stride + token] = std.math.cast(u32, source) orelse
+                return error.InvalidInputShape;
+        }
+    }
+
+    const next_cross_keys = try allocator.alloc(CT, config.decoder_layers);
+    var next_cross_keys_len: usize = 0;
+    const next_cross_values = allocator.alloc(CT, config.decoder_layers) catch |err| {
+        allocator.free(next_cross_keys);
+        return err;
+    };
+    var next_cross_values_len: usize = 0;
+    const next_self_keys = allocator.alloc(?CT, config.decoder_layers) catch |err| {
+        allocator.free(next_cross_keys);
+        allocator.free(next_cross_values);
+        return err;
+    };
+    @memset(next_self_keys, null);
+    const next_self_values = allocator.alloc(?CT, config.decoder_layers) catch |err| {
+        allocator.free(next_cross_keys);
+        allocator.free(next_cross_values);
+        allocator.free(next_self_keys);
+        return err;
+    };
+    @memset(next_self_values, null);
+    var next_cache_owned = true;
+    defer if (next_cache_owned) {
+        for (next_cross_keys[0..next_cross_keys_len]) |tensor| cb.free(tensor);
+        for (next_cross_values[0..next_cross_values_len]) |tensor| cb.free(tensor);
+        for (next_self_keys) |maybe| if (maybe) |tensor| cb.free(tensor);
+        for (next_self_values) |maybe| if (maybe) |tensor| cb.free(tensor);
+        allocator.free(next_cross_keys);
+        allocator.free(next_cross_values);
+        allocator.free(next_self_keys);
+        allocator.free(next_self_values);
+    };
+
+    for (0..config.decoder_layers) |layer| {
+        next_cross_keys[layer] = (try cb.takeRows(
+            cache.cross.keys[layer],
+            cross_row_ids,
+            cross_rows,
+            config.d_model,
+        )) orelse return false;
+        next_cross_keys_len += 1;
+        next_cross_values[layer] = (try cb.takeRows(
+            cache.cross.values[layer],
+            cross_row_ids,
+            cross_rows,
+            config.d_model,
+        )) orelse return false;
+        next_cross_values_len += 1;
+        next_self_keys[layer] = (try cb.takeRows(
+            cache.self.keys[layer] orelse return error.InvalidInputShape,
+            self_row_ids,
+            self_rows,
+            config.d_model,
+        )) orelse return false;
+        next_self_values[layer] = (try cb.takeRows(
+            cache.self.values[layer] orelse return error.InvalidInputShape,
+            self_row_ids,
+            self_rows,
+            config.d_model,
+        )) orelse return false;
+    }
+
+    const encoder_mask = try allocator.alloc(i64, cross_rows);
+    errdefer allocator.free(encoder_mask);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        const source = @as(usize, source_batch) * cache.enc_seq;
+        @memcpy(
+            encoder_mask[dst_batch * cache.enc_seq ..][0..cache.enc_seq],
+            cache.encoder_mask[source..][0..cache.enc_seq],
+        );
+    }
+    const old_self_mask_stride = cache.self_mask.len / old_batch;
+    const self_mask_len = std.math.mul(usize, next_batch, old_self_mask_stride) catch
+        return error.InvalidInputShape;
+    const self_mask = try allocator.alloc(i64, self_mask_len);
+    errdefer allocator.free(self_mask);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        const source = @as(usize, source_batch) * old_self_mask_stride;
+        @memcpy(
+            self_mask[dst_batch * old_self_mask_stride ..][0..old_self_mask_stride],
+            cache.self_mask[source..][0..old_self_mask_stride],
+        );
+    }
+
+    var old_cross = cache.cross;
+    var old_self = cache.self;
+    var old_cross_active = cache.cross_active;
+    const old_encoder_mask = cache.encoder_mask;
+    const old_self_mask = cache.self_mask;
+    cache.* = .{
+        .cross = .{ .keys = next_cross_keys, .values = next_cross_values },
+        .self = .{
+            .keys = next_self_keys,
+            .values = next_self_values,
+            .len = old_self.len,
+            .capacity = old_self.capacity,
+            .preallocated = old_self.preallocated,
+        },
+        .encoder_mask = encoder_mask,
+        .self_mask = self_mask,
+        .batch = next_batch,
+        .enc_seq = old_enc_seq,
+    };
+    next_cross_keys_len = 0;
+    next_cross_values_len = 0;
+    next_cache_owned = false;
+    if (old_cross_active) |*active| active.deinit(cb, allocator);
+    old_cross.deinit(cb, allocator);
+    old_self.deinit(cb, allocator);
+    allocator.free(old_encoder_mask);
+    allocator.free(old_self_mask);
+    return true;
+}
+
+fn compactPreallocatedDecoderIncrementalCacheInPlace(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    cache: *DecoderIncrementalCache,
+    retained_rows: []const u32,
+) !bool {
+    const old_batch = cache.batch;
+    const next_batch = retained_rows.len;
+    const encoder_mask_len = std.math.mul(usize, next_batch, cache.enc_seq) catch
+        return error.InvalidInputShape;
+    const encoder_mask = try allocator.alloc(i64, encoder_mask_len);
+    errdefer allocator.free(encoder_mask);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        const source = @as(usize, source_batch) * cache.enc_seq;
+        @memcpy(
+            encoder_mask[dst_batch * cache.enc_seq ..][0..cache.enc_seq],
+            cache.encoder_mask[source..][0..cache.enc_seq],
+        );
+    }
+
+    const self_mask_stride = cache.self_mask.len / old_batch;
+    const self_mask_len = std.math.mul(usize, next_batch, self_mask_stride) catch
+        return error.InvalidInputShape;
+    const self_mask = try allocator.alloc(i64, self_mask_len);
+    errdefer allocator.free(self_mask);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        const source = @as(usize, source_batch) * self_mask_stride;
+        @memcpy(
+            self_mask[dst_batch * self_mask_stride ..][0..self_mask_stride],
+            cache.self_mask[source..][0..self_mask_stride],
+        );
+    }
+
+    // Retained rows are strictly increasing, so every moved source slab is
+    // above its destination and cannot be overwritten before it is consumed.
+    // The unpopulated self-cache tail is deliberately ignored: future decode
+    // steps write it at the same capacity-strided offsets.
+    for (0..config.decoder_layers) |layer| {
+        const self_key = cache.self.keys[layer] orelse return error.InvalidInputShape;
+        const self_value = cache.self.values[layer] orelse return error.InvalidInputShape;
+        for (retained_rows, 0..) |source_batch_u32, dst_batch| {
+            const source_batch = @as(usize, source_batch_u32);
+            if (source_batch == dst_batch) continue;
+            const source_cross_row = std.math.mul(usize, source_batch, cache.enc_seq) catch
+                return error.InvalidInputShape;
+            const dest_cross_row = std.math.mul(usize, dst_batch, cache.enc_seq) catch
+                return error.InvalidInputShape;
+            if (!try cb.copyRows2D(
+                allocator,
+                cache.cross.keys[layer],
+                dest_cross_row,
+                cache.cross.keys[layer],
+                source_cross_row,
+                cache.enc_seq,
+                config.d_model,
+            )) return error.UnsupportedOperation;
+            if (!try cb.copyRows2D(
+                allocator,
+                cache.cross.values[layer],
+                dest_cross_row,
+                cache.cross.values[layer],
+                source_cross_row,
+                cache.enc_seq,
+                config.d_model,
+            )) return error.UnsupportedOperation;
+
+            if (cache.self.len == 0) continue;
+            const source_self_row = std.math.mul(usize, source_batch, cache.self.capacity) catch
+                return error.InvalidInputShape;
+            const dest_self_row = std.math.mul(usize, dst_batch, cache.self.capacity) catch
+                return error.InvalidInputShape;
+            if (!try cb.copyRows2D(
+                allocator,
+                self_key,
+                dest_self_row,
+                self_key,
+                source_self_row,
+                cache.self.len,
+                config.d_model,
+            )) return error.UnsupportedOperation;
+            if (!try cb.copyRows2D(
+                allocator,
+                self_value,
+                dest_self_row,
+                self_value,
+                source_self_row,
+                cache.self.len,
+                config.d_model,
+            )) return error.UnsupportedOperation;
+        }
+    }
+
+    // In-place row copies do not change tensor metadata. Publish exact active
+    // shapes for attention, keeping the original allocations alive underneath
+    // borrowed CUDA views as well as retained Metal views. Device slicing is
+    // descriptor-only; it does not allocate another KV payload. As with a
+    // failed row copy, a view failure aborts this invocation and its cache.
+    const active = try cache.cross.prefix(cb, allocator, encoder_mask_len, config.d_model);
+    if (cache.cross_active) |*previous| previous.deinit(cb, allocator);
+    cache.cross_active = active;
+
+    allocator.free(cache.encoder_mask);
+    allocator.free(cache.self_mask);
+    cache.encoder_mask = encoder_mask;
+    cache.self_mask = self_mask;
+    cache.batch = next_batch;
+    return true;
+}
+
+test "Florence compaction publishes active shapes and preserves borrowed backing through repeated EOS" {
+    try testCompactedCrossViews(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompactedCrossViews, .{});
+}
+
+fn testCompactedCrossViews(allocator: std.mem.Allocator) !void {
+    const Probe = struct {
+        allocator: std.mem.Allocator,
+        roots: usize = 0,
+        views: usize = 0,
+        payload_bytes: usize = 0,
+        const Tensor = struct { data: []f32, rows: usize, cols: usize, owned: bool };
+        fn tensor(raw: CT) *Tensor {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn alloc(raw: *anyopaque, shape: []const i32) !?CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const rows: usize = @intCast(shape[0]);
+            const cols: usize = @intCast(shape[1]);
+            const data = try self.allocator.alloc(f32, rows * cols);
+            errdefer self.allocator.free(data);
+            const output = try self.allocator.create(Tensor);
+            output.* = .{ .data = data, .rows = rows, .cols = cols, .owned = true };
+            for (data, 0..) |*value, index| value.* = @floatFromInt(index);
+            self.roots += 1;
+            self.payload_bytes += data.len * @sizeOf(f32);
+            return output;
+        }
+        fn free(raw: *anyopaque, ct: CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const value = tensor(ct);
+            if (value.owned) {
+                // Emulate CUDA's borrowed views: releasing their owner first
+                // is invalid even if Metal would retain its buffer for us.
+                std.debug.assert(self.views == 0);
+                self.roots -= 1;
+                self.payload_bytes -= value.data.len * @sizeOf(f32);
+                self.allocator.free(value.data);
+            } else self.views -= 1;
+            self.allocator.destroy(value);
+        }
+        fn copy(_: *anyopaque, dst: CT, dst_row: usize, src: CT, src_row: usize, rows: usize, cols: usize) !bool {
+            const target = tensor(dst);
+            const source = tensor(src);
+            if (target.cols != cols or source.cols != cols or dst_row + rows > target.rows or src_row + rows > source.rows) return error.InvalidShape;
+            std.mem.copyForwards(f32, target.data[dst_row * cols ..][0 .. rows * cols], source.data[src_row * cols ..][0 .. rows * cols]);
+            return true;
+        }
+        fn slice(raw: *anyopaque, input: CT, start: usize, rows: usize, cols: usize) !CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const source = tensor(input);
+            if (source.cols != cols or start + rows > source.rows) return error.InvalidShape;
+            const output = try self.allocator.create(Tensor);
+            output.* = .{ .data = source.data[start * cols ..][0 .. rows * cols], .rows = rows, .cols = cols, .owned = false };
+            self.views += 1;
+            return output;
+        }
+        fn cross(self: *@This(), layers: usize) !DecoderCrossCache {
+            const keys = try self.allocator.alloc(CT, layers);
+            errdefer self.allocator.free(keys);
+            const values = try self.allocator.alloc(CT, layers);
+            errdefer self.allocator.free(values);
+            var initialized: usize = 0;
+            errdefer for (0..initialized) |i| {
+                free(self, keys[i]);
+                free(self, values[i]);
+            };
+            for (keys, values) |*key, *value| {
+                key.* = (try alloc(self, &.{ 14, 2 })).?;
+                errdefer free(self, key.*);
+                value.* = (try alloc(self, &.{ 14, 2 })).?;
+                initialized += 1;
+            }
+            return .{ .keys = keys, .values = values };
+        }
+    };
+    var probe = Probe{ .allocator = allocator };
+    defer std.debug.assert(probe.roots == 0 and probe.views == 0 and probe.payload_bytes == 0);
+    var vtable: ComputeBackend.VTable = undefined;
+    vtable.allocUninitF32Shape = Probe.alloc;
+    vtable.freeTensor = Probe.free;
+    vtable.copyRows2D = Probe.copy;
+    vtable.sliceRows2D = Probe.slice;
+    const cb = ComputeBackend{ .ptr = &probe, .vtable = &vtable };
+    var cache: DecoderIncrementalCache = init: {
+        var cross = try probe.cross(2);
+        errdefer cross.deinit(&cb, allocator);
+        var self = (try DecoderSelfCache.tryInitPreallocated(&cb, allocator, 2, 7, 4, 2)).?;
+        errdefer self.deinit(&cb, allocator);
+        self.len = 2;
+        const encoder_mask = try allocator.alloc(i64, 14);
+        errdefer allocator.free(encoder_mask);
+        const self_mask = try allocator.alloc(i64, 28);
+        @memset(encoder_mask, 1);
+        @memset(self_mask, 1);
+        break :init .{ .cross = cross, .self = self, .encoder_mask = encoder_mask, .self_mask = self_mask, .batch = 7, .enc_seq = 2 };
+    };
+    defer cache.deinit(&cb, allocator);
+    const payload_bytes = probe.payload_bytes;
+    const backing = cache.cross.keys[0];
+    const config = Config{ .decoder_layers = 2, .d_model = 2 };
+    try std.testing.expectError(error.InvalidInputShape, compactDecoderIncrementalCache(&cb, allocator, config, &cache, &.{ 3, 1 }));
+    try std.testing.expect(try compactDecoderIncrementalCache(&cb, allocator, config, &cache, &.{ 1, 3, 5 }));
+    try std.testing.expectEqual(@as(usize, 3), cache.batch);
+    try std.testing.expectEqual(@as(usize, 6), Probe.tensor(cache.attentionCross().keys[0]).rows);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23 }, Probe.tensor(cache.attentionCross().keys[0]).data);
+    try std.testing.expect(try compactDecoderIncrementalCache(&cb, allocator, config, &cache, &.{1}));
+    try std.testing.expectEqual(@as(usize, 1), cache.batch);
+    for (cache.attentionCross().keys, cache.attentionCross().values) |key, value| {
+        try std.testing.expectEqual(@as(usize, 2), Probe.tensor(key).rows);
+        try std.testing.expectEqualSlices(f32, &.{ 12, 13, 14, 15 }, Probe.tensor(key).data);
+        try std.testing.expectEqualSlices(f32, &.{ 12, 13, 14, 15 }, Probe.tensor(value).data);
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 24, 25, 26, 27 }, Probe.tensor(cache.self.keys[0].?).data[0..4]);
+    try std.testing.expectEqual(backing, cache.cross.keys[0]);
+    try std.testing.expectEqual(payload_bytes, probe.payload_bytes);
+    try std.testing.expectEqual(@as(usize, 4), probe.views);
+}
 
 const VisionForwardResult = struct {
     features: []f32,
@@ -689,6 +1136,28 @@ pub fn decoderFusedTokenFromFinalHiddenTensor(
     return try cb.linearNoBiasArgmaxLastRowSuppressTensor(hidden, try lmHeadWeight(cb), 1, config.d_model, config.vocab_size, suppress_tokens);
 }
 
+/// Project one final-hidden row per active batch item and return only the
+/// selected token ids. Backends implementing this avoid materializing the
+/// `[rows, vocab_size]` logits tensor on every autoregressive step.
+pub fn decoderFusedTokensFromFinalHiddenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    rows: usize,
+    suppress_tokens: []const i32,
+) !?[]u32 {
+    return try cb.linearNoBiasArgmaxRowsSuppress(
+        hidden,
+        try lmHeadWeight(cb),
+        rows,
+        config.d_model,
+        config.vocab_size,
+        suppress_tokens,
+        allocator,
+    );
+}
+
 pub fn decoderFinalLogitsBiasIsZero(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -898,7 +1367,15 @@ fn visionEncoderForward(
         try control_cb.checkExecutionControl();
         const stage_start = nowNs();
         var hidden_for_stage: ?CT = null;
-        if (useTensorNativeVision(cb) and stage_hidden != null) {
+        if (useTensorNativeVision(cb) and stage == 0) {
+            if (debug_cuda_session) std.log.info("florence: stage 0 device conv embed start h={d} w={d}", .{ stage_h, stage_w });
+            const conv_start = nowNs();
+            const embedded = try convEmbedImageTensor(cb, config, batch, pixel_values, stage_h, stage_w);
+            if (profile) logFlorenceProfileStage("vision_stage_conv_embed_device", stage, conv_start);
+            hidden_for_stage = embedded.tensor;
+            stage_h = embedded.height;
+            stage_w = embedded.width;
+        } else if (useTensorNativeVision(cb) and stage_hidden != null) {
             if (debug_cuda_session) std.log.info("florence: stage {d} tensor conv embed start h={d} w={d}", .{ stage, stage_h, stage_w });
             const conv_start = nowNs();
             const embedded = try convEmbedTensor(cb, allocator, config, stage, batch, stage_hidden.?, stage_h, stage_w);
@@ -1044,8 +1521,6 @@ fn visionEncoderForwardTensorTail(
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     const profile = readProfileEnabled();
     if (debug_cuda_session) std.log.info("florence: device vision tail start backend={s}", .{@tagName(cb.kind())});
-    var stage_tokens: ?[]f32 = null;
-    errdefer if (stage_tokens) |tokens| allocator.free(tokens);
     var stage_hidden: ?CT = null;
     errdefer if (stage_hidden) |hidden| cb.free(hidden);
     var stage_h: usize = config.image_size;
@@ -1055,7 +1530,15 @@ fn visionEncoderForwardTensorTail(
         try control_cb.checkExecutionControl();
         const stage_start = nowNs();
         var hidden_for_stage: ?CT = null;
-        if (stage_hidden != null) {
+        if (stage == 0) {
+            if (debug_cuda_session) std.log.info("florence: stage 0 device conv embed start h={d} w={d}", .{ stage_h, stage_w });
+            const conv_start = nowNs();
+            const embedded = try convEmbedImageTensor(cb, config, batch, pixel_values, stage_h, stage_w);
+            if (profile) logFlorenceProfileStage("vision_stage_conv_embed_device", stage, conv_start);
+            hidden_for_stage = embedded.tensor;
+            stage_h = embedded.height;
+            stage_w = embedded.width;
+        } else if (stage_hidden != null) {
             if (debug_cuda_session) std.log.info("florence: stage {d} tensor conv embed start h={d} w={d}", .{ stage, stage_h, stage_w });
             const conv_start = nowNs();
             const embedded = try convEmbedTensor(cb, allocator, config, stage, batch, stage_hidden.?, stage_h, stage_w);
@@ -1066,29 +1549,10 @@ fn visionEncoderForwardTensorTail(
             hidden_for_stage = embedded.tensor;
             stage_h = embedded.height;
             stage_w = embedded.width;
-        } else {
-            if (debug_cuda_session) std.log.info("florence: stage {d} conv embed start h={d} w={d}", .{ stage, stage_h, stage_w });
-            const conv_start = nowNs();
-            const embedded = try convEmbed(cb, allocator, config, stage, batch, pixel_values, stage_tokens, stage_h, stage_w);
-            if (profile) logFlorenceProfileStage("vision_stage_conv_embed", stage, conv_start);
-            if (debug_cuda_session) std.log.info("florence: stage {d} conv embed done h={d} w={d}", .{ stage, embedded.height, embedded.width });
-            if (stage_tokens) |old| allocator.free(old);
-            stage_tokens = embedded.tokens;
-            stage_h = embedded.height;
-            stage_w = embedded.width;
-        }
+        } else return error.MissingInputs;
 
         const depth: usize = config.depths[stage];
-        var hidden = if (hidden_for_stage) |tensor| tensor else blk: {
-            if (debug_cuda_session) std.log.info("florence: stage {d} tensor upload start depth={d}", .{ stage, depth });
-            const upload_start = nowNs();
-            const stage_shape = [_]i32{ @intCast(batch * stage_h * stage_w), @intCast(config.dim_embed[stage]) };
-            const tensor = try cb.fromFloat32Shape(stage_tokens.?, &stage_shape);
-            if (profile) logFlorenceProfileStage("vision_stage_upload", stage, upload_start);
-            allocator.free(stage_tokens.?);
-            stage_tokens = null;
-            break :blk tensor;
-        };
+        var hidden = hidden_for_stage orelse return error.MissingInputs;
         var hidden_owned = true;
         errdefer if (hidden_owned) cb.free(hidden);
 
@@ -1662,6 +2126,83 @@ fn convEmbedTensor(
         tokens = normed;
     }
 
+    return .{ .tensor = tokens, .height = out_h, .width = out_w };
+}
+
+/// Stage-zero patch embedding for the device-resident vision path. The
+/// normalized NCHW pixels are uploaded once; convolution output is reordered
+/// to token-major form on the backend and never materialized as a host f32
+/// array. At Florence's default 768px input this avoids a ~36 MiB host round
+/// trip per page before the first vision block.
+fn convEmbedImageTensor(
+    cb: *const ComputeBackend,
+    config: Config,
+    batch: usize,
+    pixel_values: []const f32,
+    input_h: usize,
+    input_w: usize,
+) !ConvEmbedTensorResult {
+    const stage: usize = 0;
+    const in_channels: usize = 3;
+    const out_channels: usize = config.dim_embed[stage];
+    const patch: usize = config.patch_size[stage];
+    const stride: usize = config.patch_stride[stage];
+    const padding: usize = config.patch_padding[stage];
+    const out_h = (input_h + 2 * padding - patch) / stride + 1;
+    const out_w = (input_w + 2 * padding - patch) / stride + 1;
+
+    const input_shape = [_]i32{
+        @intCast(batch),
+        @intCast(in_channels),
+        @intCast(input_h),
+        @intCast(input_w),
+    };
+    const input = try cb.fromFloat32Shape(pixel_values, &input_shape);
+    defer cb.free(input);
+    const conv = try cb.conv2d(
+        input,
+        try cb.getWeight("vision_tower.convs.0.proj.weight"),
+        try cb.getWeight("vision_tower.convs.0.proj.bias"),
+        batch,
+        in_channels,
+        out_channels,
+        input_h,
+        input_w,
+        patch,
+        patch,
+        stride,
+        stride,
+        padding,
+        padding,
+        1,
+    );
+    defer cb.free(conv);
+
+    const conv_shape = [_]i64{
+        @intCast(batch),
+        @intCast(out_channels),
+        @intCast(out_h),
+        @intCast(out_w),
+    };
+    const nhwc = try cb.primTranspose(conv, &.{ 0, 2, 3, 1 }, &conv_shape);
+    defer cb.free(nhwc);
+    const token_shape = [_]i64{
+        @intCast(batch * out_h * out_w),
+        @intCast(out_channels),
+    };
+    var tokens = try cb.primReshape(nhwc, &token_shape);
+    errdefer cb.free(tokens);
+    if (!config.patch_prenorm[stage]) {
+        const normed = try cb.layerNorm(
+            tokens,
+            try cb.getWeight("vision_tower.convs.0.norm.weight"),
+            try cb.getWeight("vision_tower.convs.0.norm.bias"),
+            out_channels,
+            1e-5,
+        );
+        cb.free(tokens);
+        tokens = normed;
+    }
     return .{ .tensor = tokens, .height = out_h, .width = out_w };
 }
 
@@ -2592,7 +3133,8 @@ fn decoderBlockIncrementalCached(
 
     const q_cross = try decoderLinearProj(cb, self_normed, layer, "encoder_attn.q_proj", batch, d_model, d_model, buf);
     defer cb.free(q_cross);
-    const cross_attn = try cb.crossAttention(q_cross, cache.cross.keys[layer], cache.cross.values[layer], cache.encoder_mask, batch, 1, cache.enc_seq, num_heads, head_dim);
+    const cross = cache.attentionCross();
+    const cross_attn = try cb.crossAttention(q_cross, cross.keys[layer], cross.values[layer], cache.encoder_mask, batch, 1, cache.enc_seq, num_heads, head_dim);
     defer cb.free(cross_attn);
     const cross_proj = try decoderLinearProj(cb, cross_attn, layer, "encoder_attn.out_proj", batch, d_model, d_model, buf);
     defer cb.free(cross_proj);

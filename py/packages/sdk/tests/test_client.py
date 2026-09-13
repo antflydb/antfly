@@ -35,8 +35,20 @@ from antfly.client_generated.models.graph_document_numeric_range_filter import (
 from antfly.client_generated.models.graph_document_term_filter import (  # noqa: E402
     GraphDocumentTermFilter,
 )
+from antfly.client_generated.models.graph_index_stats import GraphIndexStats  # noqa: E402
+from antfly.client_generated.models.graph_index_stats_index_type import GraphIndexStatsIndexType  # noqa: E402
 from antfly.client_generated.models.graph_match_node import GraphMatchNode  # noqa: E402
 from antfly.client_generated.models.graph_match_query import GraphMatchQuery  # noqa: E402
+from antfly.client_generated.models.graph_metric_build_page_status import GraphMetricBuildPageStatus  # noqa: E402
+from antfly.client_generated.models.graph_metric_build_page_status_range_kind import (
+    GraphMetricBuildPageStatusRangeKind,  # noqa: E402
+)
+from antfly.client_generated.models.graph_metric_query import GraphMetricQuery  # noqa: E402
+from antfly.client_generated.models.graph_metric_query_metric_freshness import (
+    GraphMetricQueryMetricFreshness,  # noqa: E402
+)
+from antfly.client_generated.models.graph_metric_runtime_stats import GraphMetricRuntimeStats  # noqa: E402
+from antfly.client_generated.models.graph_metric_runtime_stats_role import GraphMetricRuntimeStatsRole  # noqa: E402
 from antfly.client_generated.models.inference_chat_message import InferenceChatMessage  # noqa: E402
 from antfly.client_generated.models.inference_generate_request import InferenceGenerateRequest  # noqa: E402
 from antfly.client_generated.models.inference_role import InferenceRole  # noqa: E402
@@ -87,6 +99,19 @@ class TestAntflyClient:
             "MIN": "$min",
             "MAX": "$max",
         }
+
+    def test_graph_metric_summary_build_page_deserializes(self) -> None:
+        page = GraphMetricBuildPageStatus.from_dict(
+            {
+                "phase": "reduce_ranks",
+                "iteration": 2,
+                "page_id": 0,
+                "state": "complete",
+                "range_kind": "summary",
+            }
+        )
+
+        assert page.range_kind is GraphMetricBuildPageStatusRangeKind.SUMMARY
 
     def test_generated_create_index_request_is_discriminated_and_path_owned(self) -> None:
         request = CreateEmbeddingsIndexRequest(
@@ -196,6 +221,53 @@ class TestAntflyClient:
             normalize_base_url("https://platform.antfly.io/cloud/v1/instance/db/v1")
             == "https://platform.antfly.io/cloud/v1/instance"
         )
+
+    def test_graph_index_stats_model_serializes_metric_runtime(self) -> None:
+        stats = GraphIndexStats(
+            index_type=GraphIndexStatsIndexType.GRAPH,
+            total_edges=4,
+            graph_metric_runtime=GraphMetricRuntimeStats(
+                enabled=True,
+                role=GraphMetricRuntimeStatsRole.WORKER_POOL,
+                owner_id_hash=17,
+                worker_count=3,
+                takeover_count=2,
+                lost_leases=1,
+                total_pages_claimed=6,
+                last_pages_completed=3,
+                last_budget_exhausted=True,
+            ),
+        )
+
+        stats_dict = stats.to_dict()
+        assert stats_dict["graph_metric_runtime"]["role"] == "worker_pool"
+        assert stats_dict["graph_metric_runtime"]["owner_id_hash"] == 17
+        assert stats_dict["graph_metric_runtime"]["last_budget_exhausted"] is True
+
+        round_tripped = GraphIndexStats.from_dict(stats_dict)
+        assert isinstance(round_tripped.graph_metric_runtime, GraphMetricRuntimeStats)
+        assert round_tripped.graph_metric_runtime.role == GraphMetricRuntimeStatsRole.WORKER_POOL
+        assert round_tripped.graph_metric_runtime.worker_count == 3
+        assert round_tripped.graph_metric_runtime.total_pages_claimed == 6
+
+    def test_direct_graph_metric_query_round_trip(self) -> None:
+        query = GraphMetricQuery(
+            name="central",
+            index="graph_idx",
+            metric="pagerank",
+            top_k=25,
+            metric_freshness=GraphMetricQueryMetricFreshness.FRESH,
+        )
+
+        payload = query.to_dict()
+        assert payload == {
+            "name": "central",
+            "index": "graph_idx",
+            "metric": "pagerank",
+            "top_k": 25,
+            "metric_freshness": "fresh",
+        }
+        assert GraphMetricQuery.from_dict(payload) == query
 
     def test_response_limits_must_be_positive(self) -> None:
         with pytest.raises(ValueError, match="response byte limits must be positive"):

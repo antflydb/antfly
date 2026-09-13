@@ -18,6 +18,25 @@ There is no legacy-compatibility requirement for the existing many-step
 `zig build <finetune-tool>` surface. The refactor should optimize for the
 long-term shape, not alias preservation.
 
+## Status
+
+The unified dispatcher described in "Target CLI" below is implemented:
+`src/finetune/cli/root.zig` holds a `<domain, action, subject>` command table
+(`command_registry.zig` plus the table in `root.zig`) that routes to the
+existing tool `main()` functions, `src/main.zig` wires the top-level
+`finetune` command to it (`inference.finetune_cli.main`), and legacy
+`zig build <tool-name>` names still work as compatibility wrappers over the
+same table.
+
+The typed `Options`/`Result`/`run()` programmatic contract, the shared
+`RunContext`/`ArtifactWriter` types, and the deeper source reorganization
+into `core/`, `data/`, `adapters/`, `trainers/`, `families/`, and
+`workflows/` directories described below are still a target design, not
+implemented: `src/finetune/` today has only `cli/`, `eval/`, `test/`,
+`tools/`, `train/`, and `assets/` as real subdirectories, and model-family
+code (`gemma4.zig`, `gliner2.zig`, etc.) remains flat rather than split by
+responsibility. See "Open work" at the end.
+
 ## Current Problem
 
 Fine-tuning currently mixes several concerns:
@@ -80,10 +99,10 @@ antfly inference finetune dataset generate gemma4-pilot /tmp/pilot.jsonl --count
 antfly inference finetune dataset prepare gemma4-lora /models/gemma4 /tmp/pilot.jsonl train /tmp/prepared.json
 
 antfly inference finetune adapter bootstrap gemma4 /models/gemma4 /tmp/adapter --rank 16 --alpha 32 --target-preset all-linear
-antfly inference finetune train gemma4-lora /models/gemma4 /tmp/adapter /tmp/prepared.json /tmp/out --trainer autodiff --backend mlx
+antfly inference finetune train gemma4-lora /models/gemma4 /tmp/adapter /tmp/prepared.json /tmp/out --trainer autodiff --backend native
 antfly inference finetune adapter materialize gemma4 /models/gemma4 /tmp/out /tmp/merged
 
-antfly inference finetune workflow gemma4-pilot text /models/gemma4 /tmp/pilot-run --count 1000 --backend mlx
+antfly inference finetune workflow gemma4-pilot text /models/gemma4 /tmp/pilot-run --count 1000 --backend native
 antfly inference finetune workflow recursive-lora-smoke /models/gemma4 /tmp/recursive-smoke --count 16
 antfly inference finetune workflow gliner2-entity-cleanup-smoke /models/gliner2 /tmp/adapter train.jsonl eval.jsonl /tmp/out
 ```
@@ -94,16 +113,16 @@ Use this matrix as the PR gate for declaring the unified CLI production ready.
 
 | Family / Task | Dataset | Adapter | Train/Eval | Materialize | Required Backend Lane |
 | --- | --- | --- | --- | --- | --- |
-| Gemma4 text LoRA | prepare + teacher top-k | bootstrap/inspect | supervised, autodiff, recursive preference paths | LoRA merge + recursive base | native/BLAS CPU smoke, MLX optional |
-| Gemma4 multimodal LoRA | multimodal prepare + pilot generation | bootstrap/inspect | autodiff with image/audio embeddings | LoRA merge | native/BLAS CPU smoke, MLX optional |
+| Gemma4 text LoRA | prepare + teacher top-k | bootstrap/inspect | supervised, autodiff, recursive preference paths | LoRA merge + recursive base | native/BLAS CPU smoke |
+| Gemma4 multimodal LoRA | multimodal prepare + pilot generation | bootstrap/inspect | autodiff with image/audio embeddings | LoRA merge | native/BLAS CPU smoke |
 | ColQwen2 / Qwen2VL | multimodal prepared inputs | bootstrap/inspect | LoRA train/eval bundle | LoRA merge | native/BLAS CPU smoke |
-| Qwen3.5 / Chandra OCR text-only | text SFT/DPO/GRPO JSONL; dynamic image preparation pending | bootstrap/inspect | Qwen autodiff trainer for text SFT/DPO/GRPO | adapter save; merged materialization pending | native/BLAS CPU smoke required, MLX/Metal smoke pending |
+| Qwen3.5 / Chandra OCR text-only | text SFT/DPO/GRPO JSONL; dynamic image preparation pending | bootstrap/inspect | Qwen autodiff trainer for text SFT/DPO/GRPO | adapter save; merged materialization pending | native/BLAS CPU smoke required, Metal smoke pending |
 | GLiNER2 | dataset inspect + boundary caches | bootstrap/inspect | LoRA, autodiff, boundary heads | LoRA merge | native/BLAS CPU smoke |
 | LayoutLMv3 | document token/sequence data | bootstrap/inspect | token and sequence train/eval | checkpoint materialize | native/BLAS CPU smoke |
 | Reranker | dataset inspect + pooled/top-layer caches | bootstrap/inspect | head and LoRA surrogate paths | head and LoRA materialize | native/BLAS CPU smoke |
 | Fused chunker | dataset fixtures | n/a | train/eval roots | checkpoint output | native/BLAS CPU smoke |
 
-Optional lanes should prove MLX, Metal, PJRT, ONNX, and quantized export where
+Optional lanes should prove Metal, PJRT, ONNX, and quantized export where
 the model family actually supports them. Unsupported combinations must fail
 with explicit errors rather than falling back silently.
 
@@ -386,13 +405,14 @@ Use three tiers:
 Tests should call typed `run()` functions where possible. CLI tests should be
 limited to parser and dispatch behavior.
 
-## Migration Order
+## Open work
 
-Because there is no legacy support requirement, migrate toward the target
-surface directly:
+Because there is no legacy support requirement, the remaining migration can
+move toward the target surface directly:
 
-1. Add `src/finetune/core/run_context.zig`.
-2. Add `src/finetune/cli/root.zig` and wire `antfly inference finetune`.
+1. Add `src/finetune/core/run_context.zig` (the typed `RunContext`).
+2. ~~Add `src/finetune/cli/root.zig` and wire `antfly inference finetune`.~~ Done —
+   `src/finetune/cli/root.zig` is wired from `src/main.zig`.
 3. Convert the Gemma4 path first:
    - dataset generation
    - input preparation

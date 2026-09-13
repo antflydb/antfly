@@ -13,48 +13,59 @@
 // limitations under the License.
 
 const std = @import("std");
-const finetune = @import("inference_internal").finetune.gliner2;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-    defer args.deinit();
-    _ = args.next();
-
-    const model_dir = args.next() orelse return usageError();
-    const out_dir = args.next() orelse return usageError();
-    const rank_arg = args.next() orelse "16";
-    const alpha_arg = args.next() orelse "32";
-    const dropout_arg = args.next() orelse "0.1";
-    const base_model_name_or_path = args.next();
-
-    const rank = try std.fmt.parseUnsigned(usize, rank_arg, 10);
-    const alpha = try std.fmt.parseFloat(f32, alpha_arg);
-    const dropout = try std.fmt.parseFloat(f32, dropout_arg);
-
-    var summary = try finetune.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
-        .rank = rank,
-        .alpha = alpha,
-        .dropout = dropout,
-        .base_model_name_or_path = base_model_name_or_path,
-    });
-    defer finetune.freeBootstrapSummary(allocator, &summary);
-
-    const io = init.io;
-    const stdout = std.Io.File.stdout();
-    var buf: [4096]u8 = undefined;
-    var writer = stdout.writer(io, &buf);
-    try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
+    return Command(@import("inference_finetune_assets")).main(init);
 }
 
-fn usageError() error{InvalidArguments} {
-    std.debug.print(
-        \\usage: bootstrap-gliner2-lora <model_dir> <out_dir> [rank] [alpha] [dropout] [base_model_name_or_path]
-        \\example: bootstrap-gliner2-lora /tmp/gliner2-base /tmp/gliner2-lora 16 32 0.1 urchade/gliner2-base
-        \\
-    , .{});
-    return error.InvalidArguments;
+// Reuse the parser and implementation in the combined CLI without creating a
+// second instance of model/tensor types inside its inference module.
+pub fn Command(comptime assets: type) type {
+    return struct {
+        const finetune = assets.finetune.gliner2;
+
+        pub fn main(init: std.process.Init) !void {
+            const allocator = init.gpa;
+
+            var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+            defer args.deinit();
+            _ = args.next();
+
+            const model_dir = args.next() orelse return usageError();
+            const out_dir = args.next() orelse return usageError();
+            const rank_arg = args.next() orelse "16";
+            const alpha_arg = args.next() orelse "32";
+            const dropout_arg = args.next() orelse "0.1";
+            const base_model_name_or_path = args.next();
+
+            const rank = try std.fmt.parseUnsigned(usize, rank_arg, 10);
+            const alpha = try std.fmt.parseFloat(f32, alpha_arg);
+            const dropout = try std.fmt.parseFloat(f32, dropout_arg);
+
+            var summary = try finetune.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
+                .rank = rank,
+                .alpha = alpha,
+                .dropout = dropout,
+                .base_model_name_or_path = base_model_name_or_path,
+            });
+            defer finetune.freeBootstrapSummary(allocator, &summary);
+
+            const io = init.io;
+            const stdout = std.Io.File.stdout();
+            var buf: [4096]u8 = undefined;
+            var writer = stdout.writer(io, &buf);
+            try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
+            try writer.interface.writeByte('\n');
+            try writer.interface.flush();
+        }
+
+        fn usageError() error{InvalidArguments} {
+            std.debug.print(
+                \\usage: bootstrap-gliner2-lora <model_dir> <out_dir> [rank] [alpha] [dropout] [base_model_name_or_path]
+                \\example: bootstrap-gliner2-lora /tmp/gliner2-base /tmp/gliner2-lora 16 32 0.1 urchade/gliner2-base
+                \\
+            , .{});
+            return error.InvalidArguments;
+        }
+    };
 }

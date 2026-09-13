@@ -134,7 +134,7 @@ pub const ServerlessServer = struct {
 
     pub fn stopWithDeadline(self: *ServerlessServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         self.stopListenerWithDeadline(deadline);
-        self.stack.runtime.stop();
+        self.stack.runtime.stopWithDeadline(deadline);
     }
 
     pub fn baseUri(self: *ServerlessServer, alloc: std.mem.Allocator) ![]u8 {
@@ -170,6 +170,10 @@ pub const ServerlessServer = struct {
 
     pub fn listenerFailure(self: *const ServerlessServer) ?anyerror {
         return if (self.listener_task) |*task| task.runtimeFailure() else null;
+    }
+
+    pub fn runtimeFailure(self: *ServerlessServer) ?anyerror {
+        return self.stack.runtime.runtimeFailure();
     }
 
     pub fn httpRuntime(self: *ServerlessServer) *httpx.HttpRuntime {
@@ -852,6 +856,38 @@ test "serverless server public table graph routes stay pinned until publish cuto
     try std.testing.expectEqual(@as(u64, 2), traverse_after.value.version);
     try std.testing.expectEqual(@as(usize, 3), traverse_after.value.nodes.len);
     try std.testing.expectEqualStrings("doc-c", traverse_after.value.nodes[2].doc_id);
+
+    // Pending publication may be inadmissible (or even malformed). Serving the
+    // last pinned graph must not decode that tail just to compute freshness.
+    const pending_tip = try server.stack.wal.append("docs", 300, "invalid pending mutation");
+    var neighbors_pending = try tables.graphNeighbors(base_uri, "docs", .{
+        .doc_id = @constCast("doc-a"),
+        .direction = .out,
+        .limit = 10,
+    });
+    defer neighbors_pending.deinit();
+    try std.testing.expectEqual(@as(u64, 2), neighbors_pending.value.version);
+    try std.testing.expectEqual(pending_tip, neighbors_pending.value.latest_wal_lsn);
+    try std.testing.expectEqualStrings("doc-b", neighbors_pending.value.neighbors[0].doc_id);
+    var traverse_pending = try tables.graphTraverse(base_uri, "docs", .{
+        .start_doc_id = @constCast("doc-a"),
+        .direction = .out,
+        .max_depth = 3,
+        .limit = 10,
+        .include_start = true,
+    });
+    defer traverse_pending.deinit();
+    try std.testing.expectEqual(@as(usize, 3), traverse_pending.value.nodes.len);
+    try std.testing.expectEqual(pending_tip, traverse_pending.value.latest_wal_lsn);
+    var shortest_pending = try tables.graphShortestPath(base_uri, "docs", .{
+        .start_doc_id = @constCast("doc-a"),
+        .end_doc_id = @constCast("doc-c"),
+        .direction = .out,
+        .max_depth = 4,
+    });
+    defer shortest_pending.deinit();
+    try std.testing.expect(shortest_pending.value.found);
+    try std.testing.expectEqual(pending_tip, shortest_pending.value.latest_wal_lsn);
 }
 
 test "serverless server serves requests over env-configured s3 backend" {

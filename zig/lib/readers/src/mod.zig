@@ -17,11 +17,20 @@ const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
 const inference_api = @import("inference_api");
 const config = @import("antfly_reader_config");
+const data_uri = @import("antfly_scraping").data_uri;
+const antfly_image = @import("antfly_image");
 
 const Allocator = std.mem.Allocator;
 const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
 
-fn readHttpStatusError(status: u16) anyerror {
+fn responseCapabilityStale(response: httpx.Response) bool {
+    if (response.status.code != 409) return false;
+    const value = response.headers.get("X-Antfly-Capability-Stale") orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "true");
+}
+
+fn readHttpStatusError(status: u16, capability_stale: bool) anyerror {
+    if (status == 409 and capability_stale) return error.InferenceCapabilitiesStale;
     return if (status == 408 or status == 409 or status == 425 or status == 429 or status >= 500)
         error.ReadTransientFailure
     else
@@ -29,9 +38,11 @@ fn readHttpStatusError(status: u16) anyerror {
 }
 
 test "reader classifies retryable HTTP statuses" {
-    try std.testing.expect(readHttpStatusError(429) == error.ReadTransientFailure);
-    try std.testing.expect(readHttpStatusError(503) == error.ReadTransientFailure);
-    try std.testing.expect(readHttpStatusError(400) == error.ReadRequestFailed);
+    try std.testing.expect(readHttpStatusError(429, false) == error.ReadTransientFailure);
+    try std.testing.expect(readHttpStatusError(503, false) == error.ReadTransientFailure);
+    try std.testing.expect(readHttpStatusError(400, false) == error.ReadRequestFailed);
+    try std.testing.expect(readHttpStatusError(409, false) == error.ReadTransientFailure);
+    try std.testing.expect(readHttpStatusError(409, true) == error.InferenceCapabilitiesStale);
 }
 
 pub const Provider = config.Provider;
@@ -52,20 +63,142 @@ pub const Request = struct {
     /// Stable source fingerprint for opt-in inference profiling. Remote reader
     /// providers deliberately do not serialize this internal-only value.
     source_fingerprint: ?[]const u8 = null,
+    /// Route-owned hard response ceiling. Null delegates to the client-wide
+    /// ceiling for callers that do not participate in bounded orchestration.
+    max_response_bytes: ?usize = null,
 };
+
+/// Borrowed encoded image bytes for trusted in-process producers. This avoids
+/// converting renderer output to a data URI only to parse and decode it again.
+pub const EncodedImage = struct {
+    bytes: []const u8,
+    mime_type: []const u8,
+    /// Per-item provenance survives cross-document provider batches. These
+    /// fields are diagnostic identity, not model input.
+    item_id: []const u8 = "",
+    source_fingerprint: ?[]const u8 = null,
+    page_number: ?u32 = null,
+};
+
+pub const EncodedRequest = struct {
+    images: []const EncodedImage,
+    prompt: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    source_fingerprint: ?[]const u8 = null,
+    max_response_bytes: ?usize = null,
+};
+
+/// Task-neutral physical raster attachment specialized into a reader request.
+/// The underlying bytes and identity remain borrowed for this synchronous
+/// invocation and may not be retained by a provider.
+pub const RasterImage = antfly_image.BorrowedRasterAttachment;
+
+pub const RasterRequest = struct {
+    images: []const RasterImage,
+    prompt: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    source_fingerprint: ?[]const u8 = null,
+    max_response_bytes: ?usize = null,
+};
+
+pub fn validateRasterRequest(request: RasterRequest) !void {
+    if (request.images.len == 0) return error.ReadBatchTooLarge;
+    for (request.images) |image| try image.validate();
+}
+
+/// Validate the shared in-process encoded-image contract before execution
+/// mode selection. Keeping this here prevents embedded and standalone readers
+/// from accepting different requests.
+pub fn validateEncodedRequest(request: EncodedRequest) !void {
+    if (request.images.len == 0) return error.ReadBatchTooLarge;
+    for (request.images) |image| {
+        if (image.bytes.len == 0) return error.InvalidImageInput;
+        const mime_type = std.mem.trim(u8, image.mime_type, &std.ascii.whitespace);
+        if (mime_type.len != image.mime_type.len) return error.InvalidArguments;
+        const parsed = data_uri.parseMediaType(mime_type) catch return error.InvalidArguments;
+        if (!std.ascii.startsWithIgnoreCase(parsed.essence, "image/")) {
+            return error.InvalidArguments;
+        }
+    }
+}
+
+test "encoded reader validation is execution-mode independent" {
+    const bytes = [_]u8{1};
+    try std.testing.expectError(error.ReadBatchTooLarge, validateEncodedRequest(.{ .images = &.{} }));
+    try validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/png" }} });
+    try validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "IMAGE/PNG" }} });
+    try validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/png; charset=binary" }} });
+    try std.testing.expectError(
+        error.InvalidImageInput,
+        validateEncodedRequest(.{ .images = &.{.{ .bytes = &.{}, .mime_type = "image/png" }} }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "" }} }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "application/octet-stream" }} }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/png;" }} }),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        validateEncodedRequest(.{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/png; codecs=\"unterminated" }} }),
+    );
+}
 
 pub const Result = struct {
     text: []const u8,
     fields_json: ?[]const u8 = null,
     regions_json: ?[]const u8 = null,
+    item_id: []const u8 = "",
+    source_fingerprint: ?[]const u8 = null,
+    page_number: ?u32 = null,
 };
 
 pub fn deinitResult(alloc: Allocator, result: *Result) void {
     alloc.free(@constCast(result.text));
     if (result.fields_json) |value| alloc.free(@constCast(value));
     if (result.regions_json) |value| alloc.free(@constCast(value));
+    if (result.item_id.len > 0) alloc.free(@constCast(result.item_id));
+    if (result.source_fingerprint) |value| alloc.free(@constCast(value));
     result.* = undefined;
 }
+
+pub const BatchExecution = struct {
+    requested_items: usize = 0,
+    native_batches: usize = 0,
+    native_items: usize = 0,
+    serial_items: usize = 0,
+    fallback_items: usize = 0,
+    fallback_reason: ?[]const u8 = null,
+
+    pub fn validate(self: @This(), item_count: usize) !void {
+        const executed = std.math.add(usize, self.native_items, self.serial_items) catch
+            return error.InvalidReadExecutionReport;
+        if (self.requested_items != item_count or executed != item_count)
+            return error.InvalidReadExecutionReport;
+        if (self.fallback_items > self.serial_items) return error.InvalidReadExecutionReport;
+        if (self.native_items > 0 and self.native_batches == 0) return error.InvalidReadExecutionReport;
+        if (self.native_batches > self.native_items) return error.InvalidReadExecutionReport;
+        if (self.fallback_items == 0 and self.fallback_reason != null)
+            return error.InvalidReadExecutionReport;
+    }
+};
+
+pub const BatchResult = struct {
+    items: []Result,
+    execution: BatchExecution,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.items) |*item| deinitResult(alloc, item);
+        alloc.free(self.items);
+        self.* = undefined;
+    }
+};
 
 pub const Reader = struct {
     ptr: *anyopaque,
@@ -73,11 +206,18 @@ pub const Reader = struct {
 
     pub const VTable = struct {
         read: *const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result,
+        read_reported: ?*const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult = null,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
     pub fn read(self: Reader, alloc: Allocator, req: Request) ![]Result {
         return try self.vtable.read(self.ptr, alloc, req);
+    }
+
+    pub fn readReported(self: Reader, alloc: Allocator, req: Request) !BatchResult {
+        if (self.vtable.read_reported) |reported| return try reported(self.ptr, alloc, req);
+        const items = try self.read(alloc, req);
+        return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
     }
 
     pub fn deinit(self: Reader) void {
@@ -182,6 +322,7 @@ pub const Registry = struct {
     }
 
     pub fn registerConfig(self: *Registry, name: []const u8, cfg: Config) !void {
+        try cfg.validate();
         const key = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(key);
         const owned = try cloneConfig(self.allocator, cfg);
@@ -213,6 +354,8 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
         .max_tokens = cfg.max_tokens,
         .api_key = try dupOpt(alloc, cfg.api_key),
         .bearer_token = try dupOpt(alloc, cfg.bearer_token),
+        .capability_token = try dupOpt(alloc, cfg.capability_token),
+        .capability_revision = try dupOpt(alloc, cfg.capability_revision),
         .base_url = try dupOpt(alloc, cfg.base_url),
         .url = try dupOpt(alloc, cfg.url),
         .api_url = try dupOpt(alloc, cfg.api_url),
@@ -227,6 +370,8 @@ pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
     freeOpt(alloc, cfg.prompt);
     freeOpt(alloc, cfg.api_key);
     freeOpt(alloc, cfg.bearer_token);
+    freeOpt(alloc, cfg.capability_token);
+    freeOpt(alloc, cfg.capability_revision);
     freeOpt(alloc, cfg.base_url);
     freeOpt(alloc, cfg.url);
     freeOpt(alloc, cfg.api_url);
@@ -241,12 +386,53 @@ fn deinitConfigValue(alloc: Allocator, cfg: Config) void {
     deinitConfig(alloc, &owned);
 }
 
+pub const RemoteOptions = struct {
+    source_table: []const u8 = "",
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
+};
+
 fn initReader(alloc: Allocator, http: *httpx.Client, cfg: Config) !Reader {
+    return initReaderWithOptions(alloc, http, cfg, .{});
+}
+
+fn initReaderWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
+    try cfg.validate();
     return switch (cfg.provider) {
-        .antfly => try AntflyReaderState.init(alloc, http, cfg),
+        .antfly => try AntflyReaderState.init(alloc, http, cfg, options),
         .openai => try OpenAiReaderState.init(alloc, http, cfg),
         .vertex => try VertexReaderState.init(alloc, http, cfg),
     };
+}
+
+pub fn readWithConfigReported(
+    alloc: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    request: Request,
+    options: RemoteOptions,
+) !BatchResult {
+    const reader = try initReaderWithOptions(alloc, http, cfg, options);
+    defer reader.deinit();
+    return try reader.readReported(alloc, request);
+}
+
+/// Send trusted encoded image buffers to an Antfly inference node without
+/// materializing data URIs. The attachment envelope is task-neutral; the JSON
+/// metadata retains the public read request shape and uses reserved
+/// `attachment:<index>` URLs to bind each item to its borrowed binary payload.
+pub fn readEncodedWithConfigReported(
+    alloc: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    request: EncodedRequest,
+    options: RemoteOptions,
+) !BatchResult {
+    if (cfg.provider != .antfly) return error.UnsupportedReaderProvider;
+    const reader = try AntflyReaderState.init(alloc, http, cfg, options);
+    defer reader.deinit();
+    const state: *AntflyReaderState = @ptrCast(@alignCast(reader.ptr));
+    return try state.readEncodedReported(alloc, request);
 }
 
 const AntflyReaderState = struct {
@@ -254,25 +440,50 @@ const AntflyReaderState = struct {
     http: *httpx.Client,
     api_url: []const u8,
     auth_header: ?[2][]const u8 = null,
+    capability_token: ?[]const u8 = null,
+    capability_revision: ?[]const u8 = null,
+    source_table: ?[]u8 = null,
     model: []const u8,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 
-    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Reader {
+    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
         const state = try alloc.create(AntflyReaderState);
         errdefer alloc.destroy(state);
+        const api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080");
+        errdefer alloc.free(api_url);
+        const model = try alloc.dupe(u8, cfg.model orelse "");
+        errdefer alloc.free(model);
+        const prompt = try dupOpt(alloc, cfg.prompt);
+        errdefer freeOpt(alloc, prompt);
+        const capability_token = try dupOpt(alloc, cfg.capability_token);
+        errdefer freeOpt(alloc, capability_token);
+        const capability_revision = try dupOpt(alloc, cfg.capability_revision);
+        errdefer freeOpt(alloc, capability_revision);
+        const source_table = if (options.source_table.len > 0)
+            try alloc.dupe(u8, options.source_table)
+        else
+            null;
+        errdefer freeOpt(alloc, source_table);
         state.* = .{
             .alloc = alloc,
             .http = http,
-            .api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080"),
-            .model = try alloc.dupe(u8, cfg.model orelse ""),
-            .prompt = try dupOpt(alloc, cfg.prompt),
+            .api_url = api_url,
+            .model = model,
+            .prompt = prompt,
             .max_tokens = cfg.max_tokens,
+            .capability_token = capability_token,
+            .capability_revision = capability_revision,
+            .source_table = source_table,
+            .timeout_ms = options.timeout_ms,
+            .cancellation = options.cancellation,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
         }
-        return .{ .ptr = state, .vtable = &.{ .read = read, .deinit = deinit } };
+        return .{ .ptr = state, .vtable = &.{ .read = read, .read_reported = readReported, .deinit = deinit } };
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -281,6 +492,9 @@ const AntflyReaderState = struct {
         self.alloc.free(self.model);
         freeOpt(self.alloc, self.prompt);
         if (self.auth_header) |header| self.alloc.free(header[1]);
+        freeOpt(self.alloc, self.capability_token);
+        freeOpt(self.alloc, self.capability_revision);
+        freeOpt(self.alloc, self.source_table);
         self.alloc.destroy(self);
     }
 
@@ -290,6 +504,10 @@ const AntflyReaderState = struct {
     }
 
     fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
+        return (try readReported(ptr, alloc, req)).items;
+    }
+
+    fn readReported(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult {
         const self: *AntflyReaderState = @ptrCast(@alignCast(ptr));
         const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
         defer alloc.free(images);
@@ -305,14 +523,34 @@ const AntflyReaderState = struct {
 
         const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
         defer alloc.free(url);
-        var header_buf: [1][2][]const u8 = undefined;
-        const headers: []const [2][]const u8 = if (self.auth_header) |header| blk: {
-            header_buf[0] = header;
-            break :blk header_buf[0..];
-        } else &.{};
-        var resp = try self.http.post(url, .{ .json = body, .headers = headers });
+        var header_buf: [4][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (self.auth_header) |header| {
+            header_buf[header_count] = header;
+            header_count += 1;
+        }
+        if (self.source_table) |source_table| {
+            header_buf[header_count] = .{ "X-Antfly-Source-Table", source_table };
+            header_count += 1;
+        }
+        if (self.capability_token) |token| {
+            header_buf[header_count] = .{ "X-Antfly-Capability-Token", token };
+            header_count += 1;
+        }
+        if (self.capability_revision) |revision| {
+            header_buf[header_count] = .{ "X-Antfly-Capability-Revision", revision };
+            header_count += 1;
+        }
+        const headers = header_buf[0..header_count];
+        var resp = try self.http.post(url, .{
+            .json = body,
+            .headers = headers,
+            .timeout_ms = self.timeout_ms,
+            .max_response_size = req.max_response_bytes,
+            .cancellation = self.cancellation,
+        });
         defer resp.deinit();
-        if (!resp.ok()) return readHttpStatusError(resp.status.code);
+        if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
 
         const payload = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, alloc, payload, .{
@@ -322,7 +560,10 @@ const AntflyReaderState = struct {
         if (parsed.value.data.len != req.images.len) return error.InvalidReadResultCount;
 
         const out = try alloc.alloc(Result, req.images.len);
-        const assigned = try alloc.alloc(bool, req.images.len);
+        const assigned = alloc.alloc(bool, req.images.len) catch |err| {
+            alloc.free(out);
+            return err;
+        };
         defer alloc.free(assigned);
         @memset(assigned, false);
         errdefer {
@@ -349,9 +590,199 @@ const AntflyReaderState = struct {
             initialized += 1;
         }
         if (initialized != req.images.len) return error.InvalidReadResultCount;
-        return out;
+        return .{
+            .items = out,
+            .execution = try batchExecutionFromWire(parsed.value.execution, out.len),
+        };
+    }
+
+    fn readEncodedReported(self: *AntflyReaderState, alloc: Allocator, req: EncodedRequest) !BatchResult {
+        try validateEncodedRequest(req);
+        const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
+        defer alloc.free(images);
+        const attachment_urls = try alloc.alloc([]u8, req.images.len);
+        var url_count: usize = 0;
+        defer {
+            for (attachment_urls[0..url_count]) |value| alloc.free(value);
+            alloc.free(attachment_urls);
+        }
+        const attachments = try alloc.alloc(httpx.attachment_envelope.Attachment, req.images.len);
+        defer alloc.free(attachments);
+        for (req.images, 0..) |image, index| {
+            const attachment_url = try std.fmt.allocPrint(alloc, "attachment:{d}", .{index});
+            attachment_urls[index] = attachment_url;
+            url_count += 1;
+            images[index] = .{ .url = attachment_url };
+            attachments[index] = .{ .mime_type = image.mime_type, .data = image.bytes };
+        }
+        const metadata = try httpx.json.Json.stringify(alloc, inference_api.ReadRequest{
+            .model = self.model,
+            .images = images,
+            .prompt = req.prompt orelse self.prompt,
+            .max_tokens = req.max_tokens orelse self.max_tokens,
+        });
+        defer alloc.free(metadata);
+        var body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, metadata, attachments);
+        defer body.deinit();
+
+        const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
+        defer alloc.free(url);
+        var header_buf: [5][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (self.auth_header) |header| {
+            header_buf[header_count] = header;
+            header_count += 1;
+        }
+        if (self.source_table) |source_table| {
+            header_buf[header_count] = .{ "X-Antfly-Source-Table", source_table };
+            header_count += 1;
+        }
+        if (self.capability_token) |token| {
+            header_buf[header_count] = .{ "X-Antfly-Capability-Token", token };
+            header_count += 1;
+        }
+        if (self.capability_revision) |revision| {
+            header_buf[header_count] = .{ "X-Antfly-Capability-Revision", revision };
+            header_count += 1;
+        }
+        header_buf[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
+        header_count += 1;
+        var resp = try self.http.post(url, .{
+            .borrowed_body_segments = body.segments,
+            .headers = header_buf[0..header_count],
+            .timeout_ms = self.timeout_ms,
+            .max_response_size = req.max_response_bytes,
+            .cancellation = self.cancellation,
+        });
+        defer resp.deinit();
+        if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
+
+        const payload = resp.body orelse return error.EmptyResponse;
+        var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, alloc, payload, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        if (parsed.value.data.len != req.images.len) return error.InvalidReadResultCount;
+
+        const out = try alloc.alloc(Result, req.images.len);
+        const assigned = alloc.alloc(bool, req.images.len) catch |err| {
+            alloc.free(out);
+            return err;
+        };
+        defer alloc.free(assigned);
+        @memset(assigned, false);
+        errdefer {
+            for (out, assigned) |*item, was_assigned| if (was_assigned) deinitResult(alloc, item);
+            alloc.free(out);
+        }
+        var initialized: usize = 0;
+        for (parsed.value.data) |wire_item| {
+            if (wire_item.index < 0) return error.InvalidReadResultCount;
+            const result_index = std.math.cast(usize, wire_item.index) orelse return error.InvalidReadResultCount;
+            if (result_index >= req.images.len or assigned[result_index]) return error.InvalidReadResultCount;
+            const text = try alloc.dupe(u8, wire_item.text);
+            var owns_text = true;
+            errdefer if (owns_text) alloc.free(text);
+            const item_id = if (req.images[result_index].item_id.len > 0)
+                try alloc.dupe(u8, req.images[result_index].item_id)
+            else
+                "";
+            var owns_item_id = item_id.len > 0;
+            errdefer if (owns_item_id) alloc.free(@constCast(item_id));
+            const source_fingerprint = if (req.images[result_index].source_fingerprint) |value|
+                try alloc.dupe(u8, value)
+            else
+                null;
+            var owns_source_fingerprint = source_fingerprint != null;
+            errdefer if (owns_source_fingerprint) alloc.free(source_fingerprint.?);
+            var result = Result{
+                .text = text,
+                .fields_json = null,
+                .regions_json = null,
+                .item_id = item_id,
+                .source_fingerprint = source_fingerprint,
+                .page_number = req.images[result_index].page_number,
+            };
+            owns_text = false;
+            owns_item_id = false;
+            owns_source_fingerprint = false;
+            errdefer deinitResult(alloc, &result);
+            if (wire_item.fields) |fields| result.fields_json = try std.json.Stringify.valueAlloc(alloc, fields, .{});
+            if (wire_item.regions) |regions| result.regions_json = try std.json.Stringify.valueAlloc(alloc, regions, .{});
+            out[result_index] = result;
+            assigned[result_index] = true;
+            initialized += 1;
+        }
+        if (initialized != req.images.len) return error.InvalidReadResultCount;
+        return .{
+            .items = out,
+            .execution = try batchExecutionFromWire(parsed.value.execution, out.len),
+        };
     }
 };
+
+fn batchExecutionFromWire(wire: ?inference_api.BatchExecutionReport, item_count: usize) !BatchExecution {
+    const report = wire orelse return .{ .requested_items = item_count, .serial_items = item_count };
+    // Reader responses currently contain one successful item for every
+    // request. A nonzero rejected count would contradict that cardinality and
+    // must not disappear while adapting the shared wire report.
+    if (report.rejected_items != 0) return error.InvalidReadExecutionReport;
+    const execution = BatchExecution{
+        .requested_items = std.math.cast(usize, report.requested_items) orelse return error.InvalidReadExecutionReport,
+        .native_batches = std.math.cast(usize, report.native_batches) orelse return error.InvalidReadExecutionReport,
+        .native_items = std.math.cast(usize, report.native_items) orelse return error.InvalidReadExecutionReport,
+        .serial_items = std.math.cast(usize, report.serial_items) orelse return error.InvalidReadExecutionReport,
+        .fallback_items = std.math.cast(usize, report.fallback_items) orelse return error.InvalidReadExecutionReport,
+        .fallback_reason = if (report.fallback_items > 0) "remote_reader_fallback" else null,
+    };
+    try execution.validate(item_count);
+    return execution;
+}
+
+test "reader wire execution is observed, validated, and backward compatible" {
+    const legacy = try batchExecutionFromWire(null, 2);
+    try std.testing.expectEqual(@as(usize, 2), legacy.serial_items);
+
+    const native = try batchExecutionFromWire(.{
+        .requested_items = 2,
+        .native_batches = 1,
+        .native_items = 2,
+        .serial_items = 0,
+        .rejected_items = 0,
+        .fallback_items = 0,
+    }, 2);
+    try std.testing.expectEqual(@as(usize, 2), native.native_items);
+    try std.testing.expectEqual(@as(usize, 1), native.native_batches);
+
+    const mixed = try batchExecutionFromWire(.{
+        .requested_items = 2,
+        .native_batches = 1,
+        .native_items = 1,
+        .serial_items = 1,
+        .rejected_items = 0,
+        .fallback_items = 0,
+    }, 2);
+    try std.testing.expectEqual(@as(usize, 1), mixed.native_items);
+    try std.testing.expectEqual(@as(usize, 1), mixed.serial_items);
+
+    try std.testing.expectError(error.InvalidReadExecutionReport, batchExecutionFromWire(.{
+        .requested_items = 2,
+        .native_batches = 0,
+        .native_items = 0,
+        .serial_items = 1,
+        .rejected_items = 1,
+        .fallback_items = 0,
+    }, 2));
+
+    try std.testing.expectError(
+        error.InvalidReadExecutionReport,
+        (BatchExecution{ .requested_items = 1, .serial_items = 1 }).validate(2),
+    );
+    try std.testing.expectError(
+        error.InvalidReadExecutionReport,
+        (BatchExecution{ .requested_items = 2, .serial_items = 2, .fallback_reason = "impossible" }).validate(2),
+    );
+}
 
 const OpenAiReaderState = CloudReaderState(.openai);
 const VertexReaderState = CloudReaderState(.vertex);
@@ -486,9 +917,13 @@ fn CloudReaderState(comptime provider: Provider) type {
             var minted_auth: ?[]u8 = null;
             defer if (minted_auth) |value| alloc.free(value);
             try self.appendAuthHeaders(alloc, &headers, &minted_auth);
-            var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
+            var resp = try self.http.post(url, .{
+                .json = body,
+                .headers = headers.items,
+                .max_response_size = req.max_response_bytes,
+            });
             defer resp.deinit();
-            if (!resp.ok()) return readHttpStatusError(resp.status.code);
+            if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
             const Response = struct { choices: []const struct { message: struct { content: ?[]const u8 = null } } = &.{} };
             var parsed = try std.json.parseFromSlice(Response, alloc, resp.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
@@ -522,9 +957,13 @@ fn CloudReaderState(comptime provider: Provider) type {
             var minted_auth: ?[]u8 = null;
             defer if (minted_auth) |value| alloc.free(value);
             try self.appendAuthHeaders(alloc, &headers, &minted_auth);
-            var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
+            var resp = try self.http.post(url, .{
+                .json = body,
+                .headers = headers.items,
+                .max_response_size = req.max_response_bytes,
+            });
             defer resp.deinit();
-            if (!resp.ok()) return readHttpStatusError(resp.status.code);
+            if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
             const Response = struct {
                 candidates: []const struct {
                     content: struct {
@@ -585,7 +1024,7 @@ fn appendVertexTextPart(alloc: Allocator, parts: *std.json.Array, text: []const 
 fn appendVertexImagePart(alloc: Allocator, parts: *std.json.Array, url: []const u8) !void {
     var obj = std.json.ObjectMap.empty;
     errdefer obj.deinit(alloc);
-    if (std.mem.startsWith(u8, url, "data:")) {
+    if (data_uri.hasScheme(url)) {
         const parsed = parseDataUriImage(url) orelse return error.InvalidReaderConfig;
         var inline_data = std.json.ObjectMap.empty;
         errdefer inline_data.deinit(alloc);
@@ -607,13 +1046,11 @@ const DataUriImage = struct {
 };
 
 fn parseDataUriImage(url: []const u8) ?DataUriImage {
-    if (!std.mem.startsWith(u8, url, "data:")) return null;
-    const comma = std.mem.indexOfScalar(u8, url, ',') orelse return null;
-    const meta = url["data:".len..comma];
-    if (!std.mem.endsWith(u8, meta, ";base64")) return null;
-    const mime_type = meta[0 .. meta.len - ";base64".len];
-    if (mime_type.len == 0) return null;
-    return .{ .mime_type = mime_type, .data = url[comma + 1 ..] };
+    const parsed = (data_uri.parse(url) catch return null) orelse return null;
+    if (!parsed.has_explicit_media_type or parsed.encoding != .base64 or
+        !std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "image/")) return null;
+    _ = parsed.decodedSize() catch return null;
+    return .{ .mime_type = parsed.media_type_essence, .data = parsed.payload };
 }
 
 fn singleTextResult(alloc: Allocator, text: []const u8) ![]Result {

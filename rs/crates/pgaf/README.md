@@ -67,7 +67,7 @@ Create an Antfly-backed index on a text column:
 
 ```sql
 CREATE INDEX idx_content ON docs USING antfly (content)
-  WITH (url = 'http://localhost:8080/api/v1/', collection = 'my_docs');
+  WITH (url = 'http://localhost:8080/db/v1/', collection = 'my_docs');
 ```
 
 Query naturally — the planner uses the Antfly index:
@@ -82,7 +82,7 @@ The `@@@` operator delegates search to Antfly. On `CREATE INDEX`, the table is a
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `url` | `http://localhost:8080` | Antfly server URL (include `/api/v1/` prefix) |
+| `url` | `http://localhost:8080` | Antfly server URL. Include the `/db/v1/` prefix, e.g. `http://localhost:8080/db/v1/`; the bare default does not reach the API |
 | `collection` | table name | Target Antfly table |
 
 ### Query Builders
@@ -130,7 +130,7 @@ For cases where you need scores or want to join search results explicitly:
 SELECT t.*, s.score
 FROM my_table t
 JOIN antfly_search(
-    'http://localhost:8080/api/v1/',
+    'http://localhost:8080/db/v1/',
     'my_table',
     'fix my computer'
 ) s ON t.id = s.id
@@ -151,7 +151,7 @@ CREATE TRIGGER sync_to_antfly
   AFTER INSERT OR UPDATE OR DELETE ON my_table
   FOR EACH ROW
   EXECUTE FUNCTION antfly_sync_trigger(
-    'http://localhost:8080/api/v1/',  -- Antfly server URL
+    'http://localhost:8080/db/v1/',  -- Antfly server URL
     'my_table',                       -- target Antfly table
     'id'                              -- column to use as document ID
   );
@@ -160,7 +160,7 @@ CREATE TRIGGER sync_to_antfly
 ### Status Check
 
 ```sql
-SELECT antfly_status('http://localhost:8080/api/v1/');
+SELECT antfly_status('http://localhost:8080/db/v1/');
 ```
 
 ## Architecture
@@ -212,7 +212,7 @@ make test
 make test-e2e
 
 # Or manually point at a running server
-ANTFLY_TEST_URL=http://localhost:8080/api/v1/ cargo pgrx test pg18
+ANTFLY_TEST_URL=http://localhost:8080/db/v1/ cargo pgrx test pg18
 ```
 
 The e2e tests check the `ANTFLY_TEST_URL` environment variable and skip automatically when no server is available.

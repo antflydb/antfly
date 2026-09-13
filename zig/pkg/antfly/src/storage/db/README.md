@@ -45,7 +45,7 @@ store keyspace and are the authoritative DB-level replay surface.
 The remaining future step is not more DB-layer replay work; it is collapsing
 any remaining backend-native recovery-only differences into the replay-row
 surface where that is meaningfully different.
-  - `derived_executor.zig`, `async_runtime.zig`, `io_threaded_runtime.zig`: worker backends and runtime abstraction.
+  - `derived_executor.zig`, `runtime_types.zig`, `io_threaded_runtime.zig`: worker backends and runtime abstraction.
   - `apply_state.zig`: per-index applied watermark persistence.
 - `enrichment/`
   Generated enrichment pipeline and reusable artifact logic.

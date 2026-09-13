@@ -1,0 +1,50 @@
+{
+  "schema": "antfly.pdf.qualification_plan.v1",
+  "artifacts": {
+    "binary": "${binary}",
+    "models": "${models}",
+    "oracle": "${oracle}"
+  },
+  "limitations": [
+    "Local artifact hashes are inventory, not attestation of a remote serving process. Retain deployment/backend evidence separately.",
+    "Qwen's existing oracle gates and added request isolation do not prove physical native fusion.",
+    "This plan qualifies only the Qwen embedding gate; no PDF or other model family coverage is implied."
+  ],
+  "gates": [
+    {
+      "id": "qwen3-metal",
+      "layer": "model",
+      "kind": "hardware",
+      "scope": "Existing Qwen3 Metal-lane precision/oracle/retrieval/MRL/batch gates plus bounded cross-request role and dimension isolation.",
+      "artifacts": [
+        "binary",
+        "models",
+        "oracle"
+      ],
+      "command": [
+        "${python}",
+        "${repo}/zig/pkg/inference/scripts/qwen3_embedding/qualify_qwen3_embedding_metal.py",
+        "--oracle",
+        "${oracle}",
+        "--base-url",
+        "${base_url}",
+        "--model",
+        "${model}",
+        "--tier",
+        "${tier}",
+        "--concurrency",
+        "4",
+        "--concurrent-rounds",
+        "2",
+        "--report",
+        "${run}/native.json"
+      ],
+      "report": {
+        "path": "${run}/native.json",
+        "schema": "antfly.qwen3_embedding.metal_qualification.v1",
+        "pass_field": "pass"
+      },
+      "timeout_seconds": 3600
+    }
+  ]
+}

@@ -249,6 +249,35 @@ const v1_manifest_encoded = [_]u8{
     0x30, 0x30, 0x31, 0x2e, 0x73, 0x73, 0x74,
 };
 
+/// Validate every checked-in v1 HA artifact through the current production
+/// decoders and require the current encoders to reproduce the golden bytes.
+/// Upgrade campaigns call this as one atomic compatibility audit; the focused
+/// tests below retain per-artifact failure names.
+pub fn validateV1Fixtures(alloc: std.mem.Allocator) !void {
+    try requireRecordEqual(v1_record, try replication_record.decode(&v1_encoded));
+    try requireRecordEqual(v1_timeline_switch_record, try replication_record.decode(&v1_timeline_switch_encoded));
+    try requireRecordEqual(v1_backup_start_record, try replication_record.decode(&v1_backup_start_encoded));
+    try requireRecordEqual(v1_checkpoint_record, try replication_record.decode(&v1_checkpoint_encoded));
+
+    inline for (.{
+        .{ v1_record, &v1_encoded },
+        .{ v1_timeline_switch_record, &v1_timeline_switch_encoded },
+        .{ v1_backup_start_record, &v1_backup_start_encoded },
+        .{ v1_checkpoint_record, &v1_checkpoint_encoded },
+    }) |fixture| {
+        const encoded = try replication_record.encodeAlloc(alloc, fixture[0]);
+        defer alloc.free(encoded);
+        if (!std.mem.eql(u8, encoded, fixture[1])) return error.HaV1RecordEncodingChanged;
+    }
+
+    const decoded_manifest = try backup_manifest.decodeAlloc(alloc, &v1_manifest_encoded);
+    defer backup_manifest.freeDecoded(alloc, decoded_manifest);
+    try requireManifestEqual(v1_manifest, decoded_manifest);
+    const encoded_manifest = try backup_manifest.encodeAlloc(alloc, v1_manifest);
+    defer alloc.free(encoded_manifest);
+    if (!std.mem.eql(u8, encoded_manifest, &v1_manifest_encoded)) return error.HaV1ManifestEncodingChanged;
+}
+
 test "storage.ha compat decodes v1 replication record fixture" {
     const decoded = try replication_record.decode(&v1_encoded);
 
@@ -346,6 +375,21 @@ fn expectRecordEqual(expected: replication_record.Record, actual: replication_re
     try std.testing.expectEqualStrings(expected.payload, actual.payload);
 }
 
+fn requireRecordEqual(expected: replication_record.Record, actual: replication_record.RecordView) !void {
+    if (expected.kind != actual.kind or
+        expected.payload_codec != actual.payload_codec or
+        expected.flags != actual.flags or
+        expected.cluster_id != actual.cluster_id or
+        expected.shard_id != actual.shard_id or
+        expected.table_id != actual.table_id or
+        expected.timeline_id != actual.timeline_id or
+        expected.epoch != actual.epoch or
+        expected.lsn != actual.lsn or
+        expected.previous_lsn != actual.previous_lsn or
+        expected.commit_timestamp_ns != actual.commit_timestamp_ns or
+        !std.mem.eql(u8, expected.payload, actual.payload)) return error.HaV1RecordChanged;
+}
+
 fn expectManifestEqual(expected: backup_manifest.Manifest, actual: backup_manifest.ManifestView) !void {
     try std.testing.expectEqual(expected.identity.cluster_id, actual.identity.cluster_id);
     try std.testing.expectEqual(expected.identity.shard_id, actual.identity.shard_id);
@@ -365,5 +409,25 @@ fn expectManifestEqual(expected: backup_manifest.Manifest, actual: backup_manife
         try std.testing.expectEqual(expected_file.size_bytes, actual_file.size_bytes);
         try std.testing.expectEqual(expected_file.crc32, actual_file.crc32);
         try std.testing.expectEqual(expected_file.flags, actual_file.flags);
+    }
+}
+
+fn requireManifestEqual(expected: backup_manifest.Manifest, actual: backup_manifest.ManifestView) !void {
+    if (expected.identity.cluster_id != actual.identity.cluster_id or
+        expected.identity.shard_id != actual.identity.shard_id or
+        expected.identity.table_id != actual.identity.table_id or
+        expected.identity.timeline_id != actual.identity.timeline_id or
+        expected.identity.epoch != actual.identity.epoch or
+        !std.mem.eql(u8, expected.manifest_id, actual.manifest_id) or
+        expected.backup_lsn != actual.backup_lsn or
+        expected.checkpoint_lsn != actual.checkpoint_lsn or
+        expected.flags != actual.flags or
+        expected.files.len != actual.files.len) return error.HaV1ManifestChanged;
+    for (expected.files, actual.files) |expected_file, actual_file| {
+        if (!std.mem.eql(u8, expected_file.path, actual_file.path) or
+            expected_file.kind != actual_file.kind or
+            expected_file.size_bytes != actual_file.size_bytes or
+            expected_file.crc32 != actual_file.crc32 or
+            expected_file.flags != actual_file.flags) return error.HaV1ManifestChanged;
     }
 }

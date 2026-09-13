@@ -38,6 +38,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import shutil
@@ -62,6 +63,59 @@ pytest_plugins = ("e2e_scheduler",)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
+
+
+def publication_retry_delay(
+    response: requests.Response | None, interval_s: float
+) -> float | None:
+    """Retry only explicit publication contention, never arbitrary server errors.
+
+    The current runtime emits Retry-After delta-seconds for temporary authority
+    failures. A 503 without that signal (e.g. missing source resolution) needs
+    intervention. This policy must not be applied to document mutation POSTs.
+    """
+    if response is None:
+        return None
+    if response.status_code == 409:
+        return interval_s
+    if response.status_code != 503:
+        return None
+    retry_after = response.headers.get("Retry-After", "").strip()
+    if not re.fullmatch(r"[0-9]+", retry_after):
+        return None
+    return max(interval_s, float(retry_after))
+
+
+def finish_create_table(api, table_name: str, response, *, timeout_s: float = 30.0):
+    """Resolve a committed create by observation, never by replaying its POST."""
+    created = api._check(response)
+    api._created_tables.add(table_name)
+    if response.status_code != 202:
+        return created
+    status = created.get("status")
+    if status not in ("committed_visibility_pending", "committed_repair_required"):
+        raise AssertionError(
+            f"Table create needs intervention: {table_name}: {created}"
+        )
+    deadline = time.monotonic() + timeout_s
+    last = created
+    while time.monotonic() < deadline:
+        observed = api._request("GET", f"/tables/{table_name}")
+        if observed.status_code == 200:
+            last = api._check(observed)
+            if (last.get("name") or last.get("table_name")) == table_name:
+                return last
+        elif observed.status_code not in (404, 500, 503):
+            api._check(observed)
+            raise AssertionError(
+                f"Unexpected table observation: {observed.status_code}"
+            )
+        time.sleep(0.1)
+    raise AssertionError(
+        f"Committed table create did not become visible: {table_name}: {last}"
+    )
+
+
 E2E_BACKUP_CONNECTION = "e2e-backups"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
@@ -1233,12 +1287,12 @@ class StatefulAntflyServer:
 def require_standalone_storage_headroom(root: Path) -> None:
     """Fail before launch when production disk admission cannot run fixtures.
 
-    Match storage/resource_manager.zig's default max(1 GiB, capacity/20)
+    Match storage/resource_manager.zig's max(1 GiB, min(capacity/20, 16 GiB))
     safety floor, plus 256 MiB for the small local fixtures. This is a test
     environment requirement, not an override of the server's disk guard.
     """
     usage = shutil.disk_usage(root)
-    safety_floor = max(1024**3, usage.total // 20)
+    safety_floor = max(1024**3, min(usage.total // 20, 16 * 1024**3))
     required = safety_floor + 256 * 1024**2
     if usage.free < required:
         raise RuntimeError(
@@ -1501,6 +1555,52 @@ class PdfOcrE2EServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith(f"{INFERENCE_PUBLIC_API_ROOT}/models?"):
+                    body = json.dumps(
+                        {
+                            "readers": {
+                                "antflydb/Florence-2-base": {
+                                    "inputs": ["text", "image"],
+                                    "inference_capabilities": {
+                                        "version": 4,
+                                        "task": "read",
+                                        "input_modalities": ["text", "image"],
+                                        "accepted_mime_types": [
+                                            "image/png",
+                                            "image/jpeg",
+                                        ],
+                                        "input_granularity": "page",
+                                        "output": "read_result",
+                                        "result_cardinality": "one_per_item",
+                                        "prompt_policy": "explicit",
+                                        "borrowed_attachments": False,
+                                        "task_limits": {
+                                            "max_text_bytes_per_item": 65536,
+                                            "max_input_tokens_per_item": 4096,
+                                            "max_output_tokens_per_item": 4096,
+                                            "max_candidates_per_request": None,
+                                            "max_schema_bytes": None,
+                                        },
+                                        "batch": {
+                                            "mode": "native",
+                                            "preferred_items": 8,
+                                            "max_items": 8,
+                                            "max_encoded_media_bytes": 67108864,
+                                            "max_decoded_pixels": 32000000,
+                                            "max_media_parts_per_item": 1,
+                                            "per_item_failures": False,
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if self.path == "/fixtures/two-page.pdf":
                     pdf = outer._pdf
                 elif self.path == "/fixtures/form-xobject-text.pdf":
@@ -2111,6 +2211,12 @@ class InferenceEmbeddingServer:
                     f"{INFERENCE_PUBLIC_API_ROOT}/embed",
                     f"{INFERENCE_PUBLIC_API_ROOT}/embeddings",
                 ):
+                    # Match the inference API's optional, non-nullable strings.
+                    # Permissive fixtures previously hid invalid database requests.
+                    for field in ("task_type", "instruction"):
+                        if field in payload and not isinstance(payload[field], str):
+                            self.send_error(400, f"{field} must be a string")
+                            return
                     model = payload.get("model", "")
                     is_dimension_probe = (
                         "antfly embedding dimension probe"
@@ -2353,12 +2459,12 @@ def serverless_api(serverless_runtime):
                 raise requests.HTTPError(message, response=response)
             return response.json()
 
-        def get(self, path: str) -> dict:
-            return self._check(self.s.get(f"{self.url}{path}", timeout=10))
+        def get(self, path: str, *, timeout_s: float = 10.0) -> dict:
+            return self._check(self.s.get(f"{self.url}{path}", timeout=timeout_s))
 
-        def post(self, path: str, payload: dict) -> dict:
+        def post(self, path: str, payload: dict, *, timeout_s: float = 10.0) -> dict:
             return self._check(
-                self.s.post(f"{self.url}{path}", json=payload, timeout=10)
+                self.s.post(f"{self.url}{path}", json=payload, timeout=timeout_s)
             )
 
         def put(self, path: str, payload: dict) -> dict:
@@ -2456,24 +2562,37 @@ def serverless_api(serverless_runtime):
         def build_table(
             self, table_name: str, *, timeout_s: float = 10.0, interval_s: float = 0.1
         ) -> dict:
+            if not math.isfinite(timeout_s) or timeout_s <= 0:
+                raise ValueError("publication timeout must be finite and positive")
+            if not math.isfinite(interval_s) or interval_s <= 0:
+                raise ValueError("publication interval must be finite and positive")
             deadline = time.monotonic() + timeout_s
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Publication deadline expired: {table_name}")
                 try:
                     return self.post(
-                        antfly_internal_api_path(f"/tables/{table_name}/build"), {}
+                        antfly_internal_api_path(f"/tables/{table_name}/build"),
+                        {},
+                        timeout_s=min(10.0, remaining),
                     )
                 except requests.HTTPError as exc:
-                    if (
-                        exc.response is None
-                        or exc.response.status_code != 409
-                        or time.monotonic() >= deadline
-                    ):
+                    delay = publication_retry_delay(exc.response, interval_s)
+                    # Never retry earlier than requested or give each attempt
+                    # a fresh timeout. Preserve the last HTTP error on expiry.
+                    if delay is None or delay >= deadline - time.monotonic():
                         raise
-                    time.sleep(interval_s)
+                    time.sleep(delay)
+                    if time.monotonic() >= deadline:
+                        raise
 
-        def table_build_status(self, table_name: str) -> dict:
+        def table_build_status(
+            self, table_name: str, *, timeout_s: float = 10.0
+        ) -> dict:
             return self.get(
-                antfly_internal_api_path(f"/tables/{table_name}/build-status")
+                antfly_internal_api_path(f"/tables/{table_name}/build-status"),
+                timeout_s=timeout_s,
             )
 
         def batch_table(
@@ -2888,8 +3007,11 @@ def stateful_api(request: pytest.FixtureRequest):
             num_shards: int = 1,
             description: str | None = None,
             indexes: dict[str, dict] | None = None,
+            storage: dict[str, str] | None = None,
         ) -> dict:
             payload: dict[str, object] = {"num_shards": num_shards}
+            if storage is not None:
+                payload["storage"] = storage
             if description is not None:
                 payload["description"] = description
             if indexes is not None:
@@ -2907,9 +3029,7 @@ def stateful_api(request: pytest.FixtureRequest):
                     time.sleep(0.1)
                     continue
                 if response.status_code not in (404, 500):
-                    created = self._check(response)
-                    self._created_tables.add(table_name)
-                    return created
+                    return finish_create_table(self, table_name, response)
                 if time.monotonic() >= deadline:
                     return self._check(response)
                 time.sleep(0.1)
@@ -3467,9 +3587,7 @@ def backup_api(request: pytest.FixtureRequest):
                     time.sleep(0.1)
                     continue
                 if response.status_code not in (404, 500):
-                    created = self._check(response)
-                    self._created_tables.add(table_name)
-                    return created
+                    return finish_create_table(self, table_name, response)
                 if time.monotonic() >= deadline:
                     return self._check(response)
                 time.sleep(0.1)
@@ -3777,20 +3895,30 @@ def table_api(request):
             if self.backend == "stateful":
                 return None
             deadline = time.monotonic() + timeout_s
-            while True:
+            while (remaining := deadline - time.monotonic()) > 0:
                 try:
-                    self.raw.build_table(table_name)
+                    self.raw.build_table(
+                        table_name, timeout_s=remaining, interval_s=interval_s
+                    )
                 except requests.HTTPError as exc:
-                    assert exc.response is not None
-                    if exc.response.status_code != 409:
+                    if publication_retry_delay(exc.response, interval_s) is None:
                         raise
-                status = self.raw.table_build_status(table_name)
+                    # The inner retry loop has exhausted this same deadline
+                    # (or Retry-After exceeds it). Do not restart its budget.
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                status = self.raw.table_build_status(
+                    table_name, timeout_s=min(10.0, remaining)
+                )
                 ready = ready_serverless_build_status(status)
                 if ready is not None:
                     return ready
                 if time.monotonic() >= deadline:
                     return None
-                time.sleep(interval_s)
+                time.sleep(max(0.0, min(interval_s, deadline - time.monotonic())))
+            return None
 
         def query_table(self, table_name: str, payload: dict) -> dict:
             if self.backend == "serverless":

@@ -2820,11 +2820,16 @@ test "coordinator serializes concurrent acquire and release" {
 
     var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
     defer coordinator.deinit();
-    var threads: [4]std.Thread = undefined;
-    for (&threads) |*thread| {
-        thread.* = try std.Thread.spawn(.{}, Worker.run, .{&coordinator});
+    var threads: [4]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
     }
-    for (&threads) |*thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.testing.io.concurrent(Worker.run, .{&coordinator});
+        started_tasks += 1;
+    }
+    for (&threads) |*thread| thread.await(std.testing.io);
 
     const state = coordinator.snapshot();
     try std.testing.expectEqual(@as(usize, 0), state.active_units);

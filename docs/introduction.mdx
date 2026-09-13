@@ -1,0 +1,42 @@
+---
+title: Introduction
+description: What Antfly is, what it is built from, and where to start
+sidebar: getting-started
+order: 1
+---
+
+<Questions>
+- What is Antfly?
+- What can I build with Antfly?
+- Where do I start?
+</Questions>
+
+Antfly is a database with the retrieval pipeline built in. A table can carry full-text, vector, and graph indexes at the same time, and the models that chunk, embed, rerank, and extract run inside the engine. You insert documents and query them; there is no separate pipeline to assemble around the database. It runs as a single binary on a laptop, as a cluster on Kubernetes, or hosted in [Antfly Cloud](/cloud).
+
+## What You Can Build
+
+Each of these has a guide that ends with the finished thing running:
+
+- A [support answer agent](/docs/guides/support-answer-agent) that answers from your help articles with sources, and stays quiet when it has no evidence
+- [Search and AI answers on your site](/docs/guides/site-search-and-answers): live results with facets and a streaming answer box, on one table
+- [Ticket routing](/docs/guides/ticket-routing) that streams new tickets out of PostgreSQL and assigns each a team by the resolved tickets it most resembles
+- [Retrieval for a coding copilot](/docs/guides/coding-copilot-retrieval): exact symbol lookups and intent questions over a repo index, returned as a context block sized to the model's budget
+- [Image search](/docs/guides/quickstart#image-search) and [RAG](/docs/guides/quickstart#rag-retrieval-augmented-generation) over a corpus, both covered in the Quickstart
+- An [n8n AI Agent](/docs/guides/n8n) that answers from an Antfly table over hosted MCP, with no application code in between
+
+## Inside the Engine
+
+- **One engine, several indexes.** `full_text` (BM25), `embeddings` (vector, RaBitQ-compressed), and `graph` (traversal and pathfinding) are index types on the same table and are fused in one query plan. The [Document Engine](/docs/guides/document-engine) page covers how mappings, search modes, filters, sorting, and pagination compose.
+- **Inference inside the engine.** Chunking, embedding, reranking, summarization, and entity extraction run as background enrichers and query processors on [Antfly Inference](/docs/guides/inference), which loads quantized models into the same process. Ollama, OpenAI, and AWS Bedrock plug in as index embedders through the same configuration.
+- **Any shape of data.** Text, PDFs (with local OCR when needed), images, and audio, referenced by URL or inserted directly, embedded by native models or with vectors your application manages. See [Multimodal Embeddings](/docs/guides/multimodal).
+- **Built for agents.** Streaming RAG, retrieval and query-builder agents, evaluation metrics, and an MCP surface, plus an [agent skill](https://github.com/antflydb/antfly-skills) that teaches a coding agent the whole API.
+- **Distributed by design.** Multi-Raft consensus, horizontal sharding with online splitting, cross-shard write transactions, and a Kubernetes [operator](/docs/operator) with autoscaling. [Architecture](/docs/architecture) explains how the pieces fit.
+- **Local-first too.** [Antfly Lite](/docs/guides/lite) embeds the engine in a single `.aflite` file for desktop and edge applications.
+
+## Where to Start
+
+- The [Quickstart](/docs/guides/quickstart) installs Antfly, loads 10,000 Wikipedia articles, and walks through full-text, semantic, hybrid, image search, and RAG, with every step in the CLI, cURL, TypeScript, Python, and Go
+- [Downloads](/docs/downloads) has the install script, binaries for every platform, checksums, and a Docker Compose file
+- [Antfly Cloud](/docs/cloud) if you would rather not run it yourself
+- [SDKs](/docs/sdks) for Go, TypeScript, Python, and Rust
+- The [API reference](/docs/api) for the CLI and REST surface

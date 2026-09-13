@@ -65,7 +65,7 @@ pub const LazyWeightEntry = struct {
     pin_count: usize = 0,
     pending_prefetch: bool = false,
     prefetch_score: u64 = 0,
-    guard: ?*std.atomic.Mutex = null,
+    guard: ?prefetch_mod.LockHandle = null,
     placement: PlacementPlan = .{
         .class = .other,
         .preferred_tier = .host,
@@ -255,7 +255,7 @@ pub fn installPrefetchQueue(
     data.prefetch_initialized = true;
     var it = data.lazy_weights.iterator();
     while (it.next()) |entry| {
-        entry.value_ptr.guard = data.prefetch.mutexPtr();
+        entry.value_ptr.guard = data.prefetch.lockHandle();
     }
 }
 
@@ -267,8 +267,13 @@ pub fn stopPrefetchWorker(data: *WeightStore) void {
     data.prefetch.stop();
 }
 
+/// Stops the worker and retires borrowed guards. Call before destroying
+/// lazy_weights, whose entries still refer to this queue's Io and mutex.
 pub fn deinitPrefetchQueue(data: *WeightStore) void {
     if (!data.prefetch_initialized) return;
+    data.prefetch.stop();
+    var lazy_it = data.lazy_weights.iterator();
+    while (lazy_it.next()) |entry| entry.value_ptr.guard = null;
     data.prefetch.deinit();
     data.prefetch_initialized = false;
 }

@@ -105,6 +105,10 @@ fn applyIncludePattern(
     try applyIncludeRecursive(alloc, src, dst, path.items, 0);
 }
 
+pub fn applyIncludePath(alloc: Allocator, src: std.json.ObjectMap, dst: *std.json.ObjectMap, parts: []const []const u8) Allocator.Error!void {
+    return applyIncludeRecursive(alloc, src, dst, parts, 0);
+}
+
 fn applyIncludeRecursive(
     alloc: Allocator,
     src: std.json.ObjectMap,

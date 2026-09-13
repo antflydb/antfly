@@ -167,7 +167,7 @@ func TestReconcileStatefulSetFollowsScaleToZeroActivation(t *testing.T) {
 			UID:       types.UID("cold-pool"),
 		},
 		Spec: antflyaiv1alpha1.InferencePoolSpec{
-			Models:      antflyaiv1alpha1.ModelConfig{Preload: []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}}},
+			Models:      antflyaiv1alpha1.ModelConfig{Preload: []antflyaiv1alpha1.ModelSpec{{Name: "test-model", Tasks: []string{"generate"}}}},
 			Replicas:    antflyaiv1alpha1.ReplicaConfig{Min: 0, Max: 1},
 			ScaleToZero: &antflyaiv1alpha1.ScaleToZeroConfig{Enabled: true, IdleTimeout: &idle},
 		},
@@ -225,7 +225,7 @@ func baseAutoscaledInferencePool() *antflyaiv1alpha1.InferencePool {
 		Spec: antflyaiv1alpha1.InferencePoolSpec{
 			WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 			Models: antflyaiv1alpha1.ModelConfig{
-				Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}},
+				Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model", Tasks: []string{"generate"}}},
 				LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 			},
 			Replicas: antflyaiv1alpha1.ReplicaConfig{

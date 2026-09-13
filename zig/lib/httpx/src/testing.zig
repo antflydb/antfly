@@ -35,6 +35,14 @@ pub const ResponseSpec = struct {
     status: u16 = 200,
     body: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
+    /// Delay the response on the borrowed `std.Io` clock. This is logical time
+    /// under VoprIo and wall time under Threaded.
+    delay_ns: u64 = 0,
+    /// Advertise the complete body length but close after this many bytes.
+    /// Useful for deterministic truncated-response campaigns.
+    truncate_body_at: ?usize = null,
+    /// Accept and read the request, then close without writing a response.
+    disconnect_before_response: bool = false,
 };
 
 pub const HeaderPair = struct {
@@ -44,7 +52,12 @@ pub const HeaderPair = struct {
 
 pub const RequestInfo = struct {
     method: types.Method,
+    /// Complete HTTP request target exactly as received.
+    target: []const u8,
+    /// Path component used for route matching (never includes `?query`).
     path: []const u8,
+    /// Query string without the leading `?`, or an empty slice.
+    query: []const u8,
     headers: []const HeaderPair,
     body: []const u8,
 
@@ -62,6 +75,10 @@ pub const Route = struct {
     path: []const u8,
     respond: ResponseSpec = .{},
     assert_request: ?*const fn (RequestInfo) anyerror!void = null,
+    /// Maximum times this route may match. `null` means unlimited. Multiple
+    /// routes with the same method/path can therefore express a response
+    /// sequence such as 503 followed by success.
+    max_uses: ?usize = null,
 };
 
 /// A lightweight test server that listens on an ephemeral port and
@@ -72,6 +89,7 @@ pub const TestServer = struct {
     listener: TcpListener,
     port: u16,
     routes: []const Route,
+    route_hits: []usize,
     base_url_buf: [64]u8 = undefined,
     base_url_len: usize = 0,
 
@@ -84,6 +102,11 @@ pub const TestServer = struct {
             .kernel_backlog = 8,
             .reuse_address = true,
         });
+        errdefer listener.deinit();
+
+        const route_hits = try allocator.alloc(usize, routes.len);
+        errdefer allocator.free(route_hits);
+        @memset(route_hits, 0);
 
         const bound_addr = listener.getLocalAddress();
         const port = bound_addr.getPort();
@@ -94,6 +117,7 @@ pub const TestServer = struct {
             .listener = listener,
             .port = port,
             .routes = routes,
+            .route_hits = route_hits,
         };
 
         const written = std.fmt.bufPrint(&self.base_url_buf, "http://127.0.0.1:{d}", .{port}) catch unreachable;
@@ -158,7 +182,10 @@ pub const TestServer = struct {
 
         const path_start = method_end + 1;
         const path_end = mem.indexOfPos(u8, request_line, path_start, " ") orelse return error.MalformedRequest;
-        const path = request_line[path_start..path_end];
+        const target = request_line[path_start..path_end];
+        const query_start = mem.indexOfScalar(u8, target, '?');
+        const path = if (query_start) |index| target[0..index] else target;
+        const query = if (query_start) |index| target[index + 1 ..] else "";
 
         const method = parseMethod(method_str) orelse return error.UnknownMethod;
 
@@ -186,8 +213,12 @@ pub const TestServer = struct {
 
         // Find matching route.
         var matched: ?*const Route = null;
-        for (self.routes) |*r| {
+        for (self.routes, 0..) |*r, route_index| {
             if (r.method == method and mem.eql(u8, r.path, path)) {
+                if (r.max_uses) |limit| {
+                    if (self.route_hits[route_index] >= limit) continue;
+                }
+                self.route_hits[route_index] += 1;
                 matched = r;
                 break;
             }
@@ -197,22 +228,32 @@ pub const TestServer = struct {
             if (route.assert_request) |assert_request| {
                 try assert_request(.{
                     .method = method,
+                    .target = target,
                     .path = path,
+                    .query = query,
                     .headers = headers.items,
                     .body = body,
                 });
             }
-            try writeResponse(self.allocator, &sock, route.respond);
+            try writeResponse(self.allocator, self.io, &sock, route.respond);
         } else {
-            try writeResponse(self.allocator, &sock, .{ .status = 404, .body = "not found" });
+            try writeResponse(self.allocator, self.io, &sock, .{ .status = 404, .body = "not found" });
         }
+    }
+
+    pub fn routeHitCount(self: *const Self, route_index: usize) usize {
+        return self.route_hits[route_index];
     }
 
     pub fn deinit(self: *Self) void {
         self.listener.deinit();
+        self.allocator.free(self.route_hits);
     }
 
-    fn writeResponse(alloc: Allocator, sock: *Socket, spec: ResponseSpec) !void {
+    fn writeResponse(alloc: Allocator, io: Io, sock: *Socket, spec: ResponseSpec) !void {
+        if (spec.delay_ns != 0) try io.sleep(.fromNanoseconds(@intCast(spec.delay_ns)), .awake);
+        if (spec.disconnect_before_response) return;
+
         // Build headers, then send headers + body in one sendAll call.
         const reason = statusReason(spec.status);
         const ct = spec.content_type orelse "application/json";
@@ -222,10 +263,11 @@ pub const TestServer = struct {
         defer alloc.free(header);
 
         // Concatenate header + body so we can send in one call.
-        const full = try alloc.alloc(u8, header.len + body.len);
+        const transmitted_len = @min(spec.truncate_body_at orelse body.len, body.len);
+        const full = try alloc.alloc(u8, header.len + transmitted_len);
         defer alloc.free(full);
         @memcpy(full[0..header.len], header);
-        @memcpy(full[header.len..], body);
+        @memcpy(full[header.len..], body[0..transmitted_len]);
 
         try sock.sendAll(full);
     }
@@ -350,6 +392,18 @@ test "raw HTTP response parsing" {
     try std.testing.expectEqualStrings("{\"msg\":\"hi\"}", client_body orelse "NO BODY");
 }
 
+const TestClientOutcome = struct {
+    completed_successfully: std.atomic.Value(bool) = .init(false),
+
+    fn complete(self: *@This()) void {
+        self.completed_successfully.store(true, .release);
+    }
+
+    fn expectSuccess(self: *@This()) !void {
+        try std.testing.expect(self.completed_successfully.load(.acquire));
+    }
+};
+
 test "TestServer round trip GET" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -360,9 +414,10 @@ test "TestServer round trip GET" {
     defer ts.deinit();
 
     var group = Io.Group.init;
+    var outcome = TestClientOutcome{};
 
     const ClientFiber = struct {
-        fn run(a: Allocator, test_io: Io, base: []const u8) Io.Cancelable!void {
+        fn run(a: Allocator, test_io: Io, base: []const u8, result: *TestClientOutcome) Io.Cancelable!void {
             var c = Client.initWithConfig(a, test_io, .{ .keep_alive = false });
             defer c.deinit();
 
@@ -374,10 +429,11 @@ test "TestServer round trip GET" {
 
             std.testing.expect(resp.ok()) catch return;
             std.testing.expectEqualStrings("{\"msg\":\"hi\"}", resp.body orelse "") catch return;
+            result.complete();
         }
     };
 
-    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl() }) catch {
+    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl(), &outcome }) catch {
         // No fiber support — skip test.
         return;
     };
@@ -386,7 +442,53 @@ test "TestServer round trip GET" {
     try ts.handleOne();
 
     // Wait for client fiber.
-    group.await(io) catch {};
+    try group.await(io);
+    try outcome.expectSuccess();
+}
+
+test "TestServer matches path separately from query" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Assert = struct {
+        fn request(info: RequestInfo) !void {
+            try std.testing.expectEqualStrings("/models", info.path);
+            try std.testing.expectEqualStrings("model=owner%2Fmodel&task=read", info.query);
+            try std.testing.expectEqualStrings(
+                "/models?model=owner%2Fmodel&task=read",
+                info.target,
+            );
+        }
+    };
+    var ts = try TestServer.start(alloc, io, &.{.{
+        .method = .GET,
+        .path = "/models",
+        .assert_request = Assert.request,
+        .respond = .{ .body = "{}" },
+    }});
+    defer ts.deinit();
+
+    var group = Io.Group.init;
+    var outcome = TestClientOutcome{};
+    const ClientFiber = struct {
+        fn run(a: Allocator, test_io: Io, base: []const u8, result: *TestClientOutcome) Io.Cancelable!void {
+            var c = Client.initWithConfig(a, test_io, .{ .keep_alive = false });
+            defer c.deinit();
+            const url_value = std.fmt.allocPrint(
+                a,
+                "{s}/models?model=owner%2Fmodel&task=read",
+                .{base},
+            ) catch return;
+            defer a.free(url_value);
+            var response = c.get(url_value, .{}) catch return;
+            defer response.deinit();
+            std.testing.expect(response.ok()) catch return;
+            result.complete();
+        }
+    };
+    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl(), &outcome }) catch return;
+    try ts.handleOne();
+    try group.await(io);
+    try outcome.expectSuccess();
 }
 
 test "TestServer round trip POST" {
@@ -399,9 +501,10 @@ test "TestServer round trip POST" {
     defer ts.deinit();
 
     var group = Io.Group.init;
+    var outcome = TestClientOutcome{};
 
     const ClientFiber = struct {
-        fn run(a: Allocator, test_io: Io, base: []const u8) Io.Cancelable!void {
+        fn run(a: Allocator, test_io: Io, base: []const u8, result: *TestClientOutcome) Io.Cancelable!void {
             var c = Client.initWithConfig(a, test_io, .{ .keep_alive = false });
             defer c.deinit();
 
@@ -414,15 +517,17 @@ test "TestServer round trip POST" {
             std.testing.expect(resp.ok()) catch return;
             const body = resp.body orelse "";
             std.testing.expect(mem.indexOf(u8, body, "vectors") != null) catch return;
+            result.complete();
         }
     };
 
-    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl() }) catch {
+    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl(), &outcome }) catch {
         return;
     };
 
     try ts.handleOne();
-    group.await(io) catch {};
+    try group.await(io);
+    try outcome.expectSuccess();
 }
 
 test "TestServer 404 for unmatched route" {
@@ -435,9 +540,10 @@ test "TestServer 404 for unmatched route" {
     defer ts.deinit();
 
     var group = Io.Group.init;
+    var outcome = TestClientOutcome{};
 
     const ClientFiber = struct {
-        fn run(a: Allocator, test_io: Io, base: []const u8) Io.Cancelable!void {
+        fn run(a: Allocator, test_io: Io, base: []const u8, result: *TestClientOutcome) Io.Cancelable!void {
             var c = Client.initWithConfig(a, test_io, .{ .keep_alive = false });
             defer c.deinit();
 
@@ -449,13 +555,15 @@ test "TestServer 404 for unmatched route" {
 
             std.testing.expect(!resp.ok()) catch return;
             std.testing.expectEqual(@as(u16, 404), resp.status.code) catch return;
+            result.complete();
         }
     };
 
-    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl() }) catch {
+    group.concurrent(io, ClientFiber.run, .{ alloc, io, ts.baseUrl(), &outcome }) catch {
         return;
     };
 
     try ts.handleOne();
-    group.await(io) catch {};
+    try group.await(io);
+    try outcome.expectSuccess();
 }

@@ -277,7 +277,7 @@ Example reader/OCR producer with per-enrichment batching:
     "prompt": "Read the document text."
   },
   "execution": {
-    "batch_items": 4,
+    "batch_items": 8,
     "batch_bytes": 67108864
   }
 }
@@ -301,7 +301,7 @@ enrichment producer.execution override
 
 For reader/OCR assets, the policy supports item and byte caps:
 
-- default OCR batch items: 4
+- default OCR batch items: 8
 - conservative hard cap: 8 unless the operator raises it
 - byte or pixel cap in addition to item count, because one full-page scan can
   cost much more than one cropped receipt
@@ -310,10 +310,22 @@ For reader/OCR assets, the policy supports item and byte caps:
 Suggested operator controls:
 
 ```text
-ANTFLY_ENRICHMENT_OCR_BATCH_ITEMS=4
+ANTFLY_ENRICHMENT_OCR_BATCH_ITEMS=8
 ANTFLY_ENRICHMENT_OCR_BATCH_MAX_ITEMS=8
 ANTFLY_ENRICHMENT_OCR_BATCH_BYTES=67108864
+ANTFLY_ENRICHMENT_OCR_RENDER_PARALLEL_PAGES=1
+ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_PIXELS=50000000
+ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_BYTES=268435456
 ```
+
+PDF rendering uses the resolved OCR item count as its window size. Render
+parallelism is independently capped (and defaults to one), while the pixel and
+working-byte controls bound each admitted render wave. The global enrichment
+resource manager atomically grants up to the configured aggregate render bytes
+while preserving the OCR batch-byte ceiling for separately tracked output and
+request allocations. The document-scoped PDF coordinator is reused across
+streaming OCR flushes, recomputes available worker bytes before each render
+window, and each page worker has its own hard allocator ceiling.
 
 Readers must stay model-neutral at this layer. The artifact producer exposes a
 batch request hook, and document-extraction OCR/transcription workers flush
@@ -723,6 +735,20 @@ The model-facing producer types are separate from artifact kinds:
   OCR providers and multimodal LLMs.
 - **chunkers**, **embedders**, and **rerankers** keep their current index-facing
   roles.
+
+### Text-to-speech (not implemented)
+
+Speech-to-text shipped as the `transcriber` producer type above; the symmetric
+text-to-speech capability has not been implemented in Zig. The design intent
+carried forward from the earlier Go-era proposal, recorded here as unimplemented
+direction rather than current behavior, called for a provider registry mirroring
+the reader/generator pattern -- OpenAI, Google Vertex, and ElevenLabs-class
+providers behind one interface -- with the caller selecting an output audio
+format per request. Output placement was meant to follow the same
+inline-vs-object-storage split used elsewhere in this document: small
+synthesized audio returned inline in the response, and larger or streamed
+output written to object storage with a reference returned instead of the raw
+bytes.
 
 For Zig providers, `antfly` is the canonical local/remote provider name. A
 provider config with `provider: "antfly"` and no `url` uses the local Antfly

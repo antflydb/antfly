@@ -22,6 +22,19 @@ const png = @import("png.zig");
 const Allocator = std.mem.Allocator;
 
 pub fn chunkInput(alloc: Allocator, input: types.Input, cfg: types.FixedChunkConfig) ![]types.Chunk {
+    return chunkInputBounded(alloc, input, cfg, types.default_max_chunk_owned_output_bytes);
+}
+
+/// Chunk an input while bounding bytes owned by transformed binary results.
+/// Pass-through media remains borrowed from the input and therefore does not
+/// consume this output budget.
+pub fn chunkInputBounded(
+    alloc: Allocator,
+    input: types.Input,
+    cfg: types.FixedChunkConfig,
+    max_owned_output_bytes: usize,
+) ![]types.Chunk {
+    try cfg.validate();
     return switch (input) {
         .text => |text| fixed_text.chunkText(alloc, text, .{
             .target_tokens = cfg.text.target_tokens,
@@ -29,23 +42,31 @@ pub fn chunkInput(alloc: Allocator, input: types.Input, cfg: types.FixedChunkCon
             .max_chunks = cfg.max_chunks,
             .separator = cfg.text.separator,
         }),
-        .binary => |binary| chunkBinary(alloc, binary, cfg),
+        .binary => |binary| chunkBinary(alloc, binary, cfg, max_owned_output_bytes),
     };
 }
 
-fn chunkBinary(alloc: Allocator, binary: types.BinaryInput, cfg: types.FixedChunkConfig) ![]types.Chunk {
-    if (std.mem.eql(u8, binary.mime_type, "audio/wav")) {
-        return try chunkWav(alloc, binary, cfg);
+fn chunkBinary(alloc: Allocator, binary: types.BinaryInput, cfg: types.FixedChunkConfig, max_owned_output_bytes: usize) ![]types.Chunk {
+    const mime_type = mimeEssence(binary.mime_type);
+    if (std.ascii.eqlIgnoreCase(mime_type, "audio/wav") or
+        std.ascii.eqlIgnoreCase(mime_type, "audio/x-wav"))
+    {
+        return try chunkWav(alloc, binary, cfg, max_owned_output_bytes);
     }
-    if (std.mem.eql(u8, binary.mime_type, "image/gif")) {
-        return try chunkGif(alloc, binary, cfg);
+    if (std.ascii.eqlIgnoreCase(mime_type, "image/gif")) {
+        return try chunkGif(alloc, binary, cfg, max_owned_output_bytes);
     }
     const chunks = try alloc.alloc(types.Chunk, 1);
     chunks[0] = types.Chunk.initBinary(0, binary.mime_type, binary.data);
     return chunks;
 }
 
-fn chunkWav(alloc: Allocator, binary: types.BinaryInput, cfg: types.FixedChunkConfig) ![]types.Chunk {
+fn mimeEssence(content_type: []const u8) []const u8 {
+    const separator = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+    return std.mem.trim(u8, content_type[0..separator], " \t");
+}
+
+fn chunkWav(alloc: Allocator, binary: types.BinaryInput, cfg: types.FixedChunkConfig, max_owned_output_bytes: usize) ![]types.Chunk {
     const decoded = try wav.decodeMono(alloc, binary.data);
     defer alloc.free(decoded.samples);
 
@@ -64,8 +85,17 @@ fn chunkWav(alloc: Allocator, binary: types.BinaryInput, cfg: types.FixedChunkCo
     }
 
     var offset: usize = 0;
+    var retained_bytes: usize = 0;
     while (offset < decoded.samples.len) : (offset += step_samples) {
         const end = @min(offset + window_samples, decoded.samples.len);
+        const bytes_per_sample = @as(usize, decoded.format.bits_per_sample) / 8;
+        const data_bytes = std.math.mul(usize, end - offset, bytes_per_sample) catch
+            return error.ChunkOutputTooLarge;
+        const encoded_bytes = std.math.add(usize, 44, data_bytes) catch
+            return error.ChunkOutputTooLarge;
+        retained_bytes = std.math.add(usize, retained_bytes, encoded_bytes) catch
+            return error.ChunkOutputTooLarge;
+        if (retained_bytes > max_owned_output_bytes) return error.ChunkOutputTooLarge;
         const wav_bytes = try wav.encodeMono(alloc, decoded.samples[offset..end], decoded.format);
         var chunk = types.Chunk.initOwnedBinary(@intCast(chunks.items.len), "audio/wav", wav_bytes);
         chunk.start_time_ms = @as(f32, @floatFromInt(offset)) * 1000.0 / @as(f32, @floatFromInt(decoded.format.sample_rate));
@@ -77,9 +107,15 @@ fn chunkWav(alloc: Allocator, binary: types.BinaryInput, cfg: types.FixedChunkCo
     return try chunks.toOwnedSlice(alloc);
 }
 
-fn chunkGif(alloc: Allocator, binary: types.BinaryInput, cfg: types.FixedChunkConfig) ![]types.Chunk {
-    const frames = antfly_image.gif.decodeFramesAlloc(alloc, binary.data) catch |err| switch (err) {
-        error.UnsupportedGifFormat, error.GifDecodeFailed => return error.ImageDecodeFailed,
+fn chunkGif(alloc: Allocator, binary: types.BinaryInput, cfg: types.FixedChunkConfig, max_owned_output_bytes: usize) ![]types.Chunk {
+    const max_frames = if (cfg.max_chunks > 0) cfg.max_chunks else (types.FixedChunkConfig{}).max_chunks;
+    const frames = antfly_image.gif.decodeFramesAllocBounded(
+        alloc,
+        binary.data,
+        max_frames,
+        antfly_image.DecodeLimits.inference_default.max_rgba_bytes,
+    ) catch |err| switch (err) {
+        error.UnsupportedGifFormat, error.GifDecodeFailed, error.ImageTooLarge => return error.ImageDecodeFailed,
         else => return err,
     };
     defer {
@@ -93,13 +129,18 @@ fn chunkGif(alloc: Allocator, binary: types.BinaryInput, cfg: types.FixedChunkCo
         chunks.deinit(alloc);
     }
 
+    var retained_bytes: usize = 0;
     for (frames, 0..) |frame, i| {
+        const encoded_bytes = png.encodedRgbaSize(frame.width, frame.height) catch
+            return error.ChunkOutputTooLarge;
+        retained_bytes = std.math.add(usize, retained_bytes, encoded_bytes) catch
+            return error.ChunkOutputTooLarge;
+        if (retained_bytes > max_owned_output_bytes) return error.ChunkOutputTooLarge;
         const png_bytes = try png.encodeRgba(alloc, frame.width, frame.height, frame.rgba);
         var chunk = types.Chunk.initOwnedBinary(@intCast(i), "image/png", png_bytes);
         chunk.frame_index = @intCast(i);
         chunk.frame_delay_ms = frame.delay_ms;
         try chunks.append(alloc, chunk);
-        if (cfg.max_chunks > 0 and chunks.items.len >= cfg.max_chunks) break;
     }
 
     return try chunks.toOwnedSlice(alloc);
@@ -127,6 +168,17 @@ test "fixed multimodal chunks wav windows" {
     try std.testing.expectEqualStrings("audio/wav", chunks[0].mime_type);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), chunks[0].start_time_ms.?, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), chunks[0].end_time_ms.?, 0.001);
+
+    try std.testing.expectError(
+        error.ChunkOutputTooLarge,
+        chunkInputBounded(alloc, .{ .binary = .{
+            .mime_type = "audio/wav",
+            .data = wav_bytes,
+        } }, .{
+            .audio = .{ .window_duration_ms = 3, .overlap_duration_ms = 1 },
+            .max_chunks = 8,
+        }, 1),
+    );
 }
 
 test "fixed multimodal chunks animated gif frames" {
@@ -147,4 +199,19 @@ test "fixed multimodal chunks animated gif frames" {
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, chunks[0].data.?[0..8]);
     try std.testing.expectEqual(@as(?u32, 1), chunks[1].frame_index);
     try std.testing.expect(chunks[1].frame_delay_ms != null and chunks[1].frame_delay_ms.? > 0);
+
+    const first_only = try chunkInput(alloc, .{ .binary = .{
+        .mime_type = "image/gif",
+        .data = &gif_bytes,
+    } }, .{ .max_chunks = 1 });
+    defer types.freeChunks(alloc, first_only);
+    try std.testing.expectEqual(@as(usize, 1), first_only.len);
+
+    try std.testing.expectError(
+        error.ChunkOutputTooLarge,
+        chunkInputBounded(alloc, .{ .binary = .{
+            .mime_type = "image/gif",
+            .data = &gif_bytes,
+        } }, .{ .max_chunks = 1 }, 1),
+    );
 }

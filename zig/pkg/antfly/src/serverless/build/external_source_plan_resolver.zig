@@ -104,17 +104,14 @@ pub const ResolverOptions = struct {
 };
 
 pub const Resolver = struct {
-    artifacts: *artifacts_mod.ArtifactStore,
     object_store_resolver: OpenedObjectStoreResolver,
     options: ResolverOptions = .{},
 
     pub fn init(
-        artifacts: *artifacts_mod.ArtifactStore,
         object_store_resolver: OpenedObjectStoreResolver,
         options: ResolverOptions,
     ) Resolver {
         return .{
-            .artifacts = artifacts,
             .object_store_resolver = object_store_resolver,
             .options = options,
         };
@@ -133,8 +130,12 @@ pub const Resolver = struct {
         ptr: *anyopaque,
         alloc: Allocator,
         request: resolver_api.ResolveRequest,
-    ) !?external_source_manifest.Plan {
+    ) !external_source_manifest.Plan {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        const scope = request.artifacts.upload_scope orelse return error.ExternalInventoryPublicationScopeRequired;
+        if (!std.mem.eql(u8, &scope.domain, &@import("../graph_segment/page_store.zig").PageStore.namespaceDomain(request.namespace))) return error.InvalidArtifactUploadScope;
+        try scope.validate();
+        try request.cancellation.check();
         const binding = request.binding;
         try binding.validateReadOnlyMvp();
 
@@ -142,18 +143,20 @@ pub const Resolver = struct {
             .file_bucket = self.options.file_bucket,
         });
         defer opened_store.deinit();
-
-        var inventory = try inventoryForBindingAlloc(alloc, binding, opened_store, self.options);
+        var read_authority = @import("external_source_read_authority.zig").ReadAuthority{ .inner = opened_store.client, .cancellation = request.cancellation };
+        var discovered_source = opened_store;
+        discovered_source.client = read_authority.client();
+        var inventory = try inventoryForBindingAlloc(alloc, binding, discovered_source, self.options);
         defer inventory.deinit(alloc);
 
         const artifact_name = try std.fmt.allocPrint(alloc, "{s}.external-files", .{request.table_name});
         defer alloc.free(artifact_name);
         const published = try external_source_publish.publishInventoryAlloc(
             alloc,
-            self.artifacts,
+            request.artifacts,
             binding,
             inventory,
-            .{ .artifact_name = artifact_name },
+            .{ .artifact_name = artifact_name, .previous_artifacts = request.previous_artifacts, .cancellation = request.cancellation },
         );
         return published.plan;
     }
@@ -437,7 +440,7 @@ fn objectStoreUriBaseAlloc(alloc: Allocator, bucket: []const u8, prefix: []const
     return try std.fmt.allocPrint(alloc, "object://{s}/{s}", .{ bucket, prefix });
 }
 
-test "iceberg publication requires an authoritative metadata pointer" {
+test "serverless iceberg publication requires an authoritative metadata pointer" {
     const alloc = std.testing.allocator;
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
@@ -458,7 +461,7 @@ test "iceberg publication requires an authoritative metadata pointer" {
     ));
 }
 
-test "iceberg publication compacts sorted delete refs by file and row group" {
+test "serverless iceberg publication compacts sorted delete refs by file and row group" {
     const alloc = std.testing.allocator;
     const files = [_]external_source.FileEntry{.{
         .file_id = @constCast("data.parquet"),
@@ -495,7 +498,7 @@ test "iceberg publication compacts sorted delete refs by file and row group" {
     try std.testing.expectEqualSlices(u64, &.{0}, groups[1].row_ordinals);
 }
 
-test "remote uri publication resolver pins parquet inventory into artifact store" {
+test "serverless remote uri publication resolver pins parquet inventory into artifact store" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -524,10 +527,12 @@ test "remote uri publication resolver pins parquet inventory into artifact store
     var artifacts = artifact_impl.artifactStore();
     defer artifacts.deinit();
 
-    var publication = Resolver.init(&artifacts, object_resolver.resolver(), .{
+    artifacts.upload_scope = testScope();
+    var publication = Resolver.init(object_resolver.resolver(), .{
         .object_uri_base = "object://antfly/events",
     });
-    var plan = (try publication.planResolver().resolveAlloc(alloc, .{
+    var plan = try publication.planResolver().resolveAlloc(alloc, .{
+        .artifacts = &artifacts,
         .namespace = "events",
         .table_name = "events",
         .binding = .{
@@ -538,7 +543,7 @@ test "remote uri publication resolver pins parquet inventory into artifact store
             .schema_fingerprint = "schema-v1",
             .write_policy = .read_only,
         },
-    })).?;
+    });
     defer plan.deinit(alloc);
 
     try std.testing.expectEqualStrings("events.external-files", plan.artifacts[0].name);
@@ -555,7 +560,7 @@ test "remote uri publication resolver pins parquet inventory into artifact store
     try std.testing.expectEqualStrings("amount", decoded.files[0].row_groups[0].column_chunks[0].column_id);
 }
 
-test "remote uri publication resolver rejects invalid parquet before publishing inventory artifact" {
+test "serverless remote uri publication resolver rejects invalid parquet before publishing inventory artifact" {
     const alloc = std.testing.allocator;
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
@@ -573,10 +578,12 @@ test "remote uri publication resolver rejects invalid parquet before publishing 
     var artifacts = artifact_impl.artifactStore();
     defer artifacts.deinit();
 
-    var publication = Resolver.init(&artifacts, object_resolver.resolver(), .{
+    artifacts.upload_scope = testScope();
+    var publication = Resolver.init(object_resolver.resolver(), .{
         .object_uri_base = "object://antfly/events",
     });
     try std.testing.expectError(error.InvalidParquetFooterMagic, publication.planResolver().resolveAlloc(alloc, .{
+        .artifacts = &artifacts,
         .namespace = "events",
         .table_name = "events",
         .binding = .{
@@ -591,7 +598,7 @@ test "remote uri publication resolver rejects invalid parquet before publishing 
     try std.testing.expect(artifact_impl.bytes == null);
 }
 
-test "remote uri publication resolver pins iceberg data object identity into artifact store" {
+test "serverless remote uri publication resolver pins iceberg data object identity into artifact store" {
     const alloc = std.testing.allocator;
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
@@ -631,8 +638,10 @@ test "remote uri publication resolver pins iceberg data object identity into art
     var artifacts = artifact_impl.artifactStore();
     defer artifacts.deinit();
 
-    var publication = Resolver.init(&artifacts, object_resolver.resolver(), .{});
-    var plan = (try publication.planResolver().resolveAlloc(alloc, .{
+    artifacts.upload_scope = testScope();
+    var publication = Resolver.init(object_resolver.resolver(), .{});
+    var plan = try publication.planResolver().resolveAlloc(alloc, .{
+        .artifacts = &artifacts,
         .namespace = "events",
         .table_name = "events",
         .binding = .{
@@ -643,7 +652,7 @@ test "remote uri publication resolver pins iceberg data object identity into art
             .schema_fingerprint = "iceberg-schema:7",
             .write_policy = .read_only,
         },
-    })).?;
+    });
     defer plan.deinit(alloc);
 
     const artifact_bytes = artifact_impl.bytes orelse return error.ArtifactNotFound;
@@ -915,11 +924,25 @@ const MemoryArtifactStore = struct {
     const vtable: artifacts_mod.ArtifactStore.VTable = .{
         .deinit = ifaceDeinit,
         .put = putErased,
+        .put_scoped = putScoped,
         .get_alloc = getAllocErased,
         .get_range_alloc = getRangeAllocErased,
         .stat = statErased,
         .delete = deleteErased,
     };
+
+    fn putScoped(ptr: *anyopaque, alloc: Allocator, scope: artifacts_mod.store.UploadScope, bytes: []const u8, cancellation: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.ArtifactMetadata {
+        try cancellation.check();
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.bytes) |old| self.alloc.free(old);
+        self.bytes = try self.alloc.dupe(u8, bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const checksum = std.fmt.bytesToHex(digest, .lower);
+        const id = try alloc.dupe(u8, &try scope.artifactId(&checksum));
+        errdefer alloc.free(id);
+        return .{ .artifact_id = id, .checksum = try alloc.dupe(u8, &checksum), .byte_len = bytes.len };
+    }
 
     fn putErased(ptr: *anyopaque, alloc: Allocator, contents: []const u8) !artifacts_mod.ArtifactMetadata {
         const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
@@ -946,3 +969,7 @@ const MemoryArtifactStore = struct {
         try self.delete(artifact_id);
     }
 };
+
+fn testScope() artifacts_mod.store.UploadScope {
+    return .{ .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain("events"), .attempt = @splat(1) };
+}

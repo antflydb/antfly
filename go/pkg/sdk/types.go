@@ -276,6 +276,7 @@ type (
 	// Graph index types
 	GraphIndexConfig                      = oapi.GraphIndexConfig
 	GraphIndexStats                       = oapi.GraphIndexStats
+	GraphIndexStatsIndexType              = oapi.GraphIndexStatsIndexType
 	GraphArtifactSourceConfig             = oapi.GraphArtifactSourceConfig
 	GraphArtifactSourceConfigFormat       = oapi.GraphArtifactSourceConfigFormat
 	GraphArtifactProducerConfig           = oapi.GraphArtifactProducerConfig
@@ -292,11 +293,41 @@ type (
 	GraphTemplateValue                    = oapi.GraphTemplateValue
 	GraphTemplateValue0                   = oapi.GraphTemplateValue0
 	GraphTemplateValue1                   = oapi.GraphTemplateValue1
-	EdgeTypeConfig                        = oapi.EdgeTypeConfig
-	EdgeTypeConfigTopology                = oapi.EdgeTypeConfigTopology
-	EdgeDirection                         = oapi.EdgeDirection
-	Edge                                  = oapi.Edge
-	EdgesResponse                         = oapi.EdgesResponse
+	GraphMetricActionResponse             = oapi.GraphMetricActionResponse
+	GraphMetricBuildPageStatus            = oapi.GraphMetricBuildPageStatus
+	GraphMetricBuildPageStatusRangeKind   = oapi.GraphMetricBuildPageStatusRangeKind
+	GraphMetricBuildPageStatusState       = oapi.GraphMetricBuildPageStatusState
+	GraphMetricEdgeFilterStatus           = oapi.GraphMetricEdgeFilterStatus
+	GraphMetricEdgeFilterStatusMode       = oapi.GraphMetricEdgeFilterStatusMode
+	GraphMetricEvent                      = oapi.GraphMetricEvent
+	GraphMetricEventKind                  = oapi.GraphMetricEventKind
+	GraphMetricFilter                     = oapi.GraphMetricFilter
+	GraphMetricFilterOp                   = oapi.GraphMetricFilterOp
+	GraphMetricOrder                      = oapi.GraphMetricOrder
+	GraphMetricOrderDirection             = oapi.GraphMetricOrderDirection
+	GraphMetricOrderNulls                 = oapi.GraphMetricOrderNulls
+	GraphMetricProfile                    = oapi.GraphMetricProfile
+	GraphMetricQuery                      = oapi.GraphMetricQuery
+	GraphMetricQueryMetricFreshness       = oapi.GraphMetricQueryMetricFreshness
+	GraphMetricRerank                     = oapi.GraphMetricRerank
+	GraphMetricRerankMetricFreshness      = oapi.GraphMetricRerankMetricFreshness
+	GraphMetricRerankScoreDetails         = oapi.GraphMetricRerankScoreDetails
+	GraphMetricResult                     = oapi.GraphMetricResult
+	GraphMetricRuntimeStats               = oapi.GraphMetricRuntimeStats
+	GraphMetricRuntimeStatsRole           = oapi.GraphMetricRuntimeStatsRole
+	GraphMetricScore                      = oapi.GraphMetricScore
+	GraphMetricStatus                     = oapi.GraphMetricStatus
+	GraphMetricStatusPhase                = oapi.GraphMetricStatusPhase
+	// GraphQueryMetricFreshness is retained for source compatibility; metric
+	// freshness now belongs to the canonical traversal operation.
+	GraphQueryMetricFreshness     = oapi.GraphTraversalMetricFreshness
+	GraphTraversalMetricFreshness = oapi.GraphTraversalMetricFreshness
+	QueryScoreDetails             = oapi.QueryScoreDetails
+	EdgeTypeConfig                = oapi.EdgeTypeConfig
+	EdgeTypeConfigTopology        = oapi.EdgeTypeConfigTopology
+	EdgeDirection                 = oapi.EdgeDirection
+	Edge                          = oapi.Edge
+	EdgesResponse                 = oapi.EdgesResponse
 
 	// Graph query types
 	GraphQuery                     = oapi.GraphQuery

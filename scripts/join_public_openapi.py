@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import argparse
 import copy
 import importlib.util
 import sys
@@ -23,6 +24,7 @@ from pathlib import Path
 import yaml
 from openapi_spec_validator import validate_spec
 
+from openapi_inputs import load_yaml, record_dependencies
 from public_openapi_overlays import add_unified_auth_responses
 
 
@@ -48,14 +50,6 @@ def represent_str(dumper: yaml.Dumper, value: str):
 
 
 Dumper.add_representer(str, represent_str)
-
-
-def load_yaml(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
-    if not isinstance(data, dict):
-        raise RuntimeError(f"expected mapping at {path}")
-    return data
 
 
 def load_join_openapi():
@@ -349,7 +343,7 @@ def dump_yaml(data: dict, output: Path) -> None:
         )
 
 
-def main(argv: list[str]) -> int:
+def generate(argv: list[str]) -> int:
     spec = join_specs()
     if argv and argv[0] == "--compare":
         target = ROOT / (argv[1] if len(argv) > 1 else "openapi.yaml")
@@ -365,6 +359,18 @@ def main(argv: list[str]) -> int:
     validate_spec(spec, base_uri=output.resolve().as_uri())
     print(f"wrote {output}")
     return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--depfile", type=Path)
+    options, args = parser.parse_known_args(argv)
+    if options.depfile is not None:
+        target_index = 1 if args[:1] == ["--compare"] else 0
+        if len(args) > target_index and not args[target_index].startswith("--"):
+            args[target_index] = str(Path(args[target_index]).resolve())
+    with record_dependencies(options.depfile):
+        return generate(args)
 
 
 if __name__ == "__main__":

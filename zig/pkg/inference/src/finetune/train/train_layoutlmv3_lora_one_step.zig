@@ -13,8 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const compat = @import("../../io/compat.zig");
-const finetune = @import("../layoutlmv3.zig");
+const compat = @import("inference_internal").io.compat;
+const finetune = @import("inference_internal").finetune.layoutlmv3;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

@@ -32,12 +32,15 @@ pub const OpenOptions = struct {
     read_only: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    io: ?std.Io = null,
 };
 
 pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    writer_lock_marker: []const u8 = "",
+    io: ?std.Io = null,
 };
 
 pub const Store = struct {
@@ -59,11 +62,15 @@ pub const Store = struct {
     }
 
     pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !Store {
-        const file = try native.NativeFile.openWithOptions(allocator, path, .{
+        const native_opts = native.OpenOptions{
             .read_only = opts.read_only,
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
-        });
+        };
+        const file = if (opts.io) |io|
+            try native.NativeFile.openWithIo(allocator, io, path, native_opts)
+        else
+            try native.NativeFile.openWithOptions(allocator, path, native_opts);
         return .{
             .allocator = allocator,
             .file = file,
@@ -77,11 +84,16 @@ pub const Store = struct {
     }
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !Store {
-        const file = try native.NativeFile.createWithOptions(allocator, path, .{
+        const native_opts = native.CreateOptions{
             .exclusive = opts.exclusive,
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
-        });
+            .writer_lock_marker = opts.writer_lock_marker,
+        };
+        const file = if (opts.io) |io|
+            try native.NativeFile.createWithIo(allocator, io, path, native_opts)
+        else
+            try native.NativeFile.createWithOptions(allocator, path, native_opts);
         return .{
             .allocator = allocator,
             .file = file,
@@ -120,7 +132,7 @@ pub const Store = struct {
         try self.reserveWriterSlot();
         defer self.releaseWriterSlot();
 
-        const io = self.file.io_impl.io();
+        const io = self.file.runtime();
         self.generation_lock.lockUncancelable(io);
         defer self.generation_lock.unlock(io);
 
@@ -129,9 +141,28 @@ pub const Store = struct {
         return try self.file.vacuumWithCancel(cancel);
     }
 
+    /// Publishes an offline, fully finalized store generation while fencing
+    /// all live readers and writers. The prepared store remains valid only so
+    /// its retired descriptor can be closed by normal teardown.
+    pub fn replaceWithPreparedGeneration(self: *Store, prepared: *Store) !native.GenerationPublicationOutcome {
+        if (self == prepared) return error.InvalidArgument;
+        try self.reserveWriterSlot();
+        defer self.releaseWriterSlot();
+
+        const io = self.file.io_impl.io();
+        self.generation_lock.lockUncancelable(io);
+        defer self.generation_lock.unlock(io);
+
+        lockStore(self);
+        defer self.mutex.unlock();
+        lockStore(prepared);
+        defer prepared.mutex.unlock();
+        return try self.file.replaceWithPreparedGeneration(&prepared.file);
+    }
+
     pub fn reserveWriterSlot(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
-        const io = self.file.io_impl.io();
+        const io = self.file.runtime();
         self.writer_mutex.lockUncancelable(io);
         defer self.writer_mutex.unlock(io);
         if (self.writer_active or self.next_writer_ticket != self.serving_writer_ticket) return error.FileBusy;
@@ -141,7 +172,7 @@ pub const Store = struct {
 
     pub fn reserveWriterSlotYielding(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
-        const io = self.file.io_impl.io();
+        const io = self.file.runtime();
         self.writer_mutex.lockUncancelable(io);
         defer self.writer_mutex.unlock(io);
         const ticket = self.next_writer_ticket;
@@ -154,7 +185,7 @@ pub const Store = struct {
     }
 
     pub fn releaseWriterSlot(self: *Store) void {
-        const io = self.file.io_impl.io();
+        const io = self.file.runtime();
         self.writer_mutex.lockUncancelable(io);
         defer self.writer_mutex.unlock(io);
         std.debug.assert(self.writer_active);
@@ -513,7 +544,7 @@ pub const Txn = struct {
 
     pub fn openReadWithPrefix(store: *Store, prefix: []const u8) !Txn {
         try validatePrefix(prefix);
-        const io = store.file.io_impl.io();
+        const io = store.file.runtime();
         store.generation_lock.lockSharedUncancelable(io);
         errdefer store.generation_lock.unlockShared(io);
         lockStore(store);
@@ -689,7 +720,7 @@ pub const Txn = struct {
     fn releaseGenerationReadLock(self: *Txn) void {
         if (!self.generation_read_locked) return;
         const store = self.store orelse return;
-        store.generation_lock.unlockShared(store.file.io_impl.io());
+        store.generation_lock.unlockShared(store.file.runtime());
         self.generation_read_locked = false;
     }
 

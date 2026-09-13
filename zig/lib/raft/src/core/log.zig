@@ -92,24 +92,11 @@ pub const RaftLog = struct {
 
     pub fn appendEntries(self: *RaftLog, entries: []const types.Entry) !types.Index {
         if (entries.len == 0) return self.lastIndex();
-
-        const first_new_index = entries[0].index;
-        var truncate_at: ?usize = null;
-        for (self.entries.items, 0..) |entry, i| {
-            if (entry.index >= first_new_index) {
-                truncate_at = i;
-                break;
-            }
-        }
-        if (truncate_at) |idx| {
-            for (self.entries.items[idx..]) |*entry| entry.deinit(self.alloc);
-            self.entries.shrinkRetainingCapacity(idx);
-        }
-
-        try self.entries.ensureUnusedCapacity(self.alloc, entries.len);
-        for (entries) |entry| self.entries.appendAssumeCapacity(try entry.clone(self.alloc));
-
-        return self.lastIndex();
+        // Clone before truncation so allocation failure cannot destroy the
+        // previous suffix or leave its persistence watermarks inconsistent.
+        const owned = try types.cloneEntries(self.alloc, entries);
+        defer types.freeEntries(self.alloc, owned);
+        return self.appendOwnedEntries(owned);
     }
 
     /// Atomically transfers a fully-owned entry batch into the log. Capacity
@@ -121,8 +108,9 @@ pub const RaftLog = struct {
     pub fn appendOwnedEntries(self: *RaftLog, entries: []types.Entry) !types.Index {
         if (entries.len == 0) return self.lastIndex();
 
-        try self.entries.ensureUnusedCapacity(self.alloc, entries.len);
         const first_new_index = entries[0].index;
+        if (first_new_index <= self.committed) return error.ConflictingCommittedEntry;
+        try self.entries.ensureUnusedCapacity(self.alloc, entries.len);
         var truncate_at: ?usize = null;
         for (self.entries.items, 0..) |entry, i| {
             if (entry.index >= first_new_index) {
@@ -135,6 +123,12 @@ pub const RaftLog = struct {
             self.entries.shrinkRetainingCapacity(idx);
         }
 
+        // Durability belongs to an entry identity, not its numeric position.
+        // A replacement must be persisted again, including when an older
+        // append at the same position is still awaiting acknowledgement.
+        self.stable_index = @min(self.stable_index, first_new_index - 1);
+        self.persisting_index = @min(self.persisting_index, first_new_index - 1);
+
         for (entries) |*entry| {
             self.entries.appendAssumeCapacity(entry.*);
             entry.* = .{};
@@ -145,7 +139,16 @@ pub const RaftLog = struct {
     pub fn maybeAppend(self: *RaftLog, prev_index: types.Index, prev_term: types.Term, leader_commit: types.Index, entries: []const types.Entry) !?types.Index {
         if (!self.matchTerm(prev_index, prev_term)) return null;
 
-        const last_new_index = try self.appendEntries(entries);
+        const last_new_index = prev_index + entries.len;
+        const existing = if (entries.len > 0) self.entriesFrom(entries[0].index) else &.{};
+        for (entries, 0..) |entry, i| {
+            if (i >= existing.len or existing[i].index != entry.index or existing[i].term != entry.term) {
+                _ = try self.appendEntries(entries[i..]);
+                break;
+            }
+        }
+        // A duplicate/empty append proves only the prefix carried by this
+        // message. It must neither truncate nor acknowledge an unrelated tail.
         self.commitTo(@min(leader_commit, last_new_index));
         return last_new_index;
     }
@@ -236,7 +239,8 @@ pub const RaftLog = struct {
         return self.nextCommittedEntriesMaxAllow(0, allow_unstable).len > 0;
     }
 
-    pub fn stableTo(self: *RaftLog, index: types.Index) void {
+    pub fn stableTo(self: *RaftLog, index: types.Index, expected_term: types.Term) void {
+        if (!self.matchTerm(index, expected_term)) return;
         if (index > self.stable_index) self.stable_index = index;
         if (self.persisting_index < self.stable_index) self.persisting_index = self.stable_index;
     }
@@ -293,6 +297,9 @@ test "raft log replaces conflicting suffix" {
 
     try std.testing.expectEqual(@as(types.Term, 2), log.term(2).?);
     try std.testing.expectEqual(@as(types.Index, 3), log.lastIndex());
+    // Replacing a persisted suffix must re-enter persistence at the conflict,
+    // even when the replacement has an index that was previously durable.
+    try std.testing.expectEqual(@as(types.Index, 2), log.unstableEntries()[0].index);
 }
 
 test "raft log restart separates applied snapshot from compaction boundary" {
@@ -318,4 +325,64 @@ test "raft log restart separates applied snapshot from compaction boundary" {
     try std.testing.expectEqual(@as(types.Term, 2), log.term(4).?);
     try std.testing.expectEqual(@as(types.Index, 5), log.applied);
     try std.testing.expectEqual(@as(types.Index, 5), log.committed);
+}
+
+test "raft log replacement waits for its own persistence identity" {
+    var mem = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer mem.deinit();
+    try mem.append(&.{ .{ .index = 1, .term = 1 }, .{ .index = 2, .term = 1 } });
+    var log = try RaftLog.init(std.testing.allocator, mem.storage());
+    defer log.deinit();
+    log.commitTo(1);
+    log.appliedTo(1);
+
+    _ = try log.maybeAppend(1, 1, 2, &.{.{ .index = 2, .term = 2 }});
+    try std.testing.expectEqual(@as(types.Index, 1), log.stable_index);
+    try std.testing.expectEqual(@as(usize, 1), log.unstableEntries().len);
+    try std.testing.expectEqual(@as(usize, 0), log.nextCommittedEntriesMaxAllow(0, false).len);
+    log.acceptPersisting(2);
+    // A delayed completion for the overwritten entry cannot release apply.
+    log.stableTo(2, 1);
+    try std.testing.expectEqual(@as(types.Index, 1), log.stable_index);
+    try std.testing.expectEqual(@as(usize, 0), log.nextCommittedEntriesMaxAllow(0, false).len);
+    log.stableTo(2, 2);
+    try std.testing.expectEqual(@as(types.Index, 2), log.stable_index);
+    try std.testing.expectEqual(@as(types.Term, 2), log.nextCommittedEntriesMaxAllow(0, false)[0].term);
+}
+
+test "raft log replacement supersedes an in-flight persistence suffix" {
+    var mem = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer mem.deinit();
+    try mem.append(&.{.{ .index = 1, .term = 1 }});
+    var log = try RaftLog.init(std.testing.allocator, mem.storage());
+    defer log.deinit();
+    _ = try log.appendEntries(&.{ .{ .index = 2, .term = 1 }, .{ .index = 3, .term = 1 } });
+    log.acceptPersisting(3);
+    _ = try log.maybeAppend(1, 1, 1, &.{.{ .index = 2, .term = 2 }});
+    try std.testing.expectEqual(@as(types.Index, 1), log.persisting_index);
+    try std.testing.expectEqual(@as(types.Index, 2), log.unstableEntries()[0].index);
+    log.stableTo(3, 1);
+    try std.testing.expectEqual(@as(types.Index, 1), log.stable_index);
+}
+
+test "raft log duplicate append preserves suffix and acknowledges only matching prefix" {
+    var mem = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer mem.deinit();
+    try mem.append(&.{
+        .{ .index = 1, .term = 1 },
+        .{ .index = 2, .term = 1 },
+        .{ .index = 3, .term = 2 },
+    });
+    var log = try RaftLog.init(std.testing.allocator, mem.storage());
+    defer log.deinit();
+    log.commitTo(2);
+    try std.testing.expectEqual(@as(?types.Index, 2), try log.maybeAppend(1, 1, 3, &.{.{ .index = 2, .term = 1 }}));
+    try std.testing.expectEqual(@as(types.Index, 3), log.lastIndex());
+    try std.testing.expectEqual(@as(types.Index, 3), log.stable_index);
+    try std.testing.expectEqual(@as(types.Index, 2), log.committed);
+    try std.testing.expectEqual(@as(?types.Index, 1), try log.maybeAppend(1, 1, 3, &.{}));
+    try std.testing.expectEqual(@as(types.Index, 2), log.committed);
+    try std.testing.expectError(error.ConflictingCommittedEntry, log.maybeAppend(1, 1, 3, &.{.{ .index = 2, .term = 3 }}));
+    try std.testing.expectEqual(@as(types.Term, 1), log.term(2).?);
+    try std.testing.expectEqual(@as(types.Index, 3), log.stable_index);
 }

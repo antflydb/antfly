@@ -47,6 +47,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--tier", choices=sorted(TIER_MIN_COSINE), required=True)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--report", type=Path)
+    common.add_concurrency_arguments(parser)
     args = parser.parse_args(argv)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")

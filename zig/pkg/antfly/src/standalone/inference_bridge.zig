@@ -16,11 +16,13 @@
 //! code-generated inference runtime. These are intermediate link boundaries,
 //! not a public or stable C API.
 
+const std = @import("std");
 const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
+const antfly_image = @import("antfly_image");
 
-pub const abi_version: u32 = 20;
+pub const abi_version: u32 = 26;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -141,9 +143,10 @@ pub const ResourceBudget = extern struct {
 };
 
 /// Stable operation identifiers for the embedded inference service. Requests
-/// and responses are UTF-8 JSON owned by the caller and inference unit,
-/// respectively. This keeps Zig allocators, error unions, tagged unions, and
-/// function signatures out of the archive boundary.
+/// use caller-owned UTF-8 JSON metadata and optional borrowed attachments.
+/// Responses are host-owned JSON or task-typed numeric rows, released by the
+/// response destructor. Zig allocators, slices and error unions never cross
+/// the archive boundary.
 pub const ProviderOperation = enum(c_int) {
     embed_dense_texts = 1,
     embed_dense_texts_with_context = 2,
@@ -157,6 +160,96 @@ pub const ProviderOperation = enum(c_int) {
     transcribe_audio = 10,
     extract = 11,
     list_models_json = 12,
+    read_encoded_images = 13,
+    generate_messages_with_attachments = 14,
+    model_capabilities = 15,
+    read_encoded_images_reported = 16,
+    chunk_input = 17,
+    rewrite_texts = 18,
+    classify_texts = 19,
+    read_raster_images_reported = 20,
+    embed_dense_rasters = 21,
+};
+
+pub const ProviderBinaryPayload = extern struct {
+    bytes: String,
+    content_type: String,
+};
+
+/// Task-typed numeric results borrow host-owned storage until the response
+/// destructor runs. No Zig slice or allocator crosses the archive boundary.
+pub const NumericRow = extern struct {
+    values: ?[*]const f32,
+    len: usize,
+};
+
+pub const NumericResult = extern struct {
+    kind: enum(c_int) { absent = 0, dense_vectors = 1, scores = 2 } = .absent,
+    rows: ?[*]const NumericRow = null,
+    len: usize = 0,
+
+    pub fn copyRows(self: NumericResult, alloc: std.mem.Allocator) ![][]f32 {
+        if (self.kind == .absent or (self.len != 0 and self.rows == null)) return error.InvalidInferenceNumericResult;
+        const result = try alloc.alloc([]f32, self.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |row| alloc.free(row);
+            alloc.free(result);
+        }
+        for (result, 0..) |*row, i| {
+            const source = self.rows.?[i];
+            if (source.len != 0 and source.values == null) return error.InvalidInferenceNumericResult;
+            const values: []const f32 = if (source.len == 0) &.{} else source.values.?[0..source.len];
+            for (values) |value| if (!std.math.isFinite(value)) return error.InvalidInferenceNumericResult;
+            row.* = try alloc.dupe(f32, values);
+            initialized += 1;
+        }
+        return result;
+    }
+};
+
+/// Logical work identity is independent of attachment storage order. Multiple
+/// attachments may belong to one item and one item index need not equal the
+/// payload ordinal.
+pub const ProviderAttachmentRef = extern struct {
+    attachment_index: usize,
+    item_index: usize = 0,
+    item_id: OptionalString = .{},
+    source_fingerprint: OptionalString = .{},
+    page_number: u32 = 0,
+    has_page_number: u8 = 0,
+};
+
+/// JSON metadata paired with ProviderInvokeContext.binary_payloads for
+/// operations that borrow attachments. Binary payloads are operation-neutral;
+/// the operation JSON defines their interpretation. Cardinality deliberately
+/// appears in both channels so the host rejects a torn call before borrowing
+/// memory.
+pub const ReadEncodedImagesRequest = struct {
+    model: []const u8,
+    image_count: usize,
+    prompt: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    source_fingerprint: ?[]const u8 = null,
+};
+
+pub const RasterImageMetadata = struct {
+    width: u32,
+    height: u32,
+    stride_bytes: usize,
+    format: antfly_image.RasterFormat,
+};
+
+/// Metadata paired one-for-one with borrowed binary raster payloads. Identity
+/// stays in ProviderAttachmentRef so every attachment ABI uses the same
+/// provenance channel.
+pub const ReadRasterImagesRequest = struct {
+    model: []const u8,
+    raster_count: usize,
+    rasters: []const RasterImageMetadata,
+    prompt: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    source_fingerprint: ?[]const u8 = null,
 };
 
 pub const ProgressView = extern struct {
@@ -179,8 +272,15 @@ pub const ProviderInvokeContext = extern struct {
     has_deadline: u8,
     out_response_handle: *?*anyopaque,
     out_response_json: *String,
-    /// Appended in ABI v18 so older layouts fail the strict size/version gate
-    /// rather than silently losing cooperative cancellation.
+    /// Opt in to task-typed results; JSON remains available for other tasks.
+    out_numeric_result: ?*NumericResult = null,
+    binary_payloads: ?[*]const ProviderBinaryPayload = null,
+    binary_payloads_len: usize = 0,
+    attachment_refs: ?[*]const ProviderAttachmentRef = null,
+    attachment_refs_len: usize = 0,
+    /// Borrowed invocation cancellation follows the operation-neutral binary
+    /// attachment fields. The strict size/version gate rejects older
+    /// layouts rather than silently losing media or cooperative cancellation.
     cancellation: http_abi.CancellationView = .{},
     /// Appended in ABI v19 and extended in v20 with model/backend detail.
     progress: ProgressView = .{},
@@ -286,7 +386,6 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
 pub extern fn antfly_standalone_inference_get_function_table() callconv(.c) *const FunctionTable;
 
 test "linked inference ABI rejects mismatched context and function-table prefixes" {
-    const std = @import("std");
     try std.testing.expectEqual(@as(u8, 0), @intFromEnum(ProcessMemoryLimitProvenance.automatic));
     try std.testing.expectEqual(@as(u8, 1), @intFromEnum(ProcessMemoryLimitProvenance.explicit));
     try std.testing.expectEqual(@as(u8, 2), @intFromEnum(ProcessMemoryLimitProvenance.cgroup_v2));

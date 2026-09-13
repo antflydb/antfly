@@ -228,6 +228,8 @@ components:
     # Antfly inference STT Configuration
     AntflySTTConfig:
       type: object
+      required:
+        - model
       description: |-
         Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider.
 
@@ -245,7 +247,8 @@ components:
           description: "Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable."
         model:
           type: string
-          description: "Transcriber model name (e.g., 'openai/whisper-tiny'). If empty, uses default."
+          minLength: 1
+          description: "Explicit Antfly transcriber model name (e.g., 'openai/whisper-tiny')."
       example:
         api_url: "http://localhost:8080"
         model: openai/whisper-base

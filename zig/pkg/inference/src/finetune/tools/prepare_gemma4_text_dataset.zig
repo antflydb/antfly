@@ -13,12 +13,14 @@
 // limitations under the License.
 
 const std = @import("std");
-const inference = @import("inference_internal");
-
-const gemma_data = inference.finetune.gemma_data;
-const compat = inference.io.compat;
-
 pub fn main(init: std.process.Init) !void {
+    return runWithData(@import("inference_finetune_data"), init);
+}
+
+/// The combined CLI supplies its existing owner; standalone tools import only data.
+pub fn runWithData(comptime data: type, init: std.process.Init) !void {
+    const gemma_data = data.gemma_data;
+    const compat = data.compat;
     const allocator = init.gpa;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args.deinit();

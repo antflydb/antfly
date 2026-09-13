@@ -1,7 +1,7 @@
 //! Transport-owned HTTP/1 request cancellation observation.
 //!
 //! HTTP/2 has stream-local reset state. HTTP/1 has only a connection, so one
-//! bounded listener-owned thread multiplexes hard transport-failure
+//! bounded listener-owned Io future multiplexes hard transport-failure
 //! observation for every active H1 request. It never consumes bytes from the
 //! parser's socket. In particular, an orderly FIN is not cancellation: TCP is
 //! full-duplex and a client may half-close its request direction while still
@@ -31,25 +31,7 @@ const WindowsPoll = if (builtin.os.tag == .windows) struct {
     extern "ws2_32" fn WSAPoll(fds: [*]PollFd, count: u32, timeout_ms: c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
     extern "ws2_32" fn recv(socket: std.posix.fd_t, buffer: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
-    extern "kernel32" fn Sleep(timeout_ms: u32) callconv(.winapi) void;
 } else struct {};
-
-fn sleepMs(ms: u64) void {
-    if (comptime builtin.os.tag == .freestanding) return;
-    if (comptime builtin.os.tag == .windows) {
-        WindowsPoll.Sleep(@intCast(@min(ms, @as(u64, std.math.maxInt(u32)))));
-        return;
-    }
-    var req = std.posix.timespec{
-        .sec = @intCast(ms / std.time.ms_per_s),
-        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
-    };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return,
-    };
-}
 
 pub const Observer = struct {
     const Entry = struct {
@@ -86,7 +68,13 @@ pub const Observer = struct {
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     next_id: u64 = 1,
     stopping: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
+    // One reserved worker for all registrations, independent of request Io.
+    scheduling_io: ?std.Io = null,
+    control_io: ?std.Io.Threaded = null,
+    future: ?std.Io.Future(void) = null,
+    running: std.atomic.Value(bool) = .init(false),
+    stop_event: std.Io.Event = .unset,
+    lifecycle_mutex: std.Io.Mutex = .init,
     kernel_fd: ?std.posix.fd_t = null,
     active: std.atomic.Value(usize) = .init(0),
     cancellations_total: std.atomic.Value(u64) = .init(0),
@@ -101,9 +89,21 @@ pub const Observer = struct {
         };
     }
 
+    fn schedulingIo(self: *Observer) std.Io {
+        return self.scheduling_io orelse self.control_io.?.io();
+    }
+
     pub fn start(self: *Observer) !void {
+        return self.startWithControlLimit(.limited(1));
+    }
+
+    // The explicit limit also exercises partial-start rollback in tests.
+    fn startWithControlLimit(self: *Observer, limit: std.Io.Limit) !void {
         if (comptime builtin.os.tag == .freestanding) return error.ObserverUnavailable;
-        if (self.thread != null) return error.AlreadyStarted;
+        const lifecycle_io = std.Io.Threaded.global_single_threaded.io();
+        self.lifecycle_mutex.lockUncancelable(lifecycle_io);
+        defer self.lifecycle_mutex.unlock(lifecycle_io);
+        if (self.future != null) return error.AlreadyStarted;
         try self.entries.ensureTotalCapacity(self.alloc, self.capacity);
         if (comptime builtin.os.tag == .macos) {
             const raw = std.posix.system.kqueue();
@@ -116,24 +116,36 @@ pub const Observer = struct {
         };
         self.stopping.store(false, .release);
         self.healthy.store(true, .release);
-        const spawn_config: std.Thread.SpawnConfig = if (self.thread_stack_size) |stack_size|
-            .{ .stack_size = stack_size }
-        else
-            .{};
-        self.thread = std.Thread.spawn(spawn_config, run, .{self}) catch |err| switch (err) {
-            // `Unexpected` carries no subsystem context at the role boundary.
-            // Preserve the standard resource errors, but make this otherwise
-            // opaque startup failure identify the transport component.
-            error.Unexpected => return error.CancellationObserverThreadSpawnFailed,
-            else => |spawn_err| return spawn_err,
-        };
+        self.stop_event = .unset;
+        if (self.scheduling_io == null) self.control_io = std.Io.Threaded.init(self.alloc, .{
+            .stack_size = self.thread_stack_size orelse (std.Io.Threaded.InitOptions{}).stack_size,
+            .async_limit = .nothing,
+            .concurrent_limit = limit,
+        });
+        errdefer {
+            if (self.control_io) |*owned| owned.deinit();
+            self.control_io = null;
+        }
+        // Io collapses worker allocation/spawn errors into ConcurrencyUnavailable.
+        // Retain the existing component-specific startup error at the API boundary.
+        self.future = self.schedulingIo().concurrent(run, .{self}) catch return error.CancellationObserverThreadSpawnFailed;
+        self.running.store(true, .release);
     }
 
     pub fn stop(self: *Observer) void {
         if (comptime builtin.os.tag == .freestanding) return;
+        const lifecycle_io = std.Io.Threaded.global_single_threaded.io();
+        self.lifecycle_mutex.lockUncancelable(lifecycle_io);
+        defer self.lifecycle_mutex.unlock(lifecycle_io);
         self.stopping.store(true, .release);
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
+        self.running.store(false, .release);
+        if (self.future) |*future| {
+            self.stop_event.set(self.schedulingIo());
+            future.await(self.schedulingIo());
+            self.future = null;
+        }
+        if (self.control_io) |*control| control.deinit();
+        self.control_io = null;
         if (self.kernel_fd) |fd| _ = std.posix.system.close(fd);
         self.kernel_fd = null;
         self.lock();
@@ -153,10 +165,10 @@ pub const Observer = struct {
         cancellation: *std.atomic.Value(bool),
     ) !Registration {
         if (comptime builtin.os.tag == .freestanding) return error.ObserverUnavailable;
-        if (self.thread == null or self.stopping.load(.acquire) or !self.healthy.load(.acquire)) return error.ObserverUnavailable;
+        if (!self.running.load(.acquire) or self.stopping.load(.acquire) or !self.healthy.load(.acquire)) return error.ObserverUnavailable;
         self.lock();
         defer self.mutex.unlock();
-        if (self.stopping.load(.acquire) or !self.healthy.load(.acquire)) return error.ObserverUnavailable;
+        if (!self.running.load(.acquire) or self.stopping.load(.acquire) or !self.healthy.load(.acquire)) return error.ObserverUnavailable;
         if (self.entries.items.len >= self.capacity) return error.ObserverCapacityExceeded;
         const id = self.nextId();
         if (comptime builtin.os.tag == .macos) try self.updateKqueue(fd, id, true);
@@ -208,6 +220,15 @@ pub const Observer = struct {
         }
     }
 
+    // Idle waits wake immediately on stop. Active raw kernel polls retain a
+    // finite 25 ms timeout, so draining never relies on Io cancellation being
+    // able to interrupt poll, kevent, or WSAPoll.
+    fn waitForObservation(self: *Observer) void {
+        self.stop_event.waitTimeout(self.schedulingIo(), .{
+            .duration = .{ .raw = .fromMilliseconds(observation_interval_ms), .clock = .awake },
+        }) catch {};
+    }
+
     fn run(self: *Observer) void {
         if (comptime builtin.os.tag == .freestanding) return;
         if (comptime builtin.os.tag == .windows) return self.runWindowsPoll();
@@ -239,7 +260,7 @@ pub const Observer = struct {
             }
             self.mutex.unlock();
             if (fds.items.len == 0) {
-                sleepMs(observation_interval_ms);
+                self.waitForObservation();
                 continue;
             }
             const ready = WindowsPoll.WSAPoll(
@@ -297,7 +318,7 @@ pub const Observer = struct {
             }
             self.mutex.unlock();
             if (fds.items.len == 0) {
-                sleepMs(observation_interval_ms);
+                self.waitForObservation();
                 continue;
             }
             const ready = std.posix.poll(fds.items, observation_interval_ms) catch return self.stopAfterFailure();
@@ -335,7 +356,7 @@ pub const Observer = struct {
         const timeout = std.posix.timespec{ .sec = 0, .nsec = observation_interval_ms * std.time.ns_per_ms };
         while (!self.stopping.load(.acquire)) {
             if (self.active.load(.acquire) == 0) {
-                sleepMs(observation_interval_ms);
+                self.waitForObservation();
                 continue;
             }
             const ready_raw = std.posix.system.kevent(kq, events.items.ptr, 0, events.items.ptr, @intCast(events.items.len), &timeout);
@@ -462,3 +483,49 @@ pub const Observer = struct {
         self.mutex.unlock();
     }
 };
+
+test "cancellation observer rolls back refused control capacity and restarts" {
+    if (comptime builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Noop = struct {
+        fn run() void {}
+    };
+    var observer = Observer.init(std.testing.allocator, 2, 2 * 1024 * 1024);
+    defer observer.deinit();
+    try std.testing.expectError(error.CancellationObserverThreadSpawnFailed, observer.startWithControlLimit(.nothing));
+    try std.testing.expect(observer.control_io == null);
+    try std.testing.expect(observer.future == null);
+    try std.testing.expect(observer.kernel_fd == null);
+    var cancellation: std.atomic.Value(bool) = .init(false);
+    try std.testing.expectError(error.ObserverUnavailable, observer.register(undefined, &cancellation));
+    for (0..3) |_| {
+        try observer.start();
+        try std.testing.expectError(error.AlreadyStarted, observer.start());
+        try std.testing.expectError(error.ConcurrencyUnavailable, observer.control_io.?.io().concurrent(Noop.run, .{}));
+        // Concurrent stops must serialize future consumption and Io destruction.
+        var stop = try std.testing.io.concurrent(Observer.stop, .{&observer});
+        observer.stop();
+        stop.await(std.testing.io);
+        try std.testing.expect(observer.control_io == null);
+        try std.testing.expect(observer.future == null);
+        try std.testing.expect(observer.kernel_fd == null);
+        try std.testing.expectError(error.ObserverUnavailable, observer.register(undefined, &cancellation));
+    }
+}
+
+test "observer borrows reserved capacity without owning its executor" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    defer unavailable.deinit();
+    var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer lane.deinit();
+    var observer = Observer.init(std.testing.allocator, 2, null);
+    defer observer.deinit();
+    observer.scheduling_io = unavailable.io();
+    try std.testing.expectError(error.CancellationObserverThreadSpawnFailed, observer.start());
+    try std.testing.expect(observer.control_io == null);
+    try std.testing.expect(observer.future == null);
+    try std.testing.expect(observer.kernel_fd == null);
+    observer.scheduling_io = lane.io();
+    try observer.start();
+    try std.testing.expect(observer.control_io == null);
+}

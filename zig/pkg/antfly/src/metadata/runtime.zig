@@ -14,6 +14,9 @@
 
 const std = @import("std");
 const antfly = @import("runtime_root.zig");
+const storage_source_options = @import("storage_source_options");
+const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
+const metadata_replica_root_client = @import("../storage/metadata_replica_root_client.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const group_ids = @import("../common/group_ids.zig");
@@ -26,7 +29,51 @@ const metadata_http_client = @import("http_client.zig");
 const platform_time = @import("antfly_platform").time;
 const thread_config = @import("../runtime_thread_config.zig");
 
-const setup_io_thread_stack_size = thread_config.minimum_partitioned_stack_size;
+const linked_storage = storage_source_options.control_only;
+const StorageKernelContext = if (linked_storage)
+    kernel_owner_client.Context
+else
+    struct {
+        fn deinit(self: *@This()) void {
+            self.* = .{};
+        }
+    };
+
+fn storageKernelContextHandle(context: ?StorageKernelContext) ?*anyopaque {
+    if (comptime linked_storage) {
+        return if (context) |value| value.handle else null;
+    }
+    return null;
+}
+
+const LegacyAuthBackend = if (linked_storage) struct {} else antfly.lsm_backend.BackendHandle;
+const KernelReplicaRootReconciler = if (linked_storage) struct {
+    alloc: std.mem.Allocator,
+    context: ?*anyopaque,
+    replica_root_dir: []const u8,
+
+    fn hook(self: *@This()) antfly.metadata_service.LocalReplicaRootReconcileHook {
+        return .{ .ptr = self, .vtable = &.{ .run = reconcile } };
+    }
+
+    fn reconcile(
+        ptr: *anyopaque,
+        request: antfly.metadata_service.LocalReplicaRootReconcileHook.Request,
+    ) !metadata_replica_root_client.ProvisionSummary {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try metadata_replica_root_client.reconcile(
+            self.alloc,
+            self.context,
+            self.replica_root_dir,
+            request.metadata_group_id,
+            request.group_ids,
+            request.tables,
+            request.ranges,
+        );
+    }
+} else struct {};
+
+const setup_io_thread_stack_size = 1 * 1024 * 1024;
 const metadata_raft_retained_entries = 1024;
 const metadata_raft_compaction_min_interval_entries = 512;
 const metadata_raft_election_max_ticks = 60;
@@ -245,6 +292,10 @@ pub const HealthSource = struct {
             try append(writer, "antfly_executor_inference_peak_leases", "gauge", "Peak inference executor lifetime leases", lanes.inference_peak_leases);
             try append(writer, "antfly_executor_inference_acquisitions_total", "counter", "Successful inference executor lease acquisitions", lanes.inference_acquisitions_total);
             try append(writer, "antfly_executor_inference_rejections_total", "counter", "Inference executor lease acquisitions rejected during shutdown", lanes.inference_rejections_total);
+            try append(writer, "antfly_executor_worker_capacity", "gauge", "Maximum dedicated service worker reservations", lanes.worker_capacity);
+            try append(writer, "antfly_executor_reserved_workers", "gauge", "Dedicated service workers reserved by runtime owners", lanes.reserved_workers);
+            try append(writer, "antfly_executor_peak_reserved_workers", "gauge", "Peak dedicated service worker reservations", lanes.peak_reserved_workers);
+            try append(writer, "antfly_executor_worker_active_leases", "gauge", "Active dedicated service worker owners", lanes.worker_active_leases);
             try append(writer, "antfly_executor_control_active_leases", "gauge", "Active control executor lifetime leases", lanes.control_active_leases);
             try append(writer, "antfly_executor_control_peak_leases", "gauge", "Peak control executor lifetime leases", lanes.control_peak_leases);
             try append(writer, "antfly_executor_control_acquisitions_total", "counter", "Successful control executor lease acquisitions", lanes.control_acquisitions_total);
@@ -318,7 +369,7 @@ pub const HealthSource = struct {
         try append(writer, "antfly_service_queued_updates", "gauge", "Pending metadata updates waiting to apply", @intCast(svc_metrics.queued_updates));
         try append(writer, "antfly_service_applied_updates_total", "counter", "Total applied metadata updates", @intCast(svc_metrics.applied_updates));
         try append(writer, "antfly_service_sync_rounds_total", "counter", "Total metadata sync rounds", @intCast(svc_metrics.sync_rounds));
-        try append(writer, "antfly_service_read_lease_requests_total", "counter", "Total readable-lease requests", @intCast(svc_metrics.read_lease_requests));
+        try append(writer, "antfly_service_read_index_requests_total", "counter", "Total Raft ReadIndex requests", @intCast(svc_metrics.read_index_requests));
         try append(writer, "antfly_service_split_transitions_queued", "gauge", "Queued split transitions", @intCast(svc_metrics.queued_split_transitions));
         try append(writer, "antfly_service_split_transitions_completed_total", "counter", "Completed split transitions", @intCast(svc_metrics.completed_split_transitions));
         try append(writer, "antfly_service_merge_transitions_queued", "gauge", "Queued merge transitions", @intCast(svc_metrics.queued_merge_transitions));
@@ -426,6 +477,7 @@ pub const ServerConfig = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*antfly.common.secrets.FileStore = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
+    storage_context: ?*anyopaque = null,
 };
 
 const MetadataRaftStorageDiagnostics = struct {
@@ -492,6 +544,7 @@ pub const Server = struct {
     snapshot_root_dir: []u8,
     bind_host: []u8,
     admin_bind_host: []u8,
+    kernel_replica_root_reconciler: ?*KernelReplicaRootReconciler = null,
     reallocation_protocol_peers: []antfly.metadata_service.ReallocationProtocolPeer,
     raft_storage_diagnostics: MetadataRaftStorageDiagnosticsCache = .{},
 
@@ -522,6 +575,18 @@ pub const Server = struct {
         errdefer alloc.free(result.bind_host);
         result.admin_bind_host = try alloc.dupe(u8, cfg.admin_bind_host);
         errdefer alloc.free(result.admin_bind_host);
+        result.kernel_replica_root_reconciler = null;
+        if (comptime linked_storage) {
+            const reconciler = try alloc.create(KernelReplicaRootReconciler);
+            reconciler.* = .{
+                .alloc = alloc,
+                .context = cfg.storage_context,
+                .replica_root_dir = result.replica_root_dir,
+            };
+            result.kernel_replica_root_reconciler = reconciler;
+        }
+        errdefer if (comptime linked_storage) if (result.kernel_replica_root_reconciler) |reconciler|
+            alloc.destroy(reconciler);
         result.reallocation_protocol_peers = try reallocationProtocolPeersFromClusterPeers(alloc, cfg.metadata_cluster_peers);
         errdefer freeReallocationProtocolPeers(alloc, result.reallocation_protocol_peers);
         const service_cfg = antfly.metadata_service.MetadataServiceConfig{
@@ -564,6 +629,7 @@ pub const Server = struct {
         }, .{
             .http = .{
                 .http = .{
+                    .data_apply_storage_context = cfg.storage_context,
                     .http = .{
                         .host = .{
                             .descriptor_factory = result.factory.iface(),
@@ -573,6 +639,9 @@ pub const Server = struct {
             },
         });
         errdefer result.server.deinit();
+        if (comptime linked_storage) {
+            result.server.setLocalReplicaRootReconcileHook(result.kernel_replica_root_reconciler.?.hook());
+        }
         return result;
     }
 
@@ -586,6 +655,8 @@ pub const Server = struct {
     ) void {
         self.server.deinitWithDeadline(deadline);
         freeReallocationProtocolPeers(self.alloc, self.reallocation_protocol_peers);
+        if (comptime linked_storage) if (self.kernel_replica_root_reconciler) |reconciler|
+            self.alloc.destroy(reconciler);
         self.alloc.free(self.admin_bind_host);
         self.alloc.free(self.bind_host);
         self.alloc.free(self.snapshot_root_dir);
@@ -883,6 +954,8 @@ pub fn runFromIterator(
     }
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
+    var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
+    defer setup_io.deinit();
     const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
         cli.raft_tick_ms,
         cli.control_tick_ms,
@@ -893,13 +966,14 @@ pub fn runFromIterator(
     defer if (secret_store_initialized) secret_store.deinit();
 
     if (cli.secret_store_paths.items.len > 0) {
-        secret_store = try initLayeredSecretStore(alloc, cli.secret_store_paths.items);
+        secret_store = try initLayeredSecretStore(alloc, setup_io.io(), cli.secret_store_paths.items);
         secret_store_initialized = true;
     }
 
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
-        try antfly.common.config.loadFromPathWithSecrets(
+        try antfly.common.config.loadFromPathWithSecretsWithIo(
             alloc,
+            setup_io.io(),
             config_path,
             if (secret_store_initialized) &secret_store else null,
         )
@@ -916,8 +990,9 @@ pub fn runFromIterator(
     defer if (remote_content_runtime_initialized) remote_content_runtime.deinit();
     var remote_content_facade = antfly.common.config.Config.RemoteContentConfig{};
     const remote_content = if (cli.config_path) |config_path| blk: {
-        remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.init(
+        remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.initWithIo(
             alloc,
+            setup_io.io(),
             config_path,
             if (secret_store_initialized) &secret_store else null,
             null,
@@ -932,7 +1007,7 @@ pub fn runFromIterator(
 
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
-    try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+    try antfly.common.data_format.ensureCompatible(alloc, setup_io.io(), data_dir);
 
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
@@ -1008,8 +1083,6 @@ pub fn runFromIterator(
     }
     const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
-    var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
-    defer setup_io.deinit();
     try ensureDirPath(setup_io.io(), resolved.replica_root_dir);
     try ensureParent(setup_io.io(), resolved.replica_catalog_path);
     try ensureDirPath(setup_io.io(), resolved.snapshot_root_dir);
@@ -1017,34 +1090,69 @@ pub fn runFromIterator(
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
-        init.io,
+        setup_io.io(),
         if (loaded_config) |*cfg| cfg else null,
     );
     defer active_audio_runtime.deinit();
 
-    var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
+    var storage_kernel_context: ?StorageKernelContext = null;
+    defer if (storage_kernel_context) |*context| context.deinit();
+    if (comptime linked_storage) {
+        var context = kernel_owner_client.Context{};
+        try context.ensureWith(.{
+            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        });
+        storage_kernel_context = context;
+        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
+        defer alloc.free(security_json);
+        try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+    }
+
+    var auth_backend: ?LegacyAuthBackend = null;
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_users_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_casbin_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_users_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_casbin_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
     var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
     if (auth_enabled) {
-        auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
-        errdefer if (auth_backend) |*backend| backend.close();
-        auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
-        errdefer if (auth_runtime) |*runtime| runtime.deinit();
-        auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
-        auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
-        user_manager = try antfly.usermgr.UserManager.init(
+        if (comptime linked_storage) {
+            kernel_auth_users_store = try storage_kernel_context.?.systemStore(alloc, "system/auth-users");
+            errdefer kernel_auth_users_store.?.deinit();
+            kernel_auth_casbin_store = try storage_kernel_context.?.systemStore(alloc, "system/auth-casbin");
+            errdefer kernel_auth_casbin_store.?.deinit();
+            kernel_auth_users_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_users_store.?, "usermgr_users");
+            errdefer kernel_auth_users_runtime.?.deinit();
+            kernel_auth_casbin_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_casbin_store.?, "usermgr_casbin");
+            errdefer kernel_auth_casbin_runtime.?.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, kernel_auth_users_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, kernel_auth_casbin_runtime.?);
+        } else {
+            auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
+            errdefer if (auth_backend) |*backend| backend.close();
+            auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
+            errdefer if (auth_runtime) |*runtime| runtime.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        }
+        user_manager = try antfly.usermgr.UserManager.initWithIo(
             alloc,
+            setup_io.io(),
             auth_user_store.?.iface(),
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
         errdefer if (user_manager) |*manager| manager.deinit();
         try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
-    defer if (user_manager) |*manager| manager.deinit();
+    defer if (comptime !linked_storage) if (auth_backend) |*backend| backend.close();
     defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (auth_backend) |*backend| backend.close();
+    defer if (kernel_auth_users_store) |*store| store.deinit();
+    defer if (kernel_auth_casbin_store) |*store| store.deinit();
+    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
+    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
+    defer if (user_manager) |*manager| manager.deinit();
 
     const trusted_principal_issuer = try resolveTrustedPrincipalIssuer(
         alloc,
@@ -1098,6 +1206,7 @@ pub fn runFromIterator(
             .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
+        .storage_context = storageKernelContextHandle(storage_kernel_context),
     });
     defer server.deinitWithDeadline(supervisor.deadline());
     try server.start();
@@ -1115,11 +1224,14 @@ pub fn runFromIterator(
     defer alloc.free(admin_uri);
     std.debug.print("metadata admin api listening on {s}\n", .{admin_uri});
 
+    var raft_progress_lease = try (try server.server.svc.ensureBackendRuntime()).acquireWorkers(.{});
+    defer raft_progress_lease.release();
     var raft_progress = antfly.raft.ManagedProgressDriver.init(
-        init.io,
+        setup_io.io(),
         server.raftProgressSource(),
         runtime_cadence.raft_tick_ns,
     );
+    raft_progress.scheduling_io = raft_progress_lease.io();
     defer raft_progress.deinit();
     try raft_progress.start();
 
@@ -1155,7 +1267,7 @@ pub fn runFromIterator(
     while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
         if (server.adminListenerFailure()) |err| return supervisor.fail("metadata", "admin-http", err);
         if (health_server) |hs| if (hs.runtimeFailure()) |err| return supervisor.fail("health", "http", err);
-        raft_progress.check() catch |err| return supervisor.fail("metadata", "raft-progress", err);
+        raft_progress.checkFailure() catch |err| return supervisor.fail("metadata", "raft-progress", err);
         if (preferred_bootstrap_campaigner) {
             const now_ns = platform_time.monotonicNs();
             if (last_bootstrap_campaign_retry_ns == 0 or
@@ -1292,6 +1404,7 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
 
 fn initLayeredSecretStore(
     alloc: std.mem.Allocator,
+    io: std.Io,
     raw_paths: []const []const u8,
 ) !antfly.common.secrets.FileStore {
     var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -1304,7 +1417,7 @@ fn initLayeredSecretStore(
         errdefer alloc.free(normalized_path);
         try normalized_paths.append(alloc, normalized_path);
     }
-    return try antfly.common.secrets.FileStore.initLayered(alloc, normalized_paths.items);
+    return try antfly.common.secrets.FileStore.initLayeredWithIo(alloc, io, normalized_paths.items);
 }
 
 fn resolveLocalBaseDir(
@@ -1400,10 +1513,7 @@ fn resolveExtensionPackageStoreDirWithEnv(
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) return try alloc.dupe(u8, path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
-    const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(io_impl.io(), path, alloc) catch |err| switch (err) {
+    const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(std.Options.debug_io, path, alloc) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => null,
         else => return err,
     };
@@ -2164,7 +2274,8 @@ test "metadata runtime serves raft and admin listener requests on threaded io co
     defer server.deinit();
 
     const admin_listener = server.server.owned_admin_listener orelse return error.MissingMetadataAdminListener;
-    const raft_listener = server.server.svc.raft.host.http_host.listener;
+    const raft_listener = server.server.svc.raft.host.http_host.listener orelse
+        return error.MissingRaftListener;
     try std.testing.expect(raft_listener.cfg.serve_in_connection_threads);
     try std.testing.expectEqual(antfly.raft.default_http_listener_max_connection_threads, raft_listener.cfg.max_connection_threads);
     try std.testing.expect(admin_listener.cfg.serve_in_connection_threads);

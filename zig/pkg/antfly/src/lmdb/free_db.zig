@@ -63,7 +63,25 @@ pub fn buildDb(
         candidate_free_pages = actual_free_pages;
     }
 
-    return error.Unexpected;
+    // The free DB consumes the very pages it records. At an inline/overflow
+    // boundary, consuming one extra page shrinks its value enough to need one
+    // fewer page, so iteration can oscillate instead of reaching a fixed point.
+    // Break that dependency by allocating this free DB at the append frontier.
+    // Every original reusable page stays recorded as free; no page is lost or
+    // advertised while in use. Ordinary commits still reuse pages above, and
+    // these appended metadata pages retire normally on the next replacement.
+    var builder = ImageBuilderType{
+        .allocator = allocator,
+        .page_size = page_size,
+        .next_pgno = base_next_pgno,
+    };
+    try builder.pages.appendSlice(allocator, base_pages);
+    const all_free_pages = try combinePgnoLists(allocator, retired_snapshot_pages, base_reusable_pages);
+    const entries = try buildFreePageEntries(LeafWriteEntryType, allocator, retained_free_records, next_txnid, all_free_pages);
+    const db = (try builder.buildDb(entries, format.DbFlags.integer_key)).db;
+    // Preserve the builder contract even though allocation was append-only.
+    builder.reusable_pages = try allocator.dupe(format.Pgno, base_reusable_pages);
+    return .{ .builder = builder, .db = db };
 }
 
 pub fn buildFreePageEntries(
@@ -154,4 +172,56 @@ pub fn freeRecordLessThan(comptime LeafWriteEntryType: type) fn (void, LeafWrite
             return format.readNativeInt(format.Txnid, left.key) < format.readNativeInt(format.Txnid, right.key);
         }
     }.lessThan;
+}
+
+test "free DB converges across inline and overflow boundaries without losing pages" {
+    const materialize = @import("materialize_support.zig");
+    const PageImage = @import("commit_support.zig").PageImage;
+    var appended_cases: usize = 0;
+    // Exercise Linux and Darwin page sizes on either host. Fragmented and
+    // contiguous free extents exercise different overflow allocation choices.
+    for ([_]usize{ 512, 4096, 16384 }) |page_size| for ([_]usize{ 1, 2 }) |stride| {
+        for (page_size / 8 - 12..page_size / 8 + 4) |count| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const reusable = try alloc.alloc(format.Pgno, count);
+            for (reusable, 0..) |*pgno, i| pgno.* = @intCast(10 + i * stride);
+            const retired = [_]format.Pgno{ 3, 4 };
+            const frontier = reusable[reusable.len - 1] + 1;
+            const built = try buildDb(materialize.ImageBuilder, PageImage, materialize.LeafWriteEntry, alloc, page_size, &.{}, frontier, reusable, &.{}, &retired, 7);
+            if (built.builder.next_pgno > frontier and built.builder.reusable_pages.len == reusable.len) appended_cases += 1;
+            var encoded: ?[]const u8 = null;
+            for (built.builder.pages.items) |image| switch (image) {
+                .leaf => |leaf| for (leaf.entries) |entry| {
+                    if (format.readNativeInt(format.Txnid, entry.key) != 7) continue;
+                    if (entry.flags & format.NodeFlags.bigdata == 0) {
+                        encoded = entry.value;
+                    } else {
+                        const pgno = format.readNativeInt(format.Pgno, entry.value);
+                        for (built.builder.pages.items) |payload| if (payload == .overflow and payload.overflow.pgno == pgno) {
+                            encoded = payload.overflow.data;
+                        };
+                    }
+                },
+                else => {},
+            };
+            const free = try decodePgnoList(alloc, encoded orelse return error.TestExpectedFreeRecord);
+            const expected = try combinePgnoLists(alloc, &retired, built.builder.reusable_pages);
+            try std.testing.expectEqualSlices(format.Pgno, expected, free);
+            var reused: usize = 0;
+            for (built.builder.pages.items) |image| {
+                const first = switch (image) {
+                    inline else => |value| value.pgno,
+                };
+                const pages: usize = if (image == .overflow) image.overflow.page_count else 1;
+                for (first..first + pages) |pgno| {
+                    try std.testing.expect(std.mem.indexOfScalar(format.Pgno, free, pgno) == null);
+                    if (pgno < frontier) reused += 1;
+                }
+            }
+            try std.testing.expectEqual(reusable.len, reused + built.builder.reusable_pages.len);
+        }
+    };
+    try std.testing.expect(appended_cases > 0);
 }

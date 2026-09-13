@@ -37,6 +37,7 @@ const roaring = @import("../../../encoding/roaring.zig");
 const snappy = @import("../../../encoding/snappy.zig");
 const distributed_stats_mod = @import("../../../search/distributed_stats.zig");
 const runtime_preflight = @import("../runtime_preflight.zig");
+const control_contract = @import("control_contract.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const introducer_mod = @import("../../../introducer.zig");
 const mapper_mod = @import("../document_mapper.zig");
@@ -88,42 +89,13 @@ const bench_query_profile_unknown = std.math.maxInt(u64);
 const bench_query_profile_disabled = std.math.maxInt(u64) - 1;
 var bench_query_profile_every_cache: std.atomic.Value(u64) = .init(bench_query_profile_unknown);
 
-pub const SortRejectionDiagnostic = struct {
-    field: []const u8 = "",
-    reason: []const u8 = "unsupported_exact_sort",
-    detail: []const u8 = "unsupported_exact_sort",
-};
-
-threadlocal var last_sort_rejection_diagnostic: ?SortRejectionDiagnostic = null;
-threadlocal var last_sort_rejection_field_buf: [256]u8 = undefined;
-
-pub fn resetLastSortRejectionDiagnostic() void {
-    last_sort_rejection_diagnostic = null;
-}
-
-pub fn takeLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
-    const diagnostic = last_sort_rejection_diagnostic;
-    last_sort_rejection_diagnostic = null;
-    return diagnostic;
-}
-
-pub fn peekLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
-    return last_sort_rejection_diagnostic;
-}
-
-pub fn recordSortRejectionDiagnostic(field: []const u8, reason: []const u8, detail: []const u8) void {
-    const field_len = @min(field.len, last_sort_rejection_field_buf.len);
-    if (field_len > 0) @memcpy(last_sort_rejection_field_buf[0..field_len], field[0..field_len]);
-    last_sort_rejection_diagnostic = .{
-        .field = last_sort_rejection_field_buf[0..field_len],
-        .reason = reason,
-        .detail = detail,
-    };
-}
-
-pub fn recordSortRejectionDiagnosticForTesting(field: []const u8, reason: []const u8, detail: []const u8) void {
-    recordSortRejectionDiagnostic(field, reason, detail);
-}
+pub const SortRejectionDiagnostic = runtime_preflight.SortRejectionDiagnostic;
+pub const resetLastSortRejectionDiagnostic = runtime_preflight.resetLastSortRejectionDiagnostic;
+pub const takeLastSortRejectionDiagnostic = runtime_preflight.takeLastSortRejectionDiagnostic;
+pub const peekLastSortRejectionDiagnostic = runtime_preflight.peekLastSortRejectionDiagnostic;
+pub const recordSortRejectionDiagnostic = runtime_preflight.recordSortRejectionDiagnostic;
+pub const recordSortRejectionDiagnosticForTesting = runtime_preflight.recordSortRejectionDiagnosticForTesting;
+const textQueryIsScoreBearing = runtime_preflight.textQueryIsScoreBearing;
 
 pub const SearchTextDispatcher = struct {
     ctx: ?*anyopaque,
@@ -225,21 +197,8 @@ pub const SearchTextStatsExecutor = struct {
     ) anyerror![]?[]u8 = null,
 };
 
-pub const ExplicitTextStatRequest = struct {
-    index_name: ?[]const u8 = null,
-    field: []const u8,
-    terms: []const []const u8 = &.{},
-    resolved_doc_filter: ?*const doc_set.ResolvedDocFilter = null,
-};
-
-pub const ExplicitBackgroundTextStatRequest = struct {
-    aggregation_name: []const u8,
-    index_name: ?[]const u8 = null,
-    field: []const u8,
-    terms: []const []const u8 = &.{},
-    background_query: aggregations_mod.BackgroundQuery,
-    resolved_doc_filter: ?*const doc_set.ResolvedDocFilter = null,
-};
+pub const ExplicitTextStatRequest = control_contract.ExplicitTextStatRequest;
+pub const ExplicitBackgroundTextStatRequest = control_contract.ExplicitBackgroundTextStatRequest;
 
 const SearchRequestTextStatEntry = struct {
     field: []const u8 = "",
@@ -366,127 +325,7 @@ pub const DenseSearchExecutor = struct {
     ) anyerror!types.SearchResult,
 };
 
-pub const DenseSearchProfile = struct {
-    pub const DebugHit = struct {
-        id: u64 = 0,
-        distance: f32 = 0,
-        error_bound: f32 = 0,
-        lower_bound: f32 = 0,
-        upper_bound: f32 = 0,
-    };
-
-    pub const DebugPair = struct {
-        left: DebugHit = .{},
-        right: DebugHit = .{},
-        distance_gap: f32 = 0,
-        interval_gap: f32 = 0,
-        overlaps: bool = false,
-    };
-
-    total_ns: u64 = 0,
-    index_lookup_ns: u64 = 0,
-    constraint_ns: u64 = 0,
-    hbc_search_ns: u64 = 0,
-    hbc_runtime_txn_ns: u64 = 0,
-    hbc_scratch_acquire_ns: u64 = 0,
-    hbc_node_cache_lookup_ns: u64 = 0,
-    hbc_quantized_cache_lookup_ns: u64 = 0,
-    hbc_filter_candidates: u64 = 0,
-    hbc_filter_rejected: u64 = 0,
-    hbc_filter_metadata_batches: u64 = 0,
-    hbc_filter_metadata_batch_ns: u64 = 0,
-    hbc_traversal_waves: u64 = 0,
-    hbc_traversal_initial_wave_leaves: u64 = 0,
-    hbc_traversal_max_wave_leaves: u64 = 0,
-    hbc_traversal_bound_resolutions: u64 = 0,
-    hbc_traversal_bound_fallbacks: u64 = 0,
-    hbc_traversal_bound_stops: u64 = 0,
-    hbc_traversal_frontier_remaining: u64 = 0,
-    hbc_traversal_eligible_vectors: u64 = 0,
-    hbc_traversal_stop_lower_bound: f32 = 0,
-    hbc_traversal_stop_result_upper_bound: f32 = 0,
-    resolved_search_width: u32 = 0,
-    resolved_epsilon: f32 = 0,
-    native_filter_candidate_count: u64 = 0,
-    search_route: []const u8 = "",
-    route_reason: []const u8 = "",
-    route_estimated_exact_storage_bytes: u64 = 0,
-    route_estimated_hbc_storage_bytes: u64 = 0,
-    route_estimated_exact_work_ns: u64 = 0,
-    route_estimated_hbc_work_ns: u64 = 0,
-    exact_candidate_count: u64 = 0,
-    exact_batch_count: u64 = 0,
-    exact_max_batch_size: u64 = 0,
-    exact_workspace_bytes: u64 = 0,
-    exact_request_vector_cache_entries: u64 = 0,
-    exact_raw_batch_reads: u64 = 0,
-    exact_raw_scalar_reads: u64 = 0,
-    exact_missing_vectors: u64 = 0,
-    exact_candidate_prepare_ns: u64 = 0,
-    exact_metadata_lookup_ns: u64 = 0,
-    exact_artifact_key_ns: u64 = 0,
-    exact_artifact_read_ns: u64 = 0,
-    exact_artifact_decode_ns: u64 = 0,
-    exact_distance_ns: u64 = 0,
-    exact_lsm_cache_hits: u64 = 0,
-    exact_lsm_cache_misses: u64 = 0,
-    exact_artifact_cache_hits: u64 = 0,
-    exact_artifact_vectors_loaded: u64 = 0,
-    hbc_nodes_visited: u64 = 0,
-    hbc_leaves_explored: u64 = 0,
-    hbc_approx_vectors_scored: u64 = 0,
-    hbc_exact_vectors_scored: u64 = 0,
-    hbc_leaf_payload_stale: u64 = 0,
-    hbc_leaf_payload_missing: u64 = 0,
-    hbc_reranked_vectors: u64 = 0,
-    hbc_approx_candidate_count: u64 = 0,
-    hbc_rerank_candidate_count: u64 = 0,
-    hbc_rerank_batches: u64 = 0,
-    hbc_rerank_max_batch_size: u64 = 0,
-    hbc_rerank_candidates_skipped_by_bound: u64 = 0,
-    hbc_ambiguous_top_k_pairs: u64 = 0,
-    hbc_ambiguous_boundary_pairs: u64 = 0,
-    hbc_ambiguous_distance_over_hits: u64 = 0,
-    hbc_ambiguous_distance_under_hits: u64 = 0,
-    hbc_full_rerank_due_to_threshold: bool = false,
-    hbc_top_k_count: u64 = 0,
-    hbc_min_distance_gap_top_k: f32 = 0,
-    hbc_min_interval_gap_top_k: f32 = 0,
-    hbc_closest_pair_top_k: ?DebugPair = null,
-    hbc_boundary_pair: ?DebugPair = null,
-    hbc_boundary_tail_error_avg: f32 = 0,
-    hbc_boundary_tail_error_max: f32 = 0,
-    hbc_boundary_tail_distance_gap_avg: f32 = 0,
-    hbc_boundary_tail_distance_gap_min: f32 = 0,
-    hbc_boundary_tail_distance_gap_max: f32 = 0,
-    hbc_boundary_tail_interval_gap_avg: f32 = 0,
-    hbc_boundary_tail_interval_gap_min: f32 = 0,
-    hbc_boundary_tail_interval_gap_max: f32 = 0,
-    hbc_approx_top_count: u64 = 0,
-    hbc_approx_top: [5]DebugHit = .{ .{}, .{}, .{}, .{}, .{} },
-    hbc_rerank_external_score_ns: u64 = 0,
-    hbc_rerank_vector_load_ns: u64 = 0,
-    hbc_rerank_metadata_lookup_ns: u64 = 0,
-    hbc_rerank_metadata_vectors_loaded: u64 = 0,
-    hbc_rerank_artifact_key_ns: u64 = 0,
-    hbc_rerank_artifact_read_ns: u64 = 0,
-    hbc_rerank_artifact_decode_ns: u64 = 0,
-    hbc_rerank_artifact_distance_ns: u64 = 0,
-    hbc_rerank_lsm_cache_hits: u64 = 0,
-    hbc_rerank_lsm_cache_misses: u64 = 0,
-    hbc_rerank_artifact_cache_hits: u64 = 0,
-    hbc_rerank_artifact_vectors_loaded: u64 = 0,
-    hbc_rerank_distance_ns: u64 = 0,
-    doc_key_resolve_ns: u64 = 0,
-    doc_ordinal_lookup_ns: u64 = 0,
-    load_projected_document_ns: u64 = 0,
-    postprocess_ns: u64 = 0,
-    raw_hit_count: u32 = 0,
-    returned_hit_count: u32 = 0,
-    inline_metadata_hits: u32 = 0,
-    fetched_metadata_hits: u32 = 0,
-    lookup_doc_key_hits: u32 = 0,
-};
+pub const DenseSearchProfile = control_contract.DenseSearchProfile;
 
 pub const ProfiledDenseSearchResult = struct {
     result: types.SearchResult,
@@ -882,122 +721,7 @@ pub fn preflightSearchRequestAlloc(
 }
 
 pub fn deriveEstimateFields(summary: *RuntimePreflightSummary) void {
-    summary.text_result_upper_bound = textResultUpperBound(summary.*);
-    summary.text_term_doc_freq_total = textTermDocFreqTotal(summary.*);
-    summary.corpus_doc_count_estimate = estimatedCorpusDocCount(summary.*);
-    summary.result_doc_upper_bound = resultDocUpperBound(summary.*);
-    summary.result_doc_estimate = resultDocEstimate(summary.*);
-    summary.selectivity_lower_bound_ratio = selectivityLowerBoundRatio(summary.*);
-    summary.selectivity_sample_ratio = selectivitySampleRatio(summary.*);
-    summary.selectivity_upper_bound_ratio = selectivityUpperBoundRatio(summary.*);
-    summary.effective_stored_projection_doc_estimate_total = if (summary.result_doc_estimate) |estimate|
-        @min(summary.stored_projection_doc_upper_bound_total, estimate)
-    else
-        null;
-    summary.effective_stored_projection_doc_upper_bound_total = if (summary.result_doc_upper_bound) |bound|
-        @min(summary.stored_projection_doc_upper_bound_total, bound)
-    else
-        summary.stored_projection_doc_upper_bound_total;
-    summary.effective_rerank_doc_estimate = if (summary.result_doc_estimate) |estimate|
-        @min(summary.rerank_doc_upper_bound, estimate)
-    else
-        null;
-    summary.effective_rerank_doc_upper_bound = if (summary.result_doc_upper_bound) |bound|
-        @min(summary.rerank_doc_upper_bound, bound)
-    else
-        summary.rerank_doc_upper_bound;
-    summary.aggregation_second_pass_doc_estimate = if (summary.aggregation_may_scan_full_results) summary.result_doc_estimate else null;
-    summary.aggregation_second_pass_doc_upper_bound = if (summary.aggregation_may_scan_full_results) summary.result_doc_upper_bound else null;
-}
-
-fn textResultUpperBound(summary: RuntimePreflightSummary) ?u32 {
-    var total_bound: u64 = 0;
-    var has_terms = false;
-    for (summary.text_query_stats) |item| {
-        var field_bound: u64 = 0;
-        for (item.term_doc_freqs) |term| {
-            field_bound +|= term.doc_freq;
-            has_terms = true;
-        }
-        if (field_bound == 0) continue;
-        const capped_field_bound = @min(field_bound, item.global_doc_count);
-        total_bound +|= capped_field_bound;
-    }
-    if (!has_terms) return null;
-    if (estimatedCorpusDocCount(summary)) |corpus_docs| {
-        total_bound = @min(total_bound, corpus_docs);
-    }
-    return @intCast(@min(total_bound, @as(u64, std.math.maxInt(u32))));
-}
-
-fn textTermDocFreqTotal(summary: RuntimePreflightSummary) u64 {
-    var total: u64 = 0;
-    for (summary.text_query_stats) |item| {
-        for (item.term_doc_freqs) |term| total +|= term.doc_freq;
-    }
-    return total;
-}
-
-fn estimatedCorpusDocCount(summary: RuntimePreflightSummary) ?u64 {
-    var corpus_docs: u64 = 0;
-    for (summary.text_query_stats) |item| corpus_docs = @max(corpus_docs, item.global_doc_count);
-    for (summary.text_indexes) |item| corpus_docs = @max(corpus_docs, item.doc_count);
-    for (summary.embedding_indexes) |item| corpus_docs = @max(corpus_docs, item.doc_count);
-    for (summary.graph_indexes) |item| corpus_docs = @max(corpus_docs, item.node_count);
-    return if (corpus_docs > 0) corpus_docs else null;
-}
-
-fn selectivityUpperBoundRatio(summary: RuntimePreflightSummary) ?f32 {
-    const bound = summary.result_doc_upper_bound orelse return null;
-    const corpus_docs = estimatedCorpusDocCount(summary) orelse return null;
-    if (corpus_docs == 0) return null;
-    return @as(f32, @floatFromInt(bound)) / @as(f32, @floatFromInt(corpus_docs));
-}
-
-fn selectivityLowerBoundRatio(summary: RuntimePreflightSummary) ?f32 {
-    const lower_bound = summary.structured_filter_doc_count_lower_bound orelse return null;
-    const corpus_docs = estimatedCorpusDocCount(summary) orelse return null;
-    if (corpus_docs == 0) return null;
-    return @as(f32, @floatFromInt(lower_bound)) / @as(f32, @floatFromInt(corpus_docs));
-}
-
-fn selectivitySampleRatio(summary: RuntimePreflightSummary) ?f32 {
-    const sample_estimate = summary.structured_filter_doc_count_sample_estimate orelse return null;
-    const corpus_docs = estimatedCorpusDocCount(summary) orelse return null;
-    if (corpus_docs == 0) return null;
-    return @as(f32, @floatFromInt(sample_estimate)) / @as(f32, @floatFromInt(corpus_docs));
-}
-
-fn resultDocUpperBound(summary: RuntimePreflightSummary) ?u32 {
-    var bound = summary.positive_id_result_upper_bound;
-    if (summary.structured_filter_doc_count_sample_estimate == null) if (summary.structured_filter_doc_count_estimate) |structured_count| {
-        const structured_bound: u32 = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-        bound = if (bound) |existing| @min(existing, structured_bound) else structured_bound;
-    };
-    if (summary.text_result_upper_bound) |text_bound| {
-        bound = if (bound) |existing| @min(existing, text_bound) else text_bound;
-    }
-    return bound;
-}
-
-fn resultDocEstimate(summary: RuntimePreflightSummary) ?u32 {
-    var estimate: ?u32 = null;
-    if (summary.structured_filter_count_budget_limit != null) {
-        if (summary.structured_filter_doc_count_sample_estimate) |structured_count| {
-            estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-        } else if (summary.structured_filter_doc_count_estimate) |structured_count| {
-            estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-        }
-    } else if (summary.structured_filter_doc_count_estimate) |structured_count| {
-        estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-    } else if (summary.structured_filter_doc_count_sample_estimate) |structured_count| {
-        estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-    }
-    if (estimate) |value| {
-        if (summary.result_doc_upper_bound) |bound| return @min(value, bound);
-        return value;
-    }
-    return null;
+    runtime_preflight.deriveEstimateFields(summary);
 }
 
 pub fn emptySearchResult(alloc: Allocator) !types.SearchResult {
@@ -1030,10 +754,7 @@ fn freeOwnedStringSlice(alloc: Allocator, values: []const []const u8) void {
 }
 
 pub fn isTextQuery(query: types.Query) bool {
-    return switch (query) {
-        .match_none, .match_all, .phrase, .multi_phrase, .term, .fuzzy, .numeric_range, .date_range, .doc_id, .bool_field, .geo_distance, .geo_bbox, .term_range, .ip_range, .geo_shape, .match, .match_phrase, .prefix, .wildcard, .regexp => true,
-        else => false,
-    };
+    return control_contract.isTextQuery(query);
 }
 
 fn searchComposedDenseComponent(
@@ -1492,30 +1213,20 @@ fn findComposedNamedSet(named_sets: []const graph_exec.NamedResultSet, name: []c
 }
 
 pub fn isDefaultMatchAll(query: types.Query) bool {
-    return switch (query) {
-        .match_all => true,
-        else => false,
-    };
+    return control_contract.isDefaultMatchAll(query);
 }
 
 /// Whether request execution binds `index_name` directly as a full-text index.
 /// Keep planning, binding validation, and API lifecycle error classification
 /// on one definition so an unavailable index cannot change a permanent shape
 /// error into a retryable rebuilding response.
-pub fn requestBindsRootTextIndex(req: types.SearchRequest) bool {
-    return req.full_text != null or
-        req.filter_query_json.len > 0 or
-        req.exclusion_query_json.len > 0 or
-        (!isDefaultMatchAll(req.query) and isTextQuery(req.query));
-}
+pub const requestBindsRootTextIndex = control_contract.requestBindsRootTextIndex;
 
 /// Structured text filters use their own resolution chain: the routed primary
 /// text index, then the root index, then the default full-text index. Keep that
 /// distinct from direct root-index binding so preflight does not reject a
 /// valid request merely because its semantic root index is not full-text.
-pub fn requestBindsFilterTextIndex(req: types.SearchRequest) bool {
-    return req.filter_text != null or req.exclusion_text != null;
-}
+pub const requestBindsFilterTextIndex = control_contract.requestBindsFilterTextIndex;
 
 fn hasSearchRequestFullTextResults(req: types.SearchRequest) bool {
     if (req.full_text != null) return true;
@@ -12829,6 +12540,7 @@ test "text stats use postings when segment source is omitted" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -13396,9 +13108,22 @@ fn searchDenseInternal(
                 else => return err,
             };
             profile.hbc_runtime_txn_ns = profiled.profile.runtime_txn_ns;
+            profile.hbc_admission_wait_ns = profiled.profile.admission_wait_ns;
+            profile.hbc_scan_admission_wait_ns = profiled.profile.scan_admission_wait_ns;
+            profile.hbc_rerank_admission_wait_ns = profiled.profile.rerank_admission_wait_ns;
+            profile.hbc_admission_estimated_scan_bytes = profiled.profile.admission_estimated_scan_bytes;
+            profile.hbc_admission_selected_scan_bytes = profiled.profile.admission_selected_scan_bytes;
+            profile.hbc_admission_peak_reserved_bytes = profiled.profile.admission_peak_reserved_bytes;
+            profile.hbc_admission_reservations = profiled.profile.admission_reservations;
+            profile.hbc_admission_fallback_leaves = profiled.profile.admission_fallback_leaves;
+            profile.hbc_leaf_scan_bytes = profiled.profile.leaf_scan_bytes;
+            profile.hbc_native_leaf_lookup_ns = profiled.profile.native_leaf_lookup_ns;
+            profile.hbc_projection_completion_ns = profiled.profile.projection_completion_ns;
             profile.hbc_scratch_acquire_ns = profiled.profile.scratch_acquire_ns;
             profile.hbc_node_cache_lookup_ns = profiled.profile.node_cache_lookup_ns;
             profile.hbc_quantized_cache_lookup_ns = profiled.profile.quantized_cache_lookup_ns;
+            profile.hbc_child_expand_ns = profiled.profile.child_expand_ns;
+            profile.hbc_leaf_score_ns = profiled.profile.leaf_score_ns;
             profile.hbc_filter_candidates = profiled.profile.filter_candidates;
             profile.hbc_filter_rejected = profiled.profile.filter_rejected;
             profile.hbc_filter_metadata_batches = profiled.profile.filter_metadata_batches;
@@ -13409,6 +13134,11 @@ fn searchDenseInternal(
             profile.hbc_traversal_bound_resolutions = profiled.profile.traversal_bound_resolutions;
             profile.hbc_traversal_bound_fallbacks = profiled.profile.traversal_bound_fallbacks;
             profile.hbc_traversal_bound_stops = profiled.profile.traversal_bound_stops;
+            profile.hbc_traversal_bound_unresolved_frontier = profiled.profile.traversal_bound_unresolved_frontier;
+            profile.hbc_traversal_bound_incomplete_topk = profiled.profile.traversal_bound_incomplete_topk;
+            profile.hbc_traversal_bound_overlap = profiled.profile.traversal_bound_overlap;
+            profile.hbc_traversal_unresolved_posting_bounds = profiled.profile.traversal_unresolved_posting_bounds;
+            profile.hbc_traversal_incomplete_routing_directory = profiled.profile.traversal_incomplete_routing_directory;
             profile.hbc_traversal_frontier_remaining = profiled.profile.traversal_frontier_remaining;
             profile.hbc_traversal_eligible_vectors = profiled.profile.traversal_eligible_vectors;
             profile.hbc_traversal_stop_lower_bound = profiled.profile.traversal_stop_lower_bound;
@@ -13419,6 +13149,12 @@ fn searchDenseInternal(
             profile.hbc_exact_vectors_scored = profiled.profile.exact_vectors_scored;
             profile.hbc_leaf_payload_stale = profiled.profile.leaf_payload_stale;
             profile.hbc_leaf_payload_missing = profiled.profile.leaf_payload_missing;
+            profile.hbc_native_leaf_scan_hits = profiled.profile.native_leaf_scan_hits;
+            profile.hbc_native_leaf_scan_fallbacks = profiled.profile.native_leaf_scan_fallbacks;
+            profile.hbc_subgroup_leaves_scored = profiled.profile.subgroup_leaves_scored;
+            profile.hbc_subgroup_vectors_skipped = profiled.profile.subgroup_vectors_skipped;
+            profile.hbc_subgroup_compact_groups_scored = profiled.profile.subgroup_compact_groups_scored;
+            profile.hbc_subgroup_routing_ns = profiled.profile.subgroup_routing_ns;
             profile.hbc_reranked_vectors = profiled.profile.reranked_vectors;
             profile.hbc_approx_candidate_count = profiled.profile.approx_candidate_count;
             profile.hbc_rerank_candidate_count = profiled.profile.rerank_candidate_count;
@@ -13457,6 +13193,17 @@ fn searchDenseInternal(
             profile.hbc_rerank_artifact_distance_ns = profiled.profile.rerank_artifact_distance_ns;
             profile.hbc_rerank_lsm_cache_hits = profiled.profile.rerank_lsm_cache_hits;
             profile.hbc_rerank_lsm_cache_misses = profiled.profile.rerank_lsm_cache_misses;
+            profile.hbc_rerank_vector_block_hits = profiled.profile.rerank_vector_block_hits;
+            profile.hbc_rerank_vector_projection_reads = profiled.profile.rerank_vector_projection_reads;
+            profile.hbc_rerank_vector_projection_borrows = profiled.profile.rerank_vector_projection_borrows;
+            profile.hbc_rerank_vector_projection_bytes = profiled.profile.rerank_vector_projection_bytes;
+            profile.hbc_rerank_vector_residual_reads = profiled.profile.rerank_vector_residual_reads;
+            profile.hbc_rerank_vector_residual_bytes = profiled.profile.rerank_vector_residual_bytes;
+            profile.hbc_rerank_vector_physical_reads = profiled.profile.rerank_vector_physical_reads;
+            profile.hbc_rerank_vector_physical_bytes = profiled.profile.rerank_vector_physical_bytes;
+            profile.hbc_rerank_vector_location_reuses = profiled.profile.rerank_vector_location_reuses;
+            profile.hbc_rerank_vector_block_misses = profiled.profile.rerank_vector_block_misses;
+            profile.hbc_rerank_vector_block_fallbacks = profiled.profile.rerank_vector_block_fallbacks;
             profile.hbc_rerank_artifact_cache_hits = profiled.profile.rerank_artifact_cache_hits;
             profile.hbc_rerank_artifact_vectors_loaded = profiled.profile.rerank_artifact_vectors_loaded;
             profile.hbc_rerank_distance_ns = profiled.profile.rerank_distance_ns;
@@ -14170,13 +13917,18 @@ test "raw multi-source member search avoids fixed-factor reranking" {
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = 2,
         .leaf_size = 32,
         .branching_factor = 8,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
 
     const vectors = try alloc.alloc(f32, active_count * 2);
     defer alloc.free(vectors);
@@ -14217,7 +13969,10 @@ test "raw multi-source member search avoids fixed-factor reranking" {
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const Harness = struct {
         alloc: Allocator,
@@ -14463,13 +14218,18 @@ test "built-in exact dense scorer filters metadata before vector reads" {
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = 2,
         .leaf_size = 2,
         .branching_factor = 2,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
     try index.bulkBuildWithMetadata(&.{
         .{ .vector_id = 1, .vector = &.{ 0.0, 0.0 }, .metadata = "doc:keep:a" },
         .{ .vector_id = 2, .vector = &.{ 1.0, 0.0 }, .metadata = "doc:keep:b" },
@@ -14490,7 +14250,10 @@ test "built-in exact dense scorer filters metadata before vector reads" {
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const VectorLoadCounter = struct {
         count: usize = 0,
@@ -14533,13 +14296,18 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = dims,
         .leaf_size = 64,
         .branching_factor = 8,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
 
     const vectors = try alloc.alloc(f32, candidate_count * dims);
     defer alloc.free(vectors);
@@ -14570,7 +14338,10 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const route = denseSearchRoute(true, candidate_count, candidate_count * 100, dims, result_count, 32, 64, false, false);
     try std.testing.expect(route.exact_native_filter);
@@ -14638,13 +14409,18 @@ test "one percent native filter routes through integrated dense search exactly" 
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = dims,
         .leaf_size = 128,
         .branching_factor = 16,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
 
     const vectors = try alloc.alloc(f32, active_count * dims);
     defer alloc.free(vectors);
@@ -14675,7 +14451,10 @@ test "one percent native filter routes through integrated dense search exactly" 
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const Harness = struct {
         entry: *index_manager_mod.IndexManager.DenseIndex,
@@ -14947,7 +14726,7 @@ fn logBenchDenseQueryProfile(
         },
     );
     std.log.info(
-        "antfly_bench_dense_query_hbc index={s} nodes_visited={d} leaves={d} approx_vectors={d} exact_vectors={d} payload_stale={d} payload_missing={d} reranked={d} approx_candidates={d} rerank_candidates={d} ambiguous_top_k={d} ambiguous_boundary={d} distance_over_hits={d} distance_under_hits={d} full_rerank={any} top_k_count={d} min_distance_gap={d:.6} min_interval_gap={d:.6} rerank_vector_load_us={d} rerank_metadata_us={d} rerank_artifact_key_us={d} rerank_artifact_read_us={d} rerank_artifact_decode_us={d} rerank_artifact_distance_us={d} rerank_lsm_cache_hits={d} rerank_lsm_cache_misses={d} rerank_distance_us={d} inline_meta={d} fetched_meta={d} lookup_doc_key={d}",
+        "antfly_bench_dense_query_hbc index={s} nodes_visited={d} leaves={d} approx_vectors={d} exact_vectors={d} payload_stale={d} payload_missing={d} native_leaf_scan_hits={d} native_leaf_scan_fallbacks={d} reranked={d} approx_candidates={d} rerank_candidates={d} ambiguous_top_k={d} ambiguous_boundary={d} distance_over_hits={d} distance_under_hits={d} full_rerank={any} top_k_count={d} min_distance_gap={d:.6} min_interval_gap={d:.6} rerank_vector_load_us={d} rerank_metadata_us={d} rerank_artifact_key_us={d} rerank_artifact_read_us={d} rerank_artifact_decode_us={d} rerank_artifact_distance_us={d} rerank_lsm_cache_hits={d} rerank_lsm_cache_misses={d} rerank_distance_us={d} inline_meta={d} fetched_meta={d} lookup_doc_key={d}",
         .{
             req.index_name orelse "",
             profile.hbc_nodes_visited,
@@ -14956,6 +14735,8 @@ fn logBenchDenseQueryProfile(
             profile.hbc_exact_vectors_scored,
             profile.hbc_leaf_payload_stale,
             profile.hbc_leaf_payload_missing,
+            profile.hbc_native_leaf_scan_hits,
+            profile.hbc_native_leaf_scan_fallbacks,
             profile.hbc_reranked_vectors,
             profile.hbc_approx_candidate_count,
             profile.hbc_rerank_candidate_count,
@@ -15624,65 +15405,9 @@ fn requestHasScoreSort(req: types.SearchRequest) bool {
     return false;
 }
 
-fn textQueryIsScoreBearing(query: types.TextQuery) bool {
-    return switch (query) {
-        .phrase,
-        .multi_phrase,
-        .term,
-        .match,
-        .multi_match_bool_prefix,
-        .match_phrase,
-        .fuzzy,
-        .prefix,
-        .wildcard,
-        .regexp,
-        => true,
-        .bool_query => |bool_query| textBoolQueryIsScoreBearing(bool_query),
-        .match_none,
-        .match_all,
-        .numeric_range,
-        .date_range,
-        .term_range,
-        .doc_id,
-        .bool_field,
-        .geo_distance,
-        .geo_bbox,
-        .ip_range,
-        .geo_shape,
-        => false,
-    };
-}
-
-fn textBoolQueryIsScoreBearing(query: types.TextBoolQuery) bool {
-    for (query.must) |child| {
-        if (textQueryIsScoreBearing(child)) return true;
-    }
-    for (query.should) |child| {
-        if (textQueryIsScoreBearing(child)) return true;
-    }
-    return false;
-}
-
-pub fn searchRequestHasScoreBearingTextSource(req: types.SearchRequest) bool {
-    if (req.full_text) |query| {
-        if (textQueryIsScoreBearing(query)) return true;
-    }
-    for (req.full_text_queries) |query| {
-        if (textQueryIsScoreBearing(query.query)) return true;
-    }
-    return false;
-}
-
-pub fn searchRequestHasScoreBearingVectorSource(req: types.SearchRequest) bool {
-    return req.dense != null or
-        req.sparse != null or
-        req.dense_queries.len > 0 or
-        req.sparse_queries.len > 0;
-}
-
-pub fn searchRequestHasScoreBearingSource(req: types.SearchRequest) bool {
-    return searchRequestHasScoreBearingTextSource(req) or searchRequestHasScoreBearingVectorSource(req);
-}
+pub const searchRequestHasScoreBearingTextSource = runtime_preflight.searchRequestHasScoreBearingTextSource;
+pub const searchRequestHasScoreBearingVectorSource = runtime_preflight.searchRequestHasScoreBearingVectorSource;
+pub const searchRequestHasScoreBearingSource = runtime_preflight.searchRequestHasScoreBearingSource;
 
 fn validateScoreSortHasScoreBearingTextSource(req: types.SearchRequest) !void {
     if (requestHasScoreSort(req) and !searchRequestHasScoreBearingTextSource(req)) {
@@ -17695,8 +17420,8 @@ const MatchAllPrimaryKeyScanBatch = struct {
         self.scanned += 1;
         if (self.scanned % 1024 == 0) try checkSearchRequestDeadline(self.req);
 
-        if (!internal_keys.isPrimaryDocumentKey(key)) return .@"continue";
-        var raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, key)) orelse return .@"continue";
+        if (!internal_keys.isStoredDocumentRowKey(key)) return .@"continue";
+        var raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, key)) orelse return .@"continue";
         errdefer self.alloc.free(raw_key);
 
         try self.raw_keys.append(self.alloc, raw_key);
@@ -17755,8 +17480,8 @@ const MatchAllCandidateCollectState = struct {
         self.processed += 1;
         if (self.processed % 1024 == 0) try checkSearchRequestDeadline(self.req);
 
-        if (!internal_keys.isPrimaryDocumentKey(store_key)) return;
-        var raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, store_key)) orelse return;
+        if (!internal_keys.isStoredDocumentRowKey(store_key)) return;
+        var raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, store_key)) orelse return;
         errdefer self.alloc.free(raw_key);
 
         const owned = raw_key;
@@ -20075,6 +19800,7 @@ test "match_all native doc values sort streams candidates without exact candidat
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -20262,6 +19988,7 @@ test "match_all native doc values sort consumes selective ordinal candidates dir
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -23462,6 +23189,7 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -23779,6 +23507,7 @@ test "match_all sorted segment seek honors deleted old sort values after upsert"
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -23934,6 +23663,7 @@ test "match_all index sort uses doc values collector for selective native filter
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -24141,6 +23871,7 @@ test "text field sort uses exact native doc values filter path without index sor
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -24420,6 +24151,7 @@ test "text score query exposes score top k sort profile" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -24588,6 +24320,7 @@ test "text ordered query rejects unresolved stored pattern filters" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -24751,6 +24484,7 @@ test "text field sort uses sorted segment membership path when index sort matche
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25017,6 +24751,7 @@ test "text index sort uses doc values collector for selective term filters" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25206,6 +24941,7 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25388,6 +25124,7 @@ test "match_all sorted segment seek enforces scan budget" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25474,6 +25211,7 @@ test "match_all sorted segment seek checks deadline while scanning" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25571,6 +25309,7 @@ test "match_all sorted segment seek zero limit returns profile without scanning"
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25686,6 +25425,7 @@ test "match_all sorted segment seek rejects cursor when segment bounds are unava
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25770,6 +25510,7 @@ test "match_all native ordinal doc values path enforces exact candidate budget" 
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25862,6 +25603,7 @@ test "text doc values sort zero limit avoids budget and decoration" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -26011,6 +25753,7 @@ test "match_all native ordinal doc values zero limit avoids budget and decoratio
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -27032,7 +26775,7 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
                 defer self.alloc.free(key);
                 if (i == 1023) {
                     self.reached_checkpoint.store(true, .release);
-                    while (!self.release_checkpoint.load(.acquire)) std.Thread.yield() catch {};
+                    while (!self.release_checkpoint.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                 }
                 if (try callback(scan_ctx, key, "{}") == .stop) return;
             }
@@ -27066,11 +26809,11 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
     var harness = Harness{ .alloc = std.heap.page_allocator };
     var cancellation = std.atomic.Value(bool).init(false);
     var worker = Worker{ .harness = &harness, .cancellation = &cancellation };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
     var joined = false;
     defer if (!joined) {
         harness.release_checkpoint.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     };
 
     var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -27082,7 +26825,7 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
     try std.testing.expect(harness.reached_checkpoint.load(.acquire));
     cancellation.store(true, .release);
     harness.release_checkpoint.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     joined = true;
     try std.testing.expect(worker.observed_cancel.load(.acquire));
 }
@@ -27829,6 +27572,7 @@ test "match_all native doc values without stream reports bounded exact collector
     const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,

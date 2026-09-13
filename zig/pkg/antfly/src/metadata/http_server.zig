@@ -97,7 +97,9 @@ pub const AdminSource = struct {
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
+        table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
+        linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         wait_for_routing_change: ?*const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, confirm_absence: bool) anyerror!metadata_api.CatalogRoutingChangeResult = null,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
@@ -202,9 +204,19 @@ pub const AdminSource = struct {
         return try self.vtable.routing_snapshot(self.ptr, deadline_ns);
     }
 
+    pub fn tableRoutingSnapshot(self: AdminSource, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const capture = self.vtable.table_routing_snapshot orelse return error.UnsupportedOperation;
+        return try capture(self.ptr, table_name, deadline_ns);
+    }
+
     pub fn linearizableRoutingSnapshot(self: AdminSource, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
         const capture = self.vtable.linearizable_routing_snapshot orelse return error.UnsupportedOperation;
         return try capture(self.ptr, request);
+    }
+
+    pub fn linearizableTableRoutingSnapshot(self: AdminSource, table_name: []const u8, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const capture = self.vtable.linearizable_table_routing_snapshot orelse return error.UnsupportedOperation;
+        return try capture(self.ptr, table_name, request);
     }
 
     pub fn freeRoutingSnapshot(self: AdminSource, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -494,7 +506,9 @@ pub const AdminSource = struct {
                 .status = metadataServiceStatus,
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
+                .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
+                .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServiceWaitForRoutingChange,
                 .validate_publication = metadataServiceValidatePublication,
@@ -554,7 +568,9 @@ pub const AdminSource = struct {
                 .status = metadataHttpServiceStatus,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
+                .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
+                .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
                 .validate_publication = metadataHttpServiceValidatePublication,
@@ -665,9 +681,21 @@ pub const AdminSource = struct {
         return try svc.catalogRoutingSnapshot(deadline_ns);
     }
 
+    fn metadataServiceTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
+    }
+
     fn metadataServiceLinearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         return try service.linearizableCatalogRoutingSnapshot(service.MetadataService, svc, request);
+    }
+
+    fn metadataServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
+        return try svc.catalogTableRoutingSnapshot(table_name, request.deadline_ns);
     }
 
     fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -1150,9 +1178,21 @@ pub const AdminSource = struct {
         return try svc.catalogRoutingSnapshot(deadline_ns);
     }
 
+    fn metadataHttpServiceTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
+    }
+
     fn metadataHttpServiceLinearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return try service.linearizableCatalogRoutingSnapshot(service.MetadataHttpService, svc, request);
+    }
+
+    fn metadataHttpServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
+        return try svc.catalogTableRoutingSnapshot(table_name, request.deadline_ns);
     }
 
     fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -1621,6 +1661,8 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
         try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
         try server.post(routes.Routes.internal_linearizable_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableRoutingSnapshot));
+        try server.post(routes.Routes.internal_table_routing_snapshot, httpx.Handler.bind(self, metadataTableRoutingSnapshot));
+        try server.post(routes.Routes.internal_linearizable_table_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableTableRoutingSnapshot));
         try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_routing_authority, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_await_route, httpx.Handler.bind(self, metadataAwaitRoute));
@@ -1995,6 +2037,40 @@ pub const MetadataHttpServer = struct {
         return self.trackedRoutingSnapshotJsonUntil(ctx, result);
     }
 
+    fn parseTableRoutingSnapshotRequest(ctx: *httpx.Context) !std.json.Parsed(metadata_api.CatalogTableRoutingSnapshotRequest) {
+        const body = (try ctx.body()) orelse "";
+        const parsed = std.json.parseFromSlice(metadata_api.CatalogTableRoutingSnapshotRequest, ctx.allocator, body, .{
+            .allocate = .alloc_always,
+        }) catch return error.InvalidArgument;
+        errdefer parsed.deinit();
+        if (parsed.value.table_name.len == 0) return error.InvalidArgument;
+        return parsed;
+    }
+
+    fn metadataTableRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        var parsed = parseTableRoutingSnapshotRequest(ctx) catch return ctx.status(400).text("invalid table routing snapshot request");
+        defer parsed.deinit();
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        var result = self.source.tableRoutingSnapshot(parsed.value.table_name, request.deadline_ns) catch |err| return metadataReadError(ctx, err);
+        defer self.source.freeRoutingSnapshot(&result);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedRoutingSnapshotJsonUntil(ctx, result);
+    }
+
+    fn metadataLinearizableTableRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        var parsed = parseTableRoutingSnapshotRequest(ctx) catch return ctx.status(400).text("invalid table routing snapshot request");
+        defer parsed.deinit();
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        var result = self.source.linearizableTableRoutingSnapshot(parsed.value.table_name, request) catch |err| return metadataReadError(ctx, err);
+        defer self.source.freeRoutingSnapshot(&result);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedRoutingSnapshotJsonUntil(ctx, result);
+    }
+
     fn metadataRoutingChange(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
         const body = (try ctx.body()) orelse "";
@@ -2207,6 +2283,11 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.MetadataMutationNotApplied) {
+            try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_applied);
+            try ctx.setHeader("Retry-After", "1");
+            return ctx.status(503).text("metadata mutation was superseded before application; retry on the current leader");
+        }
         if (err == error.UnsupportedOperation) return ctx.status(405).text("unsupported operation");
         if (err == error.InvalidRestoreProgressRequest)
             return ctx.status(400).text("invalid restore progress request");
@@ -2895,6 +2976,7 @@ pub const MetadataHttpServer = struct {
         self.tableOperations().create(ctx.allocator, request_context, table_name, request) catch |err| switch (err) {
             error.TableAlreadyExists => return ctx.status(409).text("table already exists"),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
+            error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => return ctx.status(400).text("vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => return ctx.status(400).text(tables_api.table_initial_ranges_error_message),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
             error.CreateTableRequestTooLarge => {
@@ -3020,6 +3102,7 @@ pub const MetadataHttpServer = struct {
     fn metadataUpdateTableSchema(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
         self.tableOperations().updateSchema(ctx.allocator, requestContext(ctx), table_name, (try ctx.body()) orelse "") catch |err| switch (err) {
+            error.SchemaInUse => return ctx.status(409).text("prepared transactions still use the current storage mode; resolve them before changing it"),
             error.TableNotFound => return ctx.status(404).text("table not found"),
             error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
@@ -3057,6 +3140,7 @@ pub const MetadataHttpServer = struct {
         ) catch |err| switch (err) {
             error.TableNotFound => return ctx.status(404).text("table not found"),
             error.SchemaVersionChanged, error.TableGenerationChanged => return ctx.status(409).text("schema version changed"),
+            error.SchemaInUse => return ctx.status(409).text("prepared transactions still use the current storage mode; resolve them before changing it"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
@@ -3444,6 +3528,7 @@ const ParsedRuntimeIndexStatus = struct {
     doc_count: ?u64 = null,
     term_count: ?u64 = null,
     edge_count: ?u64 = null,
+    graph_counts_pending: ?bool = null,
     node_count: ?u64 = null,
     root_node: ?u64 = null,
     publication_target_count: ?u64 = null,
@@ -3461,6 +3546,8 @@ const ParsedRuntimeIndexStatus = struct {
     replay_applied_sequence: ?u64 = null,
     replay_target_sequence: ?u64 = null,
     replay_catch_up_required: ?bool = null,
+    dense_vector_projection_pending: ?bool = null,
+    dense_native_storage_phase: ?metadata_table_manager.DenseNativeStoragePhase = null,
     embedding_activity_observed: ?bool = null,
     embedding_activity: ?ParsedRuntimeEmbeddingActivityStatus = null,
     source_replay: ?[]ParsedRuntimeIndexSourceReplayStatus = null,
@@ -3524,6 +3611,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         status_generation: ?u64 = null,
         artifact_sources_protocol_version: ?u16 = null,
         native_generation_restore_version: ?u16 = null,
+        dense_native_storage_protocol_version: ?u16 = null,
         api_url: ?[]const u8 = null,
         raft_url: ?[]const u8 = null,
         role: ?[]const u8 = null,
@@ -3553,6 +3641,10 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.artifact_sources_protocol_version orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.dense_native_storage_protocol_version orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
@@ -3564,6 +3656,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         .status_generation = parsed.value.status_generation orelse 0,
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
         .native_generation_restore_version = parsed.value.native_generation_restore_version orelse 0,
+        .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .api_url = try alloc.dupe(u8, parsed.value.api_url orelse ""),
         .raft_url = try alloc.dupe(u8, parsed.value.raft_url orelse ""),
         .role = try alloc.dupe(u8, parsed.value.role orelse "data"),
@@ -3658,6 +3751,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         reporter_incarnation: ?u64 = null,
         status_generation: ?u64 = null,
         artifact_sources_protocol_version: ?u16 = null,
+        dense_native_storage_protocol_version: ?u16 = null,
         live: ?bool = null,
         health_class: ?[]const u8 = null,
         capacity_bytes: ?u64 = null,
@@ -3686,6 +3780,10 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.artifact_sources_protocol_version orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.dense_native_storage_protocol_version orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
@@ -3703,6 +3801,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         .reporter_incarnation = parsed.value.reporter_incarnation orelse 0,
         .status_generation = parsed.value.status_generation orelse 0,
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
+        .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .live = parsed.value.live orelse true,
         .health_class = try alloc.dupe(u8, parsed.value.health_class orelse "healthy"),
         .capacity_bytes = parsed.value.capacity_bytes orelse 0,
@@ -3880,6 +3979,7 @@ fn cloneParsedRuntimeIndexStatus(
         .doc_count = parsed.doc_count orelse 0,
         .term_count = parsed.term_count orelse 0,
         .edge_count = parsed.edge_count orelse 0,
+        .graph_counts_pending = parsed.graph_counts_pending orelse false,
         .node_count = parsed.node_count orelse 0,
         .root_node = parsed.root_node orelse 0,
         .publication_target_count = parsed.publication_target_count orelse 0,
@@ -3897,6 +3997,8 @@ fn cloneParsedRuntimeIndexStatus(
         .replay_applied_sequence = parsed.replay_applied_sequence orelse 0,
         .replay_target_sequence = parsed.replay_target_sequence orelse 0,
         .replay_catch_up_required = parsed.replay_catch_up_required orelse false,
+        .dense_vector_projection_pending = parsed.dense_vector_projection_pending orelse false,
+        .dense_native_storage_phase = parsed.dense_native_storage_phase orelse .legacy,
         .embedding_activity_observed = parsed.embedding_activity_observed orelse false,
         .embedding_activity = if (parsed.embedding_activity) |activity| .{
             .epoch = activity.epoch orelse 0,
@@ -3916,10 +4018,10 @@ fn cloneParsedRuntimeIndexStatus(
     };
 }
 
-test "metadata status JSON preserves compact managed repair admission state" {
+test "metadata status JSON preserves compact managed index admission state" {
     const alloc = std.testing.allocator;
     const report = try parseStoreStatusReport(alloc,
-        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"serving_snapshot_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"lifecycle_work_class":"repair","repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
+        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"serving_snapshot_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"lifecycle_work_class":"repair","repair_status":"waiting","repair_active_generation_serviceable":true,"dense_vector_projection_pending":true,"dense_native_storage_phase":"native_validating"},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
     );
     defer freeStoreStatusReport(alloc, report);
 
@@ -3928,6 +4030,8 @@ test "metadata status JSON preserves compact managed repair admission state" {
     try std.testing.expectEqual(@as(usize, 3), indexes.len);
     try std.testing.expectEqual(metadata_table_manager.IndexRepairStatus.waiting, indexes[0].repair_status.?);
     try std.testing.expect(indexes[0].repair_active_generation_serviceable);
+    try std.testing.expect(indexes[0].dense_vector_projection_pending);
+    try std.testing.expectEqual(metadata_table_manager.DenseNativeStoragePhase.native_validating, indexes[0].dense_native_storage_phase);
     try std.testing.expect(indexes[0].publication_target_ready);
     try std.testing.expectEqual(@as(u64, 2500), indexes[0].publication_target_count);
     try std.testing.expect(indexes[0].serving_snapshot_ready);
@@ -3940,6 +4044,8 @@ test "metadata status JSON preserves compact managed repair admission state" {
     // normalization from a malformed or mixed-version producer.
     try std.testing.expect(indexes[1].repair_status == null);
     try std.testing.expect(!indexes[1].repair_active_generation_serviceable);
+    try std.testing.expect(!indexes[1].dense_vector_projection_pending);
+    try std.testing.expectEqual(metadata_table_manager.DenseNativeStoragePhase.legacy, indexes[1].dense_native_storage_phase);
     // A mixed-version producer can omit both fields. Preserve that absence as
     // an incomplete identity so it cannot authorize repair-state deletion.
     try std.testing.expectEqualStrings("", indexes[2].kind);
@@ -4584,7 +4690,13 @@ test "metadata http server reports reallocation protocol upgrade gating" {
 test "metadata routing server converts relative budget to local deadline" {
     const RoutingSource = struct {
         const tables = [_]metadata_table_manager.TableRecord{
-            .{ .table_id = 7, .name = "docs", .placement_role = "data" },
+            .{
+                .table_id = 7,
+                .name = "docs",
+                .placement_role = "data",
+                .schema_json = "{\"document\":{}}",
+                .indexes_json = "{\"full_text_index_v0\":{\"kind\":\"full_text\"}}",
+            },
         };
         const ranges = [_]metadata_table_manager.RangeRecord{
             .{ .range_id = 4, .group_id = 71, .table_id = 7, .start_key = "", .end_key = null },
@@ -4593,6 +4705,7 @@ test "metadata routing server converts relative budget to local deadline" {
         observed_deadline_ns: ?u64 = null,
         observed_change_token: ?metadata_api.CatalogRoutingChangeToken = null,
         observed_confirm_absence: bool = false,
+        observed_table_name: bool = false,
 
         fn iface(self: *@This()) AdminSource {
             return .{ .ptr = self, .vtable = &.{
@@ -4600,7 +4713,9 @@ test "metadata routing server converts relative budget to local deadline" {
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
                 .routing_snapshot = routingSnapshot,
+                .table_routing_snapshot = tableRoutingSnapshot,
                 .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .linearizable_table_routing_snapshot = linearizableTableRoutingSnapshot,
                 .free_routing_snapshot = freeRoutingSnapshot,
                 .wait_for_routing_change = waitForRoutingChange,
             } };
@@ -4630,6 +4745,16 @@ test "metadata routing server converts relative budget to local deadline" {
 
         fn linearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
             return routingSnapshot(ptr, request.deadline_ns);
+        }
+
+        fn tableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observed_table_name = std.mem.eql(u8, table_name, "docs");
+            return routingSnapshot(ptr, deadline_ns);
+        }
+
+        fn linearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+            return tableRoutingSnapshot(ptr, table_name, request.deadline_ns);
         }
 
         fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
@@ -4719,6 +4844,27 @@ test "metadata routing server converts relative budget to local deadline" {
     const linearizable_observed = source.observed_deadline_ns orelse return error.TestExpectedDeadline;
     try std.testing.expect(linearizable_observed >= linearizable_before_ns + 125 * std.time.ns_per_ms);
     try std.testing.expect(linearizable_observed <= platform_time.monotonicNs() + 125 * std.time.ns_per_ms);
+
+    source.observed_deadline_ns = null;
+    var table_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        routes.Routes.internal_table_routing_snapshot,
+    );
+    defer table_request.deinit();
+    table_request.body = "{\"table_name\":\"docs\"}";
+    try table_request.headers.append(routes.routing_remaining_ms_header, "125");
+    var table_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &table_request);
+    defer table_ctx.deinit();
+    var table_response = try server.metadataTableRoutingSnapshot(&table_ctx);
+    defer table_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), table_response.status.code);
+    try std.testing.expect(source.observed_table_name);
+    const parsed_table = try std.json.parseFromSlice(metadata_api.CatalogRoutingSnapshot, std.testing.allocator, table_response.body.?, .{});
+    defer parsed_table.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_table.value.tables.len);
+    try std.testing.expectEqualStrings("{\"document\":{}}", parsed_table.value.tables[0].schema_json);
+    try std.testing.expectEqualStrings("{\"full_text_index_v0\":{\"kind\":\"full_text\"}}", parsed_table.value.tables[0].indexes_json);
 
     source.observed_deadline_ns = null;
     var change_request = try httpx.Request.init(
@@ -7077,6 +7223,19 @@ test "invalid forwarded table mutation never preflights or campaigns" {
         routes.Routes.raft_mutation_outcome_not_proposed,
         response.headers.get(routes.Routes.raft_mutation_outcome_header).?,
     );
+}
+
+test "table topology mutation non-application response never claims non-admission" {
+    var request = try httpx.Request.init(std.testing.allocator, .POST, routes.Routes.internal_forwarded_table_mutation);
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
+    var response = try MetadataHttpServer.metadataMutationError(&ctx, error.MetadataMutationNotApplied);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings(routes.Routes.raft_mutation_outcome_not_applied, response.headers.get(routes.Routes.raft_mutation_outcome_header).?);
+    try std.testing.expect(response.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
 }
 
 test "metadata mutation pre-admission responses prove proposal was not admitted" {

@@ -6023,14 +6023,8 @@ fn buildMandatoryPredicates(
             predicates.filter_query = try combineMandatoryPredicate(alloc, predicates.filter_query, constraints.filter, "conjuncts");
             predicates.exclusion_query = try combineMandatoryPredicate(alloc, predicates.exclusion_query, constraints.exclusion, "disjuncts");
         }
-        const filter_query = if (query.filter_query) |raw|
-            try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
-        else
-            null;
-        const exclusion_query = if (query.exclusion_query) |raw|
-            try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
-        else
-            null;
+        const filter_query = try rawQueryValueLeaky(alloc, query.filter_query);
+        const exclusion_query = try rawQueryValueLeaky(alloc, query.exclusion_query);
         predicates.filter_query = try combineMandatoryPredicate(
             alloc,
             predicates.filter_query,
@@ -6155,14 +6149,8 @@ fn applyMandatoryPredicates(
     query_request: *QueryRequest,
     mandatory: MandatoryPredicates,
 ) !void {
-    const existing_filter = if (query_request.filter_query) |raw|
-        try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
-    else
-        null;
-    const existing_exclusion = if (query_request.exclusion_query) |raw|
-        try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
-    else
-        null;
+    const existing_filter = try rawQueryValueLeaky(alloc, query_request.filter_query);
+    const existing_exclusion = try rawQueryValueLeaky(alloc, query_request.exclusion_query);
     const combined_filter = try combineMandatoryPredicate(
         alloc,
         existing_filter,
@@ -6181,6 +6169,14 @@ fn applyMandatoryPredicates(
 
 fn rawQueryFromValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !metadata_openapi.RawQuery {
     return .{ .bytes = try std.json.Stringify.valueAlloc(alloc, value, .{}) };
+}
+
+fn rawQueryValueLeaky(
+    alloc: std.mem.Allocator,
+    raw: ?metadata_openapi.RawQuery,
+) !?std.json.Value {
+    const value = raw orelse return null;
+    return try std.json.parseFromSliceLeaky(std.json.Value, alloc, value.bytes, .{});
 }
 
 fn combineMandatoryPredicate(
@@ -7201,8 +7197,8 @@ test "retrieval agent conjoins mandatory predicates with generated predicates" {
     defer declared.deinit();
 
     try applyMandatoryPredicates(arena_impl.allocator(), &generated.value, .{
-        .filter_query = if (declared.value.filter_query) |raw| try std.json.parseFromSliceLeaky(std.json.Value, arena_impl.allocator(), raw.bytes, .{}) else null,
-        .exclusion_query = if (declared.value.exclusion_query) |raw| try std.json.parseFromSliceLeaky(std.json.Value, arena_impl.allocator(), raw.bytes, .{}) else null,
+        .filter_query = try rawQueryValueLeaky(arena_impl.allocator(), declared.value.filter_query),
+        .exclusion_query = try rawQueryValueLeaky(arena_impl.allocator(), declared.value.exclusion_query),
     });
     const encoded = try std.json.Stringify.valueAlloc(alloc, generated.value, .{});
     defer alloc.free(encoded);

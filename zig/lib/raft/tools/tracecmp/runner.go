@@ -692,6 +692,15 @@ func (c *replayCluster) compactNode(nodeID uint64, index uint64) error {
 	if !ok {
 		return fmt.Errorf("unknown node %d", nodeID)
 	}
+	// The harness compaction action is idempotent, like MemoryStorage.compactTo
+	// in Zig. Repeated seeded actions must not manufacture an oracle failure.
+	current, err := node.storage.Snapshot()
+	if err != nil {
+		return err
+	}
+	if index <= current.Metadata.Index {
+		return nil
+	}
 
 	confState := cloneConfState(c.confStates[nodeID])
 	snapshot, err := node.storage.CreateSnapshot(index, &confState, nil)
@@ -738,6 +747,25 @@ func (c *replayCluster) abortSnapshot(from uint64, to uint64, logIndex uint64) e
 			}
 
 			c.network = append(c.network[:i], c.network[i+1:]...)
+			// An append acknowledgement must describe durable follower state.
+			// Install the prefix through the competing snapshot delivery before
+			// replacing its response with the append acknowledgement under test.
+			if msg.Snapshot == nil || logIndex != msg.Snapshot.Metadata.Index {
+				return fmt.Errorf("invalid snapshot abort index %d", logIndex)
+			}
+			if err := c.nodes[to].raw.Step(msg); err != nil {
+				return err
+			}
+			if err := c.collectReady(to); err != nil {
+				return err
+			}
+			kept := c.network[:0]
+			for _, response := range c.network {
+				if response.Type != pb.MsgAppResp || response.From != to || response.To != from {
+					kept = append(kept, response)
+				}
+			}
+			c.network = kept
 			leader, ok := c.nodes[from]
 			if !ok {
 				return fmt.Errorf("unknown leader %d", from)

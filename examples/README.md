@@ -1,30 +1,25 @@
 # Antfly Examples
 
-This directory contains complete, production-ready examples demonstrating key Antfly features.
+This directory contains complete examples demonstrating key Antfly features.
+Each example is its own Go module; build and run it from inside its directory
+with `GOWORK=off`.
 
-## Linear Merge API Examples
+## Ingestion Examples
 
-The **Linear Merge API** enables efficient, stateless synchronization from external data sources to Antfly with automatic change detection and deletion handling.
+### [docsaf](./docsaf/)
 
-### [Linear Merge Markdown](./linear-merge-markdown/)
-
-Chunks markdown documentation into sections and syncs to Antfly.
+Ingest documentation from local files, Git repositories, S3, Google Drive, and
+web sources into Antfly with `docsaf`, including entity extraction.
 
 **Use cases:**
 - Documentation sync from Git repositories
 - Knowledge base import
 - Content management
 
-**Features:**
-- Markdown chunking by headers
-- Content hash optimization (skips unchanged sections)
-- Dry-run preview mode
-- Standalone CLI tool + test suite
-
 **Quick start:**
 ```bash
-go build -o linear-merge-markdown ./examples/linear-merge-markdown
-./linear-merge-markdown --docs ./README.md --table docs --create-table
+cd examples/docsaf
+./run-demo.sh
 ```
 
 ### [Postgres Real-time Sync](./postgres-sync/)
@@ -51,12 +46,36 @@ docker run --name postgres-demo -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d po
 psql postgresql://postgres:postgres@localhost:5432/postgres -f examples/postgres-sync/schema.sql
 
 # Build and run
-go build -o postgres-sync ./examples/postgres-sync
+cd examples/postgres-sync
+GOWORK=off go build -o postgres-sync .
 export POSTGRES_URL="postgresql://postgres:postgres@localhost:5432/postgres"
 ./postgres-sync --create-table
 ```
 
-## Memory Examples
+For a change-data-capture path that needs no daemon, see the
+[Stream PostgreSQL into Antfly](../docs/guides/cdc-replication.mdx) guide, which
+uses logical replication managed by Antfly itself.
+
+### [Pinecone Migration](./pinecone-migration/)
+
+Migrate vector embeddings from Pinecone into Antfly.
+
+## Search Examples
+
+### [Image Search](./image-search/)
+
+Index images with native multimodal embeddings and search them with text or
+image queries.
+
+### [Epstein](./epstein/)
+
+Document corpus ingestion with entity extraction and a graph visualization.
+
+### [Screenshots](./screenshots-shots-shots/)
+
+Index screenshots and search them semantically.
+
+## Embedded and Memory Examples
 
 ### [Antfly Lite Go](./antfly-lite-go/)
 
@@ -132,20 +151,21 @@ GOWORK=off go run . watch --dir ../../docs --project antfly-docs
 
 ## Comparison
 
-| Feature | Markdown Sync | Postgres Sync |
-|---------|---------------|---------------|
-| **Data Source** | Markdown files | Postgres JSONB |
-| **Sync Type** | On-demand / periodic | Real-time + periodic |
-| **Latency** | N/A (manual trigger) | <100ms (LISTEN/NOTIFY) |
-| **Use Case** | Documentation, static content | Live databases |
-| **Complexity** | Low | Medium |
-| **Dependencies** | None (just files) | Postgres with triggers |
+| Feature | docsaf | Postgres Sync | Antfly Lite |
+|---------|--------|---------------|-------------|
+| **Data Source** | Files, Git, S3, Drive, web | Postgres JSONB | In-process documents |
+| **Sync Type** | On-demand / watch | Real-time + periodic | N/A (embedded) |
+| **Latency** | Seconds (watch mode) | <100ms (LISTEN/NOTIFY) | In-process |
+| **Use Case** | Documentation, static content | Live databases | Desktop, edge, tests |
+| **Dependencies** | None | Postgres with triggers | `libantfly` from `zig build capi` |
 
 ## Key Concepts
 
 ### Linear Merge API
 
-The Linear Merge API provides:
+The Linear Merge API enables efficient, stateless synchronization from external
+data sources to Antfly with automatic change detection and deletion handling.
+It provides:
 
 1. **Stateless Sync**: No server-side session tracking
 2. **Content Hashing**: Automatically skips unchanged documents
@@ -179,7 +199,13 @@ External Source              Antfly
 
 ### Typical Workflow
 
+The Go SDK lives at `github.com/antflydb/antfly/go/pkg/sdk` (package `sdk`).
+
 ```go
+import "github.com/antflydb/antfly/go/pkg/sdk"
+
+client, _ := sdk.NewAntflyClient("http://localhost:8080", http.DefaultClient)
+
 // 1. Fetch data from external source
 records := fetchFromSource()
 
@@ -190,7 +216,7 @@ for _, record := range records {
 }
 
 // 3. Sync with Linear Merge
-result, _ := client.LinearMerge(ctx, "my_table", antfly.LinearMergeRequest{
+result, _ := client.LinearMerge(ctx, "my_table", sdk.LinearMergeRequest{
     Records:      antflyRecords,
     LastMergedId: cursor,
 })
@@ -200,11 +226,14 @@ fmt.Printf("Upserted: %d, Skipped: %d, Deleted: %d\n",
     result.Upserted, result.Skipped, result.Deleted)
 
 // 5. Handle pagination if needed
-if result.Status == antfly.LinearMergePageStatusPartial {
+if result.NextCursor != "" {
     cursor = result.NextCursor
     // Continue with next batch
 }
 ```
+
+`ExecuteLinearMerge` wraps this loop: pass an iterator of record pages and it
+drives the cursor, dry-run, sync level, and write options for you.
 
 ## Building Your Own Sync Tool
 
@@ -212,9 +241,9 @@ Use these examples as templates:
 
 ### 1. Identify Your Data Source
 
-- **Files**: Use markdown example as template
-- **Database**: Use Postgres example as template
-- **API**: Similar to markdown example (fetch + sync)
+- **Files**: Use the docsaf example as a template
+- **Database**: Use the Postgres example as a template
+- **API**: Fetch, convert, and merge, as in the workflow above
 
 ### 2. Implement Data Fetching
 
@@ -228,13 +257,13 @@ func fetchRecords(source string) (map[string]interface{}, error) {
 ### 3. Add Change Detection (Optional)
 
 - **File-based**: Compare modification times or content hashes
-- **Database**: Use triggers (like Postgres example)
+- **Database**: Use triggers (like the Postgres example)
 - **API**: Use webhooks or polling
 
 ### 4. Sync with Linear Merge
 
 ```go
-result, err := client.LinearMerge(ctx, tableName, antfly.LinearMergeRequest{
+result, err := client.LinearMerge(ctx, tableName, sdk.LinearMergeRequest{
     Records:      records,
     LastMergedId: cursor,
     DryRun:       false,
@@ -244,42 +273,27 @@ result, err := client.LinearMerge(ctx, tableName, antfly.LinearMergeRequest{
 ### 5. Handle Errors and Pagination
 
 ```go
-if result.Status == antfly.LinearMergePageStatusPartial {
-    // Continue from cursor
+if result.NextCursor != "" {
+    // Continue from result.NextCursor
 } else if len(result.Failed) > 0 {
     // Handle individual failures
 }
 ```
 
-## Additional Examples
-
-More examples coming soon:
-
-- [ ] MySQL/MariaDB sync
-- [ ] MongoDB sync
-- [ ] S3/Cloud Storage sync
-- [ ] REST API sync
-- [ ] CSV/Excel import
-- [ ] Git repository sync
-- [ ] Confluence/Wiki sync
-
 ## Testing
-
-Both examples include comprehensive test suites:
 
 ```bash
 # Test the docs ingestion example
-(cd examples/docsaf && go test ./...)
+(cd examples/docsaf && GOWORK=off go test ./...)
 
 # Test Postgres sync (requires Postgres)
 export POSTGRES_URL="postgresql://postgres:postgres@localhost:5432/postgres"
-(cd examples/postgres-sync && go test ./...)
+(cd examples/postgres-sync && GOWORK=off go test ./...)
 ```
 
 ## Documentation
 
-- [Linear Merge API Implementation Summary](../work-log/006-create-linear-merge-api/IMPLEMENTATION_SUMMARY.md)
-- [Linear Merge API Plan](../work-log/006-create-linear-merge-api/plan.md)
+- [Antfly docs](https://antfly.io/docs)
 - OpenAPI specs: `specs/openapi/antfly/`
 
 ## Contributing

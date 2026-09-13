@@ -40,6 +40,99 @@ pub const CancellationToken = struct {
 };
 
 const estimate_cancellation_stride = 64;
+/// Ascending, disjoint half-open physical row ranges. A range scan retains the
+/// full leaf centroid and prepares the query only once, without visiting gaps.
+pub const ScoreRange = struct { start: usize, end: usize };
+fn acceptsScore(output: anytype, index: usize) bool {
+    const T = switch (@typeInfo(@TypeOf(output))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(output),
+    };
+    if (comptime @hasDecl(T, "accepts")) return output.accepts(index);
+    return true;
+}
+const query_quantization_simd_width = 8;
+const QueryQuantizationSimdF32 = @Vector(query_quantization_simd_width, f32);
+const QueryQuantizationSimdU32 = @Vector(query_quantization_simd_width, u32);
+
+fn quantizeQueryPlanes(
+    query_diff: []const f32,
+    unbias: []const f32,
+    min_val: f32,
+    delta: f32,
+    q1: []u64,
+    q2: []u64,
+    q3: []u64,
+    q4: []u64,
+    cancellation: ?CancellationToken,
+) !u64 {
+    std.debug.assert(query_diff.len == unbias.len);
+    const width = rabitq.codeWidth(query_diff.len);
+    std.debug.assert(q1.len == width);
+    std.debug.assert(q2.len == width);
+    std.debug.assert(q3.len == width);
+    std.debug.assert(q4.len == width);
+
+    const min_vec: QueryQuantizationSimdF32 = @splat(min_val);
+    const delta_vec: QueryQuantizationSimdF32 = @splat(delta);
+    const max_vec: QueryQuantizationSimdF32 = @splat(15.0);
+    var quantized_sum: u64 = 0;
+
+    for (0..width) |word_index| {
+        if (cancellation) |token| try token.check();
+
+        const start = word_index * 64;
+        const end = @min(start + 64, query_diff.len);
+        var quantized1: u64 = 0;
+        var quantized2: u64 = 0;
+        var quantized3: u64 = 0;
+        var quantized4: u64 = 0;
+        var d = start;
+
+        if (delta != 0) {
+            while (d + query_quantization_simd_width <= end) : (d += query_quantization_simd_width) {
+                const diff_vec: QueryQuantizationSimdF32 = query_diff[d..][0..query_quantization_simd_width].*;
+                const unbias_vec: QueryQuantizationSimdF32 = unbias[d..][0..query_quantization_simd_width].*;
+                const quantized_float = @min(@floor((diff_vec - min_vec) / delta_vec + unbias_vec), max_vec);
+                const quantized: QueryQuantizationSimdU32 = @intFromFloat(quantized_float);
+
+                inline for (0..query_quantization_simd_width) |lane| {
+                    const q_val: u64 = quantized[lane];
+                    quantized_sum += q_val;
+                    quantized1 = (quantized1 << 1) | (q_val & 1);
+                    quantized2 = (quantized2 << 1) | ((q_val & 2) >> 1);
+                    quantized3 = (quantized3 << 1) | ((q_val & 4) >> 2);
+                    quantized4 = (quantized4 << 1) | ((q_val & 8) >> 3);
+                }
+            }
+
+            while (d < end) : (d += 1) {
+                var q_val: u64 = @intFromFloat(@floor((query_diff[d] - min_val) / delta + unbias[d]));
+                q_val = @min(q_val, 15);
+                quantized_sum += q_val;
+                quantized1 = (quantized1 << 1) | (q_val & 1);
+                quantized2 = (quantized2 << 1) | ((q_val & 2) >> 1);
+                quantized3 = (quantized3 << 1) | ((q_val & 4) >> 2);
+                quantized4 = (quantized4 << 1) | ((q_val & 8) >> 3);
+            }
+        }
+
+        const word_dims = end - start;
+        if (word_dims < 64) {
+            const shift: u6 = @intCast(64 - word_dims);
+            quantized1 <<= shift;
+            quantized2 <<= shift;
+            quantized3 <<= shift;
+            quantized4 <<= shift;
+        }
+        q1[word_index] = quantized1;
+        q2[word_index] = quantized2;
+        q3[word_index] = quantized3;
+        q4[word_index] = quantized4;
+    }
+
+    return quantized_sum;
+}
 
 /// RaBitQuantizer quantizes vectors into 1 bit per dimension.
 ///
@@ -85,6 +178,7 @@ pub const RaBitQuantizer = struct {
     }
 
     pub const EstimateScratch = struct {
+        prepare_epoch: u64 = 0,
         query_diff: []f32,
         q1: []u64,
         q2: []u64,
@@ -178,6 +272,7 @@ pub const RaBitQuantizer = struct {
 
         // Compute centroid dot products (for InnerProduct/Cosine).
         var centroid_dot_products: []f32 = &.{};
+        errdefer self.alloc.free(centroid_dot_products);
         var centroid_norm: f32 = 0;
         if (self.distance_metric != .l2_squared) {
             centroid_dot_products = try self.alloc.alloc(f32, count);
@@ -287,6 +382,16 @@ pub const RaBitQuantizer = struct {
                 const v = vectors[i * self.dims ..][0..self.dims];
                 qs.centroid_dot_products[old_count + i] = vec.dot(v, qs.centroid);
             }
+        } else {
+            // A borrowed/persisted L2 directory can materialize legacy zero
+            // centroid dots. Appending only extends the arrays L2 actually
+            // uses; retaining this old-length optional array makes the next
+            // checkpoint invalid even though all distance data is current.
+            if (qs.centroid_dot_products.len != 0) {
+                self.alloc.free(qs.centroid_dot_products);
+                qs.centroid_dot_products = &.{};
+            }
+            qs.centroid_norm = 0;
         }
 
         const temp_diffs = try self.alloc.alloc(f32, count * self.dims);
@@ -359,9 +464,129 @@ pub const RaBitQuantizer = struct {
         scratch: *EstimateScratch,
         cancellation: ?CancellationToken,
     ) !void {
+        const Output = struct {
+            distances: []f32,
+            errors: []f32,
+            pub fn write(out: @This(), i: usize, distance: f32, bound: f32) void {
+                out.distances[i] = distance;
+                out.errors[i] = bound;
+            }
+        };
+        return self.estimateDistancesTo(qs, query_vector, scratch, cancellation, Output{ .distances = distances, .errors = error_bounds });
+    }
+
+    /// Statically dispatched score consumer. Native scans can admit a small
+    /// register/cache-local batch directly, without materializing a leaf-sized
+    /// pair of scalar arrays. Arithmetic and cancellation match the array API.
+    pub fn estimateDistancesTo(
+        self: *const RaBitQuantizer,
+        qs: *const proto.RaBitQuantizedVectorSet,
+        query_vector: []const f32,
+        scratch: *EstimateScratch,
+        cancellation: ?CancellationToken,
+        output: anytype,
+    ) !void {
+        return self.estimateSelectedDistancesTo(qs, query_vector, scratch, cancellation, false, &.{}, output);
+    }
+
+    /// Validate the entire plan before emitting scores. Empty plans do no query
+    /// preparation; cancellation is still observed. Output indices remain the
+    /// original physical positions, so callers can preserve ID and tie order.
+    pub fn estimateDistancesInRangesTo(
+        self: *const RaBitQuantizer,
+        qs: *const proto.RaBitQuantizedVectorSet,
+        query_vector: []const f32,
+        scratch: *EstimateScratch,
+        cancellation: ?CancellationToken,
+        ranges: []const ScoreRange,
+        output: anytype,
+    ) !void {
+        try validateScoreRanges(qs, cancellation, ranges);
+        if (ranges.len == 0) return;
+        return self.estimateSelectedDistancesTo(qs, query_vector, scratch, cancellation, true, ranges, output);
+    }
+
+    fn validateScoreRanges(qs: *const proto.RaBitQuantizedVectorSet, cancellation: ?CancellationToken, ranges: []const ScoreRange) !void {
+        if (cancellation) |token| try token.check();
+        var previous_end: usize = 0;
+        for (ranges, 0..) |range, ordinal| {
+            if (ordinal % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
+            if (range.start < previous_end or range.start >= range.end or range.end > qs.getCount())
+                return error.InvalidScoreRanges;
+            previous_end = range.end;
+        }
+    }
+
+    /// Borrows both the immutable scoring origin and scratch planes. The caller
+    /// must retain them until the last chunk is scored. Preparing another query
+    /// in the same scratch invalidates this value, including a zero-diff query.
+    pub const PreparedEstimate = struct {
+        quantizer: *const RaBitQuantizer,
+        scratch: *const EstimateScratch,
+        epoch: u64,
+        centroid: []const f32,
+        centroid_norm: f32,
+        query_centroid_distance: f32,
+        squared_centroid_norm: f32 = 0,
+        query_centroid_dot_product: f32 = 0,
+        term1_scale: f32 = 0,
+        term2_scale: f32 = 0,
+        term34: f32 = 0,
+    };
+
+    pub fn estimatePreparedDistancesInRangesTo(
+        self: *const RaBitQuantizer,
+        qs: *const proto.RaBitQuantizedVectorSet,
+        prepared: PreparedEstimate,
+        cancellation: ?CancellationToken,
+        ranges: []const ScoreRange,
+        output: anytype,
+    ) !void {
+        if (cancellation) |token| try token.check();
+        if (prepared.scratch.prepare_epoch != prepared.epoch) return error.StalePreparedEstimate;
+        if (prepared.quantizer != self or qs.metric != self.distance_metric or
+            qs.codes.width != rabitq.codeWidth(self.dims) or
+            @as(u32, @bitCast(qs.centroid_norm)) != @as(u32, @bitCast(prepared.centroid_norm)) or
+            !std.mem.eql(u8, std.mem.sliceAsBytes(qs.centroid), std.mem.sliceAsBytes(prepared.centroid)))
+            return error.IncompatiblePreparedEstimate;
+        try validateScoreRanges(qs, cancellation, ranges);
+        if (ranges.len == 0) return;
+        return self.scorePreparedRanges(qs, prepared, cancellation, ranges, output);
+    }
+
+    fn estimateSelectedDistancesTo(
+        self: *const RaBitQuantizer,
+        qs: *const proto.RaBitQuantizedVectorSet,
+        query_vector: []const f32,
+        scratch: *EstimateScratch,
+        cancellation: ?CancellationToken,
+        comptime selected: bool,
+        ranges: []const ScoreRange,
+        output: anytype,
+    ) !void {
         if (cancellation) |token| try token.check();
         const count = qs.getCount();
-        const width: usize = @intCast(qs.codes.width);
+        const all = [_]ScoreRange{.{ .start = 0, .end = count }};
+        const score_ranges = if (selected) ranges else &all;
+        const prepared = try self.prepareEstimate(qs, query_vector, scratch, cancellation);
+        return self.scorePreparedRanges(qs, prepared, cancellation, score_ranges, output);
+    }
+
+    pub fn prepareEstimate(
+        self: *const RaBitQuantizer,
+        qs: *const proto.RaBitQuantizedVectorSet,
+        query_vector: []const f32,
+        scratch: *EstimateScratch,
+        cancellation: ?CancellationToken,
+    ) !PreparedEstimate {
+        if (cancellation) |token| try token.check();
+        const width = rabitq.codeWidth(self.dims);
+        if (qs.metric != self.distance_metric or qs.codes.width != width or
+            qs.centroid.len != self.dims or query_vector.len != self.dims or
+            scratch.query_diff.len < self.dims or scratch.q1.len < width or
+            scratch.q2.len < width or scratch.q3.len < width or scratch.q4.len < width)
+            return error.IncompatiblePreparedEstimate;
+        scratch.prepare_epoch = std.math.add(u64, scratch.prepare_epoch, 1) catch return error.EstimateScratchExhausted;
         const temp_query_diff = scratch.query_diff[0..self.dims];
         const temp_q1 = scratch.q1[0..width];
         const temp_q2 = scratch.q2[0..width];
@@ -371,12 +596,15 @@ pub const RaBitQuantizer = struct {
         // Normalize query vector relative to centroid.
         vec.subTo(temp_query_diff, query_vector, qs.centroid);
         const query_centroid_distance = vec.norm(temp_query_diff);
-
-        if (query_centroid_distance == 0) {
-            try self.calcCentroidDistances(qs, distances, cancellation);
-            @memset(error_bounds[0..count], 0);
-            return;
-        }
+        var prepared = PreparedEstimate{
+            .quantizer = self,
+            .scratch = scratch,
+            .epoch = scratch.prepare_epoch,
+            .centroid = qs.centroid,
+            .centroid_norm = qs.centroid_norm,
+            .query_centroid_distance = query_centroid_distance,
+        };
+        if (query_centroid_distance == 0) return prepared;
 
         var squared_centroid_norm: f32 = 0;
         var query_centroid_dot_product: f32 = 0;
@@ -396,142 +624,145 @@ pub const RaBitQuantizer = struct {
         const quantized_range: f32 = 15.0;
         const delta = (max_val - min_val) / quantized_range;
 
-        // Quantize query to 4-bit sub-codes.
-        @memset(temp_q1, 0);
-        @memset(temp_q2, 0);
-        @memset(temp_q3, 0);
-        @memset(temp_q4, 0);
-
-        var quantized_sum: u64 = 0;
-        var quantized1: u64 = 0;
-        var quantized2: u64 = 0;
-        var quantized3: u64 = 0;
-        var quantized4: u64 = 0;
-
-        for (0..self.dims) |d| {
-            if (d % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
-            if (delta != 0) {
-                var q_val: u64 = @intFromFloat(@floor((temp_query_diff[d] - min_val) / delta + self.unbias[d]));
-                q_val = @min(q_val, @as(u64, @intFromFloat(quantized_range)));
-                quantized_sum += q_val;
-                quantized1 = (quantized1 << 1) | (q_val & 1);
-                quantized2 = (quantized2 << 1) | ((q_val & 2) >> 1);
-                quantized3 = (quantized3 << 1) | ((q_val & 4) >> 2);
-                quantized4 = (quantized4 << 1) | ((q_val & 8) >> 3);
-            } else {
-                quantized1 <<= 1;
-                quantized2 <<= 1;
-                quantized3 <<= 1;
-                quantized4 <<= 1;
-            }
-
-            if ((d + 1) % 64 == 0) {
-                const offset = d / 64;
-                temp_q1[offset] = quantized1;
-                temp_q2[offset] = quantized2;
-                temp_q3[offset] = quantized3;
-                temp_q4[offset] = quantized4;
-            }
-        }
-
-        // Set leftover bits.
-        if (self.dims % 64 != 0) {
-            const offset = self.dims / 64;
-            const shift: u6 = @intCast(64 - (self.dims % 64));
-            temp_q1[offset] = quantized1 << shift;
-            temp_q2[offset] = quantized2 << shift;
-            temp_q3[offset] = quantized3 << shift;
-            temp_q4[offset] = quantized4 << shift;
-        }
+        // Quantize query to 4-bit sub-codes once per scoring origin, including
+        // leaves spread over multiple chunks. Keep the work SIMD even though the
+        // four bit planes retain the existing MSB-first wire representation.
+        const quantized_sum = try quantizeQueryPlanes(
+            temp_query_diff,
+            self.unbias,
+            min_val,
+            delta,
+            temp_q1,
+            temp_q2,
+            temp_q3,
+            temp_q4,
+            cancellation,
+        );
 
         const delta_scale = delta * self.sqrt_dims_inv;
         const term1_scale = 2.0 * delta_scale;
         const term2_scale = 2.0 * min_val * self.sqrt_dims_inv;
         const term34 = delta_scale * @as(f32, @floatFromInt(quantized_sum)) + self.sqrt_dims * min_val;
 
+        prepared.squared_centroid_norm = squared_centroid_norm;
+        prepared.query_centroid_dot_product = query_centroid_dot_product;
+        prepared.term1_scale = term1_scale;
+        prepared.term2_scale = term2_scale;
+        prepared.term34 = term34;
+        return prepared;
+    }
+
+    fn scorePreparedRanges(
+        self: *const RaBitQuantizer,
+        qs: *const proto.RaBitQuantizedVectorSet,
+        prepared: PreparedEstimate,
+        cancellation: ?CancellationToken,
+        score_ranges: []const ScoreRange,
+        output: anytype,
+    ) !void {
+        if (cancellation) |token| try token.check();
+        const query_centroid_distance = prepared.query_centroid_distance;
+        if (query_centroid_distance == 0) return self.calcCentroidDistances(qs, output, cancellation, score_ranges);
+        const width = rabitq.codeWidth(self.dims);
+        const temp_q1 = prepared.scratch.q1[0..width];
+        const temp_q2 = prepared.scratch.q2[0..width];
+        const temp_q3 = prepared.scratch.q3[0..width];
+        const temp_q4 = prepared.scratch.q4[0..width];
+        const squared_centroid_norm = prepared.squared_centroid_norm;
+        const query_centroid_dot_product = prepared.query_centroid_dot_product;
+        const term1_scale = prepared.term1_scale;
+        const term2_scale = prepared.term2_scale;
+        const term34 = prepared.term34;
+
         switch (self.distance_metric) {
             .l2_squared => {
                 const query_centroid_distance_sq = query_centroid_distance * query_centroid_distance;
-                for (0..count) |i| {
-                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
-                    const code = qs.codes.atConst(i);
-                    const bit_product: f32 = @floatFromInt(rabitq.bitProduct(
-                        code,
-                        temp_q1,
-                        temp_q2,
-                        temp_q3,
-                        temp_q4,
-                    ));
-                    const estimator = (term1_scale * bit_product +
-                        term2_scale * @as(f32, @floatFromInt(qs.code_counts[i])) -
-                        term34) * qs.quantized_dot_products[i];
-                    const data_centroid_distance = qs.centroid_distances[i];
-                    const multiplier = 2.0 * data_centroid_distance * query_centroid_distance;
-                    var distance = data_centroid_distance * data_centroid_distance +
-                        query_centroid_distance_sq -
-                        multiplier * estimator;
-                    var error_bound = multiplier / self.sqrt_dims;
+                for (score_ranges) |range| {
+                    for (range.start..range.end) |i| {
+                        if ((i - range.start) % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
+                        if (!acceptsScore(output, i)) continue;
+                        const code = qs.codes.atConst(i);
+                        const bit_product: f32 = @floatFromInt(rabitq.bitProduct(
+                            code,
+                            temp_q1,
+                            temp_q2,
+                            temp_q3,
+                            temp_q4,
+                        ));
+                        const estimator = (term1_scale * bit_product +
+                            term2_scale * @as(f32, @floatFromInt(qs.code_counts[i])) -
+                            term34) * qs.quantized_dot_products[i];
+                        const data_centroid_distance = qs.centroid_distances[i];
+                        const multiplier = 2.0 * data_centroid_distance * query_centroid_distance;
+                        var distance = data_centroid_distance * data_centroid_distance +
+                            query_centroid_distance_sq -
+                            multiplier * estimator;
+                        var error_bound = multiplier / self.sqrt_dims;
 
-                    if (distance < 0) {
-                        error_bound = @max(error_bound + distance, 0);
-                        distance = 0;
+                        if (distance < 0) {
+                            error_bound = @max(error_bound + distance, 0);
+                            distance = 0;
+                        }
+
+                        output.write(i, distance, error_bound);
                     }
-
-                    distances[i] = distance;
-                    error_bounds[i] = error_bound;
                 }
             },
             .inner_product => {
-                for (0..count) |i| {
-                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
-                    const code = qs.codes.atConst(i);
-                    const bit_product: f32 = @floatFromInt(rabitq.bitProduct(
-                        code,
-                        temp_q1,
-                        temp_q2,
-                        temp_q3,
-                        temp_q4,
-                    ));
-                    const estimator = (term1_scale * bit_product +
-                        term2_scale * @as(f32, @floatFromInt(qs.code_counts[i])) -
-                        term34) * qs.quantized_dot_products[i];
-                    const data_centroid_distance = qs.centroid_distances[i];
-                    const multiplier = data_centroid_distance * query_centroid_distance;
-                    const inner_product = multiplier * estimator +
-                        qs.centroid_dot_products[i] + query_centroid_dot_product - squared_centroid_norm;
-                    distances[i] = -inner_product;
-                    error_bounds[i] = multiplier / self.sqrt_dims;
+                for (score_ranges) |range| {
+                    for (range.start..range.end) |i| {
+                        if ((i - range.start) % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
+                        if (!acceptsScore(output, i)) continue;
+                        const code = qs.codes.atConst(i);
+                        const bit_product: f32 = @floatFromInt(rabitq.bitProduct(
+                            code,
+                            temp_q1,
+                            temp_q2,
+                            temp_q3,
+                            temp_q4,
+                        ));
+                        const estimator = (term1_scale * bit_product +
+                            term2_scale * @as(f32, @floatFromInt(qs.code_counts[i])) -
+                            term34) * qs.quantized_dot_products[i];
+                        const data_centroid_distance = qs.centroid_distances[i];
+                        const multiplier = data_centroid_distance * query_centroid_distance;
+                        const inner_product = multiplier * estimator +
+                            qs.centroid_dot_products[i] + query_centroid_dot_product - squared_centroid_norm;
+                        output.write(i, -inner_product, multiplier / self.sqrt_dims);
+                    }
                 }
             },
             .cosine => {
-                for (0..count) |i| {
-                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
-                    const code = qs.codes.atConst(i);
-                    const bit_product: f32 = @floatFromInt(rabitq.bitProduct(
-                        code,
-                        temp_q1,
-                        temp_q2,
-                        temp_q3,
-                        temp_q4,
-                    ));
-                    const estimator = (term1_scale * bit_product +
-                        term2_scale * @as(f32, @floatFromInt(qs.code_counts[i])) -
-                        term34) * qs.quantized_dot_products[i];
-                    const data_centroid_distance = qs.centroid_distances[i];
-                    const multiplier = data_centroid_distance * query_centroid_distance;
-                    const inner_product = multiplier * estimator +
-                        qs.centroid_dot_products[i] + query_centroid_dot_product - squared_centroid_norm;
-                    var distance = 1.0 - inner_product;
-                    var eb = multiplier / self.sqrt_dims;
-                    if (distance < 0) {
-                        eb = @max(eb + distance, 0);
-                        distance = 0;
-                    } else if (distance > 2) {
-                        eb = @max(@min(eb - (distance - 2), 2), 0);
-                        distance = 2;
+                for (score_ranges) |range| {
+                    for (range.start..range.end) |i| {
+                        if ((i - range.start) % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
+                        if (!acceptsScore(output, i)) continue;
+                        const code = qs.codes.atConst(i);
+                        const bit_product: f32 = @floatFromInt(rabitq.bitProduct(
+                            code,
+                            temp_q1,
+                            temp_q2,
+                            temp_q3,
+                            temp_q4,
+                        ));
+                        const estimator = (term1_scale * bit_product +
+                            term2_scale * @as(f32, @floatFromInt(qs.code_counts[i])) -
+                            term34) * qs.quantized_dot_products[i];
+                        const data_centroid_distance = qs.centroid_distances[i];
+                        const multiplier = data_centroid_distance * query_centroid_distance;
+                        const inner_product = multiplier * estimator +
+                            qs.centroid_dot_products[i] + query_centroid_dot_product - squared_centroid_norm;
+                        var distance = 1.0 - inner_product;
+                        var eb = multiplier / self.sqrt_dims;
+                        if (distance < 0) {
+                            eb = @max(eb + distance, 0);
+                            distance = 0;
+                        } else if (distance > 2) {
+                            eb = @max(@min(eb - (distance - 2), 2), 0);
+                            distance = 2;
+                        }
+                        output.write(i, distance, eb);
                     }
-                    distances[i] = distance;
-                    error_bounds[i] = eb;
                 }
             },
         }
@@ -540,27 +771,40 @@ pub const RaBitQuantizer = struct {
     fn calcCentroidDistances(
         self: *const RaBitQuantizer,
         qs: *const proto.RaBitQuantizedVectorSet,
-        distances: []f32,
+        output: anytype,
         cancellation: ?CancellationToken,
+        ranges: []const ScoreRange,
     ) !void {
         switch (self.distance_metric) {
             .l2_squared => {
-                for (qs.centroid_distances, 0..) |cd, i| {
-                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
-                    distances[i] = cd * cd;
+                for (ranges) |range| {
+                    for (range.start..range.end) |i| {
+                        if ((i - range.start) % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
+                        if (!acceptsScore(output, i)) continue;
+                        const cd = qs.centroid_distances[i];
+                        output.write(i, cd * cd, 0);
+                    }
                 }
             },
             .inner_product => {
-                for (qs.centroid_dot_products, 0..) |cdp, i| {
-                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
-                    distances[i] = -cdp;
+                for (ranges) |range| {
+                    for (range.start..range.end) |i| {
+                        if ((i - range.start) % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
+                        if (!acceptsScore(output, i)) continue;
+                        const cdp = qs.centroid_dot_products[i];
+                        output.write(i, -cdp, 0);
+                    }
                 }
             },
             .cosine => {
                 const inv_centroid_norm: f32 = if (qs.centroid_norm != 0) 1.0 / qs.centroid_norm else 0.0;
-                for (qs.centroid_dot_products, 0..) |cdp, i| {
-                    if (i % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
-                    distances[i] = 1.0 - cdp * inv_centroid_norm;
+                for (ranges) |range| {
+                    for (range.start..range.end) |i| {
+                        if ((i - range.start) % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
+                        if (!acceptsScore(output, i)) continue;
+                        const cdp = qs.centroid_dot_products[i];
+                        output.write(i, 1.0 - cdp * inv_centroid_norm, 0);
+                    }
                 }
             },
         }
@@ -573,6 +817,280 @@ fn resizeSlice(comptime T: type, alloc: Allocator, slice: []T, new_len: usize) !
 }
 
 // --- Tests ---
+
+test "RaBitQuantizer prepared origin spans chunks with parity and rejects stale reuse" {
+    const alloc = std.testing.allocator;
+    const Output = struct {
+        distances: []f32,
+        bounds: []f32,
+        writes: usize = 0,
+        pub fn write(out: *@This(), i: usize, distance: f32, bound: f32) void {
+            out.distances[i] = distance;
+            out.bounds[i] = bound;
+            out.writes += 1;
+        }
+        fn cancelled(ptr: *const anyopaque) bool {
+            const out: *const @This() = @ptrCast(@alignCast(ptr));
+            return out.writes != 0;
+        }
+    };
+    for ([_]vec.DistanceMetric{ .l2_squared, .cosine, .inner_product }) |metric| {
+        var quantizer = try RaBitQuantizer.init(alloc, 3, 42, metric);
+        defer quantizer.deinit();
+        var first = try quantizer.quantize(&.{ 0.1, 0.2, 0.3 }, &.{ 0.3, 0.1, 0.2, -0.3, 0.4, 0.5 }, 2);
+        defer first.deinit(alloc);
+        var second = try quantizer.quantize(&.{ 0.1, 0.2, 0.3 }, &.{ 0.6, -0.2, 0.1, 0.5, 0.2, -0.4 }, 2);
+        defer second.deinit(alloc);
+        var scratch = try RaBitQuantizer.EstimateScratch.init(alloc, 3);
+        defer scratch.deinit(alloc);
+        for ([_][]const f32{ &.{ 0.2, 0.3, 0.4 }, first.centroid }) |query| {
+            var expected: [4]f32 = undefined;
+            var expected_bounds: [4]f32 = undefined;
+            try quantizer.estimateDistancesWithScratch(&first, query, expected[0..2], expected_bounds[0..2], &scratch);
+            try quantizer.estimateDistancesWithScratch(&second, query, expected[2..4], expected_bounds[2..4], &scratch);
+            const prepared = try quantizer.prepareEstimate(&first, query, &scratch, null);
+            var actual: [4]f32 = undefined;
+            var bounds: [4]f32 = undefined;
+            var a = Output{ .distances = actual[0..2], .bounds = bounds[0..2] };
+            var b = Output{ .distances = actual[2..4], .bounds = bounds[2..4] };
+            try quantizer.estimatePreparedDistancesInRangesTo(&first, prepared, null, &.{.{ .start = 0, .end = 2 }}, &a);
+            try quantizer.estimatePreparedDistancesInRangesTo(&second, prepared, null, &.{.{ .start = 0, .end = 2 }}, &b);
+            try std.testing.expectEqual(prepared.epoch, scratch.prepare_epoch);
+            try std.testing.expectEqualSlices(f32, &expected, &actual);
+            try std.testing.expectEqualSlices(f32, &expected_bounds, &bounds);
+            b.writes = 0;
+            try quantizer.estimatePreparedDistancesInRangesTo(&second, prepared, null, &.{}, &b);
+            try std.testing.expectEqual(@as(usize, 0), b.writes);
+            try std.testing.expectError(error.InvalidScoreRanges, quantizer.estimatePreparedDistancesInRangesTo(&second, prepared, null, &.{ .{ .start = 0, .end = 1 }, .{ .start = 0, .end = 2 } }, &b));
+            try std.testing.expectEqual(@as(usize, 0), b.writes);
+            const old_origin = second.centroid[0];
+            second.centroid[0] = 0.9;
+            try std.testing.expectError(error.IncompatiblePreparedEstimate, quantizer.estimatePreparedDistancesInRangesTo(&second, prepared, null, &.{.{ .start = 0, .end = 2 }}, &b));
+            second.centroid[0] = old_origin;
+            var other = try RaBitQuantizer.init(alloc, 3, 42, metric);
+            defer other.deinit();
+            try std.testing.expectError(error.IncompatiblePreparedEstimate, other.estimatePreparedDistancesInRangesTo(&second, prepared, null, &.{.{ .start = 0, .end = 2 }}, &b));
+            const token = CancellationToken{ .ptr = &a, .is_cancelled_fn = Output.cancelled };
+            try std.testing.expectError(error.Canceled, quantizer.estimatePreparedDistancesInRangesTo(&second, prepared, token, &.{.{ .start = 0, .end = 2 }}, &b));
+            try std.testing.expectEqual(@as(usize, 0), b.writes);
+            _ = try quantizer.prepareEstimate(&second, second.centroid, &scratch, null);
+            try std.testing.expectError(error.StalePreparedEstimate, quantizer.estimatePreparedDistancesInRangesTo(&second, prepared, null, &.{.{ .start = 0, .end = 2 }}, &b));
+            try std.testing.expectEqual(@as(usize, 0), b.writes);
+        }
+        scratch.prepare_epoch = std.math.maxInt(u64);
+        try std.testing.expectError(error.EstimateScratchExhausted, quantizer.prepareEstimate(&first, first.centroid, &scratch, null));
+    }
+}
+
+test "RaBitQuantizer range scans preserve scores bounds gaps and empty plans" {
+    const alloc = std.testing.allocator;
+    const count = 137;
+    const Output = struct {
+        distances: []f32,
+        errors: []f32,
+        seen: []bool,
+        pub fn write(self: @This(), i: usize, distance: f32, bound: f32) void {
+            std.debug.assert(!self.seen[i]);
+            self.seen[i] = true;
+            self.distances[i] = distance;
+            self.errors[i] = bound;
+        }
+    };
+    for ([_]usize{ 3, 64, 65 }) |dims| {
+        var centroid: [65]f32 = undefined;
+        var query: [65]f32 = undefined;
+        var data: [65 * count]f32 = undefined;
+        for (0..dims) |d| {
+            centroid[d] = @as(f32, @floatFromInt(d % 7)) / 10;
+            query[d] = @as(f32, @floatFromInt(d % 5)) / 9;
+        }
+        for (data[0 .. dims * count], 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 31)) / 31;
+        for ([_]vec.DistanceMetric{ .l2_squared, .inner_product, .cosine }) |metric| {
+            var quantizer = try RaBitQuantizer.init(alloc, dims, 42, metric);
+            defer quantizer.deinit();
+            var set = try quantizer.quantize(centroid[0..dims], data[0 .. dims * count], count);
+            defer set.deinit(alloc);
+            var scratch = try RaBitQuantizer.EstimateScratch.init(alloc, dims);
+            defer scratch.deinit(alloc);
+            for ([_][]const f32{ query[0..dims], centroid[0..dims] }) |q| {
+                var distances: [count]f32 = undefined;
+                var bounds: [count]f32 = undefined;
+                try quantizer.estimateDistancesWithScratch(&set, q, &distances, &bounds, &scratch);
+                var actual: [count]f32 = undefined;
+                var errors: [count]f32 = undefined;
+                var seen = [_]bool{false} ** count;
+                const output = Output{ .distances = &actual, .errors = &errors, .seen = &seen };
+                const ranges = [_]ScoreRange{ .{ .start = 2, .end = 7 }, .{ .start = 11, .end = 13 }, .{ .start = 13, .end = count } };
+                try quantizer.estimateDistancesInRangesTo(&set, q, &scratch, null, &ranges, output);
+                for (seen, 0..) |visited, i| {
+                    try std.testing.expectEqual((i >= 2 and i < 7) or i >= 11, visited);
+                    if (visited) {
+                        try std.testing.expectEqual(distances[i], actual[i]);
+                        try std.testing.expectEqual(bounds[i], errors[i]);
+                    }
+                }
+                @memset(&seen, false);
+                try quantizer.estimateDistancesInRangesTo(&set, q, &scratch, null, &.{}, output);
+                try std.testing.expect(std.mem.indexOfScalar(bool, &seen, true) == null);
+                try std.testing.expectError(error.InvalidScoreRanges, quantizer.estimateDistancesInRangesTo(&set, q, &scratch, null, &.{ .{ .start = 0, .end = 7 }, .{ .start = 6, .end = 8 } }, output));
+                try std.testing.expect(std.mem.indexOfScalar(bool, &seen, true) == null);
+                try std.testing.expectError(error.InvalidScoreRanges, quantizer.estimateDistancesInRangesTo(&set, q, &scratch, null, &.{.{ .start = 1, .end = count + 1 }}, output));
+                try std.testing.expectError(error.InvalidScoreRanges, quantizer.estimateDistancesInRangesTo(&set, q, &scratch, null, &.{.{ .start = 2, .end = 2 }}, output));
+            }
+        }
+    }
+}
+
+test "RaBitQuantizer range scans observe cancellation after sparse gaps" {
+    const State = struct {
+        writes: usize = 0,
+        fn cancelled(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            return self.writes >= 1;
+        }
+        pub fn write(self: *@This(), _: usize, _: f32, _: f32) void {
+            self.writes += 1;
+        }
+    };
+    var quantizer = try RaBitQuantizer.init(std.testing.allocator, 2, 42, .l2_squared);
+    defer quantizer.deinit();
+    var set = try quantizer.quantize(&.{ 0, 0 }, &([_]f32{ 1, 1 } ** 137), 137);
+    defer set.deinit(std.testing.allocator);
+    var scratch = try RaBitQuantizer.EstimateScratch.init(std.testing.allocator, 2);
+    defer scratch.deinit(std.testing.allocator);
+    var state = State{};
+    const token = CancellationToken{ .ptr = &state, .is_cancelled_fn = State.cancelled };
+    // Neither selected row is an absolute multiple of 64. Polling by absolute
+    // row index would incorrectly miss cancellation at the second range.
+    try std.testing.expectError(error.Canceled, quantizer.estimateDistancesInRangesTo(&set, &.{ 0, 0 }, &scratch, token, &.{ .{ .start = 1, .end = 2 }, .{ .start = 65, .end = 66 } }, &state));
+    try std.testing.expectEqual(@as(usize, 1), state.writes);
+    try std.testing.expectError(error.Canceled, quantizer.estimateDistancesInRangesTo(&set, &.{ 0, 0 }, &scratch, token, &.{}, &state));
+}
+
+fn quantizeQueryPlanesScalarForTest(
+    query_diff: []const f32,
+    unbias: []const f32,
+    min_val: f32,
+    delta: f32,
+    q1: []u64,
+    q2: []u64,
+    q3: []u64,
+    q4: []u64,
+) u64 {
+    @memset(q1, 0);
+    @memset(q2, 0);
+    @memset(q3, 0);
+    @memset(q4, 0);
+    var quantized_sum: u64 = 0;
+    var quantized1: u64 = 0;
+    var quantized2: u64 = 0;
+    var quantized3: u64 = 0;
+    var quantized4: u64 = 0;
+
+    for (query_diff, 0..) |value, d| {
+        if (delta != 0) {
+            var q_val: u64 = @intFromFloat(@floor((value - min_val) / delta + unbias[d]));
+            q_val = @min(q_val, 15);
+            quantized_sum += q_val;
+            quantized1 = (quantized1 << 1) | (q_val & 1);
+            quantized2 = (quantized2 << 1) | ((q_val & 2) >> 1);
+            quantized3 = (quantized3 << 1) | ((q_val & 4) >> 2);
+            quantized4 = (quantized4 << 1) | ((q_val & 8) >> 3);
+        } else {
+            quantized1 <<= 1;
+            quantized2 <<= 1;
+            quantized3 <<= 1;
+            quantized4 <<= 1;
+        }
+
+        if ((d + 1) % 64 == 0) {
+            const offset = d / 64;
+            q1[offset] = quantized1;
+            q2[offset] = quantized2;
+            q3[offset] = quantized3;
+            q4[offset] = quantized4;
+        }
+    }
+
+    if (query_diff.len % 64 != 0) {
+        const offset = query_diff.len / 64;
+        const shift: u6 = @intCast(64 - (query_diff.len % 64));
+        q1[offset] = quantized1 << shift;
+        q2[offset] = quantized2 << shift;
+        q3[offset] = quantized3 << shift;
+        q4[offset] = quantized4 << shift;
+    }
+    return quantized_sum;
+}
+
+test "RaBitQuantizer SIMD query packing is bit-identical to scalar packing" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5241_4249_5451);
+    const random = prng.random();
+    const dimensions = [_]usize{ 1, 7, 8, 9, 63, 64, 65, 127, 768 };
+
+    for (dimensions) |dims| {
+        const query_diff = try alloc.alloc(f32, dims);
+        defer alloc.free(query_diff);
+        const unbias = try alloc.alloc(f32, dims);
+        defer alloc.free(unbias);
+        for (query_diff) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+        for (unbias) |*value| value.* = random.float(f32);
+
+        const mm = vec.minMax(query_diff);
+        const delta = (mm.max - mm.min) / 15.0;
+        const width = rabitq.codeWidth(dims);
+        const expected = try alloc.alloc(u64, width * 4);
+        defer alloc.free(expected);
+        const actual = try alloc.alloc(u64, width * 4);
+        defer alloc.free(actual);
+
+        const expected_sum = quantizeQueryPlanesScalarForTest(
+            query_diff,
+            unbias,
+            mm.min,
+            delta,
+            expected[0 * width .. 1 * width],
+            expected[1 * width .. 2 * width],
+            expected[2 * width .. 3 * width],
+            expected[3 * width .. 4 * width],
+        );
+        const actual_sum = try quantizeQueryPlanes(
+            query_diff,
+            unbias,
+            mm.min,
+            delta,
+            actual[0 * width .. 1 * width],
+            actual[1 * width .. 2 * width],
+            actual[2 * width .. 3 * width],
+            actual[3 * width .. 4 * width],
+            null,
+        );
+        try std.testing.expectEqual(expected_sum, actual_sum);
+        try std.testing.expectEqualSlices(u64, expected, actual);
+    }
+
+    var zero_q1: [1]u64 = undefined;
+    var zero_q2: [1]u64 = undefined;
+    var zero_q3: [1]u64 = undefined;
+    var zero_q4: [1]u64 = undefined;
+    const zero_sum = try quantizeQueryPlanes(
+        &.{ 0.25, 0.25, 0.25 },
+        &.{ 0.1, 0.2, 0.3 },
+        0.25,
+        0,
+        &zero_q1,
+        &zero_q2,
+        &zero_q3,
+        &zero_q4,
+        null,
+    );
+    try std.testing.expectEqual(@as(u64, 0), zero_sum);
+    try std.testing.expectEqual(@as(u64, 0), zero_q1[0]);
+    try std.testing.expectEqual(@as(u64, 0), zero_q2[0]);
+    try std.testing.expectEqual(@as(u64, 0), zero_q3[0]);
+    try std.testing.expectEqual(@as(u64, 0), zero_q4[0]);
+}
 
 test "RaBitQuantizer checks cancellation inside distance scans" {
     var quantizer = try RaBitQuantizer.init(std.testing.allocator, 2, 42, .l2_squared);
@@ -588,10 +1106,13 @@ test "RaBitQuantizer checks cancellation inside distance scans" {
         }
     };
     var state = State{};
-    var quantized = try quantizer.quantize(&.{ 0, 0 }, &.{ 1, 1 }, 1);
+    // Reach a second periodic scan poll. A one-row centroid-equality fixture
+    // has only entry + row-zero polls and cannot trigger a third check.
+    const count = 129;
+    var quantized = try quantizer.quantize(&.{ 0, 0 }, &([_]f32{ 1, 1 } ** count), count);
     defer quantized.deinit(std.testing.allocator);
-    var distances: [1]f32 = undefined;
-    var error_bounds: [1]f32 = undefined;
+    var distances: [count]f32 = undefined;
+    var error_bounds: [count]f32 = undefined;
     try std.testing.expectError(
         error.Canceled,
         quantizer.estimateDistancesCancellable(

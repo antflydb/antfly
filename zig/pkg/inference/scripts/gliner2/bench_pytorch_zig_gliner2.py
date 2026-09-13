@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--metal-timeout", type=int, default=180)
     parser.add_argument(
-        "--zig-release", choices=("fast", "safe", "small"), default=None
+        "--zig-release", choices=("fast", "safe", "small"), default="fast"
     )
     parser.add_argument("--extra-zig-build-arg", action="append", default=[])
     parser.add_argument("--extra-zig-arg", action="append", default=[])

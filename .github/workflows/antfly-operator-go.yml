@@ -41,6 +41,7 @@ env:
 jobs:
   test:
     runs-on: arc-antfly-standard
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: go/pkg/operator
@@ -69,14 +70,34 @@ jobs:
       - name: Download dependencies
         run: GOWORK=off go mod download
 
-      - name: Install envtest
-        run: GOWORK=off go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.0.0-20251126220622-4b46eb04d57f
-
       - name: Configure envtest
-        run: echo "KUBEBUILDER_ASSETS=$("$(go env GOPATH)/bin/setup-envtest" use -p path 1.35.x!)" >> "$GITHUB_ENV"
+        run: |
+          assets="$(GOWORK=off go tool setup-envtest use -p path 1.35.x!)"
+          printf 'KUBEBUILDER_ASSETS=%s\n' "$assets" >> "$GITHUB_ENV"
 
       - name: Run tests
         run: make test
+
+      # This is a required step, not an env-gated unit test: execute the
+      # reconciler's generated command against the supported release on CPU.
+      # Update the version AND checksum when advancing the runtime baseline.
+      - name: Test generated inference command against released runtime
+        env:
+          RUNTIME_VERSION: '0.2.1'
+          RUNTIME_SHA256: '2378190c86966626e5a6a101918f66f0f175c8f7482a85415fc446a2a09427d7'
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          runtime_dir="$(mktemp -d)"
+          archive="antfly_${RUNTIME_VERSION}_Linux_x86_64_gnu.tar.gz"
+          curl --fail --location --retry 3 --max-time 180 \
+            "https://github.com/antflydb/antfly/releases/download/v${RUNTIME_VERSION}/${archive}" \
+            --output "${runtime_dir}/${archive}"
+          printf '%s  %s\n' "$RUNTIME_SHA256" "${runtime_dir}/${archive}" | sha256sum --check --strict
+          tar -xzf "${runtime_dir}/${archive}" -C "$runtime_dir"
+          ANTFLY_RUNTIME_BIN="${runtime_dir}/antfly" GOWORK=off go test \
+            -tags runtimeintegration ./controllers/inference \
+            -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
 
       - name: Run lint
         run: make lint

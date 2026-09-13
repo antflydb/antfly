@@ -49,7 +49,7 @@ fn spinOrYield() void {
     if (@import("builtin").os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
 }
 
@@ -2449,11 +2449,15 @@ test "concurrent typed doc values coverage initialization publishes one stable s
     var failed = std.atomic.Value(bool).init(false);
     var reader_a = Reader{ .segment = segment, .start = &start, .failed = &failed };
     var reader_b = Reader{ .segment = segment, .start = &start, .failed = &failed };
-    const thread_a = try std.Thread.spawn(.{}, Reader.run, .{&reader_a});
-    const thread_b = try std.Thread.spawn(.{}, Reader.run, .{&reader_b});
+    var thread_a = try std.testing.io.concurrent(Reader.run, .{&reader_a});
+    defer {
+        start.store(true, .release);
+        thread_a.await(std.testing.io);
+    }
+    var thread_b = try std.testing.io.concurrent(Reader.run, .{&reader_b});
     start.store(true, .release);
-    thread_a.join();
-    thread_b.join();
+    thread_a.await(std.testing.io);
+    thread_b.await(std.testing.io);
 
     try std.testing.expect(!failed.load(.acquire));
     const cached = &segment.shared.typed_doc_values_coverage[0];
@@ -2953,12 +2957,20 @@ test "concurrent searches safely observe in-place deletion publication" {
     var failed = std.atomic.Value(bool).init(false);
     var reader_a = Reader{ .snapshot = writer.snapshot(), .start = &start, .failed = &failed, .initial_live_count = doc_count };
     var reader_b = Reader{ .snapshot = writer.snapshot(), .start = &start, .failed = &failed, .initial_live_count = doc_count };
-    const thread_a = try std.Thread.spawn(.{}, Reader.run, .{&reader_a});
-    const thread_b = try std.Thread.spawn(.{}, Reader.run, .{&reader_b});
+    var thread_a = try std.testing.io.concurrent(Reader.run, .{&reader_a});
+    defer {
+        start.store(true, .release);
+        thread_a.await(std.testing.io);
+    }
+    var thread_b = try std.testing.io.concurrent(Reader.run, .{&reader_b});
+    defer {
+        start.store(true, .release);
+        thread_b.await(std.testing.io);
+    }
     start.store(true, .release);
     for (docs[0..64]) |doc| try std.testing.expect(try writer.deleteById(doc.id));
-    thread_a.join();
-    thread_b.join();
+    thread_a.await(std.testing.io);
+    thread_b.await(std.testing.io);
 
     try std.testing.expect(!failed.load(.acquire));
     const results = try writer.snapshot().search(alloc, "body", &.{"common"}, doc_count);

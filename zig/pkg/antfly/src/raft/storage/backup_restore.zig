@@ -16,7 +16,7 @@ const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const backups_api = @import("../../api/backups.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const db_mod = @import("../../storage/db/selected_root.zig").db;
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const portable_backup = @import("../../storage/portable_backup.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
@@ -169,6 +169,15 @@ pub const PreparedRestore = struct {
     pub fn seal(self: *@This()) !void {
         try self._generation.seal();
     }
+
+    /// Transfer the prepared generation into a publication handle after all
+    /// restore-only repair opens are complete. The native plan is immutable
+    /// admission evidence and has no owned resources after this point.
+    pub fn takeStagedGeneration(self: *@This()) db_mod.generation_lifecycle.StagedGeneration {
+        const generation = self._generation;
+        self._generation = undefined;
+        return generation;
+    }
 };
 
 pub fn groupDbPathFromReplicaRoot(alloc: std.mem.Allocator, replica_root_dir: []const u8, group_id: u64) ![]u8 {
@@ -206,6 +215,10 @@ pub fn applyRestoreSnapshotToPathWithOptions(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !void {
+    var io_scope = try RestoreIoScope.init(alloc, restore);
+    defer io_scope.deinit();
+    var restore_with_io = restore;
+    restore_with_io.io = io_scope.io();
     // Provisioning and Raft admission may discover the same restore intent on
     // adjacent control turns. Check the published generation under a read
     // lease before requesting an exclusive transition: once the exact import
@@ -213,14 +226,14 @@ pub fn applyRestoreSnapshotToPathWithOptions(
     // generation open while it advances restartable runtime-repair phases.
     // Requiring repair completion here would make the idempotent caller fight
     // that owner forever with GenerationTransitionActive.
-    if (try publishedRestoreAlreadyImported(alloc, path, group_id, restore)) return;
+    if (try publishedRestoreAlreadyImported(alloc, path, group_id, restore_with_io)) return;
     var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntimeAndIo(
         path,
         restore.backend_runtime,
-        restore.open_options.filesystem_io orelse restore.io,
+        io_scope.io(),
     );
     defer transition.deinit();
-    try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore, options);
+    try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore_with_io, options);
 }
 
 pub fn applyRestoreSnapshotToPathWithExclusiveTransition(
@@ -366,7 +379,7 @@ pub fn publishPreparedRestore(
 ) !db_mod.generation_lifecycle.PublicationOutcome {
     try prepared._generation.validateLivePath(path);
     const outcome = try prepared._generation.publish();
-    cleanupSnapshotsForPublishedRestore(alloc, path);
+    cleanupSnapshotsForPublishedRestore(alloc, prepared._generation.io orelse std.Options.debug_io, path);
     return outcome;
 }
 
@@ -919,7 +932,13 @@ fn applyPortableRestore(
         .prefer_existing_identity_namespace = true,
         .import_derived_indexes = true,
         .embedding_source_fields = embedding_source_fields,
+        .unpublished_staging = true,
+        .cancellation = restore.cancellation,
     });
+    portable_backup.validateCompleteDatabaseImageAlloc(alloc, db.core.store) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidBackupRequest,
+    };
     // Go portable AFBs may contain portable logical artifacts (for example
     // embedding batches) as well as old on-disk index directories. Keep the
     // logical artifacts in the DocStore, but drop runtime index directories so
@@ -1042,10 +1061,10 @@ fn stageRestoreFile(
     return staging_path;
 }
 
-fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, path: []const u8) void {
+pub fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     const snapshot_dir = std.fmt.allocPrint(alloc, "{s}.snapshots", .{path}) catch return;
     defer alloc.free(snapshot_dir);
-    destroyPathIfExists(snapshot_dir);
+    destroyPathIfExistsWithIo(io, snapshot_dir);
 }
 
 fn ensureDirPath(path: []const u8) !void {

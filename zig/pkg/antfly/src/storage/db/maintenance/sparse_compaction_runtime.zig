@@ -79,7 +79,8 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
     }
 } else struct {
     alloc: Allocator,
-    io_impl: ?*Io.Threaded,
+    /// Borrowed backend-neutral executor owned by BackendRuntime.
+    io: ?Io,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     config: Config,
@@ -90,7 +91,8 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
     paused: bool = false,
     shutdown: bool = false,
     notified: bool = false,
-    future: ?Io.Future(void) = null,
+    future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
 
     pub fn init(
         alloc: Allocator,
@@ -99,11 +101,12 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         backend_runtime: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !SparseCompactionRuntime {
-        const io_impl = backend_runtime.io_impl;
-        if (config.enabled and io_impl == null) return error.MissingBackendRuntimeIo;
+        const io = backend_runtime.io();
+        if (config.enabled and io == null) return error.MissingBackendRuntimeIo;
         return .{
             .alloc = alloc,
-            .io_impl = io_impl,
+            .io = io,
+            .backend_runtime = backend_runtime,
             .index_manager = index_manager,
             .apply_mutex = apply_mutex,
             .config = config,
@@ -169,19 +172,17 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
 
     fn startLocked(self: *SparseCompactionRuntime) !void {
         if (self.future != null or self.paused or !self.desired_running) return;
-        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
-        const io = io_impl.io();
+        const io = self.io orelse return error.MissingBackendRuntimeIo;
         if (builtin.is_test and consumeTestStartFailure()) return error.TestTransientMaintenanceRestart;
         self.mutex.lockUncancelable(io);
         self.shutdown = false;
         self.notified = true;
         self.mutex.unlock(io);
-        self.future = try io.concurrent(workerMain, .{self});
+        self.future = try (try self.backend_runtime.?.maintenanceScheduler()).register(self, workerStep);
     }
 
     fn stopLocked(self: *SparseCompactionRuntime) bool {
-        const io_impl = self.io_impl orelse return false;
-        const io = io_impl.io();
+        const io = self.io orelse return false;
         if (self.future == null) return false;
 
         self.mutex.lockUncancelable(io);
@@ -196,9 +197,9 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
     }
 
     pub fn notify(self: *SparseCompactionRuntime) void {
+        if (self.backend_runtime) |backend| backend.wakeMaintenance(self);
         if (!self.config.enabled) return;
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.io orelse return;
         self.mutex.lockUncancelable(io);
         self.notified = true;
         self.cond.broadcast(io);
@@ -251,8 +252,7 @@ const MandatoryApplyRetirement = struct {
     cancellation_protected: bool = true,
 
     fn acquire(runtime: *SparseCompactionRuntime) !MandatoryApplyRetirement {
-        const io_impl = runtime.io_impl orelse return error.MissingBackendRuntimeIo;
-        const io = io_impl.io();
+        const io = runtime.io orelse return error.MissingBackendRuntimeIo;
         const previous_cancel_protection = io.swapCancelProtection(.blocked);
         errdefer _ = io.swapCancelProtection(previous_cancel_protection);
 
@@ -297,72 +297,25 @@ const MandatoryApplyRetirement = struct {
     }
 };
 
-fn workerMain(runtime: *SparseCompactionRuntime) void {
-    while (true) {
-        if (isShutdown(runtime)) return;
-        const ran = runtime.runOnce() catch |err| {
-            // `std.Io` cancellation is a task-lifetime boundary, not a
-            // recoverable compaction failure. Do not consume its one-shot
-            // notification and re-enter the worker loop.
-            if (err == error.Canceled) return;
-            if (builtin.os.tag != .freestanding) {
-                std.log.warn("sparse compaction worker failed: {s}", .{@errorName(err)});
-            }
-            sleepMs(runtime, runtime.config.error_interval_ms);
-            continue;
-        };
-        if (ran) continue;
-        waitForWork(runtime);
-    }
-}
-
-fn waitForWork(runtime: *SparseCompactionRuntime) void {
-    var remaining_ms = runtime.config.idle_interval_ms;
-    if (remaining_ms == 0) remaining_ms = 1;
-
-    const io_impl = runtime.io_impl orelse return;
-    const io = io_impl.io();
-    runtime.mutex.lockUncancelable(io);
-    if (runtime.notified or runtime.shutdown) {
-        runtime.notified = false;
-        runtime.mutex.unlock(io);
-        return;
-    }
-    runtime.mutex.unlock(io);
-
-    while (remaining_ms > 0) {
-        if (isShutdown(runtime)) return;
-        const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
-        remaining_ms -= slice_ms;
-        runtime.mutex.lockUncancelable(io);
-        const notified = runtime.notified;
-        runtime.notified = false;
-        runtime.mutex.unlock(io);
-        if (notified) return;
-    }
-}
-
-fn sleepMs(runtime: *SparseCompactionRuntime, ms: u64) void {
-    var remaining_ms = if (ms == 0) 1 else ms;
-    while (remaining_ms > 0) {
-        if (isShutdown(runtime)) return;
-        const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
-        remaining_ms -= slice_ms;
-    }
+fn workerStep(runtime: *SparseCompactionRuntime) ?u64 {
+    if (isShutdown(runtime)) return null;
+    const ran = runtime.runOnce() catch |err| {
+        if (err == error.Canceled) return null;
+        std.log.warn("sparse compaction worker failed: {s}", .{@errorName(err)});
+        return @max(1, runtime.config.error_interval_ms);
+    };
+    return if (ran) 0 else @max(1, runtime.config.idle_interval_ms);
 }
 
 fn isShutdown(runtime: *SparseCompactionRuntime) bool {
-    const io_impl = runtime.io_impl orelse return runtime.shutdown;
-    const io = io_impl.io();
+    const io = runtime.io orelse return runtime.shutdown;
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
     return runtime.shutdown;
 }
 
 fn lockApplyExclusiveCancellable(runtime: *SparseCompactionRuntime) !bool {
-    const io_impl = runtime.io_impl orelse return false;
+    const io = runtime.io orelse return false;
     const Cancellation = struct {
         runtime: *SparseCompactionRuntime,
 
@@ -371,7 +324,7 @@ fn lockApplyExclusiveCancellable(runtime: *SparseCompactionRuntime) !bool {
         }
     };
     runtime.apply_mutex.lockExclusiveIo(
-        io_impl.io(),
+        io,
         @as(?Cancellation, .{ .runtime = runtime }),
     ) catch |err| switch (err) {
         // The component stop token makes this optional pass a no-op. Backend
@@ -384,7 +337,7 @@ fn lockApplyExclusiveCancellable(runtime: *SparseCompactionRuntime) !bool {
 }
 
 fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.Thread.yield() catch {};
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 fn consumeTestStartFailure() bool {
@@ -419,7 +372,7 @@ test "sparse compaction propagates backend cancellation before task start" {
     var apply_lock: apply_rw_lock_mod.ApplyRwLock = .{};
     var runtime: SparseCompactionRuntime = .{
         .alloc = std.testing.allocator,
-        .io_impl = &io_impl,
+        .io = io,
         .index_manager = undefined,
         .apply_mutex = &apply_lock,
         .config = .{ .enabled = true },
@@ -465,7 +418,7 @@ test "sparse compaction defers backend cancellation through mandatory retirement
             release_blocker: *std.atomic.Value(bool),
             retired: *std.atomic.Value(bool),
         ) Io.Cancelable!void {
-            const io = runtime.io_impl.?.io();
+            const io = runtime.io.?;
             cancellation_point_ready.store(true, .release);
             io.sleep(.fromSeconds(60), .awake) catch |err| switch (err) {
                 error.Canceled => io.recancel(),
@@ -489,7 +442,7 @@ test "sparse compaction defers backend cancellation through mandatory retirement
         fn run(ctx: *@This()) void {
             ctx.apply_lock.lockShared();
             ctx.held.store(true, .release);
-            while (!ctx.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!ctx.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             ctx.apply_lock.unlockShared();
         }
     };
@@ -502,7 +455,7 @@ test "sparse compaction defers backend cancellation through mandatory retirement
     var apply_lock: apply_rw_lock_mod.ApplyRwLock = .{};
     var runtime: SparseCompactionRuntime = .{
         .alloc = std.testing.allocator,
-        .io_impl = &io_impl,
+        .io = io,
         .index_manager = undefined,
         .apply_mutex = &apply_lock,
         .config = .{ .enabled = true },
@@ -514,13 +467,13 @@ test "sparse compaction defers backend cancellation through mandatory retirement
         .held = &blocker_held,
         .release = &release_blocker,
     };
-    const blocker_thread = try std.Thread.spawn(.{}, Blocker.run, .{&blocker_ctx});
+    var blocker_thread = try std.testing.io.concurrent(Blocker.run, .{&blocker_ctx});
     var blocker_active = true;
     defer if (blocker_active) {
         release_blocker.store(true, .release);
-        blocker_thread.join();
+        blocker_thread.await(std.testing.io);
     };
-    while (!blocker_held.load(.acquire)) std.Thread.yield() catch {};
+    while (!blocker_held.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     var cancellation_point_ready = std.atomic.Value(bool).init(false);
     var retired = std.atomic.Value(bool).init(false);
@@ -548,7 +501,7 @@ test "sparse compaction defers backend cancellation through mandatory retirement
     const result = future.cancel(io);
     future_active = false;
     release_blocker.store(true, .release);
-    blocker_thread.join();
+    blocker_thread.await(std.testing.io);
     blocker_active = false;
 
     try std.testing.expectError(error.Canceled, result);

@@ -474,10 +474,11 @@ test "Counter: concurrent create" {
         var c = try EquitiesCounter.init(t.allocator, "counter_vec_concurrent", .{}, .{});
         defer c.deinit();
 
-        var th1 = try std.Thread.spawn(.{}, run, .{&c});
-        var th2 = try std.Thread.spawn(.{}, run, .{&c});
-        th2.join();
-        th1.join();
+        var th1 = try std.testing.io.concurrent(run, .{&c});
+        defer th1.await(std.testing.io);
+        var th2 = try std.testing.io.concurrent(run, .{&c});
+        th2.await(std.testing.io);
+        th1.await(std.testing.io);
 
         try c.write(&writer.writer);
         const buf = writer.writer.buffered();

@@ -136,7 +136,7 @@ run_case() {
 
 if [[ "$WARM_BUILD" == "1" ]]; then
   echo "warming antfly-api-bench"
-  zig build --cache-dir "$ZIG_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" antfly-api-bench
+  zig build --cache-dir "$ZIG_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" -Doptimize=ReleaseFast antfly-api-bench
 fi
 
 run_case index_sort_first_page_small exact-sort-index-sort "$DOCS_SMALL" "$LIMIT_SMALL"

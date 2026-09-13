@@ -16,7 +16,10 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,6 +45,34 @@ type ResolveRequest struct {
 	Timestamp time.Time
 }
 
+// RoutingContext is the normalized, authenticated request context shared by
+// capability discovery and execution. ExplicitPool is the caller-selected
+// fallback when no configured route matches; route policy takes precedence in
+// both paths.
+type RoutingContext struct {
+	Headers      map[string]string
+	Source       VerifiedSource
+	ExplicitPool string
+	Timestamp    time.Time
+}
+
+func (c RoutingContext) routeRequest(operation OperationType, model string) *RouteRequest {
+	timestamp := c.Timestamp
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+	return &RouteRequest{
+		Operation:          operation,
+		Model:              model,
+		Headers:            c.Headers,
+		SourceTable:        firstNonEmpty(c.Source.Table, headerValue(c.Headers, "X-Antfly-Source-Table", "X-Antfly-Table")),
+		SourceOrganization: c.Source.OrganizationID,
+		SourceProject:      c.Source.ProjectID,
+		SourceAPIKey:       c.Source.APIKeyPrefix,
+		Timestamp:          timestamp,
+	}
+}
+
 // PoolActivator wakes and refreshes request-driven scale-to-zero pools.
 // Activate returns enabled=false for pools that are not managed by the
 // activator. When enabled is true, wait is the maximum cold-start window.
@@ -62,13 +93,18 @@ type Resolution struct {
 type ResolutionLease struct {
 	Resolution *Resolution
 
-	proxy        *Proxy
-	model        string
-	workloadType WorkloadType
-	once         sync.Once
-	completed    uint32
-	admission    *leaseAdmission
-	attempts     *leaseAttempts
+	proxy                         *Proxy
+	model                         string
+	operation                     OperationType
+	capabilityToken               string
+	capabilityRevision            string
+	capabilityAuthorizationDigest [sha256.Size]byte
+	workloadType                  WorkloadType
+	reservation                   endpointReservation
+	once                          sync.Once
+	completed                     uint32
+	admission                     *leaseAdmission
+	attempts                      *leaseAttempts
 }
 
 // ForwardingLease tracks in-flight load for a concrete forwarding attempt.
@@ -90,9 +126,10 @@ type leaseAttempts struct {
 
 // ResolutionError is a user-facing routing failure.
 type ResolutionError struct {
-	StatusCode int
-	Message    string
-	RetryAfter int
+	StatusCode      int
+	Message         string
+	RetryAfter      int
+	CapabilityStale bool
 }
 
 func (e *ResolutionError) Error() string {
@@ -102,26 +139,87 @@ func (e *ResolutionError) Error() string {
 	return e.Message
 }
 
+func staleCapabilityResolutionError(message string) *ResolutionError {
+	return &ResolutionError{
+		StatusCode:      http.StatusConflict,
+		Message:         message,
+		CapabilityStale: true,
+	}
+}
+
+// writeResolutionError preserves the routing contract uniformly across initial
+// resolution, admission, and retry-time re-resolution.
+func writeResolutionError(w http.ResponseWriter, err error) bool {
+	var resolutionErr *ResolutionError
+	if !errors.As(err, &resolutionErr) {
+		return false
+	}
+	if resolutionErr.CapabilityStale {
+		w.Header().Set(capabilityStaleHeader, "true")
+	}
+	if resolutionErr.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(resolutionErr.RetryAfter))
+	}
+	http.Error(w, resolutionErr.Message, resolutionErr.StatusCode)
+	return true
+}
+
 // ResolveRequest resolves a request to an endpoint without forwarding it.
 func (p *Proxy) ResolveRequest(ctx context.Context, req ResolveRequest) (*Resolution, error) {
-	return p.resolveResolveRequest(ctx, req, false)
+	routing := routingContextForResolveRequest(req)
+	resolution, _, err := p.resolve(ctx, routing.routeRequest(req.Operation, req.Model), routing, false)
+	if err != nil {
+		return nil, err
+	}
+	return publicResolutionSnapshot(resolution), nil
 }
 
 // AcquireRequestResolution resolves and reserves an endpoint for forwarding.
 // Callers must Admit the request before forwarding, then finish the returned
 // lease with RecordSuccess, RecordFailure, or Release.
 func (p *Proxy) AcquireRequestResolution(ctx context.Context, req ResolveRequest) (*ResolutionLease, error) {
-	resolution, err := p.resolveResolveRequest(ctx, req, true)
+	lease, err := p.acquireRequestResolution(ctx, req.Operation, req.Model, routingContextForResolveRequest(req))
+	if err != nil {
+		return nil, err
+	}
+	lease.Resolution = publicResolutionSnapshot(lease.Resolution)
+	return lease, nil
+}
+
+func publicResolutionSnapshot(resolution *Resolution) *Resolution {
+	if resolution == nil {
+		return nil
+	}
+	snapshot := *resolution
+	snapshot.Route = cloneRoute(resolution.Route, false)
+	if resolution.Destination != nil {
+		destination := *resolution.Destination
+		destination.QueueDepthCondition = cloneThreshold(resolution.Destination.QueueDepthCondition)
+		destination.ReplicaCondition = cloneThreshold(resolution.Destination.ReplicaCondition)
+		destination.LatencyCondition = cloneThreshold(resolution.Destination.LatencyCondition)
+		destination.TimeCondition = cloneTimeWindow(resolution.Destination.TimeCondition)
+		snapshot.Destination = &destination
+	}
+	return &snapshot
+}
+
+func (p *Proxy) acquireRequestResolution(ctx context.Context, operation OperationType, model string, routing RoutingContext) (*ResolutionLease, error) {
+	resolution, reservation, err := p.resolve(ctx, routing.routeRequest(operation, model), routing, true)
 	if err != nil {
 		return nil, err
 	}
 	return &ResolutionLease{
-		Resolution:   resolution,
-		proxy:        p,
-		model:        req.Model,
-		workloadType: resolveWorkloadType(req.Operation, req.Headers),
-		admission:    &leaseAdmission{},
-		attempts:     newLeaseAttempts(),
+		Resolution:                    resolution,
+		proxy:                         p,
+		model:                         model,
+		operation:                     operation,
+		capabilityToken:               headerValue(routing.Headers, capabilityTokenHeader),
+		capabilityRevision:            headerValue(routing.Headers, capabilityRevisionHeader),
+		capabilityAuthorizationDigest: sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(routing.Headers))),
+		workloadType:                  resolveWorkloadType(operation, routing.Headers),
+		reservation:                   reservation,
+		admission:                     &leaseAdmission{},
+		attempts:                      newLeaseAttempts(),
 	}, nil
 }
 
@@ -166,7 +264,15 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 	}
 
 	excluded := l.attempts.excludeAndSnapshot(l.Resolution.Endpoint)
-	endpoint, err := l.proxy.router.RouteRequest(ctx, l.model, l.Resolution.Pool, l.workloadType, excluded)
+	allowed, err := l.proxy.capabilityLeaseEndpoints(l.capabilityToken, l.capabilityRevision, l.model, l.operation, l.capabilityAuthorizationDigest)
+	if err != nil {
+		return nil, err
+	}
+	namespace := l.proxy.defaultPool.Namespace
+	if l.Resolution.Route != nil {
+		namespace = l.Resolution.Route.Namespace
+	}
+	reservation, err := l.proxy.router.routeRequestInNamespaceWithin(ctx, l.model, namespace, l.Resolution.Pool, l.workloadType, excluded, allowed, l.operation)
 	if err != nil {
 		return nil, err
 	}
@@ -175,14 +281,19 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 		Resolution: &Resolution{
 			Route:       l.Resolution.Route,
 			Destination: l.Resolution.Destination,
-			Endpoint:    endpoint,
+			Endpoint:    reservation.ref.endpoint,
 			Pool:        l.Resolution.Pool,
 		},
-		proxy:        l.proxy,
-		model:        l.model,
-		workloadType: l.workloadType,
-		admission:    l.admission,
-		attempts:     l.attempts,
+		proxy:                         l.proxy,
+		model:                         l.model,
+		operation:                     l.operation,
+		capabilityToken:               l.capabilityToken,
+		capabilityRevision:            l.capabilityRevision,
+		capabilityAuthorizationDigest: l.capabilityAuthorizationDigest,
+		workloadType:                  l.workloadType,
+		reservation:                   reservation,
+		admission:                     l.admission,
+		attempts:                      l.attempts,
 	}, nil
 }
 
@@ -212,8 +323,8 @@ func (l *ResolutionLease) BeginForwarding() *ForwardingLease {
 	}
 
 	endpoint := l.Resolution.Endpoint
-	atomic.AddInt32(&endpoint.Connections, 1)
-	activeConnections.WithLabelValues(endpoint.Pool, endpoint.Address).Inc()
+	atomic.AddInt32(&endpoint.runtime.connections, 1)
+	activeConnections.WithLabelValues(endpoint.metricPool(), endpoint.address).Inc()
 
 	return &ForwardingLease{endpoint: endpoint}
 }
@@ -224,8 +335,8 @@ func (f *ForwardingLease) Finish() {
 		return
 	}
 	f.once.Do(func() {
-		atomic.AddInt32(&f.endpoint.Connections, -1)
-		activeConnections.WithLabelValues(f.endpoint.Pool, f.endpoint.Address).Dec()
+		atomic.AddInt32(&f.endpoint.runtime.connections, -1)
+		activeConnections.WithLabelValues(f.endpoint.metricPool(), f.endpoint.address).Dec()
 	})
 }
 
@@ -234,8 +345,8 @@ func (l *ResolutionLease) finish(release func(*CircuitBreaker)) {
 		return
 	}
 	l.once.Do(func() {
-		if cb := l.proxy.registry.GetCircuitBreaker(l.Resolution.Endpoint.Address); cb != nil {
-			release(cb)
+		if l.reservation.ref.breaker != nil {
+			release(l.reservation.ref.breaker)
 		}
 		atomic.StoreUint32(&l.completed, 1)
 	})
@@ -256,7 +367,7 @@ func (a *leaseAttempts) excludeAndSnapshot(endpoint *Endpoint) map[string]bool {
 	defer a.mu.Unlock()
 
 	if endpoint != nil {
-		a.excluded[endpoint.Address] = true
+		a.excluded[endpoint.address] = true
 	}
 
 	snapshot := make(map[string]bool, len(a.excluded))
@@ -266,24 +377,13 @@ func (a *leaseAttempts) excludeAndSnapshot(endpoint *Endpoint) map[string]bool {
 	return snapshot
 }
 
-func (p *Proxy) resolveResolveRequest(ctx context.Context, req ResolveRequest, reserve bool) (*Resolution, error) {
-	timestamp := req.Timestamp
-	if timestamp.IsZero() {
-		timestamp = time.Now()
+func routingContextForResolveRequest(req ResolveRequest) RoutingContext {
+	return RoutingContext{
+		Headers:      req.Headers,
+		Source:       req.Source,
+		ExplicitPool: headerValue(req.Headers, "X-Antfly-Inference-Pool"),
+		Timestamp:    req.Timestamp,
 	}
-
-	routeReq := &RouteRequest{
-		Operation:          req.Operation,
-		Model:              req.Model,
-		Headers:            req.Headers,
-		SourceTable:        firstNonEmpty(req.Source.Table, headerValue(req.Headers, "X-Antfly-Source-Table", "X-Antfly-Table")),
-		SourceOrganization: req.Source.OrganizationID,
-		SourceProject:      req.Source.ProjectID,
-		SourceAPIKey:       req.Source.APIKeyPrefix,
-		Timestamp:          timestamp,
-	}
-
-	return p.resolve(ctx, routeReq, req.Headers, reserve)
 }
 
 // StartBackground starts background refresh and route watching without an HTTP listener.
@@ -292,9 +392,11 @@ func (p *Proxy) StartBackground(ctx context.Context) {
 }
 
 func (p *Proxy) startBackgroundWorkers(ctx context.Context) {
-	if p.registry.refreshInterval > 0 {
-		go p.refreshLoop(ctx)
-	}
+	// Registration-driven discovery remains active even when periodic
+	// reconciliation is disabled. This lets deployments use event-driven
+	// endpoint discovery without making the refresh interval a correctness
+	// requirement.
+	go p.refreshLoop(ctx)
 	if p.routeWatcher == nil {
 		return
 	}
@@ -305,65 +407,93 @@ func (p *Proxy) startBackgroundWorkers(ctx context.Context) {
 	}()
 }
 
-func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map[string]string, reserve bool) (*Resolution, error) {
-	workloadType := resolveWorkloadType(routeReq.Operation, headers)
-	matchedRoute := p.router.RouteManager().Match(routeReq)
+func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing RoutingContext, reserve bool) (*Resolution, endpointReservation, error) {
+	var matchedRoute *Route
+	capabilityLease, err := p.validatedCapabilityLease(
+		headerValue(routing.Headers, capabilityTokenHeader),
+		headerValue(routing.Headers, capabilityRevisionHeader),
+		routeReq.Model,
+		routeReq.Operation,
+		sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(routing.Headers))),
+	)
+	if err != nil {
+		return nil, endpointReservation{}, err
+	}
+	allowed := capabilityLease.endpoints
+
+	if capabilityLease.scoped {
+		var current bool
+		matchedRoute, current = p.router.RouteManager().matchInstalledAtGeneration(routeReq, capabilityLease.routeGeneration)
+		if !current {
+			return nil, endpointReservation{}, staleCapabilityResolutionError("inference capability lease is stale")
+		}
+	} else {
+		matchedRoute = p.router.RouteManager().matchInstalled(routeReq)
+	}
+	workloadType := resolveWorkloadType(routeReq.Operation, routing.Headers)
 	if matchedRoute != nil {
-		dest, err := p.router.RouteManager().SelectDestination(matchedRoute, routeReq, p.registry)
+		dest, err := p.router.RouteManager().selectDestinationWithin(matchedRoute, routeReq, p.registry, allowed)
 		if err != nil {
-			return nil, &ResolutionError{
+			return nil, endpointReservation{}, &ResolutionError{
 				StatusCode: http.StatusServiceUnavailable,
 				Message:    err.Error(),
 			}
 		}
 		if dest == nil {
-			dest = p.selectActivationDestination(matchedRoute, routeReq)
+			dest = p.selectActivationDestinationWithin(matchedRoute, routeReq, allowed)
 		}
 		if dest != nil {
-			endpoint, resolveErr := p.resolvePoolTarget(ctx, routeNamespace(matchedRoute), dest.Pool, routeReq, workloadType, reserve, dest)
+			endpoint, reservation, resolveErr := p.resolvePoolTarget(
+				ctx, matchedRoute.Namespace, dest.Pool, routeReq, workloadType,
+				routeReq.Operation, reserve, dest, allowed,
+			)
 			if resolveErr == nil {
 				return &Resolution{
 					Route:       matchedRoute,
 					Destination: dest,
 					Endpoint:    endpoint,
 					Pool:        dest.Pool,
-				}, nil
+				}, reservation, nil
 			}
 			if ctx.Err() != nil {
-				return nil, resolutionError(ctx.Err())
+				return nil, endpointReservation{}, resolutionError(ctx.Err())
 			}
 			if matchedRoute.Fallback == nil {
-				return nil, resolutionError(resolveErr)
+				return nil, endpointReservation{}, resolutionError(resolveErr)
 			}
 		}
 		if matchedRoute.Fallback != nil {
-			fallbackPool, fallbackErr := p.resolveRouteFallback(ctx, matchedRoute, routeReq)
+			fallbackPool, fallbackErr := p.resolveRouteFallback(ctx, matchedRoute, routeReq, allowed)
 			if fallbackErr != nil {
-				return nil, fallbackErr
+				return nil, endpointReservation{}, fallbackErr
 			}
-			endpoint, resolveErr := p.resolvePoolTarget(ctx, routeNamespace(matchedRoute), fallbackPool, routeReq, workloadType, reserve, nil)
+			endpoint, reservation, resolveErr := p.resolvePoolTarget(
+				ctx, matchedRoute.Namespace, fallbackPool, routeReq, workloadType,
+				routeReq.Operation, reserve, nil, allowed,
+			)
 			if resolveErr != nil {
-				return nil, resolutionError(resolveErr)
+				return nil, endpointReservation{}, resolutionError(resolveErr)
 			}
-			return &Resolution{Route: matchedRoute, Endpoint: endpoint, Pool: fallbackPool}, nil
+			return &Resolution{Route: matchedRoute, Endpoint: endpoint, Pool: fallbackPool}, reservation, nil
 		}
-		return nil, noEligibleDestinationsError()
+		return nil, endpointReservation{}, noEligibleDestinationsError()
 	}
 
-	pool := headerValue(headers, "X-Antfly-Inference-Pool")
+	pool := strings.TrimSpace(routing.ExplicitPool)
 	if pool == "" {
-		pool = p.defaultPool
+		pool = p.defaultPool.Pool
 	}
-
-	endpoint, err := p.resolvePoolTarget(ctx, "", pool, routeReq, workloadType, reserve, nil)
+	endpoint, reservation, err := p.resolvePoolTarget(
+		ctx, p.defaultPool.Namespace, pool, routeReq, workloadType, routeReq.Operation, reserve, nil, allowed,
+	)
 	if err != nil {
-		return nil, resolutionError(err)
+		return nil, endpointReservation{}, resolutionError(err)
 	}
 
 	return &Resolution{
 		Endpoint: endpoint,
 		Pool:     pool,
-	}, nil
+	}, reservation, nil
 }
 
 func resolutionError(err error) *ResolutionError {
@@ -374,11 +504,15 @@ func resolutionError(err error) *ResolutionError {
 }
 
 func (p *Proxy) selectActivationDestination(route *Route, req *RouteRequest) *Destination {
+	return p.selectActivationDestinationWithin(route, req, nil)
+}
+
+func (p *Proxy) selectActivationDestinationWithin(route *Route, req *RouteRequest, allowed map[string]endpointRef) *Destination {
 	if p.activator == nil {
 		return nil
 	}
-	namespace := routeNamespace(route)
-	return p.router.RouteManager().SelectActivationDestination(route, req, p.registry, func(pool string) bool {
+	namespace := route.Namespace
+	return p.router.RouteManager().selectActivationDestinationWithin(route, req, p.registry, allowed, func(pool string) bool {
 		return p.activator.IsEnabled(namespace, pool)
 	})
 }
@@ -392,7 +526,7 @@ func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route, req 
 	if selected == nil {
 		return nil, 0
 	}
-	namespace := routeNamespace(route)
+	namespace := route.Namespace
 	wait, enabled, err := p.activatePool(ctx, namespace, selected.Pool)
 	if err != nil {
 		p.logger.Warn("failed to activate inference route destination", zap.String("namespace", namespace), zap.String("pool", selected.Pool), zap.Error(err))
@@ -408,9 +542,21 @@ func (p *Proxy) activateRouteDestination(ctx context.Context, route *Route, req 
 // refresh its activation lease, satisfy the selected route's runtime
 // conditions when it was genuinely cold, acquire an endpoint, and return the
 // result to the caller for fallback handling.
-func (p *Proxy) resolvePoolTarget(ctx context.Context, namespace, pool string, req *RouteRequest, workloadType WorkloadType, reserve bool, destination *Destination) (*Endpoint, error) {
-	wasCold := p.registry.PoolConditionStats(pool, req.Model).HealthyEndpoints == 0
-	activationWait, activationEnabled, activationErr := p.activatePool(ctx, namespace, pool)
+func (p *Proxy) resolvePoolTarget(
+	ctx context.Context,
+	namespace, pool string,
+	req *RouteRequest,
+	workloadType WorkloadType,
+	operation OperationType,
+	reserve bool,
+	destination *Destination,
+	allowed map[string]endpointRef,
+) (*Endpoint, endpointReservation, error) {
+	wasCold := p.registry.poolConditionStatsInNamespaceWithin(namespace, pool, req.Model, allowed).HealthyEndpoints == 0
+	activationWait, activationEnabled, activationErr := time.Duration(0), false, error(nil)
+	if allowed == nil || endpointRefsContainNamespacedPool(allowed, namespace, pool) {
+		activationWait, activationEnabled, activationErr = p.activatePool(ctx, namespace, pool)
+	}
 	if activationErr != nil {
 		p.logger.Warn("failed to refresh inference pool activation", zap.String("namespace", namespace), zap.String("pool", pool), zap.Error(activationErr))
 	}
@@ -419,33 +565,41 @@ func (p *Proxy) resolvePoolTarget(ctx context.Context, namespace, pool string, r
 		// acquirable until the selected destination's dynamic conditions hold.
 		// Keeping that selection and acquisition in this state machine prevents
 		// a newly visible endpoint from bypassing model/queue/replica/latency rules.
-		if p.waitForRouteDestination(ctx, destination, req, activationWait) == nil {
-			return nil, noEligibleDestinationsError()
+		if p.waitForRouteDestination(ctx, namespace, destination, req, allowed, activationWait) == nil {
+			return nil, endpointReservation{}, noEligibleDestinationsError()
 		}
 		if reserve {
-			return p.router.AcquireDestinationEndpoint(req, destination, workloadType)
+			reservation, err := p.router.acquireDestinationEndpointWithin(req, destination, workloadType, namespace, allowed, operation)
+			if err != nil {
+				return nil, endpointReservation{}, err
+			}
+			return reservation.ref.endpoint, reservation, nil
 		}
-		return p.resolveEndpoint(ctx, req.Model, pool, workloadType, reserve)
+		return p.resolveEndpoint(ctx, req.Model, namespace, pool, workloadType, operation, false, allowed)
 	}
 
 	if destination != nil && reserve {
-		return p.router.AcquireDestinationEndpoint(req, destination, workloadType)
+		reservation, err := p.router.acquireDestinationEndpointWithin(req, destination, workloadType, namespace, allowed, operation)
+		if err != nil {
+			return nil, endpointReservation{}, err
+		}
+		return reservation.ref.endpoint, reservation, nil
 	}
-	endpoint, err := p.resolveEndpoint(ctx, req.Model, pool, workloadType, reserve)
+	endpoint, reservation, err := p.resolveEndpoint(ctx, req.Model, namespace, pool, workloadType, operation, reserve, allowed)
 	if err == nil {
-		return endpoint, nil
+		return endpoint, reservation, nil
 	}
 	if !wasCold || !activationEnabled || activationErr != nil {
-		return nil, err
+		return nil, endpointReservation{}, err
 	}
 
 	if destination != nil {
-		if p.waitForRouteDestination(ctx, destination, req, activationWait) == nil {
-			return nil, err
+		if p.waitForRouteDestination(ctx, namespace, destination, req, allowed, activationWait) == nil {
+			return nil, endpointReservation{}, err
 		}
-		return p.resolveEndpoint(ctx, req.Model, pool, workloadType, reserve)
+		return p.resolveEndpoint(ctx, req.Model, namespace, pool, workloadType, operation, reserve, allowed)
 	}
-	return p.waitForPoolEndpoint(ctx, req.Model, pool, workloadType, reserve, activationWait)
+	return p.waitForPoolEndpoint(ctx, req.Model, namespace, pool, workloadType, operation, reserve, allowed, activationWait)
 }
 
 func (p *Proxy) activatePool(ctx context.Context, namespace, pool string) (time.Duration, bool, error) {
@@ -455,23 +609,12 @@ func (p *Proxy) activatePool(ctx context.Context, namespace, pool string) (time.
 	return p.activator.Activate(ctx, namespace, pool)
 }
 
-func routeNamespace(route *Route) string {
-	if route == nil {
-		return ""
-	}
-	namespace, _, found := strings.Cut(route.Name, "/")
-	if !found {
-		return ""
-	}
-	return namespace
-}
-
-func (p *Proxy) waitForRouteDestination(ctx context.Context, destination *Destination, req *RouteRequest, maxWait time.Duration) *Destination {
+func (p *Proxy) waitForRouteDestination(ctx context.Context, namespace string, destination *Destination, req *RouteRequest, allowed map[string]endpointRef, maxWait time.Duration) *Destination {
 	if maxWait <= 0 {
 		return nil
 	}
 	req.Timestamp = time.Now()
-	if p.router.RouteManager().evaluateConditions(destination, req, p.registry) {
+	if p.router.RouteManager().evaluateConditionsInNamespaceWithin(destination, req, p.registry, namespace, allowed) {
 		return destination
 	}
 	timer := time.NewTimer(maxWait)
@@ -487,16 +630,16 @@ func (p *Proxy) waitForRouteDestination(ctx context.Context, destination *Destin
 			return nil
 		case <-ticker.C:
 			req.Timestamp = time.Now()
-			if p.router.RouteManager().evaluateConditions(destination, req, p.registry) {
+			if p.router.RouteManager().evaluateConditionsInNamespaceWithin(destination, req, p.registry, namespace, allowed) {
 				return destination
 			}
 		}
 	}
 }
 
-func (p *Proxy) waitForPoolEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, reserve bool, maxWait time.Duration) (*Endpoint, error) {
+func (p *Proxy) waitForPoolEndpoint(ctx context.Context, model, namespace, pool string, workloadType WorkloadType, operation OperationType, reserve bool, allowed map[string]endpointRef, maxWait time.Duration) (*Endpoint, endpointReservation, error) {
 	if maxWait <= 0 {
-		return p.resolveEndpoint(ctx, model, pool, workloadType, reserve)
+		return p.resolveEndpoint(ctx, model, namespace, pool, workloadType, operation, reserve, allowed)
 	}
 	timer := time.NewTimer(maxWait)
 	defer timer.Stop()
@@ -507,38 +650,40 @@ func (p *Proxy) waitForPoolEndpoint(ctx context.Context, model, pool string, wor
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, endpointReservation{}, ctx.Err()
 		case <-timer.C:
 			if lastErr != nil {
-				return nil, lastErr
+				return nil, endpointReservation{}, lastErr
 			}
-			return nil, &ResolutionError{StatusCode: http.StatusServiceUnavailable, Message: "inference pool activation timed out"}
+			return nil, endpointReservation{}, &ResolutionError{StatusCode: http.StatusServiceUnavailable, Message: "inference pool activation timed out"}
 		case <-ticker.C:
-			endpoint, err := p.resolveEndpoint(ctx, model, pool, workloadType, reserve)
+			endpoint, reservation, err := p.resolveEndpoint(ctx, model, namespace, pool, workloadType, operation, reserve, allowed)
 			if err == nil {
-				return endpoint, nil
+				return endpoint, reservation, nil
 			}
 			lastErr = err
 		}
 	}
 }
 
-func (p *Proxy) resolveEndpoint(ctx context.Context, model, pool string, workloadType WorkloadType, reserve bool) (*Endpoint, error) {
+func (p *Proxy) resolveEndpoint(ctx context.Context, model, namespace, pool string, workloadType WorkloadType, operation OperationType, reserve bool, allowed map[string]endpointRef) (*Endpoint, endpointReservation, error) {
 	if reserve {
-		return p.router.RouteRequest(ctx, model, pool, workloadType, nil)
+		reservation, err := p.router.routeRequestInNamespaceWithin(ctx, model, namespace, pool, workloadType, nil, allowed, operation)
+		return reservation.ref.endpoint, reservation, err
 	}
 
-	candidates := p.router.ResolveEndpointCandidates(model, pool, nil)
+	candidates := p.router.resolveEndpointCandidatesInNamespaceWithin(model, namespace, pool, nil, allowed, operation)
 	if len(candidates) == 0 {
-		return nil, &ResolutionError{
+		return nil, endpointReservation{}, &ResolutionError{
 			StatusCode: http.StatusServiceUnavailable,
 			Message:    "no healthy endpoints available for model " + model,
 		}
 	}
-	return p.router.selectEndpoint(model, workloadType, candidates, false)
+	endpoint, err := p.router.selectEndpoint(model, workloadType, candidates, false)
+	return endpoint, endpointReservation{}, err
 }
 
-func (p *Proxy) resolveRouteFallback(ctx context.Context, route *Route, routeReq *RouteRequest) (string, *ResolutionError) {
+func (p *Proxy) resolveRouteFallback(ctx context.Context, route *Route, routeReq *RouteRequest, allowed map[string]endpointRef) (string, *ResolutionError) {
 	switch route.Fallback.Action {
 	case "reject":
 		statusCode := route.Fallback.StatusCode
@@ -557,7 +702,7 @@ func (p *Proxy) resolveRouteFallback(ctx context.Context, route *Route, routeReq
 	case "redirect":
 		return route.Fallback.RedirectPool, nil
 	case "queue":
-		queuedPool, queueErr := p.waitForQueuedDestination(ctx, route, routeReq)
+		queuedPool, queueErr := p.waitForQueuedDestination(ctx, route, routeReq, allowed)
 		if queueErr != nil {
 			return "", &ResolutionError{
 				StatusCode: http.StatusServiceUnavailable,
@@ -583,10 +728,10 @@ func resolveWorkloadType(operation OperationType, headers map[string]string) Wor
 		return workloadType
 	}
 
-	switch operation {
-	case "embed", "embeddings", "rerank", "extract":
+	switch semanticTaskForOperation(operation) {
+	case "embed", "rerank", "extract":
 		return WorkloadTypeReadHeavy
-	case "chunk", "generate", "chat.completions":
+	case "chunk", "generate":
 		return WorkloadTypeWriteHeavy
 	default:
 		return WorkloadTypeGeneral
@@ -595,11 +740,27 @@ func resolveWorkloadType(operation OperationType, headers map[string]string) Wor
 
 func headerValue(headers map[string]string, names ...string) string {
 	for _, name := range names {
-		if value := headers[name]; value != "" {
+		if value, ok := lookupHeader(headers, name); ok && value != "" {
 			return value
 		}
 	}
 	return ""
+}
+
+func lookupHeader(headers map[string]string, name string) (string, bool) {
+	if value, ok := headers[name]; ok {
+		return value, true
+	}
+	canonical := http.CanonicalHeaderKey(name)
+	if value, ok := headers[canonical]; ok {
+		return value, true
+	}
+	for candidate, value := range headers {
+		if strings.EqualFold(candidate, name) {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 func firstNonEmpty(values ...string) string {

@@ -14,6 +14,13 @@
 
 const std = @import("std");
 
+pub const max_chunk_results: usize = 4096;
+pub const max_chunk_target_tokens: usize = 1_000_000;
+pub const max_chunk_audio_window_ms: usize = 24 * 60 * 60 * 1000;
+/// Hard retained-output ceiling used by direct/local fixed multimodal calls.
+/// HTTP callers may select a smaller request-scoped ceiling.
+pub const default_max_chunk_owned_output_bytes: usize = 100 * 1024 * 1024;
+
 pub const Chunk = struct {
     id: u32,
     mime_type: []const u8,
@@ -25,6 +32,7 @@ pub const Chunk = struct {
     end_time_ms: ?f32 = null,
     frame_index: ?u32 = null,
     frame_delay_ms: ?u32 = null,
+    owns_mime_type: bool = false,
     owns_text: bool = false,
     owns_data: bool = false,
 
@@ -56,6 +64,7 @@ pub const Chunk = struct {
     }
 
     pub fn deinit(self: *Chunk, alloc: std.mem.Allocator) void {
+        if (self.owns_mime_type) alloc.free(@constCast(self.mime_type));
         if (self.owns_text and self.text != null) alloc.free(self.text.?);
         if (self.owns_data and self.data != null) alloc.free(self.data.?);
         self.* = undefined;
@@ -67,19 +76,47 @@ pub const FixedTextConfig = struct {
     overlap_tokens: usize = 50,
     max_chunks: usize = 50,
     separator: []const u8 = "\n\n",
+
+    pub fn validate(self: @This()) !void {
+        const target = if (self.target_tokens > 0) self.target_tokens else 500;
+        if (target > max_chunk_target_tokens) return error.InvalidChunkTargetTokens;
+        if (self.overlap_tokens > max_chunk_target_tokens or self.overlap_tokens >= target)
+            return error.InvalidChunkOverlapTokens;
+        if (self.max_chunks > max_chunk_results) return error.InvalidMaxChunks;
+    }
 };
 
 pub const AudioChunkOptions = struct {
     window_duration_ms: usize = 30_000,
     overlap_duration_ms: usize = 0,
+
+    pub fn validate(self: @This()) !void {
+        const window = if (self.window_duration_ms > 0) self.window_duration_ms else 30_000;
+        if (window > max_chunk_audio_window_ms) return error.InvalidChunkAudioWindow;
+        if (self.overlap_duration_ms > max_chunk_audio_window_ms or
+            self.overlap_duration_ms >= window)
+            return error.InvalidChunkAudioOverlap;
+    }
 };
 
 pub const FixedChunkConfig = struct {
-    model: []const u8 = "fixed-bert-tokenizer",
+    model: []const u8 = "fixed",
     max_chunks: usize = 50,
     threshold: ?f32 = null,
     text: FixedTextConfig = .{},
     audio: AudioChunkOptions = .{},
+
+    pub fn validate(self: @This()) !void {
+        if (self.max_chunks > max_chunk_results) return error.InvalidMaxChunks;
+        if (self.threshold) |value| {
+            if (!std.math.isFinite(value) or value < 0 or value > 1)
+                return error.InvalidChunkThreshold;
+        }
+        var text = self.text;
+        text.max_chunks = self.max_chunks;
+        try text.validate();
+        try self.audio.validate();
+    }
 };
 
 pub const BinaryInput = struct {

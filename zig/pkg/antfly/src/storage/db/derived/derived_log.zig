@@ -315,7 +315,7 @@ test "derived log propagates wal group commit settings" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -352,10 +352,11 @@ test "derived log propagates wal group commit settings" {
         var worker_a = Worker{ .log = &log, .barrier = &barrier, .payload = "alpha" };
         var worker_b = Worker{ .log = &log, .barrier = &barrier, .payload = "beta" };
 
-        const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&worker_a});
-        const thread_b = try std.Thread.spawn(.{}, Worker.run, .{&worker_b});
-        thread_a.join();
-        thread_b.join();
+        var thread_a = try std.testing.io.concurrent(Worker.run, .{&worker_a});
+        defer thread_a.await(std.testing.io);
+        var thread_b = try std.testing.io.concurrent(Worker.run, .{&worker_b});
+        thread_a.await(std.testing.io);
+        thread_b.await(std.testing.io);
 
         if (worker_a.err) |err| return err;
         if (worker_b.err) |err| return err;

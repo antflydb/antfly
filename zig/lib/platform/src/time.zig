@@ -33,7 +33,24 @@ pub fn sleepNs(ns: u64) void {
 
 pub fn yieldBriefly() void {
     if (comptime builtin.os.tag == .freestanding) return;
-    sleepNs(100_000);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    io.sleep(.fromMicroseconds(100), .awake) catch unreachable;
+}
+
+/// Scheduler handoff for synchronous compatibility APIs with no borrowed Io.
+/// No executor workers are created. Use an owner's Io waits when available;
+/// freestanding callers retain only a processor hint.
+pub fn yieldNow() void {
+    if (comptime builtin.os.tag == .freestanding) {
+        std.atomic.spinLoopHint();
+        return;
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    io.sleep(.zero, .awake) catch unreachable;
 }
 
 pub fn monotonicNs() u64 {
@@ -80,6 +97,24 @@ pub fn realtimeNs() u64 {
 
 pub fn nowSeconds() u64 {
     return monotonicNs() / std.time.ns_per_s;
+}
+
+/// CPU consumed by the calling OS thread, not elapsed wall time or node-wide
+/// CPU. Use only around synchronous work on the same thread. Unsupported
+/// targets and clock failures are explicit absence, never a fabricated zero.
+pub fn threadCpuNs() ?u64 {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return null;
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.THREAD_CPUTIME_ID, &ts))) {
+        .SUCCESS => return std.math.cast(u64, @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return null,
+    }
+}
+
+test "thread CPU clock is monotonic where supported" {
+    const before = threadCpuNs() orelse return;
+    const after = threadCpuNs() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(after >= before);
 }
 
 pub fn residentBytes() usize {

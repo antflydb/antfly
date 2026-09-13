@@ -81,6 +81,8 @@ pub const Parser = struct {
     max_body_size: usize = 100 * 1024 * 1024, // 100 MB
     request_body_limit_context: ?*anyopaque = null,
     request_body_limit_resolver: ?*const fn (*anyopaque, types.Method, []const u8) ?usize = null,
+    request_body_streaming_context: ?*anyopaque = null,
+    request_body_streaming_resolver: ?*const fn (*anyopaque, types.Method, []const u8, ?[]const u8) bool = null,
     message_body_size_limit: usize = std.math.maxInt(usize),
     /// Optional process-wide reservation shared by all inbound connections.
     /// Fixed-length bodies reserve once at header completion; chunked bodies
@@ -240,6 +242,7 @@ pub const Parser = struct {
         self.header_count = 0;
         self.total_body_bytes = 0;
         self.message_body_size_limit = std.math.maxInt(usize);
+        if (self.request_body_streaming_resolver != null) self.headers_only = false;
     }
 
     fn releaseBodyBudget(self: *Self) void {
@@ -453,14 +456,6 @@ pub const Parser = struct {
             return;
         }
 
-        // In headers-only mode the caller will read the body externally
-        // (e.g. via a streaming Io.Reader chain). Mark complete now so
-        // any unconsumed bytes remain available to the caller.
-        if (self.headers_only) {
-            self.state = .complete;
-            return;
-        }
-
         self.message_body_size_limit = self.max_body_size;
         if (self.mode == .request) {
             if (self.request_body_limit_resolver) |resolve| {
@@ -476,14 +471,41 @@ pub const Parser = struct {
             }
         }
 
-        if (self.chunked) {
-            self.state = .chunk_size;
-        } else if (self.content_length) |len| {
-            if (len > self.message_body_size_limit) {
+        if (self.content_length) |len| {
+            // Header-only response parsing deliberately leaves body limits to
+            // the streaming response reader. Requests must still reject an
+            // oversized declared body before dispatching a streaming upload.
+            if (len > self.message_body_size_limit and
+                (self.mode == .request or !self.headers_only))
+            {
                 self.state = .err;
                 self.error_reason = .body_too_large;
                 return;
             }
+        }
+        if (self.mode == .request and !self.headers_only and
+            self.content_length != null and self.content_length.? > 0 and !self.chunked)
+        {
+            if (self.request_body_streaming_resolver) |resolve| {
+                if (self.request_body_streaming_context) |context| {
+                    if (self.method) |method| if (self.path) |path| {
+                        self.headers_only = resolve(context, method, path, self.headers.get("content-type"));
+                    };
+                }
+            }
+        }
+
+        // In headers-only mode the caller will read the body externally
+        // (e.g. via a streaming Io.Reader chain). Mark complete now so
+        // any unconsumed bytes remain available to the caller.
+        if (self.headers_only) {
+            self.state = .complete;
+            return;
+        }
+
+        if (self.chunked) {
+            self.state = .chunk_size;
+        } else if (self.content_length) |len| {
             if (len > 0) {
                 const body_len: usize = @intCast(len);
                 if (self.store_body) {

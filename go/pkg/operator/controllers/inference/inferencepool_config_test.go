@@ -304,7 +304,8 @@ func TestZigWarmModelKindUsesRegistryTaskPrecedence(t *testing.T) {
 	g := NewWithT(t)
 	g.Expect(zigWarmModelKind([]string{"embed"})).To(Equal("embedder"))
 	g.Expect(zigWarmModelKind([]string{"generate", "rerank"})).To(Equal("reranker"))
-	g.Expect(zigWarmModelKind(nil)).To(Equal("generator"))
+	g.Expect(zigWarmModelKind(nil)).To(BeEmpty())
+	g.Expect(zigWarmModelKind([]string{"unknown-task"})).To(BeEmpty())
 }
 
 func TestInferenceWarmModelNamePreservesVariant(t *testing.T) {

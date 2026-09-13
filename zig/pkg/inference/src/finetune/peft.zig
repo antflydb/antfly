@@ -570,10 +570,6 @@ pub fn composeAdapterSafetensors(
     var composed = std.StringHashMapUnmanaged(usize){};
     defer composed.deinit(allocator);
     var tensors = std.ArrayListUnmanaged(AdapterTensor).empty;
-    errdefer {
-        for (tensors.items) |*tensor| tensor.deinit(allocator);
-        tensors.deinit(allocator);
-    }
     defer {
         for (tensors.items) |*tensor| tensor.deinit(allocator);
         tensors.deinit(allocator);

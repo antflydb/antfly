@@ -178,6 +178,14 @@ const Summary = struct {
     }
 };
 
+/// Retain the standalone qualification entry point alongside storage_bench.
+pub fn main(init: std.process.Init) !void {
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer args.deinit();
+    _ = args.skip();
+    return run(init, &args);
+}
+
 pub fn run(_: std.process.Init, args: *std.process.Args.Iterator) !void {
     const alloc = std.heap.c_allocator;
     const cfg = try parseArgs(args);
@@ -243,7 +251,7 @@ fn runProvisionedDenseIngest(
     var read_source = public_api.ProvisionedTableReadSource.init(
         replica_root_dir,
         catalog,
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     try storage.attachSources(&read_source, &write_source);
 
@@ -679,10 +687,7 @@ fn normalizeInPlace(vec: []f32) void {
 
 fn sleepMs(duration_ms: u64) void {
     if (duration_ms == 0) return;
-    const deadline = nowNs() +| (duration_ms * std.time.ns_per_ms);
-    while (nowNs() < deadline) {
-        std.Thread.yield() catch {};
-    }
+    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@as(i96, duration_ms) * std.time.ns_per_ms), .awake) catch {};
 }
 
 fn tempPath(buf: []u8) [*:0]const u8 {

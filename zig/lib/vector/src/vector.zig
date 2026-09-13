@@ -409,6 +409,275 @@ pub fn distanceToQuery(query: []const f32, query_measure: f32, candidate: []cons
     };
 }
 
+/// Compute distance directly from a scaled float16 projection without first
+/// materializing a float32 candidate. This is useful for immutable mmap vector
+/// blocks: conversion, candidate norm, and query dot product share one pass,
+/// avoiding a request-sized decode buffer and a second candidate traversal.
+pub fn distanceToQueryF16(
+    query: []const f32,
+    query_measure: f32,
+    candidate: []const f16,
+    candidate_scale: f32,
+    metric: DistanceMetric,
+) f32 {
+    return switch (metric) {
+        .l2_squared => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .l2_squared),
+        .inner_product => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .inner_product),
+        .cosine => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .cosine),
+    };
+}
+
+pub const BoundedDistance = struct {
+    distance: f32,
+    error_bound: f32,
+};
+
+/// Scores a scaled IEEE-f16 projection and returns a conservative interval
+/// containing the source-f32 score. The encoder rounds each scaled component
+/// once; using a full f16 ULP (rather than the ideal half-ULP) also covers the
+/// f32 divide/multiply round trips and subnormal transition. Callers must fall
+/// back to authoritative f32 when the cosine normalization denominator cannot
+/// be bounded away from zero.
+pub fn distanceToQueryF16Bounded(
+    query: []const f32,
+    query_measure: f32,
+    candidate: []const f16,
+    candidate_scale: f32,
+    metric: DistanceMetric,
+) BoundedDistance {
+    const query_norm = switch (metric) {
+        .inner_product => norm(query),
+        .cosine => query_measure,
+        .l2_squared => 0,
+    };
+    return distanceToQueryF16BoundedWithQueryNorm(
+        query,
+        query_measure,
+        query_norm,
+        candidate,
+        candidate_scale,
+        metric,
+    );
+}
+
+/// Batch-oriented form of distanceToQueryF16Bounded. The caller computes the
+/// query norm once and reuses it across every candidate, avoiding a second
+/// query traversal per inner-product candidate.
+pub fn distanceToQueryF16BoundedWithQueryNorm(
+    query: []const f32,
+    query_measure: f32,
+    query_norm: f32,
+    candidate: []const f16,
+    candidate_scale: f32,
+    metric: DistanceMetric,
+) BoundedDistance {
+    const score_distance = distanceToQueryF16(query, query_measure, candidate, candidate_scale, metric);
+    var error_norm_squared: f64 = 0;
+    var candidate_norm_squared: f64 = 0;
+    for (candidate) |component_f16| {
+        const component: f32 = @floatCast(component_f16);
+        const decoded = component * candidate_scale;
+        const component_error = candidate_scale *
+            (@abs(component) * (1.0 / 1024.0) + 1.0 / 8_388_608.0);
+        error_norm_squared += @as(f64, component_error) * component_error;
+        candidate_norm_squared += @as(f64, decoded) * decoded;
+    }
+    const error_norm_raw: f32 = @floatCast(@sqrt(error_norm_squared));
+    const error_norm = error_norm_raw + 8.0 * std.math.floatEps(f32) * (error_norm_raw + 1.0);
+    const candidate_norm_raw: f32 = @floatCast(@sqrt(candidate_norm_squared));
+    const candidate_norm = @max(0, candidate_norm_raw - 8.0 * std.math.floatEps(f32) * (candidate_norm_raw + 1.0));
+    return boundedDistanceFromProjectionMetadata(
+        score_distance,
+        query_norm,
+        error_norm,
+        candidate_norm,
+        metric,
+    );
+}
+
+/// Completes a float16 candidate score using quantization metadata persisted
+/// beside the immutable vector. `decoded_norm_lower_bound` must be a lower
+/// bound, while `error_norm` must upper-bound the source-to-projection error.
+/// This keeps the query path to one SIMD vector traversal.
+pub fn boundedDistanceFromProjectionMetadata(
+    score_distance: f32,
+    query_norm: f32,
+    error_norm: f32,
+    decoded_norm_lower_bound: f32,
+    metric: DistanceMetric,
+) BoundedDistance {
+    const arithmetic_slop = 64.0 * std.math.floatEps(f32) * (@abs(score_distance) + 1.0);
+    const query_norm_upper = query_norm + 8.0 * std.math.floatEps(f32) * (query_norm + 1.0);
+    const approximate_norm = @sqrt(@max(score_distance, 0.0));
+    const approximate_norm_upper = approximate_norm + 8.0 * std.math.floatEps(f32) * (approximate_norm + 1.0);
+    const bound = switch (metric) {
+        .inner_product => query_norm_upper * error_norm,
+        .l2_squared => 2.0 * approximate_norm_upper * error_norm + error_norm * error_norm,
+        .cosine => blk: {
+            if (query_norm == 0 or decoded_norm_lower_bound <= error_norm)
+                break :blk std.math.inf(f32);
+            // The normalized-vector perturbation is at most
+            // 2||e||/(||v_hat||-||e||); cosine distance has the same bound.
+            break :blk @min(2.0, 2.0 * error_norm / (decoded_norm_lower_bound - error_norm));
+        },
+    };
+    return .{ .distance = score_distance, .error_bound = bound + arithmetic_slop };
+}
+
+test "float16 bounded distances contain authoritative float32 scores" {
+    const query = [_]f32{ 0.03125, -0.7, 3.1415927, 12.5, -64.125 };
+    const source = [_]f32{ 0.03091, -0.6991, 3.1401, 12.493, -64.09 };
+    var encoded: [source.len]f16 = undefined;
+    for (source, &encoded) |value, *out| out.* = @floatCast(value);
+    for ([_]DistanceMetric{ .l2_squared, .inner_product, .cosine }) |metric| {
+        const query_measure = switch (metric) {
+            .l2_squared => dot(&query, &query),
+            .inner_product => 0,
+            .cosine => norm(&query),
+        };
+        const bounded = distanceToQueryF16Bounded(&query, query_measure, &encoded, 1, metric);
+        const exact = distanceToQuery(&query, query_measure, &source, metric);
+        try std.testing.expect(@abs(exact - bounded.distance) <= bounded.error_bound);
+    }
+}
+
+test "persisted float16 projection metadata bounds adversarial scores" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_f16_b0a0d);
+    const random = prng.random();
+    var query: [37]f32 = undefined;
+    var source: [37]f32 = undefined;
+    var encoded: [37]f16 = undefined;
+    var decoded: [37]f32 = undefined;
+    for (0..128) |round| {
+        const magnitude: f32 = if (round % 4 == 0) 100_000 else if (round % 4 == 1) 0.00001 else 100;
+        var max_abs: f32 = 0;
+        for (&query, &source) |*q, *s| {
+            q.* = (random.float(f32) * 2 - 1) * magnitude;
+            s.* = (random.float(f32) * 2 - 1) * magnitude;
+            max_abs = @max(max_abs, @abs(s.*));
+        }
+        const candidate_scale = if (max_abs > 65_000) max_abs / 65_000 else 1;
+        var error_squared: f64 = 0;
+        var decoded_norm_squared: f64 = 0;
+        for (source, &encoded, &decoded) |source_value, *encoded_value, *decoded_value| {
+            encoded_value.* = @floatCast(source_value / candidate_scale);
+            decoded_value.* = @as(f32, @floatCast(encoded_value.*)) * candidate_scale;
+            const component_error = source_value - decoded_value.*;
+            error_squared += @as(f64, component_error) * component_error;
+            decoded_norm_squared += @as(f64, decoded_value.*) * decoded_value.*;
+        }
+        const raw_error: f32 = @floatCast(@sqrt(error_squared));
+        const error_upper = raw_error + 8.0 * std.math.floatEps(f32) * (raw_error + 1.0);
+        const raw_decoded_norm: f32 = @floatCast(@sqrt(decoded_norm_squared));
+        const decoded_norm_lower = @max(0, raw_decoded_norm - 8.0 * std.math.floatEps(f32) * (raw_decoded_norm + 1.0));
+        for ([_]DistanceMetric{ .l2_squared, .inner_product, .cosine }) |metric| {
+            const query_measure = switch (metric) {
+                .l2_squared => dot(&query, &query),
+                .inner_product => 0,
+                .cosine => norm(&query),
+            };
+            const approximate = distanceToQueryF16(&query, query_measure, &encoded, candidate_scale, metric);
+            const bounded = boundedDistanceFromProjectionMetadata(
+                approximate,
+                norm(&query),
+                error_upper,
+                decoded_norm_lower,
+                metric,
+            );
+            const exact = distanceToQuery(&query, query_measure, &source, metric);
+            try std.testing.expect(@abs(exact - bounded.distance) <= bounded.error_bound);
+        }
+    }
+}
+
+fn distanceToQueryF16Metric(
+    query: []const f32,
+    query_measure: f32,
+    candidate: []const f16,
+    candidate_scale: f32,
+    comptime metric: DistanceMetric,
+) f32 {
+    std.debug.assert(query.len == candidate.len);
+    std.debug.assert(std.math.isFinite(candidate_scale) and candidate_scale > 0);
+    const SimdF16 = @Vector(8, f16);
+    const SimdF32 = @Vector(8, f32);
+    const scale_vec: SimdF32 = @splat(candidate_scale);
+    var sum0: SimdF32 = @splat(0);
+    var sum1: SimdF32 = @splat(0);
+    var sum2: SimdF32 = @splat(0);
+    var sum3: SimdF32 = @splat(0);
+    var norm0: SimdF32 = @splat(0);
+    var norm1: SimdF32 = @splat(0);
+    var norm2: SimdF32 = @splat(0);
+    var norm3: SimdF32 = @splat(0);
+    var i: usize = 0;
+
+    while (i + 32 <= query.len) : (i += 32) {
+        const q0: SimdF32 = query[i..][0..8].*;
+        const q1: SimdF32 = query[i + 8 ..][0..8].*;
+        const q2: SimdF32 = query[i + 16 ..][0..8].*;
+        const q3: SimdF32 = query[i + 24 ..][0..8].*;
+        const c0: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i..][0..8].*))) * scale_vec;
+        const c1: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i + 8 ..][0..8].*))) * scale_vec;
+        const c2: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i + 16 ..][0..8].*))) * scale_vec;
+        const c3: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i + 24 ..][0..8].*))) * scale_vec;
+        switch (metric) {
+            .l2_squared => {
+                const d0 = q0 - c0;
+                const d1 = q1 - c1;
+                const d2 = q2 - c2;
+                const d3 = q3 - c3;
+                sum0 += d0 * d0;
+                sum1 += d1 * d1;
+                sum2 += d2 * d2;
+                sum3 += d3 * d3;
+            },
+            .inner_product => {
+                sum0 += q0 * c0;
+                sum1 += q1 * c1;
+                sum2 += q2 * c2;
+                sum3 += q3 * c3;
+            },
+            .cosine => {
+                sum0 += q0 * c0;
+                sum1 += q1 * c1;
+                sum2 += q2 * c2;
+                sum3 += q3 * c3;
+                norm0 += c0 * c0;
+                norm1 += c1 * c1;
+                norm2 += c2 * c2;
+                norm3 += c3 * c3;
+            },
+        }
+    }
+
+    var sum: f32 = @reduce(.Add, sum0 + sum1 + sum2 + sum3);
+    var norm_squared: f32 = @reduce(.Add, norm0 + norm1 + norm2 + norm3);
+    while (i < query.len) : (i += 1) {
+        const value = @as(f32, @floatCast(candidate[i])) * candidate_scale;
+        switch (metric) {
+            .l2_squared => {
+                const diff = query[i] - value;
+                sum += diff * diff;
+            },
+            .inner_product => sum += query[i] * value,
+            .cosine => {
+                sum += query[i] * value;
+                norm_squared += value * value;
+            },
+        }
+    }
+
+    return switch (metric) {
+        .l2_squared => @max(0, sum),
+        .inner_product => -sum,
+        .cosine => if (query_measure == 0 or norm_squared == 0)
+            1
+        else
+            1 - sum / (query_measure * @sqrt(norm_squared)),
+    };
+}
+
 /// Compute cosine similarity between two vectors.
 pub fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
     const na = norm(a);
@@ -517,10 +786,21 @@ pub fn batchL2SquaredDistance(query: []const f32, candidates: []const []const f3
 pub fn minMax(v: []const f32) struct { min: f32, max: f32 } {
     if (v.len == 0) return .{ .min = 0, .max = 0 };
 
-    var min_val: f32 = v[0];
-    var max_val: f32 = v[0];
+    const simd_width = 8;
+    const SimdF32 = @Vector(simd_width, f32);
+    var min_vec: SimdF32 = @splat(v[0]);
+    var max_vec: SimdF32 = @splat(v[0]);
+    var i: usize = 1;
+    while (i + simd_width <= v.len) : (i += simd_width) {
+        const values: SimdF32 = v[i..][0..simd_width].*;
+        min_vec = @min(min_vec, values);
+        max_vec = @max(max_vec, values);
+    }
 
-    for (v[1..]) |val| {
+    var min_val: f32 = @reduce(.Min, min_vec);
+    var max_val: f32 = @reduce(.Max, max_vec);
+    while (i < v.len) : (i += 1) {
+        const val = v[i];
         if (val < min_val) min_val = val;
         if (val > max_val) max_val = val;
     }
@@ -552,14 +832,46 @@ test "subTo" {
     try std.testing.expectApproxEqAbs(dst[2], -2.0, 1e-6);
 }
 
+test "minMax handles SIMD body and scalar tail" {
+    const values = [_]f32{ 4, -2, 7, 3, 1, 9, -8, 5, 6, 11, -3, 2, 8, 0, 10, -1, 12, -4 };
+    const result = minMax(&values);
+    try std.testing.expectEqual(@as(f32, -8), result.min);
+    try std.testing.expectEqual(@as(f32, 12), result.max);
+}
+
 test "distance conversion produces higher-is-better similarity scores" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), similarityFromDistance(0.0, .l2_squared), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), similarityFromDistance(3.0, .l2_squared), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), similarityFromDistance(0.2, .cosine), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2.5), similarityFromDistance(-2.5, .inner_product), 1e-6);
 
-    inline for (.{ DistanceMetric.l2_squared, .inner_product, .cosine }) |metric| {
+    inline for ([_]DistanceMetric{ .l2_squared, .inner_product, .cosine }) |metric| {
         try std.testing.expect(similarityFromDistance(0.25, metric) > similarityFromDistance(0.75, metric));
+    }
+}
+
+test "scaled float16 distance matches decoded float32 distance" {
+    var query: [35]f32 = undefined;
+    var encoded: [35]f16 = undefined;
+    var decoded: [35]f32 = undefined;
+    const candidate_scale: f32 = 2.5;
+    for (0..query.len) |i| {
+        query[i] = @as(f32, @floatFromInt(i % 11)) * 0.125 - 0.5;
+        encoded[i] = @floatCast(@as(f32, @floatFromInt(i % 7)) * 0.25 - 0.75);
+        decoded[i] = @as(f32, @floatCast(encoded[i])) * candidate_scale;
+    }
+
+    inline for ([_]DistanceMetric{ .l2_squared, .inner_product, .cosine }) |metric| {
+        const query_measure = switch (metric) {
+            .l2_squared => dot(&query, &query),
+            .inner_product => 0,
+            .cosine => norm(&query),
+        };
+        try std.testing.expectApproxEqAbs(
+            distanceToQuery(&query, query_measure, &decoded, metric),
+            distanceToQueryF16(&query, query_measure, &encoded, candidate_scale, metric),
+            1e-5,
+        );
     }
 }
 

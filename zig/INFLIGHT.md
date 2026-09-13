@@ -1,10 +1,10 @@
-# Inflight Batching Plan
+# Inflight Batching
 
 ## Goal
 
 Reduce dense derived apply overhead by cutting the number of expensive apply and commit boundaries during replay/catch-up.
 
-The current profile still shows these hot buckets:
+Before this work, profiling showed these hot buckets:
 
 - `flushMutable`
 - `persistManifest`
@@ -12,92 +12,47 @@ The current profile still shows these hot buckets:
 - `NamespaceWriteTxn.commit`
 - `state.mergeStates`
 
-The common pattern is that dense derived apply is still finalizing too often.
+The common pattern was that dense derived apply was finalizing too often.
 
-## Why Not Add Another WAL
+## Single Durability Layer, No Second WAL
 
-The Go repo uses `go/pkg/antfly/lib/inflight/WALBuffer` to combine:
-
-- durability
-- microbatch scheduling
-
-That makes sense there because the per-index worker path owns both concerns.
-
-In Zig, we already have durable replay state in the derived log:
+Zig already has durable replay state in the derived log:
 
 - `pkg/antfly/src/storage/db/derived/derived_log.zig`
 - `pkg/antfly/src/storage/db/derived/derived_worker.zig`
 
-So the first inflight step here should only add microbatching. We should not add a second per-index WAL layer until measurement shows the existing derived log is insufficient.
+So this work adds only microbatching on top of that log; it does not add a second per-index WAL layer. Some Go services combine durability and microbatch scheduling in one WAL-like component, which makes sense where a single per-index worker path owns both concerns. In Zig those two concerns are already separated by the derived log, so only the batching half needs a home.
 
 ## Placement
 
-This should not live in `go/pkg/antfly/lib/inflight/` yet.
-
-The batching rules are still tightly coupled to the storage/db pipelines:
+The batching shell lives under storage/db (`pkg/antfly/src/storage/db/batcher.zig`) rather than in a shared cross-language library, because the batching rules are tightly coupled to the storage/db pipelines:
 
 - replay/catch-up batching depends on `DerivedBatch` semantics
 - enrichment batching depends on generated-enrichment request semantics
 - merge behavior is index-kind specific
 
-So the first reusable shell belongs under storage/db itself:
+## Replay/Catch-up Batching
 
-- `pkg/antfly/src/storage/db/batcher.zig`
+`derived_worker.catchUpIndex()` accumulates consecutive derived records for a managed index during replay and flushes the accumulator through the existing apply callback as one merged `DerivedBatch` when a per-kind threshold is hit (source record count, embedding/mutation/document count, or end of the replay loop).
 
-If sparse/full-text/enrichment/graph all converge on a truly generic queue and
-flush contract later, we can promote that smaller core to `go/pkg/antfly/lib/`.
+`batcher.zig` implements this accumulation per index kind — dense vector, sparse vector, full-text, algebraic, and graph — each with its own accumulator and threshold, since the cost of an unbatched apply differs by kind. Durability is unchanged by this: batching only changes how many records are grouped into one apply/commit boundary, not what gets persisted or when it becomes replayable.
 
-## First Narrow Implementation
+## Effect
 
-Scope:
+Batching reduces:
 
-- dense-vector indexes only
-- replay / catch-up path only
-- existing durability unchanged
+- calls into `applyDerivedBatchToIndexContext`
+- `bulk_ingest` batch lifetimes
+- LSM commit / flush / manifest reconciliation points
+- `NamespaceWriteTxn.commit` frequency
 
-Implementation shape:
+## Thresholds
 
-1. `derived_worker.catchUpIndex()` accumulates consecutive dense derived records for a managed dense index.
-2. The worker flushes that accumulator when one of these provisional thresholds is hit:
-   - source record count
-   - dense embedding count
-   - end of replay loop
-3. Flush applies one merged `DerivedBatch` through the existing apply callback.
-4. Other index kinds keep the current one-record-at-a-time behavior.
+Each index kind uses conservative, hard-coded thresholds (source records, embeddings, mutations, or documents accumulated per flush) rather than one shared generic value, so a more expensive kind doesn't share a limit sized for a cheaper one. These can be tuned or made configurable later as the profile moves.
 
-This first step is intentionally narrow. It avoids:
+## Open work
 
-- a new generic inflight framework
-- a second WAL
-- timer-driven background batching
-- cross-index coalescing
-
-## What This Should Improve
-
-- fewer calls into `applyDerivedBatchToIndexContext`
-- fewer `bulk_ingest` batch lifetimes
-- fewer LSM commit / flush / manifest reconciliation points
-- lower `NamespaceWriteTxn.commit` frequency
-
-## Expected Follow-Ups
-
-If this first step helps:
-
-1. Add a longer-lived DB-level dense apply scope so multiple replay flushes share one ingest lifetime.
-2. Reuse the same batching shell for sparse/full-text/graph with index-specific merge behavior.
-3. Add enrichment-side request coalescing on the existing worker path.
-4. Only then consider a shared inflight framework or `go/pkg/antfly/lib/` promotion.
-
-If this first step does not help enough:
-
-1. Apply the same batching idea higher up, before replay flushes become DB apply calls.
-2. Revisit in-place application of LSM overlay state on commit.
-
-## Initial Thresholds
-
-The first implementation should use conservative hard-coded thresholds and re-measure:
-
-- max source records per merged dense apply
-- max dense embedding writes per merged dense apply
-
-Those can be tuned or made configurable later once the profile moves.
+- Whether a longer-lived DB-level dense apply scope (sharing one ingest lifetime across multiple replay flushes) is needed is unresolved.
+- Whether enrichment-side request coalescing should be added to the existing worker path is unresolved.
+- Promoting a shared queue/flush contract out of `batcher.zig` into a common library has not happened; the batching shell still lives entirely under storage/db.
+- If per-kind batching turns out insufficient, two alternatives remain unexplored: applying the same batching idea higher up (before replay flushes become DB apply calls), and revisiting in-place application of LSM overlay state on commit.

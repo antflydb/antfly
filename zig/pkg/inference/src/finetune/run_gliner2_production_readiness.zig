@@ -22,7 +22,7 @@ const validation = inference.finetune.gliner2_run_validation;
 const train_gliner2_autodiff = @import("train/train_gliner2_autodiff.zig");
 const eval_gliner2_autodiff_adapter = @import("tools/eval_gliner2_autodiff_adapter.zig");
 const eval_gliner2_autodiff_adapter_dataset = @import("tools/eval_gliner2_autodiff_adapter_dataset.zig");
-const materialize_gliner2_lora = @import("tools/materialize_gliner2_lora.zig");
+const materialize_gliner2_lora = @import("tools/materialize_gliner2_lora.zig").Command(@import("inference_internal"));
 
 const CommandMain = *const fn (std.process.Init) anyerror!void;
 

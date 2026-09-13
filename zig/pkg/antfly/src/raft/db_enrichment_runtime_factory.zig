@@ -15,7 +15,7 @@
 const std = @import("std");
 const db_enrichment_executor = @import("db_enrichment_executor.zig");
 const fs_paths = @import("../common/fs_paths.zig");
-const db_mod = @import("../storage/db/db.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 
 pub const GroupDbPathResolver = struct {
     ptr: *anyopaque,
@@ -33,6 +33,7 @@ pub const GroupDbPathResolver = struct {
 pub const OpenDbRuntimeFactoryConfig = struct {
     open_options: db_mod.OpenOptions,
     owner_id: ?[]const u8 = null,
+    io: ?std.Io = null,
 };
 
 pub const OpenDbRuntimeFactory = struct {
@@ -68,9 +69,11 @@ pub const OpenDbRuntimeFactory = struct {
 
         const path = try self.resolver.resolvePath(self.alloc, group_id);
         defer self.alloc.free(path);
-        var io_impl = std.Io.Threaded.init(self.alloc, .{});
-        defer io_impl.deinit();
-        try fs_paths.createDirPathPortable(io_impl.io(), path);
+        const io = self.cfg.io orelse if (open_options.backend_runtime) |runtime|
+            runtime.io() orelse std.Options.debug_io
+        else
+            std.Options.debug_io;
+        try fs_paths.createDirPathPortable(io, path);
 
         const db = try self.alloc.create(db_mod.DB);
         errdefer self.alloc.destroy(db);

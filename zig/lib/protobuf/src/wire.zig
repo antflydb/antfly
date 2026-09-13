@@ -168,6 +168,9 @@ pub fn readVarint(bytes: []const u8, pos: *usize) DecodeError!u64 {
 
 pub fn readTag(bytes: []const u8, pos: *usize) DecodeError!Tag {
     const v = try readVarint(bytes, pos);
+    // Malformed input is a decode error, not a checked-cast panic. Callers
+    // may probe an optional payload format and must be able to fall back.
+    if (v >> 3 > std.math.maxInt(u32)) return error.Overflow;
     const raw_wire_type: u3 = @intCast(v & 0x7);
     return .{
         .field = @intCast(v >> 3),
@@ -366,6 +369,15 @@ test "skipField skips all wire types" {
 test "readTag rejects invalid wire type" {
     var pos: usize = 0;
     try std.testing.expectError(error.InvalidWireType, readTag(&.{0x03}, &pos));
+}
+
+test "readTag rejects overflowing field numbers without trapping" {
+    const alloc = std.testing.allocator;
+    var bytes = Buf.empty;
+    defer bytes.deinit(alloc);
+    try writeVarint(alloc, &bytes, (@as(u64, std.math.maxInt(u32)) + 1) << 3);
+    var pos: usize = 0;
+    try std.testing.expectError(error.Overflow, readTag(bytes.items, &pos));
 }
 
 test "packed int64s roundtrip" {

@@ -13566,6 +13566,7 @@ pub fn isInvalidBackupManifestError(err: anyerror) bool {
         error.InvalidBackupRequest,
         error.IncompleteClusterBackup,
         error.BackupManifestTooLarge,
+        error.BackupSchemaHistoryTooLarge,
         => true,
         else => false,
     };
@@ -15850,6 +15851,25 @@ test "backup location parsing requires absolute file uri" {
     try std.testing.expectEqualStrings("/tmp/antfly-backup", try parseFileLocation("file:///tmp/antfly-backup"));
     try std.testing.expectError(error.UnsupportedBackupLocation, parseFileLocation("s3://bucket/path"));
     try std.testing.expectError(error.InvalidBackupLocation, parseFileLocation("file://relative"));
+}
+
+test "authorized filesystem location returns canonical ancestor for no-follow traversal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "canonical", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "canonical", "alias", .{ .is_directory = true });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const alias_location = try std.fmt.allocPrint(alloc, "file://{s}/alias/new-backup", .{root});
+    defer alloc.free(alias_location);
+    const expected = try std.fmt.allocPrint(alloc, "{s}/canonical/new-backup", .{root});
+    defer alloc.free(expected);
+
+    const resolved = try resolveFilesystemLocationAlloc(alloc, "/", alias_location, std.testing.io);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings(expected, resolved);
 }
 
 test "restore source identities are bounded and canonical" {
@@ -18532,10 +18552,11 @@ test "remote cluster artifact cleanup advances within a strict operation budget"
     );
 
     for (1..tables.len + 1) |expected_index| {
-        // Portable cleanup uses five exact object operations. Every quantum
+        // Portable cleanup uses six exact object operations, including the
+        // forwarded artifact envelope. Every quantum
         // completes exactly one table, and its immutable-generation tombstone
         // remains durable after the cursor advances.
-        var operation_budget: usize = 5;
+        var operation_budget: usize = 6;
         try std.testing.expect(!try cleanupClusterBackupAttemptIncrementally(
             alloc,
             io,

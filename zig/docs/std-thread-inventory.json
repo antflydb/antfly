@@ -1,0 +1,1728 @@
+{
+  "base_commit": "c5ab97691fb8361503f301e8b4e0bedd6bf062e8",
+  "zig_version": "0.16.0",
+  "scope": "Tracked Zig sources; direct std.Thread.spawn and local Thread alias calls; source sites, not runtime thread counts. Runtime/library includes legacy exported implementations.",
+  "counts": {
+    "benchmark": 19,
+    "runtime/library": 30,
+    "test/helper": 237
+  },
+  "spawn_sites": [
+    {
+      "file": "zig/bench/storage/derived_log_bench.zig",
+      "line": 224,
+      "category": "benchmark",
+      "source": "threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{ worker, cfg.threads });"
+    },
+    {
+      "file": "zig/bench/storage/lsm_backend_bench.zig",
+      "line": 684,
+      "category": "benchmark",
+      "source": "threads[i] = try std.Thread.spawn(.{}, ConcurrentReadWorker.run, .{ worker, threads_count });"
+    },
+    {
+      "file": "zig/bench/storage/lsm_write_bench.zig",
+      "line": 901,
+      "category": "benchmark",
+      "source": "threads[i] = try std.Thread.spawn(.{}, ReadWorker.run, .{worker});"
+    },
+    {
+      "file": "zig/bench/storage/public_query_guardrail.zig",
+      "line": 2272,
+      "category": "benchmark",
+      "source": "threads[i] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, DirectHandlerWorkerContext.run, .{worker});"
+    },
+    {
+      "file": "zig/bench/storage/public_query_guardrail.zig",
+      "line": 2341,
+      "category": "benchmark",
+      "source": "health_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&health_poller});"
+    },
+    {
+      "file": "zig/bench/storage/public_query_guardrail.zig",
+      "line": 2342,
+      "category": "benchmark",
+      "source": "metrics_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&metrics_poller});"
+    },
+    {
+      "file": "zig/bench/storage/public_query_guardrail.zig",
+      "line": 2345,
+      "category": "benchmark",
+      "source": "break :blk try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{poller});"
+    },
+    {
+      "file": "zig/bench/storage/public_query_guardrail.zig",
+      "line": 2357,
+      "category": "benchmark",
+      "source": "try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, RssPollerContext.run, .{&rss_poller.?})"
+    },
+    {
+      "file": "zig/bench/storage/public_query_guardrail.zig",
+      "line": 2388,
+      "category": "benchmark",
+      "source": "threads[i] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, HttpWorkerContext.run, .{worker});"
+    },
+    {
+      "file": "zig/bench/storage/public_query_guardrail.zig",
+      "line": 3714,
+      "category": "benchmark",
+      "source": "const health_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&health_poller});"
+    },
+    {
+      "file": "zig/bench/storage/public_query_guardrail.zig",
+      "line": 3715,
+      "category": "benchmark",
+      "source": "const metrics_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&metrics_poller});"
+    },
+    {
+      "file": "zig/bench/storage/public_query_guardrail.zig",
+      "line": 3716,
+      "category": "benchmark",
+      "source": "const status_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&status_poller});"
+    },
+    {
+      "file": "zig/bench/storage/public_query_guardrail.zig",
+      "line": 3724,
+      "category": "benchmark",
+      "source": "const rss_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, RssPollerContext.run, .{&rss_poller});"
+    },
+    {
+      "file": "zig/bench/storage/rw_lock_bench.zig",
+      "line": 94,
+      "category": "benchmark",
+      "source": "threads[i] = try std.Thread.spawn(.{}, SearchWorker.run, .{worker});"
+    },
+    {
+      "file": "zig/bench/storage/wal_bench.zig",
+      "line": 224,
+      "category": "benchmark",
+      "source": "threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{ worker, cfg.threads });"
+    },
+    {
+      "file": "zig/bench/vectors/dense_stack_bench.zig",
+      "line": 1032,
+      "category": "benchmark",
+      "source": "threads[i] = try std.Thread.spawn(.{}, SearchWorker.run, .{worker});"
+    },
+    {
+      "file": "zig/bench/vectors/recall_harness.zig",
+      "line": 82,
+      "category": "benchmark",
+      "source": "const heartbeat_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Heartbeat.run, .{&heartbeat}) catch |err| blk: {"
+    },
+    {
+      "file": "zig/lib/httpx/bench/concurrency.zig",
+      "line": 129,
+      "category": "benchmark",
+      "source": "threads[i] = Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]}) catch {"
+    },
+    {
+      "file": "zig/lib/httpx/bench/concurrency.zig",
+      "line": 212,
+      "category": "benchmark",
+      "source": "const srv_thread = try Thread.spawn(.{}, serverThread, .{&server});"
+    },
+    {
+      "file": "zig/lib/httpx/src/concurrency/executor.zig",
+      "line": 107,
+      "category": "runtime/library",
+      "source": "thread.* = try Thread.spawn(.{}, workerLoop, .{self});"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/cancellation_observer.zig",
+      "line": 123,
+      "category": "runtime/library",
+      "source": "self.thread = std.Thread.spawn(spawn_config, run, .{self}) catch |err| switch (err) {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 3844,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 3898,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 4035,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 4095,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 4628,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 4663,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 4668,
+      "category": "test/helper",
+      "source": "const second_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 4802,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 5148,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 5201,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 5265,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 5324,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 5394,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/httpx/src/server/server.zig",
+      "line": 5455,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/lib/linalg/src/mod.zig",
+      "line": 644,
+      "category": "test/helper",
+      "source": "threads[i] = try std.Thread.spawn(.{}, Worker.run, .{ a, b, per_thread_outputs[i], m, n, k, calls_per_thread });"
+    },
+    {
+      "file": "zig/lib/linalg/src/pool.zig",
+      "line": 172,
+      "category": "runtime/library",
+      "source": "w.thread = std.Thread.spawn(.{}, workerLoop, .{w}) catch break;"
+    },
+    {
+      "file": "zig/lib/linalg/src/pool.zig",
+      "line": 283,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &state, &entered, &returned });"
+    },
+    {
+      "file": "zig/lib/mcp/src/root.zig",
+      "line": 949,
+      "category": "test/helper",
+      "source": "worker.* = try std.Thread.spawn(.{}, Worker.run, .{"
+    },
+    {
+      "file": "zig/lib/platform/src/sync.zig",
+      "line": 85,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Holder.release, .{&mutex});"
+    },
+    {
+      "file": "zig/lib/prometheus/src/counter.zig",
+      "line": 477,
+      "category": "test/helper",
+      "source": "var th1 = try std.Thread.spawn(.{}, run, .{&c});"
+    },
+    {
+      "file": "zig/lib/prometheus/src/counter.zig",
+      "line": 478,
+      "category": "test/helper",
+      "source": "var th2 = try std.Thread.spawn(.{}, run, .{&c});"
+    },
+    {
+      "file": "zig/lib/prometheus/src/gauge.zig",
+      "line": 528,
+      "category": "test/helper",
+      "source": "var th1 = try std.Thread.spawn(.{}, run, .{&c});"
+    },
+    {
+      "file": "zig/lib/prometheus/src/gauge.zig",
+      "line": 529,
+      "category": "test/helper",
+      "source": "var th2 = try std.Thread.spawn(.{}, run, .{&c});"
+    },
+    {
+      "file": "zig/lib/raft/src/runtime/multi_raft.zig",
+      "line": 345,
+      "category": "runtime/library",
+      "source": "self.thread = try std.Thread.spawn(.{}, run, .{self});"
+    },
+    {
+      "file": "zig/lib/scraping/src/mod.zig",
+      "line": 1947,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, TestHttpResponseServer.serve, .{&fixture});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/httpx_handler.zig",
+      "line": 6735,
+      "category": "test/helper",
+      "source": "self.thread = try std.Thread.spawn(.{}, listenHttpxE2eServer, .{&self.server});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/restore_jobs.zig",
+      "line": 2475,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, LoadWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/runtime_status.zig",
+      "line": 5652,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Snapshot.run, .{&snapshot});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/runtime_status.zig",
+      "line": 5785,
+      "category": "test/helper",
+      "source": "const thread_a = try std.Thread.spawn(.{}, Publish.run, .{&publish_a});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/runtime_status.zig",
+      "line": 5787,
+      "category": "test/helper",
+      "source": "const thread_b = try std.Thread.spawn(.{}, Publish.run, .{&publish_b});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/runtime_status.zig",
+      "line": 5882,
+      "category": "test/helper",
+      "source": "const refresh_thread = try std.Thread.spawn(.{}, Refresh.run, .{&refresh});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/runtime_status.zig",
+      "line": 5897,
+      "category": "test/helper",
+      "source": "const publish_thread = try std.Thread.spawn(.{}, Publish.run, .{&publish});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_reads.zig",
+      "line": 29957,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_reads.zig",
+      "line": 30056,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 35309,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 36230,
+      "category": "test/helper",
+      "source": "const batch_thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&batch_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 36247,
+      "category": "test/helper",
+      "source": "const read_thread = std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker}) catch |err| {"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38085,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38090,
+      "category": "test/helper",
+      "source": "const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38091,
+      "category": "test/helper",
+      "source": "const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38137,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38143,
+      "category": "test/helper",
+      "source": "const owner_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&owner});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38144,
+      "category": "test/helper",
+      "source": "const peer_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&peer});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38151,
+      "category": "test/helper",
+      "source": "const successor_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&successor});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38197,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38202,
+      "category": "test/helper",
+      "source": "const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38204,
+      "category": "test/helper",
+      "source": "const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38249,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38258,
+      "category": "test/helper",
+      "source": "const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38260,
+      "category": "test/helper",
+      "source": "const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38303,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38308,
+      "category": "test/helper",
+      "source": "const invalid_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&invalid});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 38309,
+      "category": "test/helper",
+      "source": "const valid_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&valid});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 40299,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Close.run, .{&close});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 41928,
+      "category": "test/helper",
+      "source": "const writer_thread = try std.Thread.spawn(.{}, WriterWorker.run, .{&queued_writer});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 41936,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 42019,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 42073,
+      "category": "test/helper",
+      "source": "const transition_thread = try std.Thread.spawn(.{}, TransitionWorker.run, .{&transition_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 42081,
+      "category": "test/helper",
+      "source": "const reader_thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&reader_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 42264,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, RequestWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 42266,
+      "category": "test/helper",
+      "source": "const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 42335,
+      "category": "test/helper",
+      "source": "const request_thread = try std.Thread.spawn(.{}, RequestWorker.run, .{&request_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 42346,
+      "category": "test/helper",
+      "source": "const capture_thread = try std.Thread.spawn(.{}, CaptureWorker.run, .{&capture_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 42876,
+      "category": "test/helper",
+      "source": "const write_thread = try std.Thread.spawn(.{}, WriteWorker.run, .{&write_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 42895,
+      "category": "test/helper",
+      "source": "const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 42990,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, ReconcileWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 43000,
+      "category": "test/helper",
+      "source": "const write_thread = try std.Thread.spawn(.{}, WriteWorker.run, .{&write_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 43795,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, ActivationCall.run, .{&first});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 43797,
+      "category": "test/helper",
+      "source": "const duplicate_thread = try std.Thread.spawn(.{}, ActivationCall.run, .{&duplicate});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 46167,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, ReconcileWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 46220,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, WriteWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 46274,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 52997,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 53313,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Quiesce.run, .{&quiesce});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 53901,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, DropWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 54074,
+      "category": "test/helper",
+      "source": "const batch_thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&batch_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 54078,
+      "category": "test/helper",
+      "source": "const drop_thread = try std.Thread.spawn(.{}, DropWorker.run, .{&drop_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 54295,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, DropWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 54452,
+      "category": "test/helper",
+      "source": "const backup_thread = try std.Thread.spawn(.{}, BackupWorker.run, .{&backup_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 54464,
+      "category": "test/helper",
+      "source": "const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 54565,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 55480,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 57317,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Context.run, .{&context});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/api/table_writes.zig",
+      "line": 57932,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Context.run, .{&context});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/data_format.zig",
+      "line": 258,
+      "category": "test/helper",
+      "source": "thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/peer_disconnect_observer.zig",
+      "line": 161,
+      "category": "runtime/library",
+      "source": "self.thread = try std.Thread.spawn("
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_executor.zig",
+      "line": 854,
+      "category": "test/helper",
+      "source": "const release_thread = try std.Thread.spawn(.{}, ReleaseTask.run, .{&release_task});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_executor.zig",
+      "line": 1011,
+      "category": "test/helper",
+      "source": "const cancel_thread = try std.Thread.spawn(.{}, CancelTask.run, .{&cancel_task});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_executor.zig",
+      "line": 1103,
+      "category": "test/helper",
+      "source": "const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request_state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 266,
+      "category": "runtime/library",
+      "source": "self.thread = try std.Thread.spawn(.{ .stack_size = self.cfg.thread_stack_size }, serve, .{self});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 1375,
+      "category": "test/helper",
+      "source": "const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request_state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 1468,
+      "category": "test/helper",
+      "source": "const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 1482,
+      "category": "test/helper",
+      "source": "const shutdown_thread = try std.Thread.spawn(.{}, DeinitThread.run, .{&shutdown});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 2230,
+      "category": "test/helper",
+      "source": "const slow_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 2245,
+      "category": "test/helper",
+      "source": "const fast_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&fast_req});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 2710,
+      "category": "test/helper",
+      "source": "const stop_thread = try std.Thread.spawn(.{}, StopThread.run, .{&stop_thread_state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 2790,
+      "category": "test/helper",
+      "source": "const stop_thread = try std.Thread.spawn(.{}, StopThread.run, .{&stop_thread_state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 2879,
+      "category": "test/helper",
+      "source": "const slow_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 2902,
+      "category": "test/helper",
+      "source": "const stop_thread = try std.Thread.spawn(.{}, StopThread.run, .{&stop_thread_state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 3032,
+      "category": "test/helper",
+      "source": "var slow_thread: ?std.Thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/http/std_http_listener.zig",
+      "line": 3042,
+      "category": "test/helper",
+      "source": "fast_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&fast_req});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/remote_content_runtime.zig",
+      "line": 571,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, ConcurrentReader.run, .{&concurrent_reader});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/remote_content_runtime.zig",
+      "line": 572,
+      "category": "test/helper",
+      "source": "const second_thread = try std.Thread.spawn(.{}, ConcurrentReader.run, .{&concurrent_reader});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/common/runtime_lifecycle.zig",
+      "line": 68,
+      "category": "runtime/library",
+      "source": "self.thread = std.Thread.spawn(.{}, run, .{self}) catch {"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/runtime.zig",
+      "line": 4720,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, ScanThread.run, .{&scan_thread});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/runtime.zig",
+      "line": 4760,
+      "category": "test/helper",
+      "source": "const unrelated_thread = try std.Thread.spawn(.{}, ScanThread.run, .{&unrelated_scan_thread});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/runtime.zig",
+      "line": 7829,
+      "category": "runtime/library",
+      "source": "self.lsm_maintenance_thread = try std.Thread.spawn(.{}, lsmMaintenanceWorkerMain, .{self});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/runtime.zig",
+      "line": 14293,
+      "category": "runtime/library",
+      "source": "self.provisioned_warmup_thread = try std.Thread.spawn(.{}, provisionedCacheWarmupWorkerMain, .{self});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/runtime.zig",
+      "line": 15427,
+      "category": "runtime/library",
+      "source": "self.runtime_status_refresh_thread = try std.Thread.spawn(.{}, runtimeStatusRefreshWorkerMain, .{self});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/runtime.zig",
+      "line": 15543,
+      "category": "runtime/library",
+      "source": "return try std.Thread.spawn(.{}, provisionedStartupCatchUpWorkerMain, .{self});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/runtime.zig",
+      "line": 15547,
+      "category": "runtime/library",
+      "source": "return try std.Thread.spawn(.{}, provisionedRootRefreshWorkerMain, .{self});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/runtime.zig",
+      "line": 16267,
+      "category": "runtime/library",
+      "source": "self.local_group_status_refresh_thread = try std.Thread.spawn(.{}, localGroupStatusRefreshWorkerMain, .{refresh});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/runtime.zig",
+      "line": 33587,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, ReplicationThread.run, .{&replication_thread});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/storage/raft_apply_store.zig",
+      "line": 3098,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/storage/raft_apply_store.zig",
+      "line": 3159,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/storage/raft_apply_store.zig",
+      "line": 3160,
+      "category": "test/helper",
+      "source": "const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/storage/raft_apply_store.zig",
+      "line": 4282,
+      "category": "test/helper",
+      "source": "var install_thread = try std.Thread.spawn(.{}, InstallContext.run, .{&install_ctx});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/data/storage/raft_apply_store.zig",
+      "line": 4307,
+      "category": "test/helper",
+      "source": "var read_thread = try std.Thread.spawn(.{}, ReadContext.run, .{&read_ctx});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/foreign/postgres_libpq.zig",
+      "line": 4096,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{"
+    },
+    {
+      "file": "zig/pkg/antfly/src/foreign/postgres_libpq.zig",
+      "line": 4148,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{"
+    },
+    {
+      "file": "zig/pkg/antfly/src/foreign/postgres_libpq.zig",
+      "line": 4327,
+      "category": "test/helper",
+      "source": "const large = try std.Thread.spawn("
+    },
+    {
+      "file": "zig/pkg/antfly/src/foreign/postgres_libpq.zig",
+      "line": 4344,
+      "category": "test/helper",
+      "source": "const small = try std.Thread.spawn("
+    },
+    {
+      "file": "zig/pkg/antfly/src/foreign/postgres_libpq.zig",
+      "line": 4431,
+      "category": "test/helper",
+      "source": "const head = try std.Thread.spawn("
+    },
+    {
+      "file": "zig/pkg/antfly/src/foreign/postgres_libpq.zig",
+      "line": 4447,
+      "category": "test/helper",
+      "source": "const follower = try std.Thread.spawn("
+    },
+    {
+      "file": "zig/pkg/antfly/src/foreign/postgres_libpq.zig",
+      "line": 4625,
+      "category": "test/helper",
+      "source": "const head = try std.Thread.spawn("
+    },
+    {
+      "file": "zig/pkg/antfly/src/foreign/postgres_libpq.zig",
+      "line": 4714,
+      "category": "test/helper",
+      "source": "waiter.* = try std.Thread.spawn("
+    },
+    {
+      "file": "zig/pkg/antfly/src/foreign/postgres_libpq.zig",
+      "line": 5052,
+      "category": "test/helper",
+      "source": "const waiter = try std.Thread.spawn("
+    },
+    {
+      "file": "zig/pkg/antfly/src/index.zig",
+      "line": 2452,
+      "category": "test/helper",
+      "source": "const thread_a = try std.Thread.spawn(.{}, Reader.run, .{&reader_a});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/index.zig",
+      "line": 2453,
+      "category": "test/helper",
+      "source": "const thread_b = try std.Thread.spawn(.{}, Reader.run, .{&reader_b});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/index.zig",
+      "line": 2956,
+      "category": "test/helper",
+      "source": "const thread_a = try std.Thread.spawn(.{}, Reader.run, .{&reader_a});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/index.zig",
+      "line": 2957,
+      "category": "test/helper",
+      "source": "const thread_b = try std.Thread.spawn(.{}, Reader.run, .{&reader_b});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/inference/bedrock.zig",
+      "line": 1782,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{ &cache, io });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/inference/managed_embedder.zig",
+      "line": 6603,
+      "category": "test/helper",
+      "source": "const worker = try std.Thread.spawn(.{}, Worker.run, .{ &managed, &err_out });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/inference/managed_embedder.zig",
+      "line": 6653,
+      "category": "test/helper",
+      "source": "const parts_worker = try std.Thread.spawn(.{}, PartsWorker.run, .{ &multimodal, &err_out });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/inference/query_embedding_cache.zig",
+      "line": 506,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/inference/query_embedding_cache.zig",
+      "line": 508,
+      "category": "test/helper",
+      "source": "const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/inference/query_embedding_cache.zig",
+      "line": 572,
+      "category": "test/helper",
+      "source": "const producer_thread = try std.Thread.spawn(.{}, Worker.run, .{&producer});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/inference/query_embedding_cache.zig",
+      "line": 574,
+      "category": "test/helper",
+      "source": "const releaser_thread = try std.Thread.spawn(.{}, Releaser.run, .{&compute});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/inference/query_embedding_cache.zig",
+      "line": 662,
+      "category": "test/helper",
+      "source": "const producer_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/lmdb/env.zig",
+      "line": 182,
+      "category": "runtime/library",
+      "source": "self.thread = std.Thread.spawn(.{}, run, .{self}) catch |err| switch (err) {"
+    },
+    {
+      "file": "zig/pkg/antfly/src/metadata/catalog_projection_reader.zig",
+      "line": 862,
+      "category": "test/helper",
+      "source": "var first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/metadata/catalog_projection_reader.zig",
+      "line": 864,
+      "category": "test/helper",
+      "source": "var second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/metadata/catalog_projection_reader.zig",
+      "line": 943,
+      "category": "test/helper",
+      "source": "var short_thread = try std.Thread.spawn(.{}, Worker.run, .{&short});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/metadata/catalog_projection_reader.zig",
+      "line": 950,
+      "category": "test/helper",
+      "source": "var patient_thread = try std.Thread.spawn(.{}, Worker.run, .{&patient});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/metadata/catalog_projection_reader.zig",
+      "line": 1026,
+      "category": "test/helper",
+      "source": "var thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/metadata/http_client.zig",
+      "line": 3442,
+      "category": "test/helper",
+      "source": "const listener_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/pkg/antfly/src/metadata/sim_harness.zig",
+      "line": 12075,
+      "category": "test/helper",
+      "source": "var external_thread = try std.Thread.spawn("
+    },
+    {
+      "file": "zig/pkg/antfly/src/metadata/sim_harness.zig",
+      "line": 12080,
+      "category": "test/helper",
+      "source": "var internal_thread = std.Thread.spawn("
+    },
+    {
+      "file": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+      "line": 12892,
+      "category": "test/helper",
+      "source": "var dispatch_thread = try std.Thread.spawn(.{}, Dispatch.run, .{&dispatch});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+      "line": 12905,
+      "category": "test/helper",
+      "source": "var detach_thread = try std.Thread.spawn(.{}, Detach.run, .{&detach});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/raft/reconciler.zig",
+      "line": 3309,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, PrepareThread.run, .{&prepare_thread});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/raft/runtime_loop.zig",
+      "line": 112,
+      "category": "runtime/library",
+      "source": "self.thread = try std.Thread.spawn(.{}, run, .{self});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/raft/shard_ops.zig",
+      "line": 617,
+      "category": "test/helper",
+      "source": "var thread: ?std.Thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/raft/storage/file_snapshot_store.zig",
+      "line": 928,
+      "category": "runtime/library",
+      "source": "self.artifact_maintenance_thread = std.Thread.spawn("
+    },
+    {
+      "file": "zig/pkg/antfly/src/raft/transport/http_driver.zig",
+      "line": 197,
+      "category": "runtime/library",
+      "source": "self.threads[started] = try std.Thread.spawn(.{}, asyncSenderMain, .{ self, started });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/raft/transport/http_snapshot.zig",
+      "line": 546,
+      "category": "runtime/library",
+      "source": "self.send_threads[started] = try std.Thread.spawn(.{}, asyncSnapshotSenderMain, .{ self, started });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/raft/transport/http_snapshot.zig",
+      "line": 2387,
+      "category": "test/helper",
+      "source": "const stop_thread = try std.Thread.spawn(.{}, StopContext.run, .{&stop_context});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/serverless/build/coordinator.zig",
+      "line": 48,
+      "category": "runtime/library",
+      "source": "self.thread = try std.Thread.spawn(.{}, runLoop, .{self});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/serverless/build/coordinator.zig",
+      "line": 332,
+      "category": "test/helper",
+      "source": "const thread_a = try std.Thread.spawn(.{}, RaceState.runA, .{&state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/serverless/build/coordinator.zig",
+      "line": 333,
+      "category": "test/helper",
+      "source": "const thread_b = try std.Thread.spawn(.{}, RaceState.runB, .{&state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/serverless/build/retention.zig",
+      "line": 336,
+      "category": "test/helper",
+      "source": "const thread_a = try std.Thread.spawn(.{}, RaceState.runA, .{&state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/serverless/build/retention.zig",
+      "line": 337,
+      "category": "test/helper",
+      "source": "const thread_b = try std.Thread.spawn(.{}, RaceState.runB, .{&state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/serverless/catalog/fs_progress_store.zig",
+      "line": 527,
+      "category": "test/helper",
+      "source": "const thread_a = try std.Thread.spawn(.{}, RaceState.race, .{&state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/serverless/catalog/fs_progress_store.zig",
+      "line": 528,
+      "category": "test/helper",
+      "source": "const thread_b = try std.Thread.spawn(.{}, RaceState.race, .{&state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/serverless/manifest/fs_store.zig",
+      "line": 455,
+      "category": "test/helper",
+      "source": "const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&worker_a});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/serverless/manifest/fs_store.zig",
+      "line": 456,
+      "category": "test/helper",
+      "source": "const thread_b = try std.Thread.spawn(.{}, Worker.run, .{&worker_b});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/serverless/query/lake_parquet_rowgroup.zig",
+      "line": 301,
+      "category": "runtime/library",
+      "source": "state.worker = try std.Thread.spawn(.{}, persistentObjectRangeWorkerMain, .{state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/serverless/runtime/manager.zig",
+      "line": 93,
+      "category": "runtime/library",
+      "source": "self.thread = try std.Thread.spawn(.{}, runLoop, .{self});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/standalone/runtime.zig",
+      "line": 5010,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Quiesce.run, .{&quiesce});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/background_runtime.zig",
+      "line": 1548,
+      "category": "test/helper",
+      "source": "const closer = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/background_runtime.zig",
+      "line": 2112,
+      "category": "test/helper",
+      "source": "const deinit_thread = try std.Thread.spawn(.{}, struct {"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/algebraic/index.zig",
+      "line": 20809,
+      "category": "test/helper",
+      "source": "threads[worker_id] = try std.Thread.spawn(.{}, Worker.run, .{worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/algebraic/index.zig",
+      "line": 22401,
+      "category": "test/helper",
+      "source": "const reader = try std.Thread.spawn(.{}, Reader.run, .{ &idx, &stop });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/apply_rw_lock.zig",
+      "line": 357,
+      "category": "test/helper",
+      "source": "const writer_thread = try std.Thread.spawn(.{}, Context.writer, .{&ctx});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/apply_rw_lock.zig",
+      "line": 360,
+      "category": "test/helper",
+      "source": "const reader_thread = try std.Thread.spawn(.{}, Context.reader, .{&ctx});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/apply_rw_lock.zig",
+      "line": 568,
+      "category": "test/helper",
+      "source": "const writer_thread = try std.Thread.spawn(.{}, Context.writerThread, .{&ctx});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/apply_rw_lock.zig",
+      "line": 619,
+      "category": "test/helper",
+      "source": "const writer_thread = try std.Thread.spawn(.{}, Context.writer, .{&ctx});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/catalog/index_manager.zig",
+      "line": 5886,
+      "category": "runtime/library",
+      "source": "thread.* = try std.Thread.spawn(.{}, WorkerState.run, .{&state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/catalog/index_manager.zig",
+      "line": 26590,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 23824,
+      "category": "runtime/library",
+      "source": "self.quarantine_retry_thread = std.Thread.spawn(.{}, quarantineRetryWorkerMain, .{self}) catch |err| {"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 42922,
+      "category": "test/helper",
+      "source": "const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 43356,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, WriteProbe.run, .{&probe});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 68890,
+      "category": "test/helper",
+      "source": "var advance_thread = try std.Thread.spawn(.{}, Race.run, .{&race});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 72084,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Persist.run, .{&persist});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 72402,
+      "category": "test/helper",
+      "source": "var retry_thread = try std.Thread.spawn(.{}, RetryState.run, .{&retry_state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 78762,
+      "category": "test/helper",
+      "source": "const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 78926,
+      "category": "test/helper",
+      "source": "const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 79012,
+      "category": "test/helper",
+      "source": "const capture_thread = try std.Thread.spawn(.{}, CaptureProbe.run, .{&probe});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 85702,
+      "category": "test/helper",
+      "source": "var terminal_thread = try std.Thread.spawn(.{}, Context.terminal, .{&context});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 85855,
+      "category": "test/helper",
+      "source": "var reconcile_thread = try std.Thread.spawn(.{}, ReconcileRace.reconcile, .{&race});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 85871,
+      "category": "test/helper",
+      "source": "var structural_thread = try std.Thread.spawn(.{}, ReconcileRace.structural, .{&race});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 89012,
+      "category": "test/helper",
+      "source": "var materialize_thread = try std.Thread.spawn(.{}, Race.materialize, .{&race});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 89027,
+      "category": "test/helper",
+      "source": "var delete_thread = std.Thread.spawn(.{}, Race.delete, .{&race}) catch |err| {"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 95134,
+      "category": "test/helper",
+      "source": "var delete_thread = try std.Thread.spawn(.{}, Delete.run, .{&deletion});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 95281,
+      "category": "test/helper",
+      "source": "var reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 95308,
+      "category": "test/helper",
+      "source": "var writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 95851,
+      "category": "test/helper",
+      "source": "const stop_thread = try std.Thread.spawn(.{}, Stop.run, .{&stop});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 96110,
+      "category": "test/helper",
+      "source": "var waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 96161,
+      "category": "test/helper",
+      "source": "const cross_index_thread = try std.Thread.spawn(.{}, CrossIndexWaiter.run, .{&cross_index_waiter});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 96241,
+      "category": "test/helper",
+      "source": "const mixed_older_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_older});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 96269,
+      "category": "test/helper",
+      "source": "const mixed_younger_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_younger});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 96337,
+      "category": "test/helper",
+      "source": "const large_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&large_waiter});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 96357,
+      "category": "test/helper",
+      "source": "const small_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&small_waiter});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 105917,
+      "category": "test/helper",
+      "source": "const snapshot_thread = try std.Thread.spawn(.{}, SnapshotWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 105930,
+      "category": "test/helper",
+      "source": "const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 105940,
+      "category": "test/helper",
+      "source": "const maintenance_thread = try std.Thread.spawn(.{}, Maintenance.run, .{&maintenance});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 107846,
+      "category": "test/helper",
+      "source": "const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 107850,
+      "category": "test/helper",
+      "source": "const search_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runSearch, .{&search_probe});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 107858,
+      "category": "test/helper",
+      "source": "const scan_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runScan, .{&scan_probe});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 107885,
+      "category": "test/helper",
+      "source": "const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/db.zig",
+      "line": 107889,
+      "category": "test/helper",
+      "source": "const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/derived/apply_state.zig",
+      "line": 1206,
+      "category": "test/helper",
+      "source": "threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/derived/async_runtime.zig",
+      "line": 191,
+      "category": "runtime/library",
+      "source": "worker.thread = try std.Thread.spawn(.{}, workerMain, .{worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/derived/derived_log.zig",
+      "line": 355,
+      "category": "test/helper",
+      "source": "const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&worker_a});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/derived/derived_log.zig",
+      "line": 356,
+      "category": "test/helper",
+      "source": "const thread_b = try std.Thread.spawn(.{}, Worker.run, .{&worker_b});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/derived/io_threaded_runtime.zig",
+      "line": 1596,
+      "category": "test/helper",
+      "source": "const wait_thread = try std.Thread.spawn(.{}, Race.wait, .{&race});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/derived/io_threaded_runtime.zig",
+      "line": 1689,
+      "category": "test/helper",
+      "source": "const wait_thread = try std.Thread.spawn(.{}, Wait.run, .{&wait});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/derived/io_threaded_runtime.zig",
+      "line": 1778,
+      "category": "test/helper",
+      "source": "const wait_thread = try std.Thread.spawn(.{}, Wait.run, .{&wait});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/generation_lifecycle.zig",
+      "line": 2675,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/generation_lifecycle.zig",
+      "line": 2676,
+      "category": "test/helper",
+      "source": "const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/maintenance/sparse_compaction_runtime.zig",
+      "line": 517,
+      "category": "test/helper",
+      "source": "const blocker_thread = try std.Thread.spawn(.{}, Blocker.run, .{&blocker_ctx});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/query/search_exec.zig",
+      "line": 27045,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/root_identity.zig",
+      "line": 191,
+      "category": "test/helper",
+      "source": "const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/db/root_identity.zig",
+      "line": 192,
+      "category": "test/helper",
+      "source": "const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/ha/lifecycle_receipt_inventory_test.zig",
+      "line": 193,
+      "category": "test/helper",
+      "source": "const left_thread = try std.Thread.spawn(.{}, ConcurrentRecorder.run, .{&left});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/ha/lifecycle_receipt_inventory_test.zig",
+      "line": 194,
+      "category": "test/helper",
+      "source": "const right_thread = try std.Thread.spawn(.{}, ConcurrentRecorder.run, .{&right});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/ha/primary.zig",
+      "line": 1098,
+      "category": "test/helper",
+      "source": "var thread = std.Thread.spawn(.{}, Adoption.run, .{&adoption}) catch |err| {"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/ha/seed_capture.zig",
+      "line": 1388,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, CaptureWorker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/ha/standby.zig",
+      "line": 1122,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/hbc_adapter.zig",
+      "line": 11026,
+      "category": "test/helper",
+      "source": "reader.* = try std.Thread.spawn(.{}, Reader.run, .{"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/hbc_adapter.zig",
+      "line": 11142,
+      "category": "test/helper",
+      "source": "const evictor = try std.Thread.spawn(.{}, Evict.run, .{ &cache, namespace, node.id });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/hbc_adapter.zig",
+      "line": 11421,
+      "category": "test/helper",
+      "source": "for (&workers) |*worker| worker.* = try std.Thread.spawn(.{}, Worker.run, .{ &idx, &start, &admitted });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/hbc_adapter.zig",
+      "line": 11983,
+      "category": "test/helper",
+      "source": "thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &cache, namespace, &start, &failed });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/hbc_adapter.zig",
+      "line": 12035,
+      "category": "test/helper",
+      "source": "var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired, &release_writer });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/hbc_adapter.zig",
+      "line": 12067,
+      "category": "test/helper",
+      "source": "var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/hbc_adapter.zig",
+      "line": 12120,
+      "category": "test/helper",
+      "source": "reader.* = try std.Thread.spawn(.{}, Reader.run, .{"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/hbc_adapter.zig",
+      "line": 12134,
+      "category": "test/helper",
+      "source": "var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/hbc_adapter.zig",
+      "line": 13503,
+      "category": "test/helper",
+      "source": "thread.* = try std.Thread.spawn(.{}, Worker.run, .{ worker, worker_index });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/lmdb.zig",
+      "line": 2536,
+      "category": "test/helper",
+      "source": "const writer_thread = try std.Thread.spawn(.{}, Worker.runWriter, .{&writer});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/lmdb.zig",
+      "line": 2537,
+      "category": "test/helper",
+      "source": "const reader_thread = try std.Thread.spawn(.{}, Worker.runReader, .{&reader});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/lsm_backend.zig",
+      "line": 6228,
+      "category": "runtime/library",
+      "source": "self.thread = try std.Thread.spawn(.{}, run, .{self});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/lsm_backend.zig",
+      "line": 7697,
+      "category": "test/helper",
+      "source": "const clear_thread = try std.Thread.spawn(.{}, ClearBuild.run, .{&backend});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/lsm_backend.zig",
+      "line": 10468,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{&ctx});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/lsm_backend.zig",
+      "line": 14337,
+      "category": "test/helper",
+      "source": "var thread = try std.Thread.spawn(.{}, Worker.run, .{&ctx});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/lsm_backend.zig",
+      "line": 14654,
+      "category": "test/helper",
+      "source": "var thread = try std.Thread.spawn(.{}, CloseState.run, .{&state});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/lsm_backend/cache.zig",
+      "line": 1321,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &waiter, &cache });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/mem_ordered.zig",
+      "line": 755,
+      "category": "test/helper",
+      "source": "for (&threads, &workers) |*t, *w| t.* = try std.Thread.spawn(.{}, Worker.run, .{w});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/wal.zig",
+      "line": 1727,
+      "category": "test/helper",
+      "source": "const left_thread = try std.Thread.spawn(.{}, Worker.run, .{&left});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/wal.zig",
+      "line": 1728,
+      "category": "test/helper",
+      "source": "const right_thread = try std.Thread.spawn(.{}, Worker.run, .{&right});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/wal.zig",
+      "line": 3574,
+      "category": "test/helper",
+      "source": "const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&worker_a});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/wal.zig",
+      "line": 3575,
+      "category": "test/helper",
+      "source": "const thread_b = try std.Thread.spawn(.{}, Worker.run, .{&worker_b});"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/wal.zig",
+      "line": 3711,
+      "category": "test/helper",
+      "source": "threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{ worker, workers.len });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/wal.zig",
+      "line": 3788,
+      "category": "test/helper",
+      "source": "threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{ worker, workers.len });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/storage/wal.zig",
+      "line": 3865,
+      "category": "test/helper",
+      "source": "threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{ worker, workers.len });"
+    },
+    {
+      "file": "zig/pkg/antfly/src/usermgr/user_manager.zig",
+      "line": 1705,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Context.run, .{&ctx});"
+    },
+    {
+      "file": "zig/pkg/inference/src/ops/cuda/a4b_prepared_pack.zig",
+      "line": 544,
+      "category": "runtime/library",
+      "source": "threads[index] = try std.Thread.spawn(.{}, State.run, .{state});"
+    },
+    {
+      "file": "zig/pkg/inference/src/ops/cuda/cuda_compute.zig",
+      "line": 2997,
+      "category": "runtime/library",
+      "source": "thread.* = std.Thread.spawn(.{}, CudaA4bLoadPipelineState.workerMain, .{&state}) catch"
+    },
+    {
+      "file": "zig/pkg/inference/src/pipelines/image.zig",
+      "line": 1134,
+      "category": "runtime/library",
+      "source": "threads[spawned] = std.Thread.spawn(.{}, ClipPreprocessWorker.run, .{&workers[spawned]}) catch |err| {"
+    },
+    {
+      "file": "zig/pkg/inference/src/pipelines/reranking.zig",
+      "line": 943,
+      "category": "test/helper",
+      "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"
+    },
+    {
+      "file": "zig/pkg/inference/src/runtime/scheduler/native_generate.zig",
+      "line": 2825,
+      "category": "test/helper",
+      "source": "thread.* = try std.Thread.spawn(.{}, Worker.run, .{&coordinator});"
+    },
+    {
+      "file": "zig/pkg/inference/src/runtime/tier/prefetch.zig",
+      "line": 97,
+      "category": "runtime/library",
+      "source": "self.worker = try std.Thread.spawn(.{}, workerMain, .{self});"
+    },
+    {
+      "file": "zig/pkg/inference/src/server/inference_admission.zig",
+      "line": 308,
+      "category": "test/helper",
+      "source": "for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Worker.run, .{&q});"
+    },
+    {
+      "file": "zig/pkg/inference/src/server/model_manager.zig",
+      "line": 3126,
+      "category": "test/helper",
+      "source": "var writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});"
+    },
+    {
+      "file": "zig/pkg/inference/src/server/model_manager.zig",
+      "line": 10645,
+      "category": "test/helper",
+      "source": "threads[i] = try std.Thread.spawn(.{}, ColdLoadWorker.run, .{worker});"
+    },
+    {
+      "file": "zig/pkg/inference/src/util/c_file.zig",
+      "line": 538,
+      "category": "runtime/library",
+      "source": "threads[index] = try std.Thread.spawn(.{}, Worker.run, .{state});"
+    }
+  ]
+}

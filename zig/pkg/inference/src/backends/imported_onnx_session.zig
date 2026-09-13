@@ -205,9 +205,7 @@ const BackendContext = union(enum) {
             .native => |*ctx| {
                 if (comptime build_options.enable_native) {
                     ctx.compute.computeBackend().deinit();
-                    ctx.weight_store.resident_weights.deinit(allocator);
-                    ctx.weight_store.lazy_weights.deinit(allocator);
-                    native_mod.deinitPrefetchQueue(ctx.weight_store);
+                    ctx.weight_store.deinitOwned();
                     allocator.destroy(ctx.weight_store);
                 } else {
                     unreachable;
@@ -761,6 +759,31 @@ pub const OnnxArtifactSet = struct {
         self.* = undefined;
     }
 };
+
+/// Inspect only declared graph I/O. No tensor data or backend session is loaded.
+/// The caller provides an arena so all descriptors have one short-lived owner.
+pub fn inspectSignature(arena: std.mem.Allocator, onnx_path: []const u8) !struct { inputs: []TensorInfo, outputs: []TensorInfo } {
+    var mapped = try c_file.MmapRegion.init(arena, onnx_path);
+    defer mapped.deinit();
+    if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
+    var model = try onnx_graph.parseLazyAsModelWithBaseDir(arena, mapped.data, std.fs.path.dirname(onnx_path) orelse ".");
+    defer model.deinit();
+    const graph = model.graph() orelse return error.InvalidOnnxGraph;
+    var inputs = std.ArrayList(TensorInfo).empty;
+    for (graph.inputs) |input| {
+        if (input.name.len == 0 or !model.input_set.contains(input.name)) continue;
+        if (input.type_proto == null or input.type_proto.?.tensor_type == null) return error.IncompatibleModel;
+        if (input.type_proto.?.tensor_type.?.shape == null) return error.IncompatibleModel;
+        try inputs.append(arena, try tensorInfoFromValueOrShape(arena, input.name, input.type_proto, Shape.init(.f32, &.{})));
+    }
+    const outputs = try arena.alloc(TensorInfo, graph.outputs.len);
+    for (graph.outputs, outputs) |output, *info| {
+        if (output.type_proto == null or output.type_proto.?.tensor_type == null) return error.IncompatibleModel;
+        if (output.type_proto.?.tensor_type.?.shape == null) return error.IncompatibleModel;
+        info.* = try tensorInfoFromValueOrShape(arena, output.name, output.type_proto, Shape.init(.f32, &.{}));
+    }
+    return .{ .inputs = inputs.items, .outputs = outputs };
+}
 
 /// Parse only initializer metadata and return the complete, validated artifact
 /// set. External files are deduplicated and conservatively charged at their

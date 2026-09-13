@@ -13,8 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const gliner2_boundary = @import("../gliner2_boundary.zig");
-const text_encoder_boundary = @import("../text_encoder_boundary.zig");
+const gliner2_boundary = @import("inference_internal").finetune.gliner2_boundary;
+const text_encoder_boundary = @import("inference_internal").finetune.text_encoder_boundary;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

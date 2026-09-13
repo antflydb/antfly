@@ -20,7 +20,7 @@ const cleanup_pipeline = @import("../pipelines/entity_cleanup.zig");
 
 pub const artifact_family_version = "entity_cleanup_head/v1alpha1";
 pub const cache_family_version = "entity_cleanup_cache/v1alpha1";
-pub const head_file_name = "entity_cleanup_head.json";
+pub const head_file_name = @import("assets/gliner2_files.zig").cleanup_head_file_name;
 
 pub const FeatureConfig = struct {
     feature_dim: usize = 128,

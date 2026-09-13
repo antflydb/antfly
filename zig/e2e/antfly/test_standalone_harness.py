@@ -142,11 +142,11 @@ def test_last(cli_server, setup_probe):
         assert (root / "server.log").read_text() == "retained diagnostics"
 
 
-@pytest.mark.parametrize("total", [10 * 1024**3, 1024**4])
+@pytest.mark.parametrize("total", [10 * 1024**3, 100 * 1024**3, 1024**4])
 def test_storage_preflight_matches_absolute_and_fractional_safety_floor(
     monkeypatch, tmp_path, total
 ):
-    floor = max(1024**3, total // 20)
+    floor = max(1024**3, min(total // 20, 16 * 1024**3))
     required = floor + 256 * 1024**2
     observation = SimpleNamespace(total=total, free=required - 1)
     paths = []
@@ -649,6 +649,7 @@ def test_cluster_seed_waits_for_precommit_write_admission(monkeypatch):
     [
         (503, b"write committed locally; standby durability acknowledgment pending"),
         (409, b"transaction outcome unknown"),
+        (409, b"write outcome unknown"),
         (500, b"internal failure"),
         (400, b"invalid batch request"),
         requests.ConnectionError("response lost"),
@@ -656,8 +657,13 @@ def test_cluster_seed_waits_for_precommit_write_admission(monkeypatch):
 )
 def test_cluster_seed_preserves_non_admission_failures(monkeypatch, outcome):
     cluster, session, calls = _seed_cluster(monkeypatch, [outcome])
-    with pytest.raises((AssertionError, requests.ConnectionError)):
+    with pytest.raises(AssertionError, match="cluster write diagnostics") as failure:
         backups._seed_cluster_docs_when_writable(cluster, session, "docs", {})
+    if isinstance(outcome, Exception):
+        assert failure.value.__cause__ is outcome
+    else:
+        assert f"last_status={outcome[0]}" in str(failure.value)
+        assert outcome[1].decode() in str(failure.value)
     assert len(calls) == 1
 
 

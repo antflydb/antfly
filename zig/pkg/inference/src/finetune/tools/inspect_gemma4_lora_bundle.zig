@@ -13,33 +13,44 @@
 // limitations under the License.
 
 const std = @import("std");
-const finetune = @import("inference_internal").finetune.gemma4;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-    defer args.deinit();
-    _ = args.next();
-
-    const base_model_input = args.next() orelse return usageError();
-    const adapter_model_input = args.next() orelse return usageError();
-
-    var summary = try finetune.inspectLoRABundle(allocator, base_model_input, adapter_model_input);
-    defer finetune.freeLoRABundleInspectionSummary(allocator, &summary);
-
-    const stdout = std.Io.File.stdout();
-    var buf: [8192]u8 = undefined;
-    var writer = stdout.writer(init.io, &buf);
-    try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
+    return Command(@import("inference_finetune_assets")).main(init);
 }
 
-fn usageError() error{InvalidArguments} {
-    std.debug.print(
-        \\usage: inspect-gemma4-lora-bundle <base_model_dir_or_checkpoint> <adapter_dir_or_checkpoint>
-        \\example: inspect-gemma4-lora-bundle /tmp/gemma4-base /tmp/gemma4-lora
-        \\
-    , .{});
-    return error.InvalidArguments;
+// Reuse the parser and implementation in the combined CLI without creating a
+// second instance of model/tensor types inside its inference module.
+pub fn Command(comptime assets: type) type {
+    return struct {
+        const finetune = assets.finetune.gemma4;
+
+        pub fn main(init: std.process.Init) !void {
+            const allocator = init.gpa;
+            var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+            defer args.deinit();
+            _ = args.next();
+
+            const base_model_input = args.next() orelse return usageError();
+            const adapter_model_input = args.next() orelse return usageError();
+
+            var summary = try finetune.inspectLoRABundle(allocator, base_model_input, adapter_model_input);
+            defer finetune.freeLoRABundleInspectionSummary(allocator, &summary);
+
+            const stdout = std.Io.File.stdout();
+            var buf: [8192]u8 = undefined;
+            var writer = stdout.writer(init.io, &buf);
+            try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
+            try writer.interface.writeByte('\n');
+            try writer.interface.flush();
+        }
+
+        fn usageError() error{InvalidArguments} {
+            std.debug.print(
+                \\usage: inspect-gemma4-lora-bundle <base_model_dir_or_checkpoint> <adapter_dir_or_checkpoint>
+                \\example: inspect-gemma4-lora-bundle /tmp/gemma4-base /tmp/gemma4-lora
+                \\
+            , .{});
+            return error.InvalidArguments;
+        }
+    };
 }

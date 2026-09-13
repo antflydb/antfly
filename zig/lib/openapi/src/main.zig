@@ -218,22 +218,31 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    try writeFile(io, output_dir, "root.zig", result.root);
+    try writeFile(gpa, io, output_dir, "root.zig", result.root);
 
     if (result.types) |content| {
-        try writeFile(io, output_dir, "types.zig", content);
+        try writeFile(gpa, io, output_dir, "types.zig", content);
     }
     if (result.client) |content| {
-        try writeFile(io, output_dir, "client.zig", content);
+        try writeFile(gpa, io, output_dir, "client.zig", content);
     }
     if (result.server) |content| {
-        try writeFile(io, output_dir, "server.zig", content);
+        try writeFile(gpa, io, output_dir, "server.zig", content);
     }
 
     std.debug.print("Generated {s} in {s}/\n", .{ package_name, output_dir });
 }
 
-fn writeFile(io: std.Io, dir_path: []const u8, file_name: []const u8, content: []const u8) !void {
+fn writeFile(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, file_name: []const u8, source: []const u8) !void {
+    // Formatting belongs to generation so cached outputs are immutable and
+    // callers do not need a second, in-place `zig fmt` step.
+    const terminated = try allocator.dupeZ(u8, source);
+    defer allocator.free(terminated);
+    var tree = try std.zig.Ast.parse(allocator, terminated, .zig);
+    defer tree.deinit(allocator);
+    if (tree.errors.len != 0) return error.InvalidGeneratedZig;
+    const content = try tree.renderAlloc(allocator);
+    defer allocator.free(content);
     const dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch |err| {
         std.debug.print("Error opening directory '{s}': {}\n", .{ dir_path, err });
         return err;

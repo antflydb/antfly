@@ -7,7 +7,7 @@
 const api_e2e = @import("api/e2e.zig");
 const backups = @import("api/backups.zig");
 const http_server = @import("api/http_server.zig");
-const db = @import("storage/db/db.zig");
+const db = @import("antfly_source_root").antfly_sources.physical_db;
 
 test {
     _ = api_e2e;
@@ -15,3 +15,6 @@ test {
     _ = http_server;
     _ = db;
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

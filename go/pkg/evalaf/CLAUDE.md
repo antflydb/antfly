@@ -56,7 +56,8 @@ The codebase follows a layered architecture with minimal dependencies at the cor
 
 - **`ui/`**: UI embedding helpers for dashboard integration
 - **`cmd/evalaf/`**: CLI tool built with cobra/viper
-- **`examples/`**: Usage examples (simple, antfly, genkit)
+- **`plugins/antfly/`**: Antfly plugin as its own nested Go module
+- **`examples/`**: Usage examples (simple, genkit, redteam) plus a sample `evalaf.yaml`
 
 ### Key Design Patterns
 

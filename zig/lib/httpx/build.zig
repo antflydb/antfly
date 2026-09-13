@@ -21,6 +21,11 @@ pub fn build(b: *std.Build) void {
     const httpx_module = b.createModule(.{
         .root_source_file = b.path("src/httpx.zig"),
     });
+    httpx_module.addImport("antfly-json", b.createModule(.{
+        .root_source_file = b.path("../json/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
 
     _ = b.addModule("httpx", .{
         .root_source_file = b.path("src/httpx.zig"),

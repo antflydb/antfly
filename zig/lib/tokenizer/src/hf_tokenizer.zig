@@ -7687,6 +7687,10 @@ fn metaspacePreTokenize(
     split: bool,
 ) ![][]const u8 {
     var words = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (words.items) |word| allocator.free(word);
+        words.deinit(allocator);
+    }
 
     if (!split) {
         var prepared = std.ArrayListUnmanaged(u8).empty;
@@ -7703,7 +7707,11 @@ fn metaspacePreTokenize(
             }
         }
 
-        try words.append(allocator, try prepared.toOwnedSlice(allocator));
+        {
+            const word = try prepared.toOwnedSlice(allocator);
+            errdefer allocator.free(word);
+            try words.append(allocator, word);
+        }
         return try words.toOwnedSlice(allocator);
     }
 
@@ -7718,9 +7726,12 @@ fn metaspacePreTokenize(
 
         if ((prepend_first and first) or !first) {
             const word = try std.fmt.allocPrint(allocator, "{s}{s}", .{ replacement, segment });
+            errdefer allocator.free(word);
             try words.append(allocator, word);
         } else {
-            try words.append(allocator, try allocator.dupe(u8, segment));
+            const word = try allocator.dupe(u8, segment);
+            errdefer allocator.free(word);
+            try words.append(allocator, word);
         }
         first = false;
     }

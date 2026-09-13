@@ -140,6 +140,8 @@ var _ = Describe("InferencePool Controller", func() {
 				"--port", "8080",
 				"--config", "/config/config.json",
 				"--allow-insecure-public-bind",
+				"--models-dir", "/models",
+				"--preload-model", "embedder:BAAI/bge-small-en-v1.5:i8",
 			}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(2))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Name).To(Equal("pjrt-plugin"))
@@ -191,7 +193,7 @@ var _ = Describe("InferencePool Controller", func() {
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "test-model"},
+							{Name: "test-model", Tasks: []string{"generate"}},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
@@ -248,7 +250,7 @@ var _ = Describe("InferencePool Controller", func() {
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
-						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}},
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model", Tasks: []string{"generate"}}},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
 					Replicas: antflyaiv1alpha1.ReplicaConfig{
@@ -303,7 +305,7 @@ var _ = Describe("InferencePool Controller", func() {
 				Spec: antflyaiv1alpha1.InferencePoolSpec{
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
-						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}},
+						Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model", Tasks: []string{"generate"}}},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
 					Replicas: antflyaiv1alpha1.ReplicaConfig{
@@ -361,7 +363,7 @@ var _ = Describe("InferencePool Controller", func() {
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{
-								Name: "bge-small-en-v1.5:quantized",
+								Name: "bge-small-en-v1.5:quantized", Tasks: []string{"embed"},
 							},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
@@ -405,7 +407,7 @@ var _ = Describe("InferencePool Controller", func() {
 					Image:        "my-registry/antfly:zig-v1.0.0",
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "test-model"},
+							{Name: "test-model", Tasks: []string{"generate"}},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
@@ -447,8 +449,8 @@ var _ = Describe("InferencePool Controller", func() {
 					WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
-							{Name: "model-a:i8"},
-							{Name: "model-b"},
+							{Name: "model-a:i8", Tasks: []string{"generate"}},
+							{Name: "model-b", Tasks: []string{"generate"}},
 							{Name: "model-c:i8", Strategy: antflyaiv1alpha1.LoadingStrategyLazy},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
@@ -472,11 +474,11 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(3))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args).To(Equal([]string{
-				"inference", "pull", "model-a:i8", "--models-dir", "/models",
+				"inference", "pull", "model-a:i8", "--models-dir", "/models", "--tasks", "generate",
 			}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[1].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[1].Args).To(Equal([]string{
-				"inference", "pull", "model-b", "--models-dir", "/models",
+				"inference", "pull", "model-b", "--models-dir", "/models", "--tasks", "generate",
 			}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[2].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[2].Args).To(Equal([]string{
@@ -488,6 +490,9 @@ var _ = Describe("InferencePool Controller", func() {
 				"--port", "8080",
 				"--config", "/config/config.json",
 				"--allow-insecure-public-bind",
+				"--models-dir", "/models",
+				"--preload-model", "generator:model-a:i8",
+				"--preload-model", "generator:model-b",
 			}))
 
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())

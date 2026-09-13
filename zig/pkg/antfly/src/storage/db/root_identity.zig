@@ -189,12 +189,16 @@ test "root identity concurrent first opens publish one incarnation" {
     var start = std.atomic.Value(bool).init(false);
     var first = Worker{ .io = std.testing.io, .path = path, .ready = &ready, .start = &start };
     var second = Worker{ .io = std.testing.io, .path = path, .ready = &ready, .start = &start };
-    const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
-    const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
+    var first_thread = try std.testing.io.concurrent(Worker.run, .{&first});
+    defer {
+        start.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
+    var second_thread = try std.testing.io.concurrent(Worker.run, .{&second});
     while (ready.load(.acquire) != 2) platform_time.yieldBriefly();
     start.store(true, .release);
-    first_thread.join();
-    second_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
 
     if (first.err) |err| return err;
     if (second.err) |err| return err;

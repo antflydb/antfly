@@ -1,6 +1,6 @@
 //! httpx.zig Concurrency Benchmarks
 //!
-//! Integration benchmarks comparing sequential vs Io-fiber concurrent
+//! Integration benchmarks comparing sequential vs fresh and shared Io concurrent
 //! request execution against a local echo server.
 //!
 //! Run with: zig build bench-concurrency
@@ -11,7 +11,6 @@ const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const Thread = std.Thread;
 
 const SERVER_HOST = "127.0.0.1";
 const SERVER_PORT: u16 = 18_080;
@@ -35,14 +34,14 @@ fn sleepMs(ms: u64) void {
 }
 
 // ---------------------------------------------------------------------------
-// Echo server (runs on a background OS thread)
+// Echo server (runs on a background Io task)
 // ---------------------------------------------------------------------------
 
 fn echoHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.json(.{ .ok = true });
 }
 
-fn serverThread(server: *httpx.Server) void {
+fn serverTask(server: *httpx.Server) void {
     server.listen() catch |err| {
         std.debug.print("Server error: {}\n", .{err});
     };
@@ -56,20 +55,20 @@ fn nsToMs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
 }
 
-fn printRow(batch: usize, seq_ns: u64, thread_ns: u64, fiber_ns: u64) void {
+fn printRow(batch: usize, seq_ns: u64, concurrent_ns: u64, pooled_ns: u64) void {
     const seq_ms = nsToMs(seq_ns);
-    const thread_ms = nsToMs(thread_ns);
-    const fiber_ms = nsToMs(fiber_ns);
-    const thread_speedup = if (thread_ms > 0.001) seq_ms / thread_ms else 0.0;
-    const fiber_speedup = if (fiber_ms > 0.001) seq_ms / fiber_ms else 0.0;
+    const concurrent_ms = nsToMs(concurrent_ns);
+    const pooled_ms = nsToMs(pooled_ns);
+    const concurrent_speedup = if (concurrent_ms > 0.001) seq_ms / concurrent_ms else 0.0;
+    const pooled_speedup = if (pooled_ms > 0.001) seq_ms / pooled_ms else 0.0;
 
     std.debug.print("  {d: <6} {d: >10.2}ms  {d: >10.2}ms {d: >6.2}x  {d: >10.2}ms {d: >6.2}x\n", .{
         batch,
         seq_ms,
-        thread_ms,
-        thread_speedup,
-        fiber_ms,
-        fiber_speedup,
+        concurrent_ms,
+        concurrent_speedup,
+        pooled_ms,
+        pooled_speedup,
     });
 }
 
@@ -94,8 +93,11 @@ fn benchAll(allocator: Allocator, client: *httpx.Client, specs: []const httpx.Re
     return nowNs() - start;
 }
 
-/// OS-thread-based all() for comparison with fiber version.
-fn benchAllThreads(allocator: Allocator, client: *httpx.Client, specs: []const httpx.RequestSpec) u64 {
+/// Guaranteed-concurrent all() with a fresh, bounded Io owner per sample.
+fn benchAllConcurrent(allocator: Allocator, client: *httpx.Client, specs: []const httpx.RequestSpec) u64 {
+    var worker_io = Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(specs.len) });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
     const WorkerCtx = struct {
         client: *httpx.Client,
         spec: httpx.RequestSpec,
@@ -113,12 +115,13 @@ fn benchAllThreads(allocator: Allocator, client: *httpx.Client, specs: []const h
     const start = nowNs();
 
     const results = allocator.alloc(httpx.RequestResult, specs.len) catch return 0;
+    for (results) |*result| result.* = .{ .err = error.ConcurrencyUnavailable };
     defer {
         for (results) |*r| r.deinit();
         allocator.free(results);
     }
 
-    const threads = allocator.alloc(Thread, specs.len) catch return 0;
+    const threads = allocator.alloc(Io.Future(void), specs.len) catch return 0;
     defer allocator.free(threads);
     const ctxs = allocator.alloc(WorkerCtx, specs.len) catch return 0;
     defer allocator.free(ctxs);
@@ -126,7 +129,7 @@ fn benchAllThreads(allocator: Allocator, client: *httpx.Client, specs: []const h
     var spawned: usize = 0;
     for (specs, 0..) |spec, i| {
         ctxs[i] = .{ .client = client, .spec = spec, .out = &results[i] };
-        threads[i] = Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]}) catch {
+        threads[i] = scheduling_io.concurrent(WorkerCtx.run, .{&ctxs[i]}) catch {
             // Fallback: run remaining sequentially
             for (specs[i..], i..) |s, j| {
                 const r = client.request(s.method, s.url, .{ .body = s.body, .headers = s.headers });
@@ -136,7 +139,7 @@ fn benchAllThreads(allocator: Allocator, client: *httpx.Client, specs: []const h
         };
         spawned += 1;
     }
-    for (threads[0..spawned]) |t| t.join();
+    for (threads[0..spawned]) |*future| future.await(scheduling_io);
 
     return nowNs() - start;
 }
@@ -187,8 +190,12 @@ fn bestOfSeq(client: *httpx.Client, url: []const u8, n: usize) u64 {
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    var io_backend = Io.Threaded.init(allocator, .{});
+    // Capacity for the largest 50-request batch and its server-side work.
+    var io_backend = Io.Threaded.init(allocator, .{ .concurrent_limit = .limited(128) });
+    defer io_backend.deinit();
     const io = io_backend.io();
+    var server_io = Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer server_io.deinit();
 
     // -- Header --
     std.debug.print("=== httpx.zig Concurrency Benchmarks ===\n\n", .{});
@@ -201,7 +208,7 @@ pub fn main() !void {
         SERVER_HOST, SERVER_PORT, ROUNDS, WARMUP,
     });
 
-    // -- Start echo server on background OS thread --
+    // -- Start echo server on background Io task --
     var server = httpx.Server.initWithConfig(allocator, io, .{
         .host = SERVER_HOST,
         .port = SERVER_PORT,
@@ -209,11 +216,11 @@ pub fn main() !void {
     defer server.deinit();
     try server.get("/echo", echoHandler);
 
-    const srv_thread = try Thread.spawn(.{}, serverThread, .{&server});
+    var server_future = try server_io.io().concurrent(serverTask, .{&server});
     sleepMs(500);
     defer {
         server.stop();
-        srv_thread.join();
+        server_future.await(server_io.io());
     }
 
     // -- Client --
@@ -221,6 +228,8 @@ pub fn main() !void {
     defer client.deinit();
 
     const url = try std.fmt.allocPrint(allocator, "http://{s}:{d}/echo", .{ SERVER_HOST, SERVER_PORT });
+
+    defer allocator.free(url);
 
     // -- Warmup --
     std.debug.print("Warming up ({d} sequential requests)...", .{WARMUP});
@@ -233,22 +242,23 @@ pub fn main() !void {
     }
     std.debug.print(" done.\n\n", .{});
 
-    // -- pool.all(): sequential vs threads vs fibers --
+    // -- pool.all(): sequential vs fresh and shared Io owners --
     {
-        std.debug.print("pool.all() — sequential vs OS threads vs Io fibers (best of {d} rounds):\n", .{ROUNDS});
-        std.debug.print("  {s: <6} {s: >12}  {s: >12} {s: >7}  {s: >12} {s: >7}\n", .{ "batch", "sequential", "threads", "speedup", "fibers", "speedup" });
+        std.debug.print("pool.all() — sequential vs fresh Io vs shared Io (best of {d} rounds):\n", .{ROUNDS});
+        std.debug.print("  {s: <6} {s: >12}  {s: >12} {s: >7}  {s: >12} {s: >7}\n", .{ "batch", "sequential", "fresh Io", "speedup", "shared Io", "speedup" });
         std.debug.print("  {s:-<68}\n", .{""});
 
         const batch_sizes = [_]usize{ 1, 5, 10, 25, 50 };
         for (batch_sizes) |n| {
             const specs = try allocator.alloc(httpx.RequestSpec, n);
+            defer allocator.free(specs);
             for (specs) |*s| s.* = .{ .url = url };
 
             const seq_ns = bestOfSeq(&client, url, n);
-            const thread_ns = bestOf(benchAllThreads, allocator, &client, specs);
-            const fiber_ns = bestOf(benchAll, allocator, &client, specs);
+            const concurrent_ns = bestOf(benchAllConcurrent, allocator, &client, specs);
+            const pooled_ns = bestOf(benchAll, allocator, &client, specs);
 
-            printRow(n, seq_ns, thread_ns, fiber_ns);
+            printRow(n, seq_ns, concurrent_ns, pooled_ns);
         }
     }
 
@@ -261,6 +271,7 @@ pub fn main() !void {
         const any_sizes = [_]usize{ 5, 10, 25 };
         for (any_sizes) |n| {
             const specs = try allocator.alloc(httpx.RequestSpec, n);
+            defer allocator.free(specs);
             for (specs) |*s| s.* = .{ .url = url };
 
             const ns = bestOf(benchAny, allocator, &client, specs);
@@ -277,6 +288,7 @@ pub fn main() !void {
         const race_sizes = [_]usize{ 5, 10, 25 };
         for (race_sizes) |n| {
             const specs = try allocator.alloc(httpx.RequestSpec, n);
+            defer allocator.free(specs);
             for (specs) |*s| s.* = .{ .url = url };
 
             const ns = bestOf(benchRace, allocator, &client, specs);

@@ -387,7 +387,7 @@ pub const CachedTokenSource = struct {
             if (self.io) |io| {
                 try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
         defer self.mutex.unlock();

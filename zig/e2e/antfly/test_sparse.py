@@ -587,6 +587,24 @@ def test_semantic_query_embedding_template_supports_remote_text(
 def test_managed_sparse_hybrid_query_with_antfly_embeddings(
     backup_api, inference_embedder, inference_reranker
 ):
+    # Direct inference preflight must succeed with omitted optional fields.
+    # Index creation, enrichment, and semantic search below must then exercise
+    # the database's own request serializer against the same strict endpoint.
+    for model in ("antfly-embed-v1", "antfly-sparse-v1"):
+        payload = {"model": model, "input": ["alpha body"]}
+        preflight = requests.post(
+            f"{inference_embedder}/embed", json=payload, timeout=5
+        )
+        assert preflight.status_code == 200, preflight.text
+        assert len(preflight.json()["data"]) == 1
+        for field in ("task_type", "instruction"):
+            invalid = requests.post(
+                f"{inference_embedder}/embed",
+                json={**payload, field: None},
+                timeout=5,
+            )
+            assert invalid.status_code == 400, invalid.text
+
     table_name = f"sparse_hybrid_managed_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name

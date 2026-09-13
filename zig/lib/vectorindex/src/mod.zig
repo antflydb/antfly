@@ -14,6 +14,14 @@
 
 const std = @import("std");
 
+test "fused native candidate scoring preserves array score and projection parity" {
+    try @import("hbc_index.zig").testFusedNativeCandidateParity();
+}
+
+test "fused native candidate scoring microbenchmark" {
+    try @import("hbc_index.zig").benchmarkFusedNativeCandidates();
+}
+
 pub const types = @import("types.zig");
 pub const bulk_build = @import("bulk_build.zig");
 pub const kmeans = @import("kmeans.zig");
@@ -23,6 +31,44 @@ pub const search = @import("search.zig");
 pub const search_runtime = @import("search_runtime.zig");
 pub const store = @import("store.zig");
 pub const posting = @import("posting.zig");
+pub const checked_region = @import("checked_region.zig");
+pub const posting_segment = @import("posting_segment.zig");
+pub const posting_row_delta = @import("posting_row_delta.zig");
+pub const centroid_directory = @import("centroid_directory.zig");
+pub const quantized_directory = @import("quantized_directory.zig");
+pub const posting_subgroups = @import("posting_subgroups.zig");
+pub const compact_subgroups = @import("compact_subgroups.zig");
+pub const weighted_subgroup_selection = @import("weighted_subgroup_selection.zig");
+
+// Discover format tests even when a filtered run excludes the root's query
+// tests (and therefore never otherwise analyzes these lazy imports).
+comptime {
+    if (@import("builtin").is_test) {
+        _ = @import("quantized_directory.zig");
+        _ = @import("vector_block.zig");
+        _ = @import("antfly_hash");
+        _ = @import("posting_wal.zig");
+        _ = @import("posting_segment.zig");
+        _ = @import("posting_row_delta.zig");
+        _ = @import("vector_block_wal.zig");
+        _ = @import("vector_block_manifest.zig");
+        _ = @import("hbc_vector_directory.zig");
+        _ = @import("hbc_index.zig");
+        _ = @import("posting.zig");
+        _ = @import("spfresh_index.zig");
+        _ = @import("posting_subgroups.zig");
+        _ = @import("weighted_subgroup_selection.zig");
+        _ = @import("global_subgroup_plan.zig");
+        _ = @import("compact_subgroups.zig");
+        _ = @import("search_results.zig");
+        _ = @import("search_runtime.zig");
+    }
+}
+pub const posting_wal = @import("posting_wal.zig");
+pub const hbc_vector_directory = @import("hbc_vector_directory.zig");
+pub const vector_block = @import("vector_block.zig");
+pub const vector_block_wal = @import("vector_block_wal.zig");
+pub const vector_block_manifest = @import("vector_block_manifest.zig");
 pub const hbc_runtime = @import("hbc_runtime.zig");
 pub const hbc = @import("hbc.zig");
 pub const hbc_index = @import("hbc_index.zig");
@@ -76,6 +122,18 @@ pub const PostingMaintenanceOptions = posting.PostingMaintenanceOptions;
 pub const PostingMaintenanceResult = posting.PostingMaintenanceResult;
 pub const PostingBacklogStats = posting.PostingBacklogStats;
 pub const PostingStore = posting.PostingStore;
+pub const PostingSegmentWriter = posting_segment.Writer;
+pub const PostingSegmentReader = posting_segment.Reader;
+pub const VerifiedPostingSegmentReader = posting_segment.VerifiedReader;
+pub const PostingSegmentEntryKind = posting_segment.EntryKind;
+pub const PostingWalWriter = posting_wal.Writer;
+pub const PostingWalReplay = posting_wal.Replay;
+pub const PostingWalRecordKind = posting_wal.RecordKind;
+pub const PostingCheckpoint = posting_wal.Checkpoint;
+pub const VectorBlockWriter = vector_block.Writer;
+pub const VectorBlockReader = vector_block.Reader;
+pub const VectorBlockWalWriter = vector_block_wal.Writer;
+pub const VectorBlockWalReplay = vector_block_wal.Replay;
 pub const AssignmentMap = posting.AssignmentMap;
 pub const CentroidDirectory = posting.CentroidDirectory;
 pub const meta_key = hbc.meta_key;
@@ -107,6 +165,64 @@ pub const encodeVecKey = hbc.encodeVecKey;
 pub const encodeVecLeafKey = hbc.encodeVecLeafKey;
 pub const encodeVecMetaKey = hbc.encodeVecMetaKey;
 pub const encodeQuantKey = hbc.encodeQuantKey;
+
+test "posting segment stores point and ordered delta values" {
+    try posting_segment.testStoresPointAndOrderedDeltaValues();
+}
+
+test "posting segment rejects duplicate logical entries" {
+    try posting_segment.testRejectsDuplicateLogicalEntries();
+}
+
+test "posting segment validates footer and version" {
+    try posting_segment.testValidatesFooterAndVersion();
+}
+
+test "posting segment validates index and payload checksums" {
+    try posting_segment.testValidatesIndexAndPayloadChecksums();
+}
+
+test "posting segment verified reader memoizes payload status" {
+    try posting_segment.testVerifiedReaderMemoizesPayloadStatus();
+}
+
+test "posting wal replays committed batches in order" {
+    try posting_wal.testCommittedBatchesReplayInOrder();
+}
+
+test "posting wal ignores uncommitted and partial tails" {
+    try posting_wal.testIgnoresUncommittedAndPartialTails();
+}
+
+test "posting wal rejects checksum and ordering errors" {
+    try posting_wal.testRejectsChecksumAndOrderingErrors();
+}
+
+test "posting checkpoint round trips with checksum" {
+    try posting_wal.testCheckpointRoundTripAndChecksum();
+}
+
+test "bounded flat proof includes all omitted postings without full-directory scratch" {
+    try @import("spfresh_index.zig").testBoundedFlatSuffixProofs();
+}
+
+test "native candidate score growth does not grow the vector fetch workspace" {
+    var scratch = try @import("search_runtime.zig").SearchScratch.init(std.testing.allocator, 768, 4, 16);
+    defer scratch.deinit(std.testing.allocator);
+    const vector_values = scratch.vector_batch.len;
+    const metadata_slots = scratch.metadata.len;
+    const positions = scratch.positions.len;
+    try scratch.ensureScoreCapacity(std.testing.allocator, 4096);
+    try std.testing.expectEqual(vector_values, scratch.vector_batch.len);
+    try std.testing.expectEqual(metadata_slots, scratch.metadata.len);
+    try std.testing.expectEqual(positions, scratch.positions.len);
+    try std.testing.expect(scratch.distances.len >= 4096);
+    try std.testing.expect(scratch.error_bounds.len >= 4096);
+}
+
+test "posting segment checkpoint and wal tail compose" {
+    try posting_wal.testSegmentCheckpointAndWalTailCompose();
+}
 
 test "cache-rejected unaligned batch vector reads keep stable per-id views" {
     const TestTxn = struct {

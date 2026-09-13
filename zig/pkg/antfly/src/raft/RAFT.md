@@ -123,7 +123,7 @@ The Antfly-side raft integration lives under
   - queue-driven runtime service around `ManagedHost` / `ManagedHttpHost`
 - [runtime_loop.zig](runtime_loop.zig)
   - deterministic node-local runtime driver
-- [sim_harness.zig](sim_harness.zig)
+- [vopr_harness.zig](vopr_harness.zig)
   - deterministic host and HTTP-cluster simulation harnesses
 - [storage](storage)
   - local replica catalog, persisted raft state, WAL provider, snapshot store,

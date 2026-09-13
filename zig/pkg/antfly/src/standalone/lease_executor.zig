@@ -125,13 +125,17 @@ const optional_client_auth_server =
     \\listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     \\listener.bind(('127.0.0.1', 0))
     \\listener.listen(1)
-    \\pathlib.Path(port_file).write_text(str(listener.getsockname()[1]))
     \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     \\if len(sys.argv) > 4 and sys.argv[4] == 'tls12':
     \\    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
     \\ctx.load_cert_chain(certfile=cert, keyfile=key)
     \\ctx.load_verify_locations(cafile=cert)
     \\ctx.verify_mode = ssl.CERT_OPTIONAL
+    \\# Publish readiness atomically, only after TLS setup has succeeded.
+    \\# A direct write exposes an empty or partially written port to the parent.
+    \\pending_port = pathlib.Path(port_file + '.tmp')
+    \\pending_port.write_text(str(listener.getsockname()[1]))
+    \\pending_port.replace(port_file)
     \\conn, _ = listener.accept()
     \\with conn:
     \\    try:

@@ -16,6 +16,22 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
+pub const default_native_batch_size: usize = 8;
+pub const max_native_batch_size: usize = 64;
+
+/// Applies the process-wide native reader microbatch policy without importing
+/// an inference backend. Both the caller-side planner and concrete executor
+/// supply the same environment value to this authority.
+pub fn nativeBatchSize(configured: ?usize) usize {
+    return std.math.clamp(configured orelse default_native_batch_size, 1, max_native_batch_size);
+}
+
+test "native reader batch policy defaults and clamps" {
+    try std.testing.expectEqual(default_native_batch_size, nativeBatchSize(null));
+    try std.testing.expectEqual(@as(usize, 1), nativeBatchSize(0));
+    try std.testing.expectEqual(max_native_batch_size, nativeBatchSize(max_native_batch_size + 1));
+}
+
 /// Language-neutral reader configuration shared by admission and inference.
 /// This module deliberately has no HTTP, provider SDK, or inference runtime
 /// imports so storage-side validation cannot pull those graphs into codegen.
@@ -51,6 +67,8 @@ pub const Config = struct {
     max_tokens: ?i64 = null,
     api_key: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
+    capability_token: ?[]const u8 = null,
+    capability_revision: ?[]const u8 = null,
     base_url: ?[]const u8 = null,
     url: ?[]const u8 = null,
     api_url: ?[]const u8 = null,
@@ -58,7 +76,22 @@ pub const Config = struct {
     location: ?[]const u8 = null,
     credentials_path: ?[]const u8 = null,
 
+    pub fn validate(self: Config) !void {
+        if (self.provider == .antfly) {
+            const model = self.model orelse return error.InvalidReaderConfig;
+            if (std.mem.trim(u8, model, " \t\r\n").len == 0)
+                return error.InvalidReaderConfig;
+        }
+    }
+
     pub fn resolvedUrl(self: Config) ?[]const u8 {
         return self.url orelse self.api_url;
     }
 };
+
+test "antfly reader requires an explicit routing model" {
+    try std.testing.expectError(error.InvalidReaderConfig, (Config{ .provider = .antfly }).validate());
+    try std.testing.expectError(error.InvalidReaderConfig, (Config{ .provider = .antfly, .model = " \t" }).validate());
+    try (Config{ .provider = .antfly, .model = "antflydb/Florence-2-base" }).validate();
+    try (Config{ .provider = .openai }).validate();
+}

@@ -1,12 +1,12 @@
 # Antfly Operator Development Guide
 
-This guide is for engineers working on the Antfly Kubernetes Operator itself. If you're a user looking to deploy Antfly clusters, see [README.md](README.md).
+This guide is for engineers working on the Antfly Kubernetes Operator itself. If you're a user looking to deploy Antfly clusters, see [README.md](../README.md).
 
 ## 🏗️ Development Environment Setup
 
 ### Prerequisites
 
-- **Go 1.24+**
+- **Go 1.26+**
 - **Docker** or **Podman**
 - **kubectl** and access to a Kubernetes cluster
 - **Make**
@@ -37,6 +37,54 @@ make run
 
 ## 🔄 Development Workflow
 
+### Inference runtime contract smoke test
+
+Operator CI runs the generated model-puller and inference-server arguments
+against the checksum-pinned Antfly v0.2.1 Linux GNU release, using the native CPU
+backend, a small public BGE embedding model, and a tiny GGUF generator
+(`shibatch/tiny1m:gguf:Q4_K_M`). It requires eager and lazy
+readiness plus a finite, nonzero 384-dimensional embedding, verifies eager
+warming before the first request, and checks that removing the model-directory
+flag and config field reproduces an unready server. It needs neither Kubernetes
+nor GPUs.
+
+The same reconciler-generated contract runs against the PR's candidate binary
+in `zig-tests.yml`. Both binaries exercise nested overrides (including empty
+preloads and zero model limits), tagged GGUF preloads with and without a nested
+`api_url`, and omitted `kind`/backend defaults. Generator warming is asserted
+before serving an embedding request. Missing downloads/binaries fail the test.
+The CPU fixture uses policy-neutral `residency_mode: auto` and
+`memory_budget_mb: 0`; non-default GPU/A4B policies retain focused config tests
+and require separate GPU execution validation.
+The contract also checks omitted task hints with lazy discovery and an explicit
+eager preload kind, plus empty/null optional identity fields. Unit tests verify
+that ambiguous eager task hints report a validation failure before workload
+creation, including on an operator upgrade with an unchanged pool generation,
+and that correcting the hint allows reconciliation to recover.
+
+To run locally on Linux or macOS, supply an absolute path to a verified released
+or newly built Antfly binary:
+
+```bash
+ANTFLY_RUNTIME_BIN=/absolute/path/to/antfly GOWORK=off go test \
+  -tags runtimeintegration ./controllers/inference \
+  -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
+```
+
+This explicit integration target fails if its binary is absent or its model
+cannot be downloaded; ordinary offline unit tests do not run it. Downloads and
+runtime state use isolated temporary directories, and server process groups are
+terminated on completion or timeout. When advancing the supported runtime,
+update both the release version and SHA256 in `antfly-operator-go.yml` and run
+this same target against the candidate binary. This test does not exercise
+container packaging, real Kubernetes scheduling, or GPU execution; retain those
+rollout checks separately.
+
+Runtime PR CI also runs `zig/e2e/inference/test_run_config.py` against the newly
+built binary: config-only flat/nested startup, eager warming and embeddings,
+and CLI precedence in either argument order. This covers the config handoff
+independently of the operator's compatibility flags.
+
 ### Quick Development Cycle
 
 ```bash
@@ -61,8 +109,8 @@ make manifests
 # Generate deepcopy methods
 make generate
 
-# Update API documentation
-make api-docs
+# Regenerate CRDs, RBAC, and deepcopy after API changes
+make manifests generate
 ```
 
 ## 🧪 Testing
@@ -76,18 +124,15 @@ make test
 # Run specific test package
 go test ./controllers/...
 
-# Run with coverage
-make test-coverage
+# make test already writes a coverage profile
+make test
 ```
 
 ### Integration Tests
 
 ```bash
-# Run integration tests with envtest
-make test-integration
-
-# Run with existing cluster
-make test-e2e
+# Unit and envtest integration tests
+make test
 ```
 
 ### Testing with Kind
@@ -99,8 +144,9 @@ make kind-create
 # Deploy to kind
 make kind-deploy
 
-# Run tests against kind
-make kind-test
+# Build and load the operator image into kind, then apply samples
+make kind-deploy
+make deploy-samples
 
 # Clean up
 make kind-delete
@@ -128,7 +174,7 @@ This section provides a complete workflow for cleaning up everything in your loc
 kubectl delete antflyclusters --all --all-namespaces
 
 # Remove the operator
-kubectl delete -f deploy/install.yaml --ignore-not-found=true
+kubectl delete -f https://antfly.io/antfly-operator-install.yaml --ignore-not-found=true
 
 # Remove any leftover resources
 kubectl delete all,pvc,secrets,configmaps -l app=antfly --all-namespaces
@@ -190,11 +236,9 @@ minikube image list | grep -E "(antfly|antfly-operator)"
 2. **Deploy the Operator**
 
 ```bash
-# Generate fresh manifests and installation bundle
-make install
-
-# Deploy the operator to minikube
-make deploy
+# Generate fresh manifests, then deploy the dev cluster to minikube
+make manifests generate
+make dev-cluster-deploy
 
 # Verify operator is running
 kubectl get pods -n antfly-operator-namespace
@@ -242,7 +286,7 @@ set -e
 
 echo "🧹 Cleaning up everything..."
 kubectl delete antflyclusters --all --all-namespaces --ignore-not-found=true
-kubectl delete -f deploy/install.yaml --ignore-not-found=true
+kubectl delete -f https://antfly.io/antfly-operator-install.yaml --ignore-not-found=true
 make clean
 
 echo "🔨 Building fresh..."
@@ -250,7 +294,7 @@ make docker-build
 minikube image load antfly-operator:latest
 
 echo "🚀 Deploying fresh..."
-make deploy
+make dev-cluster-deploy
 kubectl apply -f examples/small-dev-cluster.yaml
 
 echo "⏳ Waiting for cluster to be ready..."
@@ -267,7 +311,7 @@ chmod +x scripts/minikube-redeploy.sh
 ./scripts/minikube-redeploy.sh
 
 # Or use the Makefile target
-make minikube-redeploy
+make dev-cluster-deploy
 ```
 
 ### Troubleshooting Development Issues
@@ -427,4 +471,4 @@ go tool pprof http://localhost:6060/debug/pprof/heap
 
 ---
 
-For user-focused documentation, see [README.md](README.md).
+For user-focused documentation, see [README.md](../README.md).

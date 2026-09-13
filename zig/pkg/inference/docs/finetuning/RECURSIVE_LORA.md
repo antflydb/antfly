@@ -1,4 +1,4 @@
-# Recursive LoRA Compression Plan
+# Recursive LoRA Compression
 
 Recursive LoRA is a model-compression path, not a replacement for task LoRA.
 The target artifact stores a smaller physical transformer block and runs it
@@ -51,9 +51,9 @@ base weights are compact while different depths can still specialize.
    non-layer tensors plus the physical shared layer block.
 20. [x] Include compressed-base size and ratio in smoke/sweep promotion reports.
 
-Items 1-20 are implemented for the Gemma4 E2B compression pipeline. Larger
-sweeps and broader model-family support remain follow-up work before this
-should be treated as a general-purpose compression pipeline.
+Items 1-20 are implemented for the Gemma4 E2B compression pipeline. See
+"Open work" at the end for what remains before this is a general-purpose
+compression pipeline.
 
 ## Current Behavior
 
@@ -276,3 +276,17 @@ The output directory contains:
 The copied `config.json` intentionally preserves the original logical depth.
 Runtime still needs the recursive adapter metadata to map logical layer
 parameters onto the smaller physical tensor set.
+
+## Open work
+
+- Larger sweeps (more ranks, shared block sizes, teacher temperatures) beyond
+  the Gemma4 E2B checkpoint validated so far.
+- Broader model-family support: the metadata and graph-adapter behavior are
+  designed to be reusable, but only Gemma4 has a working distillation loop
+  today.
+- The residual-SVD initialization averages each shared block's base weights
+  before factoring the logical residual only under the `average_residual_svd`
+  compatibility name; a dedicated implementation of that averaging step is
+  still future work (see "Bootstrap Initialization").
+- Separate hard-label cross-entropy versus teacher-KL loss reporting for the
+  multimodal teacher-target path (see "Distillation Targets").

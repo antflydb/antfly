@@ -190,81 +190,18 @@ pub const ChunkResponse = struct {
     cache_hit: bool,
 };
 
-pub const ClassifyRequest = struct {
-    /// Name of classifier model from models_dir/classifiers/
-    model: []const u8,
-    /// Texts to classify
-    texts: []const []const u8,
-    /// Candidate labels for zero-shot classification. The model will predict which label(s) best describe each text.
-    labels: []const []const u8,
-    /// Custom hypothesis template for NLI-based classification. Use "{}" as placeholder for the label. Default: "This example is {}."
-    hypothesis_template: ?[]const u8 = null,
-    /// If true, allows multiple labels per text (independent scoring). If false (default), scores are normalized across labels.
-    multi_label: ?bool = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "texts", "texts", false },
-        .{ "labels", "labels", false },
-        .{ "hypothesis_template", "hypothesis_template", true },
-        .{ "multi_label", "multi_label", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        try jw.objectField("texts");
-        try jw.write(self.texts);
-        try jw.objectField("labels");
-        try jw.write(self.labels);
-        if (self.hypothesis_template) |value| {
-            try jw.objectField("hypothesis_template");
-            try jw.write(value);
-        }
-        if (self.multi_label) |value| {
-            try jw.objectField("multi_label");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const ClassifyResponse = struct {
-    /// Name of model used for classification
-    model: []const u8,
-    /// Array of classification results (one per input text). Each result is an array of ClassifyResult sorted by score descending.
-    classifications: []const []const ClassifyResult,
-};
-
-pub const ClassifyResult = struct {
-    /// The predicted class/category
-    label: []const u8,
-    /// Confidence score (0.0 to 1.0)
-    score: f32,
-};
-
 pub const Config = struct {
     /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
     max_concurrent_requests: ?i64 = null,
-    /// URL of the Antfly inference embedding/chunking service
-    api_url: []const u8,
+    /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
+    api_url: ?[]const u8 = null,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
     /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
     content_security: ?antfly_scraping_openapi.ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?antfly_s3_openapi.Credentials = null,
@@ -298,7 +235,7 @@ pub const Config = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "max_concurrent_requests", "max_concurrent_requests", true },
-        .{ "api_url", "api_url", false },
+        .{ "api_url", "api_url", true },
         .{ "api_key", "api_key", true },
         .{ "models_dir", "models_dir", true },
         .{ "ml_dir", "ml_dir", true },
@@ -334,8 +271,10 @@ pub const Config = struct {
             try jw.objectField("max_concurrent_requests");
             try jw.write(value);
         }
-        try jw.objectField("api_url");
-        try jw.write(self.api_url);
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
             try jw.write(value);
@@ -1555,8 +1494,6 @@ pub const ModelsResponse = struct {
     chunkers: std.json.ArrayHashMap(ModelInfo),
     /// Available reranking models
     rerankers: std.json.ArrayHashMap(ModelInfo),
-    /// Available zero-shot classification models
-    classifiers: std.json.ArrayHashMap(ModelInfo),
     /// Available embedding models from models_dir/embedders/
     embedders: std.json.ArrayHashMap(ModelInfo),
     /// Available extractor models (NER models with 'extraction' capability)
@@ -1809,15 +1746,15 @@ pub const Role = enum {
 pub const RuntimeConfig = struct {
     /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
     max_concurrent_requests: ?i64 = null,
-    /// URL of the Antfly inference embedding/chunking service
-    api_url: []const u8,
+    /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
+    api_url: ?[]const u8 = null,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
     /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
     content_security: ?antfly_scraping_openapi.ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?antfly_s3_openapi.Credentials = null,
@@ -1850,7 +1787,7 @@ pub const RuntimeConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "max_concurrent_requests", "max_concurrent_requests", true },
-        .{ "api_url", "api_url", false },
+        .{ "api_url", "api_url", true },
         .{ "api_key", "api_key", true },
         .{ "models_dir", "models_dir", true },
         .{ "ml_dir", "ml_dir", true },
@@ -1885,8 +1822,10 @@ pub const RuntimeConfig = struct {
             try jw.objectField("max_concurrent_requests");
             try jw.write(value);
         }
-        try jw.objectField("api_url");
-        try jw.write(self.api_url);
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
             try jw.write(value);
@@ -2122,8 +2061,8 @@ pub const ToolCallFunctionDelta = struct {
 pub const ToolChoice = std.json.Value;
 
 pub const TranscribeRequest = struct {
-    /// Name of transcriber model from models_dir/transcribers/
-    model: ?[]const u8 = null,
+    /// Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
+    model: []const u8,
     /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
     audio: []const u8,
     /// Force specific language for transcription (optional, model-dependent)
@@ -2131,7 +2070,7 @@ pub const TranscribeRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "model", "model", true },
+        .{ "model", "model", false },
         .{ "audio", "audio", false },
         .{ "language", "language", true },
     };
@@ -2146,10 +2085,8 @@ pub const TranscribeRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
+        try jw.objectField("model");
+        try jw.write(self.model);
         try jw.objectField("audio");
         try jw.write(self.audio);
         if (self.language) |value| {

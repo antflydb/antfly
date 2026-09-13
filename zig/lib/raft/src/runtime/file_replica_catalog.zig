@@ -34,15 +34,22 @@ const bootstrap_fetch_snapshot_versioned: u8 = 3;
 pub const FileReplicaCatalog = struct {
     alloc: std.mem.Allocator,
     path: []const u8,
-    mutex: std.atomic.Mutex = .unlocked,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
     generation: u64 = 0,
     loaded_from_backup: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileReplicaCatalog {
+        return initWithIo(alloc, path, std.Io.Threaded.global_single_threaded.io());
+    }
+
+    /// Borrows `io` for catalog synchronization; it must outlive the catalog.
+    pub fn initWithIo(alloc: std.mem.Allocator, path: []const u8, io: std.Io) !FileReplicaCatalog {
         if (!std.fs.path.isAbsolute(path)) return error.ReplicaCatalogPathMustBeAbsolute;
         return .{
             .alloc = alloc,
             .path = try alloc.dupe(u8, path),
+            .io = io,
         };
     }
 
@@ -82,8 +89,8 @@ pub const FileReplicaCatalog = struct {
 
     fn upsertReplica(ptr: *anyopaque, record: replica.ReplicaRecord) !void {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
-        lockCatalog(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try validateWritableRecord(record);
         var records = try self.loadRecords(self.alloc);
         defer self.freeRecords(self.alloc, records);
@@ -111,8 +118,8 @@ pub const FileReplicaCatalog = struct {
 
     fn removeReplica(ptr: *anyopaque, group_id: core.types.GroupId) !bool {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
-        lockCatalog(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         var records = try self.loadRecords(self.alloc);
         defer self.freeRecords(self.alloc, records);
 
@@ -142,8 +149,8 @@ pub const FileReplicaCatalog = struct {
 
     fn listReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) ![]replica.ReplicaRecord {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
-        lockCatalog(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return try self.loadRecords(alloc);
     }
 
@@ -301,17 +308,6 @@ fn isRecoverablePrimaryCatalogError(err: anyerror) bool {
         => true,
         else => false,
     };
-}
-
-fn lockCatalog(mutex: *std.atomic.Mutex) void {
-    var attempts: usize = 0;
-    while (!mutex.tryLock()) : (attempts += 1) {
-        if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
-            std.atomic.spinLoopHint();
-        } else {
-            std.Thread.yield() catch {};
-        }
-    }
 }
 
 fn writeFileAtomicallyDurable(

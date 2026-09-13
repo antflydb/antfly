@@ -84,6 +84,7 @@ pub const RuntimeEmbeddingActivityStatusReport = table_manager.RuntimeEmbeddingA
 pub const RuntimeIndexSourceReplayStatusReport = table_manager.RuntimeIndexSourceReplayStatusReport;
 pub const IndexLifecycleWorkClass = table_manager.IndexLifecycleWorkClass;
 pub const IndexRepairStatus = table_manager.IndexRepairStatus;
+pub const DenseNativeStoragePhase = table_manager.DenseNativeStoragePhase;
 pub const SchemaProgressRecord = table_manager.SchemaProgressRecord;
 pub const RestoreProgressRecord = table_manager.RestoreProgressRecord;
 pub const ReplicationSourceStatusRecord = table_manager.ReplicationSourceStatusRecord;

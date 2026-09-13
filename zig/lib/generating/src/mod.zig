@@ -126,6 +126,8 @@ pub const GeneratorConfig = struct {
     model: []const u8,
     url: []const u8,
     api_key: ?[]const u8 = null,
+    capability_token: ?[]const u8 = null,
+    capability_revision: ?[]const u8 = null,
     project_id: ?[]const u8 = null,
     location: ?[]const u8 = null,
     credentials_path: ?[]const u8 = null,
@@ -145,6 +147,8 @@ pub const GeneratorConfig = struct {
             .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
             .url = if (self.url.len > 0) try alloc.dupe(u8, self.url) else "",
             .api_key = if (self.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
+            .capability_token = if (self.capability_token) |token| try alloc.dupe(u8, token) else null,
+            .capability_revision = if (self.capability_revision) |revision| try alloc.dupe(u8, revision) else null,
             .project_id = if (self.project_id) |value| try alloc.dupe(u8, value) else null,
             .location = if (self.location) |value| try alloc.dupe(u8, value) else null,
             .credentials_path = if (self.credentials_path) |value| try alloc.dupe(u8, value) else null,
@@ -163,6 +167,8 @@ pub const GeneratorConfig = struct {
         if (self.model.len > 0) alloc.free(self.model);
         if (self.url.len > 0) alloc.free(self.url);
         if (self.api_key) |api_key| alloc.free(api_key);
+        if (self.capability_token) |token| alloc.free(@constCast(token));
+        if (self.capability_revision) |revision| alloc.free(@constCast(revision));
         if (self.project_id) |value| alloc.free(value);
         if (self.location) |value| alloc.free(value);
         if (self.credentials_path) |value| alloc.free(value);
@@ -459,6 +465,29 @@ pub fn executeChain(
     factory: GeneratorFactory,
     messages: []const ChatMessage,
 ) !GenerateResult {
+    return executeChainInternal(alloc, null, chain, factory, messages);
+}
+
+/// Executes retry backoff through a caller-owned runtime. Production and VOPR
+/// callers should use this entry point so time, cancellation, and scheduling
+/// remain part of the same `std.Io` history.
+pub fn executeChainWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    chain: []const ChainLink,
+    factory: GeneratorFactory,
+    messages: []const ChatMessage,
+) !GenerateResult {
+    return executeChainInternal(alloc, io, chain, factory, messages);
+}
+
+fn executeChainInternal(
+    alloc: std.mem.Allocator,
+    io: ?std.Io,
+    chain: []const ChainLink,
+    factory: GeneratorFactory,
+    messages: []const ChatMessage,
+) !GenerateResult {
     if (chain.len == 0) return error.EmptyGeneratorChain;
 
     var last_err: anyerror = error.EmptyGeneratorChain;
@@ -471,7 +500,7 @@ pub fn executeChain(
         };
         defer generator.deinit();
 
-        const result = executeWithRetry(alloc, generator, link.generator.model, messages, link.retry) catch |err| {
+        const result = executeWithRetry(alloc, io, generator, link.generator.model, messages, link.retry) catch |err| {
             last_err = err;
             if (i + 1 < chain.len and shouldTryNext(link.condition orelse .on_error, err)) continue;
             return err;
@@ -483,6 +512,7 @@ pub fn executeChain(
 
 fn executeWithRetry(
     alloc: std.mem.Allocator,
+    io: ?std.Io,
     generator: Generator,
     model: []const u8,
     messages: []const ChatMessage,
@@ -496,7 +526,12 @@ fn executeWithRetry(
     while (true) : (attempt += 1) {
         const result = generator.generate(alloc, model, messages) catch |err| {
             if (attempt + 1 >= retry.max_attempts) return err;
-            if (backoff_ms > 0) sleepMs(backoff_ms);
+            if (backoff_ms > 0) {
+                if (io) |runtime_io|
+                    try runtime_io.sleep(.fromMilliseconds(backoff_ms), .awake)
+                else
+                    sleepMs(backoff_ms);
+            }
             backoff_ms = if (backoff_ms == 0)
                 retry.max_backoff_ms
             else

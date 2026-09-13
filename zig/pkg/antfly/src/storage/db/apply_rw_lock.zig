@@ -68,7 +68,7 @@ pub const ApplyRwLock = struct {
             if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
         if (attempts != 0) {
@@ -215,7 +215,7 @@ pub const ApplyRwLock = struct {
         self.resource_mutex.unlock();
         self.reader_gate.unlock();
         if (builtin.os.tag != .freestanding and !builtin.single_threaded) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
     }
 
@@ -245,10 +245,10 @@ fn lockAtomic(mutex: *std.atomic.Mutex) bool {
             continue;
         }
         if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
             continue;
         }
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     return attempts == 0;
 }
@@ -257,7 +257,7 @@ fn yieldToPriorityReadersBounded(lock: *const ApplyRwLock) void {
     if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
     var attempts: usize = 0;
     while (attempts < 64 and lock.priority_shared_waiters.load(.monotonic) > 0) : (attempts += 1) {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
 }
 
@@ -354,15 +354,15 @@ test "apply rw lock lets queued readers through sustained exclusive loop" {
     };
 
     var ctx = Context{};
-    const writer_thread = try std.Thread.spawn(.{}, Context.writer, .{&ctx});
-    defer writer_thread.join();
+    var writer_thread = try std.testing.io.concurrent(Context.writer, .{&ctx});
+    defer writer_thread.await(std.testing.io);
 
-    const reader_thread = try std.Thread.spawn(.{}, Context.reader, .{&ctx});
-    defer reader_thread.join();
+    var reader_thread = try std.testing.io.concurrent(Context.reader, .{&ctx});
+    defer reader_thread.await(std.testing.io);
 
     var spins: usize = 0;
     while (!ctx.reader_done.load(.acquire) and spins < 100_000) : (spins += 1) {
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(ctx.reader_ready.load(.acquire));
     try std.testing.expect(ctx.reader_done.load(.acquire));
@@ -565,10 +565,10 @@ test "apply rw lock cooperative writer yields to queued reader on one-worker run
     // still owns the lock makes the test itself deadlock before it can unlock.
     // Use an independent caller for the writer while both lock waits continue
     // to use the same one-worker backend Io.
-    const writer_thread = try std.Thread.spawn(.{}, Context.writerThread, .{&ctx});
-    defer writer_thread.join();
+    var writer_thread = try std.testing.io.concurrent(Context.writerThread, .{&ctx});
+    defer writer_thread.await(std.testing.io);
     while (lock.exclusive_waiters.load(.acquire) == 0) {
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     lock.unlockExclusive();
     exclusive_held = false;
@@ -616,10 +616,10 @@ test "apply rw lock queued io writer blocks later shared barging" {
     defer if (shared_held) lock.unlockShared();
 
     var ctx = Context{ .lock = &lock, .io = io };
-    const writer_thread = try std.Thread.spawn(.{}, Context.writer, .{&ctx});
-    defer writer_thread.join();
+    var writer_thread = try std.testing.io.concurrent(Context.writer, .{&ctx});
+    defer writer_thread.await(std.testing.io);
     while (lock.exclusive_waiters.load(.acquire) == 0) {
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 
     // Once writer intent is visible, neither opportunistic nor blocking-new

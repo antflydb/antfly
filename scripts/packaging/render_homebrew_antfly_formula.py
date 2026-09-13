@@ -68,6 +68,9 @@ def main() -> int:
 class Antfly < Formula
   desc "Native Zig AntflyDB runtime"
   homepage "https://docs.antfly.io"
+  version "{args.version}"
+  # Recover from older formulae that inferred version 64 from arm64 archives.
+  version_scheme 1
   license "Elastic-2.0"
 
   if OS.mac?
@@ -111,6 +114,19 @@ class Antfly < Formula
 
   test do
     system "#{{bin}}/antfly", "--help"
+    (testpath/"smoke.c").write <<~C
+      #include <antfly.h>
+      int main(void) {{
+        if (antfly_abi_version() != 1) return 1;
+        void *db = NULL;
+        if (antfly_lite_create("smoke.aflite", &db) != ANTFLY_OK) return 2;
+        antfly_db_close(db);
+        return 0;
+      }}
+    C
+    system ENV.cc, "smoke.c", "-I#{{include}}", "-L#{{lib}}", "-lantfly",
+           "-Wl,-rpath,#{{lib}}", "-o", "smoke"
+    system "./smoke"
   end
 
   def caveats

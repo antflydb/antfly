@@ -18,6 +18,26 @@ const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
+const objectstore = @import("objectstore");
+const artifacts_object_store = @import("../artifacts/object_store.zig");
+const manifest_object_store = @import("../manifest/object_store.zig");
+const progress_object_store = @import("../catalog/object_progress_store.zig");
+const wal_object_store = @import("../wal/object_store.zig");
+const graph_page_store = @import("../graph_segment/page_store.zig");
+const graph_page_root = @import("../graph_segment/page_graph.zig").Root;
+const read_lease = @import("../manifest/read_lease.zig");
+const work_lease = @import("work_lease.zig");
+const scoped_artifacts = @import("../artifacts/store.zig");
+const document_facts = @import("document_facts.zig");
+const WorkingSetAllocator = @import("lake_build_limits.zig").WorkingSetAllocator;
+
+pub const PruneLimits = struct {
+    /// Exact mark sets, manifest inventories/decoding, pinned-version sets and
+    /// page traversal share one admitted working set. Fixed backend transport
+    /// state is owned by the stores, outside this operation's retained data.
+    max_working_set_bytes: usize = 256 * 1024 * 1024,
+};
 
 pub const PruneResult = struct {
     namespace: []u8,
@@ -27,6 +47,7 @@ pub const PruneResult = struct {
     wal_keep_from_lsn: u64,
     wal_records_removed: u64,
     gc_watermark_conflict: bool = false,
+    work_lease_conflict: bool = false,
 
     pub fn deinit(self: *PruneResult, alloc: Allocator) void {
         alloc.free(self.namespace);
@@ -40,6 +61,8 @@ pub const Pruner = struct {
     manifests: *manifest_mod.ManifestStore,
     progress: *catalog_mod.ProgressStore,
     wal: *wal_mod.WalStore,
+    read_lease_clock: read_lease.Clock = .{},
+    limits: PruneLimits = .{},
 
     pub fn init(alloc: Allocator, artifacts: *artifacts_mod.ArtifactStore, manifests: *manifest_mod.ManifestStore, progress: *catalog_mod.ProgressStore, wal: *wal_mod.WalStore) Pruner {
         return .{
@@ -52,73 +75,294 @@ pub const Pruner = struct {
     }
 
     pub fn pruneNamespace(self: *Pruner, namespace: []const u8, keep_latest_versions: usize) !PruneResult {
+        return try self.pruneNamespaceUntil(namespace, keep_latest_versions, null);
+    }
+
+    pub fn pruneNamespaceUntil(
+        self: *Pruner,
+        namespace: []const u8,
+        keep_latest_versions: usize,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !PruneResult {
+        if (self.limits.max_working_set_bytes == 0) return error.InvalidGarbageCollectionLimits;
+        var working_set = try WorkingSetAllocator.init(self.alloc, .{ .max_working_set_bytes = self.limits.max_working_set_bytes });
+        const operation_alloc = working_set.allocator();
+        var manifests = self.manifests.*;
+        manifests.allocator = operation_alloc;
+        var operation_pruner = self.*;
+        operation_pruner.alloc = operation_alloc;
+        operation_pruner.manifests = &manifests;
+        var result = operation_pruner.pruneNamespaceAdmitted(namespace, keep_latest_versions, cancellation) catch |err| {
+            if (err == error.OutOfMemory and working_set.limit_exceeded) return error.GarbageCollectionBudgetExceeded;
+            return err;
+        };
+        errdefer result.deinit(operation_alloc);
+        const owned_namespace = try self.alloc.dupe(u8, result.namespace);
+        operation_alloc.free(result.namespace);
+        result.namespace = owned_namespace;
+        std.debug.assert(working_set.live_bytes == 0);
+        return result;
+    }
+
+    fn pruneNamespaceAdmitted(
+        self: *Pruner,
+        namespace: []const u8,
+        keep_latest_versions: usize,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !PruneResult {
+        try maintenance_cancellation.check(cancellation);
+        // This short, durable ownership barrier makes every older publisher
+        // incapable of committing HEAD. Do not hold it across graph traversal:
+        // newer publishers use higher tokens and pin their source manifests.
+        var fallback_io = std.Io.Threaded.init(self.alloc, .{});
+        defer fallback_io.deinit();
+        const io = if (cancellation) |token| token.io else fallback_io.io();
+        const provider = try self.progress.workLeaseProvider();
+        var nonce: [16]u8 = undefined;
+        io.random(&nonce);
+        const owner = std.fmt.bytesToHex(&nonce, .lower);
+        var barrier = (try work_lease.acquireHeld(provider, io, namespace, &owner, 30 * std.time.ns_per_s)) orelse {
+            var result = try self.noopResult(namespace, 0, false);
+            result.work_lease_conflict = true;
+            return result;
+        };
+        defer {
+            if (!barrier.released) _ = barrier.release() catch false;
+        }
+        const retired_before = barrier.acquisition.fencing_token;
+        if (!try barrier.release()) return error.WorkLeaseLost;
+        var graph_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
+        const manifest_gc_floor = try self.progress.getManifestGcFloor(namespace);
+        // HEAD publication follows the immutable manifest write. Read HEAD
+        // first, so a concurrent publisher cannot make it newer than our
+        // version listing. Unpublished candidates are not retention roots.
+        const published_head = self.progress.getHead(namespace) catch |err| switch (err) {
+            error.FileNotFound => {
+                var result = try self.noopResult(namespace, 0, false);
+                errdefer result.deinit(self.alloc);
+                result.deleted_artifacts = try self.sweepScopedUploads(namespace, retired_before, &.{}, graph_bridge.token());
+                const candidates = try self.manifests.listVersionsAlloc(namespace);
+                defer self.alloc.free(candidates);
+                for (candidates) |version| {
+                    try maintenance_cancellation.check(cancellation);
+                    var candidate = try self.manifests.getAlloc(namespace, version);
+                    defer candidate.deinit(self.alloc);
+                    if (candidate.publication_fencing_token == 0 or candidate.publication_fencing_token >= retired_before) continue;
+                    try validateScopedRoots(namespace, candidate.artifacts);
+                    if (try self.manifests.deleteRetiredCandidate(namespace, version, retired_before)) result.deleted_versions += 1;
+                }
+                return result;
+            },
+            else => return err,
+        };
         const versions = try self.manifests.listVersionsAlloc(namespace);
         defer self.alloc.free(versions);
-
-        if (versions.len == 0) {
-            return .{
-                .namespace = try self.alloc.dupe(u8, namespace),
-                .kept_versions = 0,
-                .deleted_versions = 0,
-                .deleted_artifacts = 0,
-                .wal_keep_from_lsn = 0,
-                .wal_records_removed = 0,
-            };
+        if (manifest_gc_floor) |floor| {
+            if (published_head < floor) return error.PublishedHeadManifestMissing;
         }
 
+        // Object stores can contain manifests whose publisher never completed
+        // the HEAD CAS. Retention is defined relative to the published head,
+        // never the numerically greatest stored version.
+        if (!containsVersion(versions, published_head)) {
+            // Another retention worker may already have removed our old
+            // root after publication advanced. Let the next pass resnapshot;
+            // an unchanged HEAD with no manifest remains a corruption error.
+            if (try self.progress.getHead(namespace) != published_head)
+                return self.noopResult(namespace, 0, false);
+            return error.PublishedHeadManifestMissing;
+        }
         const keep_count = @max(keep_latest_versions, 1);
-        const keep_start = versions.len -| @min(versions.len, keep_count);
-        const kept_versions = versions[keep_start..];
+        var kept_versions = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer kept_versions.deinit(self.alloc);
+        var lineage_version: ?u64 = published_head;
+        var wal_keep_from_lsn: u64 = 0;
+        var oldest_retained_version = published_head;
+        while (lineage_version != null and kept_versions.count() < keep_count) {
+            try maintenance_cancellation.check(cancellation);
+            const version = lineage_version.?;
+            // A previously committed GC pass retired this prefix, even if
+            // cancellation left some manifests or artifacts behind. Raising
+            // retention must not resurrect those partially deleted versions.
+            if (manifest_gc_floor) |floor| {
+                if (version < floor) break;
+            }
+            if (!containsVersion(versions, version)) return error.PublishedLineageManifestMissing;
+            if (kept_versions.contains(version)) return error.PublishedLineageCycle;
 
-        var keep_manifest = try self.manifests.getAlloc(namespace, kept_versions[0]);
-        defer keep_manifest.deinit(self.alloc);
-
-        const current_gc = try self.progress.getGcWatermark(namespace);
-        const effective_keep_from = if (current_gc) |value| @max(value, keep_manifest.wal_start_lsn) else keep_manifest.wal_start_lsn;
-        if (current_gc == null) {
-            const advanced = try self.progress.compareAndSwapGcWatermark(namespace, null, effective_keep_from);
-            if (!advanced) return try self.noopResult(namespace, kept_versions.len, true);
-        } else if (current_gc.? < effective_keep_from) {
-            const advanced = try self.progress.compareAndSwapGcWatermark(namespace, current_gc, effective_keep_from);
-            if (!advanced) return try self.noopResult(namespace, kept_versions.len, true);
-        }
-
-        var retained_artifacts = std.StringHashMapUnmanaged(void).empty;
-        defer freeOwnedKeys(self.alloc, &retained_artifacts);
-        for (kept_versions) |version| {
             var manifest = try self.manifests.getAlloc(namespace, version);
             defer manifest.deinit(self.alloc);
+            try validateScopedRoots(namespace, manifest.artifacts);
+            try kept_versions.put(self.alloc, version, {});
+            oldest_retained_version = @min(oldest_retained_version, version);
+            wal_keep_from_lsn = manifest.wal_start_lsn;
+            lineage_version = if (manifest.publication_lineage_tracked)
+                manifest.publication_parent_version
+            else
+                previousStoredVersion(versions, version);
+        }
+
+        // Persist the manifest boundary before any destructive work. WAL
+        // positions alone cannot identify it: compaction/enrichment versions
+        // may share an identical wal_start_lsn.
+        if (manifest_gc_floor == null or oldest_retained_version > manifest_gc_floor.?) {
+            const advanced = try self.progress.compareAndSwapManifestGcFloor(namespace, manifest_gc_floor, oldest_retained_version);
+            if (!advanced) return try self.noopResult(namespace, kept_versions.count(), true);
+        }
+        // Read deadlines only AFTER committing the retirement floor. Readers
+        // publish pins before checking that floor, closing the read/GC race.
+        // Existing pins below the floor remain roots until their leases expire;
+        // they do not reopen history for new acquisitions or WAL consumers.
+        if (self.progress.vtable.get_manifest_read_deadline != null) {
+            const unix = self.read_lease_clock.unixNs();
+            for (versions) |version| {
+                if (version > published_head or kept_versions.contains(version)) continue;
+                if (try self.progress.getManifestReadDeadline(namespace, version)) |deadline| {
+                    if (read_lease.protects(deadline, unix)) try kept_versions.put(self.alloc, version, {});
+                }
+            }
+        }
+        const current_gc = try self.progress.getGcWatermark(namespace);
+        const effective_keep_from = if (current_gc) |value| @max(value, wal_keep_from_lsn) else wal_keep_from_lsn;
+        if (current_gc == null) {
+            const advanced = try self.progress.compareAndSwapGcWatermark(namespace, null, effective_keep_from);
+            if (!advanced) return try self.noopResult(namespace, kept_versions.count(), true);
+        } else if (current_gc.? < effective_keep_from) {
+            const advanced = try self.progress.compareAndSwapGcWatermark(namespace, current_gc, effective_keep_from);
+            if (!advanced) return try self.noopResult(namespace, kept_versions.count(), true);
+        }
+
+        var graph_read_bytes: u64 = std.math.maxInt(u64);
+        var graph_write_bytes: u64 = 0;
+        var graph_pages: graph_page_store.PageStore = .{
+            .artifacts = self.artifacts,
+            .cancellation = graph_bridge.token(),
+            .remaining_read_bytes = &graph_read_bytes,
+            .remaining_write_bytes = &graph_write_bytes,
+        };
+        var retained_artifacts = std.StringHashMapUnmanaged(void).empty;
+        defer freeOwnedKeys(self.alloc, &retained_artifacts);
+        var retired_candidates: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer retired_candidates.deinit(self.alloc);
+        for (versions) |version| {
+            // Preserve artifacts reachable from the visible publication
+            // lineage and from every above-HEAD candidate. The latter may be
+            // an in-flight publisher or a crashed orphan and retention must
+            // not break its content-addressed references while leaving its
+            // immutable manifest behind.
+            if (version <= published_head and !kept_versions.contains(version)) continue;
+            try maintenance_cancellation.check(cancellation);
+            var manifest = try self.manifests.getAlloc(namespace, version);
+            defer manifest.deinit(self.alloc);
+            try validateScopedRoots(namespace, manifest.artifacts);
+            if (version > published_head and manifest.publication_fencing_token != 0 and manifest.publication_fencing_token < retired_before) {
+                try retired_candidates.put(self.alloc, version, {});
+                // Global content IDs cannot prove publication ownership. They
+                // may be reused by a concurrent writer and are not eligible
+                // for candidate cleanup. Production uploads use scoped IDs;
+                // retain old/custom unscoped references conservatively.
+                for (manifest.artifacts) |artifact| {
+                    if (try scoped_artifacts.uploadScopeFromArtifactId(artifact.artifact_id) == null)
+                        try collectArtifactIds(self.alloc, &retained_artifacts, &.{artifact});
+                }
+                continue;
+            }
+            for (manifest.artifacts) |artifact| {
+                if (isPagedGraphRoot(artifact)) try graph_page_store.retainRoot(self.alloc, &graph_pages, artifact, &retained_artifacts);
+                if (artifact.kind == .document_facts) try document_facts.retainRoot(self.alloc, &graph_pages, artifact, &retained_artifacts);
+            }
             try collectArtifactIds(self.alloc, &retained_artifacts, manifest.artifacts);
         }
 
         var pruned_artifacts = std.StringHashMapUnmanaged(void).empty;
         defer freeOwnedKeys(self.alloc, &pruned_artifacts);
-        var deleted_versions: usize = 0;
-        for (versions[0..keep_start]) |version| {
-            var manifest = try self.manifests.getAlloc(namespace, version);
-            defer manifest.deinit(self.alloc);
-            try collectUnretainedArtifactIds(self.alloc, &pruned_artifacts, retained_artifacts, manifest.artifacts);
-            self.manifests.deleteVersion(namespace, version) catch |err| switch (err) {
-                error.CannotDeleteHead => continue,
+        var pruned_graph_roots: std.StringHashMapUnmanaged(manifest_mod.ArtifactRef) = .empty;
+        defer {
+            var roots = pruned_graph_roots.valueIterator();
+            while (roots.next()) |root| {
+                self.alloc.free(root.artifact_id);
+                self.alloc.free(root.checksum);
+            }
+            pruned_graph_roots.deinit(self.alloc);
+        }
+        for (versions) |version| {
+            if ((version > published_head and !retired_candidates.contains(version)) or kept_versions.contains(version)) continue;
+            try maintenance_cancellation.check(cancellation);
+            var manifest = self.manifests.getAlloc(namespace, version) catch |err| switch (err) {
+                error.FileNotFound => continue,
                 else => return err,
             };
-            deleted_versions += 1;
+            defer manifest.deinit(self.alloc);
+            // Another collector may have removed this orphan and a newer
+            // publication may reuse its version. Never collect the replacement
+            // graph/facts roots using an earlier candidate classification.
+            if (version > published_head and
+                (manifest.publication_fencing_token == 0 or manifest.publication_fencing_token >= retired_before)) continue;
+            try validateScopedRoots(namespace, manifest.artifacts);
+            try collectUnretainedArtifactIds(self.alloc, &pruned_artifacts, retained_artifacts, manifest.artifacts);
+            for (manifest.artifacts) |artifact| {
+                if ((!isPagedGraphRoot(artifact) and artifact.kind != .document_facts) or retained_artifacts.contains(artifact.artifact_id) or pruned_graph_roots.contains(artifact.artifact_id)) continue;
+                var owned = artifact;
+                owned.name = "";
+                owned.artifact_id = try self.alloc.dupe(u8, artifact.artifact_id);
+                errdefer self.alloc.free(owned.artifact_id);
+                owned.checksum = try self.alloc.dupe(u8, artifact.checksum);
+                errdefer self.alloc.free(owned.checksum);
+                try pruned_graph_roots.put(self.alloc, owned.artifact_id, owned);
+            }
         }
 
+        // Delete content before its obsolete manifests. If cancellation lands
+        // mid-sweep, the manifests let the next pass rediscover every remaining
+        // artifact instead of leaking unreachable objects forever.
         var deleted_artifacts: usize = 0;
+        // Page trees are DAGs, not flat artifacts. Reclaim descendants before
+        // their root inventories and preserve pages shared with any retained
+        // publication/candidate. A replay tolerates already deleted children.
+        var graph_root_it = pruned_graph_roots.valueIterator();
+        while (graph_root_it.next()) |artifact| {
+            deleted_artifacts += if (artifact.kind == .document_facts)
+                try document_facts.reclaimRoot(self.alloc, &graph_pages, artifact.*, &retained_artifacts)
+            else
+                try graph_page_store.reclaimRoot(self.alloc, &graph_pages, artifact.*, &retained_artifacts);
+            const removed = pruned_artifacts.fetchRemove(artifact.artifact_id).?;
+            self.alloc.free(removed.key);
+        }
         var artifact_it = pruned_artifacts.iterator();
         while (artifact_it.next()) |entry| {
+            try maintenance_cancellation.check(cancellation);
             self.artifacts.delete(entry.key_ptr.*) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
             deleted_artifacts += 1;
         }
+        // The physical namespace/attempt inventory also finds uploads that
+        // never reached a manifest, including PUTs completed after an earlier
+        // sweep. Newer attempt identities cannot alias these retired objects.
+        deleted_artifacts += try self.sweepScopedUploads(namespace, retired_before, &retained_artifacts, graph_bridge.token());
 
+        var deleted_versions: usize = 0;
+        for (versions) |version| {
+            if ((version > published_head and !retired_candidates.contains(version)) or kept_versions.contains(version)) continue;
+            try maintenance_cancellation.check(cancellation);
+            if (version > published_head) {
+                if (try self.manifests.deleteRetiredCandidate(namespace, version, retired_before)) deleted_versions += 1;
+            } else {
+                self.manifests.deleteVersion(namespace, version) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+                deleted_versions += 1;
+            }
+        }
+
+        try maintenance_cancellation.check(cancellation);
+        try self.progress.pruneManifestReadDeadlines(namespace, oldest_retained_version, self.read_lease_clock.unixNs() -| read_lease.gc_grace_ns, graph_bridge.token());
         const wal_records_removed = try self.wal.truncatePrefix(namespace, effective_keep_from);
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
-            .kept_versions = kept_versions.len,
+            .kept_versions = kept_versions.count(),
             .deleted_versions = deleted_versions,
             .deleted_artifacts = deleted_artifacts,
             .wal_keep_from_lsn = effective_keep_from,
@@ -137,7 +381,63 @@ pub const Pruner = struct {
             .gc_watermark_conflict = gc_watermark_conflict,
         };
     }
+
+    fn sweepScopedUploads(self: *Pruner, namespace: []const u8, retired_before: u64, retained: *const std.StringHashMapUnmanaged(void), cancellation: @import("../../common/cancellation.zig").CancellationToken) !usize {
+        const Sweep = struct {
+            artifacts: *artifacts_mod.ArtifactStore,
+            retained: *const std.StringHashMapUnmanaged(void),
+            retired_before: u64,
+            deleted: usize = 0,
+            cancellation: @import("../../common/cancellation.zig").CancellationToken,
+
+            fn visit(ptr: *anyopaque, scope: scoped_artifacts.UploadScope, id: []const u8) !void {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                try self_.cancellation.check();
+                if (scope.fencingToken() >= self_.retired_before or self_.retained.contains(id)) return;
+                self_.artifacts.delete(id) catch |err| switch (err) {
+                    error.FileNotFound => return,
+                    else => return err,
+                };
+                self_.deleted += 1;
+            }
+        };
+        var sweep = Sweep{ .artifacts = self.artifacts, .retained = retained, .retired_before = retired_before, .cancellation = cancellation };
+        try self.artifacts.visitScopedUploads(graph_page_store.PageStore.namespaceDomain(namespace), .{ .ptr = &sweep, .visit = Sweep.visit }, cancellation);
+        try self.artifacts.cleanupRetiredScopedTemporaries(graph_page_store.PageStore.namespaceDomain(namespace), retired_before, cancellation);
+        try self.manifests.cleanupRetiredTemporaries(namespace, retired_before, cancellation);
+        return sweep.deleted;
+    }
 };
+
+fn isPagedGraphRoot(artifact: manifest_mod.ArtifactRef) bool {
+    return artifact.kind == .graph_segment and artifact.metadata_version == graph_page_root.metadata_version;
+}
+
+fn validateScopedRoots(namespace: []const u8, artifacts: []const manifest_mod.ArtifactRef) !void {
+    const domain = graph_page_store.PageStore.namespaceDomain(namespace);
+    for (artifacts) |artifact| {
+        if (!isPagedGraphRoot(artifact) and artifact.kind != .document_facts) continue;
+        const scope = (try scoped_artifacts.uploadScopeFromArtifactId(artifact.artifact_id)) orelse return error.InvalidGraphPublicationScope;
+        if (!std.mem.eql(u8, &scope.domain, &domain)) return error.GraphPageDomainMismatch;
+    }
+}
+
+fn containsVersion(versions: []const u64, target: u64) bool {
+    for (versions) |version| {
+        if (version == target) return true;
+        if (version > target) return false;
+    }
+    return false;
+}
+
+fn previousStoredVersion(versions: []const u64, target: u64) ?u64 {
+    var previous: ?u64 = null;
+    for (versions) |version| {
+        if (version >= target) return previous;
+        previous = version;
+    }
+    return previous;
+}
 
 fn collectArtifactIds(
     alloc: Allocator,
@@ -172,7 +472,770 @@ fn freeOwnedKeys(alloc: Allocator, map: *std.StringHashMapUnmanaged(void)) void 
     map.deinit(alloc);
 }
 
-test "pruner retains recent manifests and truncates WAL history" {
+test "serverless retention fences upload attempts and rediscovers late orphan uploads" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "artifacts", "tenant");
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "manifests", "tenant");
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+    var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress", "tenant");
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "wal", "tenant");
+    var wal = wal_impl.walStore();
+    defer wal.deinit();
+    const provider = try progress.workLeaseProvider();
+    var first = (try work_lease.acquireHeld(provider, io, "docs", "published", 30 * std.time.ns_per_s)).?;
+    const domain = graph_page_store.PageStore.namespaceDomain("docs");
+    const first_scope = try scoped_artifacts.UploadScope.forPublication(domain, first.acquisition.fencing_token, io);
+    var published = try artifacts.putScoped(first_scope, "retained", .none);
+    defer published.deinit(alloc);
+    try putTestManifest(&manifests, 1, 0, published);
+    try std.testing.expect(try progress.compareAndSwapHeadFenced("docs", null, 1, (try first.guard().preparePublication("docs")).?));
+    try std.testing.expect(try first.release());
+    var failed = (try work_lease.acquireHeld(provider, io, "docs", "failed", 30 * std.time.ns_per_s)).?;
+    const failed_scope = try scoped_artifacts.UploadScope.forPublication(domain, failed.acquisition.fencing_token, io);
+    var orphan = try artifacts.putScoped(failed_scope, "orphan", .none);
+    defer orphan.deinit(alloc);
+    var unscoped = try artifacts.put("custom global content ID");
+    defer unscoped.deinit(alloc);
+    var candidate_refs = [_]manifest_mod.ArtifactRef{
+        .{ .kind = .document_segment, .artifact_id = published.artifact_id, .checksum = published.checksum, .byte_len = published.byte_len },
+        .{ .kind = .mutation_segment, .artifact_id = orphan.artifact_id, .checksum = orphan.checksum, .byte_len = orphan.byte_len },
+        .{ .kind = .text_segment, .artifact_id = unscoped.artifact_id, .checksum = unscoped.checksum, .byte_len = unscoped.byte_len },
+    };
+    // The candidate's own fencing token matters, not the older scope of its
+    // reused content. Retirement removes only the candidate, not shared bytes.
+    try manifests.put(.{ .namespace = "docs", .version = 2, .built_at_ns = 2, .wal_start_lsn = 0, .wal_end_lsn = 0, .publication_fencing_token = failed.acquisition.fencing_token, .publication_lineage_tracked = true, .publication_parent_version = 1, .stats = .{ .document_count = 1, .document_base_version = 1 }, .artifacts = &candidate_refs });
+    var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
+    var blocked = try pruner.pruneNamespaceUntil("docs", 1, .{ .io = io });
+    defer blocked.deinit(alloc);
+    try std.testing.expect(blocked.work_lease_conflict);
+    try std.testing.expectEqual(@as(usize, 0), blocked.deleted_artifacts);
+    try std.testing.expect(try failed.release());
+    const future_scope = try scoped_artifacts.UploadScope.forPublication(domain, failed.acquisition.fencing_token + 2, io);
+    var future = try artifacts.putScoped(future_scope, "newer than barrier", .none);
+    defer future.deinit(alloc);
+    var result = try pruner.pruneNamespaceUntil("docs", 1, .{ .io = io });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.deleted_versions);
+    try std.testing.expectError(error.FileNotFound, artifacts.stat(orphan.artifact_id));
+    var kept = try artifacts.stat(published.artifact_id);
+    defer kept.deinit(alloc);
+    var future_kept = try artifacts.stat(future.artifact_id);
+    defer future_kept.deinit(alloc);
+    // Custom unscoped IDs have no retirement authority; scoped flat segments
+    // are reclaimed, but never infer ownership of a global content ID.
+    var unscoped_kept = try artifacts.stat(unscoped.artifact_id);
+    defer unscoped_kept.deinit(alloc);
+    try std.testing.expectError(error.WorkLeaseLost, progress.compareAndSwapHeadFenced("docs", 1, 2, .{ .owner_id = "failed", .fencing_token = failed.acquisition.fencing_token }));
+    var late = try artifacts.putScoped(failed_scope, "orphan", .none);
+    defer late.deinit(alloc);
+    var replay = try pruner.pruneNamespaceUntil("docs", 1, .{ .io = io });
+    defer replay.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replay.deleted_artifacts);
+    try std.testing.expectError(error.FileNotFound, artifacts.stat(late.artifact_id));
+    // A namespace with no published HEAD still has a recoverable inventory.
+    var bootstrap = (try work_lease.acquireHeld(provider, io, "unpublished", "bootstrap", 30 * std.time.ns_per_s)).?;
+    const bootstrap_scope = try scoped_artifacts.UploadScope.forPublication(graph_page_store.PageStore.namespaceDomain("unpublished"), bootstrap.acquisition.fencing_token, io);
+    var abandoned = try artifacts.putScoped(bootstrap_scope, "before candidate", .none);
+    defer abandoned.deinit(alloc);
+    try manifests.put(.{ .namespace = "unpublished", .version = 1, .built_at_ns = 1, .wal_start_lsn = 0, .wal_end_lsn = 0, .publication_fencing_token = bootstrap.acquisition.fencing_token, .stats = .{}, .artifacts = &.{} });
+    try std.testing.expect(try bootstrap.release());
+    var empty = try pruner.pruneNamespaceUntil("unpublished", 1, .{ .io = io });
+    defer empty.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), empty.deleted_artifacts);
+    try std.testing.expectEqual(@as(usize, 1), empty.deleted_versions);
+    try std.testing.expectError(error.FileNotFound, artifacts.stat(abandoned.artifact_id));
+    // An admitted exact mark may reject a namespace, but it must neither
+    // delete live content nor lose the inventory needed by a larger retry.
+    pruner.limits.max_working_set_bytes = 1;
+    try std.testing.expectError(error.GarbageCollectionBudgetExceeded, pruner.pruneNamespaceUntil("docs", 1, .{ .io = io }));
+    var still_published = try artifacts.stat(published.artifact_id);
+    defer still_published.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), try progress.getHead("docs"));
+    var published_manifest = try manifests.getAlloc("docs", 1);
+    defer published_manifest.deinit(alloc);
+    pruner.limits = .{};
+    var resumed = try pruner.pruneNamespaceUntil("docs", 1, .{ .io = io });
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), resumed.kept_versions);
+}
+
+fn putTestManifest(
+    manifests: *manifest_mod.ManifestStore,
+    version: u64,
+    wal_start_lsn: u64,
+    artifact: artifacts_mod.ArtifactMetadata,
+) !void {
+    return try putTestManifestWithLineage(manifests, version, wal_start_lsn, artifact, false, null);
+}
+
+fn putTestManifestWithLineage(
+    manifests: *manifest_mod.ManifestStore,
+    version: u64,
+    wal_start_lsn: u64,
+    artifact: artifacts_mod.ArtifactMetadata,
+    lineage_tracked: bool,
+    parent_version: ?u64,
+) !void {
+    var refs = [_]manifest_mod.ArtifactRef{.{
+        .kind = .document_segment,
+        .artifact_id = artifact.artifact_id,
+        .byte_len = artifact.byte_len,
+        .checksum = artifact.checksum,
+    }};
+    try manifests.put(.{
+        .namespace = "docs",
+        .version = version,
+        .built_at_ns = version,
+        .wal_start_lsn = wal_start_lsn,
+        .wal_end_lsn = wal_start_lsn,
+        .publication_lineage_tracked = lineage_tracked,
+        .publication_parent_version = parent_version,
+        .stats = .{ .document_count = 1, .document_base_version = version },
+        .artifacts = &refs,
+    });
+}
+
+test "serverless retention follows graph root reachability across publication and candidates" {
+    const alloc = std.testing.allocator;
+    const tree = @import("../graph_segment/page_tree.zig");
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "artifacts", "tenant");
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "manifests", "tenant");
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+    var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress", "tenant");
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "wal", "tenant");
+    var wal = wal_impl.walStore();
+    defer wal.deinit();
+    var reads: u64 = 10 * 1024 * 1024;
+    var writes: u64 = 10 * 1024 * 1024;
+    var pages: graph_page_store.PageStore = .{ .attempt = @splat(1), .domain = graph_page_store.PageStore.namespaceDomain("docs"), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const value = [_]u8{42} ** 16000;
+    var roots: [3]graph_page_root = undefined;
+    roots[0] = .{ .domain = pages.domain, .nodes = 6, .edges = 0, .page = try tree.apply(alloc, pages.store(), null, &.{
+        .{ .key = "a", .value = &value }, .{ .key = "b", .value = &value },
+        .{ .key = "c", .value = &value }, .{ .key = "d", .value = &value },
+        .{ .key = "e", .value = &value }, .{ .key = "f", .value = &value },
+    }) };
+    roots[1] = roots[0];
+    roots[1].page = try tree.apply(alloc, pages.store(), roots[0].page, &.{.{ .key = "c", .value = "current" }});
+    roots[2] = roots[1];
+    roots[2].page = try tree.apply(alloc, pages.store(), roots[1].page, &.{.{ .key = "f", .value = "candidate" }});
+    var refs: [3]manifest_mod.ArtifactRef = undefined;
+    var initialized: usize = 0;
+    defer for (refs[0..initialized]) |ref| {
+        alloc.free(ref.name);
+        alloc.free(ref.artifact_id);
+        alloc.free(ref.checksum);
+    };
+    for (roots, &refs, 0..) |root, *ref, i| {
+        ref.* = try pages.publishRoot(alloc, root, "graph");
+        initialized += 1;
+        var single = [_]manifest_mod.ArtifactRef{ref.*};
+        try manifests.put(.{
+            .namespace = "docs",
+            .version = i + 1,
+            .built_at_ns = i + 1,
+            .wal_start_lsn = i + 1,
+            .wal_end_lsn = i + 1,
+            .publication_lineage_tracked = true,
+            .publication_parent_version = if (i == 0) null else i,
+            .stats = .{ .document_count = 1, .document_base_version = i + 1 },
+            .artifacts = &single,
+        });
+    }
+    try std.testing.expect(try progress.compareAndSwapHead("docs", null, 2));
+    var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
+    var unix: u64 = 100;
+    pruner.read_lease_clock = .{ .ptr = &unix, .unix_fn = struct {
+        fn read(ptr: *const anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+    }.read };
+    const lease = try read_lease.acquireAt(&progress, "docs", 1, unix, unix);
+    var pinned = try pruner.pruneNamespace("docs", 1);
+    defer pinned.deinit(alloc);
+    try std.testing.expectEqual(0, pinned.deleted_versions);
+    try std.testing.expectEqual(0, pinned.deleted_artifacts);
+    try std.testing.expect(roots[0].eql(try pages.loadRoot(alloc, refs[0])));
+    try std.testing.expectError(error.ManifestVersionRetired, read_lease.acquireAt(&progress, "docs", 1, unix, unix));
+    // Increasing retention cannot resurrect retired history, but the existing
+    // reader still protects its tree until expiration plus clock-skew grace.
+    var widened = try pruner.pruneNamespace("docs", 100);
+    defer widened.deinit(alloc);
+    try std.testing.expectEqual(0, widened.deleted_versions);
+    unix = lease.unix_deadline + read_lease.gc_grace_ns + 1;
+    var first = try pruner.pruneNamespace("docs", 1);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(1, first.deleted_versions);
+    try std.testing.expect(first.deleted_artifacts > 1);
+    try std.testing.expectEqual(@as(?u64, null), try progress.getManifestReadDeadline("docs", 1));
+    try std.testing.expectError(error.FileNotFound, pages.loadRoot(alloc, refs[0]));
+    for (1..3) |i| {
+        try std.testing.expect(roots[i].eql(try pages.loadRoot(alloc, refs[i])));
+        var cursor = try tree.Cursor.init(alloc, pages.store(), roots[i].page, "", null);
+        defer cursor.deinit();
+        var count: usize = 0;
+        while (try cursor.next()) |_| count += 1;
+        try std.testing.expectEqual(6, count);
+    }
+    try std.testing.expect(try progress.compareAndSwapHead("docs", 2, 3));
+    var second = try pruner.pruneNamespace("docs", 1);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(1, second.deleted_versions);
+    try std.testing.expectError(error.FileNotFound, pages.loadRoot(alloc, refs[1]));
+    var cursor = try tree.Cursor.init(alloc, pages.store(), roots[2].page, "f", null);
+    defer cursor.deinit();
+    try std.testing.expectEqualStrings("candidate", (try cursor.next()).?.value);
+}
+
+test "serverless retention increases after GC without confusing missing history with corruption" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |committed_gc| {
+        var memory = objectstore.MemoryClient.init(alloc);
+        defer memory.deinit();
+        var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "artifacts", "tenant");
+        var artifacts = artifact_impl.artifactStore();
+        defer artifacts.deinit();
+        var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "manifests", "tenant");
+        var manifests = manifest_impl.manifestStore();
+        defer manifests.deinit();
+        var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress", "tenant");
+        var progress = progress_impl.progressStore();
+        defer progress.deinit();
+        var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "wal", "tenant");
+        var wal = wal_impl.walStore();
+        defer wal.deinit();
+        var artifact = try artifacts.put("shared");
+        defer artifact.deinit(alloc);
+        // Enrichment/compaction can publish multiple versions at the same WAL
+        // position. That position must not stand in for the manifest boundary.
+        try putTestManifestWithLineage(&manifests, 1, 42, artifact, true, null);
+        try putTestManifestWithLineage(&manifests, 2, 42, artifact, true, 1);
+        try putTestManifestWithLineage(&manifests, 3, 42, artifact, true, 2);
+        try std.testing.expect(try progress.compareAndSwapHead("docs", null, 3));
+        var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
+        if (committed_gc) {
+            var first = try pruner.pruneNamespace("docs", 2);
+            defer first.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), first.deleted_versions);
+            try std.testing.expectEqual(@as(?u64, 2), try progress.getManifestGcFloor("docs"));
+        } else {
+            // A WAL watermark plus a missing ancestor is NOT proof of GC.
+            try std.testing.expect(try progress.compareAndSwapGcWatermark("docs", null, 42));
+            try manifests.deleteVersion("docs", 1);
+        }
+        var reopened_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress", "tenant");
+        var reopened = reopened_impl.progressStore();
+        defer reopened.deinit();
+        pruner.progress = &reopened;
+        if (!committed_gc) {
+            try std.testing.expectError(error.PublishedLineageManifestMissing, pruner.pruneNamespace("docs", 5));
+            try std.testing.expectEqual(@as(?u64, null), try reopened.getManifestGcFloor("docs"));
+            continue;
+        }
+        var increased = try pruner.pruneNamespace("docs", 5);
+        defer increased.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), increased.kept_versions);
+        try std.testing.expectEqual(@as(usize, 0), increased.deleted_versions);
+        try std.testing.expectEqual(@as(?u64, 2), try reopened.getManifestGcFloor("docs"));
+        // Even with a GC boundary, losing its retained root remains corruption.
+        try manifests.deleteVersion("docs", 2);
+        try std.testing.expectError(error.PublishedLineageManifestMissing, pruner.pruneNamespace("docs", 5));
+        try manifests.deleteVersion("docs", 3);
+        try std.testing.expectError(error.PublishedHeadManifestMissing, pruner.pruneNamespace("docs", 5));
+    }
+}
+
+test "serverless retention snapshots HEAD before concurrent publication and fails closed on missing roots" {
+    const Race = struct {
+        manifests: *manifest_mod.ManifestStore,
+        progress: *catalog_mod.ProgressStore,
+        artifact: artifacts_mod.ArtifactMetadata,
+        fired: bool = false,
+        remove_old: bool = false,
+
+        fn state(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn list(ptr: *anyopaque, alloc: Allocator, namespace: []const u8) ![]u64 {
+            const self = state(ptr);
+            // Snapshot the listing, then let a publisher durably install a
+            // new manifest and HEAD before the list request returns.
+            const versions = try self.manifests.listVersionsAlloc(namespace);
+            errdefer alloc.free(versions);
+            self.fired = true;
+            try putTestManifest(self.manifests, 2, 2, self.artifact);
+            try std.testing.expect(try self.progress.compareAndSwapHead(namespace, 1, 2));
+            if (self.remove_old) {
+                // A concurrent retention worker can also prune the old root.
+                try self.manifests.deleteVersion(namespace, 1);
+                const replacement = try alloc.dupe(u64, &.{2});
+                alloc.free(versions);
+                return replacement;
+            }
+            return versions;
+        }
+        fn get(ptr: *anyopaque, _: Allocator, namespace: []const u8, version: u64) !manifest_mod.Manifest {
+            return state(ptr).manifests.getAlloc(namespace, version);
+        }
+        fn put(ptr: *anyopaque, manifest: manifest_mod.Manifest) !void {
+            return state(ptr).manifests.put(manifest);
+        }
+        fn setHead(ptr: *anyopaque, namespace: []const u8, version: u64) !void {
+            return state(ptr).manifests.setHead(namespace, version);
+        }
+        fn getHead(ptr: *anyopaque, namespace: []const u8) !u64 {
+            return state(ptr).manifests.getHead(namespace);
+        }
+        fn casHead(ptr: *anyopaque, namespace: []const u8, expected: ?u64, version: u64) !bool {
+            return state(ptr).manifests.compareAndSwapHead(namespace, expected, version);
+        }
+        fn delete(ptr: *anyopaque, namespace: []const u8, version: u64) !void {
+            return state(ptr).manifests.deleteVersion(namespace, version);
+        }
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        const vtable: manifest_mod.ManifestStore.VTable = .{
+            .deinit = deinit,
+            .put = put,
+            .get_alloc = get,
+            .set_head = setHead,
+            .get_head = getHead,
+            .compare_and_swap_head = casHead,
+            .list_versions_alloc = list,
+            .delete_version = delete,
+        };
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |remove_old| {
+        var memory = objectstore.MemoryClient.init(alloc);
+        defer memory.deinit();
+        var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "artifacts", "tenant");
+        var artifacts = artifact_impl.artifactStore();
+        defer artifacts.deinit();
+        var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "manifests", "tenant");
+        var manifests = manifest_impl.manifestStore();
+        defer manifests.deinit();
+        var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress", "tenant");
+        var progress = progress_impl.progressStore();
+        defer progress.deinit();
+        var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "wal", "tenant");
+        var wal = wal_impl.walStore();
+        defer wal.deinit();
+        var artifact = try artifacts.put("shared");
+        defer artifact.deinit(alloc);
+        try putTestManifest(&manifests, 1, 1, artifact);
+        var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
+        // An unpublished candidate is harmless and must not trigger cleanup.
+        var unpublished = try pruner.pruneNamespace("docs", 1);
+        defer unpublished.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), unpublished.deleted_versions);
+        try std.testing.expect(try progress.compareAndSwapHead("docs", null, 1));
+        var race: Race = .{ .manifests = &manifests, .progress = &progress, .artifact = artifact, .remove_old = remove_old };
+        var racing_manifests: manifest_mod.ManifestStore = .{ .allocator = alloc, .ptr = &race, .vtable = &Race.vtable };
+        pruner.manifests = &racing_manifests;
+        var result = try pruner.pruneNamespace("docs", 1);
+        defer result.deinit(alloc);
+        try std.testing.expect(race.fired);
+        try std.testing.expectEqual(@as(usize, 0), result.deleted_versions);
+        try std.testing.expectEqual(@as(usize, 0), result.deleted_artifacts);
+        try std.testing.expectEqual(@as(u64, 2), try progress.getHead("docs"));
+        var head = try manifests.getAlloc("docs", 2);
+        defer head.deinit(alloc);
+        // A genuinely missing published root, even with an empty listing,
+        // must still stop retention before destructive work.
+        pruner.manifests = &manifests;
+        try manifests.deleteVersion("docs", 2);
+        try std.testing.expectError(error.PublishedHeadManifestMissing, pruner.pruneNamespace("docs", 1));
+        if (!remove_old) try manifests.deleteVersion("docs", 1);
+        try std.testing.expectError(error.PublishedHeadManifestMissing, pruner.pruneNamespace("docs", 1));
+    }
+}
+
+test "serverless retention never sweeps recreated candidate artifacts or deletes replacement manifests" {
+    const Race = struct {
+        manifests: *manifest_mod.ManifestStore,
+        replacement: manifest_mod.Manifest,
+        replace_before_collection: bool,
+        candidate_reads: usize = 0,
+        fired: bool = false,
+
+        fn state(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn replace(self: *@This()) !void {
+            if (self.fired) return;
+            self.fired = true;
+            try std.testing.expect(try self.manifests.deleteRetiredCandidate("docs", self.replacement.version, 2));
+            try self.manifests.put(self.replacement);
+        }
+        fn get(ptr: *anyopaque, alloc: Allocator, ns: []const u8, version: u64) !manifest_mod.Manifest {
+            const self = state(ptr);
+            if (version == self.replacement.version) {
+                self.candidate_reads += 1;
+                if (self.replace_before_collection and self.candidate_reads == 2) try self.replace();
+            }
+            return self.manifests.vtable.get_alloc(self.manifests.ptr, alloc, ns, version);
+        }
+        fn removeCandidate(ptr: *anyopaque, ns: []const u8, version: u64, cutoff: u64) !bool {
+            const self = state(ptr);
+            try self.replace();
+            return self.manifests.deleteRetiredCandidate(ns, version, cutoff);
+        }
+        fn put(ptr: *anyopaque, manifest: manifest_mod.Manifest) !void {
+            return state(ptr).manifests.put(manifest);
+        }
+        fn setHead(ptr: *anyopaque, ns: []const u8, version: u64) !void {
+            return state(ptr).manifests.setHead(ns, version);
+        }
+        fn getHead(ptr: *anyopaque, ns: []const u8) !u64 {
+            return state(ptr).manifests.getHead(ns);
+        }
+        fn cas(ptr: *anyopaque, ns: []const u8, expected: ?u64, version: u64) !bool {
+            return state(ptr).manifests.compareAndSwapHead(ns, expected, version);
+        }
+        fn list(ptr: *anyopaque, alloc: Allocator, ns: []const u8) ![]u64 {
+            const self = state(ptr);
+            return self.manifests.vtable.list_versions_alloc(self.manifests.ptr, alloc, ns);
+        }
+        fn remove(ptr: *anyopaque, ns: []const u8, version: u64) !void {
+            return state(ptr).manifests.deleteVersion(ns, version);
+        }
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        const vtable: manifest_mod.ManifestStore.VTable = .{
+            .deinit = deinit,
+            .put = put,
+            .get_alloc = get,
+            .set_head = setHead,
+            .get_head = getHead,
+            .compare_and_swap_head = cas,
+            .list_versions_alloc = list,
+            .delete_version = remove,
+            .delete_retired_candidate = removeCandidate,
+        };
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |has_head| {
+        for ([_]bool{ false, true }) |replace_before_collection| {
+            if (!has_head and replace_before_collection) continue;
+            var memory = objectstore.MemoryClient.init(alloc);
+            defer memory.deinit();
+            var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "artifacts", "");
+            var artifacts = artifact_impl.artifactStore();
+            defer artifacts.deinit();
+            var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "manifests", "");
+            var manifests = manifest_impl.manifestStore();
+            defer manifests.deinit();
+            var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress", "");
+            var progress = progress_impl.progressStore();
+            defer progress.deinit();
+            var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "wal", "");
+            var wal = wal_impl.walStore();
+            defer wal.deinit();
+            var old_artifact = try artifacts.put("old");
+            defer old_artifact.deinit(alloc);
+            var replacement_artifact = try artifacts.put("new publication body");
+            defer replacement_artifact.deinit(alloc);
+            if (has_head) {
+                try putTestManifest(&manifests, 1, 0, old_artifact);
+                try std.testing.expect(try progress.compareAndSwapHead("docs", null, 1));
+            }
+            const candidate_version: u64 = if (has_head) 2 else 1;
+            var old_refs = [_]manifest_mod.ArtifactRef{.{ .kind = .document_segment, .artifact_id = old_artifact.artifact_id, .checksum = old_artifact.checksum, .byte_len = old_artifact.byte_len }};
+            var candidate: manifest_mod.Manifest = .{
+                .namespace = "docs",
+                .version = candidate_version,
+                .built_at_ns = 1,
+                .wal_start_lsn = 0,
+                .wal_end_lsn = 0,
+                .stats = .{},
+                .artifacts = &old_refs,
+                .publication_fencing_token = 1,
+            };
+            try manifests.put(candidate);
+            // Reserve the old worker's token; the collector obtains token 2.
+            var old_lease = (try work_lease.acquireHeld(try progress.workLeaseProvider(), std.testing.io, "docs", "old", std.time.ns_per_s)).?;
+            try std.testing.expect(try old_lease.release());
+            var new_refs = [_]manifest_mod.ArtifactRef{.{ .kind = .document_segment, .artifact_id = replacement_artifact.artifact_id, .checksum = replacement_artifact.checksum, .byte_len = replacement_artifact.byte_len }};
+            candidate.publication_fencing_token = 3;
+            candidate.artifacts = &new_refs;
+            var race: Race = .{ .manifests = &manifests, .replacement = candidate, .replace_before_collection = replace_before_collection };
+            var wrapped: manifest_mod.ManifestStore = .{ .allocator = alloc, .ptr = &race, .vtable = &Race.vtable };
+            var pruner = Pruner.init(alloc, &artifacts, &wrapped, &progress, &wal);
+            var result = try pruner.pruneNamespace("docs", 1);
+            defer result.deinit(alloc);
+            try std.testing.expect(race.fired);
+            try std.testing.expectEqual(@as(usize, 0), result.deleted_versions);
+            var preserved = try manifests.getAlloc("docs", candidate_version);
+            defer preserved.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 3), preserved.publication_fencing_token);
+            const body = try artifacts.getAlloc(replacement_artifact.artifact_id);
+            defer alloc.free(body);
+            try std.testing.expectEqualStrings("new publication body", body);
+            try std.testing.expect(try progress.compareAndSwapHead("docs", if (has_head) 1 else null, candidate_version));
+        }
+    }
+}
+
+test "serverless retention preserves shared artifacts referenced above head" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+
+    var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "artifacts-shared-orphan", "tenant");
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "manifests-shared-orphan", "tenant");
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+    var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress-shared-orphan", "tenant");
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "wal-shared-orphan", "tenant");
+    var wal = wal_impl.walStore();
+    defer wal.deinit();
+
+    var shared_artifact = try artifacts.put("shared");
+    defer shared_artifact.deinit(alloc);
+    var head_artifact = try artifacts.put("head");
+    defer head_artifact.deinit(alloc);
+    try putTestManifest(&manifests, 1, 1, shared_artifact);
+    try putTestManifest(&manifests, 2, 2, head_artifact);
+    try putTestManifest(&manifests, 3, 3, shared_artifact);
+    try std.testing.expect(try progress.compareAndSwapHead("docs", null, 2));
+
+    var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
+    var result = try pruner.pruneNamespace("docs", 1);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.deleted_versions);
+    try std.testing.expectEqual(@as(usize, 0), result.deleted_artifacts);
+    const shared = try artifacts.getAlloc(shared_artifact.artifact_id);
+    defer alloc.free(shared);
+    try std.testing.expectEqualStrings("shared", shared);
+}
+
+test "serverless retention follows publication lineage around lower orphan" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+
+    var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "artifacts-lineage", "tenant");
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "manifests-lineage", "tenant");
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+    var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress-lineage", "tenant");
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "wal-lineage", "tenant");
+    var wal = wal_impl.walStore();
+    defer wal.deinit();
+
+    var first_artifact = try artifacts.put("first-visible");
+    defer first_artifact.deinit(alloc);
+    var orphan_artifact = try artifacts.put("lower-orphan");
+    defer orphan_artifact.deinit(alloc);
+    var head_artifact = try artifacts.put("new-head");
+    defer head_artifact.deinit(alloc);
+    try putTestManifestWithLineage(&manifests, 1, 1, first_artifact, true, null);
+    try putTestManifestWithLineage(&manifests, 2, 2, orphan_artifact, true, 1);
+    try putTestManifestWithLineage(&manifests, 3, 3, head_artifact, true, 1);
+    try std.testing.expect(try progress.compareAndSwapHead("docs", null, 3));
+    const expected_progress: catalog_mod.EnrichmentStageProgress = .{ .head_version = 3, .doc_offset = 1, .revision = 1, .pipeline_version = 1, .after_order_key = "00000001a\x00b", .cycle_upper_order_key = "00000001z" };
+    try std.testing.expect(try progress.compareAndSwapEnrichmentStageProgress(
+        "docs",
+        .lexical_sparse,
+        null,
+        expected_progress,
+    ));
+    var progress_client = memory.client();
+    var progress_before = try progress_client.listObjects("progress-lineage", .{ .prefix = "tenant/docs/ENRICHMENT/" });
+    defer progress_before.deinit(alloc);
+
+    var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
+    var result = try pruner.pruneNamespace("docs", 2);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.kept_versions);
+    try std.testing.expectEqual(@as(usize, 1), result.deleted_versions);
+    const versions = try manifests.listVersionsAlloc("docs");
+    defer alloc.free(versions);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 3 }, versions);
+    var retained_progress = (try progress.getEnrichmentStageProgress("docs", .lexical_sparse)).?;
+    defer retained_progress.deinit(progress.allocator);
+    try std.testing.expect(expected_progress.eql(retained_progress));
+    var progress_after = try progress_client.listObjects("progress-lineage", .{ .prefix = "tenant/docs/ENRICHMENT/" });
+    defer progress_after.deinit(alloc);
+    try std.testing.expectEqual(progress_before.entries.len, progress_after.entries.len);
+    try std.testing.expectError(error.FileNotFound, artifacts.getAlloc(orphan_artifact.artifact_id));
+    const first = try artifacts.getAlloc(first_artifact.artifact_id);
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("first-visible", first);
+}
+
+test "serverless retention ignores unpublished manifests above the visible head" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+
+    var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(
+        alloc,
+        memory.client(),
+        "artifacts",
+        "tenant",
+    );
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(
+        alloc,
+        memory.client(),
+        "manifests",
+        "tenant",
+    );
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+    var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(
+        alloc,
+        memory.client(),
+        "progress",
+        "tenant",
+    );
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var wal_impl = try wal_object_store.ObjectStore.initWithClient(
+        alloc,
+        memory.client(),
+        "wal",
+        "tenant",
+    );
+    var wal = wal_impl.walStore();
+    defer wal.deinit();
+
+    var old_artifact = try artifacts.put("old");
+    defer old_artifact.deinit(alloc);
+    var active_artifact = try artifacts.put("active");
+    defer active_artifact.deinit(alloc);
+    var orphan_artifact = try artifacts.put("orphan");
+    defer orphan_artifact.deinit(alloc);
+    try putTestManifest(&manifests, 1, 1, old_artifact);
+    try putTestManifest(&manifests, 2, 2, active_artifact);
+    try putTestManifest(&manifests, 3, 3, orphan_artifact);
+    try std.testing.expect(try progress.compareAndSwapHead("docs", null, 2));
+
+    var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
+    var result = try pruner.pruneNamespace("docs", 1);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.kept_versions);
+    try std.testing.expectEqual(@as(usize, 1), result.deleted_versions);
+
+    const active = try artifacts.getAlloc(active_artifact.artifact_id);
+    defer alloc.free(active);
+    try std.testing.expectEqualStrings("active", active);
+    const orphan = try artifacts.getAlloc(orphan_artifact.artifact_id);
+    defer alloc.free(orphan);
+    try std.testing.expectEqualStrings("orphan", orphan);
+    try std.testing.expectError(error.FileNotFound, artifacts.getAlloc(old_artifact.artifact_id));
+
+    const versions = try manifests.listVersionsAlloc("docs");
+    defer alloc.free(versions);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3 }, versions);
+}
+
+test "serverless retention resumes artifact cleanup after cancellation" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+
+    var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "artifacts-resume", "tenant");
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "manifests-resume", "tenant");
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+    var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress-resume", "tenant");
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "wal-resume", "tenant");
+    var wal = wal_impl.walStore();
+    defer wal.deinit();
+
+    var first_artifact = try artifacts.put("first");
+    defer first_artifact.deinit(alloc);
+    var second_artifact = try artifacts.put("second");
+    defer second_artifact.deinit(alloc);
+    var head_artifact = try artifacts.put("head");
+    defer head_artifact.deinit(alloc);
+    try putTestManifest(&manifests, 1, 1, first_artifact);
+    try putTestManifest(&manifests, 2, 2, second_artifact);
+    try putTestManifest(&manifests, 3, 3, head_artifact);
+    try std.testing.expect(try progress.compareAndSwapHead("docs", null, 3));
+
+    var requested = std.atomic.Value(bool).init(false);
+    const CancelAfterFirstDelete = struct {
+        requested: *std.atomic.Value(bool),
+        checkpoints: usize = 0,
+
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.checkpoints += 1;
+            if (self.checkpoints == 6) self.requested.store(true, .release);
+        }
+    };
+    var cancel_state = CancelAfterFirstDelete{ .requested = &requested };
+    const token = (maintenance_cancellation.Token{
+        .io = std.testing.io,
+        .requested = &requested,
+    }).withCheckpoint(&cancel_state, CancelAfterFirstDelete.checkpoint);
+
+    var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
+    try std.testing.expectError(error.Canceled, pruner.pruneNamespaceUntil("docs", 1, token));
+    const interrupted_versions = try manifests.listVersionsAlloc("docs");
+    defer alloc.free(interrupted_versions);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, interrupted_versions);
+    var removed_artifacts: usize = 0;
+    for ([_][]const u8{ first_artifact.artifact_id, second_artifact.artifact_id }) |id| {
+        const payload = artifacts.getAlloc(id) catch |err| switch (err) {
+            error.FileNotFound => {
+                removed_artifacts += 1;
+                continue;
+            },
+            else => return err,
+        };
+        alloc.free(payload);
+    }
+    try std.testing.expectEqual(@as(usize, 1), removed_artifacts);
+
+    // A larger policy cannot resurrect versions whose deletion was already
+    // committed, including manifests left behind by interrupted artifact GC.
+    try std.testing.expectEqual(@as(?u64, 3), try progress.getManifestGcFloor("docs"));
+    var resumed = try pruner.pruneNamespace("docs", 3);
+    defer resumed.deinit(alloc);
+    const final_versions = try manifests.listVersionsAlloc("docs");
+    defer alloc.free(final_versions);
+    try std.testing.expectEqualSlices(u64, &.{3}, final_versions);
+    try std.testing.expectError(error.FileNotFound, artifacts.getAlloc(first_artifact.artifact_id));
+    try std.testing.expectError(error.FileNotFound, artifacts.getAlloc(second_artifact.artifact_id));
+    const head_payload = try artifacts.getAlloc(head_artifact.artifact_id);
+    defer alloc.free(head_payload);
+    try std.testing.expectEqualStrings("head", head_payload);
+}
+
+test "serverless retention pruner retains recent manifests and truncates WAL history" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -236,12 +1299,20 @@ test "pruner retains recent manifests and truncates WAL history" {
     defer build_third.deinit(alloc);
 
     var pruner = Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    // Completed writers conservatively leave their source pins until expiry.
+    // Exercise reclamation after that protection interval, never through it.
+    const gc_now = @import("antfly_platform").time.realtimeNs() + read_lease.duration_ns + read_lease.gc_grace_ns + 1;
+    pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
+        fn now(ptr: *const anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+    }.now };
     var result = try pruner.pruneNamespace("docs", 2);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), result.kept_versions);
     try std.testing.expectEqual(@as(usize, 1), result.deleted_versions);
-    try std.testing.expectEqual(@as(usize, 3), result.deleted_artifacts);
+    try std.testing.expect(result.deleted_artifacts >= 3);
     try std.testing.expectEqual(@as(u64, 3), result.wal_keep_from_lsn);
     try std.testing.expectEqual(@as(u64, 2), result.wal_records_removed);
 
@@ -258,7 +1329,7 @@ test "pruner retains recent manifests and truncates WAL history" {
     try std.testing.expectError(error.FileNotFound, artifact_store.getAlloc(first_artifact_b));
 }
 
-test "concurrent pruners observe gc watermark conflict" {
+test "serverless retention concurrent pruners observe gc watermark conflict" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -333,13 +1404,14 @@ test "concurrent pruners observe gc watermark conflict" {
         .pruner_a = Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store),
         .pruner_b = Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store),
     };
-    const thread_a = try std.Thread.spawn(.{}, RaceState.runA, .{&state});
-    const thread_b = try std.Thread.spawn(.{}, RaceState.runB, .{&state});
-    thread_a.join();
-    thread_b.join();
-
     defer if (state.result_a) |*result| result.deinit(alloc);
     defer if (state.result_b) |*result| result.deinit(alloc);
+    var thread_a = try std.testing.io.concurrent(RaceState.runA, .{&state});
+    defer thread_a.await(std.testing.io);
+    var thread_b = try std.testing.io.concurrent(RaceState.runB, .{&state});
+    thread_a.await(std.testing.io);
+    thread_b.await(std.testing.io);
+
     try std.testing.expect(state.result_a != null);
     try std.testing.expect(state.result_b != null);
     try std.testing.expectEqual(@as(?u64, 1), try progress_store.getGcWatermark("docs"));

@@ -30,15 +30,14 @@ const Config = struct {
 
 const SearchWorker = struct {
     db: *db_mod.DB,
-    start: *std.atomic.Value(u8),
+    io: std.Io,
+    start: *std.Io.Event,
     stop: *std.atomic.Value(u8),
     completed: *std.atomic.Value(u64),
     failed: *std.atomic.Value(u64),
 
     fn run(self: *@This()) void {
-        while (self.start.load(.monotonic) == 0) {
-            std.Thread.yield() catch {};
-        }
+        self.start.waitUncancelable(self.io);
         while (self.stop.load(.monotonic) == 0) {
             var result = self.db.search(std.heap.c_allocator, .{
                 .index_name = "ft_idx",
@@ -73,29 +72,40 @@ pub fn main(init: std.process.Init) !void {
     });
     try preloadDocs(alloc, &db, cfg);
 
-    var start = std.atomic.Value(u8).init(0);
+    var worker_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(cfg.search_threads) });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
+    var start: std.Io.Event = .unset;
     var stop = std.atomic.Value(u8).init(0);
     var completed = std.atomic.Value(u64).init(0);
     var failed = std.atomic.Value(u64).init(0);
 
     const workers = try alloc.alloc(SearchWorker, cfg.search_threads);
     defer alloc.free(workers);
-    const threads = try alloc.alloc(std.Thread, cfg.search_threads);
+    const threads = try alloc.alloc(std.Io.Future(void), cfg.search_threads);
     defer alloc.free(threads);
 
+    var started_tasks: usize = 0;
+    defer {
+        stop.store(1, .monotonic);
+        start.set(scheduling_io);
+        for (threads[0..started_tasks]) |*future| future.await(scheduling_io);
+    }
     for (workers, 0..) |*worker, i| {
         worker.* = .{
             .db = &db,
+            .io = scheduling_io,
             .start = &start,
             .stop = &stop,
             .completed = &completed,
             .failed = &failed,
         };
-        threads[i] = try std.Thread.spawn(.{}, SearchWorker.run, .{worker});
+        threads[i] = try scheduling_io.concurrent(SearchWorker.run, .{worker});
+        started_tasks += 1;
     }
 
     const before = db.snapshotApplyLockStats();
-    start.store(1, .monotonic);
+    start.set(scheduling_io);
 
     const started_ns = nowNs();
     for (0..cfg.write_batches) |batch_idx| {
@@ -109,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
     const elapsed_ns = elapsedSince(started_ns);
 
     stop.store(1, .monotonic);
-    for (threads) |thread| thread.join();
+    for (threads) |*future| future.await(scheduling_io);
 
     const after = db.snapshotApplyLockStats();
     printSummary(cfg, elapsed_ns, completed.load(.monotonic), failed.load(.monotonic), deltaStats(after, before));

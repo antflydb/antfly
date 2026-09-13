@@ -82,8 +82,8 @@ test "lockYielding acquires a mutex released by another thread" {
             m.unlock();
         }
     };
-    const thread = try std.Thread.spawn(.{}, Holder.release, .{&mutex});
+    var thread = try std.testing.io.concurrent(Holder.release, .{&mutex});
     lockYielding(&mutex);
-    thread.join();
+    thread.await(std.testing.io);
     mutex.unlock();
 }
