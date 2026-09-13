@@ -14,6 +14,9 @@
 
 const std = @import("std");
 const antfly = @import("runtime_root.zig");
+const storage_source_options = @import("storage_source_options");
+const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
+const metadata_replica_root_client = @import("../storage/metadata_replica_root_client.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const group_ids = @import("../common/group_ids.zig");
@@ -26,7 +29,51 @@ const metadata_http_client = @import("http_client.zig");
 const platform_time = @import("antfly_platform").time;
 const thread_config = @import("../runtime_thread_config.zig");
 
-const setup_io_thread_stack_size = thread_config.minimum_partitioned_stack_size;
+const linked_storage = storage_source_options.control_only;
+const StorageKernelContext = if (linked_storage)
+    kernel_owner_client.Context
+else
+    struct {
+        fn deinit(self: *@This()) void {
+            self.* = .{};
+        }
+    };
+
+fn storageKernelContextHandle(context: ?StorageKernelContext) ?*anyopaque {
+    if (comptime linked_storage) {
+        return if (context) |value| value.handle else null;
+    }
+    return null;
+}
+
+const LegacyAuthBackend = if (linked_storage) struct {} else antfly.lsm_backend.BackendHandle;
+const KernelReplicaRootReconciler = if (linked_storage) struct {
+    alloc: std.mem.Allocator,
+    context: ?*anyopaque,
+    replica_root_dir: []const u8,
+
+    fn hook(self: *@This()) antfly.metadata_service.LocalReplicaRootReconcileHook {
+        return .{ .ptr = self, .vtable = &.{ .run = reconcile } };
+    }
+
+    fn reconcile(
+        ptr: *anyopaque,
+        request: antfly.metadata_service.LocalReplicaRootReconcileHook.Request,
+    ) !metadata_replica_root_client.ProvisionSummary {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try metadata_replica_root_client.reconcile(
+            self.alloc,
+            self.context,
+            self.replica_root_dir,
+            request.metadata_group_id,
+            request.group_ids,
+            request.tables,
+            request.ranges,
+        );
+    }
+} else struct {};
+
+const setup_io_thread_stack_size = 1 * 1024 * 1024;
 const metadata_raft_retained_entries = 1024;
 const metadata_raft_compaction_min_interval_entries = 512;
 const metadata_raft_election_max_ticks = 60;
@@ -430,6 +477,7 @@ pub const ServerConfig = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*antfly.common.secrets.FileStore = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
+    storage_context: ?*anyopaque = null,
 };
 
 const MetadataRaftStorageDiagnostics = struct {
@@ -496,6 +544,7 @@ pub const Server = struct {
     snapshot_root_dir: []u8,
     bind_host: []u8,
     admin_bind_host: []u8,
+    kernel_replica_root_reconciler: ?*KernelReplicaRootReconciler = null,
     reallocation_protocol_peers: []antfly.metadata_service.ReallocationProtocolPeer,
     raft_storage_diagnostics: MetadataRaftStorageDiagnosticsCache = .{},
 
@@ -526,6 +575,18 @@ pub const Server = struct {
         errdefer alloc.free(result.bind_host);
         result.admin_bind_host = try alloc.dupe(u8, cfg.admin_bind_host);
         errdefer alloc.free(result.admin_bind_host);
+        result.kernel_replica_root_reconciler = null;
+        if (comptime linked_storage) {
+            const reconciler = try alloc.create(KernelReplicaRootReconciler);
+            reconciler.* = .{
+                .alloc = alloc,
+                .context = cfg.storage_context,
+                .replica_root_dir = result.replica_root_dir,
+            };
+            result.kernel_replica_root_reconciler = reconciler;
+        }
+        errdefer if (comptime linked_storage) if (result.kernel_replica_root_reconciler) |reconciler|
+            alloc.destroy(reconciler);
         result.reallocation_protocol_peers = try reallocationProtocolPeersFromClusterPeers(alloc, cfg.metadata_cluster_peers);
         errdefer freeReallocationProtocolPeers(alloc, result.reallocation_protocol_peers);
         const service_cfg = antfly.metadata_service.MetadataServiceConfig{
@@ -568,6 +629,7 @@ pub const Server = struct {
         }, .{
             .http = .{
                 .http = .{
+                    .data_apply_storage_context = cfg.storage_context,
                     .http = .{
                         .host = .{
                             .descriptor_factory = result.factory.iface(),
@@ -577,6 +639,9 @@ pub const Server = struct {
             },
         });
         errdefer result.server.deinit();
+        if (comptime linked_storage) {
+            result.server.setLocalReplicaRootReconcileHook(result.kernel_replica_root_reconciler.?.hook());
+        }
         return result;
     }
 
@@ -590,6 +655,8 @@ pub const Server = struct {
     ) void {
         self.server.deinitWithDeadline(deadline);
         freeReallocationProtocolPeers(self.alloc, self.reallocation_protocol_peers);
+        if (comptime linked_storage) if (self.kernel_replica_root_reconciler) |reconciler|
+            self.alloc.destroy(reconciler);
         self.alloc.free(self.admin_bind_host);
         self.alloc.free(self.bind_host);
         self.alloc.free(self.snapshot_root_dir);
@@ -1028,18 +1095,48 @@ pub fn runFromIterator(
     );
     defer active_audio_runtime.deinit();
 
-    var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
+    var storage_kernel_context: ?StorageKernelContext = null;
+    defer if (storage_kernel_context) |*context| context.deinit();
+    if (comptime linked_storage) {
+        var context = kernel_owner_client.Context{};
+        try context.ensureWith(.{
+            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        });
+        storage_kernel_context = context;
+        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
+        defer alloc.free(security_json);
+        try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+    }
+
+    var auth_backend: ?LegacyAuthBackend = null;
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_users_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_casbin_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_users_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_casbin_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
     var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
     if (auth_enabled) {
-        auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
-        errdefer if (auth_backend) |*backend| backend.close();
-        auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
-        errdefer if (auth_runtime) |*runtime| runtime.deinit();
-        auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
-        auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        if (comptime linked_storage) {
+            kernel_auth_users_store = try storage_kernel_context.?.systemStore(alloc, "system/auth-users");
+            errdefer kernel_auth_users_store.?.deinit();
+            kernel_auth_casbin_store = try storage_kernel_context.?.systemStore(alloc, "system/auth-casbin");
+            errdefer kernel_auth_casbin_store.?.deinit();
+            kernel_auth_users_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_users_store.?, "usermgr_users");
+            errdefer kernel_auth_users_runtime.?.deinit();
+            kernel_auth_casbin_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_casbin_store.?, "usermgr_casbin");
+            errdefer kernel_auth_casbin_runtime.?.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, kernel_auth_users_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, kernel_auth_casbin_runtime.?);
+        } else {
+            auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
+            errdefer if (auth_backend) |*backend| backend.close();
+            auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
+            errdefer if (auth_runtime) |*runtime| runtime.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        }
         user_manager = try antfly.usermgr.UserManager.initWithIo(
             alloc,
             setup_io.io(),
@@ -1049,9 +1146,13 @@ pub fn runFromIterator(
         errdefer if (user_manager) |*manager| manager.deinit();
         try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
-    defer if (user_manager) |*manager| manager.deinit();
+    defer if (comptime !linked_storage) if (auth_backend) |*backend| backend.close();
     defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (auth_backend) |*backend| backend.close();
+    defer if (kernel_auth_users_store) |*store| store.deinit();
+    defer if (kernel_auth_casbin_store) |*store| store.deinit();
+    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
+    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
+    defer if (user_manager) |*manager| manager.deinit();
 
     const trusted_principal_issuer = try resolveTrustedPrincipalIssuer(
         alloc,
@@ -1105,6 +1206,7 @@ pub fn runFromIterator(
             .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
+        .storage_context = storageKernelContextHandle(storage_kernel_context),
     });
     defer server.deinitWithDeadline(supervisor.deadline());
     try server.start();

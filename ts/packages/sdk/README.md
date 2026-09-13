@@ -374,7 +374,7 @@ Please ensure:
 
 ## Support
 
-For issues and feature requests, please use the [GitHub issue tracker](https://github.com/antfly/antfly-sdk-ts/issues).
+For issues and feature requests, please use the [GitHub issue tracker](https://github.com/antflydb/antfly/issues).
 
 ## Agent capacity errors
 

@@ -118,6 +118,8 @@ fn scanFile(
 
 fn isPlannerOwnedSource(path: []const u8) bool {
     return std.mem.endsWith(u8, path, "pkg/antfly/src/storage/db/algebraic/planner.zig") or
+        // Control owns index-free plans; physical index planning stays in planner.zig.
+        std.mem.endsWith(u8, path, "pkg/antfly/src/storage/db/algebraic/planner_control.zig") or
         std.mem.endsWith(u8, path, "pkg/antfly/src/storage/db/algebraic/ir.zig") or
         std.mem.endsWith(u8, path, "pkg/antfly/src/storage/db/algebraic/ownership_test.zig");
 }

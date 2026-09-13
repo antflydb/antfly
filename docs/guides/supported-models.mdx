@@ -52,7 +52,7 @@ antfly inference pull hf:nomic-ai/nomic-embed-text-v1.5 --tasks embed
 antfly inference pull hf:BAAI/bge-m3 --tasks embed
 antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
 antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
-antfly inference pull hf:antflydb/clipclap:gguf:Q4_K --tasks embed
+antfly inference pull antflydb/clipclap:gguf:Q4_K --tasks embed
 antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
 
@@ -151,7 +151,7 @@ Text generation works with the decoder artifacts listed above. Multimodal genera
 
 Gemma 4 26B-A4B support is intentionally narrower than dense Gemma 4. The GGUF must match the qualified 30-layer, 128-expert, top-8 Q4_0 layout. Metal supports bounded or resident placement. CUDA requires a 16 GiB resident A4B envelope and an SM89 GPU. Unsupported geometry, streamed CUDA, or unavailable kernels are rejected at load time rather than falling back to host MoE execution. Server deployments must also leave transient host/combined admission headroom for the encoded GGUF during CUDA upload; only the 16 GiB CUDA envelope remains leased after load.
 
-CUDA uses a bounded multithreaded pinned-host load pipeline by default. Clean GGUF pages remain kernel-reclaimable and shared across rolling workers. Production images can install a versioned `$MODEL/a4b-cuda-pack-v2` created with `antfly-inference a4b-pack`; use `a4b-pack --verify` after copying it. Server preloads automatically choose the loader worker count and staging budget, use a valid installed pack when available, and warn and use the canonical GGUF when an optional pack is unusable. Preloads eagerly publish a reusable model session. Hosts must have enough reclaimable memory for their checkpoint and loader working set, and should measure replacement-worker load time on the actual storage topology.
+CUDA uses a bounded multithreaded pinned-host load pipeline by default. Clean GGUF pages remain kernel-reclaimable and shared across rolling workers. Production images can install a versioned `$MODEL/a4b-cuda-pack-v2` pre-sharded expert pack. Server preloads automatically choose the loader worker count and staging budget, use a valid installed pack when available, and warn and use the canonical GGUF when an optional pack is unusable. Preloads eagerly publish a reusable model session. Hosts must have enough reclaimable memory for their checkpoint and loader working set, and should measure replacement-worker load time on the actual storage topology.
 
 ## Known Incompatible Artifacts and Families
 

@@ -4,6 +4,7 @@ import importlib.util
 import io
 import os
 import re
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -20,6 +21,16 @@ SPEC.loader.exec_module(launcher)
 
 
 class BoundedZigBuildTest(unittest.TestCase):
+    def test_runtime_memory_profiles(self):
+        # Exercise the admission policy itself without constructing or compiling
+        # the product graph. In particular, host/target and backend fallbacks
+        # must not inherit claims measured only for native Linux CPU releases.
+        subprocess.run(
+            [os.environ.get("ZIG", "zig"), "test", "pkg/antfly/build/runtime_memory.zig"],
+            cwd=SCRIPT.parents[1],
+            check=True,
+        )
+
     def test_ci_unit_watchdog_leaves_runtime_after_cold_compilation(self):
         workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text(
             encoding="utf-8"
@@ -49,22 +60,21 @@ class BoundedZigBuildTest(unittest.TestCase):
         # Production runtime construction owns the reservation. The root build
         # only composes owners; testing it would couple this contract to file
         # layout instead of the scheduler claim used by the storage artifact.
-        runtime_build = SCRIPT.parents[1] / "pkg/antfly/build/runtime.zig"
+        runtime_build = SCRIPT.parents[1] / "pkg/antfly/build/runtime_memory.zig"
         build = runtime_build.read_text(encoding="utf-8")
         workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text(
             encoding="utf-8"
         )
         claim = re.search(
-            r"\.distributed => @as\(usize, if \(target.result.os.tag == .macos\) "
-            r"(?P<macos>\d+) else (?P<linux>\d+)\) \* 1024 \* 1024 \* 1024",
+            r"\.storage_kernel => (?P<gib>\d+) \* 1024 \* 1024 \* 1024",
             build,
         )
         self.assertIsNotNone(
             claim, "update this contract when storage claims change shape"
         )
-        # ARC is Linux. Keep macOS's independently measured reservation out
-        # of this Linux scheduler contract, without losing the target branch.
-        required = int(claim.group("linux")) * 1024**3
+        # Physical storage is its own archive. The distributed reservation no
+        # longer includes DB codegen and cannot establish this admission check.
+        required = int(claim.group("gib")) * 1024**3
         caps = re.findall(r"--max-rss-cap (\d+)", workflow)
         self.assertTrue(caps)
         for cap in caps:

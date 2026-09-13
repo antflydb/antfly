@@ -112,6 +112,20 @@ That means:
 - explicit fields and schema-driven dynamic rules can emit `__keyword` / `__2gram`
 - dynamic templates emit a single field at the original path
 
+## Link Fields
+
+A field marked with the `link` type is not just indexed as a keyword; at
+enrichment time its value is treated as a URL to fetch and process before the
+result is used downstream. HTML content is run through readability-style
+article extraction, PDF content is extracted to text, and image content is
+converted for use as image data.
+
+Fetching a link field's URL goes through the same security defaults as other
+remote content fetches: private and loopback IP ranges are blocked by default,
+so a link field cannot be used to reach internal services, and a single
+download is capped at 100 MB so one link field cannot exhaust the fetch
+budget.
+
 ## Resolution Order
 
 Text indexing currently resolves dynamic fields in this order:

@@ -69,6 +69,8 @@ pub const AddTestsOptions = struct {
     run_raft_library_tests: *std.Build.Step.Run,
 };
 pub const AddTestsResult = struct {
+    linked_consumer_tests: []const *std.Build.Step.Compile,
+    storage_test_step: *std.Build.Step,
     vopr_soak_test_step: *std.Build.Step,
     storage_workload_soak_step: *std.Build.Step,
     antfly_test_mod: *std.Build.Module,
@@ -213,14 +215,34 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, introducer_test_mod, true, true);
 
-    const data_runtime_test_mod = b.createModule(.{
+    const data_consumer_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_runtime_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configure(b, data_runtime_test_mod, true, true);
-    data_runtime_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
-
+    test_imports.configureConsumer(b, data_consumer_module);
+    // Control-plane session/lease stores also support the legacy engine. This
+    // does not expose the physical DB owner to the consumer compilation unit.
+    @import("storage.zig").configureLmdb(b, data_consumer_module, lmdb_engine_mod, true);
+    data_consumer_module.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
+    data_consumer_module.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
+    const data_implementation_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/data_runtime_implementation_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, data_implementation_module, true, true);
+    for ([_]*std.Build.Module{ data_consumer_module, data_implementation_module }) |module| {
+        module.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+        const auth = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        auth.addImport("antfly_root", module);
+        auth.addImport("antfly_platform", platform_mod);
+        module.addImport("usermgr_storage", auth);
+    }
     const raft_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_runtime_test_root.zig"),
         .target = target,
@@ -269,15 +291,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     usermgr_storage_test_mod.addImport("antfly_root", antfly_test_mod);
     usermgr_storage_test_mod.addImport("antfly_platform", platform_mod);
     antfly_test_mod.addImport("usermgr_storage", usermgr_storage_test_mod);
-
-    const usermgr_storage_data_runtime_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    usermgr_storage_data_runtime_test_mod.addImport("antfly_root", data_runtime_test_mod);
-    usermgr_storage_data_runtime_test_mod.addImport("antfly_platform", platform_mod);
-    data_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_data_runtime_test_mod);
 
     const common_http_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/common_http_test_root.zig"),
@@ -1201,7 +1214,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // Own the complete fast API query module as one stable lane. Exact
         // per-test entries let new admission and ownership regressions compile
         // out of CI until somebody remembered to extend this list.
-        "api.query.test.",
+        "api.query.",
         "graph operation execution order is independent of declaration order",
         "graph operation execution order rejects cycles",
         "graph query dependency sorting enforces request-wide operation bounds",
@@ -1984,7 +1997,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const data_tests_addTests_result = data_tests.addTests(b, .{
         .target = target,
-        .data_runtime_test_mod = data_runtime_test_mod,
+        .data_runtime_test_mod = data_consumer_module,
+        .data_implementation_module = data_implementation_module,
         .data_storage_test_mod = data_storage_test_mod,
     });
     const run_lib_data_runtime_tests = data_tests_addTests_result.run_lib_data_runtime_tests;
@@ -2467,19 +2481,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_dense_index_repair_status_tests = addFilteredTestRunArtifact(b, dense_index_repair_status_tests);
-    const dense_index_repair_runtime_tests = b.addTest(.{
-        .root_module = data_runtime_test_mod,
-        .filters = &.{
-            "data runtime repair debt hook targets the affected group queue",
-            "data runtime repair failures preserve durable backoff and increase retry delay",
-            "index repair fallback backoff never blocks an exact durable wake",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_dense_index_repair_runtime_tests = addFilteredTestRunArtifact(b, dense_index_repair_runtime_tests);
+    // These queue/admission selections are already compiled by the Data
+    // consumer suite. Reuse that object and linked executable.
+    const run_dense_index_repair_runtime_tests = b.addRunArtifact(data_tests_addTests_result.consumer.executable);
+    addRuntimeTestFilters(b, run_dense_index_repair_runtime_tests, selectTestFilters(b, &.{
+        "data runtime repair debt hook targets the affected group queue",
+        "data runtime repair failures preserve durable backoff and increase retry delay",
+        "index repair fallback backoff never blocks an exact durable wake",
+    }));
     const dense_index_lifecycle_regression_step = b.step(
         "dense-index-lifecycle-regression-test",
         "Run focused durable dense-index repair and admission regressions",
@@ -4353,6 +4362,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    antfly_imports.storage_boundary.configureSources(db_test_mod, false, false);
+    db_test_mod.addImport("runtime_failure_abi", antfly_imports.storage_boundary.failure);
     const transcribing_db_test_stub_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
         .target = target,
@@ -4625,7 +4636,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "hosted cross-range graph metric fan-in rejects missing remote hits status",
         "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations",
     };
-    const graph_metric_remote_wire_tests = b.addTest(.{
+    const graph_metric_remote_wire_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-graph-metric-wire-tests",
         // macOS ReleaseFast measured 13.45 GB after the native-generation
         // merge. Admit this indivisible compiler job with headroom; the shared
         // runner's 22 GiB cap still bounds aggregate concurrent compilation.
@@ -4636,8 +4648,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-    });
-    const run_graph_metric_remote_wire_tests = addFilteredTestRunArtifact(b, graph_metric_remote_wire_tests);
+    }, api_tests_addTests_result.write_implementation_tests);
+    const run_graph_metric_remote_wire_tests = graph_metric_remote_wire_tests.run(b);
     const graph_metric_remote_wire_test_step = b.step("graph-metric-remote-wire-test", "Run hosted graph metric shard request and remote-wire tests");
     graph_metric_remote_wire_test_step.dependOn(&run_graph_metric_remote_wire_tests.step);
     graph_metric_unit_test_step.dependOn(&run_graph_metric_remote_wire_tests.step);
@@ -4844,7 +4856,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     provisioned_write_cache_failed_close_step.dependOn(&run_provisioned_write_cache_failed_close_tests.step);
 
-    const provisioned_query_visibility_tests = b.addTest(.{
+    const provisioned_query_visibility_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-table-write-visibility-tests",
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
             "provisioned table write source invalidates cached query db after managed dense replay becomes visible",
@@ -4862,9 +4875,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-    });
-    const run_provisioned_query_visibility_tests = addFilteredTestRunArtifact(b, provisioned_query_visibility_tests);
-    const run_provisioned_query_visibility_unit_tests = addFilteredTestRunArtifact(b, provisioned_query_visibility_tests);
+    }, api_tests_addTests_result.write_implementation_tests);
+    const run_provisioned_query_visibility_tests = provisioned_query_visibility_tests.run(b);
+    const run_provisioned_query_visibility_unit_tests = provisioned_query_visibility_tests.run(b);
     run_provisioned_query_visibility_unit_tests.step.dependOn(&run_api_table_writes_production_regression_unit_tests.step);
     const provisioned_query_visibility_step = b.step(
         "provisioned-query-visibility-test",
@@ -4958,6 +4971,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
         &.{
             "storage.db.aggregations.",
+            "storage.db.aggregations_contract.",
             "storage.db.apply_rw_lock.",
             "storage.db.artifact_ids.",
             "storage.db.backfill_state.",
@@ -4979,11 +4993,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_edge_contender.",
             "storage.db.graph_state_name.",
             "storage.db.lease.",
-            "storage.db.merge_state.",
+            "storage.db.merge_contract.",
             "storage.db.mod.",
             "storage.db.native_backup.",
             "storage.db.ownership.",
             "storage.db.planning_stats.",
+            "storage.db.planning_bindings.",
             "storage.db.promotion_runtime.",
             "storage.db.publication.",
             "storage.db.query_metrics.",
@@ -4999,6 +5014,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.snapshot_admission.",
             "storage.db.template_remote_stub.",
             "storage.db.template_stub.",
+            "storage.db.text_memory_stats.",
             "storage.db.transform.",
             "storage.db.typed_doc_values_coverage.",
             "storage.db.types.",
@@ -5030,6 +5046,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.backup_codec.",
             "storage.backup_repository.",
             "storage.coverage_identity.",
+            "storage.data_raft_projection_wire.",
             "storage.db_split_vopr.",
             "storage.derived_log_test_root.",
             "storage.docstore.",
@@ -5040,7 +5057,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.hierarchy_navigation.",
             "storage.index_manager_vopr.",
             "storage.internal_keys.",
+            "storage.kernel_owner_client.",
+            "storage.kernel_wal_wire.",
             "storage.lmdb.",
+            "storage.local_write.",
             "storage.lmdb_backend.",
             "storage.lmdb_vopr.",
             "storage.maintenance.",
@@ -5093,6 +5113,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         for (shard_filters) |shard_filter| {
             unit_storage_shard_audit.addArgs(&.{ "--filter", shard_filter });
         }
+    }
+    for (@import("storage_owner_tests.zig").test_sources) |source| {
+        unit_storage_shard_audit.addArg("--dedicated");
+        unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
     }
     unit_storage_shard_audit.addArg("--runtime-partition-source");
     unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/db/db.zig"));
@@ -5310,6 +5334,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             }
         }
         run_db_core_partitioned_tests.stdio = .inherit;
+        @import("test_support.zig").configureTestRun(run_db_core_partitioned_tests);
         run_db_core_partitioned_tests.step.max_rss = 12 * 1024 * 1024 * 1024;
         unit_test_step.dependOn(&run_db_core_partitioned_tests.step);
         unit_storage_sharded_test_step.dependOn(&run_db_core_partitioned_tests.step);
@@ -5638,6 +5663,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .integration_test_step = integration_test_step,
         .chaos_test_step = chaos_test_step,
         .compiled_recall_tests = compiled_recall_tests,
+        .storage_test_step = lib_storage_test_step,
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable } }) catch @panic("OOM"),
     };
 }
 

@@ -168,6 +168,7 @@ pub const asset_producer_runtime = @import("asset_producer_runtime.zig");
 
 // Storage backends
 pub const platform_clock = @import("antfly_platform").clock;
+pub const platform_sync = @import("antfly_platform").sync;
 pub const platform_time = @import("antfly_platform").time;
 pub const storage_backend = @import("storage/backend_types.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
@@ -212,7 +213,7 @@ pub const ttl = @import("storage/ttl.zig");
 pub const transactions = @import("storage/transactions.zig");
 pub const transaction_vopr = @import("storage/transaction_vopr.zig");
 pub const schema = @import("storage/schema.zig");
-pub const db = @import("storage/db/mod.zig");
+pub const db = @import("antfly_source_root").antfly_sources.selected_db;
 pub const index_manager_vopr = @import("storage/index_manager_vopr.zig");
 pub const db_split_vopr = @import("storage/db_split_vopr.zig");
 
@@ -422,3 +423,6 @@ test {
     _ = index_manager_vopr;
     _ = db_split_vopr;
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

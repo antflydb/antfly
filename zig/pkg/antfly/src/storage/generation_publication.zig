@@ -156,6 +156,7 @@ test "control publication fails closed after repeated ambiguous failures" {
     defer memory.deinit();
     try memory.storage().createDirPath("/generation-publication-poison");
 
+    @import("../test_error_logs.zig").expectErrorLogs(1);
     injectPostPublishFailuresForTest(2);
     try std.testing.expectError(
         error.GenerationPublicationDurabilityUncertain,

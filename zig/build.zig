@@ -184,9 +184,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     if (platform_tests.process) |process| platform_test_step.dependOn(process);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, true);
-    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, true);
-    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, false);
+    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, true, false);
+    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, true, false);
+    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, false, true);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
         .root_source_file = b.path("lib/raft/src/root.zig"),
@@ -372,6 +372,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     usermgr_mod.link_libc = link_libc;
+    usermgr_mod.addImport("antfly_source_root", usermgr_mod);
     usermgr_mod.addImport("antfly_casbin", casbin_mod);
     usermgr_mod.addImport("bloom", bloom_mod);
     usermgr_mod.addImport("antfly_platform", platform_mod);
@@ -677,6 +678,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const inference_steps = @import("pkg/inference/build/integration.zig").add(inference_workflow, inference_wasm_jinja, inference_wasm_platform);
 
     const antfly_imports = AntflyRootImports{
+        .storage_boundary = @import("pkg/antfly/build/storage_boundary.zig").create(b, b.path("pkg/antfly/src"), target, optimize),
         .build_info = build_info,
         .build_options = build_options,
         .lite_options = antfly_storage_build.createLiteOptions(b, lite_local_inference_runtime),
@@ -755,6 +757,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
+    antfly_imports.storage_boundary.configureSources(storage_mod, false, false);
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;
 
@@ -1331,6 +1334,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .strip = strip,
         .link_libc = link_libc,
         .sanitize_thread = sanitize_thread,
+        .cpu_inference = !inference_enable_cuda and !inference_enable_metal and !inference_enable_onnx,
         .runtime_artifact_role = runtime_artifact_role,
         .structlog_mod = structlog_mod,
         .platform_mod = platform_mod,
@@ -1344,6 +1348,25 @@ pub fn create(b: *std.Build) ?Artifacts {
     owner_tests.standalone_runtime_test_step.dependOn(&runtime.run_linked_inference_abi_integration.step);
     const antfly_main = runtime.antfly_main;
     const runtime_library_artifacts = runtime.runtime_library_artifacts;
+    const consumer_test_metadata = @import("lib/build_info/build_support.zig").create(b, .{
+        .root = b.path("lib/build_info"),
+        .target = target,
+        .optimize = optimize,
+        .version = "test",
+    });
+    for (owner_tests.linked_consumer_tests) |tests| {
+        tests.root_module.addObject(consumer_test_metadata.object);
+        inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+            tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
+    }
+
+    const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, runtime_library_artifacts);
+    for (storage_owner_runs.runs) |run| {
+        owner_tests.storage_test_step.dependOn(&run.step);
+        owner_tests.integration_test_step.dependOn(&run.step);
+    }
+
+    b.top_level_steps.get("antfly-storage-bench").?.step.dependOn(&b.addInstallArtifact(storage_owner_runs.benchmark, .{}).step);
 
     const antfly_main_tests = runtime.antfly_main_tests;
     const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
@@ -1417,8 +1440,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .name = "antfly-lite",
         .root_module = lite_main_mod,
     });
-    // Lite commands are owned by the standalone runtime, including lite serve.
-    for ([_]RuntimeLibraryUnit{ .distributed, .api_kernel, .inference }) |unit| {
+    // Lite administration shares storage; serving shares the server runtime.
+    for ([_]RuntimeLibraryUnit{ .storage_kernel, .distributed, .api_kernel, .enrichment_compute, .inference }) |unit| {
         lite_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
     }
     const lite_cli_smoke = b.addExecutable(.{
@@ -1530,5 +1553,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         antfly_tests_build.labelTestRuns(b, unit_test_step);
         antfly_tests_build.labelTestRuns(b, lib_test_step);
     }
+    @import("pkg/antfly/build/test_support.zig").configureSimpleTestRuns(b, test_step);
     return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact };
 }

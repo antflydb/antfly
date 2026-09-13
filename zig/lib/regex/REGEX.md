@@ -1,57 +1,85 @@
 # REGEX
 
-Last updated: 2026-04-11
+`lib/regex` is Antfly's regex engine. It backs `vellum` FST-based regexp
+queries and the AST-based matcher used by JSON Schema and similar validation
+paths, with a portable Zig SIMD prefilter for plain (non-FST) haystack
+scanning.
 
-## Goal
+## Components
 
-Speed up the local `vellum`/`regex` stack with portable Zig SIMD where it materially helps, while keeping the current FST integration and full cross-platform support.
+- `src/automaton.zig`: compiles a regex to a Thompson NFA, then lazily
+  determinizes it (on-the-fly powerset/subset construction) into a DFA used to
+  implement the `vellum.Automaton` interface. `pkg/antfly/src/search/query.zig`
+  uses this automaton to prune `vellum` FST traversal for regexp queries.
+  - Bytes are grouped into equivalence classes so the DFA transition table is
+    indexed by class rather than by raw byte, and per-state transitions are
+    cached in a hashed DFA-state cache (keyed by NFA state set) instead of a
+    linear scan.
+  - Single-state epsilon closures are precomputed once and unioned to build
+    subset closures, instead of re-walking epsilon edges on every DFA step.
+  - Required-prefix literals are extracted from the compiled pattern (up to 8
+    literals, 32 bytes each) for FST-side pruning and for the plain-haystack
+    prefilter below.
+- `src/mod.zig`: the AST-based matcher (`PreparedPattern`) used by non-FST
+  callers such as `pkg/antfly/src/search/pattern_filter.zig`,
+  `pkg/antfly/src/storage/db/query/graph_exec.zig`, and
+  `pkg/antfly/src/storage/db/aggregations.zig`. It parses the pattern into a
+  small AST, then matches by walking that AST against the input (NFA
+  simulation, not backtracking).
+  - Compiled-regex substring matching is centralized here so every non-FST
+    call site goes through one implementation, with explicit handling for `^`
+    and `$` anchors (anchors are otherwise implicit for FST matching).
+  - A portable Zig `@Vector`-based prefilter scans for required literal
+    prefixes (single literal, or a small deduplicated first-byte set for
+    simple alternations like `foo|bar`) before falling back to full regex
+    verification, with a cheap secondary-byte check to reduce false-candidate
+    verification when multiple prefixes share a first byte. Prefilter metadata
+    (deduplicated first-byte sets, per-prefix secondary-check offsets) is
+    precomputed once at compile time rather than on every scan.
 
-## Current State
+## Supported Syntax
 
-- `lib/regex/src/automaton.zig` compiles regexes to a Thompson NFA and lazily determinizes them while servicing `vellum.Automaton`.
-- `pkg/antfly/src/search/query.zig` already uses that automaton to prune `vellum` FST traversal for regexp queries.
-- Several plain haystack paths still do substring matching by restarting the automaton at every byte offset:
-  - `pkg/antfly/src/search/pattern_filter.zig`
-  - `pkg/antfly/src/storage/db/query/graph_exec.zig`
-  - `pkg/antfly/src/storage/db/aggregations.zig`
-- `lib/regex/src/mod.zig` also has a separate AST-based matcher used by JSON Schema and similar validation paths.
+- literals and `.` (any byte)
+- concatenation and `|` alternation
+- `()` grouping (no captures)
+- character classes: `[abc]`, ranges `[a-z]`, negation `[^abc]`
+- quantifiers: `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}`
+- `\` escapes the next character (no `\d`/`\w`/`\s` shorthand classes)
+- `^` / `$` anchors
 
-## What SIMD Should Target First
+Regexes operate on raw bytes; there is no separate Unicode code-point mode.
 
-The first high-return target is the plain haystack scan path, not `vellum` trie traversal.
+## Limits
 
-- FST traversal is branchy pointer-chasing and tends to benefit more from better automaton state caching and byte-class reduction than from lane-wise SIMD.
-- Plain haystack scanning is contiguous byte processing and is a natural fit for SIMD prefilters.
+- `automaton.zig`: at most 256 live NFA states per compiled pattern
+  (`max_nfa_states`).
+- `mod.zig`: `PreparedPattern` parsing bounds nesting depth at 128 and the
+  total AST node count at `4 * max_states` (4096 states), returning
+  `error.InvalidRegex` if a pattern would exceed either bound.
 
-## Plan
+## Matching Strategy
 
-1. Centralize the compiled-regex substring matcher so every non-FST call site goes through one implementation.
-2. Add literal extraction for required prefixes/literals from compiled regexes.
-3. Add a portable SIMD candidate finder in Zig:
-   - single literal / substring path first
-   - small literal set path next, Teddy-style if it still looks worthwhile after measurement
-4. Verify candidates with the existing automaton so correctness stays simple.
-5. Improve automaton internals for the `vellum` path:
-   - replace linear DFA state lookup
-   - add byte-equivalence classes
-   - precompute epsilon closures where profitable
+- FST traversal (`automaton.zig`) never backtracks: the compiled automaton
+  exposes DFA-shaped `step`/`isMatch` behavior to `vellum`, with byte-class
+  transitions and a hashed state cache keeping per-step cost low even though
+  states are computed lazily.
+- Plain haystack scanning (`mod.zig`) is candidate-driven: the SIMD prefilter
+  finds candidate offsets for required prefixes/literals, and every candidate
+  is verified against the compiled automaton so correctness does not depend on
+  the prefilter being exact.
 
-## Notes
+## Benchmarking
 
-- Zig gives us a viable cross-platform SIMD route via vectors and target-feature-aware implementations; we do not need to pull in an x86-only dependency just to get the first gains.
-- Hyperscan-style ideas are still useful as design input, especially literal prefilters and Teddy-like multi-literal screening, but we can reimplement the parts that fit this codebase.
-- The compiled automaton path currently treats `^` and `$` as implicit for FST matching. For plain substring matching, that needs explicit wrapper logic so anchored patterns remain correct.
+`regex-bench` (`bench/regex_bench.zig`) measures haystack candidate filtering
+and `vellum` automaton traversal so further optimization work can be judged
+from local numbers instead of guesses.
 
-## Completed
+## Open Work
 
-- 2026-04-11: centralized compiled-regex substring matching in `lib/regex` with explicit anchor handling for `^` and `$`, and switched duplicated helper call sites to use it.
-- 2026-04-11: added conservative required-prefix extraction to compiled regexes and routed substring matching through candidate-based verification, creating the prefilter hook where SIMD search can land next.
-- 2026-04-11: replaced the scalar first-byte prefix scan with a portable Zig vector prefilter for candidate discovery before full regex verification.
-- 2026-04-11: widened prefix extraction from a single literal to small literal sets for simple alternations, so patterns like `foo|bar` and `(foo|bar)baz` can prefilter on multiple required candidates.
-- 2026-04-11: generalized the small-set first-byte prefilter so extracted multi-prefix scans search once for the whole deduplicated starting-byte set before exact prefix verification.
-- 2026-04-11: strengthened candidate screening with a cheap secondary-byte check before full prefix equality, reducing false positives when many prefixes share the same first byte.
-- 2026-04-11: replaced the lazy DFA cache's linear state-set lookup with a hashed index, which is the first direct `vellum`-side automaton optimization.
-- 2026-04-11: added byte-equivalence classes and per-DFA-state transition caching on those classes, so `vellum` traversal now reuses transitions across bytes with identical NFA behavior.
-- 2026-04-11: precomputed single-state epsilon closures and changed subset-closure building to union cached closures instead of re-walking epsilon edges on every DFA step.
-- 2026-04-11: added a dedicated `regex-bench` target to measure haystack candidate filtering and `vellum` automaton traversal, so the next optimization step can be chosen from local numbers instead of guesses.
-- 2026-04-11: moved prefix scan metadata construction out of the hot path by precomputing deduplicated first-byte sets and per-prefix secondary-check offsets at compile time.
+- FST traversal itself (walking the lazily-built DFA over the trie) is still
+  branchy pointer-chasing; further gains there are expected to come from
+  automaton-side work (already-landed byte classes and closure caching, plus
+  any future state-layout changes) rather than from SIMD.
+- Small-literal-set prefiltering is capped at 8 literals / 32 bytes per
+  literal; patterns whose required-prefix analysis exceeds that bound fall
+  back to unfiltered automaton verification.

@@ -1,12 +1,12 @@
 # Antfly Operator Development Guide
 
-This guide is for engineers working on the Antfly Kubernetes Operator itself. If you're a user looking to deploy Antfly clusters, see [README.md](README.md).
+This guide is for engineers working on the Antfly Kubernetes Operator itself. If you're a user looking to deploy Antfly clusters, see [README.md](../README.md).
 
 ## 🏗️ Development Environment Setup
 
 ### Prerequisites
 
-- **Go 1.24+**
+- **Go 1.26+**
 - **Docker** or **Podman**
 - **kubectl** and access to a Kubernetes cluster
 - **Make**
@@ -109,8 +109,8 @@ make manifests
 # Generate deepcopy methods
 make generate
 
-# Update API documentation
-make api-docs
+# Regenerate CRDs, RBAC, and deepcopy after API changes
+make manifests generate
 ```
 
 ## 🧪 Testing
@@ -124,18 +124,15 @@ make test
 # Run specific test package
 go test ./controllers/...
 
-# Run with coverage
-make test-coverage
+# make test already writes a coverage profile
+make test
 ```
 
 ### Integration Tests
 
 ```bash
-# Run integration tests with envtest
-make test-integration
-
-# Run with existing cluster
-make test-e2e
+# Unit and envtest integration tests
+make test
 ```
 
 ### Testing with Kind
@@ -147,8 +144,9 @@ make kind-create
 # Deploy to kind
 make kind-deploy
 
-# Run tests against kind
-make kind-test
+# Build and load the operator image into kind, then apply samples
+make kind-deploy
+make deploy-samples
 
 # Clean up
 make kind-delete
@@ -176,7 +174,7 @@ This section provides a complete workflow for cleaning up everything in your loc
 kubectl delete antflyclusters --all --all-namespaces
 
 # Remove the operator
-kubectl delete -f deploy/install.yaml --ignore-not-found=true
+kubectl delete -f https://antfly.io/antfly-operator-install.yaml --ignore-not-found=true
 
 # Remove any leftover resources
 kubectl delete all,pvc,secrets,configmaps -l app=antfly --all-namespaces
@@ -238,11 +236,9 @@ minikube image list | grep -E "(antfly|antfly-operator)"
 2. **Deploy the Operator**
 
 ```bash
-# Generate fresh manifests and installation bundle
-make install
-
-# Deploy the operator to minikube
-make deploy
+# Generate fresh manifests, then deploy the dev cluster to minikube
+make manifests generate
+make dev-cluster-deploy
 
 # Verify operator is running
 kubectl get pods -n antfly-operator-namespace
@@ -290,7 +286,7 @@ set -e
 
 echo "🧹 Cleaning up everything..."
 kubectl delete antflyclusters --all --all-namespaces --ignore-not-found=true
-kubectl delete -f deploy/install.yaml --ignore-not-found=true
+kubectl delete -f https://antfly.io/antfly-operator-install.yaml --ignore-not-found=true
 make clean
 
 echo "🔨 Building fresh..."
@@ -298,7 +294,7 @@ make docker-build
 minikube image load antfly-operator:latest
 
 echo "🚀 Deploying fresh..."
-make deploy
+make dev-cluster-deploy
 kubectl apply -f examples/small-dev-cluster.yaml
 
 echo "⏳ Waiting for cluster to be ready..."
@@ -315,7 +311,7 @@ chmod +x scripts/minikube-redeploy.sh
 ./scripts/minikube-redeploy.sh
 
 # Or use the Makefile target
-make minikube-redeploy
+make dev-cluster-deploy
 ```
 
 ### Troubleshooting Development Issues
@@ -475,4 +471,4 @@ go tool pprof http://localhost:6060/debug/pprof/heap
 
 ---
 
-For user-focused documentation, see [README.md](README.md).
+For user-focused documentation, see [README.md](../README.md).

@@ -119,3 +119,6 @@ test "db merge coordinator reapplies target namespace for persisted reassignment
     try std.testing.expectEqual(target_namespace.shard_id, after.doc_identity.namespace_shard_id);
     try std.testing.expectEqual(target_namespace.range_id, after.doc_identity.namespace_range_id);
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

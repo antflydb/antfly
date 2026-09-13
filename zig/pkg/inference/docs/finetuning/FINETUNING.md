@@ -1,6 +1,6 @@
 # Fine-Tuning in antfly-inference-zig
 
-antfly-inference-zig supports training and fine-tuning through reverse-mode automatic differentiation on the graph IR. Features are implemented in Zig and run on CPU (BLAS), Apple Silicon (Metal/MLX), or supported NVIDIA GPUs through the CUDA backend. CUDA is only a runtime/build dependency when that backend is selected; the native and Metal paths do not require it.
+antfly-inference-zig supports training and fine-tuning through reverse-mode automatic differentiation on the graph IR. Features are implemented in Zig and run on CPU (BLAS), Apple Silicon (Metal), or supported NVIDIA GPUs through the CUDA backend. CUDA is only a runtime/build dependency when that backend is selected; the native and Metal paths do not require it.
 
 ---
 
@@ -681,7 +681,7 @@ dataset-wide raw-label union is not a valid contextual-slot schema.
 | `reranker` | `reranker` | `prepare-reranker-pooled-cache` → `train-eval-reranker-head-cached` → optional `materialize-reranker-head` |
 | `lora-sft`, `qlora-sft` | `reranker` | `bootstrap-reranker-lora` → `prepare-reranker-top-layer-cache` → `train-eval-reranker-lora-top-layer-cached-surrogate` → optional `materialize-reranker-lora` |
 | `vlm-retrieval` | `colqwen2` | `prepare-colqwen2-inputs` → `bootstrap-colqwen2-lora` → `train-eval-colqwen2-lora-bundle` |
-| `sft`, `lora-sft`, `qlora-sft`, `dpo`, `grpo` | `qwen3_5`, Chandra OCR text-only | direct Qwen autodiff trainer route for text JSONL recipes; still requires real-weight CPU and MLX/Metal smokes before production readiness |
+| `sft`, `lora-sft`, `qlora-sft`, `dpo`, `grpo` | `qwen3_5`, Chandra OCR text-only | direct Qwen autodiff trainer route for text JSONL recipes; still requires real-weight CPU and Metal smokes before production readiness |
 
 The runner first looks for a peer tool executable next to the current Antfly inference executable. If it is not installed, it falls back to the existing `zig build <tool> -- ...` build step from the package root, preserving today's build-step workflow.
 
@@ -787,7 +787,7 @@ Completed:
 
 Remaining:
 
-1. Add real-weight one-step smoke coverage for Qwen3.5 text SFT/DPO/GRPO on CPU and MLX/Metal.
+1. Add real-weight one-step smoke coverage for Qwen3.5 text SFT/DPO/GRPO on CPU and Metal.
 2. Add execute-path verification for the broader Qwen-family text-decoder routes, including ColQwen2 if we keep that path.
 3. Add Chandra multimodal training data preparation with dynamic image-token expansion before enabling multimodal fine-tune recipes.
 4. Add more GRPO reward modes if we need tasks beyond exact, exact-match-ci, and prefix matching.
@@ -997,13 +997,13 @@ The fused-chunker embedder (`src/finetune/fused_chunker_train.zig`) is the refer
 | Global gradient norm clipping | yes | yes | yes | yes | yes | yes | yes |
 | Gradient accumulation | yes | yes | yes | — | yes | yes | yes |
 | Schedule-Free AdamW | yes | — | — | yes | yes | — | yes |
-| DDP (MLX allReduce) | — | — | — | — | yes | — | yes |
+| DDP (allReduce) | — | — | — | — | yes | — | yes |
 | PJRT fast path | — | — | — | — | yes | — | yes |
 | Cross-Batch Memory (XBM) | yes | — | — | — | — | — | — |
 | NEFTune noise | yes | — | — | — | — | — | — |
 | SPLADE sparse embeddings | yes | — | — | — | — | — | — |
 | Matryoshka Repr. Learning (MRL) | yes | — | — | — | — | — | — |
-| Mixed precision (bf16) | yes | — | — | — | — | — | — |
+| Mixed precision (bf16) | — | — | — | — | — | — | — |
 | LoRA+ | yes | — | — | — | — | — | — |
 | Checkpoint resume | yes | — | — | — | — | — | — |
 | Optimizer state save/load | yes | — | — | — | — | — | — |
@@ -1098,9 +1098,7 @@ Trains the model to produce useful embeddings at multiple truncated dimensions s
 
 ### Mixed Precision (bf16) — fused-chunker only
 
-Enables bfloat16 computation for the MLX backend. Weights and activations are stored and multiplied in bf16, with gradient accumulation in f32.
-
-**CLI flag:** `--mixed-precision` (boolean; MLX backend only)
+`--mixed-precision` enabled bfloat16 computation on the MLX backend; it is no longer supported now that the MLX backend has been removed and exits with an error if passed.
 
 ### LoRA+ — fused-chunker only
 
@@ -1190,7 +1188,7 @@ Local verification:
 ```bash
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache \
 ZIG_LOCAL_CACHE_DIR=/tmp/zig-local-cache \
-zigup run master build test-layoutlmv3-finetune -Dblas=false -Donnx=false -Dmlx=false
+zigup run master build test-layoutlmv3-finetune -Dblas=false -Donnx=false
 ```
 
 ### Expected Inputs
@@ -1216,7 +1214,7 @@ Each token: `{ "text": "...", "bbox": [x0, y0, x1, y1] }`. Bbox values must be w
 Bootstrap a LoRA bundle:
 
 ```bash
-zigup run master build bootstrap-layoutlmv3-lora -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build bootstrap-layoutlmv3-lora -Dblas=false -Donnx=false -- \
   /path/to/layoutlmv3_base \
   /path/to/bootstrap_dir \
   8 \
@@ -1226,7 +1224,7 @@ zigup run master build bootstrap-layoutlmv3-lora -Dblas=false -Donnx=false -Dmlx
 Inspect a bundle:
 
 ```bash
-zigup run master build inspect-layoutlmv3-lora-bundle -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build inspect-layoutlmv3-lora-bundle -Dblas=false -Donnx=false -- \
   /path/to/layoutlmv3_base \
   /path/to/adapter_dir \
   /tmp/layoutlmv3_lora_inspect.json
@@ -1235,7 +1233,7 @@ zigup run master build inspect-layoutlmv3-lora-bundle -Dblas=false -Donnx=false 
 Materialize a merged checkpoint:
 
 ```bash
-zigup run master build materialize-layoutlmv3-checkpoint -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build materialize-layoutlmv3-checkpoint -Dblas=false -Donnx=false -- \
   /path/to/layoutlmv3_base \
   /path/to/trained_adapter_dir \
   sequence \
@@ -1246,7 +1244,7 @@ zigup run master build materialize-layoutlmv3-checkpoint -Dblas=false -Donnx=fal
 Run bounded sequence training:
 
 ```bash
-zigup run master build train-eval-layoutlmv3-lora-sequence -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build train-eval-layoutlmv3-lora-sequence -Dblas=false -Donnx=false -- \
   /path/to/layoutlmv3_base \
   /path/to/bootstrap_dir \
   /path/to/train.jsonl \
@@ -1262,7 +1260,7 @@ zigup run master build train-eval-layoutlmv3-lora-sequence -Dblas=false -Donnx=f
 Run bounded token training:
 
 ```bash
-zigup run master build train-eval-layoutlmv3-lora-token -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build train-eval-layoutlmv3-lora-token -Dblas=false -Donnx=false -- \
   /path/to/layoutlmv3_base \
   /path/to/bootstrap_dir \
   /path/to/train.jsonl \
@@ -1280,7 +1278,7 @@ zigup run master build train-eval-layoutlmv3-lora-token -Dblas=false -Donnx=fals
 The smoke workflow chains bootstrap, train, inspect, and materialize in one command:
 
 ```bash
-zigup run master build run-layoutlmv3-lora-smoke-workflow -Dblas=false -Donnx=false -Dmlx=false -- \
+zigup run master build run-layoutlmv3-lora-smoke-workflow -Dblas=false -Donnx=false -- \
   /path/to/layoutlmv3_base \
   /path/to/train.jsonl \
   /path/to/val.jsonl \
@@ -1359,7 +1357,7 @@ usage: train-fused-chunker --data <path> --output <dir> [options]
   --seed <n>                Random seed (default: 42)
   --lora-rank <n>           LoRA rank (default: 0 = disabled)
   --intermediate-size <n>   ModernBERT intermediate_size (default: 1152)
-  --backend native|mlx|auto   Compute backend (default: auto)
+  --backend native|auto      Compute backend (default: auto)
   --grad-accum <n>          Gradient accumulation steps (default: 1)
   --schedule-free           Use Schedule-Free AdamW
   --neftune-alpha <f>       NEFTune noise magnitude (default: 0.0=disabled)
@@ -1368,7 +1366,6 @@ usage: train-fused-chunker --data <path> --output <dir> [options]
   --lora-plus-ratio <f>     LoRA+ B/A LR ratio (default: 1.0=disabled)
   --length-bucketing        Enable length bucketing
   --bucket-size <n>         Bucket window size (default: 256)
-  --mixed-precision         Enable bf16 mixed precision (MLX only)
   --splade                  Enable SPLADE sparse embedding head
   --lambda-splade <f>       SPLADE contrastive loss weight (default: 0.15)
   --lambda-flops <f>        SPLADE FLOPS regularization weight (default: 3e-5)
@@ -1411,7 +1408,7 @@ usage: train-eval-reranker-lora-surrogate <model-dir> <adapter-dir>
     [train-split] [eval-split]
 
 Flags:
-  --backend auto|native|mlx   Compute backend (default: auto)
+  --backend auto|native       Compute backend (default: auto)
   --max-examples <n>        Max training examples (default: 128)
   --epochs <n>              Number of epochs (default: 1)
   --learning-rate <f>       Learning rate (default: 0.001)
@@ -1560,7 +1557,7 @@ usage: materialize-gemma4-teacher-targets <base_model_dir> <prepared_inputs_json
   --top-k N              Teacher tokens per row (default: 8)
   --temperature F        Temperature applied before top-k softmax (default: 1.0)
   --max-examples N       Maximum examples to materialize (default: 0 = all)
-  --backend native|mlx   Teacher inference backend (default: native)
+  --backend native   Teacher inference backend (default: native)
 ```
 
 This tool runs the full Gemma4 teacher model over prepared inputs and writes sparse row-major `teacher_top_k_token_ids` and `teacher_top_k_probs` into the output prepared-input JSON. For multimodal prepared inputs, pass `--gguf-projector <projector.gguf>` unless the prepared summary records a valid projector path. The autodiff trainer consumes those soft targets when present, which is the first distillation path for recursive LoRA compression.
@@ -1614,7 +1611,7 @@ Flags:
   --grad-accum <n>              Gradient accumulation steps (default: 1)
   --llrd-decay <f>              Surrogate-only layer-wise LR decay (default: 1.0=disabled)
   --schedule-free               Surrogate-only Schedule-Free AdamW (default: false)
-  --backend auto|mlx|native       Compute backend (default: auto)
+  --backend auto|native           Compute backend (default: auto)
 ```
 
 Trainer mode behavior:

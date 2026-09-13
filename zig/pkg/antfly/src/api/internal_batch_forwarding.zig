@@ -63,61 +63,73 @@ pub fn parseValues(
     ) catch return error.InvalidRaftBatchForwardingHeaders;
 }
 
-test "internal batch forwarding headers are all-or-none and strictly parsed" {
-    const valid_headers = [_]http_common.RequestHeader{
-        .{ .name = remaining_ms_header, .value = "425" },
-        .{ .name = forwards_remaining_header, .value = "1" },
-        .{ .name = campaign_allowed_header, .value = "false" },
-    };
-    const context = (try parse(.{ .method = .POST, .uri = "/", .headers = &valid_headers })).?;
-    try std.testing.expectEqual(@as(u32, 425), context.remaining_ms);
-    try std.testing.expectEqual(@as(u8, 1), context.forwards_remaining);
-    try std.testing.expect(!context.campaign_allowed);
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        test "internal batch forwarding headers are all-or-none and strictly parsed" {
+            const valid_headers = [_]http_common.RequestHeader{
+                .{ .name = remaining_ms_header, .value = "425" },
+                .{ .name = forwards_remaining_header, .value = "1" },
+                .{ .name = campaign_allowed_header, .value = "false" },
+            };
+            const context = (try parse(.{ .method = .POST, .uri = "/", .headers = &valid_headers })).?;
+            try std.testing.expectEqual(@as(u32, 425), context.remaining_ms);
+            try std.testing.expectEqual(@as(u8, 1), context.forwards_remaining);
+            try std.testing.expect(!context.campaign_allowed);
 
-    try std.testing.expect((try parse(.{ .method = .POST, .uri = "/" })) == null);
-    try std.testing.expectError(error.InvalidRaftBatchForwardingHeaders, parse(.{
-        .method = .POST,
-        .uri = "/",
-        .headers = valid_headers[0..2],
-    }));
-    const zero_budget = [_]http_common.RequestHeader{
-        .{ .name = remaining_ms_header, .value = "0" },
-        .{ .name = forwards_remaining_header, .value = "1" },
-        .{ .name = campaign_allowed_header, .value = "true" },
+            try std.testing.expect((try parse(.{ .method = .POST, .uri = "/" })) == null);
+            try std.testing.expectError(error.InvalidRaftBatchForwardingHeaders, parse(.{
+                .method = .POST,
+                .uri = "/",
+                .headers = valid_headers[0..2],
+            }));
+            const zero_budget = [_]http_common.RequestHeader{
+                .{ .name = remaining_ms_header, .value = "0" },
+                .{ .name = forwards_remaining_header, .value = "1" },
+                .{ .name = campaign_allowed_header, .value = "true" },
+            };
+            try std.testing.expectError(error.InvalidRaftBatchForwardingHeaders, parse(.{
+                .method = .POST,
+                .uri = "/",
+                .headers = &zero_budget,
+            }));
+            const excessive_budget = [_]http_common.RequestHeader{
+                .{ .name = remaining_ms_header, .value = "5001" },
+                .{ .name = forwards_remaining_header, .value = "1" },
+                .{ .name = campaign_allowed_header, .value = "true" },
+            };
+            try std.testing.expectError(error.InvalidRaftBatchForwardingHeaders, parse(.{
+                .method = .POST,
+                .uri = "/",
+                .headers = &excessive_budget,
+            }));
+            const excessive_hops = [_]http_common.RequestHeader{
+                .{ .name = remaining_ms_header, .value = "425" },
+                .{ .name = forwards_remaining_header, .value = "3" },
+                .{ .name = campaign_allowed_header, .value = "true" },
+            };
+            try std.testing.expectError(error.InvalidRaftBatchForwardingHeaders, parse(.{
+                .method = .POST,
+                .uri = "/",
+                .headers = &excessive_hops,
+            }));
+            const invalid_campaign = [_]http_common.RequestHeader{
+                .{ .name = remaining_ms_header, .value = "425" },
+                .{ .name = forwards_remaining_header, .value = "1" },
+                .{ .name = campaign_allowed_header, .value = "1" },
+            };
+            try std.testing.expectError(error.InvalidRaftBatchForwardingHeaders, parse(.{
+                .method = .POST,
+                .uri = "/",
+                .headers = &invalid_campaign,
+            }));
+        }
     };
-    try std.testing.expectError(error.InvalidRaftBatchForwardingHeaders, parse(.{
-        .method = .POST,
-        .uri = "/",
-        .headers = &zero_budget,
-    }));
-    const excessive_budget = [_]http_common.RequestHeader{
-        .{ .name = remaining_ms_header, .value = "5001" },
-        .{ .name = forwards_remaining_header, .value = "1" },
-        .{ .name = campaign_allowed_header, .value = "true" },
-    };
-    try std.testing.expectError(error.InvalidRaftBatchForwardingHeaders, parse(.{
-        .method = .POST,
-        .uri = "/",
-        .headers = &excessive_budget,
-    }));
-    const excessive_hops = [_]http_common.RequestHeader{
-        .{ .name = remaining_ms_header, .value = "425" },
-        .{ .name = forwards_remaining_header, .value = "3" },
-        .{ .name = campaign_allowed_header, .value = "true" },
-    };
-    try std.testing.expectError(error.InvalidRaftBatchForwardingHeaders, parse(.{
-        .method = .POST,
-        .uri = "/",
-        .headers = &excessive_hops,
-    }));
-    const invalid_campaign = [_]http_common.RequestHeader{
-        .{ .name = remaining_ms_header, .value = "425" },
-        .{ .name = forwards_remaining_header, .value = "1" },
-        .{ .name = campaign_allowed_header, .value = "1" },
-    };
-    try std.testing.expectError(error.InvalidRaftBatchForwardingHeaders, parse(.{
-        .method = .POST,
-        .uri = "/",
-        .headers = &invalid_campaign,
-    }));
+    return Suite;
+}
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

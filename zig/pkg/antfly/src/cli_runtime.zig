@@ -12,7 +12,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Non-server CLI surfaces compiled together as one coarse codegen unit.
+//! Remote/client CLI surfaces compiled as one small codegen unit. The local
+//! HA operator command owns physical WAL/LSM state and therefore stays in the
+//! application/storage unit.
 
 const std = @import("std");
 const client = @import("client_runtime.zig");

@@ -67,7 +67,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const run_lib_ha_compat_tests = options.run_lib_ha_compat_tests;
     const compiled_recall_tests = options.compiled_recall_tests;
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
-    const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, true);
+    const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, true, false);
     const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_c);
     const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod, hash_mod);
     const lmstorage_bench_mod_c = b.createModule(.{
@@ -84,7 +84,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     });
 
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
-    const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, true);
+    const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, true, false);
     const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_zig);
     const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod, hash_mod);
     const lmstorage_bench_mod_zig = b.createModule(.{
@@ -105,7 +105,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     lmstorage_bench_step.dependOn(&b.addInstallArtifact(lmdb_bench_zig, .{}).step);
 
     const split_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true);
+    const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true, false);
     const split_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, split_bench_engine_options);
     const split_bench_root_mod = makeLmdbModule(b, split_bench_root, target, optimize, split_bench_build_options, split_bench_engine_mod, platform_mod, hash_mod);
     const split_bench_mod = b.createModule(.{
@@ -282,7 +282,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     lsm_backend_bench_compare_step.dependOn(&b.addInstallArtifact(lsm_backend_bench_compare, .{}).step);
 
     const wal_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true);
+    const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true, false);
     const wal_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_bench_engine_options);
     const wal_bench_wal_mod = makeLmdbModule(b, wal_bench_root, target, optimize, wal_bench_build_options, wal_bench_engine_mod, platform_mod, hash_mod);
     const wal_bench_mod = b.createModule(.{
@@ -309,7 +309,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     wal_bench_step.dependOn(&b.addInstallArtifact(wal_bench, .{}).step);
 
     const derived_log_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const derived_log_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true);
+    const derived_log_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, true, false);
     const derived_log_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, derived_log_bench_engine_options);
     const derived_log_bench_root_mod = b.createModule(.{
         .root_source_file = b.path(derived_log_bench_root),

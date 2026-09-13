@@ -1,7 +1,21 @@
 # Serverless Plan
 
-This document outlines a concrete plan for building a serverless architecture
-from `antfly-zig` code.
+This document describes the serverless architecture being built from
+`antfly-zig` code, and tracks how much of it exists today versus what is still
+planned.
+
+The core serving path is implemented and tested under
+`pkg/antfly/src/serverless/`: append-only WAL ingest, background builders that
+publish immutable manifests and per-index artifacts, object-storage-backed
+adapters (`file://`, `s3://` including R2, and `gs://`) for artifacts, WAL,
+manifests, and the catalog, namespace admission/compaction policy, and a
+cached stateless query path served through a table-oriented `/tables/...` HTTP
+surface with separate query and maintenance runtime roles. Serverless is still
+unreleased: the control plane is not yet productionized (auth/quota
+enforcement and job tracking are open), advanced features (hybrid retrieval
+optimization, richer write semantics, deeper graph traversal) are unfinished,
+and there is no Kubernetes operator yet. See "Open work" at the end of this
+document for what remains planned rather than shipped.
 
 The goal is not "run the current Antfly architecture without servers." The goal
 is to build a different storage and control-plane architecture that reuses the
@@ -1069,25 +1083,29 @@ It should not manage:
 - replica repair workflows
 - split / merge orchestration
 
-Before operator work becomes serious, the runtime should separate into
-first-class roles:
+The runtime already separates into first-class roles via `ANTFLY_SERVERLESS_ROLE`
+/ `antfly serverless <role>` (`pkg/antfly/src/serverless_main.zig`,
+`pkg/antfly/src/serverless/runtime/manager.zig`):
 
-- query pods
-  - serve read traffic
-  - keep local SSD/NVMe cache
-  - do not run maintenance loops
-- maintenance pods
-  - publish new versions
-  - compact artifacts
-  - prune WAL/history
-  - rely on CAS/progress coordination rather than ownership
-- optional ingest/API pods
-  - accept writes
-  - append WAL
-  - expose table APIs and internal namespace APIs
+- query role
+  - serves read traffic
+  - keeps local SSD/NVMe cache
+  - does not run maintenance loops
+- maintenance role
+  - publishes new versions
+  - compacts artifacts
+  - prunes WAL/history
+  - relies on CAS/progress coordination rather than ownership
+- api role
+  - accepts writes
+  - appends WAL
+  - exposes table APIs and internal namespace APIs
+- combined role
+  - runs all of the above in one process, for development
 
-The current in-process maintenance loop is acceptable for development, but it
-is not the long-term operator packaging model.
+What is still missing is the Kubernetes operator itself: turning these roles
+into separate deployments, CRDs, and rollout/autoscaling automation (see
+"Suggested CRDs" below and "Open work").
 
 Use a thin proxy. Good proxy responsibilities are TLS, auth, rate limiting,
 tenant routing headers, request logging, ingress policy, and possibly
@@ -1211,22 +1229,19 @@ above.
 Recommended packaging order:
 
 1. finish indexed query/cache/compaction work inside
-   `pkg/antfly/src/serverless/`
-2. split runtime roles into query vs maintenance
-3. keep coordination ownerless and CAS-driven
-4. then package with an operator and thin proxy
+   `pkg/antfly/src/serverless/` (see "Open work")
+2. keep coordination ownerless and CAS-driven
+3. then package with an operator and thin proxy
 
-## Missing Abstractions
+Runtime roles are already split into query vs maintenance (see above), so
+that step is done.
 
-The main gap is that the current abstraction work is still centered on "KV
-backend with transactions and snapshots."
+## Core Interfaces
 
-A serverless system needs new top-level interfaces above that layer.
-
-## New Core Interfaces
-
-Introduce these as first-class interfaces under
-`pkg/antfly/src/serverless/`.
+The serverless path does not reuse the stateful "KV backend with transactions
+and snapshots" abstraction. Instead it defines new top-level interfaces under
+`pkg/antfly/src/serverless/`, described below along with the file that
+implements each one.
 
 ### `ArtifactStore`
 
@@ -1235,25 +1250,17 @@ Purpose:
 - store immutable blobs in object storage
 - fetch whole objects or byte ranges
 
-Suggested responsibilities:
+Responsibilities (`pkg/antfly/src/serverless/artifacts/store.zig`):
 
 - `put(blob) -> artifact_id`
 - `get(artifact_id)`
 - `getRange(artifact_id, offset, len)`
 - integrity metadata
 
-The transport seam beneath this should now be a dedicated
-`go/pkg/antfly/lib/objectstore/` package rather than ad hoc `file://` handling. That package
-needs to cover the MinIO/S3-compatible feature surface already used by the Go
-repository:
-
-- bucket existence and creation
-- object put / get / stat / delete / list
-- file upload and download helpers
-- ranged reads
-- multipart/object-attribute inspection for large downloads
-- endpoint parsing and environment credential fallback
-- `s3://bucket/key` and `s3://endpoint/bucket/key` parsing
+The transport seam beneath this is the objectstore module
+(`pkg/antfly/src/serverless/artifacts/object_store.zig` over `zig/lib/objectstore`)
+rather than ad hoc `file://` handling. It covers the MinIO/S3-compatible
+feature surface, including Cloudflare R2 through the same S3-compatible path.
 
 ### `WalStore`
 
@@ -1262,11 +1269,11 @@ Purpose:
 - append write batches for a namespace
 - stream batches from a known LSN / offset
 
-Suggested responsibilities:
+Responsibilities (`pkg/antfly/src/serverless/wal/store.zig`):
 
 - `append(namespace, batch) -> lsn`
 - `readFrom(namespace, lsn)`
-- truncate / retention hooks later
+- truncate / retention hooks
 
 ### `ManifestStore`
 
@@ -1274,7 +1281,7 @@ Purpose:
 
 - store immutable versioned manifests
 
-Suggested responsibilities:
+Responsibilities (`pkg/antfly/src/serverless/manifest/store.zig`):
 
 - `putManifest(version, manifest)`
 - `getManifest(version)`
@@ -1285,7 +1292,8 @@ Purpose:
 
 - track shared namespace publication and retention progress
 
-Suggested responsibilities:
+Responsibilities (`pkg/antfly/src/serverless/catalog/progress_store.zig`,
+`pkg/antfly/src/serverless/catalog/object_progress_store.zig`):
 
 - `getHead(namespace) -> version`
 - `compareAndSwapHead(namespace, expected, next)`
@@ -1298,29 +1306,29 @@ shared compare-and-swap state decides which result becomes visible.
 
 ## Current Object-Storage Implementation Direction
 
-The current serverless path should use objectstore-backed adapters at the
-remote-storage boundary:
+The serverless path uses objectstore-backed adapters at the remote-storage
+boundary:
 
 - `pkg/antfly/src/serverless/artifacts/object_store.zig`
 - `pkg/antfly/src/serverless/wal/object_store.zig`
 - `pkg/antfly/src/serverless/manifest/object_store.zig`
 - `pkg/antfly/src/serverless/catalog/object_progress_store.zig`
 
-`file://` remains the local/shared-filesystem stand-in, but it should flow
-through the same objectstore contract as future S3-compatible backends.
+`file://` remains the local/shared-filesystem stand-in, and it flows through
+the same objectstore contract as the S3-compatible and GCS backends.
 
 ## Current Namespace Policy Knobs
 
-Serverless namespaces now need explicit policy, not just default query mode.
+Serverless namespaces have explicit policy, not just default query mode.
 
 - `keep_latest_versions`
   - retention target for manifest history
 - `max_pending_records`
   - backpressure threshold for unpublished WAL tail
 - `compaction_trigger_version_count`
-  - threshold where retained history should be treated as needing compaction
+  - threshold where retained history is treated as needing compaction
 
-These knobs should remain namespace-scoped and query/build status should expose:
+These knobs are namespace-scoped, and query/build status exposes:
 
 - current unpublished WAL depth
 - whether new ingest is admitted
@@ -1334,9 +1342,9 @@ Purpose:
 
 - manage local on-disk / memory caching of fetched artifacts
 
-Suggested responsibilities:
+Implemented in `pkg/antfly/src/serverless/query/cache.zig`, covering:
 
-- `openArtifact(artifact_id)`
+- opening/fetching artifacts
 - pin / unpin
 - eviction
 - local materialization of read-friendly views
@@ -1417,64 +1425,46 @@ That is an implementation constraint for the first serverless tranches. It does
 not mean the final cheap hosted Antfly offering must expose a completely
 different user model or give up table-level metadata and lifecycle semantics.
 
-## Migration Order
+## Serving Path Build-Out
 
-Build the serverless path in phases.
+The serverless serving path was built in stages. Phases 1 through 4, 5.5, and
+5.6 below are implemented; the remaining control-plane and advanced-feature
+work is tracked under "Open work" at the end of this document.
 
-### Phase 1: Read-Only Immutable Namespace
+### Read-Only Immutable Namespace
 
-Goal:
+Reads are served from immutable artifacts and a manifest:
 
-- serve reads from immutable artifacts and a manifest
+- the manifest schema and artifact storage schema are defined
+  (`pkg/antfly/src/serverless/manifest/`, `pkg/antfly/src/serverless/artifacts/`)
+- a builder emits namespace versions (`pkg/antfly/src/serverless/build/builder.zig`)
+- a query path loads a manifest and answers search requests
+  (`pkg/antfly/src/serverless/query/`)
 
-Work:
+### Object-Storage-Backed Query Path
 
-- define manifest schema
-- define artifact storage schema
-- create a builder that emits one namespace version
-- create a query path that loads one manifest and answers search requests
+Query workers fetch artifacts from object storage and cache them locally:
 
-No WAL yet.
-No async ingest yet.
-No control plane beyond static config.
+- `ArtifactStore` is implemented (`pkg/antfly/src/serverless/artifacts/store.zig`)
+- a local cache manager handles artifact fetch, validation, and eviction
+  (`pkg/antfly/src/serverless/query/cache.zig`)
+- manifest-driven loading is lazy
 
-### Phase 2: Object-Storage-Backed Query Path
+The read path is meaningfully stateless: any query worker can serve any
+namespace after cache warmup.
 
-Goal:
+### Append-Only Ingest
 
-- query workers fetch artifacts from object storage and cache them locally
+Write acknowledgment is decoupled from index publication:
 
-Work:
+- `WalStore` is implemented (`pkg/antfly/src/serverless/wal/store.zig`)
+- the ingest API acknowledges writes by LSN / version token
+- a background builder consumes the WAL and produces the next manifest
+  (`pkg/antfly/src/serverless/build/builder.zig`)
 
-- implement `ArtifactStore`
-- implement local cache manager
-- add artifact fetch, validation, and eviction
-- support lazy manifest-driven loading
+### Publication and Freshness Semantics
 
-At this point the read path becomes meaningfully stateless.
-
-### Phase 3: Append-Only Ingest
-
-Goal:
-
-- decouple write acknowledgment from index publication
-
-Work:
-
-- implement `WalStore`
-- implement ingest API
-- acknowledge writes by LSN or version token
-- add a background builder that consumes WAL and produces the next manifest
-
-This is the first real serverless write path.
-
-### Phase 4: Publication and Freshness Semantics
-
-Goal:
-
-- define what "read after write" means
-
-Start with two read modes:
+"Read after write" has two supported read modes:
 
 - `indexed`
   - reads the latest published manifest only
@@ -1482,104 +1472,40 @@ Start with two read modes:
   - reads the latest manifest plus a small WAL tail overlay
 
 This keeps correctness and product semantics explicit.
-If stronger transactional or point-read semantics are needed, keep them on the
-canonical write plane rather than teaching immutable published artifacts to act
-like a general-purpose transactional store.
+Stronger transactional or point-read semantics stay on the canonical write
+plane rather than being bolted onto immutable published artifacts.
 
-### Phase 5: Real Control Plane
+### Object-Store Remote Adapters
 
-Goal:
+The serverless remote boundary sits on the shared objectstore contract:
 
-- productionize namespace management and build orchestration
-
-Work:
-
-- internal namespace lifecycle APIs
-- auth and quota enforcement
-- manifest head publication
-- namespace progress tracking
-- opportunistic worker scheduling
-- job tracking and retries
-
-This replaces shard placement with namespace/version management.
-If serverless becomes a public deployment mode of Antfly, this layer should also
-own the mapping between user-facing tables and internal published serving units.
-
-### Phase 5.5: Object-Store Remote Adapters
-
-Goal:
-
-- move the serverless remote boundary onto the shared objectstore contract
-
-Work:
-
-- keep objectstore-backed adapters for artifacts, WAL, manifests, and progress
-  behind the shared objectstore seam
-- keep `file://` as the initial shared-filesystem backend
-- make serverless remote adapters depend on `go/pkg/antfly/lib/objectstore/`
-- preserve the current serverless store interfaces above that seam
-
-Acceptance:
-
-- remote serverless tests pass through objectstore-backed adapters
+- objectstore-backed adapters exist for artifacts, WAL, manifests, and
+  progress behind the shared objectstore seam
+- `file://` remains the shared-filesystem backend for local/dev use
+- remote serverless tests pass through the objectstore-backed adapters
 - no remote serverless path directly depends on raw filesystem layout
-- objectstore covers the MinIO/S3-compatible features the Go repo already uses,
-  including R2 through the same compatibility path
+- the objectstore layer covers the MinIO/S3-compatible feature surface,
+  including Cloudflare R2 through the same S3-compatible path
 
-### Phase 5.6: Namespace Admission and Compaction Policy
+### Namespace Admission and Compaction Policy
 
-Goal:
+Explicit namespace-level operational controls are in place:
 
-- keep explicit namespace-level operational controls in place before scaling
-  runtime loops
+- `max_pending_records` is enforced as an ingest backpressure threshold
+- `compaction_trigger_version_count` is exposed as a compaction threshold
+- build/namespace status reports retained versions, retained artifacts,
+  unpublished WAL depth, and whether compaction is recommended
 
-Work:
+Ingest rejects backpressured namespaces, and compaction recommendations are
+visible without reading internal logs.
 
-- enforce `max_pending_records`
-- expose `compaction_trigger_version_count`
-- report retained versions, retained artifacts, unpublished WAL depth, and
-  whether compaction is recommended
-
-Acceptance:
-
-- ingest can reject backpressured namespaces
-- build status reports retained history and admission state
-- compaction recommendation is visible without reading internal logs
-
-### Phase 6: Advanced Features
-
-Only after the above is stable, consider:
-
-- hybrid dense + sparse optimization
-- serverless graph over published snapshots
-- incremental reranking support
-- richer write semantics
-
-The first serverless graph phase should be immutable and published-version
-oriented:
-
-1. use `graph_segment` artifacts in
-   `pkg/antfly/src/serverless/graph_segment/`
-2. publish graph artifacts from WAL-materialized document state
-3. harden pinned-version graph reads in `pkg/antfly/src/serverless/query/`
-4. start with neighbor lookup, edge-type filtering, and published-head or
-   explicit-version reads
-5. only then consider traversal/path features over immutable artifacts
-
-Do not port the stateful graph engine directly. Reuse graph semantics where
-they fit, but keep the storage format immutable and object-store-friendly.
-
-Do not plan for full replica-coupled stateful transaction parity inside the
-serverless published read plane. If the product needs stronger write semantics
-later, start with idempotent ingest, expected-head / compare-and-swap writes,
-and small namespace-local conditional updates. If the product keeps
-transactional table semantics, prefer keeping those on an upstream write/control
-plane and feeding the serverless read plane from committed table-originated
-state.
+Remaining control-plane productionization and advanced-feature work (real
+control plane hardening, hybrid retrieval, graph traversal depth, richer write
+semantics) is tracked in "Open work" at the end of this document.
 
 ## First End-to-End Milestone
 
-The first meaningful milestone should be:
+This milestone is met:
 
 1. `PUT /tables/{table}/ingest-batch`
    - appends to the table's internal serving WAL
@@ -1607,137 +1533,87 @@ Do not include:
 One namespace, one sequencer, many stateless readers is enough for the first
 proof.
 
-## Implementation Backlog
+## Core Serverless Modules
 
-### Tranche 1: Documents and Manifest Model
+### Documents and Manifest Model
 
-- keep `pkg/antfly/src/serverless/manifest/types.zig` as the manifest contract
-  and harden:
-  - namespace id
-  - manifest version
-  - artifact references
-  - doc count / term stats / vector stats
-  - build metadata
-- keep encoding / decoding tests deterministic
+`pkg/antfly/src/serverless/manifest/types.zig` is the manifest contract,
+covering:
 
-### Tranche 2: Artifact Storage Abstraction
+- namespace id
+- manifest version
+- artifact references
+- doc count / term stats / vector stats
+- build metadata
 
-- keep `pkg/antfly/src/serverless/artifacts/store.zig` as the shared interface
-  for:
-  - filesystem-backed implementation for tests
-  - object-store-shaped interface from day one
-- continue hardening real cloud implementations behind the same interface
+Encoding / decoding tests are deterministic.
 
-### Tranche 3: Query Runtime
+### Artifact Storage Abstraction
 
-- keep `pkg/antfly/src/serverless/query/runtime.zig` focused on:
-  - manifest loader
-  - local artifact cache
-  - snapshot-like query session pinned to one manifest version
-- make the query runtime reuse:
-  - `pkg/antfly/src/index.zig`
-  - `pkg/antfly/src/search/*`
-  - `go/pkg/antfly/lib/vector/go/pkg/antfly/src/*`
-  - `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/*`
+`pkg/antfly/src/serverless/artifacts/store.zig` is the shared interface for:
 
-### Tranche 4: WAL and Builder
+- filesystem-backed implementation for tests
+- object-store-shaped implementations (see "Object-Store Remote Adapters"
+  above)
 
-- keep `pkg/antfly/src/serverless/wal/store.zig` and
-  `pkg/antfly/src/serverless/build/builder.zig` centered on append-only write
-  batches and full rebuild or coarse-grained build
-- do not optimize for tiny incremental updates first
+### Query Runtime
 
-### Tranche 5: Minimal API Surface
+`pkg/antfly/src/serverless/query/runtime.zig` is focused on:
 
-- keep `pkg/antfly/src/serverless/api/http_routes.zig` focused on:
-  - table ingest
-  - table query/search
-  - table build status
-  - internal namespace head/debug routes as needed
+- manifest loader
+- local artifact cache
+- snapshot-like query session pinned to one manifest version
 
-Keep `/tables/...` as the public API. Route internal publication, artifact, and
-manifest inspection through `/internal/v1/namespaces/...`.
+The query runtime reuses:
 
-### Tranche 6: Control Plane Skeleton
+- `pkg/antfly/src/index.zig`
+- `pkg/antfly/src/search/*`
+- `go/pkg/antfly/lib/vector/go/pkg/antfly/src/*`
+- `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/*`
 
-- keep `pkg/antfly/src/serverless/catalog/service.zig` tracking:
-  - namespace records
-  - namespace progress state
-  - build jobs
-  - retention policy
+### WAL and Builder
 
-### Tranche 7: Progress-Based Coordination
+`pkg/antfly/src/serverless/wal/store.zig` and
+`pkg/antfly/src/serverless/build/builder.zig` are centered on append-only
+write batches and full rebuild or coarse-grained build; they are not tuned
+for tiny incremental updates.
 
-- keep `pkg/antfly/src/serverless/catalog/progress_store.zig` focused on:
-  - filesystem-backed head CAS
-  - filesystem-backed GC watermark CAS
-- route publish and prune through shared progress state
-- allow duplicate build work when only one CAS winner becomes visible
+### Minimal API Surface
 
-### Current Next-Tranche Detail
+`pkg/antfly/src/serverless/api/http_routes.zig` is focused on:
 
-The current query path is still centered on manifest-pinned artifact fetch and
-document-state materialization. That is correctness scaffolding, not the final
-steady state. The next query work should finish the existing request/indexed
-reader seam and add the missing search module:
+- table ingest
+- table query/search
+- table build status
+- internal namespace head/debug routes as needed
 
-- `pkg/antfly/src/serverless/query/request.zig`
-- `pkg/antfly/src/serverless/query/indexed_reader.zig`
-- missing: `pkg/antfly/src/serverless/query/search.zig`
+`/tables/...` is the public API. Internal publication, artifact, and manifest
+inspection route through `/internal/v1/namespaces/...`.
 
-The goal is to read from published searchable artifacts, preserve
-pinned-manifest semantics, and return ranked hits or bounded document matches
-without reconstructing full document state for every request.
+### Control Plane Skeleton
 
-Text-only indexed reads are not enough. The serverless path also needs the
-existing dense and sparse artifact families to become production query inputs
-before operator work starts:
+`pkg/antfly/src/serverless/catalog/service.zig` tracks:
 
-- `pkg/antfly/src/serverless/vector_segment/mod.zig`
-- `pkg/antfly/src/serverless/vector_segment/types.zig`
-- `pkg/antfly/src/serverless/vector_segment/codec.zig`
-- `pkg/antfly/src/serverless/sparse_segment/mod.zig`
-- `pkg/antfly/src/serverless/sparse_segment/types.zig`
-- `pkg/antfly/src/serverless/sparse_segment/codec.zig`
-- `pkg/antfly/src/serverless/document_projection.zig`
+- namespace records
+- namespace progress state
+- build jobs
+- retention policy
 
-Do not copy the mutable HBC storage format directly into serverless. Reuse HBC
-and RaBitQ lessons, but publish immutable `vector_segment` and `sparse_segment`
-artifact families that are object-storage and cache friendly. Start with exact
-or lightly optimized retrieval over immutable published vectors and weighted
-sparse postings, while keeping the format evolvable toward centroid / quantized
-ANN layouts.
+### Progress-Based Coordination
 
-The local query cache should keep becoming explicit and testable:
+`pkg/antfly/src/serverless/catalog/progress_store.zig` (filesystem-backed)
+and `pkg/antfly/src/serverless/catalog/object_progress_store.zig`
+(object-store-backed) implement:
 
-- `pkg/antfly/src/serverless/query/cache.zig`
-- optional missing: `pkg/antfly/src/serverless/query/cache_fs.zig`
+- head CAS
+- GC watermark CAS
 
-Cache behavior should include SSD/NVMe-oriented artifact storage, query-session
-pin/unpin behavior, bounded eviction, and checksum-aware validation.
+Publish and prune route through shared progress state, and duplicate build
+work is allowed when only one CAS winner becomes visible.
 
-Compaction should keep moving beyond retention:
-
-- `pkg/antfly/src/serverless/build/compactor.zig`
-- optional missing: `pkg/antfly/src/serverless/build/segment_plan.zig`
-
-The compactor should rewrite many small published deltas into fewer optimized
-artifacts, reduce repeated full snapshot publication, and control artifact
-growth without depending only on deletion.
-
-Before multiple maintenance workers are expected to run in anger, harden:
-
-- `pkg/antfly/src/serverless/catalog/progress_store.zig`
-- `pkg/antfly/src/serverless/catalog/object_progress_store.zig`
-- `pkg/antfly/src/serverless/runtime/manager.zig`
-
-Add concurrent publish/prune tests, crash/retry tests around manifest write plus
-head publish, and idempotency checks for prune GC watermark advancement.
-
-Before operator packaging, `pkg/antfly/src/serverless/runtime/manager.zig`
-should expose first-class query-only and maintenance-only modes so query pods
-can run without maintenance loops and maintenance pods can run without serving
-queries.
+Remaining query/build hardening work (search-artifact reads, dense/sparse
+production readiness, cache and compaction follow-ups) is tracked under
+"Open work" at the end of this document.
 
 ## Testing Strategy
 
@@ -1853,3 +1729,137 @@ Prefer:
 - opportunistic workers that can safely lose races
 
 Duplicate build work is acceptable. Conflicting visible state is not.
+
+## Open work
+
+The serving path above (manifests, artifacts, WAL, object-store adapters,
+admission/compaction policy, query caching) is implemented. The items below
+are not, and remain planned rather than shipped.
+
+### Real Control Plane
+
+Goal:
+
+- productionize namespace management and build orchestration
+
+Work:
+
+- internal namespace lifecycle APIs
+- auth and quota enforcement
+- manifest head publication
+- namespace progress tracking
+- opportunistic worker scheduling
+- job tracking and retries
+
+This replaces shard placement with namespace/version management.
+If serverless becomes a public deployment mode of Antfly, this layer should
+also own the mapping between user-facing tables and internal published
+serving units.
+
+Note: manifest head publication and namespace progress tracking already exist
+(see "Object-Store Remote Adapters" and "Namespace Admission and Compaction
+Policy" above); auth/quota enforcement and job tracking/retries are the parts
+still open.
+
+### Advanced Features
+
+Only after the rest is stable, consider:
+
+- hybrid dense + sparse optimization
+- serverless graph over published snapshots
+- incremental reranking support
+- richer write semantics
+
+The first serverless graph phase should be immutable and published-version
+oriented:
+
+1. use `graph_segment` artifacts in
+   `pkg/antfly/src/serverless/graph_segment/`
+2. publish graph artifacts from WAL-materialized document state
+3. harden pinned-version graph reads in `pkg/antfly/src/serverless/query/`
+4. start with neighbor lookup, edge-type filtering, and published-head or
+   explicit-version reads
+5. only then consider traversal/path features over immutable artifacts
+
+Do not port the stateful graph engine directly. Reuse graph semantics where
+they fit, but keep the storage format immutable and object-store-friendly.
+
+Do not plan for full replica-coupled stateful transaction parity inside the
+serverless published read plane. If the product needs stronger write semantics
+later, start with idempotent ingest, expected-head / compare-and-swap writes,
+and small namespace-local conditional updates. If the product keeps
+transactional table semantics, prefer keeping those on an upstream write/control
+plane and feeding the serverless read plane from committed table-originated
+state.
+
+### Next Query And Build Work
+
+The current query path is still centered on manifest-pinned artifact fetch and
+document-state materialization. That is correctness scaffolding, not the final
+steady state. The next query work should finish the existing request/indexed
+reader seam and add the missing search module:
+
+- `pkg/antfly/src/serverless/query/request.zig`
+- `pkg/antfly/src/serverless/query/indexed_reader.zig`
+- missing: `pkg/antfly/src/serverless/query/search.zig`
+
+The goal is to read from published searchable artifacts, preserve
+pinned-manifest semantics, and return ranked hits or bounded document matches
+without reconstructing full document state for every request.
+
+Text-only indexed reads are not enough. The serverless path also needs the
+existing dense and sparse artifact families to become production query inputs
+before operator work starts:
+
+- `pkg/antfly/src/serverless/vector_segment/mod.zig`
+- `pkg/antfly/src/serverless/vector_segment/types.zig`
+- `pkg/antfly/src/serverless/vector_segment/codec.zig`
+- `pkg/antfly/src/serverless/sparse_segment/mod.zig`
+- `pkg/antfly/src/serverless/sparse_segment/types.zig`
+- `pkg/antfly/src/serverless/sparse_segment/codec.zig`
+- `pkg/antfly/src/serverless/document_projection.zig`
+
+Do not copy the mutable HBC storage format directly into serverless. Reuse HBC
+and RaBitQ lessons, but publish immutable `vector_segment` and `sparse_segment`
+artifact families that are object-storage and cache friendly. Start with exact
+or lightly optimized retrieval over immutable published vectors and weighted
+sparse postings, while keeping the format evolvable toward centroid / quantized
+ANN layouts.
+
+The local query cache should keep becoming explicit and testable:
+
+- `pkg/antfly/src/serverless/query/cache.zig`
+- optional missing: `pkg/antfly/src/serverless/query/cache_fs.zig`
+
+Cache behavior should include SSD/NVMe-oriented artifact storage, query-session
+pin/unpin behavior, bounded eviction, and checksum-aware validation.
+
+Compaction should keep moving beyond retention:
+
+- `pkg/antfly/src/serverless/build/compactor.zig`
+- optional missing: `pkg/antfly/src/serverless/build/segment_plan.zig`
+
+The compactor should rewrite many small published deltas into fewer optimized
+artifacts, reduce repeated full snapshot publication, and control artifact
+growth without depending only on deletion.
+
+Before multiple maintenance workers are expected to run in anger, harden:
+
+- `pkg/antfly/src/serverless/catalog/progress_store.zig`
+- `pkg/antfly/src/serverless/catalog/object_progress_store.zig`
+- `pkg/antfly/src/serverless/runtime/manager.zig`
+
+Add concurrent publish/prune tests, crash/retry tests around manifest write plus
+head publish, and idempotency checks for prune GC watermark advancement.
+
+### Remaining Checklist Items
+
+These are called out inline elsewhere in this document but are not yet done:
+
+- (from "Shared Public Table API Backend") separate public and internal
+  serverless HTTP surfaces more aggressively
+- (from "Shared Public Table API Backend") separate public and internal
+  stateful HTTP surfaces more aggressively
+- (from "Current Execution Priorities") evaluate renaming internal `namespace`
+  to `serving_namespace`, `publication`, or `generation_family` after the
+  public surface is stable

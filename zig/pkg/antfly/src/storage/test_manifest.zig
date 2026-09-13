@@ -14,9 +14,10 @@
 
 //! Authoritative storage-test discovery surface.
 //!
-//! Every storage source containing a test declaration is imported exactly once
-//! here. The bounded shard builds compile this manifest through root.zig and
-//! select disjoint test-name prefixes. The accompanying audit rejects missing,
+//! Storage sources containing tests are imported exactly once here, except
+//! dedicated ABI suites declared by build/storage_owner_tests.zig. The bounded
+//! shard builds compile this manifest through root.zig and select disjoint
+//! test-name prefixes. The accompanying audit rejects missing,
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
@@ -38,8 +39,10 @@ comptime {
     _ = @import("backup_bundle_io.zig");
     _ = @import("backup_repository.zig");
     _ = @import("coverage_identity.zig");
+    _ = @import("data_raft_projection_wire.zig");
     _ = @import("db_split_vopr.zig");
     _ = @import("db/aggregations.zig");
+    _ = @import("db/aggregations_contract.zig");
     _ = @import("db/algebraic/adaptive.zig");
     _ = @import("db/algebraic/algebra.zig");
     _ = @import("db/algebraic/cylinder.zig");
@@ -47,6 +50,7 @@ comptime {
     _ = @import("db/algebraic/fact.zig");
     _ = @import("db/algebraic/hll.zig");
     _ = @import("db/algebraic/index.zig");
+    _ = @import("db/algebraic/index_config.zig");
     _ = @import("db/algebraic/ir.zig");
     _ = @import("db/algebraic/join.zig");
     _ = @import("db/algebraic/law.zig");
@@ -116,10 +120,11 @@ comptime {
     _ = @import("db/maintenance/sparse_compaction_runtime.zig");
     _ = @import("db/maintenance/transaction_runtime.zig");
     _ = @import("db/maintenance/ttl_runtime.zig");
-    _ = @import("db/merge_state.zig");
+    _ = @import("db/merge_contract.zig");
     _ = @import("db/mod.zig");
     _ = @import("db/native_backup.zig");
     _ = @import("db/ownership.zig");
+    _ = @import("db/planning_bindings.zig");
     _ = @import("db/planning_stats.zig");
     _ = @import("db/promotion_runtime.zig");
     _ = @import("db/publication.zig");
@@ -129,6 +134,7 @@ comptime {
     _ = @import("db/query/relational_projection.zig");
     _ = @import("db/query/result_shape.zig");
     _ = @import("db/query/search_exec.zig");
+    _ = @import("db/query/structured_filter_validation.zig");
     _ = @import("db/query_metrics.zig");
     _ = @import("db/range_state.zig");
     _ = @import("db/relational_columns.zig");
@@ -142,6 +148,7 @@ comptime {
     _ = @import("db/snapshot_admission.zig");
     _ = @import("db/template_remote_stub.zig");
     _ = @import("db/template_stub.zig");
+    _ = @import("db/text_memory_stats.zig");
     _ = @import("db/transform.zig");
     _ = @import("db/typed_doc_values_coverage.zig");
     _ = @import("db/types.zig");
@@ -196,6 +203,8 @@ comptime {
     _ = @import("hbc_adapter.zig");
     _ = @import("hierarchy_navigation.zig");
     _ = @import("internal_keys.zig");
+    _ = @import("kernel_owner_client.zig");
+    _ = @import("kernel_wal_wire.zig");
     _ = @import("index_manager_vopr.zig");
     _ = @import("lite/backend.zig");
     _ = @import("lite/bridge.zig");
@@ -207,6 +216,7 @@ comptime {
     _ = @import("lite/native.zig");
     _ = @import("lite/paths.zig");
     _ = @import("lite/restore_staging.zig");
+    _ = @import("local_write.zig");
     _ = @import("lmdb.zig");
     _ = @import("lmdb_backend.zig");
     _ = @import("lmdb_vopr.zig");

@@ -140,7 +140,7 @@ Build minimal PPTX ZIPs in-memory:
 ## Verification
 
 ```bash
-cd /Users/ajroetker/go/src/github.com/antflydb/antfly2/antfly-go
+cd go/pkg/docsaf
 GOEXPERIMENT=simd go test ./docsaf/...
 GOEXPERIMENT=simd go build ./docsaf/...
 ```

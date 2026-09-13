@@ -22,7 +22,7 @@ An ordered set of `(DeviceId, ComputeBackend)` pairs representing physical or lo
 
 ```
 DeviceMesh { devices: [
-    (0, mlx_backend,  .metal,  "gpu:0"),
+    (0, metal_backend,  .metal,  "gpu:0"),
     (1, native_backend, .native, "cpu:0"),
 ] }
 ```
@@ -117,4 +117,4 @@ The output is transferred to f32 from whichever device produced it, then the las
 - **Native Metal multi-device**: Replace CPU-mediated transfers with Metal's native multi-device primitives when available.
 - **Pipeline overlap**: Run consecutive pipeline stages concurrently via `std.Thread` for true pipeline parallelism.
 - **Graph-level collective nodes**: Currently collectives are executor-boundary operations. Promoting them to graph nodes would enable the compiler passes to optimize around them.
-- **Distributed training**: Compose collective ops with gradient all-reduce for data-parallel training (see [TRAINING.md](TRAINING.md)).
+- **Distributed training**: Compose collective ops with gradient all-reduce for data-parallel training (see [FINETUNING.md](docs/finetuning/FINETUNING.md)).

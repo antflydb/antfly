@@ -32,6 +32,7 @@ pub const Command = struct {
 };
 
 const table_subcommands = [_][]const u8{ "create", "drop", "list", "get" };
+const index_subcommands = [_][]const u8{ "create", "drop", "list", "get", "wait" };
 const artifact_subcommands = [_][]const u8{ "list", "get", "put", "delete", "reprocess", "job" };
 const agents_subcommands = [_][]const u8{ "retrieval", "query-builder" };
 const auth_subcommands = [_][]const u8{ "me", "users", "permissions", "roles", "row-filters", "subjects", "api-keys" };
@@ -68,7 +69,7 @@ pub const commands = [_]Command{
     .{ .name = "lite", .description = "Manage embedded Antfly Lite databases", .route = .standalone, .subcommands = &lite_subcommands },
     .{ .name = "ha", .description = "Manage local hot-standby HA", .route = .ha },
     .{ .name = "table", .description = "Manage tables", .route = .cli, .subcommands = &table_subcommands },
-    .{ .name = "index", .description = "Manage indexes", .route = .cli, .subcommands = &table_subcommands },
+    .{ .name = "index", .description = "Manage indexes", .route = .cli, .subcommands = &index_subcommands },
     .{ .name = "artifact", .description = "Manage generated artifacts", .route = .cli, .subcommands = &artifact_subcommands },
     .{ .name = "query", .description = "Query table data", .route = .cli },
     .{ .name = "lookup", .description = "Look up a document by key", .route = .cli },
@@ -247,4 +248,5 @@ test "zsh completion contains nested inference and completion commands" {
     try write(.zsh, &output.writer);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "inference) subcommands=(run embed classify") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "completion) subcommands=(bash zsh fish)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "index) subcommands=(create drop list get wait)") != null);
 }

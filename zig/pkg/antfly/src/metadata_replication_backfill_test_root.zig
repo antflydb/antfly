@@ -9,3 +9,6 @@ const replication_backfill = @import("metadata/replication_backfill.zig");
 test {
     _ = replication_backfill;
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");
