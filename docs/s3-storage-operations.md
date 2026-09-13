@@ -53,8 +53,8 @@ invalid and reports the stale condition; investigate it immediately.
 Startup is intentionally fail closed. Check, in order:
 
 1. `deployment_mode` is `serverless` and `storage.engine` is `object`.
-2. every referenced connection exists, is `external_io` with protocol `s3`,
-   and has capability `storage.primary`;
+2. every referenced connection exists, is `external_io` with protocol `s3` or
+   `gcs`, and has capability `storage.primary`;
 3. lane buckets are present in the connection allowlist and prefixes stay
    within the configured connection prefix;
 4. endpoint TLS and addressing style match the provider;

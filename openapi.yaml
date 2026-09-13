@@ -410,21 +410,24 @@ tags:
       ### Basic Configuration
 
 
-      Configure TTL when creating a table using a `ttl` policy:
+      Configure TTL when creating a table (`POST /db/v1/tables/{tableName}`)
+
+      with a `ttl` policy under `schema`. The table name is part of the URL:
 
 
       ```json
 
       {
-        "name": "sessions",
-        "ttl": {"duration": "24h"},
-        "document_schemas": {
-          "session": {
-            "schema": {
-              "type": "object",
-              "properties": {
-                "user_id": {"type": "string"},
-                "data": {"type": "object"}
+        "schema": {
+          "ttl": {"duration": "24h"},
+          "document_schemas": {
+            "session": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "user_id": {"type": "string"},
+                  "data": {"type": "object"}
+                }
               }
             }
           }
@@ -456,20 +459,21 @@ tags:
       ```json
 
       {
-        "name": "events",
-        "ttl": {
-          "duration": "7d",
-          "field": "created_at"
-        },
-        "document_schemas": {
-          "event": {
-            "schema": {
-              "type": "object",
-              "properties": {
-                "created_at": {"type": "string", "format": "date-time"},
-                "event_type": {"type": "string"}
-              },
-              "required": ["created_at"]
+        "schema": {
+          "ttl": {
+            "duration": "7d",
+            "field": "created_at"
+          },
+          "document_schemas": {
+            "event": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "created_at": {"type": "string", "format": "date-time"},
+                  "event_type": {"type": "string"}
+                },
+                "required": ["created_at"]
+              }
             }
           }
         }
@@ -513,7 +517,7 @@ tags:
       ```json
 
       {
-        "ttl": {"duration": "1h", "field": "last_accessed"}
+        "schema": {"ttl": {"duration": "1h", "field": "last_accessed"}}
       }
 
       ```
@@ -527,7 +531,7 @@ tags:
       ```json
 
       {
-        "ttl": {"duration": "24h"}
+        "schema": {"ttl": {"duration": "24h"}}
       }
 
       ```
@@ -540,7 +544,7 @@ tags:
       ```json
 
       {
-        "ttl": {"duration": "30d"}
+        "schema": {"ttl": {"duration": "30d"}}
       }
 
       ```
@@ -29086,8 +29090,6 @@ components:
               $ref: '#/components/schemas/InferenceAdmissionConfig'
     InferenceRuntimeConfig:
       type: object
-      required:
-        - api_url
       properties:
         max_concurrent_requests:
           type: integer
@@ -29106,7 +29108,16 @@ components:
         api_url:
           type: string
           format: uri
-          description: URL of the Antfly inference embedding/chunking service
+          description: >
+            URL of an out-of-process Antfly inference service that the Antfly
+
+            server should call for embedding, chunking, reranking, and
+
+            generation. Omit it to use the in-process inference runtime
+
+            (the default in standalone mode). `antfly inference run` ignores
+
+            this field; it configures the client side only.
           example: http://localhost:8080
         api_key:
           type: string

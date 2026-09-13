@@ -12,40 +12,12 @@ Relevant code:
 - `src/models/bert.zig`
 - `src/architectures/bert.zig`
 - `src/pipelines/reranking.zig`
-- `src/ops/mlx_compute.zig`
-- `src/backends/mlx.zig`
 
 ### Endpoint
 
 `POST /api/rerank`
 
 Standard cross-encoder inference: tokenize `[CLS] query [SEP] document [SEP]` pairs, run through the BERT/RoBERTa encoder session, extract classification logits, apply sigmoid (num_labels=1) or softmax.
-
-### Distributed MLX Tensor Parallel
-
-Distributed MLX configuration for the native reranker path:
-
-```
-ANTFLY_INFERENCE_MLX_DISTRIBUTED_ENABLE=1
-ANTFLY_INFERENCE_MLX_DISTRIBUTED_MODE=tensor_parallel
-ANTFLY_INFERENCE_MLX_DISTRIBUTED_BACKEND=ring
-ANTFLY_INFERENCE_MLX_WORLD_SIZE=<n>
-ANTFLY_INFERENCE_MLX_RANK=<rank>
-ANTFLY_INFERENCE_MLX_LOCAL_RANK=<rank>
-MLX_WORLD_SIZE=<n>
-MLX_RANK=<rank>
-MLX_HOSTFILE=<path>
-ANTFLY_INFERENCE_MLX_ALLOW_CPU_STREAM_WITHOUT_METAL=1
-```
-
-The current verified local setup is 2-rank ring mode on one host.
-
-What the TP path implements:
-- Fixed TP linear math for sharded `[out, in]` weights
-- MLX-native matmul for TP linears
-- Per-rank row/column/bias shard cache keyed by tensor name
-- Cached borrowed MLX arrays and transposes for those shards
-- BERT/RoBERTa encoder attention and FFN projection seams routed through MLX tensor-parallel helpers when TP mode is enabled
 
 ### Build and Verify
 
@@ -61,20 +33,12 @@ Run a one-shot probe:
 
 ```bash
 ./zig-out/bin/probe-cross-encoder-rerank \
-  /Users/tim/.cache/bge-reranker-base \
+  ~/.cache/bge-reranker-base \
   "what is antfly inference zig" \
   "antfly inference is a zig inference server with native model runtimes" \
-  --tokenizer-dir /Users/tim/.cache/bge-reranker-base \
+  --tokenizer-dir ~/.cache/bge-reranker-base \
   --backend native
 ```
-
-Run the bounded BLAS-vs-MLX TP verifier:
-
-```bash
-bash ./scripts/verify_cross_encoder_rerank.sh
-```
-
-That script builds the standalone probe, runs a BLAS baseline, runs a 2-rank MLX tensor-parallel check, and compares scores within tolerance.
 
 ### Benchmarking
 
@@ -83,12 +47,12 @@ ANTFLY_INFERENCE_RERANK_BENCH_REPEAT=8 \
 bash ./scripts/benchmark_cross_encoder_rerank.sh
 ```
 
-Runs repeated reranks in-process on one loaded model session for BLAS and 2-rank MLX TP. The probe reports `last_ms`, `min_ms`, `max_ms`, `avg_ms`, `warm_avg_ms`. `warm_avg_ms` excludes the first run (most useful for the TP shard/transposed-weight cache).
+Runs repeated reranks in-process on one loaded model session for BLAS. The probe reports `last_ms`, `min_ms`, `max_ms`, `avg_ms`, `warm_avg_ms`. `warm_avg_ms` excludes the first run (most useful for the TP shard/transposed-weight cache).
 
 Server-lifecycle benchmark:
 
 ```bash
-ANTFLY_BIN=/Users/tim/Documents/af/antfly-inference-zig/zig-out/bin/antfly \
+ANTFLY_BIN=./zig-out/bin/antfly \
 ANTFLY_INFERENCE_RERANK_SERVER_BENCH_REPEAT=4 \
 bash ./scripts/benchmark_cross_encoder_rerank_server.sh
 ```
@@ -164,23 +128,6 @@ Late-interaction single-text encoding is chosen from the model config:
 
 This makes the reranker compatible with both BERT-style ColBERT checkpoints and decoder-style text models that expose token-level hidden states.
 
-### Distributed MLX
-
-The same distributed MLX env contract as the cross-encoder path applies to text late-interaction rerankers:
-
-```
-ANTFLY_INFERENCE_MLX_DISTRIBUTED_ENABLE=1
-ANTFLY_INFERENCE_MLX_DISTRIBUTED_MODE=data_parallel   # or tensor_parallel
-ANTFLY_INFERENCE_MLX_DISTRIBUTED_BACKEND=ring
-ANTFLY_INFERENCE_MLX_WORLD_SIZE=<n>
-ANTFLY_INFERENCE_MLX_RANK=<rank>
-ANTFLY_INFERENCE_MLX_LOCAL_RANK=<rank>
-```
-
-The distributed MLX config is plumbed into the native reranker pipeline configuration used by `LoadedModel.rerankingPipeline()`.
-
-Current state on the native BERT/RoBERTa cross-encoder path: distributed MLX TP is implemented and verified; bounded BLAS-vs-TP verification passes; repeated-request benchmarking shows warm TP behavior after the shard/transposed-weight cache is populated.
-
 ---
 
 ## Multimodal Reranking (ColQwen)
@@ -211,10 +158,6 @@ Each document carries `content` in the same format used for generation and embed
 
 The text side runs through Antfly inference's native GPT/Qwen compute backend and late-interaction scorer. The image side uses either the `visual_model` export or the native Qwen2-VL-style vision/projection fallback.
 
-Antfly inference has a distributed-aware multimodal ColQwen wrapper:
-- The probe reports `runtime.distributed.Config`, `uses_distributed_mlx`, and `uses_tensor_parallel_mlx`
-- The served `/rerank_multimodal` path runs through the same wrapper (not free functions)
-
 ### Verification
 
 ```bash
@@ -224,7 +167,7 @@ bash ./scripts/verify_colqwen_rerank.sh
 Defaults:
 - model bundle: `/tmp/colqwen2-v1.0-hf`
 - tokenizer bundle: `/tmp/colqwen2-v1.0`
-- probe image: `/Users/tim/Documents/af/go-xla/docs/gomlx_stablehlo_gopher.png`
+- probe image: any small local PNG
 
 Override with:
 ```
@@ -234,11 +177,7 @@ ANTFLY_INFERENCE_COLQWEN_IMAGE_PATH=<path>
 ANTFLY_INFERENCE_COLQWEN_QUERY=<string>
 ```
 
-The verification script rebuilds `probe-colqwen2-rerank`, runs the full native MLX ColQwen2 path, and asserts that the probe reaches `document_encode` and emits a final `score=...` line.
-
-The probe emits:
-- `distributed enabled=... mode=... backend=... rank=... world_size=... local_rank=...`
-- `pipeline uses_distributed_mlx=... uses_tensor_parallel_mlx=...`
+The verification script rebuilds `probe-colqwen2-rerank`, runs the full native ColQwen2 path, and asserts that the probe reaches `document_encode` and emits a final `score=...` line.
 
 ### Model Bundle Notes
 
@@ -246,9 +185,7 @@ The published `vidore/colqwen2-v1.0-hf` config contains the full `vlm_config.vis
 
 ### Remaining Work
 
-- Bounded BLAS-vs-MLX TP verification on a real local ColQwen2 bundle
 - Request-level `/rerank_multimodal` smoke/regression surface
-- Verify native Qwen2-VL vision behavior under distributed MLX on the larger machine
 - Unified text and multimodal late-interaction reporting semantics
 - Broader multimodal server-path regression coverage
 ```

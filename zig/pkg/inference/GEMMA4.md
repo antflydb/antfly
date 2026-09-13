@@ -282,11 +282,11 @@ algorithm. Phase 1 used an independent decoder drafter. Phase 2 now has a
 Gemma-specific MTP draft step that consumes target hidden activations, reads
 target K/V, and chains projected activations. Verification is still target-owned.
 
-## Implementation Plan
+## Implementation
 
-### Phase 1: Generic Assistant Drafters
+### Generic Assistant Drafters
 
-Status: implemented for the native server API and CLI.
+Implemented for the native server API and CLI.
 
 - Load an optional `draft_model` alongside the target model.
 - Validate tokenizer compatibility before generation.
@@ -301,15 +301,13 @@ Status: implemented for the native server API and CLI.
 This should work with Gemma 4 `*-assistant` checkpoints if they are exported in
 a format the native loader understands as a decoder-only model.
 
-### Phase 2: Gemma 4 MTP Runtime
+### Gemma 4 MTP Runtime
 
-Status: implemented with Gemma-specific runtime ownership and remaining
-acceptance-rate investigation.
+A Gemma-specific drafter runtime understands assistant checkpoints as MTP
+heads instead of independent decoders, with Gemma-specific runtime ownership
+and remaining acceptance-rate investigation (see Open work):
 
-Add a Gemma-specific drafter runtime that understands assistant checkpoints as
-MTP heads instead of independent decoders:
-
-1. Extend model metadata parsing for MTP assistant structure: done.
+1. Model metadata parsing for MTP assistant structure covers:
    - `model_type = "gemma4_assistant"` and
      `architectures = ["Gemma4AssistantForCausalLM"]`,
    - `backbone_hidden_size`,
@@ -317,28 +315,28 @@ MTP heads instead of independent decoders:
    - `pre_projection.weight` and `post_projection.weight`,
    - clustered embedder metadata for E2B/E4B where present,
    - explicit target-model compatibility identifiers when available.
-2. Expose target drafter activations from the target decode pass: done for
+2. Target drafter activations are exposed from the target decode pass for
    native generation through `forwardAllLogitsAndHiddenHost` and
    `materializeAcceptedTokenKvAndReturnHidden`. The MTP path uses final
    RMSNorm hidden for the drafter handoff, matching the extracted PyTorch
    reference's `text_model.norm` hook.
-3. Add a Gemma 4 MTP draft helper in `src/architectures/gemma4_mtp.zig`: done.
-   - borrow or alias target token embeddings at the target/backbone width,
-   - consume target final hidden activations,
-   - build drafter inputs from `concat(token_embedding, target_hidden)`,
-   - run the assistant transformer stack,
-   - produce assistant logits and clustered candidate logits,
-   - retain the drafter's `projected_activations`/post-projection output so the
+3. A Gemma 4 MTP draft helper in `src/architectures/gemma4_mtp.zig`:
+   - borrows or aliases target token embeddings at the target/backbone width,
+   - consumes target final hidden activations,
+   - builds drafter inputs from `concat(token_embedding, target_hidden)`,
+   - runs the assistant transformer stack,
+   - produces assistant logits and clustered candidate logits,
+   - retains the drafter's `projected_activations`/post-projection output so the
      next draft step can chain from the prior assistant step without rerunning
      the target.
-4. Replace independent draft prompt prefill with target-activation seeding: done
+4. Independent draft prompt prefill is replaced with target-activation seeding
    for `gemma4_assistant` draft configs.
-5. Keep the existing verification path unchanged: done. Target-side verification is
+5. The existing verification path is unchanged: target-side verification is
    what preserves output quality and sampling semantics.
-6. Extend telemetry: partially done. `ANTFLY_GEMMA4_MTP_DEBUG=1` prints drafted
+6. Telemetry is partial: `ANTFLY_GEMMA4_MTP_DEBUG=1` prints drafted
    token ids and verifier choices for acceptance debugging.
-7. Move Gemma 4 runtime-specific construction into
-   `src/architectures/gemma4_runtime.zig`: done.
+7. Gemma 4 runtime-specific construction lives in
+   `src/architectures/gemma4_runtime.zig`:
    - the explicit backend contract is `gemma4_gated_ple_shared_kv`,
    - shared-KV layer specs, PLE slots, head-norm slots, and final/tail slots are
      built by the Gemma 4 architecture module,
@@ -671,30 +669,11 @@ MLX streams/providers for the `.mlx` backend. The repaired smoke
 `token_ids: 10979 236888 2088 740`, `prefill=157ms`, `decode=149ms`,
 `total=1006ms`, and no diagnostic reports.
 
-### Phase 3: Performance Work
-
 Baseline, no-MTP prefill/decode optimization is tracked separately in
-[GEMMA4_PERF_PLAN.md](./GEMMA4_PERF_PLAN.md). That roadmap owns
+[GEMMA4_PERF_PLAN.md](./GEMMA4_PERF_PLAN.md). That plan owns
 the pinned llama.cpp comparison, current experiment ledger, promotion gates,
 and ordered Metal kernel/runtime tranches. MTP speedups are additive and must
 not be used to qualify the baseline model path.
-
-- Tune `speculative_k`; start at 4 and compare against 2, 6, and 8.
-- Add a heuristic schedule that increases draft length after full acceptance
-  and decreases it after rejection.
-- Benchmark dense Gemma 4 separately from the 26B MoE model. MoE verification
-  can lose speedup at batch size 1 because drafted tokens may route to
-  different experts.
-- Prefer batched server benchmarks for MoE models, where expert reuse is more
-  likely.
-- Keep the compiled graph route as the single public Metal whole-model path.
-  Avoid reintroducing a second live-executor CLI route; graph execution should
-  own attachment, fallback, greedy-token shortcuts, and future prefill/decode
-  scheduling.
-- Fill the remaining GGML-shaped gaps behind generic quant entrypoints:
-  extend the monolithic whole-block kernels beyond Q8_0, add any missing
-  format-specific fused matvec kernels, and keep the layer/block planner
-  independent of the physical quant format.
 
 ## Correctness Rules
 
@@ -711,12 +690,28 @@ not be used to qualify the baseline model path.
 - MTP must fall back to standard decoding if the assistant is missing,
   incompatible, or slower for the current backend.
 
-## Open Questions
+## Open work
 
+- MTP acceptance rate is still far below published best-case numbers (2 of 41
+  drafted tokens accepted in one longer local smoke); likely causes include
+  source/model pairing differences between the official safetensors assistant
+  and local GGUF targets, target quantization effects, or a still-missing
+  detail in the clustered output head.
+- Telemetry beyond `ANTFLY_GEMMA4_MTP_DEBUG=1` (structured acceptance-rate
+  reporting) is not built out.
+- Prompt-prefix cache attach (`--prompt-cache` in `chat`) reproducibly
+  degrades attached-token KV on Metal and can hang generation on native; see
+  "Chat REPL" above. Chat defaults to full re-prefill each turn until fixed.
+- Baseline (non-MTP) prefill/decode performance work is tracked separately in
+  [GEMMA4_PERF_PLAN.md](./GEMMA4_PERF_PLAN.md): speculative-k tuning, an
+  acceptance-adaptive draft-length schedule, MoE-vs-dense benchmarking
+  separation, and batched server benchmarking for MoE models.
+- CUDA MTP remains experimental; strict MTP certification and promotion
+  remain follow-up work (see "CUDA Branch Status" above).
 - What is the exact public Transformers implementation for
   `Gemma4AssistantForCausalLM`? The tagged public Gemma 4 files do not yet show
-  it, so implementation should follow confirmed artifacts plus LiteRT-LM
-  behavior until upstream source is visible.
+  it, so implementation follows confirmed artifacts plus LiteRT-LM behavior
+  until upstream source is visible.
 - Do assistant checkpoints expose enough metadata to validate exact target
   compatibility, or do we need a local compatibility table?
 - Should the experimental inverse `masked_embedding.token_ordering` environment

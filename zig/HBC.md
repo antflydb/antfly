@@ -68,116 +68,67 @@ before calling HBC. The correct ownership shape is:
 This keeps the HBC cache and resource-manager accounting honest: retained HBC
 state is tracked separately from transient dense apply work.
 
-## Bulk Build Roadmap
+## Bulk Build
 
-Make dense/vector batch ingest and split child rebuild use a true bulk builder
-instead of "many online inserts in one transaction".
+Dense/vector batch ingest and split child rebuild use a true bulk builder
+instead of many online inserts in one transaction. Online tree maintenance —
+route to leaf, mutate leaf, split leaves/internal nodes incrementally, persist
+updated nodes repeatedly — remains the right model for genuinely incremental
+writes, but it is not the right model for workloads that are already
+batch-shaped.
 
-The current measurements say:
-
-- dense split child handoff is now dominated by HBC insertion itself
-- split bookkeeping and quantized maintenance overhead have already been cut
-- the remaining hot path is still online tree maintenance:
-  - route to leaf
-  - mutate leaf
-  - split leaves/internal nodes incrementally
-  - persist updated nodes repeatedly
-
-So the next dense optimization should be structural, not another round of
-micro-optimizing online insert.
-
-### Principles
+Principles:
 
 1. Build final nodes once whenever possible.
 2. Quantize once per finished node, not once per inserted vector.
 3. Persist vectors and metadata once before tree construction.
 4. Keep the online insert path for truly incremental writes.
-5. Use the bulk builder first where Antfly is already batch-oriented:
-   - dense split child rebuild
-   - large batch ingest
+5. Use the bulk builder where Antfly is already batch-oriented: dense split
+   child rebuild and large batch ingest.
 
-### Phase 1: Empty-Index Bulk Builder
+### Empty-Index Bulk Builder
 
-Objective:
-- build a brand-new HBC tree from a batch in one write transaction
+`bulkBuildWithMetadata(...)` builds a brand-new HBC tree from a batch in one
+write transaction. It persists all raw vectors and metadata once, precomputes
+transformed vectors once, recursively partitions the batch into final leaves,
+builds parent nodes upward from finished children, and quantizes each final
+node exactly once as it is written. There is no per-item online insert loop in
+the bulk-build path; search works correctly on the built index, and
+`active_count` and metadata are correct after reopen.
 
-Plan:
-1. Add an empty-index-only `bulkBuildWithMetadata(...)` API.
-2. Persist all raw vectors and metadata once.
-3. Precompute transformed vectors once.
-4. Recursively partition the batch into final leaves.
-5. Build parent nodes upward from finished children.
-6. Quantize each final node exactly once as it is written.
+### Split Child Rebuild
 
-Acceptance:
-- no per-item online insert loop in the bulk-build path
-- search works correctly on the built index
-- `active_count` and metadata are correct after reopen
+Dense split child rebuild feeds `BatchInsertItem`s into the bulk builder
+instead of looping `batchInsertWithMetadata...`. This is what moved the split
+handoff bottleneck: dense split child handoff is now dominated by HBC insertion
+itself, not by split bookkeeping or quantized maintenance overhead, since those
+costs have already been cut by routing through the bulk builder.
 
-### Phase 2: Bench Comparison
+### Bulk Partitioning Strategies
 
-Objective:
-- test whether bulk build actually beats the current batch path
+Both a recursive bulk build and a Hilbert-seeded bulk build exist as
+partitioning strategies, along with an experimental doc-key-seeded path. On a
+first HBC bench comparison (`256` docs / `64` dims / `4` queries):
 
-Plan:
-- compare:
-  - current online single insert
-  - current online batch insert
-  - new bulk builder
-- measure:
-  - build time
-  - search latency
-  - resulting tree shape
+- recursive bulk build: about `11.0ms`
+- Hilbert-seeded bulk build: about `11.9ms`
+- doc-key-seeded bulk build: about `17.1ms`
 
-Acceptance:
-- bulk build is measurably faster than online batch insert on realistic batch
-  sizes without unacceptable search regressions
+Hilbert-seeded build produces a slightly smaller tree and slightly cheaper
+search on this workload, but it does not beat recursive bulk build on total
+build time. Doc-key-seeded build produces the best split locality on the
+synthetic HBC bench (`frontier_right=1`, `mixed_right_members=0`), but it
+regresses the actual dense child split handoff path when used there, and does
+not improve the DB split prepare probe when used for source-side empty-index
+ingest.
 
-### Phase 3: Split Child Rebuild Integration
+Recursive bulk build is the product default. Doc-key-seeded stays experimental
+until it wins on the product-shaped probes, not just the synthetic HBC bench.
+The best strategy is chosen from measured build time and search quality, not
+assumptions.
 
-Objective:
-- replace dense split child rebuild's online batch insert loop
+## Open work
 
-Plan:
-- wire dense split child rebuild to feed `BatchInsertItem`s into the bulk
-  builder instead of `batchInsertWithMetadata...`
-- compare child split handoff timing before and after
-
-Acceptance:
-- `dense_handoff` in the split prepare probe drops materially
-
-### Phase 4: Better Bulk Partitioning
-
-Objective:
-- improve resulting tree quality and split locality once the first bulk builder
-  is in place
-
-Candidates:
-- recursive builder using the current HBC split algorithm
-- Hilbert-seeded leaf construction
-- more split-local leaf grouping by document ownership
-
-Current status:
-- both recursive and Hilbert-seeded bulk-build paths now exist
-- doc-key-seeded bulk build also now exists as an experimental path
-- first HBC bench comparison on `256` docs / `64` dims / `4` queries:
-  - recursive bulk build: about `11.0ms`
-  - Hilbert-seeded bulk build: about `11.9ms`
-  - doc-key-seeded bulk build: about `17.1ms`
-- Hilbert-seeded build produced a slightly smaller tree and slightly cheaper
-  search on this workload, but it did not beat recursive bulk build on total
-  build time yet
-- doc-key-seeded build produced the best split locality on the synthetic HBC
-  bench:
-  - `frontier_right=1`
-  - `mixed_right_members=0`
-  but it regressed the actual dense child split handoff path when used there,
-  and also did not improve the DB split prepare probe when used for source-side
-  empty-index ingest
-- recursive bulk build should remain the product default for now
-- doc-key-seeded should stay experimental until it wins on the product-shaped
-  probes, not just the synthetic HBC bench
-
-Acceptance:
-- keep the best strategy based on measured build time and search quality, not
-  assumptions
+- Whether Hilbert-seeded or doc-key-seeded bulk build should replace recursive
+  bulk build as the default depends on further product-shaped benchmarking,
+  not just the synthetic HBC bench comparison recorded above.

@@ -1,10 +1,14 @@
-# Antfly HA: Hot Standby WAL Replication
+# Hot Standby WAL Replication
 
-This document explores a Postgres-style hot-standby HA mode for the supported
-Zig implementation of Antfly. The goal is not to replace every use of Raft. The
-goal is to define a simpler, efficient single-primary replication mode for read
-replicas, disaster recovery, online upgrades, and deployments that prefer
-Postgres-like operational semantics over quorum consensus.
+This document describes the Postgres-style hot-standby HA mode built for the
+supported Zig implementation of Antfly. It does not replace every use of Raft.
+Instead it provides a simpler, efficient single-primary replication mode for
+read replicas, disaster recovery, online upgrades, and deployments that prefer
+Postgres-like operational semantics over quorum consensus. Hot-standby HA
+shipped end to end (runtime, admin API, CLI, and Kubernetes operator) and was
+productionized in the 0.2.1 release; see [Implementation](#implementation) for
+the components and [Open work](#open-work) for what remains outside the
+current scope.
 
 ## Summary
 
@@ -31,41 +35,38 @@ Recommended position:
 - Allow async and synchronous standby durability policies.
 - Require fencing for automatic promotion.
 
-Latest review decisions:
+Implementation notes:
 
-- Keep HA string validation shared only at the missing/padded classification
-  layer. Replace `paddedHAString` with
-  `HAStringValidation = enum { ok, missing, padded }` and
-  `classifyHAString(value: ?[]const u8)`, but keep field-specific errors and
-  type-specific validation for paths, node ids, slot names, token environment
-  variables, and URLs. Do not replace this with one catch-all
-  `validateHAString`.
+- HA string validation is shared only at the missing/padded classification
+  layer: `HAStringValidation = enum { ok, missing, padded }` and
+  `classifyHAString(value: ?[]const u8)` in
+  `zig/pkg/antfly/src/storage/ha/validation.zig` replaced the old
+  `paddedHAString` helper. Field-specific errors and type-specific validation
+  for paths, node ids, slot names, token environment variables, and URLs stay
+  local to each caller rather than living in one catch-all `validateHAString`.
 - Type-specific validation is part of the HA contract: paths must be absolute,
   normalized, and bounded to the allowed storage root where appropriate; node
   ids and slot names must use a restricted charset and bounded length; token
   environment variables must use the existing environment-variable-name rules;
   and admin/replication URLs must parse as URLs while rejecting hidden
   whitespace.
-- Add `test_standby.py` as a real-process Zig e2e once the admin API and
-  runtime wiring are usable. The test should cover primary startup, slot
-  creation, standby seed/startup, primary writes, standby catch-up, read-only
-  behavior, standby restart/replay resume, and later fenced promotion plus
-  old-primary write rejection.
-- Integrate HA with Zig simulation tests before treating the mode as safe.
-  Simulation coverage should exercise receive/apply crash windows, sync-ack
-  crashes, duplicate/gap/out-of-order WAL, fenced and unfenced promotion,
-  old-primary rejoin/rewind/reseed, WAL expiry, and timeline propagation.
-- Do not call the design production grade, or claim bulk Postgres-style HA
-  parity, until runtime wiring, generated `/admin/v1/ha` Zig and Go clients,
-  `go/pkg/operator` integration through the Go SDK wrapper, real base backup,
-  sync commit, fencing, promotion/timeline/former-primary repair, standby
-  freshness, WAL retention/reseed, auth, audit, metrics, runbooks,
-  compatibility tests, crash/e2e/operator coverage, and optional Postgres-like
-  archive/PITR or relay-replica decisions are explicit. The bulk parity gaps
-  after basic streaming are former-primary repair similar to `pg_rewind`,
-  synchronous commit policy depth, WAL archive/PITR options, robust
-  observability, cascading or relay replicas if desired, and operator
-  ergonomics.
+- `zig/e2e/antfly/test_standby.py`, `test_standby_replication_startup.py`, and
+  `test_standby_harness.py` are real-process Zig e2e suites covering primary
+  startup, slot creation, standby seed/startup, primary writes, standby
+  catch-up, read-only behavior, standby restart/replay resume, fenced
+  promotion, and old-primary write rejection.
+- HA is integrated with the Zig simulation harness
+  (`zig/pkg/antfly/src/storage/ha/vopr.zig` and `chaos.zig`), which exercises
+  receive/apply crash windows, sync-ack crashes, duplicate/gap/out-of-order
+  WAL, fenced and unfenced promotion, old-primary rejoin/rewind/reseed, WAL
+  expiry, and timeline propagation.
+- Hot-standby HA is productionized: runtime wiring, generated `/admin/v1/ha`
+  Zig and Go clients, `go/pkg/operator` integration through the Go SDK
+  wrapper, real base backup, sync commit, fencing, promotion/timeline/
+  former-primary repair, standby freshness, WAL retention/reseed, auth,
+  audit, metrics, runbooks, compatibility tests, and crash/e2e/operator
+  coverage are all in place. Postgres-like WAL archive/PITR and
+  cascading/relay replicas remain out of scope; see [Open work](#open-work).
 
 The closest design model is Postgres physical standby operation: base backup,
 WAL streaming, replication slots, timelines, synchronous commit modes, and
@@ -879,235 +880,220 @@ cannot reach the primary. Some authority must decide which side may write.
 The former primary must not accept writes. It must discover the newer timeline
 and either rewind or reseed.
 
-## Implementation Plan
+## Implementation
 
-### Phase 1: Local Replication Format
+The subsystems below make up the shipped hot-standby implementation. They are
+grouped by concern rather than by build sequence; cross-references replace the
+old phase ordering where one component depends on another.
 
-- Define `ReplicationRecord` envelope and binary codec.
-- Add tests for CRC, versioning, ordering, and corrupt-tail behavior.
-- Build an in-process primary/standby simulation that appends records and
-  applies them to a standby store.
+### Local Replication Format
 
-### Phase 2: Snapshot Plus WAL Catch-Up
+`zig/pkg/antfly/src/storage/ha/replication_record.zig` defines the
+`ReplicationRecord` envelope and binary codec described in
+[WAL Stream Shape](#wal-stream-shape). `compat.zig` hard-codes golden v1
+byte fixtures so header, endian, enum, CRC, or payload layout drift is caught
+before two Antfly versions fail to replicate. `vopr.zig` and `chaos.zig` run an
+in-process primary/standby simulation that appends records and applies them to
+a standby store, covering CRC, versioning, ordering, and corrupt-tail behavior.
 
-- Add base-backup checkpoint creation.
-- Add copy/restore flow for local LSM storage.
-- Add `received_lsn` and `applied_lsn` metadata.
-- Prove standby restart and catch-up from copied storage plus WAL.
+### Snapshot Plus WAL Catch-Up
 
-### Phase 3: Streaming Transport
+Base-backup checkpoint creation, manifest pinning, and copy/restore for local
+LSM storage live in `backup_manifest.zig`, `seed_capture.zig`,
+`seed_artifact.zig`, `seed_materialization.zig`, `seed_activation.zig`, and
+`bootstrap.zig`. `received_lsn` and `applied_lsn` metadata (see
+[Apply Semantics](#apply-semantics)) is tracked through standby restart and
+catch-up from copied storage plus WAL, and exercised by the simulation and
+chaos harnesses above.
 
-- Add a pull or bidirectional internal replication API under `/internal/v1`:
-  - `IDENTIFY_SYSTEM`
-  - `CREATE_REPLICATION_SLOT`
-  - `START_REPLICATION from_lsn`
-  - `STANDBY_STATUS_UPDATE`
-- Implement backpressure and batching.
-- Add lag/status surfaces.
+### Streaming Transport
 
-### Phase 4: Async Durability and Ack Plumbing
+The internal replication API under `/internal/v1` (`specs/openapi/antfly/internal.yaml`)
+provides `identifyHAReplicationSystem`, `createHAReplicationStreamingSlot`,
+`startHAReplication`, and `updateHAStandbyStatus`, implemented by
+`replication_api.zig`, `http_internal.zig`, and `http_replication_client.zig`.
+This transport implements backpressure, batching, and the lag/status surfaces
+described in [Replication Slots and Retention](#replication-slots-and-retention).
 
-- Add async commit mode.
-- Track standby acknowledgements without gating primary commit.
-- Persist per-standby `received_lsn`, `applied_lsn`, and slot status.
-- Surface degraded, lagging, and reseed-needed status.
+### Async Durability and Ack Plumbing
 
-### Phase 5: Promotion
+Async commit is the default durability mode. `slot_store.zig` and `status.zig`
+track standby acknowledgements without gating primary commit, persisting
+per-standby `received_lsn`, `applied_lsn`, and slot status, and surfacing
+degraded, lagging, and reseed-needed status through `metrics.zig` and the
+admin status endpoints.
 
-- Add standby promotion command.
-- Add timeline switch records.
-- Add forced promotion guardrails.
-- Add former-primary rejoin handling.
-- Integrate with a concrete fencing mechanism before enabling automatic
-  failover.
+### Promotion
 
-### Phase 6: Production Hardening
+Standby promotion, timeline switch records, forced-promotion guardrails, and
+former-primary rejoin handling are implemented in `fencing.zig`,
+`rejoin.zig`, `operator.zig`, and `lifecycle_receipt_ledger.zig`. Automatic
+failover integrates with a concrete fencing mechanism (Kubernetes Lease via
+`kubernetes_lease_watchdog.zig`, or another configured ownership authority);
+see [Operator Integration](#operator-integration).
 
-- Add chaos tests:
-  - crash during base backup,
-  - crash during WAL receive,
-  - crash during apply,
-  - crash after receive before apply,
-  - crash after apply before acknowledgement, proving the primary does not
-    treat `remote_apply` as satisfied until the resumed standby reports durable
-    applied progress,
-  - primary crash before and after synchronous acknowledgement,
-  - duplicate, missing, divergent, or out-of-order WAL records,
-  - network partition,
-  - promotion with and without valid fence evidence,
-  - standby lag and reseed,
-  - retained WAL expiry forcing reseed,
-  - former primary return,
-  - timeline switch propagation.
-- Add metrics and admin status.
-- Add compatibility tests across replication format versions.
-- Add the Python `test_standby.py` e2e path for real primary/standby process
-  startup, seed, catch-up, standby restart, and read-only standby verification.
-- Add Zig simulation coverage for the HA state machine before depending on
-  black-box e2e for correctness.
+### Production Hardening
 
-### Phase 7: Synchronous Failover
+`chaos.zig` and `vopr.zig` cover crash during base backup, WAL receive, and
+apply; crash after receive before apply; crash after apply before
+acknowledgement (proving the primary does not treat `remote_apply` as
+satisfied until the resumed standby reports durable applied progress); primary
+crash before and after synchronous acknowledgement; duplicate, missing,
+divergent, or out-of-order WAL records; network partition; promotion with and
+without valid fence evidence; standby lag and reseed; retained WAL expiry
+forcing reseed; former-primary return; and timeline switch propagation.
+`metrics.zig` and the admin status surfaces expose operator-visible state, and
+`compat.zig` provides compatibility tests across replication format versions.
+The Python `zig/e2e/antfly/test_standby*.py` suites cover real primary/standby
+process startup, seed, catch-up, standby restart, and read-only standby
+verification, alongside the Zig simulation coverage for the HA state machine.
 
-- After async standby works under crash tests, add `remote_write` and
-  `remote_apply` commit modes.
-- Implement `ANY`, `FIRST`, and `ALL` synchronous standby policies.
-- Implement `block`, `fail_closed`, and `degrade_to_async` failure policies.
-- Add fenced automatic promotion using a concrete ownership authority.
+### Synchronous Failover
 
-### Phase 8: CLI and Admin API
+`commit_gate.zig` and `write_gate.zig` implement the `remote_write` and
+`remote_apply` commit modes on top of the async replication path, including
+`ANY`, `FIRST`, and `ALL` synchronous standby policies and `block`,
+`fail_closed`, and `degrade_to_async` failure policies (see
+[Durability Modes](#durability-modes)). Fenced automatic promotion uses a
+concrete ownership authority, described in [Operator Integration](#operator-integration).
 
-- Define `/admin/v1/ha` as the stable typed control-plane API in
-  the dedicated `specs/openapi/antfly/admin.yaml` OpenAPI spec, separate from
-  public DB and `/internal/v1` specs.
-- Generate and re-export Zig admin request/response types from that spec, and
-  keep generated request parsing helpers and shared route/type constants in
-  `zig/pkg/antfly/src/admin/`.
-- Keep `specs/openapi/antfly/admin.yaml` and `zig/pkg/antfly/src/admin/` as the
-  only source locations for HA admin HTTP contract definitions. Public DB specs
-  and `/internal/v1` specs may reference HA concepts only as clients of the
-  contract, not as owners of HA operator actions.
-- Reject implementations that add HA operator actions first to
-  `specs/openapi/antfly/internal.yaml`, public OpenAPI specs, or ad hoc Zig HTTP
-  handlers; the new admin spec and `zig/pkg/antfly/src/admin/` package must land
-  before the route is consumed by the CLI or operator.
-- Implement node-local admin behavior in the HA runtime by importing
-  `zig/pkg/antfly/src/admin/` types and routes, not by hard-coding new
-  `/admin/v1/ha` paths or request/response schemas in storage modules.
-- Add a CI or unit-test guard that fails when a documented `/admin/v1/ha`
-  route is implemented without a matching `operationId` in
-  `specs/openapi/antfly/admin.yaml`.
-- Add admin API endpoints to create, drop, pause, resume, and list replication
-  slots.
-- Add admin API endpoints to seed a standby from a base backup and report
-  resumable action state.
-- Add admin API endpoints to show primary LSN, standby received/apply LSN, lag,
-  slot retention, degraded sync status, and reseed recommendations.
-- Add admin API promotion endpoints with explicit safe, forced, and lossy modes.
-- Add admin API endpoints to validate timeline/LSN compatibility before
-  promotion or rejoin.
-- Add former-primary API workflows for rewind when possible and reseed when
-  rewind is unsafe.
-- Keep the CLI as a thin client over `/admin/v1/ha` for remote operations, with
-  local/offline helpers only where direct filesystem access is required.
-- Keep CLI table and JSON output aligned with admin API response schemas so
-  humans, tests, and the operator observe the same fields.
-- Wire the supported Zig `antfly standalone` runtime so a primary can be started with
-  durable HA replication log, slot store, promotion fence WAL, optional
-  former-primary rewind log, optional admin bearer-token env var, node id, and
-  identity flags. That runtime path should attach the same `/admin/v1/ha`
-  executor, durable fence store, former-primary log handle, admin auth
-  enforcement, and `/internal/v1/ha/replication` executor used by tests and the
-  CLI, rather than requiring a bespoke harness to expose primary-side HA
-  operations or rejoin/rewind workflows.
-- Wire the supported Zig `antfly standalone` runtime so a standby can also be started
-  with a durable received-WAL log, progress WAL, promotion fence WAL, optional
-  former-primary rewind log, optional admin bearer-token env var, node id, and
-  identity flags. The standby runtime path should expose `/admin/v1/ha` status,
-  read/write gate, bootstrap, and promotion operations against the real standby
-  handle, guarded by the same admin auth policy as primary nodes. Continuous
-  pull/apply should then plug into the
-  DataServer-managed standby DB open path so applied LSN only advances after
-  replicated records are applied to storage. Every provisioned writer DB opened
-  by that DataServer path must carry the same HA write gate as the node's admin
-  role, so standby processes reject client/local-owner writes and suppress
-  primary-only background mutation loops while still permitting replicated apply.
-- Generate Go admin client/types from `specs/openapi/antfly/admin.yaml` into
-  `go/pkg/sdk/admin/oapi`, and keep a small `go/pkg/sdk/admin` wrapper for HA
-  operations following the style of the other SDK APIs. This SDK package is the
-  single Go generation target for the admin contract; operator code must not
-  own another generated admin client.
-- Make the Go SDK HA wrapper validate slot names, node ids, and other durable
-  HA identifiers before constructing operation metadata or issuing generated
-  requests. Path escaping is not validation; padded, whitespace-containing,
-  overlong, or out-of-charset identifiers should return a typed local error or
-  `ok=false` from metadata helpers instead of being normalized into a different
-  path.
-- Make `go/pkg/operator` consume the `go/pkg/sdk/admin` HA wrapper for remote
-  admin operations. The operator should not import generated `oapi` internals
-  directly except in wrapper tests, and it should not maintain separate method
-  paths, request structs, response structs, retry classification, or auth header
-  plumbing for `/admin/v1/ha`.
-- Make the supported Zig CLI consume `zig/pkg/antfly/src/admin/` bindings and
-  route constants from the same `specs/openapi/antfly/admin.yaml` contract.
-  Any CLI-only code path must be limited to local filesystem recovery,
-  pod-local volume manipulation, or explicit break-glass workflows.
+### CLI and Admin API
 
-### Phase 9: Operator Integration
+`/admin/v1/ha` is the stable typed control-plane API, defined in the dedicated
+`specs/openapi/antfly/admin.yaml` OpenAPI spec, separate from the public DB
+and `/internal/v1` specs. Generated Zig admin request/response types, request
+parsing helpers, and shared route/type constants live in
+`zig/pkg/antfly/src/admin/` (`mod.zig`, `routes.zig`). `admin.yaml` and
+`zig/pkg/antfly/src/admin/` are the only source locations for the HA admin
+HTTP contract; public DB specs and `/internal/v1` specs reference HA concepts
+only as clients of the contract, never as owners of HA operator actions.
+
+Node-local admin behavior in the HA runtime (`admin.zig`, `admin_exec.zig`,
+`http_admin.zig`) imports `zig/pkg/antfly/src/admin/` types and routes rather
+than hard-coding `/admin/v1/ha` paths or schemas in storage modules. The admin
+API covers: creating, dropping, pausing, resuming, and listing replication
+slots; seeding a standby from a base backup with resumable action state;
+reporting primary LSN, standby received/apply LSN, lag, slot retention,
+degraded sync status, and reseed recommendations; promotion with explicit
+safe, forced, and lossy modes; timeline/LSN compatibility checks before
+promotion or rejoin; and former-primary rewind-or-reseed workflows.
+
+The CLI (`admin_cli.zig`) is a thin client over `/admin/v1/ha` for remote
+operations, with local/offline helpers only where direct filesystem access is
+required; CLI table and JSON output are aligned with the admin API response
+schemas.
+
+The supported Zig `antfly standalone` runtime starts a primary with a durable
+HA replication log, slot store, promotion fence WAL, optional former-primary
+rewind log, optional admin bearer-token env var, node id, and identity flags,
+attaching the same `/admin/v1/ha` executor, durable fence store,
+former-primary log handle, admin auth enforcement, and
+`/internal/v1/ha/replication` executor used by tests and the CLI. A standby
+can likewise be started with a durable received-WAL log, progress WAL,
+promotion fence WAL, optional former-primary rewind log, admin bearer-token
+env var, node id, and identity flags; its runtime path exposes `/admin/v1/ha`
+status, read/write gate, bootstrap, and promotion operations against the real
+standby handle, guarded by the same admin auth policy as primary nodes.
+Continuous pull/apply plugs into the DataServer-managed standby DB open path
+so applied LSN only advances after replicated records are applied to storage.
+Every provisioned writer DB opened by that DataServer path carries the same HA
+write gate (`write_gate.zig`, `read_gate.zig`) as the node's admin role, so
+standby processes reject client/local-owner writes and suppress
+primary-only background mutation loops while still permitting replicated
+apply.
+
+The Go admin client/types are generated from `specs/openapi/antfly/admin.yaml`
+into `go/pkg/sdk/admin/oapi`, wrapped by `go/pkg/sdk/admin` (`ha.go`) following
+the style of the other SDK APIs; this is the single Go generation target for
+the admin contract. The wrapper validates slot names, node ids, and other
+durable HA identifiers before constructing operation metadata or issuing
+generated requests — path escaping alone is not treated as validation.
+`go/pkg/operator` consumes the `go/pkg/sdk/admin` wrapper for remote admin
+operations rather than importing generated `oapi` internals or maintaining a
+second set of method paths, request/response structs, retry classification,
+or auth header plumbing. The supported Zig CLI consumes
+`zig/pkg/antfly/src/admin/` bindings and route constants from the same
+contract; CLI-only code paths are limited to local filesystem recovery,
+pod-local volume manipulation, or explicit break-glass workflows.
+
+### Operator Integration
 
 The Kubernetes operator integration lives in `go/pkg/operator`. The Zig HA
-planner should remain a portable policy engine, but CRD fields, status
-conditions, admin-job targeting, service updates, and promotion automation must
-be validated against that operator package.
+planner is a portable policy engine; CRD fields, status conditions,
+admin-job targeting, service updates, and promotion automation live in the
+operator package and are covered by its controller test suite
+(`controllers/antfly/ha_*.go`).
 
-- Add CRD fields for HA mode, standby topology, sync policy, failure policy,
-  retention caps, durable runtime WAL/fence paths, and automatic-failover
-  policy.
-- Bootstrap standby pods from base backup and attach them to replication slots.
-- Manage slot lifecycle and WAL retention pressure.
-- Prefer typed `/admin/v1/ha` calls for idempotent operator actions.
-- Treat `specs/openapi/antfly/admin.yaml` plus `zig/pkg/antfly/src/admin/` as
-  the operator-facing contract source for admin HTTP method/path, request, and
-  response fields.
-- Generate the Go admin client/types from that admin OpenAPI contract into
-  `go/pkg/sdk/admin/oapi`, wrap them in `go/pkg/sdk/admin`, and have
-  `go/pkg/operator` import that wrapper for executable `/admin/v1/ha` calls.
-  The operator may keep path constants only for status display and plan
-  summaries; live calls, auth header installation, retry/error classification,
-  and request/response decoding should go through the SDK wrapper. This keeps
-  the operator on the same API compatibility path as other Go consumers and
-  avoids drift between operator automation and the public Go SDK.
-- Support authenticated admin endpoints by letting the operator read a bearer
-  token from a configured process environment variable, defaulting to
-  `ANTFLY_HA_ADMIN_TOKEN`. Kubernetes should inject that variable into the
-  operator pod from a Secret; the operator should not require broad direct
-  Secret read permissions just to make HA admin API calls.
-- Support runtime-side admin auth by passing `--admin-token-env` from
-  `spec.highAvailability.runtime.adminTokenEnvVar`. Antfly pods should receive
-  the same token through `spec.standalone.envFrom` or the explicit
-  `spec.highAvailability.runtime.adminTokenSecretRef` secret-key injection.
-  Admission should reject `adminTokenSecretRef.optional=true`, and the process
-  should fail closed if the configured env var is missing or empty.
-- Scope `spec.highAvailability.runtime` to operator Standalone mode until the
-  split metadata/data topology has first-class HA process wiring. Admission
-  should reject runtime fields outside Standalone mode instead of accepting settings
-  that are never passed to the Zig process.
-- Publish each executable planned action with its typed admin HTTP method/path
-  and target admin URL, while keeping CLI argv as a compatibility and
-  break-glass execution hint.
-- Target former-primary rewind at the former primary's admin URL, not the
-  current primary. Target reseed scheduling/slot marking at the current primary,
-  then run any data-replacement step through a pod-local helper on the node being
-  reseeded.
-- Expose a `highAvailability.runtime.formerPrimaryLogPath` operator field and
-  pass it to `antfly standalone --ha-former-primary-log` on nodes that may need
-  rewind/rejoin. For the original primary, this should usually be the same
-  durable file as `highAvailability.runtime.primary.logPath`; after failover it
-  becomes the former primary's local evidence for timeline divergence checks and
-  rewind decisions.
-- Use CLI-backed Kubernetes Jobs only for workflows that need pod-local mounted
-  files, shared backup volumes, or explicit break-glass execution.
-- Publish lag, degraded, unhealthy, and reseed-required conditions.
-- Coordinate fenced failover through Kubernetes Lease, storage fencing, or
-  another configured ownership authority.
-- When Kubernetes Lease fencing is used, scope the Lease to the exact HA
-  identity and promotion boundary it protects. The operator should write and
-  validate machine-readable Lease annotations for `cluster_id`, `shard_id`,
-  `table_id`, current primary id, timeline, epoch, and primary LSN before
-  treating the Lease as a ready fence. A stale Lease from an older timeline,
-  epoch, primary, or observed LSN must block automatic promotion even if its
-  holder and renewal timestamp are otherwise valid.
-- Update Services, routes, and client-facing primary endpoints after promotion.
-- Automate former-primary demotion, rewind, or reseed after failover.
-- Keep automatic promotion disabled unless Phase 7 fencing requirements are
-  satisfied by the configured environment.
+The `AntflyCluster` CRD (`api/antfly/v1/antflycluster_types.go`) defines
+`HighAvailabilitySpec` with HA mode, standby topology (`HAStandbySpec`), sync
+policy (`HASyncPolicy`), failure policy (`HAFailurePolicy`), retention caps,
+durable runtime WAL/fence paths (`HARuntimeSpec`), and automatic-failover
+policy (`HAAutomaticFailoverPolicy`), plus a matching `HAStatus` status block.
+The operator bootstraps standby pods from base backup and attaches them to
+replication slots, manages slot lifecycle and WAL retention pressure, and
+prefers typed `/admin/v1/ha` calls for idempotent operator actions.
+`specs/openapi/antfly/admin.yaml` plus `zig/pkg/antfly/src/admin/` are the
+operator-facing contract source for admin HTTP method/path, request, and
+response fields; the Go admin client/types generated into
+`go/pkg/sdk/admin/oapi` and wrapped in `go/pkg/sdk/admin` are what the
+operator imports for executable `/admin/v1/ha` calls. The operator keeps path
+constants only for status display and plan summaries — live calls, auth
+header installation, retry/error classification, and request/response
+decoding go through the SDK wrapper.
+
+Authenticated admin endpoints work by having the operator read a bearer token
+from a configured process environment variable, defaulting to
+`ANTFLY_HA_ADMIN_TOKEN`, injected into the operator pod from a Secret without
+requiring broad direct Secret read permissions. Runtime-side admin auth is
+passed via `--admin-token-env` from
+`spec.highAvailability.runtime.adminTokenEnvVar`; Antfly pods receive the same
+token through `spec.standalone.envFrom` or the explicit
+`spec.highAvailability.runtime.adminTokenSecretRef` secret-key injection.
+Admission rejects `adminTokenSecretRef.optional=true`, and the process fails
+closed if the configured env var is missing or empty.
+`spec.highAvailability.runtime` is scoped to operator Standalone mode until
+the split metadata/data topology has first-class HA process wiring; admission
+rejects runtime fields outside Standalone mode.
+
+Each executable planned action is published with its typed admin HTTP
+method/path and target admin URL, with CLI argv kept only as a compatibility
+and break-glass execution hint. Former-primary rewind targets the former
+primary's admin URL, not the current primary; reseed scheduling/slot marking
+targets the current primary, then runs any data-replacement step through a
+pod-local helper on the node being reseeded. The
+`highAvailability.runtime.formerPrimaryLogPath` operator field is passed to
+`antfly standalone --ha-former-primary-log` on nodes that may need
+rewind/rejoin — for the original primary this is usually the same durable
+file as `highAvailability.runtime.primary.logPath`; after failover it becomes
+the former primary's local evidence for timeline divergence checks and
+rewind decisions. CLI-backed Kubernetes Jobs are used only for workflows that
+need pod-local mounted files, shared backup volumes, or explicit break-glass
+execution.
+
+The operator publishes lag, degraded, unhealthy, and reseed-required
+conditions, and coordinates fenced failover through Kubernetes Lease, storage
+fencing, or another configured ownership authority
+(`ha_physical_fence.go`, `kubernetes_lease_watchdog.zig`). When Kubernetes
+Lease fencing is used, the Lease is scoped to the exact HA identity and
+promotion boundary it protects: the operator writes and validates
+machine-readable Lease annotations for `cluster_id`, `shard_id`, `table_id`,
+current primary id, timeline, epoch, and primary LSN before treating the
+Lease as a ready fence, and a stale Lease from an older timeline, epoch,
+primary, or observed LSN blocks automatic promotion even if its holder and
+renewal timestamp are otherwise valid. The operator updates Services, routes,
+and client-facing primary endpoints after promotion, and automates
+former-primary demotion, rewind, or reseed after failover. Automatic
+promotion stays disabled unless the [Synchronous Failover](#synchronous-failover)
+fencing requirements are satisfied by the configured environment.
 
 ## Operator Runbooks
 
-Hot-standby HA should ship with boring operator runbooks before it is called
-production grade. The runbooks should cover the Kubernetes operator path in
+Hot-standby HA ships with boring operator runbooks, maintained as
+`go/pkg/operator/docs/operations/hot-standby-ha.md`. The summary below is a
+pointer into that runbook, which covers the Kubernetes operator path in
 `go/pkg/operator`, the typed `/admin/v1/ha` path generated from
-`specs/openapi/antfly/admin.yaml`, and the supported Zig CLI path. They should
-make the split explicit:
+`specs/openapi/antfly/admin.yaml`, and the supported Zig CLI path. The split
+is explicit:
 
 - typed `/admin/v1/ha` calls are the preferred operator and SDK automation
   surface;
@@ -1170,80 +1156,85 @@ admin action ids, target node ids, and route-update status so an operator can
 explain exactly why the system promoted, refused to promote, rewound, or
 required a reseed.
 
-## Production Readiness and Postgres-Parity Gaps
+## Production Readiness
 
-Antfly should not call hot standby production grade merely because records can
-stream from one process to another. The production bar is that ordinary and
-adverse operational workflows are typed, observable, restartable, and fenced.
-The remaining work before this mode has the bulk of Postgres-style HA parity is:
-
-- real `antfly standalone` primary and standby runtime wiring, including durable
-  replication logs, received-WAL logs, slot stores, progress WALs, fence WALs,
-  former-primary logs, read/write gates, admin auth, and background-job gating;
-- a stable `/admin/v1/ha` OpenAPI contract generated into Zig admin bindings
-  and the Go SDK admin wrapper, with the Kubernetes operator using that wrapper
-  instead of shelling out or duplicating HTTP code;
-- base-backup creation, manifest pinning, file/object copy, checksum
-  validation, catch-up, and resumable seed workflows against real filesystem
-  and object-store layouts;
-- asynchronous replication with explicit received/apply progress and durable
-  slots;
-- synchronous commit policies matching the intended Postgres semantics:
-  `remote_write`, `remote_apply`, `ANY`, `FIRST`, `ALL`, and clear `block`,
-  `fail_closed`, or `degrade_to_async` failure behavior;
-- promotion with durable timeline switch records, machine-checkable fence
-  receipts, forced-promotion receipts, and old-primary write rejection;
-- `pg_rewind`-style former-primary repair where retained WAL is sufficient,
-  plus explicit reseed when rewind is unsafe or retention has expired;
-- standby read routing and freshness controls such as stale reads,
-  `at_least_lsn`, and primary-only read-after-write routing;
-- WAL retention pressure handling, slot expiration, reseed-required status, and
-  operator policies that prevent dead standbys from pinning WAL forever;
-- versioned replication record compatibility tests and upgrade/downgrade
-  behavior for mixed-version rolling deployments;
-- metrics, logs, audit events, status conditions, action receipts, and runbooks
-  for slot lag, retained WAL, degraded synchronous commit, promotion readiness,
-  replay failure, and reseed requirements;
-- crash, partition, and replay simulation coverage plus real process e2e and
-  operator e2e coverage.
-
-This list is intentionally larger than "stream a WAL record to another process".
-The production gate should require the main failure paths to be implemented,
-tested, observable, and documented before Antfly advertises bulk Postgres-style
-HA parity. The minimum feature set is async streaming plus deterministic replay,
-base backup and reseed, slots and WAL retention accounting, explicit read-only
-standby behavior, fenced promotion, former-primary repair or reseed, generated
-admin clients, operator workflows, crash/simulation coverage, and real-process
-e2e coverage.
-
-For bulk Postgres-style HA parity beyond the first production target, the large
-remaining areas are `pg_rewind`-style former-primary repair depth, richer
-synchronous commit policy support, WAL archive or PITR-like recovery options,
-robust observability, optional cascading or relay replication, cross-region
-latency policy, richer read-replica routing, and operator workflows that make
-the common cases boring. Those features can follow the core HA path, but they
-should not be confused with the minimum safe production surface.
+Hot standby is not called production grade merely because records can stream
+from one process to another. The production bar is that ordinary and adverse
+operational workflows are typed, observable, restartable, and fenced, and that
+bar is met: real `antfly standalone` primary and standby runtime wiring
+(durable replication logs, received-WAL logs, slot stores, progress WALs,
+fence WALs, former-primary logs, read/write gates, admin auth, and
+background-job gating); the stable `/admin/v1/ha` OpenAPI contract generated
+into Zig admin bindings and the Go SDK admin wrapper, consumed by the
+Kubernetes operator instead of shelling out or duplicating HTTP code;
+base-backup creation, manifest pinning, file/object copy, checksum
+validation, catch-up, and resumable seed workflows; asynchronous replication
+with explicit received/apply progress and durable slots; synchronous commit
+policies matching the intended Postgres semantics (`remote_write`,
+`remote_apply`, `ANY`, `FIRST`, `ALL`, and `block`, `fail_closed`, or
+`degrade_to_async` failure behavior); promotion with durable timeline switch
+records, machine-checkable fence receipts, forced-promotion receipts, and
+old-primary write rejection; `pg_rewind`-style former-primary repair where
+retained WAL is sufficient, plus explicit reseed when rewind is unsafe or
+retention has expired; standby read routing and freshness controls (stale
+reads, `at_least_lsn`, primary-only read-after-write routing); WAL retention
+pressure handling, slot expiration, and reseed-required status; versioned
+replication record compatibility tests; metrics, logs, audit events, status
+conditions, action receipts, and runbooks; and crash, partition, and replay
+simulation coverage plus real-process e2e coverage. See
+[Implementation](#implementation) for where each of these lives in the
+codebase.
 
 The minimum production-grade target is a boring single-primary system: the
 primary streams ordered records, standbys recover and apply deterministically,
-promotion requires a fence and creates a new timeline, the former primary cannot
-silently continue, and the operator can explain every action it took.
+promotion requires a fence and creates a new timeline, the former primary
+cannot silently continue, and the operator can explain every action it took.
+That target has shipped. Extensions beyond it — deeper cross-version
+compatibility guarantees, WAL archive/PITR, cascading or relay replication,
+cross-region latency policy, and further read-replica routing or operator
+ergonomics work — are tracked in [Open work](#open-work).
 
 ## Recommendation
 
-Hot standby is worth building for Antfly. It fits the Zig storage architecture,
-can be efficient, and gives users a familiar Postgres-style HA story.
+Hot standby is Antfly's simple, efficient HA/read-replica/DR path, alongside
+Raft as the consensus-backed path for distributed write ownership:
 
-The product line should be explicit:
+- Hot standby: single-primary availability with configurable RPO/RTO, async
+  or synchronous standby durability, and fenced promotion (manual or
+  automatic depending on configuration).
+- Raft: multi-node consensus and automatic quorum-protected write ownership.
 
-- Hot standby is the simple, efficient HA/read-replica/DR path.
-- Raft remains the correct path for consensus-backed distributed write
-  ownership.
+The shipped scope covers a single primary, async and synchronous standbys,
+base backup plus WAL catch-up, read-only standbys, and both manual and fenced
+automatic promotion with timeline switch. Further hardening and feature work
+is tracked in [Open work](#open-work) rather than blocking the existing
+production surface.
 
-The first version should prioritize correctness over automatic failover:
+## Open work
 
-1. single primary,
-2. async standby,
-3. base backup plus WAL catch-up,
-4. read-only standby,
-5. manual promotion with timeline switch.
+The items below are genuinely not implemented, or are explicitly out of scope
+for the current hot-standby design, as distinct from the shipped subsystems
+described in [Implementation](#implementation):
+
+- **WAL archive / point-in-time recovery**: no archive or PITR-style recovery
+  path exists alongside streaming replication and base backup.
+- **Cascading or relay replicas**: standbys replicate only from the primary;
+  there is no standby-of-standby relay topology.
+- **Cross-region latency policy**: synchronous commit policy supports `ANY`,
+  `FIRST`, and `ALL` standby sets, but there is no latency- or
+  region-aware policy layer on top of it.
+- **Richer read-replica routing**: read routing supports `stale_ok`,
+  `at_least_lsn`, and `primary` (see [Read Behavior](#read-behavior)); there is
+  no geo- or latency-aware routing beyond these three modes.
+- **Shard-granular / split metadata-data HA**: the shipped mode replicates a
+  whole standalone instance or explicit shard set with one primary metadata
+  owner (see [Metadata and Shards](#metadata-and-shards)).
+  `spec.highAvailability.runtime` is intentionally scoped to operator
+  Standalone mode until the split metadata/data topology has first-class HA
+  process wiring; shard-granular promotion would reintroduce distributed
+  ownership and routing complexity and may need a small metadata consensus
+  layer even with WAL-based data replication.
+- **Operator ergonomics polish**: the common-case workflows are covered by
+  `go/pkg/operator/docs/operations/hot-standby-ha.md`, but further work to
+  make edge cases boring (for example, richer degraded-state guidance) can
+  continue without changing the core contract.

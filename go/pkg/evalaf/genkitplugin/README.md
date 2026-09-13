@@ -448,9 +448,8 @@ g, err := genkit.Init(ctx,
 ## See Also
 
 - [evalaf README](../eval/README.md) - Core evaluation library
-- [antfly README](../antfly/README.md) - Antfly-specific evaluators
+- [Antfly Genkit plugin](../../genkit/antfly/README.md) - Antfly retriever and docstore for Genkit
 - [Genkit Documentation](https://firebase.google.com/docs/genkit) - Genkit framework
-- [genkit_integration.md](../work-log/genkit_integration.md) - Integration design document
 
 ## Current Limitations
 

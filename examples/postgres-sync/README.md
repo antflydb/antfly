@@ -604,7 +604,7 @@ Ideas for customization:
 ## Related Examples
 
 - [docsaf](../docsaf/) - Sync documentation files to Antfly
-- Linear Merge API docs - See `work-log/006-create-linear-merge-api/`
+- Linear Merge API - see the `LinearMerge` operations in `specs/openapi/antfly/` and the Go SDK (`go/pkg/sdk`)
 
 ## Project Files
 

@@ -373,5 +373,5 @@ rewound a former primary, or required reseed.
 
 ## Related Design
 
-See `zig/HA.md` for the storage and control-plane design, including the
+See `zig/HOT_STANDBY.md` for the storage and control-plane design, including the
 production readiness and Postgres-parity checklist.

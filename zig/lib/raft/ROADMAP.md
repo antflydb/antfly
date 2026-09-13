@@ -1,98 +1,14 @@
 # Raft Roadmap
 
-This file tracks current state, parity, gaps, and next work for
-`antflydb/raft`. Stable architecture belongs in [RAFT.md](RAFT.md).
-
-## Current State
-
-The repo now has a broad single-group core and the first real multi-Raft runtime
-pass. The implementation is past skeleton bring-up.
-
-The single-group Zig core covers:
-
-- leader election
-- pre-vote
-- check-quorum
-- leader transfer
-- `ReadIndex`
-- lease-based reads
-- snapshots, retry, abort, and restore
-- learners
-- joint consensus / `ConfChangeV2`
-- restart, replay, and compaction paths
-- `AsyncStorageWrites`
-- proposal forwarding and `DisableProposalForwarding`
-- `MaxSizePerMsg`
-- `MaxInflightMsgs`
-- `MaxInflightBytes`
-- `MaxUncommittedEntriesSize`
-- `MaxCommittedSizePerReady`
-- `Applied`
-- `ForgetLeader`
-- `StepDownOnRemoval`
-- `DisableConfChangeValidation`
-- public randomness API for simulation-style testing
-
-The runtime has:
-
-- real `Group`
-- real `MultiRaft` host owning groups
-- round-robin and priority-aware scheduler
-- quiescence-aware scheduling and ready draining
-- explicit transport, storage, state-machine, snapshot, and backpressure
-  interfaces
-- async-aware `processReady` handling for local storage/apply messages
-- host-round execution via `runRound`
-- host-side disk batcher seam
-- concrete in-memory disk batcher
-- host-side apply queue seam
-- concrete queued apply worker
-- host-owned bounded apply backlog with per-round draining
-- host-owned bounded outbound queue with per-round transport draining
-- concrete limit-based backpressure policy
-- retry/defer behavior through bounded outbound/apply host queues
-- lightweight host metrics snapshot
-- control-plane command surface in `src/runtime/control_plane.zig`
-- replica catalog and factory seams for restart-safe local hosting
-- concrete in-memory replica catalog and in-memory replica factory
-- concrete file-backed replica catalog
-- host-driven replica restart scan through the control-plane API
-- metadata-driven reconciliation layer
-- placement provider seam and in-memory placement provider
-- replica reconciler driving `ensureReplica`, `removeReplica`, and peer refresh
-
-The transport layer has:
-
-- in-memory transport host
-- group serving lifecycle
-- peer lifecycle tracking
-- inbound delivery for tests
-- debug/test peer-batch codec
-- binary peer-batch codec intended as the first production-oriented framing
-  layer
-- codec-backed transport host
-- per-group peer route table
-- peer upsert/refresh
-- bounded retry/backoff across host rounds
-- inbound frame decode back into served groups
-- local-file snapshot transport implementation
-- outbound snapshot routing through the snapshot transport seam
-- host-driven snapshot fetch/install through the snapshot transport seam
-- transport metrics for lifecycle, flush activity, peer-batch flushes, and
-  snapshot sends
+This file tracks parity gaps and next work for `antflydb/raft`. Stable
+architecture and shipped capabilities belong in [RAFT.md](RAFT.md).
 
 ## Parity Status
 
 The project is aiming for strong single-group behavioral parity with
-`go.etcd.io/raft/v3`, not just API shape parity.
-
-The validation stack includes:
-
-- direct Zig core tests
-- direct Zig cluster/harness tests
-- checked-in differential traces compared against etcd
-- seeded stable/stress trace generation
-- explicit random-seed support for reproducible election scheduling
+`go.etcd.io/raft/v3`, not just API shape parity. RAFT.md describes the
+validation stack (direct core/cluster tests, differential traces, seeded
+stress generation) that backs this effort.
 
 Recent matrix expansion has covered:
 
@@ -103,20 +19,9 @@ Recent matrix expansion has covered:
   async restart/snapshot-style churn, and async lease restart/snapshot-style
   churn
 
-Randomness is a public dependency:
-
-- `Config.random_source`
-- `Config.random_seed`
-- `core.RandomSource`
-- `core.SplitMix64`
-
-This boundary exists so simulation and differential replay can stay
-reproducible. The core should remain deterministic given input messages, ticks,
-storage state, and injected randomness.
+This is not yet perfect etcd parity. See Remaining Gaps below.
 
 ## Remaining Gaps
-
-This is not yet perfect etcd parity.
 
 The main remaining single-group gaps are:
 
@@ -207,13 +112,3 @@ Recommended Antfly adoption order:
 If shipping replicated auto-sharding soon is the priority, do not block on this
 module. Use the existing Go consensus system and move the DB state machine into
 Zig first.
-
-## Bottom Line
-
-Build:
-
-- an `etcd/raft`-style core for correctness
-- a Dragonboat-inspired runtime for multi-group scalability
-
-Treat both references as design input, and make correctness validation a
-first-class deliverable.

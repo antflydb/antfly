@@ -62,6 +62,19 @@ This gives the product names precise meanings:
   `.aflite` file.
 - **Embedded Lite** is an application opening the same file without a server.
 
+## High availability modes
+
+Each deployment mode has its own availability story. Pick the mode by the
+failure you need to survive and the operational model you prefer; the detailed
+design for each lives in its own document.
+
+| Mode | Availability mechanism | Design |
+| --- | --- | --- |
+| `embedded` (`lite`) | Single writer; durability is the fsync policy on the `.aflite` file. No replication. | [LITE.md](LITE.md) |
+| `standalone` | Optional Postgres-style hot standby: WAL streaming to a replica with fenced promotion, managed by `antfly ha` and the operator. | [HOT_STANDBY.md](HOT_STANDBY.md) |
+| `distributed` | Raft replication per shard and for metadata; quorum consensus, online shard splits, cross-shard transactions. | [DB.md](DB.md), [raft/RAFT.md](pkg/antfly/src/raft/RAFT.md) |
+| `serverless` | Durable state in object storage; compute is stateless and replaceable. | [SERVERLESS.md](SERVERLESS.md) |
+
 ## Configuration
 
 Storage is a tagged union. Exactly one member matching `storage.engine` may be

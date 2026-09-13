@@ -10,9 +10,8 @@ A cloud-native Kubernetes operator for deploying and managing [Antfly](https://g
 Deploy the operator and create your first database cluster in under 60 seconds:
 
 ```bash
-# 1. Copy and deploy the operator
-cp deploy/example_install.yaml deploy/install.yaml
-kubectl apply -f ./deploy/install.yaml
+# 1. Deploy the operator
+kubectl apply -f https://antfly.io/antfly-operator-install.yaml
 
 # 2. Create a database cluster
 kubectl create namespace antfly-dev-ns
@@ -91,17 +90,12 @@ kubectl get storageclass
 The operator requires a custom installation manifest tailored to your environment. Use the example as a starting point:
 
 ```bash
-# 1. Copy the example installation manifest
-cp deploy/example_install.yaml deploy/install.yaml
+# Install the published manifest
+kubectl apply -f https://antfly.io/antfly-operator-install.yaml
 
-# 2. Customize the manifest (optional - review and adjust as needed):
-#    - Container image version/registry
-#    - Resource limits for operator pod
-#    - Namespace names
-#    - RBAC permissions
-
-# 3. Deploy the operator
-kubectl apply -f ./deploy/install.yaml
+# Or, from a source checkout, build and apply the kustomize base
+# (namespace antfly-system; requires cert-manager for the admission webhook)
+kubectl apply -k ./config/default
 ```
 
 This installs:
@@ -110,7 +104,7 @@ This installs:
 - **RBAC** roles and bindings
 - **Operator Deployment**: Uses container image `ghcr.io/antflydb/antfly-operator:latest`
 
-See `deploy/example_install.yaml` for the complete installation manifest structure.
+See `config/default/` and `manifests/` for the sources of the installation manifest.
 
 For production environments that manage CRDs separately, run the operator with
 `--skip-crd-install=true` and remove the `customresourcedefinitions` verbs from
@@ -269,7 +263,7 @@ cosign verify ghcr.io/antflydb/antfly-operator:latest \
   --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
 
 # Verify a specific version
-cosign verify ghcr.io/antflydb/antfly-operator:v1.0.0 \
+cosign verify ghcr.io/antflydb/antfly-operator:v0.1.0 \
   --certificate-identity-regexp="^https://github.com/antflydb/" \
   --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
 ```
@@ -285,7 +279,7 @@ cosign verify ghcr.io/antflydb/antfly-operator:latest \
   --certificate-oidc-issuer="https://token.actions.githubusercontent.com" | jq
 
 # Expected annotations:
-# - repo: github.com/antflydb/antfly-operator
+# - repo: github.com/antflydb/antfly
 # - workflow: Container
 # - ref: <git commit SHA>
 ```

@@ -318,19 +318,21 @@ tags:
 
       ### Basic Configuration
 
-      Configure TTL when creating a table using a `ttl` policy:
+      Configure TTL when creating a table (`POST /db/v1/tables/{tableName}`)
+      with a `ttl` policy under `schema`. The table name is part of the URL:
 
       ```json
       {
-        "name": "sessions",
-        "ttl": {"duration": "24h"},
-        "document_schemas": {
-          "session": {
-            "schema": {
-              "type": "object",
-              "properties": {
-                "user_id": {"type": "string"},
-                "data": {"type": "object"}
+        "schema": {
+          "ttl": {"duration": "24h"},
+          "document_schemas": {
+            "session": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "user_id": {"type": "string"},
+                  "data": {"type": "object"}
+                }
               }
             }
           }
@@ -351,20 +353,21 @@ tags:
 
       ```json
       {
-        "name": "events",
-        "ttl": {
-          "duration": "7d",
-          "field": "created_at"
-        },
-        "document_schemas": {
-          "event": {
-            "schema": {
-              "type": "object",
-              "properties": {
-                "created_at": {"type": "string", "format": "date-time"},
-                "event_type": {"type": "string"}
-              },
-              "required": ["created_at"]
+        "schema": {
+          "ttl": {
+            "duration": "7d",
+            "field": "created_at"
+          },
+          "document_schemas": {
+            "event": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "created_at": {"type": "string", "format": "date-time"},
+                  "event_type": {"type": "string"}
+                },
+                "required": ["created_at"]
+              }
             }
           }
         }
@@ -391,7 +394,7 @@ tags:
       **Session Management:**
       ```json
       {
-        "ttl": {"duration": "1h", "field": "last_accessed"}
+        "schema": {"ttl": {"duration": "1h", "field": "last_accessed"}}
       }
       ```
       Sessions expire 1 hour after `last_accessed`. Update the timestamp on each access to extend the session.
@@ -399,7 +402,7 @@ tags:
       **Temporary Caching:**
       ```json
       {
-        "ttl": {"duration": "24h"}
+        "schema": {"ttl": {"duration": "24h"}}
       }
       ```
       Cache entries expire 24 hours after insertion.
@@ -407,7 +410,7 @@ tags:
       **Log Rotation:**
       ```json
       {
-        "ttl": {"duration": "30d"}
+        "schema": {"ttl": {"duration": "30d"}}
       }
       ```
       Logs are automatically deleted after 30 days.

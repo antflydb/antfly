@@ -1,6 +1,6 @@
 # JPEG 2000 Native Conformance Tracker
 
-Reference implementation: `/Users/ajroetker/go/src/github.com/ajroetker/go-jpeg2000`.
+Reference implementation: [github.com/ajroetker/go-jpeg2000](https://github.com/ajroetker/go-jpeg2000).
 
 Current ISO Part 1 baseline before this work:
 
