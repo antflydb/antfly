@@ -33,9 +33,20 @@ pub const GRPOConfig = struct {
     group_size: usize = 8,
     clip_epsilon: f32 = 0.2,
     kl_coef: f32 = 0.04,
-    advantage_eps: f32 = 1e-8,
+    /// Matches the stock TRL group reward-scaling denominator.
+    advantage_eps: f32 = 1e-4,
     normalize_advantage: bool = true,
 };
+
+pub fn validateConfig(config: GRPOConfig) !void {
+    if (config.group_size < 2) return error.InvalidGRPOConfig;
+    if (!std.math.isFinite(config.clip_epsilon) or config.clip_epsilon < 0.0 or config.clip_epsilon >= 1.0)
+        return error.InvalidGRPOConfig;
+    if (!std.math.isFinite(config.kl_coef) or config.kl_coef < 0.0)
+        return error.InvalidGRPOConfig;
+    if (!std.math.isFinite(config.advantage_eps) or config.advantage_eps <= 0.0)
+        return error.InvalidGRPOConfig;
+}
 
 pub const Completion = struct {
     prompt_idx: usize,
@@ -67,17 +78,20 @@ pub fn scoreGroup(
     const advantages = try allocator.alloc(f32, completions.len);
     errdefer allocator.free(advantages);
 
-    var max_prompt: usize = 0;
-    var any = false;
+    var num_groups: usize = 0;
     for (completions, 0..) |c, i| {
         rewards[i] = try rewarder.score(c.prompt_idx, c.tokens);
+        if (!std.math.isFinite(rewards[i])) return error.NonFiniteReward;
         advantages[i] = 0;
-        if (!any or c.prompt_idx > max_prompt) {
-            max_prompt = c.prompt_idx;
-            any = true;
+        var seen = false;
+        for (completions[0..i]) |previous| {
+            if (previous.prompt_idx == c.prompt_idx) {
+                seen = true;
+                break;
+            }
         }
+        if (!seen) num_groups += 1;
     }
-    const num_groups: usize = if (any) max_prompt + 1 else 0;
 
     return GroupAdvantages{
         .allocator = allocator,
@@ -87,42 +101,74 @@ pub fn scoreGroup(
     };
 }
 
+fn validateCompletionGroups(completions: []const Completion, config: GRPOConfig) !void {
+    for (completions, 0..) |anchor, anchor_idx| {
+        var seen = false;
+        for (completions[0..anchor_idx]) |previous| {
+            if (previous.prompt_idx == anchor.prompt_idx) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+
+        var count: usize = 0;
+        for (completions) |candidate| {
+            if (candidate.prompt_idx == anchor.prompt_idx) count += 1;
+        }
+        if (count != config.group_size) return error.InvalidGRPOGroup;
+    }
+}
+
 pub fn computeAdvantages(
     ga: *GroupAdvantages,
     completions: []const Completion,
     config: GRPOConfig,
-) void {
+) !void {
+    try validateConfig(config);
     const n = completions.len;
     if (n == 0) return;
+    if (ga.rewards.len != n or ga.advantages.len != n) return error.GroupLengthMismatch;
+    try validateCompletionGroups(completions, config);
 
-    var g: usize = 0;
-    while (g < ga.num_groups) : (g += 1) {
+    for (completions, 0..) |anchor, anchor_idx| {
+        var seen = false;
+        for (completions[0..anchor_idx]) |previous| {
+            if (previous.prompt_idx == anchor.prompt_idx) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+
         var count: usize = 0;
         var sum: f64 = 0;
         for (completions, 0..) |c, i| {
-            if (c.prompt_idx == g) {
+            if (c.prompt_idx == anchor.prompt_idx) {
                 sum += ga.rewards[i];
                 count += 1;
             }
         }
-        if (count == 0) continue;
         const mean: f64 = sum / @as(f64, @floatFromInt(count));
 
         var std_val: f64 = 0;
         if (config.normalize_advantage) {
             var var_sum: f64 = 0;
             for (completions, 0..) |c, i| {
-                if (c.prompt_idx == g) {
+                if (c.prompt_idx == anchor.prompt_idx) {
                     const d = @as(f64, ga.rewards[i]) - mean;
                     var_sum += d * d;
                 }
             }
-            const variance = var_sum / @as(f64, @floatFromInt(count));
+            // Stock TRL/Unsloth group scaling uses torch.std's default
+            // correction=1. Keeping the sample standard deviation here is
+            // required for objective-equivalent GRPO comparisons.
+            const variance = var_sum / @as(f64, @floatFromInt(count - 1));
             std_val = @sqrt(variance);
         }
 
         for (completions, 0..) |c, i| {
-            if (c.prompt_idx == g) {
+            if (c.prompt_idx == anchor.prompt_idx) {
                 const centered = @as(f64, ga.rewards[i]) - mean;
                 if (config.normalize_advantage) {
                     const denom = std_val + @as(f64, config.advantage_eps);
@@ -156,11 +202,22 @@ pub fn grpoLoss(
     advantages: []const f32,
     config: GRPOConfig,
 ) !GRPOLossResult {
+    try validateConfig(config);
+    try validateCompletionGroups(completions, config);
     var total_tokens: usize = 0;
-    for (completions) |c| total_tokens += c.tokens.len;
+    for (completions) |c| {
+        if (c.tokens.len == 0) return error.EmptyCompletion;
+        if (c.old_logps.len != c.tokens.len or c.ref_logps.len != c.tokens.len)
+            return error.LogpLenMismatch;
+        for (c.old_logps) |value| if (!std.math.isFinite(value)) return error.NonFiniteLogprob;
+        for (c.ref_logps) |value| if (!std.math.isFinite(value)) return error.NonFiniteLogprob;
+        total_tokens += c.tokens.len;
+    }
 
     if (new_logps.len != total_tokens) return error.LogpLenMismatch;
     if (advantages.len != completions.len) return error.AdvLenMismatch;
+    for (new_logps) |value| if (!std.math.isFinite(value)) return error.NonFiniteLogprob;
+    for (advantages) |value| if (!std.math.isFinite(value)) return error.NonFiniteAdvantage;
 
     const grad = try allocator.alloc(f32, total_tokens);
     errdefer allocator.free(grad);
@@ -178,7 +235,7 @@ pub fn grpoLoss(
     }
 
     const n_f: f32 = @floatFromInt(total_tokens);
-    const inv_n: f32 = 1.0 / n_f;
+    const completion_count_f: f32 = @floatFromInt(completions.len);
     const eps = config.clip_epsilon;
     const kl = config.kl_coef;
 
@@ -189,6 +246,7 @@ pub fn grpoLoss(
     var off: usize = 0;
     for (completions, 0..) |c, ci| {
         const adv: f32 = advantages[ci];
+        const completion_weight: f32 = 1.0 / (completion_count_f * @as(f32, @floatFromInt(c.tokens.len)));
         var t: usize = 0;
         while (t < c.tokens.len) : (t += 1) {
             const new_lp = new_logps[off + t];
@@ -203,13 +261,14 @@ pub fn grpoLoss(
             // -min(pg_1, pg_2)
             const chosen = if (pg_1 < pg_2) pg_1 else pg_2;
             const pg_token = -chosen;
-            pg_sum += pg_token;
+            pg_sum += @as(f64, pg_token) * completion_weight;
 
             // KL k3: exp(ref - new) - (ref - new) - 1
             const diff = ref_lp - new_lp;
             const exp_diff = @exp(diff);
+            if (!std.math.isFinite(ratio) or !std.math.isFinite(exp_diff)) return error.NonFiniteLoss;
             const k3 = exp_diff - diff - 1.0;
-            kl_sum += kl * k3;
+            kl_sum += @as(f64, kl * k3) * completion_weight;
 
             // Gradient w.r.t. new_lp.
             //
@@ -233,13 +292,13 @@ pub fn grpoLoss(
             //   Loss contribution is +kl_coef * k3, so grad is +kl_coef * (1 - exp_diff).
             const g_kl: f32 = kl * (1.0 - exp_diff);
 
-            grad[off + t] = (g_pg + g_kl) * inv_n;
+            grad[off + t] = (g_pg + g_kl) * completion_weight;
         }
         off += c.tokens.len;
     }
 
-    const pg_loss: f32 = @floatCast(pg_sum / @as(f64, n_f));
-    const kl_loss: f32 = @floatCast(kl_sum / @as(f64, n_f));
+    const pg_loss: f32 = @floatCast(pg_sum);
+    const kl_loss: f32 = @floatCast(kl_sum);
     const loss: f32 = pg_loss + kl_loss;
     const clip_fraction: f32 = @as(f32, @floatFromInt(clipped_count)) / n_f;
 
@@ -306,8 +365,8 @@ test "computeAdvantages equal rewards -> zero" {
     var ga = try scoreGroup(alloc, rewarder, &comps);
     defer ga.deinit();
 
-    const cfg = GRPOConfig{};
-    computeAdvantages(&ga, &comps, cfg);
+    const cfg = GRPOConfig{ .group_size = 3 };
+    try computeAdvantages(&ga, &comps, cfg);
     for (ga.advantages) |a| try testing.expectApproxEqAbs(@as(f32, 0), a, 1e-6);
 }
 
@@ -344,7 +403,7 @@ fn indexedReward(
     return v;
 }
 
-test "computeAdvantages two-completion group [1,3] -> [-1,+1]" {
+test "computeAdvantages uses group sample standard deviation" {
     const alloc = testing.allocator;
     const values = [_]f32{ 1.0, 3.0 };
     var ctx = IndexedRewardCtx{ .values = &values };
@@ -360,10 +419,11 @@ test "computeAdvantages two-completion group [1,3] -> [-1,+1]" {
     var ga = try scoreGroup(alloc, rewarder, &comps);
     defer ga.deinit();
 
-    const cfg = GRPOConfig{};
-    computeAdvantages(&ga, &comps, cfg);
-    try testing.expectApproxEqAbs(@as(f32, -1.0), ga.advantages[0], 1e-4);
-    try testing.expectApproxEqAbs(@as(f32, 1.0), ga.advantages[1], 1e-4);
+    const cfg = GRPOConfig{ .group_size = 2 };
+    try computeAdvantages(&ga, &comps, cfg);
+    const expected: f32 = 1.0 / (@sqrt(@as(f32, 2.0)) + cfg.advantage_eps);
+    try testing.expectApproxEqAbs(-expected, ga.advantages[0], 1e-6);
+    try testing.expectApproxEqAbs(expected, ga.advantages[1], 1e-6);
 }
 
 test "grpoLoss zero when ratio=1, adv=0, ref=new" {
@@ -377,7 +437,7 @@ test "grpoLoss zero when ratio=1, adv=0, ref=new" {
     const new_lp = [_]f32{ -0.3, -0.7, -0.3, -0.7 };
     const advs = [_]f32{ 0.0, 0.0 };
 
-    var res = try grpoLoss(alloc, &comps, &new_lp, &advs, .{});
+    var res = try grpoLoss(alloc, &comps, &new_lp, &advs, .{ .group_size = 2 });
     defer res.deinit();
 
     try testing.expectApproxEqAbs(@as(f32, 0), res.loss, 1e-6);
@@ -385,6 +445,65 @@ test "grpoLoss zero when ratio=1, adv=0, ref=new" {
     try testing.expectApproxEqAbs(@as(f32, 0), res.kl_loss, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0), res.clip_fraction, 1e-6);
     for (res.grad_new_logps) |g| try testing.expectApproxEqAbs(@as(f32, 0), g, 1e-6);
+}
+
+test "grpoLoss balances completions independently of token length" {
+    const alloc = testing.allocator;
+    const short_tokens = [_]i32{1};
+    const long_tokens = [_]i32{ 2, 3, 4 };
+    const short_lp = [_]f32{-0.5};
+    const long_lp = [_]f32{ -0.5, -0.5, -0.5 };
+    const comps = [_]Completion{
+        .{ .prompt_idx = 0, .tokens = &short_tokens, .old_logps = &short_lp, .ref_logps = &short_lp },
+        .{ .prompt_idx = 0, .tokens = &long_tokens, .old_logps = &long_lp, .ref_logps = &long_lp },
+    };
+    const new_lp = [_]f32{ -0.5, -0.5, -0.5, -0.5 };
+    const advs = [_]f32{ 1.0, 1.0 };
+
+    var res = try grpoLoss(alloc, &comps, &new_lp, &advs, .{ .group_size = 2, .kl_coef = 0.0 });
+    defer res.deinit();
+
+    try testing.expectApproxEqAbs(@as(f32, -1.0), res.loss, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, -0.5), res.grad_new_logps[0], 1e-6);
+    for (res.grad_new_logps[1..]) |grad| {
+        try testing.expectApproxEqAbs(@as(f32, -1.0 / 6.0), grad, 1e-6);
+    }
+}
+
+test "GRPO config rejects unsafe values" {
+    try testing.expectError(error.InvalidGRPOConfig, validateConfig(.{ .group_size = 0 }));
+    try testing.expectError(error.InvalidGRPOConfig, validateConfig(.{ .group_size = 1 }));
+    try testing.expectError(error.InvalidGRPOConfig, validateConfig(.{ .clip_epsilon = -0.1 }));
+    try testing.expectError(error.InvalidGRPOConfig, validateConfig(.{ .clip_epsilon = 1.0 }));
+    try testing.expectError(error.InvalidGRPOConfig, validateConfig(.{ .clip_epsilon = std.math.nan(f32) }));
+    try testing.expectError(error.InvalidGRPOConfig, validateConfig(.{ .kl_coef = -0.1 }));
+    try testing.expectError(error.InvalidGRPOConfig, validateConfig(.{ .kl_coef = std.math.nan(f32) }));
+    try testing.expectError(error.InvalidGRPOConfig, validateConfig(.{ .advantage_eps = 0.0 }));
+    try testing.expectError(error.InvalidGRPOConfig, validateConfig(.{ .advantage_eps = std.math.nan(f32) }));
+}
+
+test "GRPO rejects incomplete groups and non-finite log-probs" {
+    const tokens = [_]i32{1};
+    const finite = [_]f32{-0.5};
+    const invalid = [_]f32{std.math.nan(f32)};
+    const incomplete = [_]Completion{
+        .{ .prompt_idx = 7, .tokens = &tokens, .old_logps = &finite, .ref_logps = &finite },
+    };
+    const complete_invalid = [_]Completion{
+        .{ .prompt_idx = 7, .tokens = &tokens, .old_logps = &invalid, .ref_logps = &finite },
+        .{ .prompt_idx = 7, .tokens = &tokens, .old_logps = &finite, .ref_logps = &finite },
+    };
+    const new_logps = [_]f32{ -0.5, -0.5 };
+    const advantages = [_]f32{ 1.0, -1.0 };
+
+    try testing.expectError(
+        error.InvalidGRPOGroup,
+        grpoLoss(testing.allocator, &incomplete, &finite, &.{1.0}, .{ .group_size = 2 }),
+    );
+    try testing.expectError(
+        error.NonFiniteLogprob,
+        grpoLoss(testing.allocator, &complete_invalid, &new_logps, &advantages, .{ .group_size = 2 }),
+    );
 }
 
 fn lossOnly(
@@ -415,7 +534,7 @@ test "grpoLoss finite-difference gradient check" {
     var new_lp = [_]f32{ -0.35, -0.85, -0.25, -0.82, -1.05 };
     const advs = [_]f32{ 0.7, -0.3 };
 
-    const cfg = GRPOConfig{ .clip_epsilon = 0.5, .kl_coef = 0.1 };
+    const cfg = GRPOConfig{ .group_size = 2, .clip_epsilon = 0.5, .kl_coef = 0.1 };
 
     var res = try grpoLoss(alloc, &comps, &new_lp, &advs, cfg);
     defer res.deinit();

@@ -100,16 +100,25 @@ pub fn bindF32(
     return cb.fromFloat32Shape(data, dims);
 }
 
-/// Bind a placeholder to a concrete i64 value (for token IDs, position IDs).
-/// Converts i64 -> f32 slice (via simple cast), then calls fromFloat32Shape.
-/// This is a lossy conversion but matches the current harness convention.
-/// A proper i64 binding path is a TODO.
+/// Bind a placeholder to a concrete integer value (for token IDs, position
+/// IDs). Prefer a backend-native i32 tensor so CUDA embedding lookup stays
+/// resident; fall back to the graph's historical f32 placeholder convention
+/// on backends without integer uploads.
 pub fn bindI64(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     placeholder: PlaceholderInfo,
     data: []const i64,
 ) !CT {
+    const dims = try shapeToDims(allocator, placeholder.shape);
+    defer allocator.free(dims);
+    const i32_buf = try allocator.alloc(i32, data.len);
+    defer allocator.free(i32_buf);
+    for (data, 0..) |value, idx| {
+        i32_buf[idx] = std.math.cast(i32, value) orelse return error.IntegerInputOutOfRange;
+    }
+    if (try cb.fromInt32Shape(i32_buf, dims)) |integer_tensor| return integer_tensor;
+
     const f32_buf = try allocator.alloc(f32, data.len);
     defer allocator.free(f32_buf);
     for (data, 0..) |v, i| {

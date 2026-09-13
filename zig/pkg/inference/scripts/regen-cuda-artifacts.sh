@@ -191,6 +191,7 @@ required_symbols=(
   termite_f32_to_i32
   termite_round_f32
   termite_primitive_transpose_2d_f32
+  termite_primitive_gather_bf16_f32
   termite_add_bias_relu_rows_f32
   termite_add_weighted_scalars_f32
   termite_linear_bf16_weight_f32_tiled
