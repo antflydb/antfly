@@ -13,6 +13,12 @@ Go-era design documents whose content now lives in the Zig design docs were remo
 | DOCX/PPTX & Google Docs/Slides Support | [ppt-docx.md](completed/ingestion/ppt-docx.md) | Structured extraction for Office and Google Workspace document formats in docsaf, using only the standard library |
 | Reader Interface (OCR/Vision) | [reader-integration.md](completed/ingestion/reader-integration.md) | A reusable `Reader` interface for OCR/vision integrations, replacing ad-hoc per-app implementations |
 
+### Inference
+
+| Feature | Document | Summary |
+|---------|----------|---------|
+| GLiNER2.5 | [gliner2.5.md](completed/gliner2.5.md) | Native CPU/Metal extraction, training, artifact compatibility, and qualification boundaries |
+
 ## Planned Features
 
 | Feature | Document | Summary |

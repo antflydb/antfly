@@ -22,6 +22,7 @@ pub const Suite = struct {
     selected_test_filters: []const []const u8,
     run_tests: *std.Build.Step.Run,
     run_cli_tests: *std.Build.Step.Run,
+    run_gliner25_fuzz_tests: *std.Build.Step.Run,
 };
 
 pub fn create(ctx: Context) Suite {
@@ -114,7 +115,13 @@ pub fn create(ctx: Context) Suite {
         run_tests.addArgs(&.{ "--test-filter", filter });
     }
     build_test_filters.addRuntimeControls(run_tests, ctx.args orelse &.{});
-    return .{ .tests = tests, .selected_test_filters = selected_test_filters, .run_tests = run_tests, .run_cli_tests = run_cli_tests };
+    return .{
+        .tests = tests,
+        .selected_test_filters = selected_test_filters,
+        .run_tests = run_tests,
+        .run_cli_tests = run_cli_tests,
+        .run_gliner25_fuzz_tests = addGliner25Fuzz(ctx),
+    };
 }
 
 pub const Checks = struct {
@@ -164,6 +171,60 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     if (selected_test_filters.len == 0) {
         test_step.dependOn(&run_cli_tests.step);
         test_step.dependOn(&run_bge_m3_e2e_bench_tests.step);
+        test_step.dependOn(&suite.run_gliner25_fuzz_tests.step);
     }
     return test_step;
+}
+
+pub fn addGliner25Trained(ctx: Context, gliner25_trained_check_module: *std.Build.Module) void {
+    const b = ctx.b;
+    const gliner25_trained_tests = b.addTest(.{
+        .root_module = gliner25_trained_check_module,
+        .filters = build_test_filters.select(b.allocator, ctx.args orelse &.{}, &.{"trained execution"}),
+    });
+    const run_gliner25_trained_tests = ctx.addRunArtifact(gliner25_trained_tests);
+    ctx.step("gliner25-trained-check-test", "Test trained GLiNER2.5 execution envelopes, identity, admission and lifetimes without a model").dependOn(&run_gliner25_trained_tests.step);
+}
+
+fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
+    const b = ctx.b;
+    const no_error_tracing = b.option(bool, "gliner25-fuzz-no-error-tracing", "Work around Zig 0.16.0 fuzz runner error-trace mismatch for GLiNER25 only (use with --fuzz)") orelse false;
+    // Keep the standard test runner for deterministic corpus and --fuzz runs.
+    // This pure-Zig platform instance deliberately omits filesystem_capacity.c:
+    // Zig 0.16 cannot instrument that C helper with its fuzz sanitizer profile.
+    // Construct it from shared paths so root and package builds need no nested
+    // package dependency and the ML imports share exactly this module identity.
+    const platform = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/platform/src/root.zig" })),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .link_libc = false,
+    });
+    const ml = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/ml/src/root.zig" })),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    ml.addImport("antfly_platform", platform);
+    const tests = b.addTest(.{
+        .name = "gliner25-parser-properties",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/gliner25_fuzz.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+            .link_libc = ctx.backend.link_libc,
+            .error_tracing = if (no_error_tracing) false else null,
+        }),
+        .filters = &.{"GLiNER25 fuzz"},
+    });
+    tests.root_module.addImport("build_options", ctx.graph.build_options_mod);
+    tests.root_module.addImport("antfly_platform", platform);
+    tests.root_module.addImport("antfly_image", ctx.graph.image_mod);
+    tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
+    tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
+    tests.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    tests.root_module.addImport("ml", ml);
+    const run = ctx.addRunArtifact(tests);
+    ctx.step("test-gliner25-fuzz", "Run bounded GLiNER2.5 parser, schema and document property tests").dependOn(&run.step);
+    return run;
 }

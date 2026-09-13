@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
-KNOWN_SUITES = ("qwen3_embedding", "qwen3vl")
+KNOWN_SUITES = ("qwen3_embedding", "qwen3vl", "gliner25")
 
 
 def parse_args() -> argparse.Namespace:

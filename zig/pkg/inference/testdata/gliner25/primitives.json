@@ -1,0 +1,2323 @@
+{
+  "format_version": 1,
+  "generator_sha256": "ee24f4f02a0a39fc0cd77f4ed7f0c06764550982e873e0c252e9f124bdfa6fc2",
+  "inside_cases": [
+    {
+      "batch": 2,
+      "expected": {
+        "input_gradient": [
+          0.0,
+          0.5,
+          0.75,
+          0.75,
+          0.5,
+          -1.25,
+          -0.5,
+          0.0,
+          0.25,
+          0.25,
+          -0.75,
+          -1.5,
+          -0.75,
+          -0.25,
+          0.0,
+          -0.25,
+          -0.75,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.75,
+          0.75,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "masked_logits": [
+          1.0,
+          2.0,
+          4.0,
+          8.0,
+          16.0,
+          -20001.0,
+          -20002.0,
+          -20004.0,
+          -20008.0,
+          -20016.0,
+          0.0,
+          -1.0,
+          0.0,
+          1.0,
+          0.0,
+          3.0,
+          9.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -3.0,
+          5.0,
+          -10000.0,
+          -10000.0,
+          -10000.0
+        ],
+        "mean": [
+          6.199999809265137,
+          -20006.19921875,
+          0.0,
+          6.0,
+          0.0,
+          1.0
+        ],
+        "prefix": [
+          0.0,
+          -5.199999809265137,
+          -9.399999618530273,
+          -11.59999942779541,
+          -9.799999237060547,
+          9.5367431640625e-07,
+          0.0,
+          5.19921875,
+          9.3984375,
+          11.59765625,
+          9.796875,
+          -0.00390625,
+          0.0,
+          0.0,
+          -1.0,
+          -1.0,
+          0.0,
+          0.0,
+          0.0,
+          -3.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          -4.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "grad_mean": [
+        11.0,
+        11.0,
+        11.0,
+        11.0,
+        11.0,
+        11.0
+      ],
+      "grad_prefix": [
+        -0.75,
+        -0.5,
+        -0.25,
+        0.0,
+        0.25,
+        0.5,
+        0.75,
+        -0.75,
+        -0.5,
+        -0.25,
+        0.0,
+        0.25,
+        0.5,
+        0.75,
+        -0.75,
+        -0.5,
+        -0.25,
+        0.0,
+        0.25,
+        0.5,
+        0.75,
+        -0.75,
+        -0.5,
+        -0.25,
+        0.0,
+        0.25,
+        0.5,
+        0.75,
+        -0.75,
+        -0.5,
+        -0.25,
+        0.0,
+        0.25,
+        0.5,
+        0.75,
+        -0.75
+      ],
+      "id": "ragged_detached_mean",
+      "inside_logits": [
+        1.0,
+        2.0,
+        4.0,
+        8.0,
+        16.0,
+        -20001.0,
+        -20002.0,
+        -20004.0,
+        -20008.0,
+        -20016.0,
+        0.0,
+        -1.0,
+        0.0,
+        1.0,
+        0.0,
+        3.0,
+        9.0,
+        7000.0,
+        -7000.0,
+        10000.0,
+        11.0,
+        12.0,
+        13.0,
+        14.0,
+        15.0,
+        -3.0,
+        5.0,
+        19.0,
+        20.0,
+        21.0
+      ],
+      "length": 5,
+      "lengths": [
+        5,
+        2
+      ],
+      "queries": 3,
+      "query_mask": [
+        true,
+        true,
+        true,
+        true,
+        false,
+        true
+      ],
+      "text_mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false
+      ]
+    }
+  ],
+  "layouts": {
+    "indices": "[B,C,2]",
+    "inside": "[B,Q,L]",
+    "logits": "[B,Q,N]",
+    "mean": "[B,Q,1]",
+    "prefix": "[B,Q,L+1]",
+    "projected_states": "[B,N,D]"
+  },
+  "manifest_sha256": "918005508a57d2c558c18a78167637f39c54e7c2c6d67814be15fc6714c4152f",
+  "native_runtime_qualified": false,
+  "oracle_sha256": "61bbf4544a21111dbfbd643ed2392b1d9723498493b3fa6832154d6e1dc42752",
+  "overlap_cases": [
+    {
+      "canonical_policy": "allow",
+      "expected_ids": [
+        1,
+        2,
+        0,
+        3
+      ],
+      "id": "crossing_containment_allow",
+      "items": [
+        {
+          "end": 8,
+          "id": 0,
+          "score": 0.75,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.9,
+          "start": 1
+        },
+        {
+          "end": 5,
+          "id": 2,
+          "score": 0.8,
+          "start": 2
+        },
+        {
+          "end": 9,
+          "id": 3,
+          "score": 0.4,
+          "start": 8
+        }
+      ],
+      "policy": "allow"
+    },
+    {
+      "canonical_policy": "nested",
+      "expected_ids": [
+        1,
+        0,
+        3
+      ],
+      "id": "crossing_containment_nested",
+      "items": [
+        {
+          "end": 8,
+          "id": 0,
+          "score": 0.75,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.9,
+          "start": 1
+        },
+        {
+          "end": 5,
+          "id": 2,
+          "score": 0.8,
+          "start": 2
+        },
+        {
+          "end": 9,
+          "id": 3,
+          "score": 0.4,
+          "start": 8
+        }
+      ],
+      "policy": "nested"
+    },
+    {
+      "canonical_policy": "longest",
+      "expected_ids": [
+        0,
+        3
+      ],
+      "id": "crossing_containment_longest",
+      "items": [
+        {
+          "end": 8,
+          "id": 0,
+          "score": 0.75,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.9,
+          "start": 1
+        },
+        {
+          "end": 5,
+          "id": 2,
+          "score": 0.8,
+          "start": 2
+        },
+        {
+          "end": 9,
+          "id": 3,
+          "score": 0.4,
+          "start": 8
+        }
+      ],
+      "policy": "longest"
+    },
+    {
+      "canonical_policy": "disallow",
+      "expected_ids": [
+        1,
+        3
+      ],
+      "id": "crossing_containment_flat",
+      "items": [
+        {
+          "end": 8,
+          "id": 0,
+          "score": 0.75,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.9,
+          "start": 1
+        },
+        {
+          "end": 5,
+          "id": 2,
+          "score": 0.8,
+          "start": 2
+        },
+        {
+          "end": 9,
+          "id": 3,
+          "score": 0.4,
+          "start": 8
+        }
+      ],
+      "policy": "flat"
+    },
+    {
+      "canonical_policy": "allow",
+      "expected_ids": [
+        0,
+        1,
+        2
+      ],
+      "id": "global_weighted_allow",
+      "items": [
+        {
+          "end": 6,
+          "id": 0,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.6,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.6,
+          "start": 3
+        }
+      ],
+      "policy": "allow"
+    },
+    {
+      "canonical_policy": "nested",
+      "expected_ids": [
+        0,
+        1,
+        2
+      ],
+      "id": "global_weighted_nested",
+      "items": [
+        {
+          "end": 6,
+          "id": 0,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.6,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.6,
+          "start": 3
+        }
+      ],
+      "policy": "nested"
+    },
+    {
+      "canonical_policy": "longest",
+      "expected_ids": [
+        0
+      ],
+      "id": "global_weighted_longest",
+      "items": [
+        {
+          "end": 6,
+          "id": 0,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.6,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.6,
+          "start": 3
+        }
+      ],
+      "policy": "longest"
+    },
+    {
+      "canonical_policy": "disallow",
+      "expected_ids": [
+        1,
+        2
+      ],
+      "id": "global_weighted_flat",
+      "items": [
+        {
+          "end": 6,
+          "id": 0,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.6,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.6,
+          "start": 3
+        }
+      ],
+      "policy": "flat"
+    },
+    {
+      "canonical_policy": "allow",
+      "expected_ids": [
+        1,
+        3
+      ],
+      "id": "exact_duplicates_allow",
+      "items": [
+        {
+          "end": 2,
+          "id": 0,
+          "score": 0.5,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "id": 1,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "id": 2,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 3,
+          "score": 0.1,
+          "start": 2
+        }
+      ],
+      "policy": "allow"
+    },
+    {
+      "canonical_policy": "nested",
+      "expected_ids": [
+        1,
+        3
+      ],
+      "id": "exact_duplicates_nested",
+      "items": [
+        {
+          "end": 2,
+          "id": 0,
+          "score": 0.5,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "id": 1,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "id": 2,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 3,
+          "score": 0.1,
+          "start": 2
+        }
+      ],
+      "policy": "nested"
+    },
+    {
+      "canonical_policy": "longest",
+      "expected_ids": [
+        1,
+        3
+      ],
+      "id": "exact_duplicates_longest",
+      "items": [
+        {
+          "end": 2,
+          "id": 0,
+          "score": 0.5,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "id": 1,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "id": 2,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 3,
+          "score": 0.1,
+          "start": 2
+        }
+      ],
+      "policy": "longest"
+    },
+    {
+      "canonical_policy": "disallow",
+      "expected_ids": [
+        1,
+        3
+      ],
+      "id": "exact_duplicates_flat",
+      "items": [
+        {
+          "end": 2,
+          "id": 0,
+          "score": 0.5,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "id": 1,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "id": 2,
+          "score": 0.9,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 3,
+          "score": 0.1,
+          "start": 2
+        }
+      ],
+      "policy": "flat"
+    },
+    {
+      "canonical_policy": "allow",
+      "expected_ids": [
+        1,
+        0,
+        2
+      ],
+      "id": "zero_score_count_tie_allow",
+      "items": [
+        {
+          "end": 6,
+          "id": 0,
+          "score": 0.0,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.0,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.0,
+          "start": 3
+        }
+      ],
+      "policy": "allow"
+    },
+    {
+      "canonical_policy": "nested",
+      "expected_ids": [
+        1,
+        0,
+        2
+      ],
+      "id": "zero_score_count_tie_nested",
+      "items": [
+        {
+          "end": 6,
+          "id": 0,
+          "score": 0.0,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.0,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.0,
+          "start": 3
+        }
+      ],
+      "policy": "nested"
+    },
+    {
+      "canonical_policy": "longest",
+      "expected_ids": [
+        0
+      ],
+      "id": "zero_score_count_tie_longest",
+      "items": [
+        {
+          "end": 6,
+          "id": 0,
+          "score": 0.0,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.0,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.0,
+          "start": 3
+        }
+      ],
+      "policy": "longest"
+    },
+    {
+      "canonical_policy": "disallow",
+      "expected_ids": [
+        1,
+        2
+      ],
+      "id": "zero_score_count_tie_flat",
+      "items": [
+        {
+          "end": 6,
+          "id": 0,
+          "score": 0.0,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.0,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.0,
+          "start": 3
+        }
+      ],
+      "policy": "flat"
+    },
+    {
+      "canonical_policy": "allow",
+      "expected_ids": [
+        1,
+        0,
+        2
+      ],
+      "id": "equal_score_count_lex_tie_allow",
+      "items": [
+        {
+          "end": 4,
+          "id": 0,
+          "score": 0.5,
+          "start": 1
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.5,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.5,
+          "start": 4
+        }
+      ],
+      "policy": "allow"
+    },
+    {
+      "canonical_policy": "nested",
+      "expected_ids": [
+        1,
+        2
+      ],
+      "id": "equal_score_count_lex_tie_nested",
+      "items": [
+        {
+          "end": 4,
+          "id": 0,
+          "score": 0.5,
+          "start": 1
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.5,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.5,
+          "start": 4
+        }
+      ],
+      "policy": "nested"
+    },
+    {
+      "canonical_policy": "longest",
+      "expected_ids": [
+        1,
+        0,
+        2
+      ],
+      "id": "equal_score_count_lex_tie_longest",
+      "items": [
+        {
+          "end": 4,
+          "id": 0,
+          "score": 0.5,
+          "start": 1
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.5,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.5,
+          "start": 4
+        }
+      ],
+      "policy": "longest"
+    },
+    {
+      "canonical_policy": "disallow",
+      "expected_ids": [
+        1,
+        2
+      ],
+      "id": "equal_score_count_lex_tie_flat",
+      "items": [
+        {
+          "end": 4,
+          "id": 0,
+          "score": 0.5,
+          "start": 1
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.5,
+          "start": 0
+        },
+        {
+          "end": 6,
+          "id": 2,
+          "score": 0.5,
+          "start": 4
+        }
+      ],
+      "policy": "flat"
+    },
+    {
+      "canonical_policy": "allow",
+      "expected_ids": [
+        2,
+        1,
+        3,
+        0
+      ],
+      "id": "negative_chunk_scores_allow",
+      "items": [
+        {
+          "end": 2,
+          "id": 0,
+          "score": -0.5,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.0,
+          "start": 2
+        },
+        {
+          "end": 5,
+          "id": 2,
+          "score": 0.25,
+          "start": 3
+        },
+        {
+          "end": 5,
+          "id": 3,
+          "score": -0.1,
+          "start": 0
+        }
+      ],
+      "policy": "allow"
+    },
+    {
+      "canonical_policy": "nested",
+      "expected_ids": [
+        2,
+        1,
+        3,
+        0
+      ],
+      "id": "negative_chunk_scores_nested",
+      "items": [
+        {
+          "end": 2,
+          "id": 0,
+          "score": -0.5,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.0,
+          "start": 2
+        },
+        {
+          "end": 5,
+          "id": 2,
+          "score": 0.25,
+          "start": 3
+        },
+        {
+          "end": 5,
+          "id": 3,
+          "score": -0.1,
+          "start": 0
+        }
+      ],
+      "policy": "nested"
+    },
+    {
+      "canonical_policy": "longest",
+      "expected_ids": [
+        3
+      ],
+      "id": "negative_chunk_scores_longest",
+      "items": [
+        {
+          "end": 2,
+          "id": 0,
+          "score": -0.5,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.0,
+          "start": 2
+        },
+        {
+          "end": 5,
+          "id": 2,
+          "score": 0.25,
+          "start": 3
+        },
+        {
+          "end": 5,
+          "id": 3,
+          "score": -0.1,
+          "start": 0
+        }
+      ],
+      "policy": "longest"
+    },
+    {
+      "canonical_policy": "disallow",
+      "expected_ids": [
+        2,
+        1
+      ],
+      "id": "negative_chunk_scores_flat",
+      "items": [
+        {
+          "end": 2,
+          "id": 0,
+          "score": -0.5,
+          "start": 0
+        },
+        {
+          "end": 3,
+          "id": 1,
+          "score": 0.0,
+          "start": 2
+        },
+        {
+          "end": 5,
+          "id": 2,
+          "score": 0.25,
+          "start": 3
+        },
+        {
+          "end": 5,
+          "id": 3,
+          "score": -0.1,
+          "start": 0
+        }
+      ],
+      "policy": "flat"
+    }
+  ],
+  "pool_cases": [
+    {
+      "batch": 2,
+      "boundaries": 6,
+      "boundary_mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false
+      ],
+      "config": {
+        "boundary_top_k": 4,
+        "capacity": 8,
+        "min_per_query": 2
+      },
+      "dim": 4,
+      "end_logits": [
+        4.0,
+        -1.0,
+        0.0,
+        5.0,
+        5.0,
+        1.0,
+        3.0,
+        0.0,
+        2.0,
+        5.0,
+        1.0,
+        4.0,
+        4.0,
+        0.0,
+        5.0,
+        1.0,
+        2.0,
+        3.0,
+        0.0,
+        2.0,
+        4.0,
+        0.0,
+        2.0,
+        2.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        1.0,
+        3.0,
+        4.0,
+        0.0,
+        3.0,
+        -1.0
+      ],
+      "expected": {
+        "compat_logits": [
+          0.15625,
+          0.29296875,
+          -0.140625,
+          0.0,
+          0.0234375,
+          0.0,
+          -0.03125,
+          -0.03125,
+          0.03125,
+          0.0,
+          -0.0625,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "indices": [
+          0,
+          2,
+          2,
+          3,
+          0,
+          3,
+          1,
+          2,
+          1,
+          4,
+          3,
+          4,
+          1,
+          3,
+          2,
+          4,
+          0,
+          2,
+          1,
+          2,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "proposal_logits": [
+          9.15625,
+          10.29296875,
+          8.859375,
+          10.0,
+          10.0234375,
+          10.0,
+          9.96875,
+          9.96875,
+          6.03125,
+          7.0,
+          4.9375,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0
+        ],
+        "valid": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "id": "ragged_queries",
+      "lengths": [
+        5,
+        2
+      ],
+      "projected_ends": [
+        0.25,
+        0.3125,
+        -0.3125,
+        -0.25,
+        0.0,
+        0.0625,
+        0.125,
+        0.1875,
+        -0.25,
+        -0.1875,
+        -0.125,
+        -0.0625,
+        0.1875,
+        0.25,
+        0.3125,
+        -0.3125,
+        -0.0625,
+        0.0,
+        0.0625,
+        0.125,
+        -0.3125,
+        -0.25,
+        -0.1875,
+        -0.125,
+        -0.3125,
+        -0.25,
+        -0.1875,
+        -0.125,
+        0.125,
+        0.1875,
+        0.25,
+        0.3125,
+        -0.125,
+        -0.0625,
+        0.0,
+        0.0625,
+        0.3125,
+        -0.3125,
+        -0.25,
+        -0.1875,
+        0.0625,
+        0.125,
+        0.1875,
+        0.25,
+        -0.1875,
+        -0.125,
+        -0.0625,
+        0.0
+      ],
+      "projected_starts": [
+        -0.625,
+        -0.5,
+        -0.375,
+        -0.25,
+        -0.125,
+        0.0,
+        0.125,
+        0.25,
+        0.375,
+        0.5,
+        0.625,
+        -0.625,
+        -0.5,
+        -0.375,
+        -0.25,
+        -0.125,
+        0.0,
+        0.125,
+        0.25,
+        0.375,
+        0.5,
+        0.625,
+        -0.625,
+        -0.5,
+        -0.375,
+        -0.25,
+        -0.125,
+        0.0,
+        0.125,
+        0.25,
+        0.375,
+        0.5,
+        0.625,
+        -0.625,
+        -0.5,
+        -0.375,
+        -0.25,
+        -0.125,
+        0.0,
+        0.125,
+        0.25,
+        0.375,
+        0.5,
+        0.625,
+        -0.625,
+        -0.5,
+        -0.375,
+        -0.25
+      ],
+      "queries": 3,
+      "query_mask": [
+        true,
+        true,
+        true,
+        true,
+        false,
+        true
+      ],
+      "start_logits": [
+        1.0,
+        5.0,
+        5.0,
+        0.0,
+        -1.0,
+        4.0,
+        4.0,
+        1.0,
+        5.0,
+        2.0,
+        0.0,
+        3.0,
+        3.0,
+        2.0,
+        1.0,
+        5.0,
+        0.0,
+        4.0,
+        2.0,
+        2.0,
+        0.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        -1.0,
+        3.0,
+        0.0,
+        10000.0,
+        10000.0,
+        10000.0
+      ]
+    },
+    {
+      "batch": 2,
+      "boundaries": 6,
+      "boundary_mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false
+      ],
+      "config": {
+        "boundary_top_k": 4,
+        "capacity": 8,
+        "min_per_query": 2
+      },
+      "dim": 4,
+      "end_logits": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "expected": {
+        "compat_logits": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "indices": [
+          0,
+          1,
+          0,
+          2,
+          0,
+          3,
+          1,
+          2,
+          1,
+          3,
+          2,
+          3,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          2,
+          1,
+          2,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "proposal_logits": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          -10000.0,
+          -10000.0,
+          0.0,
+          0.0,
+          0.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0
+        ],
+        "valid": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          false,
+          false,
+          true,
+          true,
+          true,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "id": "all_ties",
+      "lengths": [
+        5,
+        2
+      ],
+      "projected_ends": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "projected_starts": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "queries": 3,
+      "query_mask": [
+        true,
+        true,
+        true,
+        true,
+        false,
+        true
+      ],
+      "start_logits": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "batch": 2,
+      "boundaries": 6,
+      "boundary_mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false
+      ],
+      "config": {
+        "boundary_top_k": 4,
+        "capacity": 8,
+        "min_per_query": 2
+      },
+      "dim": 4,
+      "end_logits": [
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0,
+        -20001.0
+      ],
+      "expected": {
+        "compat_logits": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "indices": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "proposal_logits": [
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0
+        ],
+        "valid": [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "id": "below_mask_sentinel",
+      "lengths": [
+        5,
+        2
+      ],
+      "projected_ends": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "projected_starts": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "queries": 3,
+      "query_mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "start_logits": [
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0,
+        -20000.0
+      ]
+    },
+    {
+      "batch": 2,
+      "boundaries": 6,
+      "boundary_mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false
+      ],
+      "config": {
+        "boundary_top_k": 4,
+        "capacity": 8,
+        "min_per_query": 2
+      },
+      "dim": 4,
+      "end_logits": [
+        4.0,
+        -1.0,
+        0.0,
+        5.0,
+        5.0,
+        1.0,
+        3.0,
+        0.0,
+        2.0,
+        5.0,
+        1.0,
+        4.0,
+        4.0,
+        0.0,
+        5.0,
+        1.0,
+        2.0,
+        3.0,
+        0.0,
+        2.0,
+        4.0,
+        0.0,
+        2.0,
+        2.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        1.0,
+        3.0,
+        4.0,
+        0.0,
+        3.0,
+        -1.0
+      ],
+      "expected": {
+        "compat_logits": [
+          0.15625,
+          0.29296875,
+          -0.140625,
+          0.0,
+          0.0234375,
+          0.0,
+          -0.03125,
+          -0.03125,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "indices": [
+          0,
+          2,
+          2,
+          3,
+          0,
+          3,
+          1,
+          2,
+          1,
+          4,
+          3,
+          4,
+          1,
+          3,
+          2,
+          4,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "proposal_logits": [
+          9.15625,
+          10.29296875,
+          8.859375,
+          10.0,
+          10.0234375,
+          10.0,
+          9.96875,
+          9.96875,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0,
+          -10000.0
+        ],
+        "valid": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "id": "no_active_queries",
+      "lengths": [
+        5,
+        2
+      ],
+      "projected_ends": [
+        0.25,
+        0.3125,
+        -0.3125,
+        -0.25,
+        0.0,
+        0.0625,
+        0.125,
+        0.1875,
+        -0.25,
+        -0.1875,
+        -0.125,
+        -0.0625,
+        0.1875,
+        0.25,
+        0.3125,
+        -0.3125,
+        -0.0625,
+        0.0,
+        0.0625,
+        0.125,
+        -0.3125,
+        -0.25,
+        -0.1875,
+        -0.125,
+        -0.3125,
+        -0.25,
+        -0.1875,
+        -0.125,
+        0.125,
+        0.1875,
+        0.25,
+        0.3125,
+        -0.125,
+        -0.0625,
+        0.0,
+        0.0625,
+        0.3125,
+        -0.3125,
+        -0.25,
+        -0.1875,
+        0.0625,
+        0.125,
+        0.1875,
+        0.25,
+        -0.1875,
+        -0.125,
+        -0.0625,
+        0.0
+      ],
+      "projected_starts": [
+        -0.625,
+        -0.5,
+        -0.375,
+        -0.25,
+        -0.125,
+        0.0,
+        0.125,
+        0.25,
+        0.375,
+        0.5,
+        0.625,
+        -0.625,
+        -0.5,
+        -0.375,
+        -0.25,
+        -0.125,
+        0.0,
+        0.125,
+        0.25,
+        0.375,
+        0.5,
+        0.625,
+        -0.625,
+        -0.5,
+        -0.375,
+        -0.25,
+        -0.125,
+        0.0,
+        0.125,
+        0.25,
+        0.375,
+        0.5,
+        0.625,
+        -0.625,
+        -0.5,
+        -0.375,
+        -0.25,
+        -0.125,
+        0.0,
+        0.125,
+        0.25,
+        0.375,
+        0.5,
+        0.625,
+        -0.625,
+        -0.5,
+        -0.375,
+        -0.25
+      ],
+      "queries": 3,
+      "query_mask": [
+        true,
+        true,
+        true,
+        false,
+        false,
+        false
+      ],
+      "start_logits": [
+        1.0,
+        5.0,
+        5.0,
+        0.0,
+        -1.0,
+        4.0,
+        4.0,
+        1.0,
+        5.0,
+        2.0,
+        0.0,
+        3.0,
+        3.0,
+        2.0,
+        1.0,
+        5.0,
+        0.0,
+        4.0,
+        2.0,
+        2.0,
+        0.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        10000.0,
+        -1.0,
+        3.0,
+        0.0,
+        10000.0,
+        10000.0,
+        10000.0
+      ]
+    }
+  ],
+  "provenance": {
+    "checkout": "/private/tmp/antfly-gliner25-upstream",
+    "commit": "3c913c7369301133d3b7699252074c4303ada50e",
+    "device": "cpu",
+    "dtype": "float32",
+    "imports": {
+      "gliner2": "/private/tmp/antfly-gliner25-upstream/gliner2/__init__.py",
+      "gliner2.api_client": "/private/tmp/antfly-gliner25-upstream/gliner2/api_client.py",
+      "gliner2.auto": "/private/tmp/antfly-gliner25-upstream/gliner2/auto.py",
+      "gliner2.configuration": "/private/tmp/antfly-gliner25-upstream/gliner2/configuration.py",
+      "gliner2.inference": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/__init__.py",
+      "gliner2.inference.candidate_decoder": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/candidate_decoder.py",
+      "gliner2.inference.chunking": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/chunking.py",
+      "gliner2.inference.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/engine.py",
+      "gliner2.inference.overlap": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/overlap.py",
+      "gliner2.inference.runtime": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/runtime.py",
+      "gliner2.inference.schema": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema.py",
+      "gliner2.inference.schema_model": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema_model.py",
+      "gliner2.layers": "/private/tmp/antfly-gliner25-upstream/gliner2/layers.py",
+      "gliner2.models": "/private/tmp/antfly-gliner25-upstream/gliner2/models/__init__.py",
+      "gliner2.models.base": "/private/tmp/antfly-gliner25-upstream/gliner2/models/base.py",
+      "gliner2.models.boundary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/__init__.py",
+      "gliner2.models.boundary.constants": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/constants.py",
+      "gliner2.models.boundary.content": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/content.py",
+      "gliner2.models.boundary.encoding": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/encoding.py",
+      "gliner2.models.boundary.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/engine.py",
+      "gliner2.models.boundary.heads": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/heads.py",
+      "gliner2.models.boundary.indexing": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/indexing.py",
+      "gliner2.models.boundary.losses": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/losses.py",
+      "gliner2.models.boundary.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/model.py",
+      "gliner2.models.boundary.pool": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/pool.py",
+      "gliner2.models.boundary.proposal": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/proposal.py",
+      "gliner2.models.boundary.records": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/records.py",
+      "gliner2.models.boundary.relations": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/relations.py",
+      "gliner2.models.boundary.rotary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/rotary.py",
+      "gliner2.models.boundary.scoring": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/scoring.py",
+      "gliner2.models.boundary.targets_device": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/targets_device.py",
+      "gliner2.models.boundary.validation": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/validation.py",
+      "gliner2.models.candidates": "/private/tmp/antfly-gliner25-upstream/gliner2/models/candidates.py",
+      "gliner2.models.loading": "/private/tmp/antfly-gliner25-upstream/gliner2/models/loading.py",
+      "gliner2.models.outputs": "/private/tmp/antfly-gliner25-upstream/gliner2/models/outputs.py",
+      "gliner2.models.span": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/__init__.py",
+      "gliner2.models.span.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/model.py",
+      "gliner2.processing": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/__init__.py",
+      "gliner2.processing.layouts": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/layouts.py",
+      "gliner2.processing.records": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/records.py",
+      "gliner2.processing.targets": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/targets.py",
+      "gliner2.processing.word_splitter": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/word_splitter.py",
+      "gliner2.processor": "/private/tmp/antfly-gliner25-upstream/gliner2/processor.py",
+      "gliner2.training": "/private/tmp/antfly-gliner25-upstream/gliner2/training/__init__.py",
+      "gliner2.training.data": "/private/tmp/antfly-gliner25-upstream/gliner2/training/data.py",
+      "gliner2.training.matching": "/private/tmp/antfly-gliner25-upstream/gliner2/training/matching.py",
+      "gliner2.training.sampler": "/private/tmp/antfly-gliner25-upstream/gliner2/training/sampler.py",
+      "gliner2.training.trainer": "/private/tmp/antfly-gliner25-upstream/gliner2/training/trainer.py",
+      "gliner2.utils": "namespace:/private/tmp/antfly-gliner25-upstream/gliner2/utils",
+      "gliner2.utils.device_errors": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/device_errors.py",
+      "gliner2.utils.sync_probe": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/sync_probe.py"
+    },
+    "platform": {
+      "machine": "arm64",
+      "system": "Darwin"
+    },
+    "runtime": {
+      "packages": {
+        "PyYAML": "6.0.3",
+        "accelerate": "1.10.1",
+        "huggingface-hub": "0.36.0",
+        "numpy": "2.3.5",
+        "packaging": "25.0",
+        "peft": "0.17.1",
+        "psutil": "7.1.3",
+        "pydantic": "2.12.3",
+        "requests": "2.32.5",
+        "safetensors": "0.7.0",
+        "scipy": "1.16.3",
+        "tokenizers": "0.21.4",
+        "torch": "2.9.1",
+        "transformers": "4.55.4",
+        "urllib3": "2.5.0"
+      },
+      "python": "3.12.3",
+      "unicode": "15.0.0"
+    },
+    "threads": 1
+  },
+  "real_model_qualified": false,
+  "scope": "boundary_primitive_reference",
+  "training_qualified": false
+}

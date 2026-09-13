@@ -49,6 +49,9 @@ const model_compatibility = @import("../models/compatibility.zig");
 const chunking_mod = @import("../pipelines/chunking.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
+const extraction_v2 = @import("../extractors/extraction_v2.zig");
+const boundary_executor = @import("../extractors/gliner_boundary_executor.zig");
+const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
@@ -2863,6 +2866,11 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
 fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     return switch (err) {
+        error.MemoryBudgetExceeded => ctx.status(507).json(.{
+            .@"error" = "MEMORY_BUDGET_EXCEEDED",
+            .message = memory_budget_exceeded_message,
+            .retryable = false,
+        }),
         error.Timeout => ctx.status(504).json(.{
             .@"error" = "INFERENCE_TIMEOUT",
             .message = "the inference deadline expired",
@@ -3529,6 +3537,10 @@ pub const Node = struct {
     readiness_refresh_io: ?std.Io = null,
     readiness_refresh_started: bool = false,
     hard_cancellation_watchdog: ?*HardCancellationWatchdog = null,
+    /// Only native tests may cross the unpublished boundary-model capability
+    /// gate to qualify this handler. Production has no value or runtime knob;
+    /// architecture, artifact, backend and resource checks still apply.
+    test_allow_unqualified_gliner_boundary: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// Runtime JIT qualification is limited to the single-threaded startup phase.
     request_surfaces_published: bool = false,
     /// Set after configured preloads, including declared optional sessions,
@@ -4000,6 +4012,12 @@ pub const Node = struct {
                 control.hard_cancellation = watchdog.boundary();
         }
         return control;
+    }
+
+    fn extractionExecutionControl(self: *Node, supplied: ?InferenceExecutionControl) InferenceExecutionControl {
+        // Cold construction and cached direct execution receive the same
+        // Node-owned process boundary, including when no control was supplied.
+        return self.bindExecutionControl(null, supplied orelse .{});
     }
 
     fn refreshReadinessInventory(self: *Node, io: std.Io) !void {
@@ -7996,6 +8014,251 @@ pub const Node = struct {
     }
 
     const ExtractionAdmissionOwner = enum { direct, http_route };
+    const ExtractionV2Input = union(enum) {
+        json: []const u8,
+        typed: struct { model_name: []const u8, request: extracting_api.Request },
+    };
+
+    /// Versioned mixed-task extraction for embedded callers. Raw JSON preserves
+    /// per-input schema presence and nullable cardinality exactly as HTTP does.
+    pub fn extractV2DirectJsonWithControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        request_json: []const u8,
+        control: ?InferenceExecutionControl,
+    ) !extracting_api.Response {
+        var failure = extraction_v2.FailureContext{};
+        return self.extractV2WithAdmission(allocator, .{ .json = request_json }, .direct, control, &failure, null);
+    }
+
+    fn extractV2WithAdmission(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        input: ExtractionV2Input,
+        admission_owner: ExtractionAdmissionOwner,
+        supplied_control: ?InferenceExecutionControl,
+        failure: *extraction_v2.FailureContext,
+        response_limit: ?usize,
+    ) !extracting_api.Response {
+        self.metrics.incRequest(if (admission_owner == .direct) "extract.local" else "extract");
+        defer self.metrics.decActive();
+        var trace = self.metrics.extraction_v2.begin(if (admission_owner == .direct) .direct else .http);
+        var trace_error: ?anyerror = null;
+        // The inner call drains managed backend, model, allocator and admission
+        // owners before returning, so this trace includes their teardown.
+        defer trace.finish(trace_error);
+        return self.extractV2Observed(allocator, input, admission_owner, supplied_control, failure, response_limit, trace.observer()) catch |err| {
+            trace_error = err;
+            // The shared admission helper already records QueueFull globally.
+            if (err != error.QueueFull) self.metrics.incError();
+            return err;
+        };
+    }
+
+    fn extractV2Observed(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        input: ExtractionV2Input,
+        admission_owner: ExtractionAdmissionOwner,
+        supplied_control: ?InferenceExecutionControl,
+        failure: *extraction_v2.FailureContext,
+        response_limit: ?usize,
+        observer: metrics_mod.extraction.observation.Observer,
+    ) !extracting_api.Response {
+        const control: ?InferenceExecutionControl = self.extractionExecutionControl(supplied_control);
+        if (control) |active| try active.check();
+        const serialized: ?[]u8 = switch (input) {
+            .json => null,
+            .typed => |typed| blk: {
+                observer.emit(.{ .phase = .parsing });
+                if (typed.request.attachments.len != 0) return error.UnsupportedExtractionInput;
+                break :blk try extracting_api.requestJsonAllocBounded(allocator, .{ .provider = .antfly, .model = typed.model_name, .schema_version = 2 }, typed.request, 16 * 1024 * 1024);
+            },
+        };
+        defer if (serialized) |bytes| allocator.free(bytes);
+        const request_json = switch (input) {
+            .json => |bytes| bytes,
+            .typed => serialized.?,
+        };
+        observer.emit(.{ .phase = .admission });
+        switch (admission_owner) {
+            .direct => try self.acquireAdmissionUnits(1),
+            .http_route => try self.reserveAdmissionUnits(1),
+        }
+        defer switch (admission_owner) {
+            .direct => self.releaseAdmissionUnits(1),
+            .http_route => self.releaseSlotUnits(1),
+        };
+        // Admit a conservative hard ceiling before parsing/compilation. The
+        // reclaiming heap underneath this wrapper ensures frees release memory
+        // during a batch even when the caller's allocator is an HTTP arena.
+        const limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.cpu));
+        var working_bytes: usize = 512 * 1024 * 1024;
+        if (limits.host_limit_bytes != 0) working_bytes = @min(working_bytes, limits.host_limit_bytes);
+        if (limits.scratch_limit_bytes != 0) working_bytes = @min(working_bytes, limits.scratch_limit_bytes);
+        var lease = try self.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = working_bytes });
+        defer lease.release();
+        var budget = runtime.tier.memory.RunBudget.init(limits);
+        try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = working_bytes, .scratch_tier = .host });
+        var bounded = BoundedRequestAllocator{ .backing = std.heap.smp_allocator, .limit = working_bytes };
+        defer observer.emit(.{ .host_peak = bounded.peak });
+        var allocation_failure = ExtractionAllocationFailure{};
+        const scratch = allocation_failure.allocator(&bounded);
+        defer std.debug.assert(bounded.live == 0);
+        const json = self.extractV2InMemory(scratch, request_json, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure) catch |err|
+            return allocation_failure.translate(err);
+        defer scratch.free(json);
+        observer.emit(.{ .phase = .teardown });
+        // Inner teardown can outlast the last execution check. Discard the
+        // completed JSON if cancellation or the deadline won during cleanup.
+        if (control) |active| try active.check();
+        // This allocation belongs to the caller, after all model/backend work
+        // has drained. Its genuine backing OOM is not a request-heap denial.
+        return .{ .allocator = allocator, .json = try allocator.dupe(u8, json) };
+    }
+
+    fn extractV2InMemory(
+        self: *Node,
+        scratch: std.mem.Allocator,
+        request_json: []const u8,
+        control: ?InferenceExecutionControl,
+        failure: *extraction_v2.FailureContext,
+        response_limit: ?usize,
+        observer: metrics_mod.extraction.observation.Observer,
+        budget: *runtime.tier.memory.RunBudget,
+        working_bytes: usize,
+        allocation_failure: *ExtractionAllocationFailure,
+    ) ![]u8 {
+        const regex = @import("../pipelines/extraction_regex.zig");
+        var validators = regex.Context.init(scratch, .{
+            .compile_options = .{ .control = control },
+            .match_options = .{ .control = control },
+        });
+        defer validators.deinit();
+        observer.emit(.{ .phase = .parsing });
+        var request = try extraction_v2.parseJson(scratch, request_json, .{ .failure = failure, .compiler = validators.compilerOptions(.{}) });
+        defer request.deinit();
+        var parsed_bytes: usize = 0;
+        for (request.items) |item| parsed_bytes +|= item.text.len;
+        observer.emit(.{ .parsed = .{ .items = request.items.len, .input_bytes = parsed_bytes } });
+        var execution_options = boundary_executor.Options{
+            .control = control,
+            .failure = failure,
+            .observer = observer,
+            .pipeline = .{ .regex_context = &validators, .validate_value_fn = regex.Context.validateValue },
+            .max_response_bytes = @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024),
+        };
+        try boundary_executor.preflight(&request, execution_options);
+
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(scratch, null, &owned_io);
+        failure.* = .{ .stage = "model" };
+        observer.emit(.{ .phase = .model });
+        const model_path = try self.resolveRequestModelPath(scratch, io, request.model, "extractors");
+        defer scratch.free(model_path);
+        // Only architecture/configuration and capability are needed here.
+        // Full tokenizer JSON materialization belongs to the admitted managed
+        // loader; repeating it per request can exceed the request heap before
+        // this gate, even for an otherwise small extraction request.
+        var manifest = try manifest_mod.loadListingFromDir(scratch, model_path);
+        defer manifest.deinit();
+        if (manifest.gliner_architecture != .boundary) return error.UnsupportedExtractionModel;
+        const test_qualification = if (builtin.is_test) self.test_allow_unqualified_gliner_boundary else false;
+        if (!test_qualification and !manifest.mayLoadQualifiedGlinerBoundaryRuntime()) return error.UnsupportedGlinerBoundaryRuntime;
+        // The model manager owns a separate allocator and resource lifetime.
+        // A previous recoverable request-heap failure cannot label its OOM as
+        // a declared request limit. The real loader still validates all model
+        // and tokenizer bytes before publishing a managed session.
+        allocation_failure.clear();
+        var handle = self.model_manager.acquireFromDirWithControl(model_path, control orelse .{}) catch |err| {
+            allocation_failure.clear();
+            return err;
+        };
+        defer handle.release();
+        const loaded = handle.get();
+        const backend = loaded.session.backend();
+        if (backend != .native and backend != .metal) return error.UnsupportedExtractionBackend;
+        const config = try session_factory.getGlinerBoundaryConfig(loaded.session);
+        execution_options.identity = try session_factory.getGlinerBoundaryIdentity(loaded.session);
+        if (backend == .metal and session_factory.isGlinerBoundaryResidentReady(loaded.session))
+            execution_options.metal_execution_policy = .optimized_v2;
+        if (!test_qualification) {
+            // Reject exact artifact/backend/features before creating request
+            // device state. Geometry is mandatory in executeQualified below.
+            _ = try @import("../extractors/gliner_boundary_qualification.zig").Gate.init(execution_options.identity.?, if (backend == .metal) .metal else .native, &request, control);
+        }
+        // This pass uses the held immutable tokenizer and exact prepared items
+        // and windows under the existing request heap. Observe its real CPU
+        // phase while keeping decoded-item and window counters quiet. No CB or
+        // model work precedes physical workspace admission.
+        const workspace_tokens = if (execution_options.metal_execution_policy == .optimized_v2) tokens: {
+            failure.* = .{ .stage = "tokenizing" };
+            observer.emit(.{ .phase = .tokenizing });
+            const count = try boundary_executor.workspaceGeometry(scratch, &config, loaded.getTokenizer(), &request, execution_options);
+            // Later cancellation or admission failure belongs to the model
+            // queue, rather than the last item visited by the quiet planner.
+            failure.* = .{ .stage = "model" };
+            observer.emit(.{ .phase = .model });
+            break :tokens count;
+        } else 0;
+        const execution_mutex = loaded.targetInferenceExecutionMutex();
+        const effective = control orelse InferenceExecutionControl{};
+        while (true) {
+            try effective.check();
+            var workspace_plan: ?session_factory.GlinerBoundaryWorkspacePlan = null;
+            if (workspace_tokens != 0) {
+                // Snapshot only. Admission can evict other models and must not
+                // run while an execution/provider lock is held.
+                if (execution_mutex) |mutex| try effective.lock(mutex);
+                defer if (execution_mutex) |mutex| mutex.unlock();
+                workspace_plan = try session_factory.planGlinerBoundaryWorkspace(loaded.session, 1, workspace_tokens);
+            }
+            var request_options = execution_options;
+            var workspace_permit: ?runtime.tier.memory.AdmissionLease = null;
+            defer if (workspace_permit) |*owned| owned.release();
+            var device_lease: ?runtime.tier.memory.AdmissionLease = null;
+            defer if (device_lease) |*owned| owned.release();
+            if (backend == .metal) {
+                const device_limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
+                const full_device_bytes = try boundary_executor.deviceScratchUpperBound(execution_options);
+                if (workspace_plan) |plan| {
+                    request_options.device.max_encoder_device_bytes = try plan.requestEncoderLimit(execution_options.device.max_encoder_device_bytes);
+                    request_options.profile_encoder_device_limit = execution_options.device.max_encoder_device_bytes;
+                }
+                const request_device_bytes = try boundary_executor.deviceScratchUpperBound(request_options);
+                // The per-run ceiling includes the whole borrowed workspace.
+                // The controller owns that buffer through a separate persistent
+                // lease, so only the remaining capacity is requested here.
+                budget.* = runtime.tier.memory.RunBudget.init(device_limits);
+                try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = working_bytes, .scratch_tier = .host });
+                try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = full_device_bytes, .scratch_tier = .backend });
+                if (workspace_plan) |plan| if (plan.replacement_amounts) |amounts| {
+                    workspace_permit = try self.model_manager.acquireRunResourceAmounts(.gpu, device_limits, amounts);
+                };
+                device_lease = try self.model_manager.acquireRunResourceAmounts(.gpu, device_limits, .{ .backend_scratch_bytes = request_device_bytes });
+            }
+            // Keep the existing model lock through CB and workspace-view
+            // cleanup. Every retry first unlocks and releases both permits.
+            if (execution_mutex) |mutex| try effective.lock(mutex);
+            defer if (execution_mutex) |mutex| mutex.unlock();
+            var managed = if (workspace_plan) |plan|
+                session_factory.getManagedGlinerBoundaryComputeBackend(loaded.session, scratch, budget, control, plan, if (workspace_permit) |*permit| permit else null) catch |err| {
+                    if (err == error.GlinerBoundaryWorkspacePlanChanged) continue;
+                    return err;
+                }
+            else
+                try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, control);
+            defer managed.deinit();
+            const json = if (test_qualification)
+                try boundary_executor.execute(&managed.backend, scratch, &config, loaded.getTokenizer(), &request, request_options)
+            else
+                try boundary_executor.executeQualified(&managed.backend, scratch, &config, loaded.getTokenizer(), &request, request_options);
+            errdefer scratch.free(json);
+            try effective.check();
+            return json;
+        }
+    }
 
     fn extractWithAdmission(
         self: *Node,
@@ -8005,7 +8268,15 @@ pub const Node = struct {
         admission_owner: ExtractionAdmissionOwner,
         supplied_control: ?InferenceExecutionControl,
     ) !extracting_api.Response {
+        const schema_version = request.schema_version orelse 1;
+        if (schema_version == 2) {
+            var failure = extraction_v2.FailureContext{};
+            return self.extractV2WithAdmission(allocator, .{ .typed = .{ .model_name = model_name, .request = request } }, admission_owner, supplied_control, &failure, request.max_response_bytes);
+        }
+        if (supplied_control) |active| try active.check();
+        if (schema_version != 1) return error.UnsupportedExtractionSchemaVersion;
         try validateDirectExtractionRequest(request);
+        try validateLegacyDirectExtractionExtensions(self, request);
         const execution_control = if (supplied_control) |control|
             self.bindExecutionControl(null, control)
         else
@@ -16086,7 +16357,7 @@ pub const Node = struct {
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
-        var parsed = if (uses_attachment_envelope) blk: {
+        const request_json = if (uses_attachment_envelope) blk: {
             attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
                 .max_metadata_bytes = ctx.max_request_body_size,
                 .max_attachment_bytes = requestMediaMaxBytes(self),
@@ -16095,13 +16366,37 @@ pub const Node = struct {
                 .@"error" = attachmentEnvelopeErrorCode(err),
                 .message = attachmentEnvelopeErrorMessage(err),
             });
-            break :blk std.json.parseFromSlice(extraction_api.ExtractionRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
-                return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
-                    .message = "attachment envelope metadata must be a valid extraction request",
-                });
-        } else (try ctx.parseJson(extraction_api.ExtractionRequest)) orelse
+            break :blk attachment_envelope.?.metadata;
+        } else (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        const version = extractionSchemaVersion(self, request_json, ctx.max_request_body_size) catch |err| {
+            self.metrics.extraction_v2.envelopeFailure(err);
+            self.metrics.incError();
+            return extractionV2FailureResponse(ctx, err, .{});
+        };
+        if (version == 2) {
+            if (attachment_envelope) |envelope| if (envelope.attachments.len != 0) {
+                self.metrics.incRequest("extract");
+                defer self.metrics.decActive();
+                self.metrics.incError();
+                var trace = self.metrics.extraction_v2.begin(.http);
+                trace.observer().emit(.{ .phase = .parsing });
+                trace.finish(error.UnsupportedExtractionInput);
+                return extractionV2FailureResponse(ctx, error.UnsupportedExtractionInput, .{});
+            };
+            var failure = extraction_v2.FailureContext{};
+            var response = self.extractV2WithAdmission(ctx.allocator, .{ .json = request_json }, .http_route, execution_control, &failure, null) catch |err|
+                return extractionV2FailureResponse(ctx, err, failure);
+            defer response.deinit();
+            try ctx.setHeader("content-type", "application/json");
+            _ = ctx.response.body(response.json);
+            return ctx.response.build();
+        }
+        // Keep legacy DTO semantics after dispatch, including its existing
+        // attachment-envelope strictness and HTTP unknown-field policy.
+        var parsed = std.json.parseFromSlice(extraction_api.ExtractionRequest, ctx.allocator, request_json, .{
+            .ignore_unknown_fields = !uses_attachment_envelope,
+        }) catch return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "body must be a valid extraction request" });
         defer parsed.deinit();
         const body = parsed.value;
         if (body.model.len == 0) {
@@ -16472,27 +16767,10 @@ pub const Node = struct {
             "embedders",  "rerankers", "chunkers", "generators",
             "extractors", "rewriters", "readers",  "transcribers",
         };
-        // Keep every snapshotted model alive while filesystem canonicalization
-        // and manifest rendering run without the manager lock.
-        var loaded_model_snapshot = std.ArrayListUnmanaged(model_manager_mod.ModelHandle).empty;
-        defer {
-            for (loaded_model_snapshot.items) |*handle| handle.release();
-            loaded_model_snapshot.deinit(a);
-        }
-        self.model_manager.lockLoadedModels();
-        loaded_model_snapshot.ensureTotalCapacity(a, self.model_manager.loaded.count()) catch |err| {
-            self.model_manager.unlockLoadedModels();
-            return err;
-        };
-        var loaded_it = self.model_manager.loaded.valueIterator();
-        while (loaded_it.next()) |model| {
-            model.*.active_handles += 1;
-            loaded_model_snapshot.appendAssumeCapacity(.{
-                .manager = &self.model_manager,
-                .model = model.*,
-            });
-        }
-        self.model_manager.unlockLoadedModels();
+        // Keep models alive through unlocked listing work without counting
+        // observation as inference use or extending their idle residency.
+        var loaded_model_snapshot = try self.model_manager.acquireLoadedModelSnapshot(a);
+        defer loaded_model_snapshot.deinit();
 
         const LoadedListing = struct {
             model: *model_manager_mod.LoadedModel,
@@ -16535,7 +16813,7 @@ pub const Node = struct {
         defer if (canonical_models_dir) |path| a.free(path);
 
         if (canonical_models_dir) |models_root| {
-            for (loaded_model_snapshot.items) |*model_handle| {
+            for (loaded_model_snapshot.handles) |*model_handle| {
                 const model = model_handle.get();
                 if (discoveredContainsModelDir(discovered, model.model_dir)) continue;
 
@@ -17310,6 +17588,16 @@ fn validateDirectExtractionRequest(request: extracting_api.Request) !void {
     }
 }
 
+fn validateLegacyDirectExtractionExtensions(node: *Node, request: extracting_api.Request) !void {
+    for (request.inputs) |input| if (input.schema_json != null or input.options_json != null)
+        return error.AdvancedExtractionSchemaRequiresVersion2;
+    // Validate shared extensions through the same raw contract as HTTP without
+    // duplicating potentially large input documents or borrowed attachments.
+    var memory = try ExtractionPreflightMemory.init(node);
+    defer memory.deinit();
+    try memory.validateLegacy(request);
+}
+
 fn validateExtractionCardinality(input_count: usize) !void {
     if (input_count == 0) return error.UnsupportedInput;
     if (input_count > max_serial_family_batch_items) return error.InferenceBatchTooLarge;
@@ -17598,6 +17886,109 @@ fn freeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) voi
     allocator.free(values);
 }
 
+/// Record terminal allocation failures only. A resize/remap denial may recover
+/// with a different capacity and must not misclassify a later backing OOM.
+/// Attach only after both this record and the allocator have stable addresses;
+/// neither may outlive the synchronous request or its joined allocation workers.
+const ExtractionAllocationFailure = struct {
+    const Kind = enum(u8) { none, declared_limit, backing_allocator };
+    last: std.atomic.Value(Kind) = .init(.none),
+
+    fn allocator(self: *ExtractionAllocationFailure, bounded: *BoundedRequestAllocator) std.mem.Allocator {
+        bounded.failure_context = self;
+        bounded.allocation_failed = failed;
+        return bounded.allocator();
+    }
+
+    fn failed(raw: ?*anyopaque, failure: BoundedRequestAllocator.AllocationFailure) void {
+        const self: *ExtractionAllocationFailure = @ptrCast(@alignCast(raw.?));
+        self.last.store(switch (failure.kind) {
+            .declared_limit => .declared_limit,
+            .backing_allocator => .backing_allocator,
+        }, .release);
+    }
+
+    fn clear(self: *ExtractionAllocationFailure) void {
+        self.last.store(.none, .release);
+    }
+
+    fn translate(self: *const ExtractionAllocationFailure, err: anyerror) anyerror {
+        return if (err == error.OutOfMemory and self.last.load(.acquire) == .declared_limit) error.MemoryBudgetExceeded else err;
+    }
+};
+
+/// The version probe precedes model-specific admission, but its JSON tree must
+/// still belong to the shared memory domain. The owner is reclaimed before a
+/// V2 request acquires its larger execution reservation.
+const ExtractionPreflightMemory = struct {
+    lease: runtime.tier.memory.AdmissionLease,
+    bounded: BoundedRequestAllocator,
+    allocation_failure: ExtractionAllocationFailure = .{},
+
+    fn init(node: *Node) !ExtractionPreflightMemory {
+        const limits = node.config.generation_budget_overrides.apply(node.defaultGenerationLimits(.cpu));
+        var bytes: usize = 128 * 1024 * 1024;
+        if (limits.host_limit_bytes != 0) bytes = @min(bytes, limits.host_limit_bytes);
+        if (limits.scratch_limit_bytes != 0) bytes = @min(bytes, limits.scratch_limit_bytes);
+        const lease = try node.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = bytes });
+        return .{ .lease = lease, .bounded = .{ .backing = std.heap.smp_allocator, .limit = bytes } };
+    }
+
+    fn deinit(self: *ExtractionPreflightMemory) void {
+        std.debug.assert(self.bounded.live == 0);
+        self.lease.release();
+    }
+
+    fn translate(self: *const ExtractionPreflightMemory, err: anyerror) anyerror {
+        return self.allocation_failure.translate(err);
+    }
+
+    fn version(self: *ExtractionPreflightMemory, bytes: []const u8, max_request_bytes: usize) !u32 {
+        self.allocation_failure.clear();
+        return extraction_v2.versionJson(self.allocation_failure.allocator(&self.bounded), bytes, .{ .max_request_bytes = max_request_bytes }) catch |err|
+            return self.translate(err);
+    }
+
+    fn validateLegacy(self: *ExtractionPreflightMemory, request: extracting_api.Request) !void {
+        // Serialization is already inside this admitted owner. Install terminal
+        // failure attribution before its first allocation, as for JSON parsing.
+        self.allocation_failure.clear();
+        const heap = self.allocation_failure.allocator(&self.bounded);
+        const bytes = extracting_api.requestJsonAllocBounded(heap, .{ .provider = .antfly, .model = "legacy-preflight" }, .{
+            .inputs = &.{},
+            .schema_json = request.schema_json,
+            .options_json = request.options_json,
+        }, 16 * 1024 * 1024) catch |err| return self.translate(err);
+        defer heap.free(bytes);
+        _ = try self.version(bytes, 16 * 1024 * 1024);
+    }
+};
+
+fn extractionSchemaVersion(node: *Node, bytes: []const u8, max_request_bytes: usize) !u32 {
+    var memory = try ExtractionPreflightMemory.init(node);
+    defer memory.deinit();
+    return memory.version(bytes, max_request_bytes);
+}
+
+fn extractionV2FailureResponse(ctx: *httpx.Context, err: anyerror, failure: extraction_v2.FailureContext) !httpx.Response {
+    if (err == error.MemoryBudgetExceeded) return ctx.status(507).json(.{
+        .@"error" = "MEMORY_BUDGET_EXCEEDED",
+        .message = memory_budget_exceeded_message,
+        .retryable = false,
+        .schema_version = @as(u32, 2),
+        .input_index = failure.input_index,
+        .stage = failure.stage,
+    });
+    if (extraction_v2.errorDetails(err)) |details| return ctx.status(details.status).json(.{
+        .@"error" = details.code,
+        .message = details.message,
+        .schema_version = @as(u32, 2),
+        .input_index = failure.input_index,
+        .stage = failure.stage,
+    });
+    return extractionDirectFailureResponse(ctx, err);
+}
+
 fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     if (isInferenceExecutorContractError(err))
         return inferenceExecutorContractFailureResponse(ctx, err);
@@ -17636,6 +18027,383 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" }),
         else => inferenceFailureResponse(ctx, err),
     };
+}
+
+test {
+    _ = @import("gliner_boundary_service_test.zig");
+    _ = @import("gliner_boundary_socket_test.zig");
+    _ = @import("gliner_boundary_concurrency_test.zig");
+    _ = @import("gliner_boundary_metal_socket_test.zig");
+    _ = @import("gliner_boundary_queued_cancellation_test.zig");
+}
+
+test "gliner boundary v2 allocation attribution distinguishes recovery and model backing OOM" {
+    const a = std.testing.allocator;
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var bounded = BoundedRequestAllocator{ .backing = backing.allocator(), .limit = 64 };
+    var failure = ExtractionAllocationFailure{};
+    const scratch = failure.allocator(&bounded);
+    const held = try scratch.alloc(u8, 32);
+    defer scratch.free(held);
+    // Sticky statistics remember the unsuccessful resize even though the
+    // caller subsequently recovers with a smaller, successful allocation.
+    try std.testing.expect(!scratch.resize(held, 65));
+    try std.testing.expect(bounded.denied);
+    const recovered = try scratch.alloc(u8, 16);
+    scratch.free(recovered);
+    backing.fail_index = backing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, scratch.alloc(u8, 8));
+    const genuine_oom = failure.translate(error.OutOfMemory);
+    try std.testing.expectEqual(error.OutOfMemory, genuine_oom);
+    {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try extractionV2FailureResponse(&ctx, genuine_oom, .{ .stage = "model" });
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 500), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "OutOfMemory") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MEMORY_BUDGET_EXCEEDED") == null);
+    }
+    try std.testing.expectError(error.OutOfMemory, scratch.alloc(u8, 65));
+    try std.testing.expectEqual(error.MemoryBudgetExceeded, failure.translate(error.OutOfMemory));
+    // Independent managed/caller allocators begin with no stale attribution.
+    failure.clear();
+    try std.testing.expectEqual(error.OutOfMemory, failure.translate(error.OutOfMemory));
+    try std.testing.expectEqual(error.Cancelled, failure.translate(error.Cancelled));
+}
+
+test "gliner boundary v2 HTTP dispatch rejects advanced legacy fields and recovers admission" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{
+        .max_concurrent_requests = 1,
+        .generation_budget_overrides = .{ .scratch_limit_bytes = 16 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    const cases = [_]struct { json: []const u8, code: []const u8 }{
+        .{
+            .json = "{\"schema_version\":2,\"model\":\"demo\",\"schema\":{\"entities\":[\"person\"],\"entity_definitions\":{\"person\":{\"validators\":[{\"pattern\":\"(?=a)\"}]}}},\"inputs\":[{\"content\":\"John\"}]}",
+            .code = "UNSUPPORTED_EXTRACTION_FEATURE",
+        },
+        .{
+            .json = "{\"model\":\"demo\",\"schema\":{\"entities\":[\"person\"]},\"inputs\":[{\"content\":\"John\",\"schema\":{\"entities\":[\"person\"]}}]}",
+            .code = "UNSUPPORTED_EXTRACTION_FEATURE",
+        },
+        .{
+            .json = "{\"schema_version\":2,\"model\":\"demo\",\"schema\":{\"entities\":[\"person\"]},\"inputs\":[{\"content\":\"John\",\"options\":{\"long_document\":{\"mode\":\"window\",\"window_words\":1,\"overlap_words\":1}}}]}",
+            .code = "INVALID_EXTRACTION_REQUEST",
+        },
+        .{
+            .json = "{\"schema_version\":2,\"model\":\"demo\",\"schema\":{\"entities\":[\"person\"]},\"inputs\":[{\"content\":\"John\",\"options\":{\"unknown\":true}}]}",
+            .code = "INVALID_EXTRACTION_REQUEST",
+        },
+    };
+    for (cases) |case| {
+        resetRequestWorkTestCounters();
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        request.body = case.json;
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.extractJSON(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, case.code) != null);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
+    try std.testing.expectEqual(@as(u64, 3), node.metrics.extraction_v2.requests.get(.http));
+    try std.testing.expectEqual(@as(u64, 1), node.metrics.extraction_v2.envelope_failures.get(.unsupported));
+    try std.testing.expectEqual(@as(u64, 1), node.metrics.extraction_v2.outcomes.get(.unsupported));
+    try std.testing.expectEqual(@as(u64, 2), node.metrics.extraction_v2.outcomes.get(.invalid));
+    try std.testing.expectEqual(@as(i64, 0), node.metrics.extraction_v2.active.impl.value);
+}
+
+test "gliner boundary v2 direct cancellation and HTTP capacity use existing admission" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+    const json = "{\"schema_version\":2,\"model\":\"demo\",\"schema\":{\"entities\":[\"person\"]},\"inputs\":[{\"content\":\"John\"}]}";
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    const direct = extracting_api.Request{
+        .schema_version = 2,
+        .inputs = &.{.{ .content_json = "\"John\"" }},
+        .schema_json = "{\"entities\":[\"person\"]}",
+    };
+    try std.testing.expectError(error.Cancelled, node.extractDirectWithControl(allocator, "demo", direct, .{ .check_fn = Cancel.check }));
+    try std.testing.expectError(error.Cancelled, node.extractV2DirectJsonWithControl(allocator, json, .{ .check_fn = Cancel.check }));
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try node.inference_admission.reserveUnits(1);
+    defer node.inference_admission.releaseReservedUnits(1);
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body = json;
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    try std.testing.expectEqual(@as(u64, 2), node.metrics.extraction_v2.requests.get(.direct));
+    try std.testing.expectEqual(@as(u64, 1), node.metrics.extraction_v2.requests.get(.http));
+    try std.testing.expectEqual(@as(u64, 2), node.metrics.extraction_v2.outcomes.get(.cancelled));
+    try std.testing.expectEqual(@as(u64, 1), node.metrics.extraction_v2.outcomes.get(.admission));
+    try std.testing.expectEqual(@as(u64, 3), node.metrics.extract_requests.impl.count);
+    try std.testing.expectEqual(@as(u64, 3), node.metrics.errors_total.impl.count);
+    try std.testing.expectEqual(@as(i64, 0), node.metrics.requests_active.impl.value);
+    try std.testing.expectEqual(@as(i64, 0), node.metrics.extraction_v2.active.impl.value);
+}
+
+test "gliner boundary v2 direct control binds cold and cached Metal process guards" {
+    const Fake = struct {
+        fn backend(_: *anyopaque) backends_mod.BackendType {
+            return .metal;
+        }
+    };
+    var marker: u8 = 0;
+    var vtable: backends_mod.Session.VTable = undefined;
+    vtable.backend = Fake.backend;
+    vtable.interruption = null;
+    const session = backends_mod.Session{ .ptr = &marker, .vtable = &vtable };
+    const supplied_controls = [_]?InferenceExecutionControl{ null, .{} };
+    var embedded = try Node.init(std.testing.allocator, .{});
+    defer embedded.deinit();
+    for (supplied_controls) |supplied| {
+        const control = embedded.extractionExecutionControl(supplied);
+        // Cold construction and cached compute use these same boundaries.
+        try std.testing.expectError(error.ProcessIsolationRequired, control.enterUninterruptible(.process_required));
+        try std.testing.expectError(error.ProcessIsolationRequired, session_factory.getManagedComputeBackend(session, std.testing.allocator, null, control));
+    }
+    var supervised = try Node.init(std.testing.allocator, .{ .process_termination_available = true });
+    defer supervised.deinit();
+    try supervised.attachIo(std.testing.io);
+    for (supplied_controls) |supplied| {
+        const control = supervised.extractionExecutionControl(supplied);
+        try std.testing.expect(control.io != null);
+        try std.testing.expect(control.hard_cancellation != null);
+        var cold_guard = try control.enterUninterruptible(.process_required);
+        cold_guard.deinit();
+        // The deliberately non-architecture session reaches construction only
+        // after arming; constructor failure must release that watchdog lease.
+        try std.testing.expectError(error.NotArchSession, session_factory.getManagedComputeBackend(session, std.testing.allocator, null, control));
+    }
+    const expired = supervised.extractionExecutionControl(.{ .deadline_ns = 0 });
+    try std.testing.expect(expired.hard_cancellation != null);
+    try std.testing.expectError(error.Timeout, session_factory.getManagedComputeBackend(session, std.testing.allocator, null, expired));
+}
+
+test "gliner boundary v2 version probe shares memory admission and recovers declared limits" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .generation_budget_overrides = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 } });
+    defer node.deinit();
+    const small = "{\"schema_version\":2}";
+    const shallow = "{\"schema_version\":2,\"unused\":[" ++ ("0," ** 256) ++ "0]}";
+    {
+        var memory = try ExtractionPreflightMemory.init(&node);
+        defer memory.deinit();
+        try std.testing.expectEqual(@as(usize, 4096), memory.bounded.limit);
+        try std.testing.expectEqual(@as(usize, 4096), node.model_manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, extractionSchemaVersion(&node, small, 4096));
+        try std.testing.expectError(error.MemoryBudgetExceeded, memory.version(shallow, 4096));
+        try std.testing.expect(memory.bounded.denied);
+        try std.testing.expectEqual(@as(usize, 0), memory.bounded.live);
+        try std.testing.expectEqual(@as(u32, 2), try memory.version(small, 4096));
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(u32, 2), try extractionSchemaVersion(&node, small, 4096));
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+
+    resetRequestWorkTestCounters();
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body = shallow;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 507), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MEMORY_BUDGET_EXCEEDED") != null);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+}
+
+test "gliner boundary v2 declared budget failures preserve input provenance and real OOM" {
+    const a = std.testing.allocator;
+    for ([_]anyerror{ error.MemoryBudgetExceeded, error.OutOfMemory }) |err| {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try extractionV2FailureResponse(&ctx, err, .{ .input_index = 3, .stage = "windowing" });
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        const fields = parsed.value.object;
+        if (err == error.MemoryBudgetExceeded) {
+            try std.testing.expectEqual(@as(u16, 507), response.status.code);
+            try std.testing.expectEqualStrings("MEMORY_BUDGET_EXCEEDED", fields.get("error").?.string);
+            try std.testing.expectEqual(@as(i64, 2), fields.get("schema_version").?.integer);
+            try std.testing.expectEqual(@as(i64, 3), fields.get("input_index").?.integer);
+            try std.testing.expectEqualStrings("windowing", fields.get("stage").?.string);
+            try std.testing.expect(!fields.get("retryable").?.bool);
+        } else {
+            try std.testing.expectEqual(@as(u16, 500), response.status.code);
+            try std.testing.expectEqualStrings("INFERENCE_FAILED", fields.get("error").?.string);
+        }
+    }
+}
+
+test "gliner boundary direct legacy extension guard matches HTTP before model work" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    try std.testing.expectError(error.AdvancedExtractionSchemaRequiresVersion2, validateLegacyDirectExtractionExtensions(&node, .{
+        .inputs = &.{.{ .content_json = "\"John\"", .schema_json = "{}" }},
+        .schema_json = "{\"entities\":[\"person\"]}",
+    }));
+    try std.testing.expectError(error.AdvancedExtractionSchemaRequiresVersion2, validateLegacyDirectExtractionExtensions(&node, .{
+        .inputs = &.{.{ .content_json = "\"John\"" }},
+        .schema_json = "{\"entities\":[\"person\"],\"joint_ie\":{}}",
+    }));
+    try validateLegacyDirectExtractionExtensions(&node, .{
+        .inputs = &.{.{ .content_json = "\"John\"" }},
+        .schema_json = "{\"entities\":[\"person\"]}",
+        .options_json = "{\"threshold\":0.5}",
+    });
+}
+
+test "gliner boundary legacy direct preflight attributes serialization denial and backing OOM" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{
+        .generation_budget_overrides = .{ .host_limit_bytes = 8192, .scratch_limit_bytes = 8192 },
+    });
+    defer node.deinit();
+    const small = extracting_api.Request{
+        .inputs = &.{.{ .content_json = "\"Ada\"" }},
+        .schema_json = "{\"entities\":[\"person\"]}",
+    };
+    var oversized = small;
+    // Valid JSON, within the 16 MiB serialization ceiling, but larger than the
+    // explicitly configured owner before the version parser can be entered.
+    oversized.schema_json = "{\"entities\":[\"person\"]}" ++ (" " ** 16384);
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(error.MemoryBudgetExceeded, node.extractDirect(a, "unused", oversized));
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+
+    {
+        // Exercise the same production preflight operation with a failing
+        // backing heap. A previous declared denial must not poison its error.
+        var backing = std.testing.FailingAllocator.init(a, .{});
+        var memory = try ExtractionPreflightMemory.init(&node);
+        defer memory.deinit();
+        memory.bounded.backing = backing.allocator();
+        try std.testing.expectError(error.MemoryBudgetExceeded, memory.validateLegacy(oversized));
+        try std.testing.expect(memory.bounded.denied);
+        try std.testing.expectEqual(@as(usize, 0), memory.bounded.live);
+        backing.fail_index = backing.alloc_index;
+        try std.testing.expectError(error.OutOfMemory, memory.validateLegacy(small));
+        try std.testing.expectEqual(ExtractionAllocationFailure.Kind.backing_allocator, memory.allocation_failure.last.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), memory.bounded.live);
+        try std.testing.expectEqual(@as(usize, 8192), node.model_manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+        backing.fail_index = std.math.maxInt(usize);
+        try memory.validateLegacy(small);
+        try std.testing.expectEqual(@as(usize, 0), memory.bounded.live);
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+    try validateLegacyDirectExtractionExtensions(&node, small);
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+}
+
+test "gliner boundary v2 enum work exhaustion returns atomic 413 and retries" {
+    const a = std.testing.allocator;
+    var fixture = try @import("gliner_boundary_enum_work_test.zig").Fixture.init(a);
+    defer fixture.deinit();
+    const baseline = try fixture.run(a, 12, null);
+    defer a.free(baseline);
+    try std.testing.expectEqual(@as(usize, 2), fixture.record_calls);
+    fixture.reset();
+    var bounded = BoundedRequestAllocator{ .backing = a, .limit = 1024 * 1024 };
+    const scratch = bounded.allocator();
+    const failed: anyerror = failure: {
+        const unexpected = fixture.run(scratch, 8, null) catch |err| break :failure err;
+        scratch.free(unexpected);
+        return error.ExpectedEnumWorkExhaustion;
+    };
+    try std.testing.expectEqual(error.ExtractionLiteralLimitExceeded, failed);
+    // Row zero completed, and row one reached enum filtering. Only the complete
+    // batch is publishable: failure has released the first row and wire prefix.
+    try std.testing.expectEqual(@as(usize, 1), fixture.record_calls);
+    try std.testing.expectEqual(@as(usize, 2), fixture.explicit_calls);
+    try std.testing.expectEqual(@as(?usize, 1), fixture.last_sample);
+    try std.testing.expectEqual(@as(usize, 0), bounded.live);
+    try std.testing.expect(!bounded.denied);
+    try std.testing.expectEqual(metrics_mod.extraction.Outcome.resource_limit, metrics_mod.extraction.outcome(failed, .execution));
+    {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try extractionV2FailureResponse(&ctx, failed, .{ .input_index = fixture.last_sample, .stage = "execution" });
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        const fields = parsed.value.object;
+        try std.testing.expectEqual(@as(u16, 413), response.status.code);
+        try std.testing.expectEqualStrings("EXTRACTION_LIMIT_EXCEEDED", fields.get("error").?.string);
+        try std.testing.expectEqual(@as(i64, 2), fields.get("schema_version").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), fields.get("input_index").?.integer);
+        try std.testing.expectEqualStrings("execution", fields.get("stage").?.string);
+        try std.testing.expect(!fields.contains("data"));
+    }
+    fixture.reset();
+    {
+        const retried = try fixture.run(scratch, 12, null);
+        defer scratch.free(retried);
+        try std.testing.expectEqualStrings(baseline, retried);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, retried, .{});
+        defer parsed.deinit();
+        const rows = parsed.value.object.get("data").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        for (rows) |row| {
+            const records = row.object.get("structures").?.object.get("event").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), records.len);
+            const field = records[0].object.get("kind").?.object;
+            try std.testing.expectEqualStrings("good", field.get("value").?.string);
+            try std.testing.expectEqualStrings("schema", field.get("source").?.string);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.record_calls);
+    try std.testing.expectEqual(@as(usize, 0), bounded.live);
+    fixture.reset();
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, fixture.run(scratch, 12, .{ .check_fn = Cancel.check }));
+    try std.testing.expectEqual(@as(usize, 0), fixture.explicit_calls);
+    try std.testing.expectEqual(@as(usize, 0), bounded.live);
+}
+
+test "gliner boundary v2 enum work retry releases every failed allocation" {
+    const Fixture = @import("gliner_boundary_enum_work_test.zig").Fixture;
+    var fixture = try Fixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    const Check = struct {
+        fn run(a: std.mem.Allocator, state: *Fixture) !void {
+            const bytes = try state.run(a, 12, null);
+            defer a.free(bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&fixture});
 }
 
 fn rebelSchemaFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
@@ -18504,6 +19272,10 @@ fn taskMatchesModelListing(
     capabilities: []const []const u8,
     zero_shot_classification: bool,
 ) bool {
+    // A listing, including an already loaded model rendered through this
+    // string-only path, has no exact prepared request qualification. Explicit
+    // tasks/capabilities cannot turn boundary metadata into a serving grant.
+    if (std.mem.eql(u8, gliner_model_type, "gliner2.5")) return false;
     // Classification is a public extraction capability. Keep `classifier` as
     // an internal pipeline kind without publishing a parallel API/catalog task.
     if (std.mem.eql(u8, task, "classifiers")) return false;
@@ -29705,4 +30477,14 @@ fn appendBase64Json(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 fn graphModeEnabled() bool {
     if (comptime @import("builtin").os.tag == .freestanding) return false;
     return platform.env.getenvBool("TERMITE_GRAPH_MODE");
+}
+
+test "boundary qualification model listings reject raw explicit tasks and capabilities" {
+    for ([_][]const u8{ "extractors", "generators", "readers" }) |task| {
+        for ([_][]const u8{ "recognizer", "extractor", "generator" }) |kind| {
+            try std.testing.expect(!taskMatchesModelListing(task, kind, "gliner2.5", &.{ "extract", "generate", "read" }, &.{ "extraction", "classification", "relations" }, true));
+        }
+    }
+    try std.testing.expect(!taskMatchesModelListing("extractors", "extractor", "gliner2.5", &.{}, &.{}, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{"extract"}, &.{"labels"}, true));
 }

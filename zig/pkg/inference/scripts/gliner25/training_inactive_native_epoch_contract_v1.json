@@ -1,0 +1,201 @@
+{
+  "accumulation_steps": 2,
+  "alpha": 3,
+  "baseline": {
+    "capture.json": {
+      "sha256": "3d0541e2c3d2b99f2032db2825c30f0f1be5bbbc0e5dd18bf6caceb59ec6361e",
+      "size_bytes": 791932
+    },
+    "tensors.safetensors": {
+      "sha256": "4236272817561a1828076446c3069053a730f5b21e7642c3ef87138ed1131abe",
+      "size_bytes": 1228022
+    },
+    "tokenizer.json": {
+      "sha256": "ee7f0d2f277c34191fe76227371cc95d7b55e0f7a10f1a153eec36b5d5865cc8",
+      "size_bytes": 6561
+    },
+    "tokenizer_config.json": {
+      "sha256": "2ea7f1b38011a9f3f7b4c895bd876160e8672cfe62f26d8303fa875e3eaa5f80",
+      "size_bytes": 588
+    }
+  },
+  "dropout": 0.0,
+  "fallback_policy": "exact_pinned_trainer_total_loss_missing_or_not_requires_grad_then_model_zero_loss",
+  "fresh_owner_resume": "in_memory_owned_snapshot_of_weights_accumulated_gradients_moments_scheduler_counters_rng",
+  "gradient_presence": "None_is_absent_zero_is_present_and_eligible_for_adamw",
+  "max_metadata_bytes": 4194304,
+  "max_rss_bytes": 2147483648,
+  "max_seconds": 120,
+  "max_tensor_bytes": 8388608,
+  "model_source": "immutable_synthetic_training_step_full_initial_weights",
+  "modes": [
+    "lora",
+    "dora"
+  ],
+  "native_epoch": {
+    "batch_size": 1,
+    "classifier_window_sizes": [
+      2,
+      2,
+      1
+    ],
+    "control_contract": {
+      "sha256": "d88ece37ce0873baf481d957a4e30c53b5fb35e5780ea542dc360931d5e810cd",
+      "size_bytes": 4680
+    },
+    "control_generator": {
+      "sha256": "8f63e2ccb46fcf2ee00033ea3577c02615d59c07b233da7ed9303de0fea45380",
+      "size_bytes": 25119
+    },
+    "dataset_format": "gliner_boundary_dataset.Row/version1",
+    "epochs": 1,
+    "only_numerical_profile_change": "classifier_only.flush_after=[2,4,5]",
+    "row_identity": "profile_name + '-' + zero_based_sequence_index",
+    "shuffle": false,
+    "source_resume": "fresh_owner_after_first_microbatch_with_no_post_update_weight_injection",
+    "version": 1
+  },
+  "oracle": {
+    "sha256": "61bbf4544a21111dbfbd643ed2392b1d9723498493b3fa6832154d6e1dc42752",
+    "size_bytes": 28555
+  },
+  "precision": "float32",
+  "profiles": {
+    "classifier_only": {
+      "flush_after": [
+        2,
+        4,
+        5
+      ],
+      "resume_after": 1,
+      "sequence": [
+        "active_good",
+        "inactive",
+        "active_bad",
+        "inactive",
+        "inactive"
+      ],
+      "targets": [
+        "classification_head"
+      ]
+    },
+    "encoder_classifier": {
+      "flush_after": [
+        2
+      ],
+      "resume_after": null,
+      "sequence": [
+        "active_good",
+        "inactive"
+      ],
+      "targets": [
+        "encoder",
+        "classification_head"
+      ]
+    },
+    "record_only": {
+      "flush_after": [
+        1
+      ],
+      "resume_after": null,
+      "sequence": [
+        "inactive"
+      ],
+      "targets": [
+        "record_head"
+      ]
+    },
+    "relation_only": {
+      "flush_after": [
+        1
+      ],
+      "resume_after": null,
+      "sequence": [
+        "inactive"
+      ],
+      "targets": [
+        "relation_head"
+      ]
+    }
+  },
+  "published_checkpoint_loaded": false,
+  "qualification": false,
+  "qualification_scope": "source_control_and_optimizer_capture_only_native_and_durable_resume_consumers_separate",
+  "rank": 2,
+  "scope": "gliner25_inactive_adapter_native_epoch/v1",
+  "source_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+  "source_files": {
+    "gliner2/models/boundary/model.py": {
+      "sha256": "b6c838a93096d958a7411df4d0a199c6aba25f80588430bbeb3a74db944165b3",
+      "size_bytes": 88893
+    },
+    "gliner2/training/lora.py": {
+      "sha256": "0374d35c66c7fedd2c39f80ad22246d3d053ee300b11806385fb1584af423e4c",
+      "size_bytes": 13727
+    },
+    "gliner2/training/lora_targets.py": {
+      "sha256": "abc97069b5685fe23d8bf51da2da41d78e209eaa551c585d811e479f50cc07c4",
+      "size_bytes": 3321
+    },
+    "gliner2/training/trainer.py": {
+      "sha256": "8b720f6da4fa3d74ad2c0adda3b5ef5a71c001f01d7822ba48dfaf974dec05d3",
+      "size_bytes": 95112
+    }
+  },
+  "tensor_storage_helper": {
+    "sha256": "2ca6610037b8a357766a81c7a0002af59e6e433bfea60fb0d51cf1d5eebf831b",
+    "size_bytes": 47291
+  },
+  "trainer_methods": {
+    "_backward_one": {
+      "lines": [
+        1112,
+        1230
+      ],
+      "sha256": "f6d1bddc2440db0fb6585ccf862a3c04f21421e16dd760bcf2a44b778c47aef2"
+    },
+    "_create_optimizer": {
+      "lines": [
+        1342,
+        1384
+      ],
+      "sha256": "51d9446732dfd9897edf776cbe7ee2c12bc6594723200e2823c2a63d7f4db268"
+    },
+    "_gold_injection_probability": {
+      "lines": [
+        1093,
+        1103
+      ],
+      "sha256": "9707b0fe1e9c3a6c134b9edff055b6bcf32c78d36053a75f28846bc5abbe65d7"
+    },
+    "_install_finite_grad_hooks": {
+      "lines": [
+        763,
+        775
+      ],
+      "sha256": "d6f2e552e0f8c3c4cfba50bca4a373805f1626ead59c5911d9066768a08d56bb"
+    },
+    "_optimizer_step": {
+      "lines": [
+        1293,
+        1322
+      ],
+      "sha256": "feaa8bbbe5baf4ed6c52b1f6cf418a73a2427e4af8d88bdd855a2626b90b9a45"
+    },
+    "_renormalize_partial_accumulation": {
+      "lines": [
+        1232,
+        1240
+      ],
+      "sha256": "aaccb77d089528e2826f7500eb523950038329eb441db6fb8a9bd676a2cc2cfb"
+    },
+    "_soft_iou_anneal_scale": {
+      "lines": [
+        1106,
+        1110
+      ],
+      "sha256": "1131a6ba9db66319d0fb405d0984f872759e30df73b663ab415ab0b2f3d744ee"
+    }
+  },
+  "version": 1
+}

@@ -213,3 +213,81 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         .tests = tests,
     };
 }
+
+/// The root and standalone package share identical GLiNER2.5 worker modules.
+/// Return the trained worker module so its protocol tests use the same imports.
+pub fn addGliner25(ctx: Context) *std.Build.Module {
+    const b = ctx.b;
+    // Use the shared optimize value for the entire dependency graph. The
+    // worker refuses to compile unless that graph is ReleaseFast; forcing
+    // only this executable root would leave imported kernels unoptimized.
+    const gliner25_cpu_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-cpu-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner25_cpu.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    gliner25_cpu_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
+    gliner25_cpu_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    // The imported native runtime owns backend and BLAS linkage.
+    gliner25_cpu_bench_exe.root_module.link_libc = true;
+    const install_gliner25_cpu_bench = b.addInstallArtifact(gliner25_cpu_bench_exe, .{});
+    const gliner25_cpu_bench_step = ctx.step("bench-gliner25-cpu-build", "Build the supervised GLiNER2.5 direct-core CPU benchmark worker (requires ReleaseFast)");
+    gliner25_cpu_bench_step.dependOn(&install_gliner25_cpu_bench.step);
+
+    const gliner25_metal_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-metal-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner25_metal.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    gliner25_metal_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
+    gliner25_metal_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_metal_bench_exe.root_module.link_libc = true;
+    const install_gliner25_metal_bench = b.addInstallArtifact(gliner25_metal_bench_exe, .{});
+    ctx.step("bench-gliner25-metal-build", "Build the supervised GLiNER2.5 production-lifetime Metal comparison worker (requires ReleaseFast)").dependOn(&install_gliner25_metal_bench.step);
+
+    const gliner25_convert = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-convert",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner25_convert.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    gliner25_convert.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_convert.root_module.link_libc = true;
+    const install_gliner25_convert = b.addInstallArtifact(gliner25_convert, .{});
+    ctx.step("gliner25-convert-build", "Build the atomic GLiNER2.5 converter and bundle verifier").dependOn(&install_gliner25_convert.step);
+    const gliner25_bundle_check = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-bundle-check",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner25_bundle_check.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    gliner25_bundle_check.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_bundle_check.root_module.link_libc = true;
+    const install_gliner25_bundle_check = b.addInstallArtifact(gliner25_bundle_check, .{});
+    ctx.step("gliner25-bundle-check-build", "Build the converted GLiNER2.5 CPU diagnostic runner").dependOn(&install_gliner25_bundle_check.step);
+
+    const gliner25_trained_check_module = b.createModule(.{
+        .root_source_file = ctx.path("src/bench/gliner25_trained_check.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    gliner25_trained_check_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_trained_check_module.link_libc = true;
+    const gliner25_trained_check = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-trained-check",
+        .root_module = gliner25_trained_check_module,
+    });
+    const install_gliner25_trained_check = b.addInstallArtifact(gliner25_trained_check, .{});
+    ctx.step("gliner25-trained-check-build", "Build the bounded trained GLiNER2.5 CPU/Metal artifact execution worker").dependOn(&install_gliner25_trained_check.step);
+    return gliner25_trained_check_module;
+}

@@ -417,6 +417,13 @@ jobs:
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
+      - name: Test GLiNER2.5 artifact evaluation and training contracts
+        working-directory: zig/pkg/inference
+        run: |
+          uv run --no-project --isolated --no-python-downloads --no-build \
+            --with-requirements scripts/gliner25/requirements-contract.txt \
+            python scripts/run_model_contract_tests.py gliner25
+
       - name: Check inference kernels through the root build graph
         working-directory: zig
         run: >-
@@ -726,6 +733,13 @@ jobs:
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
+
+      - name: Test GLiNER2.5 artifact evaluation and training contracts
+        working-directory: zig/pkg/inference
+        run: |
+          uv run --no-project --isolated --no-python-downloads --no-build \
+            --with-requirements scripts/gliner25/requirements-contract.txt \
+            python scripts/run_model_contract_tests.py gliner25
 
       # Keep normal build-step parallelism while bounding aggregate compiler
       # memory to the pod's cgroup budget and the 22 GiB largest-step claim.

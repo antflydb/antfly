@@ -7397,6 +7397,19 @@ paths:
         document extraction.
 
 
+        Set `schema_version: 2` for strict mixed-task schemas, span attributes,
+
+        constrained classification, typed records and JointIE. Each input may
+
+        replace the shared schema/options. Offsets default to half-open UTF-8
+
+        bytes, and text content parts are joined by a single newline. Inputs
+
+        are validated atomically. Unsupported features and long documents are
+
+        rejected explicitly; windowing requires runtime support.
+
+
         Image-backed extraction uses the same byte-reserving and image-count-weighted
 
         admission policy as `/read`, before model resolution or download. Text-only
@@ -7435,7 +7448,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '413':
-          description: Media content exceeds the configured size limit
+          description: Media, text, schema, candidate graph, or output exceeds a configured size/work
+            limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '422':
+          description: Extraction hard constraints are infeasible, required record fields are missing,
+            or bounded search exhausted without an accepted feasible witness
           content:
             application/json:
               schema:
@@ -27226,6 +27247,14 @@ components:
           type: integer
           minimum: 0
           description: Minimum retry delay in milliseconds
+        input_index:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Input whose atomic extraction validation or decoding failed, when known
+        stage:
+          type: string
+          description: Extraction failure stage, when known
     InferenceTransientCapacityError:
       type: object
       description: Actionable retry contract for temporary inference-capacity failures.
@@ -29912,6 +29941,15 @@ components:
           type: string
       required:
         - error
+    ExtractionSchemaVersion:
+      type: integer
+      enum:
+        - 1
+        - 2
+      default: 1
+      description: Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task
+        schemas, per-input replacements and explicit offsets; the selected model/runtime must support
+        every requested feature.
     ExtractionToken:
       type: object
       required:
@@ -29925,22 +29963,12 @@ components:
           maxItems: 4
           items:
             type: integer
-    ExtractionInput:
-      type: object
-      required:
-        - content
-      properties:
-        id:
-          type: string
-        content:
-          $ref: '#/components/schemas/ChatMessageContent'
-        tokens:
-          type: array
-          items:
-            $ref: '#/components/schemas/ExtractionToken'
-        metadata:
-          type: object
-          additionalProperties: true
+    ExtractionProbability:
+      type: number
+      format: double
+      minimum: 0
+      maximum: 1
+      x-go-type-skip-optional-pointer: false
     ExtractionRelationSchema:
       type: object
       description: Optional source and target labels constrain relation endpoints. A target requires a
@@ -29957,6 +29985,49 @@ components:
         target:
           type: string
           minLength: 1
+        description:
+          type: string
+          description: Version 2 model-facing relation description.
+          x-go-type-skip-optional-pointer: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+    ExtractionLabelDefinition:
+      type: object
+      properties:
+        description:
+          type: string
+          description: Model-facing label description.
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionDecisionProbability:
+      type: number
+      format: double
+      minimum: 0
+      maximum: 1
+      exclusiveMinimum: true
+      exclusiveMaximum: true
+      x-go-type-skip-optional-pointer: false
+      description: Finite centered-logit decisions require a threshold strictly between zero and one.
+    ExtractionClassificationExample:
+      oneOf:
+        - type: object
+          required:
+            - input
+            - label
+          properties:
+            input:
+              type: string
+            label:
+              type: string
+          additionalProperties: false
+        - type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            type: string
+          description: A two-string [input,label] pair.
     ExtractionClassificationSchema:
       type: object
       required:
@@ -29971,28 +30042,123 @@ components:
             type: string
         multi_label:
           type: boolean
-          default: false
-          description: >
-            When false, return the highest-ranked labels up to `top_k` (one by
-
-            default). When true, return every label meeting `options.threshold`.
+          description: 'The server uses false when omitted. Version 1: return highest-ranked labels up
+            to top_k when false, or labels meeting options.threshold when true. Version 2: selects ordinary
+            single or multi classification unless mode is specified; classification.threshold controls
+            the decision threshold.'
         hypothesis_template:
           type: string
-          default: This example is {}.
-          description: >
-            NLI hypothesis template for this named taxonomy. Use `{}` as the
-
-            candidate-label placeholder. Non-NLI extractors ignore this field.
+          description: Version 1 NLI hypothesis template with {} as the label placeholder; the server
+            uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit
+            hypothesis_template; use prompt/instruction and label_definitions for model conditioning.
         top_k:
           type: integer
           minimum: 1
-          default: 1
-          description: >
-            Maximum labels returned for single-label classification. Ignored
-
-            when `multi_label` is true, where `options.threshold` controls the
-
-            returned set.
+          description: Maximum labels for ordinary single-label classification; the server uses 1 when
+            omitted. Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection
+            options or cross-task constraints on any classification in the collection reject every explicit
+            top_k in that collection, including 1. Omit top_k when using these options.
+        mode:
+          type: string
+          enum:
+            - single
+            - multi
+            - ordinal
+          description: Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+          x-go-type-skip-optional-pointer: false
+        label_definitions:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionLabelDefinition'
+          x-go-type-skip-optional-pointer: false
+        min_labels:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        max_labels:
+          type: integer
+          minimum: 0
+          nullable: true
+          x-go-type: stdjson.RawMessage
+          x-go-type-import:
+            path: encoding/json
+            name: stdjson
+          description: Version 2 maximum selected labels. Explicit null means no maximum; omission preserves
+            mode defaults.
+        ordered:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionDecisionProbability'
+          x-go-type-skip-optional-pointer: false
+        candidate_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        activation:
+          type: string
+          enum:
+            - auto
+            - sigmoid
+            - softmax
+          x-go-type-skip-optional-pointer: false
+        temperature:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          x-go-type-skip-optional-pointer: false
+        default:
+          type: string
+          description: Version 2 fallback label; must be declared in labels.
+          x-go-type-skip-optional-pointer: false
+        prompt:
+          type: string
+          description: Version 2 model-facing task instruction. Mutually exclusive with instruction.
+          x-go-type-skip-optional-pointer: false
+        instruction:
+          type: string
+          description: Alias of prompt.
+          x-go-type-skip-optional-pointer: false
+        examples:
+          type: array
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/ExtractionClassificationExample'
+          x-go-type-skip-optional-pointer: false
+    ExtractionRegexValidator:
+      type: object
+      required:
+        - pattern
+      properties:
+        type:
+          type: string
+          enum:
+            - regex
+          x-go-type-skip-optional-pointer: false
+        pattern:
+          type: string
+          maxLength: 4096
+        mode:
+          type: string
+          enum:
+            - full
+            - partial
+          default: full
+          x-go-type-skip-optional-pointer: false
+        exclude:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+        flags:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          default: 2
+          description: Python-compatible regex flags supported by the active bounded validator engine;
+            unsupported flags or syntax fail validation.
+      additionalProperties: false
     ExtractionStructureField:
       oneOf:
         - type: string
@@ -30011,6 +30177,44 @@ components:
               items:
                 type: string
                 minLength: 1
+            dtype:
+              type: string
+              enum:
+                - str
+                - list
+              x-go-type-skip-optional-pointer: false
+            choices:
+              type: array
+              minItems: 2
+              items:
+                type: string
+              x-go-type-skip-optional-pointer: false
+            description:
+              type: string
+              x-go-type-skip-optional-pointer: false
+            threshold:
+              allOf:
+                - $ref: '#/components/schemas/ExtractionProbability'
+              x-go-type-skip-optional-pointer: false
+            cardinality:
+              type: string
+              enum:
+                - optional_one
+                - required_one
+                - zero_or_more
+                - one_or_more
+              description: Version 2 explicit cardinality. Required fields are validated after record
+                assignment.
+              x-go-type-skip-optional-pointer: false
+            exclusive:
+              type: boolean
+              description: Version 2 field spans cannot be assigned to multiple record instances.
+              x-go-type-skip-optional-pointer: false
+            validators:
+              type: array
+              items:
+                $ref: '#/components/schemas/ExtractionRegexValidator'
+              x-go-type-skip-optional-pointer: false
           additionalProperties: true
     ExtractionStructureSchema:
       type: object
@@ -30022,15 +30226,690 @@ components:
           minProperties: 1
           additionalProperties:
             $ref: '#/components/schemas/ExtractionStructureField'
+        mode:
+          type: string
+          enum:
+            - natural
+            - latent
+            - anchorless
+          description: Version 2 record grouping. Omission preserves one-record extraction.
+          x-go-type-skip-optional-pointer: false
+        anchor:
+          type: string
+          description: Natural mode only; defaults to the first declared field.
+          x-go-type-skip-optional-pointer: false
+        occurrence_policy:
+          type: string
+          enum:
+            - all
+            - first
+            - error_on_ambiguous
+            - latent_all
+          x-go-type-skip-optional-pointer: false
       additionalProperties: true
+    ExtractionEntityDefinition:
+      type: object
+      properties:
+        description:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        dtype:
+          type: string
+          enum:
+            - str
+            - list
+          x-go-type-skip-optional-pointer: false
+        type:
+          type: string
+          enum:
+            - str
+            - string
+            - list
+            - array
+          x-go-type-skip-optional-pointer: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        validators:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionRegexValidator'
+          maxItems: 64
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionAttributeGroup:
+      type: object
+      required:
+        - labels
+      properties:
+        labels:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          minItems: 1
+        multi_label:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        applies_to:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          x-go-type-skip-optional-pointer: false
+        qualify_labels:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+      additionalProperties: false
+      description: Version 2 attributes are scored on retained entity spans using shared encoded states.
+        Omitted applies_to selects all entities; [] selects none. Raw labels must be unique across groups,
+        including when qualify_labels is true. Group names text,confidence,start,end are reserved.
+    ExtractionConstraintLabelRef:
+      type: object
+      required:
+        - type
+        - task
+        - label
+      properties:
+        type:
+          type: string
+          enum:
+            - LabelRef
+        task:
+          type: string
+        label:
+          type: string
+      additionalProperties: false
+    ExtractionConstraintAnySelected:
+      type: object
+      required:
+        - type
+        - task
+      properties:
+        type:
+          type: string
+          enum:
+            - AnySelected
+        task:
+          type: string
+      additionalProperties: false
+    ExtractionConstraintAnyOtherSelected:
+      type: object
+      required:
+        - type
+        - task
+      properties:
+        type:
+          type: string
+          enum:
+            - AnyOtherSelected
+        task:
+          type: string
+      additionalProperties: false
+    ExtractionConstraintIsDefault:
+      type: object
+      required:
+        - type
+        - task
+      properties:
+        type:
+          type: string
+          enum:
+            - IsDefault
+        task:
+          type: string
+      additionalProperties: false
+    ExtractionConstraintCardinality:
+      type: object
+      required:
+        - type
+        - task
+      properties:
+        type:
+          type: string
+          enum:
+            - Cardinality
+        task:
+          type: string
+        minimum:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        maximum:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+      additionalProperties: false
+    ExtractionConstraintMinLevel:
+      type: object
+      required:
+        - type
+        - task
+        - level
+      properties:
+        type:
+          type: string
+          enum:
+            - MinLevel
+        task:
+          type: string
+        level:
+          oneOf:
+            - type: string
+            - type: integer
+              minimum: 0
+              x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionConstraintMaxLevel:
+      type: object
+      required:
+        - type
+        - task
+        - level
+      properties:
+        type:
+          type: string
+          enum:
+            - MaxLevel
+        task:
+          type: string
+        level:
+          oneOf:
+            - type: string
+            - type: integer
+              minimum: 0
+              x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionConstraintAtLevel:
+      type: object
+      required:
+        - type
+        - task
+        - level
+      properties:
+        type:
+          type: string
+          enum:
+            - AtLevel
+        task:
+          type: string
+        level:
+          oneOf:
+            - type: string
+            - type: integer
+              minimum: 0
+              x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionConstraintNot:
+      type: object
+      required:
+        - type
+        - child
+      properties:
+        type:
+          type: string
+          enum:
+            - Not
+        child:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+      additionalProperties: false
+    ExtractionConstraintAnd:
+      type: object
+      required:
+        - type
+        - children
+      properties:
+        type:
+          type: string
+          enum:
+            - And
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionClassificationConstraint'
+          maxItems: 512
+      additionalProperties: false
+    ExtractionConstraintOr:
+      type: object
+      required:
+        - type
+        - children
+      properties:
+        type:
+          type: string
+          enum:
+            - Or
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionClassificationConstraint'
+          maxItems: 512
+      additionalProperties: false
+    ExtractionConstraintExactlyOneOf:
+      type: object
+      required:
+        - type
+        - children
+      properties:
+        type:
+          type: string
+          enum:
+            - ExactlyOneOf
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionClassificationConstraint'
+          maxItems: 512
+      additionalProperties: false
+    ExtractionConstraintImplies:
+      type: object
+      required:
+        - type
+        - cond
+        - then
+      properties:
+        type:
+          type: string
+          enum:
+            - Implies
+        cond:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+        then:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+      additionalProperties: false
+    ExtractionConstraintIff:
+      type: object
+      required:
+        - type
+        - left
+        - right
+      properties:
+        type:
+          type: string
+          enum:
+            - Iff
+        left:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+        right:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+      additionalProperties: false
+    ExtractionConstraintExcludes:
+      type: object
+      required:
+        - type
+        - left
+        - right
+      properties:
+        type:
+          type: string
+          enum:
+            - Excludes
+        left:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+        right:
+          $ref: '#/components/schemas/ExtractionClassificationConstraint'
+      additionalProperties: false
+    ExtractionClassificationConstraint:
+      x-zig-type: std.json.Value
+      description: Declarative, bounded constraint AST. Task and label references are validated before
+        inference. Nesting is bounded by the server schema limit.
+      oneOf:
+        - $ref: '#/components/schemas/ExtractionConstraintLabelRef'
+        - $ref: '#/components/schemas/ExtractionConstraintAnySelected'
+        - $ref: '#/components/schemas/ExtractionConstraintAnyOtherSelected'
+        - $ref: '#/components/schemas/ExtractionConstraintIsDefault'
+        - $ref: '#/components/schemas/ExtractionConstraintCardinality'
+        - $ref: '#/components/schemas/ExtractionConstraintMinLevel'
+        - $ref: '#/components/schemas/ExtractionConstraintMaxLevel'
+        - $ref: '#/components/schemas/ExtractionConstraintAtLevel'
+        - $ref: '#/components/schemas/ExtractionConstraintNot'
+        - $ref: '#/components/schemas/ExtractionConstraintAnd'
+        - $ref: '#/components/schemas/ExtractionConstraintOr'
+        - $ref: '#/components/schemas/ExtractionConstraintExactlyOneOf'
+        - $ref: '#/components/schemas/ExtractionConstraintImplies'
+        - $ref: '#/components/schemas/ExtractionConstraintIff'
+        - $ref: '#/components/schemas/ExtractionConstraintExcludes'
+      discriminator:
+        propertyName: type
+        mapping:
+          LabelRef: '#/components/schemas/ExtractionConstraintLabelRef'
+          AnySelected: '#/components/schemas/ExtractionConstraintAnySelected'
+          AnyOtherSelected: '#/components/schemas/ExtractionConstraintAnyOtherSelected'
+          IsDefault: '#/components/schemas/ExtractionConstraintIsDefault'
+          Cardinality: '#/components/schemas/ExtractionConstraintCardinality'
+          MinLevel: '#/components/schemas/ExtractionConstraintMinLevel'
+          MaxLevel: '#/components/schemas/ExtractionConstraintMaxLevel'
+          AtLevel: '#/components/schemas/ExtractionConstraintAtLevel'
+          Not: '#/components/schemas/ExtractionConstraintNot'
+          And: '#/components/schemas/ExtractionConstraintAnd'
+          Or: '#/components/schemas/ExtractionConstraintOr'
+          ExactlyOneOf: '#/components/schemas/ExtractionConstraintExactlyOneOf'
+          Implies: '#/components/schemas/ExtractionConstraintImplies'
+          Iff: '#/components/schemas/ExtractionConstraintIff'
+          Excludes: '#/components/schemas/ExtractionConstraintExcludes'
+    ExtractionJointEntity:
+      type: object
+      properties:
+        description:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionDecisionProbability'
+          x-go-type-skip-optional-pointer: false
+        candidate_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        max_candidates:
+          type: integer
+          minimum: 1
+          maximum: 256
+          x-go-type-skip-optional-pointer: false
+        allow_nested:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointRelation:
+      type: object
+      required:
+        - head
+        - tail
+      properties:
+        head:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          minItems: 1
+        tail:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          minItems: 1
+        description:
+          type: string
+          description: Retained declarative metadata; model conditioning follows the pinned JointIE compiler.
+          x-go-type-skip-optional-pointer: false
+        threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionDecisionProbability'
+          x-go-type-skip-optional-pointer: false
+        candidate_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        directed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: true
+        symmetric:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+        inverse:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        allow_self:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+        max_per_head:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        max_per_tail:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintTypedEndpoints:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - TypedEndpoints
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        head_types:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          x-go-type-skip-optional-pointer: false
+        tail_types:
+          type: array
+          items:
+            type: string
+          maxItems: 128
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintNoSelfLoops:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - NoSelfLoops
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintUniqueRelationPair:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - UniqueRelationPair
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        directed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: true
+      additionalProperties: false
+    ExtractionJointConstraintUniqueRelationSlot:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - UniqueRelationSlot
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        slot:
+          type: string
+          enum:
+            - head
+            - tail
+            - slot
+          default: head
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintEntityOverlapPolicy:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - EntityOverlapPolicy
+        policy:
+          type: string
+          enum:
+            - allow
+            - disallow
+            - nested
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintMaxRelationsPerHead:
+      type: object
+      required:
+        - type
+        - limit
+      properties:
+        type:
+          type: string
+          enum:
+            - MaxRelationsPerHead
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        limit:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintMaxRelationsPerTail:
+      type: object
+      required:
+        - type
+        - limit
+      properties:
+        type:
+          type: string
+          enum:
+            - MaxRelationsPerTail
+        relation:
+          type: string
+          x-go-type-skip-optional-pointer: false
+        limit:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionJointConstraintSymmetricRelation:
+      type: object
+      required:
+        - type
+        - relation
+      properties:
+        type:
+          type: string
+          enum:
+            - SymmetricRelation
+        relation:
+          type: string
+      additionalProperties: false
+    ExtractionJointConstraintAcyclicRelation:
+      type: object
+      required:
+        - type
+        - relation
+      properties:
+        type:
+          type: string
+          enum:
+            - AcyclicRelation
+        relation:
+          type: string
+      additionalProperties: false
+    ExtractionJointConstraintInverseRelation:
+      type: object
+      required:
+        - type
+        - relation
+        - inverse
+      properties:
+        type:
+          type: string
+          enum:
+            - InverseRelation
+        relation:
+          type: string
+        inverse:
+          type: string
+      additionalProperties: false
+    ExtractionJointConstraint:
+      x-zig-type: std.json.Value
+      oneOf:
+        - $ref: '#/components/schemas/ExtractionJointConstraintTypedEndpoints'
+        - $ref: '#/components/schemas/ExtractionJointConstraintNoSelfLoops'
+        - $ref: '#/components/schemas/ExtractionJointConstraintUniqueRelationPair'
+        - $ref: '#/components/schemas/ExtractionJointConstraintUniqueRelationSlot'
+        - $ref: '#/components/schemas/ExtractionJointConstraintEntityOverlapPolicy'
+        - $ref: '#/components/schemas/ExtractionJointConstraintMaxRelationsPerHead'
+        - $ref: '#/components/schemas/ExtractionJointConstraintMaxRelationsPerTail'
+        - $ref: '#/components/schemas/ExtractionJointConstraintSymmetricRelation'
+        - $ref: '#/components/schemas/ExtractionJointConstraintAcyclicRelation'
+        - $ref: '#/components/schemas/ExtractionJointConstraintInverseRelation'
+      discriminator:
+        propertyName: type
+        mapping:
+          TypedEndpoints: '#/components/schemas/ExtractionJointConstraintTypedEndpoints'
+          NoSelfLoops: '#/components/schemas/ExtractionJointConstraintNoSelfLoops'
+          UniqueRelationPair: '#/components/schemas/ExtractionJointConstraintUniqueRelationPair'
+          UniqueRelationSlot: '#/components/schemas/ExtractionJointConstraintUniqueRelationSlot'
+          EntityOverlapPolicy: '#/components/schemas/ExtractionJointConstraintEntityOverlapPolicy'
+          MaxRelationsPerHead: '#/components/schemas/ExtractionJointConstraintMaxRelationsPerHead'
+          MaxRelationsPerTail: '#/components/schemas/ExtractionJointConstraintMaxRelationsPerTail'
+          SymmetricRelation: '#/components/schemas/ExtractionJointConstraintSymmetricRelation'
+          AcyclicRelation: '#/components/schemas/ExtractionJointConstraintAcyclicRelation'
+          InverseRelation: '#/components/schemas/ExtractionJointConstraintInverseRelation'
+    ExtractionJointSchema:
+      type: object
+      required:
+        - entities
+      properties:
+        entities:
+          type: object
+          minProperties: 1
+          maxProperties: 128
+          additionalProperties:
+            oneOf:
+              - type: string
+              - $ref: '#/components/schemas/ExtractionJointEntity'
+        relations:
+          type: object
+          maxProperties: 32
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionJointRelation'
+          x-go-type-skip-optional-pointer: false
+        constraints:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionJointConstraint'
+          maxItems: 512
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+      description: Separate typed graph schema, mutually exclusive with ordinary extraction families.
+        Hard typed endpoints, overlap, uniqueness and declared graph constraints apply to every returned
+        edge, including derived companions.
     ExtractionSchema:
       type: object
       description: >
-        Selects one extraction operation family per request. Entity labels may
+        Version 1 selects one extraction family; entities may accompany relations.
 
-        accompany relation schemas so relation extraction can return its
+        With schema_version 2, entities, attributes, classifications, structures,
 
-        participating entities in the same response.
+        and ordinary relations may share one encoded input. joint_ie is a separate,
+
+        mutually exclusive typed graph schema. The version 2 compiler rejects
+
+        unknown fields and validates all references before model execution.
       properties:
         entities:
           type: array
@@ -30049,7 +30928,162 @@ components:
           type: object
           additionalProperties:
             $ref: '#/components/schemas/ExtractionStructureSchema'
+        entity_definitions:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionEntityDefinition'
+          x-go-type-skip-optional-pointer: false
+        entity_attributes:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionAttributeGroup'
+          x-go-type-skip-optional-pointer: false
+        classification_constraints:
+          type: array
+          maxItems: 512
+          items:
+            $ref: '#/components/schemas/ExtractionClassificationConstraint'
+          x-go-type-skip-optional-pointer: false
+        joint_ie:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionJointSchema'
+          x-go-type-skip-optional-pointer: false
       additionalProperties: true
+    ExtractionOffsetUnit:
+      type: string
+      description: Half-open offsets into the immutable caller text. Version 2 defaults to utf8_bytes.
+        No normalization, lowercasing or synthetic suffix is included in these coordinates.
+      enum:
+        - utf8_bytes
+        - unicode_codepoints
+        - utf16_codeunits
+    ExtractionLongDocumentOptions:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum:
+            - reject
+            - window
+          default: reject
+          x-go-type-skip-optional-pointer: false
+        window_words:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          x-go-type-skip-optional-pointer: false
+          description: Maximum body words per window; also bounded by the checkpoint and encoded token
+            limits.
+        overlap_words:
+          type: integer
+          minimum: 0
+          maximum: 4095
+          x-go-type-skip-optional-pointer: false
+        max_windows:
+          type: integer
+          minimum: 1
+          maximum: 128
+          x-go-type-skip-optional-pointer: false
+        record_identity:
+          type: string
+          enum:
+            - occurrence
+            - semantic
+          default: occurrence
+          description: Identity of latent, anchorless and legacy records across windows. Occurrence uses
+            exact source spans; semantic explicitly merges equal field values. Natural records always
+            use their exact source anchor. This is independent of annotation occurrence_policy.
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+      description: Version 2 never silently truncates. Reject is the default. Windowing requires an enabled
+        runtime capability, reconstructs document-global offsets and revalidates all hard graph constraints
+        after merging.
+    ExtractionDecoderOptions:
+      type: object
+      properties:
+        algorithm:
+          type: string
+          enum:
+            - auto
+            - exact
+            - beam
+          description: Omit to use the model's per-task default. GLiNER2.5 uses source-compatible beam
+            selection for single-window JointIE and automatic selection for classification. Windowed JointIE
+            uses the native automatic global solver with independent window resources. Explicit values
+            select the native bounded search algorithm.
+          x-go-type-skip-optional-pointer: false
+        beam_width:
+          type: integer
+          minimum: 1
+          maximum: 1024
+          x-go-type-skip-optional-pointer: false
+        max_search_nodes:
+          type: integer
+          minimum: 0
+          maximum: 200000
+          x-go-type-skip-optional-pointer: false
+        max_local_assignments:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          x-go-type-skip-optional-pointer: false
+        best_effort:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: false
+      additionalProperties: false
+      description: Bounded classification and JointIE selection. Exact optimality is with respect to admitted
+        candidates. A completed beam may be feasible without an optimality proof. By default exhausted
+        search is an error; best_effort permits only a validated feasible witness and reports exhausted:true.
+    ExtractionJointOptions:
+      type: object
+      properties:
+        candidate_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        entity_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        relation_role_threshold:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        top_k_entities:
+          type: integer
+          minimum: 1
+          maximum: 256
+          x-go-type-skip-optional-pointer: false
+        top_k_roles:
+          type: integer
+          minimum: 1
+          maximum: 32
+          x-go-type-skip-optional-pointer: false
+        relation_pair_cap:
+          type: integer
+          minimum: 1
+          maximum: 128
+          x-go-type-skip-optional-pointer: false
+        max_edges_per_type:
+          type: integer
+          minimum: 1
+          maximum: 256
+          x-go-type-skip-optional-pointer: false
+        entity_weight:
+          type: number
+          format: double
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        relation_weight:
+          type: number
+          format: double
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+      description: JointIE proposal admission and utility calibration. Entity candidate caps are bypassed
+        for endpoints of retained relation proposals, subject to server hard bounds. entity_threshold
+        overrides candidate admission, not entity decision thresholds.
     ExtractionReaderOptions:
       type: object
       properties:
@@ -30105,13 +31139,79 @@ components:
           type: boolean
         include_spans:
           type: boolean
+        word_splitter:
+          type: string
+          enum:
+            - whitespace
+            - char
+          description: Version 2 source word splitting. char keeps ASCII alphanumeric and @._-+ runs together
+            and splits other non-whitespace codepoints, preserving original source offsets. An input's
+            options replace the shared options in full; omitted word_splitter uses whitespace. Explicit
+            word_splitter is rejected by version 1.
+          x-go-type-skip-optional-pointer: false
+        overlap:
+          type: string
+          enum:
+            - allow
+            - nested
+            - flat
+            - disallow
+            - longest
+          description: Version 2 overlap selection. flat/disallow prohibit overlap, nested permits containment,
+            longest removes strictly contained spans.
+          x-go-type-skip-optional-pointer: false
+        offset_unit:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionOffsetUnit'
+          x-go-type-skip-optional-pointer: false
+        long_document:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionLongDocumentOptions'
+          x-go-type-skip-optional-pointer: false
+        decoder:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionDecoderOptions'
+          x-go-type-skip-optional-pointer: false
+        joint_ie:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionJointOptions'
+          x-go-type-skip-optional-pointer: false
         reader:
           $ref: '#/components/schemas/ExtractionReaderOptions'
         resolver:
           $ref: '#/components/schemas/ExtractionResolverOptions'
       additionalProperties: true
+    ExtractionInput:
+      type: object
+      required:
+        - content
+      properties:
+        id:
+          type: string
+        content:
+          $ref: '#/components/schemas/ChatMessageContent'
+        tokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionToken'
+        metadata:
+          type: object
+          additionalProperties: true
+        schema:
+          description: Version 2 only. Replaces the complete shared schema for this input.
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSchema'
+          x-go-type-skip-optional-pointer: false
+        options:
+          description: Version 2 only. Replaces the complete shared options; omitted fields use runtime
+            defaults.
+          allOf:
+            - $ref: '#/components/schemas/ExtractionOptions'
+          x-go-type-skip-optional-pointer: false
     ExtractionRequest:
       type: object
+      description: Atomic extraction request. Every input is validated before inference; failures return
+        no partial data.
       required:
         - model
         - inputs
@@ -30120,6 +31220,10 @@ components:
         model:
           type: string
           minLength: 1
+        schema_version:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSchemaVersion'
+          x-go-type-skip-optional-pointer: false
         inputs:
           type: array
           minItems: 1
@@ -30130,6 +31234,24 @@ components:
           $ref: '#/components/schemas/ExtractionSchema'
         options:
           $ref: '#/components/schemas/ExtractionOptions'
+    ExtractionAttributeLabel:
+      type: object
+      required:
+        - label
+        - confidence
+      properties:
+        label:
+          type: string
+        confidence:
+          $ref: '#/components/schemas/ExtractionProbability'
+      additionalProperties: false
+    ExtractionAttributeSelection:
+      oneOf:
+        - $ref: '#/components/schemas/ExtractionAttributeLabel'
+        - type: array
+          items:
+            $ref: '#/components/schemas/ExtractionAttributeLabel'
+          maxItems: 128
     ExtractionEntity:
       type: object
       required:
@@ -30147,6 +31269,12 @@ components:
         score:
           type: number
           format: float
+        attributes:
+          type: object
+          description: Version 2 span attributes. Attribute confidence is retained independently of include_confidence.
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionAttributeSelection'
+          x-go-type-skip-optional-pointer: false
     ExtractionRelationEndpoint:
       type: object
       properties:
@@ -30154,6 +31282,26 @@ components:
           type: integer
         id:
           type: string
+        label:
+          type: string
+          description: Entity type when the endpoint has a typed identity.
+          x-go-type-skip-optional-pointer: false
+        text:
+          type: string
+          description: Version 2 endpoint surface, including endpoints absent from the entities list.
+          x-go-type-skip-optional-pointer: false
+        start:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        end:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        score:
+          type: number
+          format: float
+          x-go-type-skip-optional-pointer: false
       additionalProperties: true
     ExtractionRelation:
       type: object
@@ -30169,6 +31317,10 @@ components:
         score:
           type: number
           format: float
+        derived:
+          type: boolean
+          description: Version 2 inverse or symmetric companion derived from a selected relation.
+          x-go-type-skip-optional-pointer: false
       additionalProperties: true
     ExtractionClassification:
       type: object
@@ -30184,11 +31336,124 @@ components:
           type: number
           format: float
       additionalProperties: true
+    ExtractionRecordMetadata:
+      type: object
+      properties:
+        score:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionProbability'
+          x-go-type-skip-optional-pointer: false
+        anchor:
+          type: object
+          required:
+            - start
+            - end
+          properties:
+            start:
+              type: integer
+              minimum: 0
+              x-go-type-skip-optional-pointer: false
+            end:
+              type: integer
+              minimum: 0
+              x-go-type-skip-optional-pointer: false
+          additionalProperties: false
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionSolverStatus:
+      type: object
+      required:
+        - status
+        - utility
+        - visited_nodes
+        - exhausted
+      properties:
+        status:
+          type: string
+          enum:
+            - optimal
+            - feasible
+        utility:
+          type: number
+          format: double
+        visited_nodes:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        exhausted:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionSolverDiagnostics:
+      type: object
+      properties:
+        classification:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSolverStatus'
+          x-go-type-skip-optional-pointer: false
+        joint_ie:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSolverStatus'
+          x-go-type-skip-optional-pointer: false
+        records:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSolverStatus'
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    ExtractionLongDocumentMetadata:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+        - window_count
+        - window_policy
+        - classification_aggregation
+        - duplicate_score
+        - natural_record_identity
+        - other_record_identity
+        - solver_optimality_scope
+      properties:
+        version:
+          type: integer
+          enum:
+            - 1
+        window_count:
+          type: integer
+          minimum: 1
+        window_policy:
+          type: string
+          enum:
+            - source_words_midpoint_ownership
+        classification_aggregation:
+          type: string
+          enum:
+            - owned_word_weighted_mean_raw_logits
+        duplicate_score:
+          type: string
+          enum:
+            - maximum_calibrated_score
+        natural_record_identity:
+          type: string
+          enum:
+            - exact_source_anchor
+        other_record_identity:
+          type: string
+          enum:
+            - occurrence
+            - semantic
+        solver_optimality_scope:
+          type: string
+          enum:
+            - retained_candidate_graph
     ExtractionObject:
       type: object
       properties:
         id:
           type: string
+        offset_unit:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionOffsetUnit'
+          x-go-type-skip-optional-pointer: false
         entities:
           type: array
           items:
@@ -30203,7 +31468,25 @@ components:
             $ref: '#/components/schemas/ExtractionClassification'
         structures:
           type: object
+          description: Structure name to record array. Each record maps field names to value objects or
+            arrays of value objects; v2 value objects follow ExtractionFieldValue.
           additionalProperties: true
+        structure_metadata:
+          type: object
+          description: Version 2 metadata arrays aligned with each named structure's record array.
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/ExtractionRecordMetadata'
+          x-go-type-skip-optional-pointer: false
+        solvers:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSolverDiagnostics'
+          x-go-type-skip-optional-pointer: false
+        long_document:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionLongDocumentMetadata'
+          x-go-type-skip-optional-pointer: false
       additionalProperties: true
     ExtractionResponse:
       type: object
@@ -30218,6 +31501,10 @@ components:
             - extraction
         model:
           type: string
+        schema_version:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSchemaVersion'
+          x-go-type-skip-optional-pointer: false
         data:
           type: array
           items:

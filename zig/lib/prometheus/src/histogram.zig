@@ -97,7 +97,7 @@ pub fn Histogram(comptime V: type, comptime upper_bounds: []const V) type {
 
                 const idx = blk: {
                     for (upper_bounds, 0..) |upper, i| {
-                        if (value < upper) {
+                        if (value <= upper) {
                             break :blk i;
                         }
                     }
@@ -223,7 +223,7 @@ pub fn HistogramVec(comptime V: type, comptime L: type, comptime upper_bounds: [
 
                 fn getIndex(value: V) ?usize {
                     for (upper_bounds, 0..) |upper, i| {
-                        if (value < upper) {
+                        if (value <= upper) {
                             return i;
                         }
                     }
@@ -292,7 +292,7 @@ pub fn HistogramVec(comptime V: type, comptime L: type, comptime upper_bounds: [
                 // do this outside any lock
                 const idx: ?usize = blk: {
                     for (upper_bounds, 0..) |upper, i| {
-                        if (value < upper) {
+                        if (value <= upper) {
                             break :blk i;
                         }
                     }
@@ -466,6 +466,27 @@ test "Histogram: noop " {
     try t.expectEqual(0, buf.len);
 }
 
+test "Histogram: inclusive upper boundaries" {
+    inline for (.{ u64, f64 }) |V| {
+        var h = Histogram(V, &.{ 0, 2, 5 }).init("hst_boundaries", .{}, .{});
+        for ([_]V{ 0, 1, 2, 3, 5, 6 }) |value| h.observe(value);
+
+        var writer: std.Io.Writer.Allocating = .init(t.allocator);
+        defer writer.deinit();
+        try h.write(&writer.writer);
+        try t.expectString(
+            \\# TYPE hst_boundaries histogram
+            \\hst_boundaries_bucket{le="0"} 1
+            \\hst_boundaries_bucket{le="2"} 3
+            \\hst_boundaries_bucket{le="5"} 5
+            \\hst_boundaries_bucket{le="+Inf"} 6
+            \\hst_boundaries_sum 17
+            \\hst_boundaries_count 6
+            \\
+        , writer.writer.buffered());
+    }
+}
+
 test "Histogram: simple" {
     var h = Histogram(f64, &.{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 }).init("hst_1", .{}, .{});
 
@@ -538,6 +559,30 @@ test "HistogramVec: noop " {
     try h.write(&writer.writer);
     const buf = writer.writer.buffered();
     try t.expectEqual(0, buf.len);
+}
+
+test "HistogramVec: inclusive upper boundaries" {
+    inline for (.{ u64, f64 }) |V| {
+        var h = try HistogramVec(V, struct { status: u16 }, &.{ 0, 2, 5 }).init(t.allocator, "hst_boundaries", .{}, .{});
+        defer h.deinit();
+        // The first exact-boundary observation creates the label; the later
+        // observations also exercise the existing-label update path.
+        for ([_]V{ 0, 1, 2, 3, 5, 6 }) |value| try h.observe(.{ .status = 200 }, value);
+
+        var writer: std.Io.Writer.Allocating = .init(t.allocator);
+        defer writer.deinit();
+        try h.write(&writer.writer);
+        try t.expectString(
+            \\# TYPE hst_boundaries histogram
+            \\hst_boundaries_bucket{le="0",status="200"} 1
+            \\hst_boundaries_bucket{le="2",status="200"} 3
+            \\hst_boundaries_bucket{le="5",status="200"} 5
+            \\hst_boundaries_bucket{le="+Inf",status="200"} 6
+            \\hst_boundaries_sum{status="200"} 17
+            \\hst_boundaries_count{status="200"} 6
+            \\
+        , writer.writer.buffered());
+    }
 }
 
 test "HistogramVec" {

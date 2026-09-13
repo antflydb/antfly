@@ -105,6 +105,7 @@ export type {
   ExtractEntity,
   ExtractRelation,
   ExtractRequest,
+  ExtractV2Request,
   ExtractResponse,
   GenerateChunk,
   GenerateRequest,

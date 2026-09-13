@@ -52,11 +52,11 @@ from pathlib import Path
 import pytest
 
 
-def _find_repo_root() -> Path:
+def _find_repo_root(start: Path | None = None) -> Path:
     # Walk up until the directory containing zig/pkg/inference is found, so the
     # gate resolves correctly regardless of how deep e2e/inference is nested
     # (the file lives at <repo>/zig/e2e/inference/).
-    here = Path(__file__).resolve()
+    here = (start or Path(__file__)).resolve()
     for parent in here.parents:
         if (
             parent
@@ -64,16 +64,16 @@ def _find_repo_root() -> Path:
             / "pkg"
             / "inference"
             / "scripts"
+            / "gliner2"
             / "compare_gliner2_lora_python_zig.py"
         ).exists():
             return parent
-    # Fall back to the historical assumption (file three levels under the root).
-    return here.parents[3]
+    raise RuntimeError(f"cannot locate the GLiNER2 parity helper above {here}")
 
 
 REPO_ROOT = _find_repo_root()
 INFERENCE_DIR = REPO_ROOT / "zig" / "pkg" / "inference"
-COMPARE_SCRIPT = INFERENCE_DIR / "scripts" / "compare_gliner2_lora_python_zig.py"
+COMPARE_SCRIPT = INFERENCE_DIR / "scripts" / "gliner2" / "compare_gliner2_lora_python_zig.py"
 FIXTURE_DIR = INFERENCE_DIR / "testdata" / "gliner2"
 TRAIN_FIXTURE = FIXTURE_DIR / "ner_smoke.jsonl"
 ALL_TASK_FIXTURE = FIXTURE_DIR / "full_task_smoke.jsonl"

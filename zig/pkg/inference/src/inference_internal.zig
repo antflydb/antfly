@@ -13,23 +13,29 @@
 // limitations under the License.
 
 const build_options = @import("build_options");
+pub const gliner_boundary_export = @import("gliner_boundary_export.zig");
 
 pub const platform = @import("antfly_platform");
 pub const backends = @import("backends/backends.zig");
 pub const execution_control = @import("execution_control.zig");
 pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
+pub const HardCancellationWatchdog = @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog;
 pub const metal_runtime = if (build_options.enable_metal) @import("backends/metal_runtime.zig") else struct {
     pub fn metalDeviceAvailable() bool {
         return false;
     }
 };
 pub const metal_native_provider = if (build_options.enable_metal) @import("backends/metal_native_provider.zig") else struct {};
+pub const metal_tensor = if (build_options.enable_metal) @import("backends/metal_tensor.zig") else struct {};
 pub const graph = @import("graph/root.zig");
 pub const io = @import("io/io.zig");
 pub const ops = @import("ops/ops.zig");
 pub const run = @import("run/root.zig");
 pub const runtime = @import("runtime/root.zig");
+pub const file_snapshot = @import("runtime/file_snapshot.zig");
 pub const util = @import("util/util.zig");
+pub const tokenizer = @import("inference_tokenizer");
+pub const hf_tokenizer = @import("inference_hf_tokenizer");
 pub const native_backend_guard = @import("native_backend_guard.zig");
 pub const native_backend_choice = @import("native_backend_choice.zig");
 pub const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig");
@@ -39,8 +45,14 @@ pub const server = struct {
 };
 pub const pipelines = struct {
     pub const embedding = @import("pipelines/embedding.zig");
+    pub const extraction_schema = @import("pipelines/extraction_schema.zig");
+    pub const gliner_boundary_processor = @import("pipelines/gliner_boundary_processor.zig");
+    pub const gliner_boundary_pipeline = @import("pipelines/gliner_boundary_pipeline.zig");
 };
 pub const finetune = struct {
+    pub const gliner_boundary_training_job = @import("finetune/gliner_boundary_training_job.zig");
+    pub const gliner_boundary_native_trainer = @import("finetune/gliner_boundary_native_trainer.zig");
+    pub const gliner_boundary_merge_job = @import("finetune/gliner_boundary_merge_job.zig");
     pub const colqwen2 = @import("finetune/colqwen2.zig");
     pub const gemma4 = @import("finetune/gemma4.zig");
     pub const gemma_chat_data = @import("finetune/gemma_chat_data.zig");
@@ -80,6 +92,10 @@ pub const finetune = struct {
     pub const tokenizer_batch = @import("finetune/tokenizer_batch.zig");
 };
 pub const architectures = struct {
+    pub const gliner_boundary_engine = @import("architectures/gliner_boundary_engine.zig");
+    pub const gliner_boundary_request_device = @import("architectures/gliner_boundary_request_device.zig");
+    pub const gliner_boundary_head = @import("architectures/gliner_boundary_head.zig");
+    pub const gliner_boundary_tasks = @import("architectures/gliner_boundary_tasks.zig");
     pub const session_factory = @import("architectures/session_factory.zig");
     pub const deberta = @import("architectures/deberta.zig");
     pub const deberta_graph = @import("architectures/deberta_graph.zig");
@@ -98,6 +114,10 @@ pub const architectures = struct {
 };
 pub const models = struct {
     pub const manifest = @import("models/manifest.zig");
+    pub const gliner_boundary_bundle = @import("models/gliner_boundary_bundle.zig");
+    pub const gliner_boundary = @import("models/gliner_boundary.zig");
+    pub const gliner_boundary_artifact = @import("models/gliner_boundary_artifact.zig");
+    pub const tensor_access = @import("models/tensor_access.zig");
     pub const deberta = @import("models/deberta.zig");
     pub const clip = @import("models/clip.zig");
     pub const clap = @import("models/clap.zig");

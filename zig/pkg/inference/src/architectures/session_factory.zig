@@ -39,6 +39,8 @@ const clip_mod = @import("../models/clip.zig");
 const clap_mod = @import("../models/clap.zig");
 const deberta_mod = @import("../models/deberta.zig");
 const layoutlmv3_mod = @import("../models/layoutlmv3.zig");
+const boundary_bundle = @import("../models/gliner_boundary_bundle.zig");
+const boundary_resident = @import("../ops/gliner_boundary_resident.zig");
 const bert_arch = @import("bert.zig");
 const modern_bert_arch = @import("modern_bert.zig");
 const nomic_bert_arch = @import("nomic_bert.zig");
@@ -53,6 +55,7 @@ const clap_arch = @import("clap.zig");
 const florence_arch = @import("florence.zig");
 const deberta_arch = @import("deberta.zig");
 const gliner_head = @import("gliner_head.zig");
+const gliner_boundary_model = @import("../models/gliner_boundary.zig");
 const gliner_head_graph = @import("gliner_head_graph.zig");
 const kernel_jit = @import("../graph/kernel_jit.zig");
 const graph_runtime = @import("../graph/runtime.zig");
@@ -307,6 +310,49 @@ fn glinerBaseWeightKey(full_name: []const u8) []const u8 {
     return full_name;
 }
 
+fn validateNativeBoundaryWeights(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, config: gliner_boundary_model.Config, store: tensor_store_mod.TensorStore) !void {
+    if (mf.usesGgufWeights()) {
+        const receipt = mf.gliner_boundary_bundle orelse return error.UnsupportedGlinerBoundaryBundle;
+        const file = store.ggufFile() orelse return error.InvalidGlinerBoundaryBundle;
+        const bytes = store.ggufArtifactBytes() orelse return error.InvalidGlinerBoundaryBundle;
+        _ = try @import("../models/gliner_boundary_bundle.zig").validateLoadedGguf(allocator, receipt.value, config, file, bytes, null);
+        return;
+    }
+    const tensor_access = @import("../models/tensor_access.zig");
+    const reader = store.singleSafetensorsReader() orelse return error.UnsupportedGlinerBoundaryBundle;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const descriptors = try a.alloc(tensor_access.Descriptor, reader.header.tensors.count());
+    var entries = reader.header.tensors.iterator();
+    var index: usize = 0;
+    while (entries.next()) |entry| : (index += 1) {
+        const meta = entry.value_ptr.*;
+        descriptors[index] = .{
+            .name = entry.key_ptr.*,
+            .shape = meta.shape,
+            .encoding = .{ .dense = meta.dtype },
+            .byte_len = @intCast(meta.data_end - meta.data_start),
+            .quantized = false,
+        };
+    }
+    _ = try @import("../models/gliner_boundary_artifact.zig").validate(a, config.backbone, .fp32, descriptors, null);
+}
+
+fn captureBoundaryIdentity(mf: *const manifest_mod.ModelManifest, store: tensor_store_mod.TensorStore) !boundary_bundle.Identity {
+    const config = mf.gliner_boundary_config orelse return error.InvalidGlinerBoundaryConfig;
+    const sidecars = try mf.boundarySidecarDigests();
+    if (mf.gliner_boundary_bundle) |receipt| {
+        // validateNativeBoundaryWeights already checked the opened mapping.
+        const pin = try boundary_bundle.pinFor(receipt.value.files, boundary_bundle.model_name);
+        var digest = boundary_bundle.Digest{ .size_bytes = pin.size_bytes, .sha256 = undefined };
+        @memcpy(&digest.sha256, pin.sha256);
+        return .{ .backbone = config.backbone, .precision = receipt.value.precision, .weight = digest, .sidecars = sidecars };
+    }
+    const reader = store.singleSafetensorsReader() orelse return error.UnsupportedGlinerBoundaryBundle;
+    return .{ .backbone = config.backbone, .precision = .fp32, .weight = boundary_bundle.Digest.of(reader.file_bytes), .sidecars = sidecars };
+}
+
 fn shardedSafetensorsTotalBytes(allocator: std.mem.Allocator, index_path: []const u8) !u64 {
     const index_bytes = try c_file.readFile(allocator, index_path);
     defer allocator.free(index_bytes);
@@ -348,6 +394,7 @@ const ArchType = enum {
     clip,
     clap,
     gliner,
+    gliner_boundary,
     layoutlmv3,
 };
 
@@ -364,6 +411,7 @@ const ArchConfig = union(ArchType) {
     clip: clip_mod.Config,
     clap: clap_mod.Config,
     gliner: deberta_mod.Config,
+    gliner_boundary: gliner_boundary_model.Config,
     layoutlmv3: layoutlmv3_mod.Config,
 };
 
@@ -415,6 +463,18 @@ fn sessionEnablesDebertaRerankerWeightMirrors(
     return model_type == .reranker and arch_type == .deberta and task == .classifier;
 }
 
+fn sessionEnablesImmutableF32WeightBorrow(
+    backend_type: BackendType,
+    arch_type: ArchType,
+    task: SessionTask,
+) bool {
+    // These model-scoped lazy weights are read-only for the session lifetime.
+    // Finetuning's explicit generic sessions and caller-created WeightStores
+    // retain the copying contract; they must never inherit this capability
+    // merely because a parameter name resembles an inference weight.
+    return backend_type == .metal and arch_type == .gliner and task == .recognizer;
+}
+
 /// Metal mirror/cache and graph-plan scratch amounts that ModelManager must
 /// reserve for native DeBERTa and GLiNER sessions. An absent reranker
 /// architecture hint is treated conservatively because GGUF metadata can still
@@ -441,6 +501,34 @@ pub fn metalDebertaFastPathAdmissionAmounts(mf: manifest_mod.ModelManifest) runt
         .backend_weight_bytes = reservation.persistent_bytes,
         .backend_scratch_bytes = reservation.scratch_bytes,
     };
+}
+
+pub const GlinerBoundaryResidentLoadAmounts = struct {
+    peak: runtime.tier.memory.AdmissionAmounts,
+    resident: runtime.tier.memory.AdmissionAmounts,
+};
+
+/// Exact new FP32 ownership replaces the generic mirrored-DeBERTa reservation.
+/// The opened source mapping and separate device allocations coexist. Keep the
+/// existing import allowance in the construction peak; workspace retention is
+/// admitted separately and is never folded into immutable model bytes.
+pub fn glinerBoundaryResidentLoadAmounts(mf: manifest_mod.ModelManifest, source_bytes: usize) !?GlinerBoundaryResidentLoadAmounts {
+    if (mf.gliner_architecture != .boundary) return null;
+    const config = mf.gliner_boundary_config orelse return error.InvalidGlinerBoundaryConfig;
+    if (mf.gliner_boundary_bundle) |receipt| {
+        if (receipt.value.precision != .fp32) return null;
+    } else if (mf.usesGgufWeights()) return null;
+    const admitted = try boundary_resident.estimate(config.backbone);
+    if (source_bytes < admitted.weight_bytes) return error.InvalidGlinerBoundaryTensorByteLength;
+    const resident = runtime.tier.memory.AdmissionAmounts{
+        .host_weight_bytes = try std.math.add(usize, source_bytes, admitted.host_metadata_bytes),
+        .backend_weight_bytes = admitted.model_device_bytes,
+    };
+    var peak = resident;
+    peak.host_weight_bytes = try std.math.add(usize, peak.host_weight_bytes, source_bytes / 4);
+    peak.host_scratch_bytes = admitted.upload_staging_bytes;
+    peak.backend_scratch_bytes = admitted.derived_preparation_device_bytes;
+    return .{ .peak = peak, .resident = resident };
 }
 
 pub const UnsupportedTensorTypeCount = struct {
@@ -579,7 +667,7 @@ pub fn createNativeSession(allocator: std.mem.Allocator, model_path: []const u8)
 }
 
 pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
-    const direct_quant_enabled = directQuantEnabled();
+    var direct_quant_enabled = directQuantEnabled();
     const cpu_plan_context = defaultPlanContextForBackend(.cpu);
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
     defer mf.deinit();
@@ -588,6 +676,18 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     var arch_config = try detectArchitecture(allocator, model_path, mf);
     // Determine weight prefix for the native backend (strip from source tensor names)
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
+    var store_owned = true;
+    errdefer if (store_owned) store.deinit();
+    if (arch_config == .gliner_boundary) {
+        try validateNativeBoundaryWeights(allocator, mf, arch_config.gliner_boundary, store);
+        // Reduced bundles retain their declared quantized storage. FP32
+        // checkpoints never acquire an implicit quantization profile.
+        direct_quant_enabled = if (mf.gliner_boundary_bundle) |receipt| switch (receipt.value.precision) {
+            .q8_0, .q4_k, .q4_0 => true,
+            else => false,
+        } else false;
+    }
+    const boundary_identity = if (arch_config == .gliner_boundary) try captureBoundaryIdentity(&mf, store) else null;
     if (mf.usesGgufWeights()) {
         if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
             defer {
@@ -610,12 +710,12 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
         .florence => "", // Florence2 uses full names (davit.*, model.decoder.*)
         .clip => "", // CLIP uses full names (text_model.*, vision_model.*)
         .clap => "", // CLAP uses full names (text_model.*, audio_model.*)
-        .gliner => "encoder", // GLiNER wraps DeBERTa encoder; span_rep/count_embed keep full names
+        .gliner, .gliner_boundary => "encoder", // GLiNER wraps DeBERTa encoder; span_rep/count_embed keep full names
         .layoutlmv3 => |cfg| cfg.effectivePrefix(),
     };
 
     // Detect prefix override from actual weight names
-    const is_gliner = arch_config == .gliner;
+    const is_gliner = arch_config == .gliner or arch_config == .gliner_boundary;
     const actual_prefix = blk: {
         if (is_gliner) break :blk prefix; // GLiNER uses "encoder" prefix, no auto-detection
         switch (arch_config) {
@@ -659,7 +759,8 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
 
     var resident_weights = std.StringHashMapUnmanaged(LoadedWeight){};
     var lazy_weights = std.StringHashMapUnmanaged(LazyWeightEntry){};
-    errdefer {
+    var maps_owned = true;
+    errdefer if (maps_owned) {
         var wit = resident_weights.iterator();
         while (wit.next()) |entry| {
             var w = entry.value_ptr.*;
@@ -674,8 +775,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
             allocator.free(entry.key_ptr.*);
         }
         lazy_weights.deinit(allocator);
-        store.deinit();
-    }
+    };
 
     for (all_names) |full_name| {
         if (try appendPackedMoeLazyWeights(allocator, &lazy_weights, store, arch_config, full_name, cpu_plan_context)) {
@@ -693,19 +793,22 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
         var key_buf: [256]u8 = undefined;
         const key = try normalizeWeightKey(store.kind(), arch_config, base_key, &key_buf);
         const owned_key = try allocator.dupe(u8, key);
+        var key_owned = true;
+        defer if (key_owned) allocator.free(owned_key);
         if (shouldLazyLoadWeight(store.kind(), arch_config, key)) {
             if (lazy_weights.contains(key)) {
-                allocator.free(owned_key);
                 continue;
             }
             const expert_coord = parseMoeExpertCoord(key);
-            const tensor_ref = try store.describeTensor(allocator, full_name);
+            var tensor_ref = try store.describeTensor(allocator, full_name);
+            errdefer tensor_ref.deinit(allocator);
             try lazy_weights.put(allocator, owned_key, .{
                 .tensor_ref = tensor_ref,
                 .expert_coord = expert_coord,
                 .projection_mask = if (expert_coord != null) projectionMaskForWeightKey(key) else 0,
                 .placement = runtime.tier.planner.planForContext(cpu_plan_context, key, tensor_ref.byte_len),
             });
+            key_owned = false;
             continue;
         }
 
@@ -716,10 +819,9 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
                 ref.deinit(allocator);
             }
             const storage = (try store.loadQuantizedStorageRef(&tensor_ref)) orelse {
-                allocator.free(owned_key);
                 return error.UnsupportedTensorType;
             };
-            const weight: LoadedWeight = .{
+            var weight: LoadedWeight = .{
                 .tensor = .{
                     .data = &.{},
                     .dtype = .f32,
@@ -732,20 +834,22 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
                 .quantized = true,
                 .quantized_storage = storage,
             };
+            errdefer weight.deinit();
             try resident_weights.put(allocator, owned_key, weight);
+            key_owned = false;
             continue;
         }
 
-        var tensor_ref = store.describeTensor(allocator, full_name) catch {
-            allocator.free(owned_key);
+        var tensor_ref = store.describeTensor(allocator, full_name) catch |err| {
+            if (arch_config == .gliner_boundary or err == error.OutOfMemory) return err;
             continue;
         };
         defer {
             var ref = tensor_ref;
             ref.deinit(allocator);
         }
-        var weight = store.loadTensorRef(&tensor_ref) catch {
-            allocator.free(owned_key);
+        var weight = store.loadTensorRef(&tensor_ref) catch |err| {
+            if (arch_config == .gliner_boundary or err == error.OutOfMemory) return err;
             continue;
         };
         errdefer weight.deinit();
@@ -757,6 +861,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
             }
         }
         try resident_weights.put(allocator, owned_key, weight);
+        key_owned = false;
     }
 
     if (store.kind() != .gguf) {
@@ -774,7 +879,10 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
 
     const keep_store = shouldRetainTensorStore(store.kind(), lazy_weights.count());
     const resident_store = if (keep_store) store else null;
-    if (!keep_store) store.deinit();
+    if (!keep_store) {
+        store.deinit();
+        store_owned = false;
+    }
     const moe_num_experts = switch (arch_config) {
         .gpt => |cfg| cfg.num_local_experts,
         else => 0,
@@ -787,12 +895,13 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
         runtime.tier.cache.SharedCache.init(runtime.tier.cache.defaultBudgetForBackend(.cpu))
     else
         null;
-    errdefer {
+    var residency_owned = true;
+    errdefer if (residency_owned) {
         if (residency) |value| {
             var v = value;
             v.deinit();
         }
-    }
+    };
 
     const task = sessionTaskForModelType(mf.model_type, override);
     const impl = try allocator.create(ArchSession);
@@ -806,6 +915,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
             task,
         ),
         .backend_type = .native,
+        .boundary_identity = boundary_identity,
         .backend_data = .{ .native = .{
             .allocator = allocator,
             .resident_weights = resident_weights,
@@ -817,6 +927,9 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
             .allow_direct_quant = direct_quant_enabled,
         } },
     };
+    maps_owned = false;
+    store_owned = false;
+    residency_owned = false;
     errdefer archClose(impl);
     native_mod.initPrefetchQueue(&impl.backend_data.native, allocator);
     {
@@ -859,6 +972,7 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     defer mf.deinit();
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
+    if (arch_config == .gliner_boundary) return error.UnsupportedGlinerBoundaryBackend;
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
     if (mf.usesGgufWeights()) {
         if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
@@ -882,11 +996,11 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
         .florence => "",
         .clip => "",
         .clap => "",
-        .gliner => "encoder",
+        .gliner, .gliner_boundary => "encoder",
         .layoutlmv3 => |cfg| cfg.effectivePrefix(),
     };
 
-    const is_gliner = arch_config == .gliner;
+    const is_gliner = arch_config == .gliner or arch_config == .gliner_boundary;
     const actual_prefix = blk: {
         if (is_gliner) break :blk prefix;
         switch (arch_config) {
@@ -1335,6 +1449,8 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
 
     var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
     defer model_manifest.deinit();
+    try model_manifest.requireRecognizedGlinerArchitecture();
+    if (model_manifest.gliner_architecture == .boundary) return error.UnsupportedGlinerBoundaryBackend;
     const a4b_inference = try resolveCudaA4bInferenceConfigForModelListing(
         allocator,
         model_path,
@@ -1749,7 +1865,7 @@ fn loadSafetensorsIntoResident(
     }
     return switch (arch_config) {
         .t5, .gpt, .whisper, .florence, .clip, .clap, .modern_bert, .nomic_bert => "",
-        .gliner => "encoder",
+        .gliner, .gliner_boundary => "encoder",
         .deberta => "deberta",
         .layoutlmv3 => "layoutlmv3",
         .bert => |cfg| detected: {
@@ -1806,6 +1922,8 @@ fn createGpuHostedSessionWithTaskOverride(
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
+    if (arch_config == .gliner_boundary and backend_type != .metal) return error.UnsupportedGlinerBoundaryBackend;
+    var boundary_identity: ?boundary_bundle.Identity = null;
     // BGE-M3 publishes an F32 checkpoint and its dense embedding contract is
     // expected to preserve those weights. Treating SafeTensors F32 storage as
     // a generic direct-quant source silently staged every projection to Q8_0,
@@ -1872,18 +1990,24 @@ fn createGpuHostedSessionWithTaskOverride(
         a4bGpuHostedBudgetPolicy(config)
     else
         gpuHostedBudgetPolicy(backend_type, model_weight_bytes, mf, arch_config, quant_mode);
-    const prefer_f32_dense_tensors = budget_policy.prefer_f32_dense_tensors;
+    // Boundary artifacts have an exact per-tensor precision contract. Keep
+    // original F16 matrix bytes available to the strict resident operations.
+    const prefer_f32_dense_tensors = if (arch_config == .gliner_boundary) false else budget_policy.prefer_f32_dense_tensors;
     const budget_floor = budget_policy.budget_floor;
     const shared_cache_floor = budget_policy.shared_cache_floor;
     const plan_context = budget_policy.plan_context;
 
     const resident_prefix: []const u8 = if (mf.safetensors_path != null or mf.safetensors_index_path != null or mf.gguf_path != null) blk: {
         tensor_store = try tensor_store_mod.openFromManifest(allocator, mf);
+        if (arch_config == .gliner_boundary) {
+            try validateNativeBoundaryWeights(allocator, mf, arch_config.gliner_boundary, tensor_store.?);
+            boundary_identity = try captureBoundaryIdentity(&mf, tensor_store.?);
+        }
         const source = (try tensor_store.?.weightSource()) orelse return error.NoDenseWeightSource;
         const all_names = try source.listNames(allocator);
         defer allocator.free(all_names);
         try maybeInferGptAttentionLayoutFromStore(allocator, tensor_store.?, all_names, &arch_config);
-        const is_gliner = arch_config == .gliner;
+        const is_gliner = arch_config == .gliner or arch_config == .gliner_boundary;
         const actual_prefix = detected: {
             if (is_gliner) break :detected "encoder";
             switch (arch_config) {
@@ -1941,10 +2065,19 @@ fn createGpuHostedSessionWithTaskOverride(
                     full_name;
                 var key_buf: [256]u8 = undefined;
                 const key = try normalizeWeightKey(tensor_store.?.kind(), arch_config, base_key, &key_buf);
-                if (lazy_weights.contains(key)) continue;
+                if (lazy_weights.contains(key)) {
+                    if (arch_config == .gliner_boundary) return error.DuplicateGlinerBoundaryWeight;
+                    continue;
+                }
                 const expert_coord = parseMoeExpertCoord(key);
                 const tensor_ref = try tensor_store.?.describeTensor(allocator, full_name);
-                try lazy_weights.put(allocator, try allocator.dupe(u8, key), .{
+                errdefer {
+                    var owned_ref = tensor_ref;
+                    owned_ref.deinit(allocator);
+                }
+                const owned_key = try allocator.dupe(u8, key);
+                errdefer allocator.free(owned_key);
+                try lazy_weights.put(allocator, owned_key, .{
                     .tensor_ref = tensor_ref,
                     .expert_coord = expert_coord,
                     .projection_mask = if (expert_coord != null) projectionMaskForWeightKey(key) else 0,
@@ -2018,6 +2151,7 @@ fn createGpuHostedSessionWithTaskOverride(
         .allocator = allocator,
         .arch_config = arch_config,
         .task = task,
+        .boundary_identity = boundary_identity,
         .deberta_reranker_weight_mirrors = sessionEnablesDebertaRerankerWeightMirrors(
             mf.model_type,
             std.meta.activeTag(arch_config),
@@ -2044,12 +2178,25 @@ fn createGpuHostedSessionWithTaskOverride(
             .allow_direct_quant = session_direct_quant_enabled,
             .quant_execution_mode = quant_mode,
             .prefer_f32_dense_tensors = prefer_f32_dense_tensors,
+            .allow_immutable_f32_weight_borrow = sessionEnablesImmutableF32WeightBorrow(
+                backend_type,
+                std.meta.activeTag(arch_config),
+                task,
+            ),
             .jina_lora_adapter = gpu_jina_lora_adapter,
         }),
     };
     backend_resources_transferred = true;
     gpu_jina_lora_adapter = null;
     errdefer archClose(impl);
+    if (comptime build_options.enable_metal) {
+        if (boundary_identity) |identity| if (identity.precision == .fp32) {
+            // Only metadata is attached here. The managed loader supplies its
+            // request control and admitted peak to the preparation hook before it
+            // publishes the session. Unmanaged owners call that same hook explicitly.
+            gpuBackendData(impl).boundary_resident = try boundary_resident.Owner.create(allocator, identity);
+        };
+    }
     // Build and qualify the model-scoped provider before publishing the
     // session. Required mode therefore fails model loading, and subsequent
     // compute wrappers reuse the already-initialized shared provider.
@@ -2070,6 +2217,19 @@ fn createGpuHostedSessionWithTaskOverride(
     return .{ .ptr = impl, .vtable = &arch_vtable };
 }
 
+test "gliner boundary cannot fall through to legacy session architecture" {
+    const allocator = std.testing.allocator;
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .gliner_architecture = .boundary,
+    };
+    try std.testing.expectError(error.InvalidGlinerBoundaryConfig, detectArchitecture(
+        allocator,
+        "/private/tmp/antfly-gliner25-intentionally-missing",
+        manifest,
+    ));
+}
+
 /// Detect the model architecture from config.json.
 fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest) !ArchConfig {
     return detectArchitectureWithGgufFile(allocator, model_path, mf, null);
@@ -2081,6 +2241,13 @@ fn detectArchitectureWithGgufFile(
     mf: manifest_mod.ModelManifest,
     parsed_gguf: ?*const gguf_mod.format.File,
 ) !ArchConfig {
+    // Recognize a boundary checkpoint before the legacy span branches. Public
+    // qualification remains gated independently of this internal typed loader.
+    try mf.requireRecognizedGlinerArchitecture();
+    if (mf.gliner_architecture == .boundary) {
+        const config = mf.gliner_boundary_config orelse return error.InvalidGlinerBoundaryConfig;
+        return .{ .gliner_boundary = config };
+    }
     // Try to read config.json for model_type
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_path});
     defer allocator.free(config_path);
@@ -2090,20 +2257,19 @@ fn detectArchitectureWithGgufFile(
 
         if (try detectModelType(allocator, config_bytes)) |model_type| {
             defer allocator.free(model_type);
+            if (std.mem.eql(u8, model_type, "extractor")) {
+                // Original Fastino checkpoints keep wrapper metadata here and
+                // the actual DeBERTa geometry/activation in a local sidecar.
+                var cfg = try loadLegacyGlinerEncoderConfig(allocator, model_path);
+                try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
+                return .{ .gliner = cfg };
+            }
             if (mf.gliner_model_type.len > 0) {
                 // Split GLiNER bundles keep the DeBERTa encoder config in
                 // config.json and use antfly_inference_bundle/gliner_config sidecars
                 // to identify the GLiNER wrapper.
                 var cfg = try deberta_mod.parseConfig(allocator, config_bytes);
                 try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
-                return .{ .gliner = cfg };
-            }
-            if (std.mem.eql(u8, model_type, "extractor")) {
-                // GLiNER2: DeBERTa encoder + span classification head
-                var cfg = deberta_mod.Config{};
-
-                try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
-
                 return .{ .gliner = cfg };
             }
             if (modern_bert_arch.isModernBertModel(model_type)) {
@@ -2164,6 +2330,34 @@ fn detectArchitectureWithGgufFile(
 
     // Default: BERT
     return .{ .bert = makeBertConfig(mf) };
+}
+
+const legacy_gliner_encoder_config_max_bytes: usize = 1024 * 1024;
+
+fn loadLegacyGlinerEncoderConfig(allocator: std.mem.Allocator, model_path: []const u8) !deberta_mod.Config {
+    const io = compat.io();
+    const managed_receipt = @import("../registry/managed_receipt.zig");
+    var receipt = try managed_receipt.loadValidated(allocator, io, model_path);
+    defer if (receipt) |*validated| validated.deinit();
+    // Match manifest/ModelManager sidecar resolution: a managed receipt is
+    // authoritative, and unmanaged local aliases must stay inside the model
+    // root. Never resolve the wrapper's encoder-name/remote locator.
+    const config_path: ?[]u8 = if (receipt) |*validated|
+        if (validated.find("encoder_config/config.json")) |artifact|
+            try allocator.dupe(u8, artifact.canonical_path)
+        else
+            null
+    else
+        managed_receipt.resolveContainedArtifactPath(allocator, io, model_path, "encoder_config/config.json") catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+    defer if (config_path) |path| allocator.free(path);
+    const path = config_path orelse return .{};
+    const snapshot = @import("../runtime/file_snapshot.zig");
+    const bytes = try snapshot.read(allocator, io, compat.cwd(), path, legacy_gliner_encoder_config_max_bytes, null);
+    defer allocator.free(bytes);
+    return deberta_mod.parseConfig(allocator, bytes);
 }
 
 fn detectArchitectureFromOptionalGgufFile(
@@ -3702,6 +3896,22 @@ fn shouldKeepResidentWeightQuantizedOnly(
         break :blk tensor.tensor_type;
     } else null;
 
+    if (arch_config == .gliner_boundary) {
+        const policy = @import("../models/gliner_boundary_artifact.zig");
+        for (policy.specs(arch_config.gliner_boundary.backbone)) |spec| {
+            if (!std.mem.eql(u8, spec.name, source_name)) continue;
+            if (policy.role(spec) != .encoder_matrix) return error.InvalidGlinerBoundaryTensorType;
+            return switch (tensor_type orelse return error.InvalidGlinerBoundaryTensorType) {
+                .known => |known| switch (known) {
+                    .Q8_0, .Q4_0, .Q4_K => true,
+                    else => return error.UnsupportedGlinerBoundaryPrecision,
+                },
+                else => return error.UnsupportedGlinerBoundaryPrecision,
+            };
+        }
+        return error.InvalidGlinerBoundaryTensorName;
+    }
+
     if (isGptEmbeddingTableKey(key)) {
         var storage = (try store.loadQuantizedStorageRef(&tensor_ref)) orelse return false;
         defer storage.deinit();
@@ -3766,8 +3976,15 @@ fn shouldKeepResidentClipClapWeightQuantizedOnly(
 
 fn shouldKeepGpuHostedLazyWeightDense(backend_type: BackendType, arch_config: ArchConfig, key: []const u8) bool {
     _ = backend_type;
-    _ = arch_config;
-    _ = key;
+    if (arch_config == .gliner_boundary) {
+        const policy = @import("../models/gliner_boundary_artifact.zig");
+        for (policy.specs(arch_config.gliner_boundary.backbone)) |spec| {
+            if (std.mem.eql(u8, glinerBaseWeightKey(spec.name), key)) return policy.role(spec) != .encoder_matrix;
+        }
+        // The inventory admission rejects unknown tensors before this point.
+        // Preserve dense bytes if a future caller reaches an unknown key.
+        return true;
+    }
     return false;
 }
 
@@ -4419,6 +4636,12 @@ fn sessionDirectQuantEnabled(
     manifest: manifest_mod.ModelManifest,
     arch_config: ArchConfig,
 ) bool {
+    if (arch_config == .gliner_boundary) {
+        return if (manifest.gliner_boundary_bundle) |receipt| switch (receipt.value.precision) {
+            .q8_0, .q4_0, .q4_k => true,
+            .fp32, .fp16_encoder => false,
+        } else false;
+    }
     return direct_quant_enabled and !isBgeM3DenseEncoder(manifest, arch_config);
 }
 
@@ -4507,6 +4730,16 @@ fn openGpuHostedStream(backend_type: BackendType) !GpuHostedStream {
 fn ensureMetalHostedSessionAvailable() !void {
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     if (!metal_runtime.metalDeviceAvailable()) return error.MetalDeviceUnavailable;
+}
+
+test "gpu-hosted Metal disabled constructors reject before model allocation" {
+    if (comptime build_options.enable_metal) return error.SkipZigTest;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const allocator = failing.allocator();
+    const missing_model = "/private/tmp/antfly-metal-disabled-intentionally-missing";
+    try std.testing.expectError(error.MetalNotEnabled, createMetalSession(allocator, missing_model));
+    try std.testing.expectError(error.MetalNotEnabled, createMetalSessionWithTaskOverride(allocator, missing_model, .classifier));
+    try std.testing.expect(!failing.has_induced_failure);
 }
 
 test "gpu-hosted Metal availability gate agrees with linked runtime probe" {
@@ -4859,6 +5092,7 @@ const GpuHostedBackendInit = struct {
     allow_direct_quant: bool,
     quant_execution_mode: GpuHostedQuantExecutionMode,
     prefer_f32_dense_tensors: bool,
+    allow_immutable_f32_weight_borrow: bool = false,
     jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null,
 };
 
@@ -4883,6 +5117,7 @@ fn makeGpuHostedBackendData(
         .allow_direct_quant = init.allow_direct_quant,
         .quant_execution_mode = init.quant_execution_mode,
         .prefer_f32_dense_tensors = init.prefer_f32_dense_tensors,
+        .allow_immutable_f32_weight_borrow = init.allow_immutable_f32_weight_borrow,
         .mirror_kv_to_manager = false,
         .jina_lora_adapter = init.jina_lora_adapter,
     };
@@ -5353,6 +5588,40 @@ test "sessionTaskForModelType maps classifier and recognizer tasks" {
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
+test "legacy GLiNER immutable F32 borrow policy excludes generic training and other sessions" {
+    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.recognizer, null)));
+    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.recognizer, .recognizer)));
+    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.recognizer, .generic)));
+    inline for (std.meta.tags(BackendType)) |backend_type| {
+        inline for (std.meta.tags(ArchType)) |arch_type| {
+            inline for (std.meta.tags(SessionTask)) |task| {
+                const expected = backend_type == .metal and arch_type == .gliner and task == .recognizer;
+                try std.testing.expectEqual(expected, sessionEnablesImmutableF32WeightBorrow(backend_type, arch_type, task));
+            }
+        }
+    }
+    if (comptime build_options.enable_metal) {
+        for ([_]bool{ false, true }) |enabled| {
+            const backend = makeGpuHostedBackendData(.metal, .{
+                .allocator = std.testing.allocator,
+                .resident_weight_estimate_bytes = 0,
+                .prefix = "",
+                .lazy_weights = .empty,
+                .tensor_store = null,
+                .moe_num_experts = 0,
+                .a4b_inference = null,
+                .residency = null,
+                .tier_cache = null,
+                .allow_direct_quant = true,
+                .quant_execution_mode = .prefer_backend_dense,
+                .prefer_f32_dense_tensors = false,
+                .allow_immutable_f32_weight_borrow = enabled,
+            });
+            try std.testing.expectEqual(enabled, backend.metal.allow_immutable_f32_weight_borrow);
+        }
+    }
+}
+
 test "DeBERTa fast-path admission covers direct classifiers and reranker mirrors" {
     try std.testing.expect(!debertaRerankerPrefersWeightMirrors(false, 1, 512));
     try std.testing.expect(!debertaRerankerPrefersWeightMirrors(true, 1, 127));
@@ -5424,6 +5693,127 @@ test "detectArchitecture recognizes generic deberta classifier configs" {
         .deberta => |cfg| try std.testing.expectEqual(@as(u32, 3), cfg.num_labels),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "legacy GLiNER architecture reads local encoder sidecar and preserves label overrides" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\",\"encoder_name\":\"ignored/remote-model\"}" });
+    try tmp.dir.createDir(io, "encoder_config", .default_dir);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "encoder_config/config.json",
+        .data = "{\"model_type\":\"deberta-v2\",\"hidden_size\":64,\"num_hidden_layers\":2,\"num_attention_heads\":4,\"intermediate_size\":128,\"vocab_size\":99,\"max_position_embeddings\":32,\"position_buckets\":16,\"layer_norm_eps\":0.000001,\"hidden_act\":\"gelu\"}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "added_tokens.json", .data = "{\"[C]\":88,\"[E]\":89,\"[R]\":90}" });
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+    const mf = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .recognizer, .gliner_token_e = 87 };
+    const arch = try detectArchitecture(allocator, model_dir, mf);
+    try std.testing.expect(arch == .gliner);
+    const cfg = arch.gliner;
+    try std.testing.expectEqual(@as(u32, 64), cfg.hidden_size);
+    try std.testing.expectEqual(@as(u32, 2), cfg.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 4), cfg.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 128), cfg.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 99), cfg.vocab_size);
+    try std.testing.expectEqual(@as(u32, 32), cfg.max_position_embeddings);
+    try std.testing.expectEqual(@as(u32, 16), cfg.position_buckets);
+    try std.testing.expectEqual(@as(f32, 0.000001), cfg.layer_norm_eps);
+    try std.testing.expect(cfg.use_exact_gelu);
+    try std.testing.expectEqual(@as(i64, 88), cfg.classification_token_id);
+    try std.testing.expectEqual(@as(i64, 89), cfg.entity_token_id);
+    try std.testing.expectEqual(@as(i64, 90), cfg.relation_token_id);
+    var wrapped_manifest = mf;
+    wrapped_manifest.gliner_model_type = "gliner2";
+    try std.testing.expectEqual(cfg, (try detectArchitecture(allocator, model_dir, wrapped_manifest)).gliner);
+}
+
+test "legacy GLiNER absent encoder sidecar keeps defaults while malformed present config rejects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\"}" });
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+    const mf = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .recognizer };
+    try std.testing.expectEqual(deberta_mod.Config{}, (try detectArchitecture(allocator, model_dir, mf)).gliner);
+    try tmp.dir.createDir(io, "encoder_config", .default_dir);
+    try std.testing.expectEqual(deberta_mod.Config{}, (try detectArchitecture(allocator, model_dir, mf)).gliner);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = "{" });
+    try std.testing.expectError(error.UnexpectedEndOfInput, detectArchitecture(allocator, model_dir, mf));
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = "[]" });
+    try std.testing.expectError(error.InvalidDebertaConfig, detectArchitecture(allocator, model_dir, mf));
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = "{\"hidden_act\":\"relu\"}" });
+    try std.testing.expectError(error.UnsupportedDebertaActivation, detectArchitecture(allocator, model_dir, mf));
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = "{\"hidden_act\":\"gelu_new\"}" });
+    try std.testing.expect(!(try detectArchitecture(allocator, model_dir, mf)).gliner.use_exact_gelu);
+}
+
+test "legacy GLiNER encoder sidecar bounds regular input and recovers after allocation failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "encoder_config", .default_dir);
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+    {
+        const oversized = try tmp.dir.createFile(io, "encoder_config/config.json", .{});
+        defer oversized.close(io);
+        try oversized.setLength(io, legacy_gliner_encoder_config_max_bytes + 1);
+    }
+    try std.testing.expectError(error.SnapshotLimitExceeded, loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try tmp.dir.deleteFile(io, "encoder_config/config.json");
+    try tmp.dir.createDir(io, "encoder_config/config.json", .default_dir);
+    try std.testing.expectError(error.InvalidModelArtifactKind, loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try tmp.dir.deleteDir(io, "encoder_config/config.json");
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = "{\"hidden_size\":64,\"hidden_act\":\"gelu\"}" });
+    const Check = struct {
+        fn run(a: std.mem.Allocator, path: []const u8) !void {
+            const cfg = try loadLegacyGlinerEncoderConfig(a, path);
+            try std.testing.expectEqual(@as(u32, 64), cfg.hidden_size);
+            try std.testing.expect(cfg.use_exact_gelu);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
+    try Check.run(allocator, model_dir);
+}
+
+test "legacy GLiNER encoder sidecar obeys managed inventory and root containment" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const managed_receipt = @import("../registry/managed_receipt.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model/encoder_config");
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.json", .data = "{\"hidden_act\":\"gelu\"}" });
+    try tmp.dir.symLink(io, "../../outside.json", "model/encoder_config/config.json", .{});
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try tmp.dir.deleteFile(io, "model/encoder_config/config.json");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/encoder.json", .data = "{\"hidden_act\":\"gelu\"}" });
+    try tmp.dir.symLink(io, "../encoder.json", "model/encoder_config/config.json", .{});
+    try std.testing.expect((try loadLegacyGlinerEncoderConfig(allocator, model_dir)).use_exact_gelu);
+
+    // A complete managed publication may omit optional encoder metadata. An
+    // unrelated local sidecar must not silently override that admitted set.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.safetensors", .data = "payload" });
+    const receipt_path = "model/" ++ managed_receipt.complete_filename;
+    try tmp.dir.writeFile(io, .{
+        .sub_path = receipt_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.safetensors\",\"size\":7}]}",
+    });
+    try std.testing.expectEqual(deberta_mod.Config{}, try loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try tmp.dir.writeFile(io, .{
+        .sub_path = receipt_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.safetensors\",\"size\":7},{\"path\":\"encoder_config/config.json\",\"size\":21}]}",
+    });
+    try std.testing.expect((try loadLegacyGlinerEncoderConfig(allocator, model_dir)).use_exact_gelu);
 }
 
 test "detectArchitecture preserves exact GELU for BGE-M3 XLM-R config" {
@@ -6011,6 +6401,7 @@ const BackendData = union {
 const ArchSession = struct {
     allocator: std.mem.Allocator,
     arch_config: ArchConfig,
+    boundary_identity: ?boundary_bundle.Identity = null,
     task: SessionTask = .generic,
     /// Only real DeBERTa reranker sessions may trade persistent mirror memory
     /// for the resident fused-layer path. Generic classifiers stay unchanged.
@@ -6415,6 +6806,7 @@ fn makeComputeBackend(
                 NativeCompute.initWithIo(allocator, &self.backend_data.native, run_budget, io_handle)
             else
                 NativeCompute.init(allocator, &self.backend_data.native, run_budget);
+            if (self.arch_config == .gliner_boundary) compute.quantized_activation_policy = .strict_f32;
             break :blk compute.computeBackend();
         },
         .metal => try makeGpuHostedComputeBackend(self, allocator, run_budget),
@@ -6751,12 +7143,21 @@ pub const ManagedComputeBackend = struct {
     backend: ops.ComputeBackend,
     guard: @import("../execution_control.zig").UninterruptibleGuard,
     owns_backend: bool = true,
+    workspace_borrow: ?boundary_resident.Workspace.Borrow = null,
 
     pub fn deinit(self: *ManagedComputeBackend) void {
         if (!self.owns_backend) return;
         self.owns_backend = false;
         defer self.guard.deinit();
         self.backend.deinit();
+        if (self.workspace_borrow) |*borrow| {
+            // A completed backend must have drained its frame and released all
+            // physical views. Reusing or unloading an aliased arena is unsafe.
+            // Preserve the established process-required fatal boundary without
+            // entering synchronous logging or C teardown on this impossible path.
+            borrow.finish() catch platform.inference_process_supervisor.restartWorker();
+        }
+        self.workspace_borrow = null;
     }
 };
 
@@ -6765,17 +7166,255 @@ pub fn getComputeBackendWithControl(
     allocator: std.mem.Allocator,
     control: ?InferenceExecutionControl,
 ) !ManagedComputeBackend {
-    if (control) |active| try active.check();
-    var guard = if (control) |active|
-        try active.enterUninterruptible(session.interruption())
-    else
-        @import("../execution_control.zig").UninterruptibleGuard{};
+    return getManagedComputeBackend(session, allocator, null, control);
+}
+
+/// Binds both request memory admission and cancellation to a direct model
+/// pipeline. Neither owner is stored on a shared native backend instance.
+pub fn getManagedComputeBackend(
+    session: Session,
+    allocator: std.mem.Allocator,
+    run_budget: ?*runtime.tier.memory.RunBudget,
+    control: ?InferenceExecutionControl,
+) !ManagedComputeBackend {
+    // An omitted cooperative control must not waive process isolation for a
+    // cached accelerator session. Unmanaged offline callers can explicitly use
+    // getComputeBackend; this owner always enforces the session's contract.
+    const effective = control orelse InferenceExecutionControl{};
+    try effective.check();
+    var guard = try effective.enterUninterruptible(session.interruption());
     errdefer guard.deinit();
-    var cb = try getComputeBackend(session, allocator);
+    var cb = if (run_budget) |budget| try getComputeBackendWithBudget(session, allocator, budget) else try getComputeBackend(session, allocator);
     errdefer cb.deinit();
     cb.execution_control = control;
     if (control) |active| try active.check();
     return .{ .backend = cb, .guard = guard };
+}
+
+/// Prepare immutable FP32 state before publishing a model or reporting an
+/// offline worker ready. The caller owns load admission and model serialization.
+/// This hook independently preserves process protection through construction,
+/// synchronous device preparation, CB cleanup, and failed partial-table cleanup.
+/// CPU and reduced artifacts retain their existing storage and execution path.
+pub fn prepareGlinerBoundaryResident(session: Session, control: ?InferenceExecutionControl) !void {
+    if (comptime !build_options.enable_metal) return;
+    if (session.vtable != &arch_vtable) return;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal or self.arch_config != .gliner_boundary) return;
+    const data = gpuBackendData(self);
+    const owner = data.boundary_resident orelse return;
+    const effective = control orelse InferenceExecutionControl{};
+    try effective.check();
+    if (owner.isReady()) return;
+    var protection = try effective.enterUninterruptible(session.interruption());
+    defer protection.deinit();
+    errdefer owner.abortPreparation();
+    {
+        // Physical tensor ownership records produced for constants must belong
+        // to this session allocator, never to a caller's request arena.
+        var cb = try getComputeBackend(session, self.allocator);
+        defer cb.deinit();
+        cb.execution_control = control;
+        const provider = data.shared_metal_native_provider orelse return error.UnsupportedGlinerBoundaryDevice;
+        const runtime_identity: *anyopaque = @ptrCast(provider.raw_decode_runtime orelse return error.UnsupportedGlinerBoundaryDevice);
+        try owner.prepare(data.tensor_store orelse return error.UnsupportedGlinerBoundaryBundle, runtime_identity, control);
+        try cb.glinerBoundaryResidentPreparation(true);
+        var preparation_access = true;
+        defer if (preparation_access) cb.glinerBoundaryResidentPreparation(false) catch {};
+        try @import("gliner_boundary_engine_device.zig").prepareResidentConstants(&cb, self.allocator, &self.arch_config.gliner_boundary, control);
+        try cb.glinerBoundaryResidentPreparation(false);
+        preparation_access = false;
+    }
+    try effective.check();
+    try owner.finishPreparation();
+}
+
+/// Read only while holding the session/model lifetime and serialization lease.
+pub fn isGlinerBoundaryResidentReady(session: Session) bool {
+    if (comptime !build_options.enable_metal) return false;
+    if (session.vtable != &arch_vtable) return false;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal or self.arch_config != .gliner_boundary) return false;
+    const owner = gpuBackendData(self).boundary_resident orelse return false;
+    return owner.isReady();
+}
+
+pub const GlinerBoundaryResidentStats = struct {
+    model_live_bytes: usize = 0,
+    workspace_live_bytes: usize = 0,
+    workspace_capacity_bytes: usize = 0,
+    workspace_generation: u64 = 0,
+    generation: u64 = 0,
+    weight_upload_bytes: u64 = 0,
+    weight_upload_calls: u64 = 0,
+    ready: bool = false,
+};
+
+/// Snapshot only; never creates a CB, uploads, extends model TTL, or performs
+/// device synchronization. Do not call it after releasing the model/session.
+pub fn glinerBoundaryResidentStats(session: Session) !GlinerBoundaryResidentStats {
+    if (comptime !build_options.enable_metal) return .{};
+    if (session.vtable != &arch_vtable) return .{};
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal or self.arch_config != .gliner_boundary) return .{};
+    const owner = gpuBackendData(self).boundary_resident orelse return .{};
+    const stats = owner.stats();
+    const workspace = owner.workspace.stats();
+    return .{ .model_live_bytes = stats.resident_model_live_bytes, .workspace_live_bytes = workspace.live_bytes, .workspace_capacity_bytes = workspace.capacity_bytes, .workspace_generation = workspace.generation, .generation = stats.generation, .weight_upload_bytes = stats.weight_upload_bytes, .weight_upload_calls = stats.weight_upload_calls, .ready = owner.isReady() };
+}
+
+/// No lock, CB, allocation or ownership token. The model manager may call this
+/// only after excluding active handles and in-flight loads under its cache lock;
+/// a normal caller must instead hold the session's execution/lifetime lease.
+pub fn glinerBoundaryWorkspaceAdmissionAmounts(session: Session) runtime.tier.memory.AdmissionAmounts {
+    if (comptime !build_options.enable_metal) return .{};
+    if (session.vtable != &arch_vtable) return .{};
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal or self.arch_config != .gliner_boundary) return .{};
+    const owner = gpuBackendData(self).boundary_resident orelse return .{};
+    return owner.workspace.admittedAmounts();
+}
+
+test "gliner boundary workspace admission reader leaves foreign native and cold sessions untouched" {
+    const empty = runtime.tier.memory.AdmissionAmounts{};
+    var unrelated: u8 = 0;
+    var foreign = arch_vtable;
+    foreign.independentBatchRows = null;
+    try std.testing.expectEqual(empty, glinerBoundaryWorkspaceAdmissionAmounts(.{ .ptr = &unrelated, .vtable = &foreign }));
+    var self = ArchSession{
+        .allocator = std.testing.allocator,
+        .arch_config = .{ .gliner_boundary = std.mem.zeroes(gliner_boundary_model.Config) },
+        .backend_type = .native,
+        .backend_data = .{ .native = .{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty } },
+    };
+    const session = Session{ .ptr = &self, .vtable = &arch_vtable };
+    try std.testing.expectEqual(empty, glinerBoundaryWorkspaceAdmissionAmounts(session));
+    if (comptime build_options.enable_metal) {
+        self.backend_type = .metal;
+        self.backend_data = .{ .metal = .{ .allocator = std.testing.allocator, .prefix = "", .lazy_weights = .empty } };
+        try std.testing.expectEqual(empty, glinerBoundaryWorkspaceAdmissionAmounts(session));
+        try std.testing.expect(self.backend_data.metal.boundary_resident == null);
+        try std.testing.expect(self.backend_data.metal.shared_metal_native_provider == null);
+    }
+}
+
+/// Exact serial encoder geometry and the observed model-owned workspace slot.
+/// Snapshot under the model lock, release that lock before acquiring admission,
+/// then pass this value and its separate permit to the managed constructor.
+pub const GlinerBoundaryWorkspacePlan = struct {
+    batch: usize,
+    sequence: usize,
+    model_generation: u64,
+    observed_generation: u64,
+    observed_capacity_bytes: usize,
+    required_capacity_bytes: usize,
+    effective_capacity_bytes: usize,
+    max_product_elements: usize,
+    replacement_amounts: ?runtime.tier.memory.AdmissionAmounts,
+
+    fn init(model_generation: u64, workspace: boundary_resident.WorkspaceStats, batch: usize, sequence: usize, hidden: usize, intermediate: usize) !GlinerBoundaryWorkspacePlan {
+        if (workspace.active) return error.GlinerBoundaryWorkspaceBusy;
+        const geometry = try ops.gliner_boundary_device.EncoderWorkspacePlan.init(batch, sequence, hidden, intermediate);
+        return .{
+            .batch = batch,
+            .sequence = sequence,
+            .model_generation = model_generation,
+            .observed_generation = workspace.generation,
+            .observed_capacity_bytes = workspace.capacity_bytes,
+            .required_capacity_bytes = geometry.capacity_bytes,
+            .effective_capacity_bytes = @max(workspace.capacity_bytes, geometry.capacity_bytes),
+            .max_product_elements = geometry.max_product_elements,
+            .replacement_amounts = if (workspace.capacity_bytes < geometry.capacity_bytes)
+                try boundary_resident.Workspace.replacementAmounts(geometry.capacity_bytes)
+            else
+                null,
+        };
+    }
+
+    /// The existing encoder ceiling still covers workspace plus request-local
+    /// allocations. The workspace lease is retained separately, so subtract it
+    /// from both the execution owner ceiling and the transient admission amount.
+    pub fn requestEncoderLimit(self: GlinerBoundaryWorkspacePlan, encoder_limit_bytes: usize) !usize {
+        if (self.effective_capacity_bytes == 0 or self.effective_capacity_bytes >= encoder_limit_bytes)
+            return error.ResourceLimitExceeded;
+        return encoder_limit_bytes - self.effective_capacity_bytes;
+    }
+};
+
+fn readyGlinerBoundaryResident(session: Session) !*boundary_resident.Owner {
+    if (comptime !build_options.enable_metal) return error.UnsupportedGlinerBoundaryDevice;
+    if (session.vtable != &arch_vtable) return error.NotArchSession;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal or self.arch_config != .gliner_boundary) return error.UnsupportedGlinerBoundaryDevice;
+    const owner = gpuBackendData(self).boundary_resident orelse return error.UnsupportedGlinerBoundaryPrecision;
+    if (!owner.isReady()) return error.GlinerBoundaryResidentNotPrepared;
+    return owner;
+}
+
+/// Pure scalar planning: no CB creation, allocation, admission or device work.
+/// The caller supplies actual padded token geometry, never a configured maximum.
+pub fn planGlinerBoundaryWorkspace(session: Session, batch: usize, sequence: usize) !GlinerBoundaryWorkspacePlan {
+    const owner = try readyGlinerBoundaryResident(session);
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const config = self.arch_config.gliner_boundary.encoder;
+    return GlinerBoundaryWorkspacePlan.init(owner.generation, owner.workspace.stats(), batch, sequence, config.hidden_size, config.intermediate_size);
+}
+
+/// Uses only a previously acquired exact replacement permit. This function
+/// runs under the caller's model lock and the CB's provider lease; it must never
+/// call admission or eviction. A racing growth is rejected before creating a
+/// backend or consuming the caller's permit, allowing an outside-lock retry.
+pub fn getManagedGlinerBoundaryComputeBackend(
+    session: Session,
+    allocator: std.mem.Allocator,
+    run_budget: ?*runtime.tier.memory.RunBudget,
+    control: ?InferenceExecutionControl,
+    plan: GlinerBoundaryWorkspacePlan,
+    replacement_permit: ?*runtime.tier.memory.AdmissionLease,
+) !ManagedComputeBackend {
+    if (comptime !build_options.enable_metal) return error.UnsupportedGlinerBoundaryDevice;
+    const effective = control orelse InferenceExecutionControl{};
+    try effective.check();
+    const current = try planGlinerBoundaryWorkspace(session, plan.batch, plan.sequence);
+    if (!std.meta.eql(current, plan)) return error.GlinerBoundaryWorkspacePlanChanged;
+    const owner = try readyGlinerBoundaryResident(session);
+    var managed = try getManagedComputeBackend(session, allocator, run_budget, control);
+    errdefer managed.deinit();
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const provider = gpuBackendData(self).shared_metal_native_provider orelse return error.UnsupportedGlinerBoundaryDevice;
+    const runtime_identity: *anyopaque = @ptrCast(provider.raw_decode_runtime orelse return error.UnsupportedGlinerBoundaryDevice);
+    try owner.checkRuntime(runtime_identity);
+    if (plan.replacement_amounts != null) {
+        const permit = replacement_permit orelse return error.InvalidGlinerBoundaryWorkspaceAdmission;
+        var pending = try owner.workspace.prepareReplacement(runtime_identity, owner.generation, plan.required_capacity_bytes, permit, control);
+        defer pending.deinit();
+        try owner.workspace.install(&pending);
+    }
+    try effective.check();
+    managed.workspace_borrow = try owner.workspace.begin(runtime_identity, owner.generation);
+    // Only this architecture's Metal constructor supplied this concrete CB.
+    // The backend copies the borrow's generation/epoch and never finishes it.
+    const compute: *MetalCompute = @ptrCast(@alignCast(managed.backend.ptr));
+    try compute.bindBoundaryWorkspace(&managed.workspace_borrow.?, plan.max_product_elements);
+    try effective.check();
+    return managed;
+}
+
+test "gliner boundary workspace plan separates persistent capacity from request ceiling" {
+    const first = try GlinerBoundaryWorkspacePlan.init(7, .{ .live_bytes = 0, .capacity_bytes = 0, .generation = 0, .epoch = 0, .active = false }, 1, 17, 384, 1536);
+    try std.testing.expectEqual(@as(usize, 2 * 17 * (5 * 384 + 1536) * 4), first.required_capacity_bytes);
+    try std.testing.expectEqual(@as(usize, 17 * 1536), first.max_product_elements);
+    try std.testing.expectEqual(first.required_capacity_bytes, first.replacement_amounts.?.backend_scratch_bytes);
+    const ceiling: usize = 2 * 1024 * 1024 * 1024;
+    try std.testing.expectEqual(ceiling, first.effective_capacity_bytes + try first.requestEncoderLimit(ceiling));
+    try std.testing.expectError(error.ResourceLimitExceeded, first.requestEncoderLimit(first.effective_capacity_bytes));
+    const cached = try GlinerBoundaryWorkspacePlan.init(7, .{ .live_bytes = first.effective_capacity_bytes, .capacity_bytes = first.effective_capacity_bytes, .generation = 1, .epoch = 3, .active = false }, 1, 1, 384, 1536);
+    try std.testing.expect(cached.replacement_amounts == null);
+    try std.testing.expectEqual(first.effective_capacity_bytes, cached.effective_capacity_bytes);
+    try std.testing.expectEqual(ceiling, cached.effective_capacity_bytes + try cached.requestEncoderLimit(ceiling));
+    const grown = try GlinerBoundaryWorkspacePlan.init(7, .{ .live_bytes = first.effective_capacity_bytes, .capacity_bytes = first.effective_capacity_bytes, .generation = 1, .epoch = 3, .active = false }, 2, 17, 384, 1536);
+    try std.testing.expectEqual(2 * first.effective_capacity_bytes, grown.replacement_amounts.?.backend_scratch_bytes);
+    try std.testing.expectError(error.GlinerBoundaryWorkspaceBusy, GlinerBoundaryWorkspacePlan.init(7, .{ .live_bytes = 32, .capacity_bytes = 32, .generation = 1, .epoch = 3, .active = true }, 1, 1, 384, 1536));
 }
 
 pub fn replaceBlasResidentWeight(session: Session, name: []const u8, weight: LoadedWeight) !void {
@@ -6827,6 +7466,7 @@ test "managed direct compute guards construction and cleanup" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.Timeout, getComputeBackendWithControl(session, allocator, .{ .deadline_ns = 0 }));
     try std.testing.expectError(error.ProcessIsolationRequired, getComputeBackendWithControl(session, allocator, .{}));
+    try std.testing.expectError(error.ProcessIsolationRequired, getManagedComputeBackend(session, allocator, null, null));
     const control = InferenceExecutionControl{
         .hard_cancellation = .{ .ptr = &probe, .arm_fn = Probe.arm, .disarm_fn = Probe.disarm },
     };
@@ -6875,6 +7515,152 @@ pub fn getGenericEncoderArchConfig(session: Session) !GenericEncoderArchConfig {
         .gliner => |cfg| .{ .deberta = cfg },
         else => error.UnsupportedArchitecture,
     };
+}
+
+/// Schema-aware extraction owns boundary task execution. Generic Session.run
+/// must not synthesize a legacy span request for this architecture.
+pub fn getGlinerBoundaryConfig(session: Session) !gliner_boundary_model.Config {
+    if (session.vtable != &arch_vtable) return error.NotArchSession;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return switch (self.arch_config) {
+        .gliner_boundary => |config| config,
+        else => error.NotGlinerBoundarySession,
+    };
+}
+
+pub fn getGlinerBoundaryIdentity(session: Session) !boundary_bundle.Identity {
+    if (session.vtable != &arch_vtable) return error.NotArchSession;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.arch_config != .gliner_boundary) return error.NotGlinerBoundarySession;
+    return self.boundary_identity orelse error.MissingGlinerBoundaryIdentity;
+}
+
+/// Test-only observation of the actual loaded owner. A caller must retain the
+/// model (or hold its cache owner's load lock) and its execution mutex until
+/// this function returns. The returned addresses are identity scalars, never
+/// borrowed handles to use after the model lifetime ends.
+///
+/// This namespace has no callable surface in production. It does not create a
+/// compute backend, reopen files, upload weights, synchronize or allocate.
+pub const TestGlinerBoundaryMetalOwner = if (@import("builtin").is_test) struct {
+    pub const Identity = struct {
+        store_address: usize,
+        reader_address: usize,
+        mapping_address: usize,
+        mapping_bytes: usize,
+        source_bytes: usize,
+        source_tensor_count: usize,
+        lazy_tensor_count: usize,
+        provider_address: usize,
+        runtime_address: usize,
+    };
+
+    pub const RuntimeState = struct {
+        reported_buffer_count: u64,
+        reported_buffer_bytes: u64,
+        mapped_model_logical_bytes: u64,
+        mapped_model_allocated_bytes: u64,
+        scratch_in_use_slots: u64,
+        scratch_pending_slots: u64,
+        frame_retained_bytes: u64,
+        graph_plan_active: u64,
+        active_frame: bool,
+        submitted_frame: bool,
+    };
+
+    pub const Snapshot = struct {
+        identity: Identity,
+        state: RuntimeState,
+    };
+
+    pub fn snapshot(session: Session, io: std.Io) !Snapshot {
+        if (session.vtable != &arch_vtable) return error.NotArchSession;
+        const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        if (self.arch_config != .gliner_boundary) return error.NotGlinerBoundarySession;
+        if (self.backend_type != .metal) return error.NotMetalSession;
+        if (comptime !build_options.enable_metal) return error.MetalUnavailable;
+        const data = gpuBackendData(self);
+        // Same final lock as MetalCompute: cache load -> model execution ->
+        // shared provider. An observer must not wait for or construct a user.
+        if (!data.shared_metal_native_provider_lock.tryLock()) return error.QueueFull;
+        defer data.shared_metal_native_provider_lock.unlock(io);
+        const provider = data.shared_metal_native_provider orelse return error.MissingMetalNativeProvider;
+        const device_runtime = provider.raw_decode_runtime orelse return error.MissingMetalRuntime;
+        const store = data.tensor_store orelse return error.MissingTensorStore;
+        const reader = store.singleSafetensorsReader() orelse return error.NotSingleSafetensorsStore;
+        const mapping = reader.mmap_region orelse return error.ModelWeightsNotMapped;
+        if (mapping.data.ptr != reader.file_bytes.ptr or mapping.data.len != reader.file_bytes.len)
+            return error.ModelMappingMismatch;
+        const state = metal_runtime.runtimeMemorySnapshot(device_runtime);
+        return .{
+            .identity = .{
+                .store_address = @intFromPtr(store.ptr),
+                .reader_address = @intFromPtr(reader),
+                .mapping_address = @intFromPtr(mapping.data.ptr),
+                .mapping_bytes = mapping.data.len,
+                .source_bytes = reader.file_bytes.len,
+                .source_tensor_count = reader.header.tensors.count(),
+                .lazy_tensor_count = data.lazy_weights.count(),
+                .provider_address = @intFromPtr(provider),
+                .runtime_address = @intFromPtr(device_runtime),
+            },
+            .state = .{
+                .reported_buffer_count = state.buffer_count,
+                .reported_buffer_bytes = state.total_bytes,
+                .mapped_model_logical_bytes = state.mapped_model_logical_bytes,
+                .mapped_model_allocated_bytes = state.mapped_model_allocated_bytes,
+                .scratch_in_use_slots = state.scratch_pool_in_use_slots,
+                .scratch_pending_slots = state.scratch_pool_pending_slots,
+                .frame_retained_bytes = state.frame_retained_bytes,
+                .graph_plan_active = state.graph_plan_active,
+                .active_frame = metal_runtime.hasActiveFrame(device_runtime),
+                .submitted_frame = metal_runtime.hasSubmittedFrame(device_runtime),
+            },
+        };
+    }
+} else struct {};
+
+test "gliner boundary persistent Metal owner observation rejects foreign cold and busy sessions without construction" {
+    var unrelated: u8 = 0;
+    var other_vtable = arch_vtable;
+    other_vtable.independentBatchRows = null;
+    try std.testing.expectError(error.NotArchSession, TestGlinerBoundaryMetalOwner.snapshot(.{
+        .ptr = &unrelated,
+        .vtable = &other_vtable,
+    }, std.testing.io));
+    var self = ArchSession{
+        .allocator = std.testing.allocator,
+        // Only the discriminator is observed; this is not a loaded model.
+        .arch_config = .{ .gliner_boundary = std.mem.zeroes(gliner_boundary_model.Config) },
+        .backend_type = .native,
+        .backend_data = .{ .native = .{
+            .allocator = std.testing.allocator,
+            .resident_weights = .empty,
+            .lazy_weights = .empty,
+        } },
+    };
+    const session = Session{ .ptr = &self, .vtable = &arch_vtable };
+    try std.testing.expectError(error.NotMetalSession, TestGlinerBoundaryMetalOwner.snapshot(session, std.testing.io));
+    self.arch_config = .{ .gpt = .{
+        .hidden_size = 4,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .intermediate_size = 8,
+        .vocab_size = 16,
+    } };
+    try std.testing.expectError(error.NotGlinerBoundarySession, TestGlinerBoundaryMetalOwner.snapshot(session, std.testing.io));
+    if (comptime build_options.enable_metal) {
+        self.arch_config = .{ .gliner_boundary = std.mem.zeroes(gliner_boundary_model.Config) };
+        self.backend_type = .metal;
+        self.backend_data = .{ .metal = .{ .allocator = std.testing.allocator, .prefix = "", .lazy_weights = .empty } };
+        const data = gpuBackendData(&self);
+        try std.testing.expectError(error.MissingMetalNativeProvider, TestGlinerBoundaryMetalOwner.snapshot(session, std.testing.io));
+        try std.testing.expect(data.shared_metal_native_provider == null);
+        try std.testing.expect(data.shared_metal_native_provider_lock.tryLock());
+        defer data.shared_metal_native_provider_lock.unlock(std.testing.io);
+        try std.testing.expectError(error.QueueFull, TestGlinerBoundaryMetalOwner.snapshot(session, std.testing.io));
+        try std.testing.expect(data.shared_metal_native_provider == null);
+    }
 }
 
 /// Whether the architecture can produce a resident [batch, seq, hidden]
@@ -7622,6 +8408,7 @@ fn archRunImpl(
             result[0] = output_tensor;
             return result;
         },
+        .gliner_boundary => return error.BoundaryExtractionRequiresSchema,
         .gliner => |cfg| {
             // GLiNER2: DeBERTa encoder + span classification head
             // Inputs: input_ids, attention_mask, words_mask, span_idx
@@ -8228,6 +9015,10 @@ fn archClose(ptr: *anyopaque) void {
             if (comptime build_options.enable_metal) {
                 const gpu_data = gpuBackendData(self);
                 metal_compute_mod.stopPrefetchWorker(gpu_data);
+                if (gpu_data.boundary_resident) |owner| {
+                    owner.destroy();
+                    gpu_data.boundary_resident = null;
+                }
                 metal_compute_mod.deinitSharedNativeProvider(gpu_data);
                 metal_compute_mod.deinitPrefetchQueue(gpu_data);
                 var it = gpu_data.lazy_weights.iterator();

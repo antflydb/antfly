@@ -254,6 +254,70 @@ pub const AttentionAttrs = struct {
     skip_kv_write: bool = false,
 };
 
+/// Version-1 training attention with replayable probability dropout. This is
+/// distinct from inference attention: the query AND key mask use finite
+/// -max(f32), so fully masked queries retain uniform softmax probabilities.
+///
+/// Forward leaves are packed [Q;K;V], packed [Qr;Kr], and physical i32 control.
+/// Control contains seed/microbatch/replica low/high u32 bit limbs, B*S token
+/// validity entries, and 2*S-1 relative bucket indices. Both relative terms
+/// use bucket[q-k+S-1]. Dropout addresses ((b*heads+h)*S+q)*S+k, independently
+/// of execution tiling; it affects the PV numerator, not normalization.
+pub const DebertaTrainingAttentionAttrs = struct {
+    batch: u32,
+    seq_len: u32,
+    num_heads: u32,
+    head_dim: u32,
+    relative_rows: u32,
+    dropout_probability: f32,
+    dropout_stream_id: u64,
+
+    pub const Layout = struct {
+        batch_tokens: i64,
+        hidden: i64,
+        qkv_rows: i64,
+        relative_packed_rows: i64,
+        gradient_rows: i64,
+        control_elements: i64,
+
+        pub fn qkvShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.qkv_rows, self.hidden });
+        }
+        pub fn relativeShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.relative_packed_rows, self.hidden });
+        }
+        pub fn controlShape(self: Layout) Shape {
+            return Shape.init(.i32, &.{self.control_elements});
+        }
+        pub fn outputShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.batch_tokens, self.hidden });
+        }
+        pub fn gradientShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.gradient_rows, self.hidden });
+        }
+    };
+
+    /// Shape validation only. Each backend must separately admit physical
+    /// bytes, scratch, dispatch work and the contents of the control leaf.
+    pub fn layout(self: DebertaTrainingAttentionAttrs) !Layout {
+        for ([_]u32{ self.batch, self.seq_len, self.num_heads, self.head_dim, self.relative_rows }) |dim|
+            if (dim == 0 or dim > std.math.maxInt(i32)) return error.InvalidDebertaTrainingAttentionShape;
+        if (!std.math.isFinite(self.dropout_probability) or self.dropout_probability < 0 or self.dropout_probability >= 1)
+            return error.InvalidDebertaTrainingAttentionShape;
+        const bs = try std.math.mul(i64, self.batch, self.seq_len);
+        const hidden = try std.math.mul(i64, self.num_heads, self.head_dim);
+        const qkv_rows = try std.math.mul(i64, 3, bs);
+        const relative_rows = try std.math.mul(i64, 2, self.relative_rows);
+        const gradient_rows = try std.math.add(i64, qkv_rows, relative_rows);
+        const relative_indices = try std.math.sub(i64, try std.math.mul(i64, 2, self.seq_len), 1);
+        const control_elements = try std.math.add(i64, 6, try std.math.add(i64, bs, relative_indices));
+        // Reject element-count overflow before Shape.numElements or VJP
+        // slicing can encounter a malformed manually assembled graph.
+        _ = try std.math.mul(i64, gradient_rows, hidden);
+        return .{ .batch_tokens = bs, .hidden = hidden, .qkv_rows = qkv_rows, .relative_packed_rows = relative_rows, .gradient_rows = gradient_rows, .control_elements = control_elements };
+    }
+};
+
 pub const RopeAttrs = struct {
     seq_len: u32,
     head_dim: u32,
@@ -443,6 +507,8 @@ pub const OpCode = union(enum) {
     fused_gqa_causal_attention: AttentionAttrs,
     fused_disentangled_attention: AttentionAttrs,
     fused_disentangled_attention_backward: AttentionAttrs,
+    fused_deberta_training_attention_v1: DebertaTrainingAttentionAttrs,
+    fused_deberta_training_attention_backward_v1: DebertaTrainingAttentionAttrs,
     fused_relative_position_bias: RelativePositionBiasAttrs,
     fused_rope: RopeAttrs,
     fused_conv1d: Conv1dAttrs,
@@ -464,6 +530,9 @@ pub const OpCode = union(enum) {
     fused_log_softmax: SoftmaxAttrs,
     fused_masked_bce_with_logits_loss: MaskedBceWithLogitsAttrs,
     fused_masked_bce_with_logits_backward: MaskedBceWithLogitsAttrs,
+    /// Identity in forward execution, with no gradient through its input.
+    /// Kept as an intrinsic so lowering cannot lose a PEFT detach boundary.
+    stop_gradient: void,
 
     pub fn isFused(self: OpCode) bool {
         return switch (self) {

@@ -1,0 +1,33 @@
+{
+  "expected_model_imports": [],
+  "fixed_cases": {
+    "sha256": "199143699c54fb53043527bd245ddba9d51d06337eea29128479f273e2750a78",
+    "size_bytes": 16288
+  },
+  "format_version": 1,
+  "numeric_comparison": "exact fixed-score control decisions and utility; no tensor execution",
+  "scope": "gliner25_pinned_joint_optimizer_fixed_scores_v1",
+  "source_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+  "source_files": {
+    "gliner2/joint_ie/candidates.py": {
+      "sha256": "192650271f5a85ecb4e32d0245bf2e4c126b2e70e60464808bd98a975631eb99",
+      "size_bytes": 16691
+    },
+    "gliner2/joint_ie/constraints.py": {
+      "sha256": "1ed05f1f2dee57b6c57569a61dac9da41082059f8393d9a908b0580754179d94",
+      "size_bytes": 12379
+    },
+    "gliner2/joint_ie/optimizers/base.py": {
+      "sha256": "cbd41e3cfe1cd16e68e8e37b49d4da502589864f596ad1c1f3b5c97fa5b8c9b7",
+      "size_bytes": 7660
+    },
+    "gliner2/joint_ie/optimizers/beam.py": {
+      "sha256": "0a0a01a77f9e33552d1b6b9d5e74dfbeb936442a83b9890197a48caa20489808",
+      "size_bytes": 5256
+    },
+    "gliner2/joint_ie/optimizers/greedy.py": {
+      "sha256": "302a8b839ba40b7d95afb1a039b415a962b9f5ad0217adc78e2ac9e0b1b8aab3",
+      "size_bytes": 3243
+    }
+  }
+}

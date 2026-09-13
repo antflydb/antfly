@@ -22,6 +22,22 @@ const gemma_lora_imports = &.{ .build_options, .ml, .inference_internal };
 
 pub const specs = [_]common.CommandSpec{
     .{
+        .name = "materialize-gliner25-adapter",
+        .root_source_file = "src/finetune/tools/materialize_gliner25_adapter.zig",
+        .description = "Materialize a verified GLiNER2.5 PEFT adapter with bounded immutable-source streaming",
+        .imports = &.{ .build_options, .inference_internal },
+        .native_link = .default,
+        .link_libc = true,
+    },
+    .{
+        .name = "train-gliner25",
+        .root_source_file = "src/finetune/train/train_gliner25.zig",
+        .description = "Train GLiNER2.5 from an admitted versioned job with durable resume and portable export",
+        .imports = &.{ .build_options, .inference_internal },
+        .native_link = .default,
+        .link_libc = true,
+    },
+    .{
         .name = "inspect-layoutlmv3-bundle",
         .root_source_file = "src/finetune/tools/inspect_layoutlmv3_bundle.zig",
         .description = "Inspect a LayoutLMv3 runtime bundle",

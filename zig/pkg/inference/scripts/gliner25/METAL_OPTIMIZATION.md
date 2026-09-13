@@ -1,0 +1,17 @@
+# GLiNER2.5 FP32 Metal execution
+
+The optimized policy retains immutable checkpoint weights and derived relative-position constants in the model session. Every request gets its own tensor wrappers and compute backend; model-owned allocations are never transferred to a request allocator. The reference policy remains available to the comparison worker.
+
+Preparation uses the common model-loading hook, validates the exact bundle and runtime generation, and publishes the resident table only after all weights and constants succeed. Partial construction releases its prefix. CPU and reduced-precision artifacts keep their existing paths.
+
+A separate admission lease owns the bounded GEMM product workspace. Growth admits the complete replacement while the previous workspace remains charged, then swaps only after allocation succeeds. Requests deduct retained capacity from their existing encoder ceiling. The production handler obtains admission outside the model execution mutex and rechecks the workspace generation after locking; stale plans retry without retaining their permits. Idle-model eviction accounts for this lease, and model teardown releases it before destroying the Metal runtime.
+
+Command scopes are request-owned and bounded by dispatch count and pending physical bytes. They retain in-flight references until completion, drain before host reads or arena reuse, and enforce stale-generation rejection. Backend cleanup and cancellation remain inside the process-required watchdog boundary. Scope telemetry reads cached scalar counters and does not introduce extra GPU waits.
+
+The encoder reuses normalized relative embeddings and per-layer projections, releases segments at explicit layer boundaries, and allocates matrix products from the admitted arena. Task heads evaluate record candidates only when the compiled schema requires them. The existing FP32 operations, original thresholds, exact discrete-output requirements and confidence tolerance remain unchanged.
+
+Scaling validation also exercises decoder behavior outside the original short-input corpus. Latent and anchorless record decoding uses one bounded reusable row buffer and deduplicates complete record keys before retaining values. Duplicate expansion does not consume the retained output limit; unique records and natural-mode occurrences still do. Global exclusive assignments and first-ranked duplicate ownership are preserved.
+
+When a request omits the decoder algorithm, single-window GLiNER2.5 JointIE uses the versioned `fastino_v1` beam profile from the pinned upstream optimizer. It preserves source token identities, semantic tie breaking, the independent greedy candidate, and final relation presentation order. Explicit `auto`, `exact`, and `beam` selectors retain the native bounded optimizer. Classification keeps its automatic default. Windowed JointIE retains the native automatic global optimizer, whose slot and count alternatives are independently scoped per window. SDK constructors preserve omission, and inference identities and qualification features distinguish these resolved contracts. The source-only optimizer fixture is independent of model numerical tolerances.
+
+See [comparison protocol](METAL_BENCHMARK_V2.md) for the original 30-case gate, separate CPU preservation and true-batch scaling. Diagnostic phase timing does not enter accepted samples. These direct-core comparisons do not qualify serving load or open the public release gate.

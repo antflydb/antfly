@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.extraction_schema_version import ExtractionSchemaVersion
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -19,19 +20,26 @@ T = TypeVar("T", bound="ExtractionRequest")
 
 @_attrs_define
 class ExtractionRequest:
-    """
+    """Atomic extraction request. Every input is validated before inference; failures return no partial data.
+
     Attributes:
         model (str):
         inputs (list[ExtractionInput]):
-        schema (ExtractionSchema): Selects one extraction operation family per request. Entity labels may
-            accompany relation schemas so relation extraction can return its
-            participating entities in the same response.
+        schema (ExtractionSchema): Version 1 selects one extraction family; entities may accompany relations.
+            With schema_version 2, entities, attributes, classifications, structures,
+            and ordinary relations may share one encoded input. joint_ie is a separate,
+            mutually exclusive typed graph schema. The version 2 compiler rejects
+            unknown fields and validates all references before model execution.
+        schema_version (ExtractionSchemaVersion | Unset): Omission preserves the legacy extraction contract. Version 2
+            opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime
+            must support every requested feature.
         options (ExtractionOptions | Unset):
     """
 
     model: str
     inputs: list[ExtractionInput]
     schema: ExtractionSchema
+    schema_version: ExtractionSchemaVersion | Unset = UNSET
     options: ExtractionOptions | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -44,6 +52,10 @@ class ExtractionRequest:
             inputs.append(inputs_item)
 
         schema = self.schema.to_dict()
+
+        schema_version: int | Unset = UNSET
+        if not isinstance(self.schema_version, Unset):
+            schema_version = self.schema_version.value
 
         options: dict[str, Any] | Unset = UNSET
         if not isinstance(self.options, Unset):
@@ -58,6 +70,8 @@ class ExtractionRequest:
                 "schema": schema,
             }
         )
+        if schema_version is not UNSET:
+            field_dict["schema_version"] = schema_version
         if options is not UNSET:
             field_dict["options"] = options
 
@@ -81,6 +95,13 @@ class ExtractionRequest:
 
         schema = ExtractionSchema.from_dict(d.pop("schema"))
 
+        _schema_version = d.pop("schema_version", UNSET)
+        schema_version: ExtractionSchemaVersion | Unset
+        if isinstance(_schema_version, Unset):
+            schema_version = UNSET
+        else:
+            schema_version = ExtractionSchemaVersion(_schema_version)
+
         _options = d.pop("options", UNSET)
         options: ExtractionOptions | Unset
         if isinstance(_options, Unset):
@@ -92,6 +113,7 @@ class ExtractionRequest:
             model=model,
             inputs=inputs,
             schema=schema,
+            schema_version=schema_version,
             options=options,
         )
 

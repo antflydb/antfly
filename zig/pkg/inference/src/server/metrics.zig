@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const prometheus = @import("prometheus");
+pub const extraction = @import("extraction_metrics.zig");
 
 comptime {
     @setEvalBranchQuota(30000);
@@ -29,6 +30,7 @@ pub const Metrics = struct {
     requests_total: prometheus.Counter(u64),
     requests_active: prometheus.Gauge(i64),
     errors_total: prometheus.Counter(u64),
+    extraction_v2: extraction.Metrics = .{},
 
     embed_requests: prometheus.Counter(u64),
     embed_batches_total: prometheus.Counter(u64),
@@ -128,7 +130,7 @@ pub const Metrics = struct {
             self.chunk_requests.incr();
         } else if (std.mem.eql(u8, endpoint, "classify")) {
             self.classify_requests.incr();
-        } else if (std.mem.eql(u8, endpoint, "extract")) {
+        } else if (std.mem.eql(u8, endpoint, "extract") or std.mem.eql(u8, endpoint, "extract.local")) {
             self.extract_requests.incr();
         } else if (std.mem.eql(u8, endpoint, "rewrite")) {
             self.rewrite_requests.incr();
@@ -222,8 +224,13 @@ pub const Metrics = struct {
     /// Write metrics in Prometheus exposition format.
     pub fn render(self: *Metrics, writer: *std.Io.Writer) !void {
         try prometheus.write(self, writer);
+        try self.extraction_v2.render(writer);
     }
 };
+
+test {
+    _ = extraction;
+}
 
 test "metrics render" {
     var m = Metrics.default;

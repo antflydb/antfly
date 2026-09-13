@@ -1,0 +1,78 @@
+{
+  "scope": "gliner25_crossner_ai_corpus/v1",
+  "qualification": false,
+  "repository": "https://github.com/zliucr/CrossNER",
+  "revision": "2e7ba2a7798c961e3f29fbc51252c5a8d40224bf",
+  "files": [
+    {
+      "path": "ner_data/ai/train.txt",
+      "size_bytes": 40202,
+      "sha256": "484217a660f52927bd5157507c22fc103b36306364329f62f80fc8acb897b187",
+      "git_blob_sha1": "bd929d7e174df3a8e2051a05e6823e1edbbe80a0"
+    },
+    {
+      "path": "ner_data/ai/dev.txt",
+      "size_bytes": 114516,
+      "sha256": "b47ffda6de5901a454a873feac1bebe782e54ce7edf9deb729cab3d769212eee",
+      "git_blob_sha1": "a1c3e3441097fd2fdc0c585dc16ee4522a398088"
+    },
+    {
+      "path": "ner_data/ai/test.txt",
+      "size_bytes": 134455,
+      "sha256": "7595ad386e0a98067100fe47f86811b38867a236011fee97cfaa90f778c37bcf",
+      "git_blob_sha1": "572dccc566629caeaddcd50250e4f9ee1689c782"
+    },
+    {
+      "path": "src/dataloader.py",
+      "size_bytes": 13534,
+      "sha256": "730c8ddfcc60fc63f613c36217326388d06c8e281e97f9929d75223973c1cc35",
+      "git_blob_sha1": "da2c7351732c8555475eb12e61ffdc94acaae1f2"
+    },
+    {
+      "path": "LICENSE",
+      "size_bytes": 1066,
+      "sha256": "9291793d0b49d69642edcd47e730136693722e3a1d398d1412e8d47e2443b71f",
+      "git_blob_sha1": "61f34757664c6153d13d3a448dc900baed37ac9b"
+    },
+    {
+      "path": "README.md",
+      "size_bytes": 6398,
+      "sha256": "8a0dd60bca8c7f22219c9f0a614dad77c56b777e7f4220fc52f546fa939d38d8",
+      "git_blob_sha1": "4342d8d6f75e01cbc624cbcb70c3339fa01c17f3"
+    }
+  ],
+  "domain": "ai",
+  "split_policy": "preserve_official_test_remove_lower_priority_normalized_overlaps/v1",
+  "source_documents": {"train": 100, "dev": 350, "test": 431},
+  "excluded_ids": ["crossner/ai/dev/000117", "crossner/ai/dev/000143", "crossner/ai/dev/000262"],
+  "no_model_execution": true,
+  "data_status": "downloaded_and_git_blob_verified",
+  "entity_types": [
+    "field",
+    "task",
+    "product",
+    "algorithm",
+    "researcher",
+    "metrics",
+    "programlang",
+    "conference",
+    "university",
+    "country",
+    "person",
+    "organisation",
+    "location",
+    "misc"
+  ],
+  "text_profile": "original_bio_tokens_joined_with_single_ascii_space/v1",
+  "schema_profile": "full_verbatim_author_ontology_no_descriptions_or_examples/v1",
+  "license_evidence": {
+    "file": "LICENSE",
+    "repository_declaration": "MIT",
+    "source_notice": "README.md",
+    "corpus_not_redistributed_in_repository": true
+  },
+  "missing_provenance": [
+    "Original Wikipedia article IDs are not present in BIO rows.",
+    "Pretraining/synthetic teacher exposure to this public dataset is unknown."
+  ]
+}

@@ -214,6 +214,12 @@ pub const WeightStore = struct {
     allow_direct_quant: bool = true,
     quant_execution_mode: QuantExecutionMode = .prefer_backend_dense,
     prefer_f32_dense_tensors: bool = false,
+    /// Constructor-only capability for immutable legacy GLiNER inference
+    /// sessions. A request may borrow an aligned F32 host payload while holding
+    /// its LazyWeightEntry pin. Generic and mutable training stores stay false;
+    /// this never authorizes borrowing mutable parameters or retaining a CT
+    /// beyond the request/backend lifetime.
+    allow_immutable_f32_weight_borrow: bool = false,
     mirror_kv_to_manager: bool = true,
     access_epoch: u64 = 1,
     packed_expert_views: std.StringHashMapUnmanaged(PackedExpertViewEntry) = .empty,
@@ -222,8 +228,20 @@ pub const WeightStore = struct {
         if (supports_native_metal_provider) null else {},
     shared_metal_native_provider_lock: if (supports_native_metal_provider) std.Io.Mutex else void =
         if (supports_native_metal_provider) .init else {},
+    /// Immutable physical FP32 weights/relative constants. Request ComputeBackend
+    /// wrappers borrow this owner; it is destroyed before the shared provider.
+    boundary_resident: ?*@import("gliner_boundary_resident.zig").Owner = null,
     jina_lora_adapter: ?*JinaLoraAdapter = null,
 };
+
+test "gpu hosted immutable F32 borrowing is disabled for ordinary stores" {
+    const store = WeightStore{
+        .allocator = std.testing.allocator,
+        .prefix = "",
+        .lazy_weights = .empty,
+    };
+    try std.testing.expect(!store.allow_immutable_f32_weight_borrow);
+}
 
 pub fn touchLazyWeight(data: *WeightStore, entry: *LazyWeightEntry) void {
     entry.last_access_epoch = data.access_epoch;

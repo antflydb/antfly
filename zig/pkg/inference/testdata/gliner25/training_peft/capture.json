@@ -1,0 +1,168 @@
+{
+  "format_version": 1,
+  "rank": 2,
+  "alpha": 3,
+  "cases": [
+    {
+      "id": "lora_p00_eval",
+      "kind": "lora",
+      "probability": 0.0,
+      "mode": "eval",
+      "replay": {
+        "seed": 1701,
+        "optimizer_step": 2,
+        "micro_batch": 3,
+        "replica": 0
+      },
+      "masks": [],
+      "loss": 5.574629783630371
+    },
+    {
+      "id": "lora_p00_train",
+      "kind": "lora",
+      "probability": 0.0,
+      "mode": "train",
+      "replay": {
+        "seed": 1701,
+        "optimizer_step": 2,
+        "micro_batch": 3,
+        "replica": 0
+      },
+      "masks": [],
+      "loss": 5.574629783630371
+    },
+    {
+      "id": "lora_p25_eval",
+      "kind": "lora",
+      "probability": 0.25,
+      "mode": "eval",
+      "replay": {
+        "seed": 1701,
+        "optimizer_step": 2,
+        "micro_batch": 3,
+        "replica": 0
+      },
+      "masks": [],
+      "loss": 5.574629783630371
+    },
+    {
+      "id": "lora_p25_train",
+      "kind": "lora",
+      "probability": 0.25,
+      "mode": "train",
+      "replay": {
+        "seed": 1701,
+        "optimizer_step": 2,
+        "micro_batch": 3,
+        "replica": 0
+      },
+      "masks": [
+        {
+          "module": "encoder.encoder.layer.0.attention.self.query_proj",
+          "occurrence": 0,
+          "tensor": "lora_p25_train.mask.encoder.encoder.layer.0.attention.self.query_proj.0"
+        },
+        {
+          "module": "encoder.encoder.layer.0.attention.self.query_proj",
+          "occurrence": 1,
+          "tensor": "lora_p25_train.mask.encoder.encoder.layer.0.attention.self.query_proj.1"
+        },
+        {
+          "module": "classifier.0",
+          "occurrence": 0,
+          "tensor": "lora_p25_train.mask.classifier.0.0"
+        }
+      ],
+      "loss": 5.449501991271973
+    },
+    {
+      "id": "dora_p00_eval",
+      "kind": "dora",
+      "probability": 0.0,
+      "mode": "eval",
+      "replay": {
+        "seed": 1701,
+        "optimizer_step": 2,
+        "micro_batch": 3,
+        "replica": 0
+      },
+      "masks": [],
+      "loss": 4.882463455200195
+    },
+    {
+      "id": "dora_p00_train",
+      "kind": "dora",
+      "probability": 0.0,
+      "mode": "train",
+      "replay": {
+        "seed": 1701,
+        "optimizer_step": 2,
+        "micro_batch": 3,
+        "replica": 0
+      },
+      "masks": [],
+      "loss": 4.882463455200195
+    },
+    {
+      "id": "dora_p25_eval",
+      "kind": "dora",
+      "probability": 0.25,
+      "mode": "eval",
+      "replay": {
+        "seed": 1701,
+        "optimizer_step": 2,
+        "micro_batch": 3,
+        "replica": 0
+      },
+      "masks": [],
+      "loss": 4.882463455200195
+    },
+    {
+      "id": "dora_p25_train",
+      "kind": "dora",
+      "probability": 0.25,
+      "mode": "train",
+      "replay": {
+        "seed": 1701,
+        "optimizer_step": 2,
+        "micro_batch": 3,
+        "replica": 0
+      },
+      "masks": [
+        {
+          "module": "encoder.encoder.layer.0.attention.self.query_proj",
+          "occurrence": 0,
+          "tensor": "dora_p25_train.mask.encoder.encoder.layer.0.attention.self.query_proj.0"
+        },
+        {
+          "module": "encoder.encoder.layer.0.attention.self.query_proj",
+          "occurrence": 1,
+          "tensor": "dora_p25_train.mask.encoder.encoder.layer.0.attention.self.query_proj.1"
+        },
+        {
+          "module": "classifier.0",
+          "occurrence": 0,
+          "tensor": "dora_p25_train.mask.classifier.0.0"
+        }
+      ],
+      "loss": 4.932155609130859
+    }
+  ],
+  "provenance": {
+    "python": "3.12.3",
+    "torch": "2.9.1",
+    "peft": "0.17.1",
+    "peft_source_sha256": {
+      "layer.py": "39e2f6908c9f3faf4d2de2b6ecfdf44c96d2cae67b8155ed1b51bc67fb25b734",
+      "dora.py": "07d514fd057d8aa9ec7b89bec3f3fbd04862951c1a8ff73153e833096481ecf5",
+      "variants.py": "c477a90d68caa2d3d2ffa22266f32ad3ab1767f01d84250e5242f1fc29f202c2"
+    },
+    "generator_sha256": "4bc714f55d85bbae1e61aff4b7775b08fa4cce20d25f719e3f41ed79438714df",
+    "mask_protocol": "boundary_peft_site_element_v1",
+    "dtype": "float32"
+  },
+  "files_sha256": {
+    "weights.safetensors": "53b2b780fec707d8ce4f7b51a8139520cd7946dbcdd423ceffefeca3b9708150",
+    "tensors.safetensors": "93b1c17e5d6f852a6181d904e12a546718b17a69585700b06d10f0ff1a855e70"
+  }
+}

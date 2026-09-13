@@ -14,8 +14,15 @@
 
 pub const types = @import("types.zig");
 pub const extractor = @import("extractor.zig");
+pub const extraction_v2 = @import("extraction_v2.zig");
+pub const gliner_boundary_executor = @import("gliner_boundary_executor.zig");
+pub const gliner_boundary_long_executor = @import("gliner_boundary_long_executor.zig");
 
 test {
     _ = types;
     _ = extractor;
+    _ = extraction_v2;
+    _ = gliner_boundary_executor;
+    _ = gliner_boundary_long_executor;
+    _ = @import("../runtime/bounded_allocator.zig");
 }

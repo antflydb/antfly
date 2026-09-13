@@ -1,0 +1,263 @@
+{
+  "format_version": 1,
+  "optimizer": {
+    "name": "AdamW",
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "gradient_accumulation_steps": 2,
+    "max_grad_norm": 0.7,
+    "norm_type": 2,
+    "clip_epsilon": 1e-06,
+    "foreach": false,
+    "fused": false,
+    "partial_flush_policy": "renormalize_to_actual_microbatch_count",
+    "legacy_difference": "GLiNER2.5 upstream renormalizes a partial final window; legacy Antfly fixed-divisor accumulation is unchanged."
+  },
+  "parameters": [
+    {
+      "name": "encoder.weight",
+      "shape": [
+        2
+      ],
+      "initial": [
+        0.4,
+        -0.2
+      ],
+      "lr": 0.01,
+      "weight_decay": 0.1
+    },
+    {
+      "name": "head.bias",
+      "shape": [
+        1
+      ],
+      "initial": [
+        0.1
+      ],
+      "lr": 0.02,
+      "weight_decay": 0.0
+    },
+    {
+      "name": "adapter",
+      "shape": [
+        2
+      ],
+      "initial": [
+        0.3,
+        -0.4
+      ],
+      "lr": 0.03,
+      "weight_decay": 0.05
+    }
+  ],
+  "microbatches": [
+    {
+      "gradients": {
+        "encoder.weight": [
+          3.0,
+          -1.0
+        ],
+        "head.bias": null,
+        "adapter": [
+          0.8,
+          -0.6
+        ]
+      },
+      "flush": false
+    },
+    {
+      "gradients": {
+        "encoder.weight": [
+          1.0,
+          0.5
+        ],
+        "head.bias": [
+          0.0
+        ],
+        "adapter": null
+      },
+      "flush": true
+    },
+    {
+      "gradients": {
+        "encoder.weight": null,
+        "head.bias": [
+          1.7
+        ],
+        "adapter": [
+          0.0,
+          0.0
+        ]
+      },
+      "flush": true
+    }
+  ],
+  "flushes": [
+    {
+      "after_microbatch": 2,
+      "window_microbatches": 2,
+      "partial_renormalization": 1.0,
+      "gradients_before_clip": {
+        "encoder.weight": [
+          2.0,
+          -0.25
+        ],
+        "head.bias": [
+          0.0
+        ],
+        "adapter": [
+          0.4000000059604645,
+          -0.30000001192092896
+        ]
+      },
+      "grad_norm": 2.076655864715576,
+      "gradients_after_clip": {
+        "encoder.weight": [
+          0.6741604804992676,
+          -0.08427006006240845
+        ],
+        "head.bias": [
+          0.0
+        ],
+        "adapter": [
+          0.13483209908008575,
+          -0.10112407803535461
+        ]
+      },
+      "parameters": {
+        "encoder.weight": {
+          "weight": [
+            0.38960000872612,
+            -0.18979999423027039
+          ],
+          "step": 1,
+          "exp_avg": [
+            0.06741604954004288,
+            -0.00842700619250536
+          ],
+          "exp_avg_sq": [
+            0.0004544923722278327,
+            7.1014433160598855e-06
+          ]
+        },
+        "head.bias": {
+          "weight": [
+            0.10000000149011612
+          ],
+          "step": 1,
+          "exp_avg": [
+            0.0
+          ],
+          "exp_avg_sq": [
+            0.0
+          ]
+        },
+        "adapter": {
+          "weight": [
+            0.26954999566078186,
+            -0.3693999946117401
+          ],
+          "step": 1,
+          "exp_avg": [
+            0.01348321046680212,
+            -0.010112407617270947
+          ],
+          "exp_avg_sq": [
+            1.8179696780862287e-05,
+            1.022607921186136e-05
+          ]
+        }
+      }
+    },
+    {
+      "after_microbatch": 3,
+      "window_microbatches": 1,
+      "partial_renormalization": 2.0,
+      "gradients_before_clip": {
+        "encoder.weight": null,
+        "head.bias": [
+          1.7000000476837158
+        ],
+        "adapter": [
+          0.0,
+          0.0
+        ]
+      },
+      "grad_norm": 1.7000000476837158,
+      "gradients_after_clip": {
+        "encoder.weight": null,
+        "head.bias": [
+          0.6999996304512024
+        ],
+        "adapter": [
+          0.0,
+          0.0
+        ]
+      },
+      "parameters": {
+        "encoder.weight": {
+          "weight": [
+            0.38960000872612,
+            -0.18979999423027039
+          ],
+          "step": 1,
+          "exp_avg": [
+            0.06741604954004288,
+            -0.00842700619250536
+          ],
+          "exp_avg_sq": [
+            0.0004544923722278327,
+            7.1014433160598855e-06
+          ]
+        },
+        "head.bias": {
+          "weight": [
+            0.08511726558208466
+          ],
+          "step": 2,
+          "exp_avg": [
+            0.06999996304512024
+          ],
+          "exp_avg_sq": [
+            0.0004899995401501656
+          ]
+        },
+        "adapter": {
+          "weight": [
+            0.24904392659664154,
+            -0.34874412417411804
+          ],
+          "step": 2,
+          "exp_avg": [
+            0.012134889140725136,
+            -0.009101166389882565
+          ],
+          "exp_avg_sq": [
+            1.816151780076325e-05,
+            1.0215852853434626e-05
+          ]
+        }
+      }
+    }
+  ],
+  "provenance": {
+    "python": "3.12.3",
+    "torch": "2.9.1",
+    "upstream_revision": "3c913c7369301133d3b7699252074c4303ada50e",
+    "trainer_file": "gliner2/training/trainer.py",
+    "trainer_sha256": "8b720f6da4fa3d74ad2c0adda3b5ef5a71c001f01d7822ba48dfaf974dec05d3",
+    "partial_function": "_renormalize_partial_accumulation",
+    "partial_function_lines": [
+      1232,
+      1240
+    ],
+    "partial_function_sha256": "aaccb77d089528e2826f7500eb523950038329eb441db6fb8a9bd676a2cc2cfb",
+    "partial_call_line": 1865,
+    "configured_loss_divisor_line": 1217,
+    "generator_sha256": "7499ab16422de6dd5494ccdeb908ddcbc78444ad6d564461ae0122f80dc2d117",
+    "dtype": "float32"
+  }
+}

@@ -716,9 +716,7 @@ fn exportGraphResultMaybeStream(
     defer if (lowered) |*l| l.deinit();
 
     const effective_graph: *const Graph = if (opts.lower_fused) blk: {
-        lowered = ml.graph.lower.lower(alloc, graph) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-        };
+        lowered = try ml.graph.lower.lower(alloc, graph);
         break :blk &lowered.?.graph;
     } else graph;
 
@@ -2909,6 +2907,21 @@ test "exportGraph roundtrip — export then import" {
 
     try std.testing.expect(model.graph() != null);
     try std.testing.expectEqual(@as(u64, 17), model.opsetVersion());
+}
+
+test "exportGraph with lower_fused preserves graph validation errors" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", Shape.init(.f32, &.{2}));
+    const output = try builder.mul(input, input);
+    try graph.markOutput(output);
+
+    graph.nodes.items[output].inputs[0] = output;
+    try std.testing.expectError(error.CyclicGraph, exportGraph(a, &graph, .{ .lower_fused = true }));
+    graph.nodes.items[output].inputs[0] = @intCast(graph.nodes.items.len);
+    try std.testing.expectError(error.InvalidGraphDependency, exportGraph(a, &graph, .{ .lower_fused = true }));
 }
 
 test "exportGraph with lower_fused decomposes fused ops" {

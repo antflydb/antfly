@@ -1,0 +1,1 @@
+{"version":1,"id":"relation_only-0","text":"Ada.","schema":{"entities":["person"]},"entities":[{"id":"ada","type":"person","span":{"start":0,"end":3,"unit":"utf8_bytes"}}]}

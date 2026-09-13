@@ -38,4 +38,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run supervisor unit and process-lifecycle tests (Python 3 on POSIX)");
     test_step.dependOn(&tests.unit.step);
     if (tests.process) |process| test_step.dependOn(process);
+    const command_test_step = b.step("test-one-shot", "Run disposable command worker unit and process tests");
+    command_test_step.dependOn(&tests.one_shot_unit.step);
+    if (tests.one_shot_process) |process| command_test_step.dependOn(process);
+    test_step.dependOn(command_test_step);
 }

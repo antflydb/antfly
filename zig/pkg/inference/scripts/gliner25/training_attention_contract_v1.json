@@ -1,0 +1,440 @@
+{
+  "cases": [
+    {
+      "batch": 2,
+      "cotangent": "all_rows",
+      "id": "ragged7_p0",
+      "lengths": [
+        7,
+        4
+      ],
+      "logical_layer": 0,
+      "micro_batch": 4294967298,
+      "probability": 0.0,
+      "probability_stream_id": 3,
+      "relative_stream_id": 2,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7
+    },
+    {
+      "batch": 2,
+      "cotangent": "all_rows",
+      "id": "ragged7_p01",
+      "lengths": [
+        7,
+        4
+      ],
+      "logical_layer": 2,
+      "micro_batch": 4294967298,
+      "probability": 0.10000000149011612,
+      "probability_stream_id": 8589934595,
+      "relative_stream_id": 8589934594,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7
+    },
+    {
+      "batch": 2,
+      "cotangent": "all_rows",
+      "id": "ragged7_p0125",
+      "lengths": [
+        7,
+        4
+      ],
+      "logical_layer": 7,
+      "micro_batch": 4294967298,
+      "probability": 0.125,
+      "probability_stream_id": 30064771075,
+      "relative_stream_id": 30064771074,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7
+    },
+    {
+      "batch": 2,
+      "cotangent": "fully_masked_sample_only",
+      "id": "fully_masked7_p0",
+      "lengths": [
+        7,
+        0
+      ],
+      "logical_layer": 0,
+      "micro_batch": 4294967298,
+      "probability": 0.0,
+      "probability_stream_id": 3,
+      "relative_stream_id": 2,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7
+    },
+    {
+      "batch": 2,
+      "cotangent": "fully_masked_sample_only",
+      "id": "fully_masked7_p01",
+      "lengths": [
+        7,
+        0
+      ],
+      "logical_layer": 2,
+      "micro_batch": 4294967298,
+      "probability": 0.10000000149011612,
+      "probability_stream_id": 8589934595,
+      "relative_stream_id": 8589934594,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7
+    },
+    {
+      "batch": 2,
+      "cotangent": "fully_masked_sample_only",
+      "id": "fully_masked7_p0125",
+      "lengths": [
+        7,
+        0
+      ],
+      "logical_layer": 7,
+      "micro_batch": 4294967298,
+      "probability": 0.125,
+      "probability_stream_id": 30064771075,
+      "relative_stream_id": 30064771074,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7
+    },
+    {
+      "batch": 2,
+      "cotangent": "all_rows",
+      "id": "buckets512_p0",
+      "lengths": [
+        512,
+        259
+      ],
+      "logical_layer": 0,
+      "micro_batch": 4294967298,
+      "probability": 0.0,
+      "probability_stream_id": 3,
+      "relative_stream_id": 2,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 512
+    },
+    {
+      "batch": 2,
+      "cotangent": "all_rows",
+      "id": "buckets512_p01",
+      "lengths": [
+        512,
+        259
+      ],
+      "logical_layer": 2,
+      "micro_batch": 4294967298,
+      "probability": 0.10000000149011612,
+      "probability_stream_id": 8589934595,
+      "relative_stream_id": 8589934594,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 512
+    },
+    {
+      "batch": 2,
+      "cotangent": "all_rows",
+      "id": "buckets512_p0125",
+      "lengths": [
+        512,
+        259
+      ],
+      "logical_layer": 7,
+      "micro_batch": 4294967298,
+      "probability": 0.125,
+      "probability_stream_id": 30064771075,
+      "relative_stream_id": 30064771074,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 512
+    }
+  ],
+  "config": {
+    "conv_kernel_size": 0,
+    "hidden_act": "gelu",
+    "hidden_size": 8,
+    "intermediate_size": 16,
+    "layer_norm_eps": 1e-07,
+    "max_position_embeddings": 512,
+    "max_relative_positions": -1,
+    "norm_rel_ebd": "layer_norm",
+    "num_attention_heads": 2,
+    "num_hidden_layers": 1,
+    "pos_att_type": [
+      "p2c",
+      "c2p"
+    ],
+    "position_biased_input": false,
+    "position_buckets": 256,
+    "relative_attention": true,
+    "share_att_key": true,
+    "type_vocab_size": 0
+  },
+  "counter_vectors": [
+    {
+      "case_id": "ragged7_p0",
+      "indices": [
+        0,
+        1,
+        2,
+        3,
+        31,
+        32,
+        127,
+        128,
+        255,
+        256,
+        16777216,
+        16777217
+      ],
+      "parameters": [
+        3889838079712730835,
+        0,
+        1.0
+      ],
+      "values": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "case_id": "ragged7_p01",
+      "indices": [
+        0,
+        1,
+        2,
+        3,
+        31,
+        32,
+        127,
+        128,
+        255,
+        256,
+        16777216,
+        16777217
+      ],
+      "parameters": [
+        14333122603827937433,
+        429496736,
+        1.1111111640930176
+      ],
+      "values": [
+        1.1111111640930176,
+        1.1111111640930176,
+        1.1111111640930176,
+        1.1111111640930176,
+        0.0,
+        1.1111111640930176,
+        1.1111111640930176,
+        1.1111111640930176,
+        1.1111111640930176,
+        0.0,
+        1.1111111640930176,
+        0.0
+      ]
+    },
+    {
+      "case_id": "ragged7_p0125",
+      "indices": [
+        0,
+        1,
+        2,
+        3,
+        31,
+        32,
+        127,
+        128,
+        255,
+        256,
+        16777216,
+        16777217
+      ],
+      "parameters": [
+        15402974502876376406,
+        536870912,
+        1.1428571939468384
+      ],
+      "values": [
+        1.1428571939468384,
+        1.1428571939468384,
+        1.1428571939468384,
+        1.1428571939468384,
+        1.1428571939468384,
+        0.0,
+        1.1428571939468384,
+        1.1428571939468384,
+        1.1428571939468384,
+        1.1428571939468384,
+        1.1428571939468384,
+        1.1428571939468384
+      ]
+    }
+  ],
+  "fastino_files": {
+    "gliner2/models/base.py": {
+      "sha256": "791814c58c3674f0b546c67d90ab5013bf645e5eda29d25e9fd17fa100aaa061",
+      "size_bytes": 9533
+    },
+    "gliner2/models/boundary/model.py": {
+      "sha256": "b6c838a93096d958a7411df4d0a199c6aba25f80588430bbeb3a74db944165b3",
+      "size_bytes": 88893
+    }
+  },
+  "limits": {
+    "artifact_bytes": 67108864,
+    "child_rss_bytes": 2147483648,
+    "cooperative_seconds": 120,
+    "interop_threads": 1,
+    "metadata_bytes": 2097152,
+    "outer_seconds": 180,
+    "tensor_payload_bytes": 58720256,
+    "threads": 1
+  },
+  "methods": {
+    "DebertaV2Encoder.get_attention_mask": {
+      "lines": [
+        609,
+        616
+      ],
+      "sha256": "9a9167a9a22251d20b726d7f9343eb39099c155d49994feafa457da1894d2b14"
+    },
+    "DebertaV2Encoder.get_rel_embedding": {
+      "lines": [
+        603,
+        607
+      ],
+      "sha256": "f27ddfc1efdae21bfb5a59fb17117c034ec54236c424e2d9570e68f557bdcdb0"
+    },
+    "DebertaV2Encoder.get_rel_pos": {
+      "lines": [
+        618,
+        634
+      ],
+      "sha256": "2af489114d62fbf217dfe6c98030e935cecdee85e4f31225067332d8a7c65fb3"
+    },
+    "DisentangledSelfAttention.disentangled_attention_bias": {
+      "lines": [
+        282,
+        351
+      ],
+      "sha256": "593ca272bc139c85d6d5e434fc62042699f0b01a4fcf92e80128a620e2e22939"
+    },
+    "DisentangledSelfAttention.forward": {
+      "lines": [
+        196,
+        280
+      ],
+      "sha256": "0dbd0e76daf144bef99bdb709de14ac316dd30267dd3e713cd6cffb632b68c69"
+    },
+    "DisentangledSelfAttention.transpose_for_scores": {
+      "lines": [
+        191,
+        194
+      ],
+      "sha256": "56ef3fca0782312e36258597c1e4abf78f9551e461749b20bb2ea3cbe8a22591"
+    },
+    "build_relative_position": {
+      "lines": [
+        74,
+        103
+      ],
+      "sha256": "f4141b79151586f4210104586ff46dea3d7735111bc2b15352acffeab2ffb33c"
+    },
+    "build_rpos": {
+      "lines": [
+        130,
+        139
+      ],
+      "sha256": "89b7f2a9be6e12bf98f558917b5e0eb85748c00f5078ff0ab27034e3cc1e7456"
+    },
+    "make_log_bucket_position": {
+      "lines": [
+        59,
+        71
+      ],
+      "sha256": "21d5ad4335df3ddee2cd458f28b8b5751b83ce7564a26daad52794208be4b0cd"
+    },
+    "scaled_size_sqrt": {
+      "lines": [
+        125,
+        126
+      ],
+      "sha256": "f8e5b7564f0debaefd1e6c4e9872f4100652a7b772946abd4082767232234b71"
+    }
+  },
+  "oracle": {
+    "sha256": "61bbf4544a21111dbfbd643ed2392b1d9723498493b3fa6832154d6e1dc42752",
+    "size_bytes": 28555
+  },
+  "qualification": false,
+  "runtime": {
+    "packages": {
+      "PyYAML": "6.0.3",
+      "accelerate": "1.10.1",
+      "huggingface-hub": "0.36.0",
+      "numpy": "2.3.5",
+      "packaging": "25.0",
+      "peft": "0.17.1",
+      "psutil": "7.1.3",
+      "pydantic": "2.12.3",
+      "requests": "2.32.5",
+      "safetensors": "0.7.0",
+      "scipy": "1.16.3",
+      "tokenizers": "0.21.4",
+      "torch": "2.9.1",
+      "transformers": "4.55.4",
+      "urllib3": "2.5.0"
+    },
+    "python": "3.12.3",
+    "unicode": "15.0.0"
+  },
+  "scope": "gliner25_projected_training_attention/v1",
+  "semantics": {
+    "control_layout": "physical i32: seed low/high, micro_batch low/high, replica low/high (bit limbs), then mask[B,S] 0/1, then 2*S-1 source bucket indices for -(S-1)..S-1",
+    "counter": "splitmix64_site_element_v1; wrapping u64 stream=mix(seed)^mix(micro)^mix(replica+0x7265706c696361)^mix(stream_id); drop if high32(mix(stream^mix(index))) < floor(f64(f32(p))*2^32)",
+    "counter_mix": "mix(v): v+=0x9e3779b97f4a7c15; v=(v^(v>>30))*0xbf58476d1ce4e5b9; v=(v^(v>>27))*0x94d049bb133111eb; return v^(v>>31), all wrapping u64",
+    "dropout": "Explicit native counter masks replace nn.Dropout only; no claim to reproduce Torch RNG. Probabilities and inversion arithmetic use f32.",
+    "dropout_inversion": "f32(1/f32(1-f32(p)))",
+    "fully_masked_query": "uniform before dropout, zero score-path VJP, potentially nonzero V VJP including masked key rows",
+    "gradient_inputs": [
+      "Q[B*S,H]",
+      "K[B*S,H]",
+      "V[B*S,H]",
+      "Qr[R,H]",
+      "Kr[R,H]"
+    ],
+    "gradient_layout": "[dQ;dK;dV;dQr;dKr] rows 3*B*S+2*R",
+    "mask": "query AND key, masked_fill with finite -maxf32 before softmax",
+    "probability_index": "((b*num_heads+h)*S+q)*S+k; logical layer stream=(layer<<32)|3; relative-dropout stream=(layer<<32)|2",
+    "projection_boundary": "Capture actual shared Q/K/V projection returns, then substitute those same values as five independent autograd leaves. Original and leaf replay context and probabilities must be byte-identical.",
+    "qkv_layout": "[Q;K;V] in source B,S,H order",
+    "relative_index": "both Qr and Kr use bucket(q-k) for equal-length self-attention after source p2c transpose",
+    "relative_layout": "[Qr;Kr], R512 full projected shared table; table VJPs sum source batch repetition",
+    "relative_order": "shared full-table LayerNorm, then per-layer relative dropout, then shared Q/K projections, then score gathers",
+    "scale": "sqrt(3*head_dim); Q @ (K^T / scale), c2p and p2c each divided after its dot/gather, then summed in source order",
+    "scope_limit": "Projected attention primitive only; this does not independently qualify raw relative embedding/projection weight gradients, full tiled encoder or training jobs, unequal query/key lengths, inference masking, or release readiness",
+    "source_methods": "Actual pinned get_attention_mask/get_rel_embedding/get_rel_pos and DisentangledSelfAttention.forward/disentangled_attention_bias execute; attention math is not rewritten.",
+    "source_rng": "torch.manual_seed(251019) generates only the tiny source encoder initialization; it is distinct from the explicit dropout counter"
+  },
+  "source_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+  "transformers_source": {
+    "sha256": "98fa398f62e446e1f6303ff67fa7aceddac4f746a1a6013226896c3fa4e6cdd6",
+    "size_bytes": 56783
+  },
+  "version": 1
+}

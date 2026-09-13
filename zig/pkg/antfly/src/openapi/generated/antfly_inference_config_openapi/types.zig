@@ -547,6 +547,44 @@ pub const EmbedResponse = struct {
 pub const Error = struct {
     /// Error message
     @"error": []const u8,
+    message: ?[]const u8 = null,
+    input_index: ?i64 = null,
+    stage: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "error", "error", false },
+        .{ "message", "message", true },
+        .{ "input_index", "input_index", true },
+        .{ "stage", "stage", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.input_index) |value| {
+            try jw.objectField("input_index");
+            try jw.write(value);
+        }
+        if (self.stage) |value| {
+            try jw.objectField("stage");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Reason why generation stopped

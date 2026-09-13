@@ -45,6 +45,7 @@ pub const ModelEntry = struct {
     kind: ModelKind,
     path: []const u8,
     variant: []const u8,
+    gliner_architecture: @import("../models/gliner_boundary.zig").Architecture = .unknown,
 };
 
 const DiscoverKindMode = enum {
@@ -672,10 +673,12 @@ pub const ModelRegistry = struct {
             return err;
         };
 
+        var gliner_architecture: @import("../models/gliner_boundary.zig").Architecture = .unknown;
         const kind = switch (kind_mode) {
             .manifest => blk: {
                 var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
                 defer manifest.deinit();
+                gliner_architecture = manifest.gliner_architecture;
                 break :blk modelKindFromManifestType(manifest.model_type);
             },
             .path => kind_hint orelse inferModelKindFromPath(model_path),
@@ -693,6 +696,7 @@ pub const ModelRegistry = struct {
             .kind = kind,
             .path = owned_path,
             .variant = "f32",
+            .gliner_architecture = gliner_architecture,
         });
     }
 
@@ -1010,6 +1014,7 @@ fn appendManifestTasks(
     manifest: *const manifest_mod.ModelManifest,
     tasks: *std.ArrayListUnmanaged([]const u8),
 ) !void {
+    if (!manifest.hasSupportedGlinerRuntime()) return;
     for (manifest.tasks) |task| try appendUniqueOwnedString(allocator, tasks, task);
 
     switch (manifest.model_type) {
@@ -1032,12 +1037,41 @@ fn appendSupplementalTasks(
     manifest: *const manifest_mod.ModelManifest,
     tasks: *std.ArrayListUnmanaged([]const u8),
 ) !void {
+    if (!manifest.hasSupportedGlinerRuntime()) return;
     if (manifest.hasCapability("extraction")) {
         try appendUniqueOwnedString(allocator, tasks, "extract");
     }
     if (std.mem.eql(u8, manifest.gliner_model_type, "gliner2")) {
         try appendUniqueOwnedString(allocator, tasks, "extract");
     }
+}
+
+test "gliner boundary registry withholds tasks until runtime support exists" {
+    const allocator = std.testing.allocator;
+    var declared_tasks = [_][]const u8{"extract"};
+    var declared_capabilities = [_][]const u8{ "classification", "relations", "extraction" };
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .recognizer,
+        .gliner_architecture = .boundary,
+        .tasks = &declared_tasks,
+        .capabilities = &declared_capabilities,
+    };
+    var tasks = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (tasks.items) |task| allocator.free(task);
+        tasks.deinit(allocator);
+    }
+    var capabilities = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (capabilities.items) |capability| allocator.free(capability);
+        capabilities.deinit(allocator);
+    }
+    try appendManifestTasks(allocator, &manifest, &tasks);
+    try appendSupplementalTasks(allocator, &manifest, &tasks);
+    try appendInferredCapabilities(allocator, &manifest, &declared_tasks, &capabilities);
+    try std.testing.expectEqual(@as(usize, 0), tasks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), capabilities.items.len);
 }
 
 fn taskListContains(tasks: []const []const u8, needle: []const u8) bool {
@@ -1066,6 +1100,7 @@ fn appendInferredCapabilities(
     tasks: []const []const u8,
     capabilities: *std.ArrayListUnmanaged([]const u8),
 ) !void {
+    if (!manifest.hasSupportedGlinerRuntime()) return;
     for (manifest.capabilities) |cap| try appendUniqueOwnedString(allocator, capabilities, cap);
 
     if (taskListContains(tasks, "embed") and manifest.sparse_3d_output_layout != null) {
@@ -1294,6 +1329,9 @@ fn synthesizePulledModelManifestJsonInternal(
         .staging_plan => try manifest_mod.loadFromManagedPlanDir(allocator, dest_dir),
     };
     defer manifest.deinit();
+
+    if (!manifest.hasSupportedGlinerRuntime() and (tasks_csv != null or capabilities_csv != null))
+        return error.UnsupportedGlinerBoundaryRuntime;
 
     var tasks = std.ArrayListUnmanaged([]const u8).empty;
     defer {

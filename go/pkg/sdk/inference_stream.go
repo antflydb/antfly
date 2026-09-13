@@ -40,7 +40,10 @@ type InferenceAPIError struct {
 	Message    string
 	// Retryable is nil when the server did not classify the error.
 	Retryable *bool
-	prefix    string
+	// InputIndex and Stage identify an atomic extraction validation failure.
+	InputIndex *int
+	Stage      string
+	prefix     string
 }
 
 func (e *InferenceAPIError) Error() string {
@@ -56,6 +59,8 @@ func newInferenceAPIError(statusCode int, prefix string, payload *oapi.Inference
 		Code:       payload.Error,
 		Message:    inferenceErrorDetail(payload),
 		Retryable:  payload.Retryable,
+		InputIndex: payload.InputIndex,
+		Stage:      payload.Stage,
 		prefix:     prefix,
 	}
 }

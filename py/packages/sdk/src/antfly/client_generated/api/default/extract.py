@@ -64,6 +64,11 @@ def _parse_response(
 
         return response_413
 
+    if response.status_code == 422:
+        response_422 = InferenceError.from_dict(response.json())
+
+        return response_422
+
     if response.status_code == 500:
         response_500 = InferenceError.from_dict(response.json())
 
@@ -108,12 +113,20 @@ def sync_detailed(
     text/document classification, token classification, and structured
     document extraction.
 
+    Set `schema_version: 2` for strict mixed-task schemas, span attributes,
+    constrained classification, typed records and JointIE. Each input may
+    replace the shared schema/options. Offsets default to half-open UTF-8
+    bytes, and text content parts are joined by a single newline. Inputs
+    are validated atomically. Unsupported features and long documents are
+    rejected explicitly; windowing requires runtime support.
+
     Image-backed extraction uses the same byte-reserving and image-count-weighted
     admission policy as `/read`, before model resolution or download. Text-only
     extraction consumes one admission unit.
 
     Args:
-        body (ExtractionRequest):
+        body (ExtractionRequest): Atomic extraction request. Every input is validated before
+            inference; failures return no partial data.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -146,12 +159,20 @@ def sync(
     text/document classification, token classification, and structured
     document extraction.
 
+    Set `schema_version: 2` for strict mixed-task schemas, span attributes,
+    constrained classification, typed records and JointIE. Each input may
+    replace the shared schema/options. Offsets default to half-open UTF-8
+    bytes, and text content parts are joined by a single newline. Inputs
+    are validated atomically. Unsupported features and long documents are
+    rejected explicitly; windowing requires runtime support.
+
     Image-backed extraction uses the same byte-reserving and image-count-weighted
     admission policy as `/read`, before model resolution or download. Text-only
     extraction consumes one admission unit.
 
     Args:
-        body (ExtractionRequest):
+        body (ExtractionRequest): Atomic extraction request. Every input is validated before
+            inference; failures return no partial data.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -179,12 +200,20 @@ async def asyncio_detailed(
     text/document classification, token classification, and structured
     document extraction.
 
+    Set `schema_version: 2` for strict mixed-task schemas, span attributes,
+    constrained classification, typed records and JointIE. Each input may
+    replace the shared schema/options. Offsets default to half-open UTF-8
+    bytes, and text content parts are joined by a single newline. Inputs
+    are validated atomically. Unsupported features and long documents are
+    rejected explicitly; windowing requires runtime support.
+
     Image-backed extraction uses the same byte-reserving and image-count-weighted
     admission policy as `/read`, before model resolution or download. Text-only
     extraction consumes one admission unit.
 
     Args:
-        body (ExtractionRequest):
+        body (ExtractionRequest): Atomic extraction request. Every input is validated before
+            inference; failures return no partial data.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -215,12 +244,20 @@ async def asyncio(
     text/document classification, token classification, and structured
     document extraction.
 
+    Set `schema_version: 2` for strict mixed-task schemas, span attributes,
+    constrained classification, typed records and JointIE. Each input may
+    replace the shared schema/options. Offsets default to half-open UTF-8
+    bytes, and text content parts are joined by a single newline. Inputs
+    are validated atomically. Unsupported features and long documents are
+    rejected explicitly; windowing requires runtime support.
+
     Image-backed extraction uses the same byte-reserving and image-count-weighted
     admission policy as `/read`, before model resolution or download. Text-only
     extraction consumes one admission unit.
 
     Args:
-        body (ExtractionRequest):
+        body (ExtractionRequest): Atomic extraction request. Every input is validated before
+            inference; failures return no partial data.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
