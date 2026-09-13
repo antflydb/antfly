@@ -828,7 +828,59 @@ authentication budgets, and point-only query metadata. See
 for measured scope, fixtures, and limitations. Kernel or mock-storage microbenchmarks are not claims
 about whole-query, whole-build, or cloud-network latency.
 
-Focused validation targets are `graph-metric-core-test`,
-`antfly-graph-page-test`, `antfly-document-facts-test`, `lake-test` and
-`antfly-serverless-test`. The graph-page target supports `ReleaseSafe` for
+Focused validation targets are `antfly-storage-db-test`,
+`antfly-graph-test`, `antfly-document-facts-test`, `lake-test` and
+`antfly-serverless-test`. The graph owner target supports `ReleaseSafe` for
 checked page/key invariants; allocation-failure tests also validate ownership.
+
+### Test ownership and fault qualification
+
+Public test targets follow code ownership. There are no graph-metric-specific
+unit, core, topology, fan-in, wire, smoke, integration, or process targets.
+
+| Owner / aggregate | Coverage |
+| --- | --- |
+| `antfly-graph-test` | Graph algorithms, topology, scores, query, immutable pages and recovery contracts |
+| `antfly-storage-db-test` | DB maintenance, publication, cleanup and storage regressions using the existing storage support/core binaries |
+| `antfly-api-test` | API contracts, authorization, graph fan-in and linked remote-wire behavior |
+| `antfly-cmd-test` | Remote index/artifact command parsing, HTTP contracts and output |
+| `antfly-unit-test` | Bounded owner selections, one PageRank runtime smoke, and a fixed VOPR regression seed |
+| `vopr-test` | Broader maintenance/ownership record-and-replay histories alongside other VOPR scenarios |
+| `antfly-integration-test` | Complete graph owner coverage, storage lifecycle tests, worker-tool contracts and six native process boundary checks |
+
+The topology-only compilation was redundant with the storage core selection.
+The PageRank smoke now shares that core compilation. API fan-in and remote-wire
+coverage keep their existing compiler boundaries. Remote CLI tests use the
+product CLI dependency profile; the physical Lite restore fixture belongs to
+Lite tests, and serverless command tests belong to serverless tests.
+
+The process fixture launches itself as a worker, so it does not build or launch
+the product CLI for test-only maintenance controls. Its six native checks cover
+concurrent launch, killed coordinator takeover, killed page-worker reclaim,
+HTTP service-owner takeover, HTTP publish/cleanup restart, and active public
+reads. It no longer multiplies these OS boundaries across every metric family
+and iterative phase.
+
+Family-specific score, page-output, convergence and exhaustion assertions stay
+in `graph/graph.zig` tests, including `graph degree planned expired worker page
+is reclaimed across reopened handles`, the eigenvector/HITS reclaimed-page
+tests, and the PageRank/eigenvector/HITS exhausted-page and prior-generation
+regressions. Full integration runs the complete graph owner suite;
+API tests retain the existing compatible/incompatible HITS and hosted fan-in
+cases. Worker parser/supervisor assertions are moved intact into testing.
+
+VOPR `index-maintenance` runs production graph operations against in-memory LSM
+stores with an owner-supplied clock. It explores metric families and failure
+positions, checks early-claim exclusion, attempt increment/reset, stale output
+rejection, publication preservation, pause/resume, failed cleanup and retry
+exhaustion. `index-ownership` exercises actual DB runtime leases, takeover,
+stale owner close/tick ordering and clean lease release. That scenario shares
+the existing DB/index VOPR fixture's explicit physical-index differential
+boundary. Exact replay recreates the world; native crash/durability proof stays
+in integration tests.
+
+CI's `zig-base` unit aggregate includes the fixed seed. `zig-full` runs the
+broader VOPR campaign and native integration suite; compilation/cache matrices
+remain in the existing build-cache job. Graph, DB and remote-command owner filters narrow execution without changing
+their compiler selections. The shared API implementation artifact still serves
+other API targets with their existing selection policy.

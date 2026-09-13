@@ -11,7 +11,6 @@ const std = @import("std");
 pub const Route = enum {
     cli,
     data,
-    graph_metric_maintenance,
     ha,
     inference,
     metadata,
@@ -32,8 +31,8 @@ pub const Command = struct {
 };
 
 const table_subcommands = [_][]const u8{ "create", "drop", "list", "get" };
-const index_subcommands = [_][]const u8{ "create", "drop", "list", "get", "wait" };
-const artifact_subcommands = [_][]const u8{ "list", "get", "put", "delete", "reprocess", "job" };
+const index_subcommands = [_][]const u8{ "create", "drop", "list", "get", "wait", "maintenance" };
+const artifact_subcommands = [_][]const u8{ "list", "get", "put", "delete", "reprocess", "job", "maintenance" };
 const agents_subcommands = [_][]const u8{ "retrieval", "query-builder" };
 const auth_subcommands = [_][]const u8{ "me", "users", "permissions", "roles", "row-filters", "subjects", "api-keys" };
 const inference_subcommands = [_][]const u8{
@@ -59,8 +58,6 @@ const completion_subcommands = [_][]const u8{ "bash", "zsh", "fish" };
 /// completions behind.
 pub const commands = [_]Command{
     .{ .name = "data", .description = "Run a data node", .route = .data },
-    .{ .name = "graph-metric-maintenance", .description = "Run resumable graph metric maintenance", .route = .graph_metric_maintenance },
-    .{ .name = "__graph-metric-maintenance", .description = "Run internal graph metric maintenance", .route = .graph_metric_maintenance, .hidden = true },
     .{ .name = "metadata", .description = "Run a metadata node", .route = .metadata },
     .{ .name = "standalone", .description = "Run a standalone server", .route = .standalone },
     .{ .name = "swarm", .description = "Run a standalone server (legacy alias)", .route = .standalone },
@@ -228,7 +225,6 @@ test "command table drives routes and completion entries" {
     try std.testing.expectEqual(Route.standalone, findCommand("swarm").?.route);
     try std.testing.expectEqual(Route.cli, findCommand("table").?.route);
     try std.testing.expectEqual(Route.completion, findCommand("completion").?.route);
-    try std.testing.expectEqual(Route.graph_metric_maintenance, findCommand("__graph-metric-maintenance").?.route);
     try std.testing.expect(findCommand("termite") == null);
 }
 
@@ -238,7 +234,8 @@ test "completion output omits hidden commands" {
         defer output.deinit();
         try write(shell, &output.writer);
         try std.testing.expect(std.mem.indexOf(u8, output.written(), "__graph-metric-maintenance") == null);
-        try std.testing.expect(std.mem.indexOf(u8, output.written(), "graph-metric-maintenance") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "__maintenance-worker") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "graph-metric-maintenance") == null);
     }
 }
 
@@ -248,5 +245,5 @@ test "zsh completion contains nested inference and completion commands" {
     try write(.zsh, &output.writer);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "inference) subcommands=(run embed classify") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "completion) subcommands=(bash zsh fish)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "index) subcommands=(create drop list get wait)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "index) subcommands=(create drop list get wait maintenance)") != null);
 }

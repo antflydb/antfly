@@ -676,6 +676,8 @@ fn hasConfiguredEdgeType(edge_type_configs: []const EdgeTypeConfig, edge_type: [
 }
 
 pub const GraphIndexOptions = struct {
+    /// Owner-supplied time for lease fencing and publication metadata.
+    clock: @import("antfly_platform").clock.Clock = .real(),
     /// DB-owned indexes activate prepared fences from the authoritative
     /// primary range, not from a separately committed private-store marker.
     managed_ownership_range: bool = false,
@@ -872,6 +874,7 @@ pub const ReverseBackend = enum {
 };
 
 pub const GraphIndex = struct {
+    clock: @import("antfly_platform").clock.Clock = .real(),
     /// Topology task views borrow stores and live ownership from this owner.
     /// Never copy a live GraphIndex: its mutexes and caches have identity.
     borrowed_owner: ?*GraphIndex = null,
@@ -2905,7 +2908,7 @@ pub const GraphIndex = struct {
     fn acquireGraphMetricBuildLeaseWithPlanning(self: *GraphIndex, metric_name: []const u8, target_generation: u64, comptime drain: bool) !void {
         if (self.ownershipTransitionPending()) return error.MetricNotReady;
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
-        const observed_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const observed_at_ms = self.clock.nowRealtimeMs();
         // Avoid the boundary scan for the common duplicate-scheduler case.
         // The write transaction below repeats both checks to close the race.
         {
@@ -2921,7 +2924,7 @@ pub const GraphIndex = struct {
         // Boundary planning can be substantial for a cold generation. Base
         // both lease takeover and the new expiry on the time at which the
         // transaction is actually ready to commit, not the pre-scan probe.
-        const lease_started_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const lease_started_at_ms = self.clock.nowRealtimeMs();
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
 
@@ -3662,7 +3665,7 @@ pub const GraphIndex = struct {
             .target_generation = job.target_generation,
             .score_generation = job.score_generation,
             .config_fingerprint = graphMetricConfigFingerprint(cfg),
-            .planned_at_ms = if (job.started_at_ms != 0) job.started_at_ms else @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+            .planned_at_ms = if (job.started_at_ms != 0) job.started_at_ms else self.clock.nowRealtimeMs(),
             .edge_count = partition_plan.edge_count,
             .node_count = partition_plan.node_count,
             .phase_count = phases.len,
@@ -4438,7 +4441,7 @@ pub const GraphIndex = struct {
         page_id: u64,
         worker_id: []const u8,
     ) !?GraphMetricBuildPage {
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         return try self.claimGraphMetricBuildPageAt(metric_name, job_id, phase, iteration, page_id, worker_id, now_ms);
     }
 
@@ -4450,7 +4453,7 @@ pub const GraphIndex = struct {
         iteration: u32,
         worker_id: []const u8,
     ) !?GraphMetricBuildPage {
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         return try self.claimNextGraphMetricBuildPageAt(metric_name, job_id, phase, iteration, worker_id, now_ms);
     }
 
@@ -5210,7 +5213,7 @@ pub const GraphIndex = struct {
             try self.planGraphMetricIterationPagesInBatch(&batch, metric_name, cfg.kind, job, next_iteration);
             job.phase = .reduce_ranks;
             job.iteration = next_iteration;
-            job.updated_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+            job.updated_at_ms = self.clock.nowRealtimeMs();
             job.completed_units = summary.completed_units;
             job.total_units = summary.total_units;
             try self.putGraphMetricBuildJobInBatch(&batch, metric_name, job);
@@ -5272,7 +5275,7 @@ pub const GraphIndex = struct {
         }
         job.phase = next_phase;
         job.iteration = iteration;
-        job.updated_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        job.updated_at_ms = self.clock.nowRealtimeMs();
         job.completed_units = summary.completed_units;
         job.total_units = summary.total_units;
         try self.putGraphMetricBuildJobInBatch(&batch, metric_name, job);
@@ -5488,7 +5491,7 @@ pub const GraphIndex = struct {
         };
         lease.phase = phase;
         lease.iteration = iteration;
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         const score_generation = if (try self.metricBuildJob(&batch, metric_name)) |job|
             if (job.job_id == lease.job_id) job.score_generation else lease.target_generation
         else
@@ -5526,7 +5529,7 @@ pub const GraphIndex = struct {
             .target_generation = job.target_generation,
             .score_generation = job.score_generation,
             .started_at_ms = job.started_at_ms,
-            .updated_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+            .updated_at_ms = self.clock.nowRealtimeMs(),
             .lease_expires_at_ms = 0,
             .phase = .complete,
             .iteration = job.iteration,
@@ -6047,7 +6050,7 @@ pub const GraphIndex = struct {
         }
         const retry_count = try self.nextGraphMetricFailureRetryCountInBatch(&batch, metric_name);
         try self.putGraphMetricFailureDetailInBatch(&batch, metric_name, retry_count, failure_reason);
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         var failure_record = GraphMetricFailureRecord{
             .at_ms = now_ms,
             .retry_count = retry_count,
@@ -6432,6 +6435,7 @@ pub const GraphIndex = struct {
             .reverse_owner = reverse_store.owner,
             .edge_type_configs = opts.edge_type_configs,
             .metric_configs = opts.metric_configs,
+            .clock = opts.clock,
             .sealed_vectors = if (opts.sealed_vector_budget) |budget| .{ .budget = budget } else .{},
             .rebuild_root_path = if (opts.rebuild_root_path) |path| try alloc.dupe(u8, path) else null,
             .rebuild_storage = opts.reverse_lsm_storage,
@@ -14111,7 +14115,7 @@ pub const GraphIndex = struct {
             progress_page.output_prefix = cleanup_prefix;
             try self.putGraphMetricBuildPageInBatch(&batch, metric_name, progress_page);
             var progress_job = job;
-            progress_job.updated_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+            progress_job.updated_at_ms = self.clock.nowRealtimeMs();
             progress_job.worker_id = worker_id;
             progress_job.cursor = delete_page.cursor;
             progress_job.completed_units = completed_units_raw;
@@ -14135,7 +14139,7 @@ pub const GraphIndex = struct {
                 .target_generation = job.target_generation,
                 .score_generation = job.score_generation,
                 .started_at_ms = job.started_at_ms,
-                .updated_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+                .updated_at_ms = self.clock.nowRealtimeMs(),
                 .lease_expires_at_ms = 0,
                 .phase = .complete,
                 .iteration = job.iteration,
@@ -14166,7 +14170,7 @@ pub const GraphIndex = struct {
             };
             try self.putGraphMetricBuildPageInBatch(&batch, metric_name, completed_page);
             var progress_job = job;
-            progress_job.updated_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+            progress_job.updated_at_ms = self.clock.nowRealtimeMs();
             progress_job.worker_id = worker_id;
             progress_job.cursor = cleanup_cursor;
             progress_job.completed_units = page.page_id + 1;
@@ -14877,7 +14881,7 @@ pub const GraphIndex = struct {
         if (try self.metricBuildJob(&batch, name)) |job| {
             if (job.target_generation == generation and job.phase != .complete and job.retry_count == 0 and job.last_error.len == 0) {
                 if (try self.metricBuildLease(&batch, name)) |lease| {
-                    const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+                    const now_ms = self.clock.nowRealtimeMs();
                     if (lease.job_id == job.job_id and lease.target_generation == generation and lease.lease_expires_at_ms > now_ms) {
                         batch.abort();
                         return self.graphMetricStatus(metric);
@@ -15035,6 +15039,7 @@ pub const GraphIndex = struct {
         // ownership reads delegate to the pinned owner's live publication.
         return .{
             .borrowed_owner = self,
+            .clock = self.clock,
             .alloc = self.alloc,
             .index_name = self.index_name,
             .outgoing_store = self.outgoing_store,
@@ -15975,7 +15980,7 @@ pub const GraphIndex = struct {
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         try self.deleteGraphMetricMaterializationInBatch(&batch, cfg.name, now_ms);
         if (self.pairedHitsMetricConfig(cfg)) |pair| {
             try self.deleteGraphMetricMaterializationInBatch(&batch, pair.name, now_ms);
@@ -16104,7 +16109,7 @@ pub const GraphIndex = struct {
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         try self.pauseGraphMetricMaintenanceInBatch(&batch, cfg.name, now_ms);
         if (self.pairedHitsMetricConfig(cfg)) |pair| {
             try self.pauseGraphMetricMaintenanceInBatch(&batch, pair.name, now_ms);
@@ -16130,7 +16135,7 @@ pub const GraphIndex = struct {
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         try self.resumeGraphMetricMaintenanceInBatch(&batch, cfg.name, now_ms);
         if (self.pairedHitsMetricConfig(cfg)) |pair| {
             try self.resumeGraphMetricMaintenanceInBatch(&batch, pair.name, now_ms);
@@ -16288,7 +16293,7 @@ pub const GraphIndex = struct {
             .target_generation = job.target_generation,
             .score_generation = job.score_generation,
             .started_at_ms = job.started_at_ms,
-            .updated_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+            .updated_at_ms = self.clock.nowRealtimeMs(),
             .lease_expires_at_ms = job.lease_expires_at_ms,
             .phase = .cleanup_old_generations,
             .iteration = job.iteration,
@@ -16854,7 +16859,7 @@ pub const GraphIndex = struct {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
             if (try self.metricBuildLease(&txn, owner_name)) |lease| {
-                const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+                const now_ms = self.clock.nowRealtimeMs();
                 if (lease.lease_expires_at_ms > now_ms) {
                     if (lease.target_generation != target_generation) return error.GraphMetricBuildAlreadyRunning;
                     _ = try self.metricBuildJob(&txn, owner_name) orelse return error.GraphMetricBuildJobNotFound;
@@ -17008,7 +17013,7 @@ pub const GraphIndex = struct {
             .converged = result.converged,
             .iterations_completed = result.iterations_completed,
             .delta = result.delta,
-            .computed_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+            .computed_at_ms = self.clock.nowRealtimeMs(),
             .config_fingerprint = graphMetricConfigFingerprint(cfg),
             .edge_filter = cfg.edge_filter,
         });
@@ -17040,7 +17045,7 @@ pub const GraphIndex = struct {
             .converged = true,
             .iterations_completed = 1,
             .delta = 0.0,
-            .computed_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+            .computed_at_ms = self.clock.nowRealtimeMs(),
             .config_fingerprint = graphMetricConfigFingerprint(cfg),
             .edge_filter = cfg.edge_filter,
         });
@@ -17222,7 +17227,7 @@ pub const GraphIndex = struct {
         cfg: GraphMetricConfig,
         worker_id: []const u8,
     ) !GraphMetricBuildWorkerStepResult {
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         return try self.runGraphMetricPlannedWorkerPageStepAt(metric_name, cfg, worker_id, now_ms);
     }
 
@@ -17317,7 +17322,7 @@ pub const GraphIndex = struct {
         metric_name: []const u8,
         worker_id: []const u8,
     ) !GraphMetricBuildWorkerStepResult {
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         return try self.runGraphMetricPlannedWorkerPageStepForMetricAt(metric_name, worker_id, now_ms);
     }
 
@@ -17337,7 +17342,7 @@ pub const GraphIndex = struct {
         metric_name: []const u8,
         cfg: GraphMetricConfig,
     ) !GraphMetricBuildWorkerStepResult {
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         return try self.runGraphMetricPlannedCoordinatorStepAt(metric_name, cfg, now_ms);
     }
 
@@ -17408,7 +17413,7 @@ pub const GraphIndex = struct {
         self: *GraphIndex,
         metric_name: []const u8,
     ) !GraphMetricBuildWorkerStepResult {
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         return try self.runGraphMetricPlannedCoordinatorStepForMetricAt(metric_name, now_ms);
     }
 
@@ -17441,7 +17446,7 @@ pub const GraphIndex = struct {
                     .converged = true,
                     .iterations_completed = 1,
                     .delta = 0.0,
-                    .computed_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+                    .computed_at_ms = self.clock.nowRealtimeMs(),
                     .config_fingerprint = graphMetricConfigFingerprint(cfg),
                     .edge_filter = cfg.edge_filter,
                 });
@@ -17455,7 +17460,7 @@ pub const GraphIndex = struct {
                     .converged = verification.converged,
                     .iterations_completed = verification.iteration + 1,
                     .delta = verification.total_delta,
-                    .computed_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+                    .computed_at_ms = self.clock.nowRealtimeMs(),
                     .config_fingerprint = graphMetricConfigFingerprint(cfg),
                     .edge_filter = cfg.edge_filter,
                 });
@@ -17469,7 +17474,7 @@ pub const GraphIndex = struct {
                     .converged = verification.converged,
                     .iterations_completed = verification.iteration + 1,
                     .delta = verification.total_delta,
-                    .computed_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+                    .computed_at_ms = self.clock.nowRealtimeMs(),
                     .config_fingerprint = graphMetricConfigFingerprint(cfg),
                     .edge_filter = cfg.edge_filter,
                 });
@@ -17536,7 +17541,7 @@ pub const GraphIndex = struct {
             .converged = verification.converged,
             .iterations_completed = rank_iteration,
             .delta = verification.total_delta,
-            .computed_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+            .computed_at_ms = self.clock.nowRealtimeMs(),
             .config_fingerprint = graphMetricConfigFingerprint(cfg),
             .edge_filter = cfg.edge_filter,
         };
@@ -17590,7 +17595,7 @@ pub const GraphIndex = struct {
             .target_generation = persisted_job.target_generation,
             .score_generation = persisted_job.score_generation,
             .started_at_ms = persisted_job.started_at_ms,
-            .updated_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+            .updated_at_ms = self.clock.nowRealtimeMs(),
             .lease_expires_at_ms = persisted_job.lease_expires_at_ms,
             .phase = .cleanup_old_generations,
             .iteration = persisted_job.iteration,
@@ -17652,7 +17657,7 @@ pub const GraphIndex = struct {
             .converged = result.converged,
             .iterations_completed = result.iterations_completed,
             .delta = result.delta,
-            .computed_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+            .computed_at_ms = self.clock.nowRealtimeMs(),
             .config_fingerprint = graphMetricConfigFingerprint(cfg),
             .edge_filter = cfg.edge_filter,
         });
@@ -17712,7 +17717,7 @@ pub const GraphIndex = struct {
             .converged = result.converged,
             .iterations_completed = result.iterations_completed,
             .delta = result.delta,
-            .computed_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms),
+            .computed_at_ms = self.clock.nowRealtimeMs(),
             .config_fingerprint = graphMetricConfigFingerprint(cfg),
             .edge_filter = cfg.edge_filter,
         };
@@ -17746,7 +17751,7 @@ pub const GraphIndex = struct {
         const maintenance_paused = try self.metricMaintenancePaused(&txn, lifecycle_name);
         const disabled = try self.metricDisabled(&txn, metric_name);
         const maybe_lease = try self.metricBuildLease(&txn, lifecycle_name);
-        const current_ms = now_ms orelse @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const current_ms = now_ms orelse self.clock.nowRealtimeMs();
         const active_lease = if (maybe_lease) |lease| lease.lease_expires_at_ms > current_ms else false;
         const last_event = try self.graphMetricLastEvent(&txn, metric_name);
 
@@ -17884,7 +17889,7 @@ pub const GraphIndex = struct {
         }
         const current_generation = try self.graphMetricCurrentGenerationInTxn(txn, metric_name);
         const target_edge_generation = @max(dirty_generation, current_generation);
-        const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+        const now_ms = self.clock.nowRealtimeMs();
         const active_build_lease = if (maybe_build_lease) |lease| lease.lease_expires_at_ms > now_ms else false;
         const building_generation = if (active_build_lease) maybe_build_lease.?.target_generation else 0;
         const build_job_id = if (active_build_lease) maybe_build_lease.?.job_id else 0;
@@ -24386,6 +24391,19 @@ test "graph pagerank planned worker page step leaves phase and publish to coordi
     }
 }
 
+/// Drain whatever pages the planner assigned without letting workers advance
+/// the phase or publish. Tests must not assume a fixed partition/summary count.
+fn completePlannedWorkerPhaseForTest(graph: *GraphIndex, metric: []const u8, phase: GraphIndex.GraphMetricBuildPhase) !void {
+    for (0..2048) |_| {
+        const step = try graph.runGraphMetricPlannedWorkerPageStepForMetric(metric, "phase-worker");
+        try std.testing.expectEqual(phase, step.phase);
+        try std.testing.expect(!step.advanced_phase);
+        try std.testing.expect(!step.published);
+        if (!step.claimed_page) return;
+    }
+    return error.TestWorkerPhaseDidNotComplete;
+}
+
 fn expectPlannedWorkerCoordinatorSplitUntilPublish(
     graph: *GraphIndex,
     metric_name: []const u8,
@@ -24440,7 +24458,7 @@ fn expectPlannedWorkerCoordinatorSplitUntilPublish(
 
     const worker_publish_step = try graph.runGraphMetricPlannedWorkerPageStepForMetric(metric_name, "worker-publish");
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, worker_publish_step.phase);
-    try std.testing.expect(!worker_publish_step.claimed_page);
+    try completePlannedWorkerPhaseForTest(graph, metric_name, .publish_generation);
     try std.testing.expect(!worker_publish_step.advanced_phase);
     try std.testing.expect(!worker_publish_step.published);
     {
@@ -26339,7 +26357,7 @@ test "graph degree planned build publishes scores matching local runner" {
     var planned_status = try graph.runDegreeMetricPlanned("degree_planned");
     defer planned_status.deinit(alloc);
     try std.testing.expectEqual(GraphIndex.GraphMetricState.fresh, planned_status.state);
-    try std.testing.expectEqual(@as(u64, 2), planned_status.last_event.?.score_count);
+    try std.testing.expectEqual(local_status.last_event.?.score_count, planned_status.last_event.?.score_count);
     try std.testing.expectEqual(graph.edge_generation, planned_status.published_generation);
     try std.testing.expectEqual(graph.edge_generation, planned_status.edge_generation);
     try std.testing.expectEqual(@as(u32, 1), planned_status.iterations_completed);
@@ -26687,13 +26705,15 @@ test "graph degree planned worker and coordinator steps survive reopened handles
         var coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer coordinator.close();
 
+        try completePlannedWorkerPhaseForTest(&coordinator, "degree", .reduce_ranks);
+
         const reduce_step = try coordinator.runGraphMetricPlannedCoordinatorStep("degree", metrics[0]);
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, reduce_step.phase);
         try std.testing.expect(reduce_step.advanced_phase);
 
         const worker_publish_step = try coordinator.runGraphMetricPlannedWorkerPageStep("degree", metrics[0], "worker-publish");
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, worker_publish_step.phase);
-        try std.testing.expect(!worker_publish_step.claimed_page);
+        try completePlannedWorkerPhaseForTest(&coordinator, "degree", .publish_generation);
         try std.testing.expect(!worker_publish_step.advanced_phase);
         try std.testing.expect(!worker_publish_step.published);
 
@@ -26976,13 +26996,15 @@ test "graph degree planned name-only public steps require coordinator across wor
     try std.testing.expect(reduce_b.page_id != reduce_a.page_id);
     try std.testing.expect(!reduce_b.advanced_phase);
 
+    try completePlannedWorkerPhaseForTest(&graph, "degree", .reduce_ranks);
+
     const reduce_ready = try graph.runGraphMetricPlannedCoordinatorStepForMetric("degree");
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, reduce_ready.phase);
     try std.testing.expect(reduce_ready.advanced_phase);
 
     const worker_publish = try graph.runGraphMetricPlannedWorkerPageStepForMetric("degree", "worker-publish");
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, worker_publish.phase);
-    try std.testing.expect(!worker_publish.claimed_page);
+    try completePlannedWorkerPhaseForTest(&graph, "degree", .publish_generation);
     try std.testing.expect(!worker_publish.advanced_phase);
     try std.testing.expect(!worker_publish.published);
 
@@ -27446,13 +27468,15 @@ test "graph degree planned public workers claim phase pages from concurrent hand
         });
         defer graph.close();
 
+        try completePlannedWorkerPhaseForTest(&graph, "degree", .reduce_ranks);
+
         const reduce_ready = try graph.runGraphMetricPlannedCoordinatorStepForMetric("degree");
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, reduce_ready.phase);
         try std.testing.expect(reduce_ready.advanced_phase);
 
         const worker_publish = try graph.runGraphMetricPlannedWorkerPageStepForMetric("degree", "worker-publish");
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, worker_publish.phase);
-        try std.testing.expect(!worker_publish.claimed_page);
+        try completePlannedWorkerPhaseForTest(&graph, "degree", .publish_generation);
         try std.testing.expect(!worker_publish.advanced_phase);
         try std.testing.expect(!worker_publish.published);
 
@@ -34154,9 +34178,12 @@ test "graph compatible HITS aliases share lifecycle controls and reject stale pu
     var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
-    var scheduled_hub = try graph.ensureGraphMetricPlannedBuild("hub", 1);
+    // Plan a real committed generation, not an invented snapshot number.
+    try graph.addEdge("a", "b", "link", 1, 0, 0, "");
+    const generation = try graph.graphMetricCurrentGeneration("authority");
+    var scheduled_hub = try graph.ensureGraphMetricPlannedBuild("hub", generation);
     defer scheduled_hub.deinit(alloc);
-    var scheduled_authority = try graph.ensureGraphMetricPlannedBuild("authority", 1);
+    var scheduled_authority = try graph.ensureGraphMetricPlannedBuild("authority", generation);
     defer scheduled_authority.deinit(alloc);
     try std.testing.expectEqualStrings("hub", scheduled_hub.name);
     try std.testing.expectEqual(scheduled_hub.build_job_id, scheduled_authority.build_job_id);
