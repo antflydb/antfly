@@ -43,6 +43,7 @@ class TableStatus:
             concrete field variants and their supported query modes, such as full_text, exact,
             range, geo, and autocomplete. Public exact field sort is supported only for `_id`
             or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
+        table_id (str | Unset): Immutable physical table identity, preserved by catalog renames.
         artifact_enrichments (list[EnrichmentConfig] | Unset): Table-level generated artifact enrichments registered
             outside a specific index.
     """
@@ -57,6 +58,7 @@ class TableStatus:
     migration: TableMigration | Unset = UNSET
     replication_sources: list[ReplicationSource] | Unset = UNSET
     field_capabilities: list[FieldCapability] | Unset = UNSET
+    table_id: str | Unset = UNSET
     artifact_enrichments: list[EnrichmentConfig] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -97,6 +99,8 @@ class TableStatus:
                 field_capabilities_item = field_capabilities_item_data.to_dict()
                 field_capabilities.append(field_capabilities_item)
 
+        table_id = self.table_id
+
         artifact_enrichments: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.artifact_enrichments, Unset):
             artifact_enrichments = []
@@ -126,6 +130,8 @@ class TableStatus:
             field_dict["replication_sources"] = replication_sources
         if field_capabilities is not UNSET:
             field_dict["field_capabilities"] = field_capabilities
+        if table_id is not UNSET:
+            field_dict["table_id"] = table_id
         if artifact_enrichments is not UNSET:
             field_dict["artifact_enrichments"] = artifact_enrichments
 
@@ -193,6 +199,8 @@ class TableStatus:
 
                 field_capabilities.append(field_capabilities_item)
 
+        table_id = d.pop("table_id", UNSET)
+
         _artifact_enrichments = d.pop("artifact_enrichments", UNSET)
         artifact_enrichments: list[EnrichmentConfig] | Unset = UNSET
         if _artifact_enrichments is not UNSET:
@@ -213,6 +221,7 @@ class TableStatus:
             migration=migration,
             replication_sources=replication_sources,
             field_capabilities=field_capabilities,
+            table_id=table_id,
             artifact_enrichments=artifact_enrichments,
         )
 

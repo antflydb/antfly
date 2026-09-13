@@ -87,6 +87,7 @@ comptime {
     _ = @import("db/derived/io_threaded_runtime.zig");
     _ = @import("db/derived/replay_source.zig");
     _ = @import("db/derived/replay_stream.zig");
+    _ = @import("db/derived/runtime_types.zig");
     _ = @import("db/doc_filter_wire.zig");
     _ = @import("db/doc_identity.zig");
     _ = @import("db/doc_set.zig");

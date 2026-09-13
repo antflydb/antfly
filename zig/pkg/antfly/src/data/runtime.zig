@@ -13,6 +13,9 @@
 // limitations.
 
 const std = @import("std");
+const store_report_update = @import("../metadata/store_report_update.zig");
+const report_collection = @import("../metadata/report_collection.zig");
+const system_catalog = @import("../system_catalog/domain.zig");
 const runtime_io_abi = @import("../runtime_io_abi.zig");
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
@@ -5632,6 +5635,9 @@ pub const DataServer = struct {
     reporter_incarnation_mutex: std.atomic.Mutex = .unlocked,
     reporter_incarnation: u64 = 0,
     store_status_generation: std.atomic.Value(u64) = .init(1),
+    store_report_publisher: store_report_update.Publisher = .{},
+    store_report_publish_mutex: std.Io.Mutex = .init,
+    store_report_update_retry_at_ms: u64 = 0,
     metadata_bootstrap_retry_mutex: std.atomic.Mutex = .unlocked,
     metadata_bootstrap_retry_attempts: u32 = 0,
     next_metadata_bootstrap_retry_at_ms: u64 = 0,
@@ -6427,7 +6433,7 @@ pub const DataServer = struct {
         // shard owns the entity table, then hand it to the write source(s) that
         // open managed DBs. Captures `read_source.source()` (ptr+vtable), so
         // later read-source mutations remain visible.
-        self.distributed_candidate_source = .{ .reads = self.read_source.source() };
+        self.distributed_candidate_source = .{ .reads = self.read_source.source(), .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
         const candidate_source = self.distributed_candidate_source.?.candidateSource();
         _ = self.write_source.withResolutionCandidateSource(candidate_source);
         if (self.data_raft_apply) |apply_sm| {
@@ -6440,7 +6446,7 @@ pub const DataServer = struct {
         // that open managed DBs.
         // Require atomic promotion: one fenced batch for a single shard and
         // 2PC only when the entity set spans multiple shards.
-        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .atomic_batch_required = true };
+        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .atomic_batch_required = true, .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
         const entity_sink = self.distributed_entity_sink.?.entitySink();
         _ = self.write_source.withEntitySink(entity_sink);
         if (self.data_raft_apply) |apply_sm| {
@@ -6985,8 +6991,11 @@ pub const DataServer = struct {
             alloc.free(records);
         }
 
-        var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
-        defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
+        const exported = try self.write_source.catalog.exportCatalog(alloc);
+        defer alloc.free(exported);
+        var parsed_export = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").Export, alloc, exported, .{ .allocate = .alloc_always });
+        defer parsed_export.deinit();
+        const metadata_snapshot = parsed_export.value;
         if (records.len == 0 and !self.api_server_cfg.deployment_mode.isStandalone())
             return error.HASeedSnapshotEmptyCatalog;
         const group_ids = try alloc.alloc(
@@ -7001,7 +7010,7 @@ pub const DataServer = struct {
         }
         std.mem.sort(u64, group_ids, {}, std.sort.asc(u64));
 
-        if (metadata_snapshot.status.metadata_epoch == 0 or
+        if (metadata_snapshot.epoch == 0 or
             metadata_snapshot.tables.len == 0 or
             metadata_snapshot.ranges.len == 0 or
             group_ids.len != metadata_snapshot.ranges.len)
@@ -7126,7 +7135,8 @@ pub const DataServer = struct {
         const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
             .generation = request.generation,
             .catalog = .{
-                .epoch = metadata_snapshot.status.metadata_epoch,
+                .epoch = metadata_snapshot.epoch,
+                .system_catalog = metadata_snapshot.system_catalog,
                 .tables = metadata_snapshot.tables,
                 .ranges = metadata_snapshot.ranges,
                 .extension_packages = metadata_snapshot.extension_packages,
@@ -8201,6 +8211,7 @@ pub const DataServer = struct {
         self.provisioned_index_repair_terminal_log_groups.deinit(self.alloc);
         self.provisioned_index_repair_cancel_groups.deinit(self.alloc);
         self.provisioned_index_repair_routes.deinit(self.alloc);
+        self.store_report_publisher.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
         self.provisioned_storage.deinit();
         self.write_source.deinit();
@@ -8767,6 +8778,29 @@ pub const DataServer = struct {
         defer remote_metadata.cache_mutex.unlock();
         remote_metadata.test_faults.fetch_head_error = fetch_error;
         remote_metadata.test_faults.force_snapshot_cache_miss = fetch_error != null;
+    }
+
+    fn bindSystemCatalogTables(ptr: *anyopaque, alloc: std.mem.Allocator, names: []const []const u8) ![][]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const targets = try a.alloc(system_catalog.Target, names.len);
+        for (names, targets) |name, *target| target.* = try system_catalog.Target.literal(name);
+        const bytes = try self.status_source.systemCatalog(a, .{}, .{ .resolve_many = .{ .targets = targets } });
+        const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
+        if (resolved.tables.len != names.len) return error.InvalidCatalogRecord;
+        const result = try alloc.alloc([]u8, names.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |name| alloc.free(name);
+            alloc.free(result);
+        }
+        for (resolved.tables, result) |table, *name| {
+            name.* = try alloc.dupe(u8, (table orelse return error.TableNotFound).name);
+            initialized += 1;
+        }
+        return result;
     }
 
     pub fn remoteMetadataLifecycleLinearizableReadsForTest(self: *DataServer) u64 {
@@ -14217,6 +14251,8 @@ pub const DataServer = struct {
         split_observations: []const antfly.metadata.transition_state.SplitObservationRecord,
         merge_observations: []const antfly.metadata.transition_state.MergeObservationRecord,
     ) ![]antfly.metadata.table_manager.GroupStatusReport {
+        var collection_index = try report_collection.Index.init(alloc, tables, ranges);
+        defer collection_index.deinit(alloc);
         var reports = std.ArrayListUnmanaged(antfly.metadata.table_manager.GroupStatusReport).empty;
         errdefer {
             for (reports.items) |record| antfly.metadata.table_manager.freeGroupStatus(alloc, record);
@@ -14255,8 +14291,8 @@ pub const DataServer = struct {
                 else => return err,
             };
 
-            if (findRangeByGroupId(ranges, group_id)) |range| {
-                if (findTableById(tables, range.table_id)) |table| {
+            if (collection_index.range(group_id)) |range| {
+                if (collection_index.table(range.table_id)) |table| {
                     if (try self.snapshotCachedActiveStartupLocalGroupStatusReport(alloc, group_id, table.name, active_target)) |cached| {
                         var current = cached;
                         overlayLiveRaftGroupStatus(&current, group_leadership_source, group_membership_source);
@@ -14716,6 +14752,7 @@ pub const DataServer = struct {
             .reporter_incarnation = candidate_report.reporter_incarnation,
             .status_generation = status_generation,
             .artifact_sources_protocol_version = candidate_report.artifact_sources_protocol_version,
+            .dense_native_storage_protocol_version = candidate_report.dense_native_storage_protocol_version,
             .live = candidate_report.live,
             .health_class = candidate_report.health_class,
             .capacity_bytes = candidate_report.capacity_bytes,
@@ -14734,7 +14771,7 @@ pub const DataServer = struct {
         if (self.local_group_status_generation.load(.acquire) != report_generation) {
             return error.StaleLocalGroupStatusGeneration;
         }
-        try remote_metadata.reportNodeStatus(report);
+        if (!try self.publishStoreReportUpdate(report, false)) try remote_metadata.reportNodeStatus(report);
         try self.reportRuntimeSchemaProgress(
             remote_metadata,
             registration.store_id,
@@ -15429,15 +15466,75 @@ pub const DataServer = struct {
         }
     }
 
+    fn publishStoreReportUpdate(self: *DataServer, report: antfly.metadata.table_manager.StoreStatusReport, retain_runtime: bool) !bool {
+        const remote = self.remote_metadata orelse return false;
+        self.store_report_publish_mutex.lockUncancelable(remote.io);
+        defer self.store_report_publish_mutex.unlock(remote.io);
+        if (self.backgroundMonotonicMs() < self.store_report_update_retry_at_ms) return false;
+        if (retain_runtime and self.store_report_publisher.cursor == null) return false;
+        for (0..2) |attempt| {
+            var prepared = try self.store_report_publisher.prepare(self.alloc, report, attempt != 0, retain_runtime);
+            defer prepared.deinit(self.alloc);
+            const activity = prepared.update.activity;
+            prepared.update.activity = activity[0..@min(activity.len, store_report_update.max_activity_samples)];
+            const body = try stringifyJsonAlloc(prepared.arena.allocator(), prepared.update);
+            const cursor = remote.reportNodeUpdate(report.store_id, body) catch |err| switch (err) {
+                error.StoreReportBaseMismatch => if (attempt == 0) continue else return err,
+                error.UnsupportedOperation => {
+                    self.store_report_publisher.cursor = null;
+                    self.store_report_update_retry_at_ms = self.backgroundMonotonicMs() + 60 * std.time.ms_per_s;
+                    return false;
+                },
+                else => return err,
+            };
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+            const retained_base = prepared.update.base != null and
+                std.meta.eql(cursor, prepared.update.base.?) and
+                prepared.update.report.group_statuses.len == 0 and
+                prepared.update.report.runtime_statuses.len == 0 and
+                prepared.update.removed_groups.len == 0;
+            if (!retained_base and (cursor.sequence != prepared.update.sequence or cursor.reporter_incarnation != report.reporter_incarnation or !std.mem.eql(u8, &digest, &cursor.digest))) return error.InvalidStoreReporterFence;
+            self.store_report_publisher.commit(self.alloc, &prepared, cursor);
+            var offset = prepared.update.activity.len;
+            while (offset < activity.len) {
+                const end = @min(activity.len, offset + store_report_update.max_activity_samples);
+                self.store_report_publisher.sequence = try std.math.add(u64, self.store_report_publisher.sequence, 1);
+                var batch: store_report_update.Update = .{ .sequence = self.store_report_publisher.sequence, .base = cursor, .report = prepared.update.report, .activity = activity[offset..end] };
+                batch.report.group_statuses = &.{};
+                batch.report.runtime_statuses = &.{};
+                const batch_body = try stringifyJsonAlloc(self.alloc, batch);
+                defer self.alloc.free(batch_body);
+                const observed = try remote.reportNodeUpdate(report.store_id, batch_body);
+                if (!std.meta.eql(cursor, observed)) return error.StoreReportBaseMismatch;
+                offset = end;
+            }
+            remote.supports_runtime_reference.store(true, .release);
+            return true;
+        }
+        unreachable;
+    }
+
     fn reportStoreStatusHeartbeat(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
         const registration = self.store_registration orelse return;
-        var report = (try self.cloneHeartbeatStoreStatusReport(registration.store_id)) orelse return try self.reportStoreStatus();
+        const reference = remote_metadata.supports_runtime_reference.load(.acquire);
+        var report = (try self.cloneHeartbeatStoreStatusReport(registration.store_id, reference)) orelse return try self.reportStoreStatus();
         defer freeStoreStatusReportOwned(self.alloc, &report);
         for (report.group_statuses) |*group_status| {
             overlayLiveRaftGroupStatus(group_status, self.group_leadership_source, self.group_membership_source);
         }
-        try remote_metadata.reportNodeStatus(report);
+        if (try self.publishStoreReportUpdate(report, reference)) {
+            self.last_store_status_report_at_ms = self.backgroundMonotonicMs();
+            self.clearMetadataBootstrapRetry();
+            return;
+        }
+        if (reference) {
+            remote_metadata.reportNodeHeartbeat(report) catch |err| switch (err) {
+                error.UnsupportedOperation, error.StoreReportBaseMismatch => return self.reportStoreStatus(),
+                else => return err,
+            };
+        } else try remote_metadata.reportNodeStatus(report);
         self.last_store_status_report_at_ms = self.backgroundMonotonicMs();
         self.clearMetadataBootstrapRetry();
     }
@@ -15445,12 +15542,13 @@ pub const DataServer = struct {
     fn cloneHeartbeatStoreStatusReport(
         self: *DataServer,
         store_id: u64,
+        reference: bool,
     ) !?antfly.metadata.table_manager.StoreStatusReport {
         lockAtomic(&self.store_status_cache_mutex);
         defer self.store_status_cache_mutex.unlock();
         const cache = &self.store_status_heartbeat_cache;
         if (!cache.valid) return null;
-        const runtime_statuses = try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, cache.runtime_statuses);
+        const runtime_statuses = if (reference) try self.alloc.alloc(antfly.metadata.table_manager.RuntimeGroupStatusReport, 0) else try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, cache.runtime_statuses);
         errdefer if (runtime_statuses.len > 0)
             antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
         for (runtime_statuses) |*group_runtime_status| {
@@ -15459,8 +15557,11 @@ pub const DataServer = struct {
                 index_status.embedding_activity = .{};
             }
         }
+        const health_class = try self.alloc.dupe(u8, cache.health_class);
+        errdefer self.alloc.free(health_class);
         return .{
             .store_id = store_id,
+            .runtime_reference = reference,
             .embedding_activity_protocol_version = cache.embedding_activity_protocol_version,
             // A cached heartbeat is a durable liveness refresh, not a new
             // activity observation. Keep the owner sequence for diagnostics,
@@ -15471,7 +15572,7 @@ pub const DataServer = struct {
             .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
             .dense_native_storage_protocol_version = cache.dense_native_storage_protocol_version,
             .live = cache.live,
-            .health_class = try self.alloc.dupe(u8, cache.health_class),
+            .health_class = health_class,
             .capacity_bytes = cache.capacity_bytes,
             .available_bytes = cache.available_bytes,
             .lease_pressure = cache.lease_pressure,
@@ -15540,6 +15641,8 @@ pub const DataServer = struct {
         ranges: []const antfly.metadata.table_manager.RangeRecord,
         registration: StoreRegistrationConfig,
     ) ![]antfly.metadata.table_manager.RuntimeGroupStatusReport {
+        var collection_index = try report_collection.Index.init(alloc, tables, ranges);
+        defer collection_index.deinit(alloc);
         var reports = std.ArrayListUnmanaged(antfly.metadata.table_manager.RuntimeGroupStatusReport).empty;
         errdefer {
             for (reports.items) |record| antfly.metadata.table_manager.freeRuntimeGroupStatusReport(alloc, record);
@@ -15547,8 +15650,8 @@ pub const DataServer = struct {
         }
 
         for (group_ids) |group_id| {
-            const range = findRangeByGroupId(ranges, group_id) orelse continue;
-            const table = findTableById(tables, range.table_id) orelse continue;
+            const range = collection_index.range(group_id) orelse continue;
+            const table = collection_index.table(range.table_id) orelse continue;
             var status = (try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(alloc, table.name, group_id)) orelse continue;
             defer status.deinit(alloc);
             self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
@@ -19326,6 +19429,7 @@ const RemoteMetadataSource = struct {
         /// blocks mutation invalidation or protocol bookkeeping.
         ref_count: std.atomic.Value(usize) = .init(1),
         snapshot: antfly.metadata_api.CatalogRoutingSnapshot,
+        generation: *antfly.public_api.table_catalog.RoutingGeneration,
 
         fn create(
             alloc: std.mem.Allocator,
@@ -19342,7 +19446,8 @@ const RemoteMetadataSource = struct {
         ) !*@This() {
             const entry = try alloc.create(@This());
             errdefer alloc.destroy(entry);
-            entry.* = .{ .snapshot = try cloneRoutingSnapshotOwnedUntil(alloc, source, deadline_ns, io) };
+            const generation = try antfly.public_api.table_catalog.RoutingGeneration.create(alloc, source, antfly.public_api.table_catalog.RoutingBudget.initIo(deadline_ns, io));
+            entry.* = .{ .snapshot = generation.indexed.snapshot.value, .generation = generation };
             return entry;
         }
 
@@ -19355,7 +19460,7 @@ const RemoteMetadataSource = struct {
             const previous = self.ref_count.fetchSub(1, .acq_rel);
             std.debug.assert(previous > 0);
             if (previous != 1) return;
-            freeRoutingSnapshotOwned(alloc, &self.snapshot);
+            self.generation.release();
             alloc.destroy(self);
         }
     };
@@ -19367,6 +19472,7 @@ const RemoteMetadataSource = struct {
         lifecycle_linearizable_snapshot_calls: std.atomic.Value(u64) = .init(0),
     } else struct {};
 
+    supports_runtime_reference: std.atomic.Value(bool) = .init(false),
     alloc: std.mem.Allocator,
     /// Clock authority must match the executor that performs the requests.
     /// This makes cache TTLs and retry suppression part of VOPR replay truth.
@@ -19387,6 +19493,7 @@ const RemoteMetadataSource = struct {
     cached_snapshot_at_ms: u64 = 0,
     cached_routing_snapshot: ?*RoutingSnapshotCacheEntry = null,
     cached_routing_snapshot_at_ms: u64 = 0,
+    authoritative_routing_generation: ?*antfly.public_api.table_catalog.RoutingGeneration = null,
     routing_refresh_mutex: std.atomic.Mutex = .unlocked,
     // Incremented only by authoritative replacement or invalidation. An
     // ordinary snapshot request captures this before I/O and may not publish
@@ -19483,6 +19590,7 @@ const RemoteMetadataSource = struct {
         lockAtomic(&self.cache_mutex);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         if (self.cached_routing_snapshot) |snapshot| snapshot.release(self.alloc);
+        if (self.authoritative_routing_generation) |generation| generation.release();
         self.alloc.free(self.linearizable_snapshot_unsupported_until_ns);
         self.alloc.free(self.routing_protocol_states);
         for (self.base_uris) |uri| self.alloc.free(uri);
@@ -19961,8 +20069,10 @@ const RemoteMetadataSource = struct {
             .io = runtime_io_abi.Borrow.init(&self.io),
             .vtable = &.{
                 .admin_snapshot = remoteAdminSnapshot,
+                .export_catalog = remoteExportCatalog,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .catalog_identity = remoteCatalogIdentity,
+                .acquire_routing_generation = remoteAcquireRoutingGeneration,
                 .routing_snapshot = remoteRoutingSnapshot,
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
@@ -19981,6 +20091,8 @@ const RemoteMetadataSource = struct {
             .ptr = self,
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
+                .system_catalog = remoteSystemCatalog,
+                .supports_query_definitions = true,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
@@ -20421,6 +20533,10 @@ const RemoteMetadataSource = struct {
         return last_err;
     }
 
+    fn remoteExportCatalog(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+        return remoteSystemCatalog(ptr, alloc, .{}, .export_snapshot);
+    }
+
     fn remoteAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         return try self.fetchSnapshot();
@@ -20444,6 +20560,52 @@ const RemoteMetadataSource = struct {
             .metadata_incarnation = head.metadata_incarnation orelse
                 return error.MetadataIncarnationUnavailable,
         };
+    }
+
+    fn cachedRoutingGenerationFresh(self: *RemoteMetadataSource, deadline_ns: ?u64) !?*antfly.public_api.table_catalog.RoutingGeneration {
+        const now_ms: u64 = @intCast(@divTrunc(self.awakeNs(), std.time.ns_per_ms));
+        if (!self.lockBefore(&self.cache_mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        defer self.cache_mutex.unlock();
+        const entry = self.cached_routing_snapshot orelse return null;
+        if (now_ms -| self.cached_routing_snapshot_at_ms > metadata_snapshot_cache_ttl_ms) return null;
+        entry.generation.retain();
+        return entry.generation;
+    }
+
+    fn remoteAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        if (!authoritative) {
+            if (try self.cachedRoutingGenerationFresh(deadline_ns)) |generation| return generation;
+        }
+        // Preserve singleflight refresh, incarnation validation and read
+        // barriers in the existing capture path. Only cache misses copy data.
+        var snapshot = try self.remoteRoutingSnapshotWithMode(deadline_ns, authoritative);
+        defer freeRoutingSnapshotOwned(self.alloc, &snapshot);
+        if (!authoritative) {
+            if (try self.cachedRoutingGenerationFresh(deadline_ns)) |generation| return generation;
+        }
+        if (!authoritative or snapshot.change_token.revision == 0)
+            return try antfly.public_api.table_catalog.RoutingGeneration.create(self.alloc, snapshot, self.catalogSource().budget(deadline_ns));
+        // The read barrier has already completed. Reuse indexes only for the
+        // exact incarnation/revision it observed, never based on cache age.
+        if (!self.lockBefore(&self.cache_mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        if (self.authoritative_routing_generation) |generation| {
+            if (std.meta.eql(generation.indexed.snapshot.value.change_token, snapshot.change_token)) {
+                generation.retain();
+                self.cache_mutex.unlock();
+                return generation;
+            }
+        }
+        self.cache_mutex.unlock();
+        const next = try antfly.public_api.table_catalog.RoutingGeneration.create(self.alloc, snapshot, self.catalogSource().budget(deadline_ns));
+        errdefer next.release();
+        if (!self.lockBefore(&self.cache_mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        const previous = self.authoritative_routing_generation;
+        self.authoritative_routing_generation = next;
+        next.retain();
+        self.cache_mutex.unlock();
+        if (previous) |generation| generation.release();
+        return next;
     }
 
     fn remoteRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
@@ -20968,6 +21130,94 @@ const RemoteMetadataSource = struct {
         return last_err;
     }
 
+    fn readSystemCatalog(self: *RemoteMetadataSource, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
+        try request.ensureActive();
+        const started = self.awakeNs();
+        var budget_ns: u64 = @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
+        if (request.deadline_ns) |deadline| {
+            const now: u64 = if (request.deadline_io) |borrow| blk: {
+                var receiver = try borrow.receive();
+                break :blk @intCast(@max(0, std.Io.Clock.awake.now(receiver.io()).nanoseconds));
+            } else @import("antfly_platform").time.monotonicNs();
+            budget_ns = @min(budget_ns, deadline -| now);
+        }
+        const deadline = started +| budget_ns;
+        // Pin the endpoint order for each pass. Concurrent successful calls
+        // may change affinity, but must not cause this read to skip a peer.
+        while (true) {
+            const first = self.metadataApiIndexForAttempt(0);
+            var terminal_error: ?anyerror = null;
+            for (0..self.base_uris.len) |attempt| {
+                try request.ensureActive();
+                const remaining_ns = deadline -| self.awakeNs();
+                if (remaining_ns == 0) return error.DeadlineExceeded;
+                const index = (first + attempt) % self.base_uris.len;
+                var client = self.metadataClient(alloc);
+                var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(request.cancellation);
+                const read = client.readSystemCatalog(self.base_uris[index], input, @intCast(@max(1, remaining_ns / std.time.ns_per_ms)), &cancellation) catch |err| {
+                    switch (err) {
+                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
+                        else => {
+                            if (!antfly.metadata.authority.isRetryableError(err) and
+                                !isRetryableControlPlaneTransportError(err) and err != error.RemoteUnavailable)
+                                terminal_error = err;
+                            continue;
+                        },
+                    }
+                };
+                self.acceptMetadataIdentity(read.metadata_group_id, read.metadata_incarnation) catch |err| {
+                    read.deinit(alloc);
+                    terminal_error = err;
+                    continue;
+                };
+                self.noteMetadataAuthoritySuccess(index);
+                return read.body;
+            }
+            if (terminal_error) |err| return err;
+            // Reads can safely cross an election, unlike ambiguous mutations.
+            // Keep one absolute budget and a short cancellation-bounded pause.
+            try request.ensureActive();
+            const remaining_ns = deadline -| self.awakeNs();
+            if (remaining_ns == 0) return error.DeadlineExceeded;
+            try self.io.sleep(.fromNanoseconds(@intCast(@min(remaining_ns, 10 * std.time.ns_per_ms))), .awake);
+        }
+    }
+
+    fn remoteSystemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        if (input != .mutate) return self.readSystemCatalog(alloc, request, input);
+        // Even ambiguous writes may have committed new topology. Invalidate
+        // cached snapshots without automatically replaying the mutation.
+        defer if (input == .mutate) self.invalidateCache();
+        return self.withMetadataMutationApiClient([]u8, struct {
+            fn call(
+                _: *RemoteMetadataSource,
+                client: *antfly.metadata_http_client.MetadataHttpClient,
+                base_uri: []const u8,
+                forwarding: antfly.public_api.raft_mutation_forwarding.Context,
+                ctx: anytype,
+            ) ![]u8 {
+                try ctx.request.ensureActive();
+                var bounded = forwarding;
+                if (ctx.request.deadline_ns) |deadline| {
+                    const now: u64 = if (ctx.request.deadline_io) |borrow| blk: {
+                        var receiver = try borrow.receive();
+                        break :blk @intCast(@max(0, std.Io.Clock.awake.now(receiver.io()).nanoseconds));
+                    } else @import("antfly_platform").time.monotonicNs();
+                    if (now >= deadline) return error.DeadlineExceeded;
+                    bounded.remaining_ms = @intCast(@min(bounded.remaining_ms, @max(1, (deadline - now) / std.time.ns_per_ms)));
+                }
+                const bytes = try client.forwardSystemCatalog(base_uri, ctx.input, bounded);
+                defer client.alloc.free(bytes);
+                return ctx.alloc.dupe(u8, bytes) catch |err| {
+                    if (ctx.input == .mutate) return error.MetadataMutationOutcomeUnknown;
+                    return err;
+                };
+            }
+        }.call, .{ .alloc = alloc, .request = request, .input = input });
+    }
+
     fn remoteCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         const body = try antfly.public_api.table_contract.encodeCreateTableRequest(alloc, req);
@@ -21434,11 +21684,35 @@ const RemoteMetadataSource = struct {
         defer arena.deinit();
         const scratch = arena.allocator();
         const body = try stringifyJsonAlloc(scratch, report);
-        try self.withMetadataApiClient(void, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: []const u8) !void {
-                try client.reportNodeStatus(base_uri, ctx);
+        const supported = try self.withMetadataApiClient(bool, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: []const u8) !bool {
+                return try client.reportNodeStatusWithReferenceSupport(base_uri, ctx);
             }
         }.call, body);
+        self.supports_runtime_reference.store(supported, .release);
+    }
+
+    fn reportNodeUpdate(self: *RemoteMetadataSource, store_id: u64, body: []const u8) !store_report_update.Cursor {
+        const Request = struct { store_id: u64, body: []const u8 };
+        return self.withMetadataApiClient(store_report_update.Cursor, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, req: Request) !store_report_update.Cursor {
+                return client.reportNodeUpdate(base_uri, req.store_id, req.body);
+            }
+        }.call, Request{ .store_id = store_id, .body = body });
+    }
+
+    fn reportNodeHeartbeat(self: *RemoteMetadataSource, report: antfly.metadata.table_manager.StoreStatusReport) !void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const body = try stringifyJsonAlloc(arena.allocator(), report);
+        self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, bytes: []const u8) !void {
+                try client.reportNodeHeartbeat(base_uri, bytes);
+            }
+        }.call, body) catch |err| {
+            if (err == error.UnsupportedOperation or err == error.StoreReportBaseMismatch) self.supports_runtime_reference.store(false, .release);
+            return err;
+        };
     }
 
     fn upsertSchemaProgress(self: *RemoteMetadataSource, record: antfly.metadata.table_manager.SchemaProgressRecord) !void {
@@ -34985,6 +35259,7 @@ const TestHASeedSnapshotProvider = struct {
         const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
             .generation = request.generation,
             .catalog = .{
+                .system_catalog = .{},
                 .epoch = 7,
                 .tables = &.{.{
                     .table_id = 20,
@@ -35055,6 +35330,7 @@ test "storage.ha data runtime default seed snapshot derives standalone groups fr
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
+                    .export_catalog = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).exportCatalog,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                     .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
@@ -35265,6 +35541,7 @@ test "data server wires configured HA executors into API server" {
                 .ptr = self,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
+                    .export_catalog = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).exportCatalog,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                     .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
@@ -35463,6 +35740,7 @@ test "data server wires configured HA executors into API server" {
         .body = capture_body,
     });
     defer capture_resp.deinit(alloc);
+    if (capture_resp.status != 200) std.debug.print("HA seed capture failed: {s}\n", .{capture_resp.body});
     try std.testing.expectEqual(@as(u16, 200), capture_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"action_kind\":\"seed_capture\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"state\":\"applied\"") != null);
@@ -36813,6 +37091,41 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         ) !antfly.common.http.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const snapshot = self.snapshot orelse return .{ .status = 503 };
+            // This fixture owns metadata directly. Serve the same compact
+            // read contract as production instead of relying on data caches
+            // to stand in for the catalog authority.
+            if (std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog")) {
+                const catalog = @import("../system_catalog/domain.zig");
+                const parsed = try std.json.parseFromSlice(catalog.Call, response_alloc, request.body, .{});
+                defer parsed.deinit();
+                const body = switch (parsed.value) {
+                    .read => return error.UnexpectedCatalogRead,
+                    .snapshot => try std.json.Stringify.valueAlloc(response_alloc, catalog.State{ .revision = snapshot.status.metadata_epoch }, .{}),
+                    .resolve => |target| try std.json.Stringify.valueAlloc(response_alloc, resolve(snapshot, target), .{}),
+                    .resolve_many => |input| blk: {
+                        if (input.expected_revision) |revision| if (revision != snapshot.status.metadata_epoch) return .{ .status = 409 };
+                        const tables = try response_alloc.alloc(?catalog.ResolvedTable, input.targets.len);
+                        defer response_alloc.free(tables);
+                        for (input.targets, tables) |target, *table| table.* = resolve(snapshot, target);
+                        break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.ResolvedMany{ .revision = snapshot.status.metadata_epoch, .tables = tables }, .{});
+                    },
+                    .query_definition => |name| blk: {
+                        const table = antfly.public_api.tables.findTableByName(snapshot, name) orelse return .{ .status = 404 };
+                        break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.QueryDefinition.fromTable(table), .{});
+                    },
+                    .mutate => return error.UnexpectedCatalogMutation,
+                };
+                errdefer response_alloc.free(body);
+                const headers = try response_alloc.alloc(antfly.common.http.Header, 2);
+                errdefer response_alloc.free(headers);
+                headers[0] = .{ .name = try response_alloc.dupe(u8, "x-antfly-catalog-metadata-group"), .value = &.{} };
+                errdefer headers[0].deinit(response_alloc);
+                headers[0].value = try std.fmt.allocPrint(response_alloc, "{d}", .{snapshot.status.metadata_group_id});
+                headers[1] = .{ .name = try response_alloc.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = &.{} };
+                errdefer headers[1].deinit(response_alloc);
+                headers[1].value = try response_alloc.dupe(u8, &snapshot.status.metadata_incarnation.?);
+                return .{ .status = 200, .body = body, .headers = headers };
+            }
             if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.capabilities)) {
                 return .{
                     .status = 200,
@@ -36862,6 +37175,11 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 };
             }
             return .{ .status = 404 };
+        }
+        fn resolve(snapshot: *const antfly.metadata_api.AdminSnapshot, target: @import("../system_catalog/domain.zig").Target) ?@import("../system_catalog/domain.zig").ResolvedTable {
+            if (!target.isDefault()) return null;
+            for (snapshot.tables) |table| if (std.mem.eql(u8, table.name, target.table)) return .{ .table_id = table.table_id, .name = table.name };
+            return null;
         }
     };
     var metadata = Metadata{};
@@ -40754,6 +41072,57 @@ test "data runtime background maintenance is due for dense posting cadence witho
     try std.testing.expect(!server.backgroundMaintenanceDue(99));
 }
 
+test "system catalog remote reads survive elections without skipping peers or extending budgets" {
+    const alloc = std.testing.allocator;
+    const Http = antfly.common.http;
+    const Fake = struct {
+        source: ?*RemoteMetadataSource = null,
+        calls: usize = 0,
+        unavailable: usize = 3,
+        status: u16 = 200,
+        cancel: ?*antfly.raft.transport.http_common.RequestCancellation = null,
+
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: Http.HttpRequest) !Http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const expected = [_][]const u8{ "http://one.invalid/", "http://two.invalid/", "http://three.invalid/", "http://two.invalid/" };
+            if (self.source) |source| {
+                try std.testing.expect(std.mem.startsWith(u8, request.uri, expected[self.calls]));
+                if (self.calls == 0) source.noteMetadataAuthoritySuccess(1);
+            }
+            self.calls += 1;
+            if (self.cancel) |signal| signal.cancel();
+            if (self.calls <= self.unavailable) return .{ .status = 503 };
+            if (self.status != 200) return .{ .status = self.status };
+            const headers = try a.alloc(Http.Header, 2);
+            headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "9") };
+            headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, "11111111111111111111111111111111") };
+            return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "null") };
+        }
+    };
+    var fake = Fake{};
+    var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{ "http://one.invalid", "http://two.invalid", "http://three.invalid" }, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+    defer source.deinit();
+    fake.source = &source;
+    const body = try source.readSystemCatalog(alloc, .{}, .{ .resolve = .{ .table = "docs" } });
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("null", body);
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+
+    // A generation conflict cannot restart binding against a new revision.
+    fake = .{ .unavailable = 0, .status = 409 };
+    try std.testing.expectError(error.CatalogGenerationChanged, source.readSystemCatalog(alloc, .{}, .snapshot));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    fake = .{ .unavailable = std.math.maxInt(usize) };
+    try std.testing.expectError(error.DeadlineExceeded, source.readSystemCatalog(alloc, .{ .deadline_ns = platform_time.monotonicNs() +| 20 * std.time.ns_per_ms }, .snapshot));
+    try std.testing.expect(fake.calls > 0);
+
+    var cancellation = antfly.raft.transport.http_common.RequestCancellation{};
+    fake = .{ .unavailable = std.math.maxInt(usize), .cancel = &cancellation };
+    try std.testing.expectError(error.Canceled, source.readSystemCatalog(alloc, .{ .cancellation = cancellation.token() }, .snapshot));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
 test "remote metadata source pins one cluster incarnation across cache invalidation" {
     const first: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
     const foreign: antfly.metadata_api.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
@@ -41267,6 +41636,18 @@ test "remote routing capture cache and session share a virtual deadline clock" {
     try std.testing.expectEqual(calls_after_capture, stub.calls);
     var session = try antfly.public_api.table_catalog.RoutingSession.init(alloc, source.catalogSource(), deadline);
     defer session.deinit();
+    const calls_before_authority = stub.calls;
+    var same_generation = try antfly.public_api.table_catalog.RoutingSession.init(alloc, source.catalogSource(), deadline);
+    defer same_generation.deinit();
+    try std.testing.expect(same_generation.generation.? == session.generation.?);
+    try std.testing.expect(stub.calls > calls_before_authority);
+    const first = try RemoteMetadataSource.remoteAcquireRoutingGeneration(&source, deadline, false);
+    defer first.release();
+    const second = try RemoteMetadataSource.remoteAcquireRoutingGeneration(&source, deadline, false);
+    defer second.release();
+    try std.testing.expect(first == second);
+    source.invalidateCache();
+    try std.testing.expectEqual(@as(u64, 9), first.indexed.snapshot.value.catalog_revision);
     try std.testing.expectEqual(@as(u64, 0), session.catalog().budget(deadline).nowNs());
     try session.catalog().budget(deadline).checkpoint();
     vopr_io.monotonic_ns = deadline;

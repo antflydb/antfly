@@ -33,6 +33,7 @@ from conftest import (
     REPO_ROOT,
     _read_log_tail,
     antfly_public_api_url,
+    annotate_metadata_table_names,
     internal_service_headers,
     lookup_key_path,
     maybe_preserve_tempdir,
@@ -1274,7 +1275,7 @@ class MultiNodeScalingCluster:
             response.raise_for_status()
             payload = response.json()
             assert isinstance(payload, dict)
-            return payload
+            return annotate_metadata_table_names(payload, self.live_data_api_urls)
 
         last_error: Exception | None = None
         for url in self.metadata_urls:
@@ -1283,7 +1284,7 @@ class MultiNodeScalingCluster:
                 response.raise_for_status()
                 payload = response.json()
                 assert isinstance(payload, dict)
-                return payload
+                return annotate_metadata_table_names(payload, self.live_data_api_urls)
             except Exception as exc:
                 last_error = exc
         if last_error is not None:
@@ -1380,7 +1381,7 @@ class MultiNodeScalingCluster:
         response.raise_for_status()
         payload = response.json()
         assert isinstance(payload, dict)
-        return payload
+        return annotate_metadata_table_names(payload, self.live_data_api_urls)
 
     def wait_for_all_data_nodes_registered(
         self, *, timeout_s: float
@@ -1592,8 +1593,16 @@ class MultiNodeScalingCluster:
         _retry_metadata_mutation_until_admitted(self.trigger_reallocate_once)
 
     def request_split(self, table_name: str, split_key: str) -> None:
+        from urllib.parse import quote
+
+        table = next(
+            table
+            for table in self.metadata_snapshot()["tables"]
+            if table.get("logical_name", table["name"]) == table_name
+        )
+        physical_name = quote(table["name"], safe="")
         response = self.post_metadata(
-            f"/internal/v1/tables/{table_name}/split",
+            f"/internal/v1/tables/{physical_name}/split",
             json_body={"split_key": split_key},
         )
         response.raise_for_status()
@@ -1831,7 +1840,10 @@ def _table_group_ids_from_snapshot(
 ) -> set[int] | None:
     table_id = None
     for table in snapshot.get("tables", []):
-        if isinstance(table, dict) and table.get("name") == table_name:
+        if (
+            isinstance(table, dict)
+            and table.get("logical_name", table.get("name")) == table_name
+        ):
             table_id = int(table["table_id"])
             break
     if table_id is None:
@@ -1854,7 +1866,8 @@ def _oversized_table_group_ids(
         (
             int(table["table_id"])
             for table in snapshot.get("tables", [])
-            if isinstance(table, dict) and table.get("name") == table_name
+            if isinstance(table, dict)
+            and table.get("logical_name", table.get("name")) == table_name
         ),
         None,
     )
@@ -1919,7 +1932,10 @@ def _table_write_route_diagnostic(
     snapshot = cluster.metadata_snapshot()
     table_id: int | None = None
     for table in snapshot.get("tables", []):
-        if isinstance(table, dict) and table.get("name") == table_name:
+        if (
+            isinstance(table, dict)
+            and table.get("logical_name", table.get("name")) == table_name
+        ):
             table_id = int(table.get("table_id", 0))
             break
     if table_id is None:
@@ -2107,7 +2123,10 @@ def _data_api_urls_for_table(
     snapshot = cluster.metadata_snapshot()
     table_id: int | None = None
     for table in snapshot.get("tables", []):
-        if isinstance(table, dict) and table.get("name") == table_name:
+        if (
+            isinstance(table, dict)
+            and table.get("logical_name", table.get("name")) == table_name
+        ):
             table_id = int(table.get("table_id", 0))
             break
     if table_id is None:

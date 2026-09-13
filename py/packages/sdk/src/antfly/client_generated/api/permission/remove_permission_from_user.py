@@ -8,7 +8,7 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
 from ...models.resource_type import ResourceType
-from ...types import UNSET, Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -16,6 +16,9 @@ def _get_kwargs(
     *,
     resource: str,
     resource_type: ResourceType,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
@@ -24,6 +27,12 @@ def _get_kwargs(
 
     json_resource_type = resource_type.value
     params["resourceType"] = json_resource_type
+
+    params["database"] = database
+
+    params["namespace"] = namespace
+
+    params["all_tables"] = all_tables
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -79,6 +88,9 @@ def sync_detailed(
     client: AuthenticatedClient,
     resource: str,
     resource_type: ResourceType,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Response[Any | Error]:
     """Remove permission from user
 
@@ -90,6 +102,9 @@ def sync_detailed(
         resource_type (ResourceType): Type of resource: table, user, inference, or global ('*').
             Use inference with resource '*' to grant access to unified inference routes. Example:
             table.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -103,6 +118,9 @@ def sync_detailed(
         user_name=user_name,
         resource=resource,
         resource_type=resource_type,
+        database=database,
+        namespace=namespace,
+        all_tables=all_tables,
     )
 
     response = client.get_httpx_client().request(
@@ -118,6 +136,9 @@ def sync(
     client: AuthenticatedClient,
     resource: str,
     resource_type: ResourceType,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Any | Error | None:
     """Remove permission from user
 
@@ -129,6 +150,9 @@ def sync(
         resource_type (ResourceType): Type of resource: table, user, inference, or global ('*').
             Use inference with resource '*' to grant access to unified inference routes. Example:
             table.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -143,6 +167,9 @@ def sync(
         client=client,
         resource=resource,
         resource_type=resource_type,
+        database=database,
+        namespace=namespace,
+        all_tables=all_tables,
     ).parsed
 
 
@@ -152,6 +179,9 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     resource: str,
     resource_type: ResourceType,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Response[Any | Error]:
     """Remove permission from user
 
@@ -163,6 +193,9 @@ async def asyncio_detailed(
         resource_type (ResourceType): Type of resource: table, user, inference, or global ('*').
             Use inference with resource '*' to grant access to unified inference routes. Example:
             table.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -176,6 +209,9 @@ async def asyncio_detailed(
         user_name=user_name,
         resource=resource,
         resource_type=resource_type,
+        database=database,
+        namespace=namespace,
+        all_tables=all_tables,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -189,6 +225,9 @@ async def asyncio(
     client: AuthenticatedClient,
     resource: str,
     resource_type: ResourceType,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Any | Error | None:
     """Remove permission from user
 
@@ -200,6 +239,9 @@ async def asyncio(
         resource_type (ResourceType): Type of resource: table, user, inference, or global ('*').
             Use inference with resource '*' to grant access to unified inference routes. Example:
             table.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -215,5 +257,8 @@ async def asyncio(
             client=client,
             resource=resource,
             resource_type=resource_type,
+            database=database,
+            namespace=namespace,
+            all_tables=all_tables,
         )
     ).parsed

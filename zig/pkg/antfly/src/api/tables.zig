@@ -70,6 +70,23 @@ pub fn validateTableMutationName(table_name: []const u8) !void {
     }
 }
 
+/// Internal restore identities also carry a bounded qualified target until
+/// publication. Public names keep their existing 255-byte validation contract.
+pub fn validateInternalTableMutationName(table_name: []const u8) !void {
+    if (table_name.len <= max_table_name_bytes) return validateTableMutationName(table_name);
+    const catalog = @import("../system_catalog/domain.zig");
+    try catalog.validateStorageName(table_name);
+}
+
+test "system catalog maximum restore identity can be dropped internally" {
+    const catalog = @import("../system_catalog/domain.zig");
+    const component: [catalog.max_name_bytes]u8 = @splat('a');
+    const name = try catalog.restoreStorageNameAlloc(std.testing.allocator, "table:00000000000000000000000000000000", .{ .database = &component, .namespace = &component, .table = &component });
+    defer std.testing.allocator.free(name);
+    try validateInternalTableMutationName(name);
+    try std.testing.expectError(error.InvalidTableName, validateTableMutationName(name));
+}
+
 test "table mutation names preserve the public contract" {
     try validateTableMutationName("vmp_media_item_embedding-v0.2~candidate");
     try validateTableMutationName("sales/archive");
@@ -675,12 +692,289 @@ pub fn encodeSingleTableStatusWithStorageStatuses(
 ) !?[]u8 {
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
-    const status = (try buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), snapshot, table_name, storage_statuses)) orelse return null;
-    const encoded = try std.json.Stringify.valueAlloc(alloc, status, .{ .emit_null_optional_fields = false });
-    defer alloc.free(encoded);
+    var status = (try buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), snapshot, table_name, storage_statuses)) orelse return null;
     const table = findTableByName(snapshot, table_name).?;
-    return try projectSingleTableStatusJson(alloc, encoded, table.indexes_json);
+    status.artifact_enrichments = try publicArtifactEnrichmentsAlloc(arena_impl.allocator(), table.indexes_json);
+    return try std.json.Stringify.valueAlloc(alloc, status, .{ .emit_null_optional_fields = false });
 }
+
+pub fn encodeSingleTableStatusWithDefinitions(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_name: []const u8,
+    label: []const u8,
+    storage_statuses: ?[]const TableStorageStatus,
+    definitions: *DefinitionCache.Leases,
+) !?[]u8 {
+    const table = findTableByName(snapshot, table_name) orelse return null;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ranges: std.ArrayListUnmanaged(*const metadata_table_manager.RangeRecord) = .empty;
+    for (snapshot.ranges) |*range| if (range.table_id == table.table_id) try ranges.append(a, range);
+    var status = try buildTableStatusWithRanges(a, snapshot, table, findTableStorageStatus(storage_statuses, table_name), true, ranges.items, try definitions.get(table));
+    status.name = label;
+    status.artifact_enrichments = try publicArtifactEnrichmentsAlloc(a, table.indexes_json);
+    return try std.json.Stringify.valueAlloc(alloc, status, .{ .emit_null_optional_fields = false });
+}
+
+/// Content-addressed immutable definition projections. Runtime coverage and
+/// counters are deliberately excluded and merged from each fresh observation.
+// Clone only the final wire projection into its owning arena. Generated JSON
+// parsers and capability aggregation allocate intermediate trees and indexes;
+// retaining those would make cache capacity depend on parser implementation.
+fn cloneSchemaProjection(comptime T: type, alloc: std.mem.Allocator, value: T) !T {
+    if (T == std.json.Value) return cloneJsonValueAlloc(alloc, value);
+    return switch (@typeInfo(T)) {
+        .optional => |info| if (value) |item| try cloneSchemaProjection(info.child, alloc, item) else null,
+        .pointer => |info| blk: {
+            if (info.size != .slice) @compileError("schema projection must contain owned slices");
+            const out = try alloc.alloc(info.child, value.len);
+            for (value, out) |item, *dest| dest.* = try cloneSchemaProjection(info.child, alloc, item);
+            break :blk out;
+        },
+        .@"struct" => |info| blk: {
+            if (@hasField(T, "map")) {
+                var out: T = .{};
+                try out.map.ensureTotalCapacity(alloc, value.map.count());
+                var it = value.map.iterator();
+                while (it.next()) |item| {
+                    out.map.putAssumeCapacity(try alloc.dupe(u8, item.key_ptr.*), try cloneSchemaProjection(@TypeOf(item.value_ptr.*), alloc, item.value_ptr.*));
+                }
+                break :blk out;
+            }
+            var out: T = undefined;
+            inline for (info.fields) |field| @field(out, field.name) = try cloneSchemaProjection(field.type, alloc, @field(value, field.name));
+            break :blk out;
+        },
+        .@"union" => switch (value) {
+            inline else => |item, tag| @unionInit(T, @tagName(tag), try cloneSchemaProjection(@TypeOf(item), alloc, item)),
+        },
+        else => value,
+    };
+}
+
+/// Content-addressed schemas only: table-specific index incarnations and runtime
+/// status are read afresh. Compiler scratch never consumes the retained budget.
+pub const DefinitionCache = struct {
+    const max_entries = 256;
+    const max_bytes = 64 * 1024 * 1024;
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: [max_entries]?*Entry = @splat(null),
+    bytes: usize = 0,
+    clock: u64 = 0,
+    frequency: [4][1024]u8 = @splat(@splat(0)),
+    flights: std.AutoHashMapUnmanaged([32]u8, *Flight) = .empty,
+    const Flight = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        users: usize = 1,
+        result: anyerror!*Entry = error.OutOfMemory,
+    };
+
+    fn recordAccess(self: *DefinitionCache, key: [32]u8) void {
+        self.clock +%= 1;
+        if (self.clock % 4096 == 0) for (&self.frequency) |*row| {
+            for (row) |*count| count.* >>= 1;
+        };
+        for (&self.frequency, 0..) |*row, i| {
+            const bucket = std.mem.readInt(u16, key[i * 2 ..][0..2], .little) % row.len;
+            row[bucket] +|= 1;
+        }
+    }
+    fn estimate(self: *DefinitionCache, key: [32]u8) u64 {
+        var count: u8 = 255;
+        for (&self.frequency, 0..) |*row, i| count = @min(count, row[std.mem.readInt(u16, key[i * 2 ..][0..2], .little) % row.len]);
+        return count;
+    }
+
+    const Entry = struct {
+        alloc: std.mem.Allocator,
+        arena: std.heap.ArenaAllocator,
+        refs: std.atomic.Value(usize) = .init(1),
+        key: [32]u8,
+        touched: u64 = 0,
+        schema: ?schema_openapi.TableSchema,
+        read_schema: ?schema_openapi.TableSchema,
+        declared: ?[]const runtime_schema_mod.FieldCapability,
+        capabilities: ?[]const metadata_openapi.FieldCapability,
+        fn size(self: *const Entry) usize {
+            return @sizeOf(Entry) + self.arena.queryCapacity();
+        }
+        fn retain(self: *Entry) void {
+            _ = self.refs.fetchAdd(1, .monotonic);
+        }
+        fn release(self: *Entry) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const alloc = self.alloc;
+            self.arena.deinit();
+            alloc.destroy(self);
+        }
+        fn create(alloc: std.mem.Allocator, key: [32]u8, table: *const metadata_table_manager.TableRecord) !*Entry {
+            const entry = try alloc.create(Entry);
+            errdefer alloc.destroy(entry);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            errdefer arena.deinit();
+            const a = arena.allocator();
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
+            const schema_json = if (table.read_schema_json.len > 0) table.read_schema_json else effectiveSchemaJson(table.schema_json);
+            const declared: ?[]const runtime_schema_mod.FieldCapability = declared: {
+                const parsed = schema_mod.parseValidatedTableSchema(temporary, schema_json) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    break :declared null;
+                };
+                const runtime = schema_mod.deriveRuntimeTableSchema(temporary, parsed) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    break :declared null;
+                };
+                const capabilities = try runtime_schema_mod.fieldCapabilitiesAlloc(temporary, runtime);
+                break :declared try runtime_schema_mod.cloneFieldCapabilitiesAlloc(a, capabilities);
+            };
+            entry.* = .{
+                .alloc = alloc,
+                .arena = arena,
+                .key = key,
+                .schema = try cloneSchemaProjection(?schema_openapi.TableSchema, a, try parseOptionalTableSchema(temporary, table.schema_json)),
+                .read_schema = if (table.read_schema_json.len > 0) try cloneSchemaProjection(schema_openapi.TableSchema, a, try parseTableSchema(temporary, table.read_schema_json)) else null,
+                .declared = declared,
+                .capabilities = if (declared) |caps| try cloneSchemaProjection([]const metadata_openapi.FieldCapability, a, try generatedFieldCapabilitiesFromSchema(temporary, caps, null)) else null,
+            };
+            // Entry fields above can grow the local arena after its first copy.
+            entry.arena = arena;
+            return entry;
+        }
+    };
+
+    pub fn deinit(self: *DefinitionCache) void {
+        for (self.entries) |entry| if (entry) |value| value.release();
+        std.debug.assert(self.flights.count() == 0);
+        // Flights remove their map storage when the last compiler completes.
+        self.* = .{};
+    }
+    fn acquire(self: *DefinitionCache, alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord) !*Entry {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for ([_][]const u8{ table.schema_json, table.read_schema_json }) |value| {
+            var size: [8]u8 = undefined;
+            std.mem.writeInt(u64, &size, value.len, .little);
+            hash.update(&size);
+            hash.update(value);
+        }
+        const key = hash.finalResult();
+        const sync = @import("antfly_platform").sync;
+        sync.lockYielding(&self.mutex);
+        self.recordAccess(key);
+        for (self.entries) |slot| if (slot) |entry| {
+            if (std.mem.eql(u8, &entry.key, &key)) {
+                entry.touched = self.clock;
+                entry.retain();
+                self.mutex.unlock();
+                return entry;
+            }
+        };
+        const found = self.flights.get(key);
+        const flight = found orelse alloc.create(Flight) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        if (found != null) {
+            flight.users += 1;
+        } else {
+            flight.* = .{};
+            self.flights.put(alloc, key, flight) catch |err| {
+                alloc.destroy(flight);
+                self.mutex.unlock();
+                return err;
+            };
+        }
+        self.mutex.unlock();
+        if (found == null) {
+            flight.result = Entry.create(alloc, key, table);
+            if (flight.result) |prepared| self.admit(prepared) else |_| {}
+            flight.done.store(true, .release);
+        } else {
+            while (!flight.done.load(.acquire)) @import("antfly_platform").time.yieldBriefly();
+        }
+        const result = flight.result;
+        if (result) |entry| entry.retain() else |_| {}
+        sync.lockYielding(&self.mutex);
+        flight.users -= 1;
+        const last = flight.users == 0;
+        if (last) {
+            _ = self.flights.remove(key);
+            if (self.flights.count() == 0) {
+                self.flights.deinit(alloc);
+                self.flights = .empty;
+            }
+        }
+        self.mutex.unlock();
+        if (last) {
+            if (result) |entry| entry.release() else |_| {}
+            alloc.destroy(flight);
+        }
+        return result;
+    }
+
+    fn admit(self: *DefinitionCache, prepared: *Entry) void {
+        if (prepared.size() > max_bytes) return;
+        var retired: [max_entries]*Entry = undefined;
+        var retired_count: usize = 0;
+        defer for (retired[0..retired_count]) |entry| entry.release();
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        var candidates = self.entries;
+        var remaining_bytes = self.bytes;
+        while (true) {
+            var vacant: ?usize = null;
+            var victim: ?usize = null;
+            for (candidates, 0..) |slot, i| {
+                if (slot) |entry| {
+                    if (victim == null) {
+                        victim = i;
+                    } else {
+                        const previous = candidates[victim.?].?;
+                        const left = self.estimate(entry.key) * previous.size();
+                        const right = self.estimate(previous.key) * entry.size();
+                        if (left < right or (left == right and entry.touched < previous.touched)) victim = i;
+                    }
+                } else vacant = i;
+            }
+            if (vacant != null and remaining_bytes + prepared.size() <= max_bytes) {
+                for (self.entries, candidates) |before, after| if (before != null and after == null) {
+                    retired[retired_count] = before.?;
+                    retired_count += 1;
+                };
+                prepared.touched = self.clock;
+                candidates[vacant.?] = prepared;
+                self.entries = candidates;
+                self.bytes = remaining_bytes + prepared.size();
+                prepared.retain();
+                return;
+            }
+            const entry = candidates[victim.?].?;
+            // Equal-frequency scan entries cannot evict residents. Weight by
+            // retained bytes so one large schema must justify all its victims.
+            if (self.estimate(prepared.key) * entry.size() <= self.estimate(entry.key) * prepared.size()) return;
+            candidates[victim.?] = null;
+            remaining_bytes -= entry.size();
+        }
+    }
+    pub const Leases = struct {
+        cache: *DefinitionCache,
+        alloc: std.mem.Allocator,
+        entries: std.ArrayListUnmanaged(*Entry) = .empty,
+        pub fn deinit(self: *Leases) void {
+            for (self.entries.items) |entry| entry.release();
+            self.entries.deinit(self.alloc);
+        }
+        fn get(self: *Leases, table: *const metadata_table_manager.TableRecord) !*const Entry {
+            const entry = try self.cache.acquire(self.alloc, table);
+            errdefer entry.release();
+            try self.entries.append(self.alloc, entry);
+            return entry;
+        }
+    };
+};
 
 pub fn buildTableListWithStorageStatuses(
     alloc: std.mem.Allocator,
@@ -688,6 +982,30 @@ pub fn buildTableListWithStorageStatuses(
     prefix: ?[]const u8,
     storage_statuses: ?[]const TableStorageStatus,
 ) ![]metadata_openapi.TableStatus {
+    return buildTableListWithDefinitions(alloc, snapshot, prefix, storage_statuses, null);
+}
+
+pub fn buildTableListWithDefinitions(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    prefix: ?[]const u8,
+    storage_statuses: ?[]const TableStorageStatus,
+    definitions: ?*DefinitionCache.Leases,
+) ![]metadata_openapi.TableStatus {
+    var ranges_by_table: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(*const metadata_table_manager.RangeRecord)) = .empty;
+    defer {
+        var values = ranges_by_table.valueIterator();
+        while (values.next()) |value| value.deinit(alloc);
+        ranges_by_table.deinit(alloc);
+    }
+    for (snapshot.ranges) |*range| {
+        const entry = try ranges_by_table.getOrPut(alloc, range.table_id);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(alloc, range);
+    }
+    var statuses: std.StringHashMapUnmanaged(TableStorageStatus) = .empty;
+    defer statuses.deinit(alloc);
+    if (storage_statuses) |items| for (items) |item| try statuses.put(alloc, item.table_name, item);
     var count: usize = 0;
     for (snapshot.tables) |*table| {
         if (prefix) |pfx| {
@@ -702,7 +1020,7 @@ pub fn buildTableListWithStorageStatuses(
         if (prefix) |pfx| {
             if (!std.mem.startsWith(u8, table.name, pfx)) continue;
         }
-        listed[index] = try buildTableStatus(alloc, snapshot, table, findTableStorageStatus(storage_statuses, table.name), false);
+        listed[index] = try buildTableStatusWithRanges(alloc, snapshot, table, statuses.get(table.name), false, if (ranges_by_table.get(table.table_id)) |value| value.items else &.{}, if (definitions) |cache| try cache.get(table) else null);
         index += 1;
     }
     return listed;
@@ -798,6 +1116,7 @@ pub fn encodeStoredCreateTableRequestAlloc(alloc: std.mem.Allocator, req: Create
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
     var root = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{}", .{});
+    if (req.tablespace_name) |name| try root.object.put(arena, "tablespace_name", .{ .string = name });
     try root.object.put(arena, "storage", try std.json.parseFromSliceLeaky(std.json.Value, arena, try std.json.Stringify.valueAlloc(arena, req.storage, .{}), .{}));
     if (req.num_shards) |num_shards| {
         try root.object.put(arena, "num_shards", .{ .integer = @intCast(num_shards) });
@@ -845,6 +1164,13 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     var req: CreateTableRequest = .{};
     errdefer req.deinit(alloc);
 
+    if (root.get("tablespace_name")) |value| {
+        if (value != .null) {
+            if (value != .string) return error.InvalidCreateTableRequest;
+            try @import("../system_catalog/domain.zig").validateName(value.string);
+            req.tablespace_name = try alloc.dupe(u8, value.string);
+        }
+    }
     if (root.get("storage")) |value| req.storage = try @import("../common/table_storage.zig").Settings.parse(value);
 
     if (root.get("num_shards")) |value| {
@@ -1536,7 +1862,18 @@ fn buildTableStatus(
 ) !metadata_openapi.TableStatus {
     const ranges = try metadata_admin.listTableRanges(alloc, snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
+    return buildTableStatusWithRanges(alloc, snapshot, table, storage_status, include_replication_runtime, ranges, null);
+}
 
+fn buildTableStatusWithRanges(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    storage_status: ?TableStorageStatus,
+    include_replication_runtime: bool,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+    definition: ?*const DefinitionCache.Entry,
+) !metadata_openapi.TableStatus {
     var shards = std.json.ArrayHashMap(metadata_openapi.ShardConfig){};
     for (ranges) |range_ref| {
         const key = try std.fmt.allocPrint(alloc, "{d}", .{range_ref.group_id});
@@ -1553,17 +1890,21 @@ fn buildTableStatus(
         null;
     return .{
         .name = table.name,
+        .table_id = try std.fmt.allocPrint(alloc, "{d}", .{table.table_id}),
         .description = if (table.description.len > 0) table.description else null,
         .storage = .{ .dense_embeddings = @tagName(table.storage.dense_embeddings) },
         .indexes = try parseTableIndexes(alloc, table.indexes_json),
         .shards = shards,
-        .schema = try parseOptionalTableSchema(alloc, table.schema_json),
+        .schema = if (definition) |value| value.schema else try parseOptionalTableSchema(alloc, table.schema_json),
         .migration = if (table.read_schema_json.len > 0) .{
             .state = "rebuilding",
-            .read_schema = try parseTableSchema(alloc, table.read_schema_json),
+            .read_schema = if (definition) |value| value.read_schema.? else try parseTableSchema(alloc, table.read_schema_json),
         } else null,
         .replication_sources = try parseReplicationSources(alloc, snapshot, table, include_replication_runtime),
-        .field_capabilities = try generatedFieldCapabilitiesAlloc(alloc, table, storage_status),
+        .field_capabilities = if (definition) |value|
+            if (observedDynamicFieldCapabilitySetsFromStatus(storage_status).len == 0) value.capabilities else if (value.declared) |declared| try generatedFieldCapabilitiesFromSchema(alloc, declared, storage_status) else null
+        else
+            try generatedFieldCapabilitiesAlloc(alloc, table, storage_status),
         .storage_status = .{
             .source_vectors = if (storage_status) |status| if (status.source_vectors) |stats| generatedSourceVectorStats(stats) else null else null,
             .disk_usage = if (storage_status) |status|
@@ -1591,6 +1932,10 @@ fn generatedFieldCapabilitiesAlloc(
     const schema_capabilities = try runtime_schema_mod.fieldCapabilitiesAlloc(alloc, runtime_schema);
     defer runtime_schema_mod.freeFieldCapabilities(alloc, schema_capabilities);
 
+    return try generatedFieldCapabilitiesFromSchema(alloc, schema_capabilities, storage_status);
+}
+
+fn generatedFieldCapabilitiesFromSchema(alloc: std.mem.Allocator, schema_capabilities: []const runtime_schema_mod.FieldCapability, storage_status: ?TableStorageStatus) ![]const metadata_openapi.FieldCapability {
     var out = std.ArrayListUnmanaged(GeneratedFieldCapability).empty;
     var capability_index = GeneratedFieldCapabilityIndex.empty;
     defer freeGeneratedFieldCapabilityIndex(alloc, &capability_index);
@@ -2357,14 +2702,20 @@ fn projectInlineEnrichmentConfigsInTableStatusJson(alloc: std.mem.Allocator, enc
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
 }
 
-fn projectSingleTableStatusJson(alloc: std.mem.Allocator, encoded: []const u8, indexes_json: []const u8) ![]u8 {
-    var arena_impl = std.heap.ArenaAllocator.init(alloc);
-    defer arena_impl.deinit();
-    const arena = arena_impl.allocator();
-    var parsed = try std.json.parseFromSlice(std.json.Value, arena, encoded, .{});
-    try attachArtifactEnrichmentsToTableStatus(arena, &parsed.value, indexes_json);
-    redactInlineEnrichmentProducerConfigsFromTableStatuses(&parsed.value);
-    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+fn publicArtifactEnrichmentsAlloc(alloc: std.mem.Allocator, indexes_json: []const u8) !?[]const indexes_openapi.EnrichmentConfig {
+    const source = if (indexes_json.len > 0) indexes_json else default_indexes_json;
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, source, .{});
+    if (parsed != .object) return error.InvalidTableIndexMetadata;
+    var summaries = std.json.Array.init(alloc);
+    try collectArtifactEnrichmentSummaries(alloc, parsed, &summaries);
+    if (summaries.items.len == 0) return null;
+    const out = try alloc.alloc(indexes_openapi.EnrichmentConfig, summaries.items.len);
+    for (summaries.items, out) |item, *value| {
+        var redacted = item;
+        _ = redacted.object.swapRemove("producer_json");
+        value.* = try std.json.parseFromValueLeaky(indexes_openapi.EnrichmentConfig, alloc, redacted, .{ .ignore_unknown_fields = true });
+    }
+    return out;
 }
 
 /// Producer configuration is accepted on writes but is deliberately omitted
@@ -2398,26 +2749,6 @@ fn redactProducerConfigsFromEnrichmentArray(container: *std.json.Value, key: []c
     for (enrichments.array.items) |*enrichment| {
         if (enrichment.* == .object) _ = enrichment.object.swapRemove("producer_json");
     }
-}
-
-fn attachArtifactEnrichmentsToTableStatus(alloc: std.mem.Allocator, value: *std.json.Value, indexes_json: []const u8) !void {
-    if (value.* != .object) return;
-    const source = if (indexes_json.len > 0) indexes_json else default_indexes_json;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidTableIndexMetadata;
-
-    var enrichments = std.json.Array.init(alloc);
-    errdefer {
-        var owned: std.json.Value = .{ .array = enrichments };
-        deinitJsonValue(alloc, &owned);
-    }
-    try collectArtifactEnrichmentSummaries(alloc, parsed.value, &enrichments);
-    if (enrichments.items.len == 0) return;
-
-    const key = try alloc.dupe(u8, "artifact_enrichments");
-    errdefer alloc.free(key);
-    try value.object.put(alloc, key, .{ .array = enrichments });
 }
 
 fn collectArtifactEnrichmentSummaries(
@@ -4815,6 +5146,7 @@ test "stored create table encoding round-trips a normalized public request" {
 test "stored create table encoding preserves empty requests" {
     const encoded = try encodeStoredCreateTableRequestAlloc(std.testing.allocator, .{});
     defer std.testing.allocator.free(encoded);
+    // Store the default ownership explicitly so replay does not depend on future defaults.
     try std.testing.expectEqualStrings("{\"storage\":{\"dense_embeddings\":\"primary_lsm\"}}", encoded);
 
     var decoded = try parseStoredCreateTableRequest(std.testing.allocator, encoded);
@@ -5765,4 +6097,204 @@ test "metadata.query routing selects read schema text index for vector-only stru
     try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
     try std.testing.expectEqualStrings("dense_idx", req.index_name.?);
     try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+}
+
+test "system catalog stored create preserves tablespace and storage ownership together" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseCreateTableRequest(alloc, "{\"tablespace_name\":\"serving\",\"num_shards\":1,\"storage\":{\"dense_embeddings\":\"vector_store\"}}");
+    defer parsed.deinit(alloc);
+    const encoded = try encodeStoredCreateTableRequestAlloc(alloc, parsed);
+    defer alloc.free(encoded);
+    var decoded = try parseStoredCreateTableRequest(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("serving", decoded.tablespace_name.?);
+    try std.testing.expectEqual(@as(?u32, 1), decoded.num_shards);
+    try std.testing.expectEqual(@import("../common/table_storage.zig").DenseEmbeddings.vector_store, decoded.storage.dense_embeddings);
+}
+
+test "system catalog definition cache shares immutable content and protects hot entries from scans" {
+    const alloc = std.testing.allocator;
+    var cache: DefinitionCache = .{};
+    defer cache.deinit();
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "physical", .schema_json = "{\"version\":1}" };
+    const first = try cache.acquire(alloc, &table);
+    defer first.release();
+    var renamed = table;
+    renamed.name = "other";
+    renamed.table_id = 8;
+    // Index incarnations belong to individual tables, not shared schemas.
+    renamed.indexes_json = "{\"other\":{\"type\":\"full_text\"}}";
+    const same = try cache.acquire(alloc, &renamed);
+    defer same.release();
+    try std.testing.expect(first == same);
+    for (0..DefinitionCache.max_entries + 1) |i| {
+        const schema = try std.fmt.allocPrint(alloc, "{{\"version\":{d}}}", .{i + 2});
+        defer alloc.free(schema);
+        var changed = table;
+        changed.schema_json = schema;
+        const next = try cache.acquire(alloc, &changed);
+        next.release();
+        try std.testing.expect(cache.bytes <= DefinitionCache.max_bytes);
+    }
+    try std.testing.expectEqual(@as(i64, 1), first.schema.?.version.?);
+    const rebuilt = try cache.acquire(alloc, &table);
+    defer rebuilt.release();
+    try std.testing.expect(rebuilt == first);
+    var migrating = table;
+    migrating.read_schema_json = "{\"version\":0}";
+    const migration = try cache.acquire(alloc, &migrating);
+    defer migration.release();
+    try std.testing.expect(migration != rebuilt);
+    try std.testing.expectEqual(@as(i64, 0), migration.read_schema.?.version.?);
+}
+
+test "system catalog schema cache releases partial compilation on allocation failure" {
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var cache: DefinitionCache = .{};
+            defer cache.deinit();
+            const table: metadata_table_manager.TableRecord = .{
+                .table_id = 7,
+                .name = "physical",
+                .schema_json = "{\"version\":1,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"}}}}}}",
+            };
+            var leases: DefinitionCache.Leases = .{ .cache = &cache, .alloc = alloc };
+            defer leases.deinit();
+            _ = try leases.get(&table);
+            _ = try leases.get(&table);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "system catalog wide schema cache retained budget" {
+    const alloc = std.testing.allocator;
+    var properties: std.ArrayListUnmanaged(u8) = .empty;
+    defer properties.deinit(alloc);
+    for (0..200) |i| {
+        const field = try std.fmt.allocPrint(alloc, "{s}\"field_{d}\":{{\"type\":\"string\"}}", .{ if (i == 0) "" else ",", i });
+        defer alloc.free(field);
+        try properties.appendSlice(alloc, field);
+    }
+    const schema = try std.fmt.allocPrint(alloc, "{{\"document_schemas\":{{\"doc\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{{s}}}}}}}}}}}", .{properties.items});
+    defer alloc.free(schema);
+    const entry = try DefinitionCache.Entry.create(alloc, @splat(0), &.{ .table_id = 1, .name = "wide", .schema_json = schema });
+    defer entry.release();
+    // Leave room for at least 100 independently evolved 200-field schemas
+    // within the retained budget; parser scratch must not count as cache data.
+    try std.testing.expect(entry.size() <= 512 * 1024);
+}
+
+test "system catalog cache concurrent cold reads share one compiled definition" {
+    const Worker = struct {
+        cache: *DefinitionCache,
+        start: *std.atomic.Value(bool),
+        result: ?*DefinitionCache.Entry = null,
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) @import("antfly_platform").time.yieldBriefly();
+            self.result = self.cache.acquire(std.testing.allocator, &.{ .table_id = 1, .name = "shared", .schema_json = "{\"version\":1}" }) catch unreachable;
+        }
+    };
+    var cache: DefinitionCache = .{};
+    defer cache.deinit();
+    var start: std.atomic.Value(bool) = .init(false);
+    var workers: [8]Worker = undefined;
+    var threads: [8]std.Thread = undefined;
+    var started: usize = 0;
+    defer {
+        start.store(true, .release);
+        for (threads[0..started]) |thread| thread.join();
+        for (workers[0..started]) |worker| if (worker.result) |entry| entry.release();
+    }
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .cache = &cache, .start = &start };
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        started += 1;
+    }
+    start.store(true, .release);
+    for (threads) |thread| thread.join();
+    started = 0;
+    defer for (workers) |worker| worker.result.?.release();
+    for (workers) |worker| try std.testing.expect(worker.result.? == workers[0].result.?);
+    try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
+}
+
+test "system catalog cache admits recurring demand and keeps evicted leases valid" {
+    const alloc = std.testing.allocator;
+    var cache: DefinitionCache = .{};
+    defer cache.deinit();
+    const original = try cache.acquire(alloc, &.{ .table_id = 1, .name = "first", .schema_json = "{\"version\":1}" });
+    defer original.release();
+    for (0..DefinitionCache.max_entries - 1) |i| {
+        const schema = try std.fmt.allocPrint(alloc, "{{\"version\":{d}}}", .{i + 2});
+        defer alloc.free(schema);
+        const entry = try cache.acquire(alloc, &.{ .table_id = 2, .name = "filler", .schema_json = schema });
+        entry.release();
+    }
+    const candidate: metadata_table_manager.TableRecord = .{ .table_id = 3, .name = "hot", .schema_json = "{\"version\":9999}" };
+    for (0..4) |_| (try cache.acquire(alloc, &candidate)).release();
+    var resident = false;
+    var old_resident = false;
+    for (cache.entries) |slot| if (slot) |entry| {
+        if (entry.schema.?.version.? == 9999) resident = true;
+        if (entry == original) old_resident = true;
+    };
+    try std.testing.expect(resident);
+    try std.testing.expect(!old_resident);
+    try std.testing.expectEqual(@as(i64, 1), original.schema.?.version.?);
+    try std.testing.expect(cache.bytes <= DefinitionCache.max_bytes);
+}
+
+test "system catalog detail preserves replication runtime through its projection" {
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = default_indexes_json, .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        .replication_source_statuses = @constCast((&[_]metadata_table_manager.ReplicationSourceStatusRecord{.{
+            .table_id = 7,
+            .source_ordinal = 0,
+            .source_kind = "postgres",
+            .external_table = "users",
+            .cutover_mode = "slot_resumed",
+            .slot_name = "slot_old",
+            .publication_name = "pub_old",
+            .phase = "streaming",
+            .checkpoint = "lsn:0/10",
+            .last_error = "",
+        }})[0..]),
+        .replication_source_action_hints = @constCast((&[_]metadata_api.ReplicationSourceActionHint{.{
+            .table_id = 7,
+            .table_name = @constCast("docs"),
+            .source_ordinal = 0,
+            .action = "reseed_exact_cutover",
+            .reason = "existing_slot_non_exact_cutover",
+            .reseed_exact_cutover_path = @constCast("/internal/v1/tables/docs/replication-sources/0/reseed-exact-cutover"),
+        }})[0..]),
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const projection = @import("../system_catalog/projection.zig");
+    const entries = [_]projection.TableEntry{.{ .name = "docs", .table = snapshot.tables[0] }};
+    const listing: projection.TableListing = .{ .revision = 1, .entries = &entries, .ranges = snapshot.ranges, .replication_source_statuses = snapshot.replication_source_statuses };
+    const selected = try listing.adminSnapshot(arena.allocator());
+    var cache: DefinitionCache = .{};
+    defer cache.deinit();
+    var leases: DefinitionCache.Leases = .{ .cache = &cache, .alloc = std.testing.allocator };
+    defer leases.deinit();
+    const encoded = (try encodeSingleTableStatusWithDefinitions(std.testing.allocator, &selected, "docs", "docs", null, &leases)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replication_sources\":[{\"type\":\"postgres\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"status\":{\"source_kind\":\"postgres\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"cutover_mode\":\"slot_resumed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"action_hint\":{\"action\":\"reseed_exact_cutover\"") != null);
+
+    const listed = try encodeTableList(std.testing.allocator, &snapshot, null);
+    defer std.testing.allocator.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"action_hint\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"status\":{\"source_kind\":\"postgres\"") == null);
 }

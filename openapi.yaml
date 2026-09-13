@@ -2496,6 +2496,107 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  ? /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}
+  : parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the graph index
+        schema:
+          type: string
+      - name: metricName
+        in: path
+        required: true
+        description: Name of the configured graph metric
+        schema:
+          type: string
+      - name: action
+        in: path
+        required: true
+        description: Operational action to apply to the graph metric materialization
+        schema:
+          type: string
+          enum:
+            - refresh
+            - rebuild
+            - delete
+            - pause
+            - resume
+    post:
+      summary: Execute a graph metric operational action
+      description: >
+        Refresh, rebuild, delete, pause, or resume maintenance for a configured
+
+        graph metric. The metric configuration remains owned by the graph index.
+
+        Refresh and rebuild durably enqueue bounded, resumable maintenance and
+
+        return the aggregate shard status without waiting for graph-sized work.
+
+        `delete` clears materialized metric state and durably disables automatic
+
+        maintenance. A later refresh, rebuild, or resume action re-enables the
+
+        metric and can publish a new generation.
+      tags:
+        - index_management
+      operationId: executeNamespaceTableGraphMetricAction
+      responses:
+        '200':
+          description: Aggregate graph metric status after the action is durably accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphMetricActionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: The table topology or write-owner generation changed, or only some shards accepted
+            the action; retrying is consistency-safe and reuses any still-active build
+          content:
+            text/plain:
+              schema:
+                type: string
+        '429':
+          description: Local storage resources are temporarily exhausted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          description: Graph metric actions are unavailable for this runtime
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/transactions/commit:
     post:
       summary: Commit an OCC transaction
@@ -3694,9 +3795,36 @@ paths:
             maxLength: 500
           description: Filter tables by regex pattern (e.g., "^prod_.*_v[0-9]+$")
           example: ^user_.*
+        - name: limit
+          in: query
+          required: false
+          description: Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization
+            may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+          schema:
+            type: integer
+            format: int32
+            x-go-type-skip-optional-pointer: false
+            minimum: 1
+            maximum: 1000
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix.
+            Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart
+            the listing.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+            maxLength: 4096
       responses:
         '200':
           description: A list of tables
+          headers:
+            X-Antfly-Next-Cursor:
+              description: Continue with this cursor until the header is absent. Pages may contain no
+                authorized rows.
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -3705,6 +3833,12 @@ paths:
                   $ref: '#/components/schemas/TableStatus'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Catalog changed during pagination. Restart without a cursor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5566,6 +5700,1336 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tablespaces:
+    get:
+      summary: List tablespaces
+      description: Lists tablespace catalog objects visible to the caller.
+      tags:
+        - table_management
+      operationId: listTablespaces
+      responses:
+        '200':
+          description: A list of tablespaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TablespaceCatalogRecord'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tablespaces/{tablespaceName}:
+    parameters:
+      - name: tablespaceName
+        in: path
+        required: true
+        description: Tablespace name
+        schema:
+          type: string
+          maxLength: 128
+    get:
+      summary: Get tablespace
+      tags:
+        - table_management
+      operationId: getTablespace
+      responses:
+        '200':
+          description: Tablespace details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TablespaceCatalogRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      summary: Create tablespace
+      description: Creates a tablespace catalog object. The server applies the same lifecycle semantics
+        as `CREATE TABLESPACE`.
+      tags:
+        - table_management
+      operationId: createTablespace
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTablespaceRequest'
+      responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
+        '201':
+          description: Tablespace created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TablespaceCatalogRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Tablespace already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      summary: Drop tablespace
+      description: Drops a tablespace catalog object. Table placement by tablespace is fail-closed until
+        native placement planning consumes tablespace policy.
+      tags:
+        - table_management
+      operationId: dropTablespace
+      responses:
+        '204':
+          description: Tablespace dropped
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases:
+    get:
+      summary: List databases
+      description: Lists database catalog objects visible to the caller. Shorthand table APIs resolve
+        through the caller's current/default database.
+      tags:
+        - table_management
+      operationId: listDatabases
+      responses:
+        '200':
+          description: A list of databases
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DatabaseCatalogRecord'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+    get:
+      summary: Get database
+      tags:
+        - table_management
+      operationId: getDatabase
+      responses:
+        '200':
+          description: Database details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseCatalogRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      summary: Create database
+      description: Creates a database catalog object. The server applies the same semantics as `CREATE
+        DATABASE`.
+      tags:
+        - table_management
+      operationId: createDatabase
+      responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
+        '201':
+          description: Database created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseCatalogRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Database already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      summary: Drop database
+      description: Drops an empty database catalog object. Non-empty databases fail with a conflict.
+      tags:
+        - table_management
+      operationId: dropDatabase
+      responses:
+        '204':
+          description: Database dropped
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Database is not empty
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/tablespace:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+    put:
+      summary: Set database tablespace
+      description: Binds the database catalog object to an existing tablespace.
+      tags:
+        - table_management
+      operationId: setDatabaseTablespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogTablespaceBindingRequest'
+      responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
+        '200':
+          description: Updated database
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseCatalogRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      summary: Clear database tablespace
+      description: Clears the database catalog object's durable tablespace binding.
+      tags:
+        - table_management
+      operationId: clearDatabaseTablespace
+      responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
+        '200':
+          description: Updated database
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseCatalogRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+    get:
+      summary: List namespaces
+      description: Lists namespace catalog objects inside a database. PostgreSQL schemas map to these
+        namespaces.
+      tags:
+        - table_management
+      operationId: listNamespaces
+      responses:
+        '200':
+          description: A list of namespaces in the database
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NamespaceCatalogRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+    post:
+      summary: Create namespace
+      description: Creates a namespace catalog object in a database. The server applies the same semantics
+        as `CREATE SCHEMA` for the selected database.
+      tags:
+        - table_management
+      operationId: createNamespace
+      responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
+        '201':
+          description: Namespace created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NamespaceCatalogRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Namespace already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      summary: Drop namespace
+      description: Drops an empty namespace catalog object. Non-empty namespaces fail with a conflict.
+      tags:
+        - table_management
+      operationId: dropNamespace
+      responses:
+        '204':
+          description: Namespace dropped
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Namespace is not empty
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tablespace:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+    put:
+      summary: Set namespace tablespace
+      description: Binds the namespace catalog object to an existing tablespace.
+      tags:
+        - table_management
+      operationId: setNamespaceTablespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogTablespaceBindingRequest'
+      responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
+        '200':
+          description: Updated namespace
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NamespaceCatalogRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      summary: Clear namespace tablespace
+      description: Clears the namespace catalog object's durable tablespace binding.
+      tags:
+        - table_management
+      operationId: clearNamespaceTablespace
+      responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
+        '200':
+          description: Updated namespace
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NamespaceCatalogRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+    get:
+      summary: List tables in namespace
+      description: Lists table catalog objects under an explicit database and namespace.
+      tags:
+        - table_management
+      operationId: listNamespaceTables
+      parameters:
+        - name: prefix
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 128
+          description: Filter tables by name prefix.
+        - name: limit
+          in: query
+          required: false
+          description: Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization
+            may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+          schema:
+            type: integer
+            format: int32
+            x-go-type-skip-optional-pointer: false
+            minimum: 1
+            maximum: 1000
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix.
+            Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart
+            the listing.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+            maxLength: 4096
+      responses:
+        '200':
+          description: A list of tables in the namespace
+          headers:
+            X-Antfly-Next-Cursor:
+              description: Continue with this cursor until the header is absent. Pages may contain no
+                authorized rows.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TableStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Catalog changed during pagination. Restart without a cursor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: Get namespace table details
+      description: Gets a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: getNamespaceTable
+      responses:
+        '200':
+          description: Table details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      summary: Create namespace table
+      description: Creates a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: createNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTableRequest'
+      responses:
+        '201':
+          description: Table created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableStatus'
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '501':
+          description: Explicit catalog table lifecycle is not supported by the configured local table
+            write backend.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      summary: Drop namespace table
+      description: Drops a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: dropNamespaceTable
+      responses:
+        '204':
+          description: Table dropped
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          description: Explicit catalog table lifecycle is not supported by the configured local table
+            write backend.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Query an explicit namespace table
+      description: Queries a table through an explicit database and namespace route. While storage APIs
+        are still bare-table-name based, the server fails closed when the resolved catalog table does
+        not map to a unique physical table name.
+      tags:
+        - query_operations
+      operationId: queryNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StatefulQueryRequest'
+          application/x-ndjson:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Query successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponses'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Perform batch inserts and deletes on an explicit namespace table
+      description: Performs batch writes through an explicit database and namespace route. While storage
+        APIs are still bare-table-name based, the server fails closed when the resolved catalog table
+        does not map to a unique physical table name.
+      tags:
+        - data_operations
+      operationId: batchNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchRequest'
+      responses:
+        '201':
+          description: Batch operation successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Backup an explicit namespace table
+      tags:
+        - data_operations
+      operationId: backupNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BackupRequest'
+      responses:
+        '201':
+          description: Backup process initiated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backup:
+                    type: string
+                    example: successful
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Restore an explicit namespace table from backup
+      tags:
+        - data_operations
+      operationId: restoreNamespaceTable
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+            x-go-type-skip-optional-pointer: false
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to
+            the authenticated principal and table. Requests without this header create a new job.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestoreRequest'
+      responses:
+        '202':
+          description: Restore process triggered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+      - name: key
+        in: path
+        required: true
+        description: Key of the document to retrieve
+        schema:
+          type: string
+    get:
+      summary: Retrieve a document by key from an explicit namespace table
+      description: Retrieves a document through an explicit database and namespace route. While storage
+        APIs are still bare-table-name based, the server fails closed when the resolved catalog table
+        does not map to a unique physical table name.
+      tags:
+        - data_operations
+      operationId: lookupNamespaceTableDocument
+      parameters:
+        - name: fields
+          in: query
+          required: false
+          description: Comma-separated list of fields to include in the response.
+          schema:
+            type: string
+        - name: consistency
+          in: query
+          required: false
+          description: Read consistency; defaults to read_index.
+          schema:
+            type: string
+            enum:
+              - read_index
+              - stale
+      responses:
+        '200':
+          description: Record found
+          headers:
+            X-Antfly-Version:
+              description: Version token for this document.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: List indexes for an explicit namespace table
+      description: Lists index metadata through an explicit database and namespace route.
+      tags:
+        - index_management
+      operationId: listNamespaceTableIndexes
+      responses:
+        '200':
+          description: A list of indexes for the table
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/IndexStatus'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the index
+        schema:
+          type: string
+    get:
+      summary: Get index details for an explicit namespace table
+      tags:
+        - index_management
+      operationId: getNamespaceTableIndex
+      responses:
+        '200':
+          description: Index details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexStatus'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      summary: Add an index to an explicit namespace table
+      tags:
+        - index_management
+      operationId: createNamespaceTableIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateIndexRequest'
+      responses:
+        '201':
+          description: Index added successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedIndex'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      summary: Drop an index from an explicit namespace table
+      tags:
+        - index_management
+      operationId: dropNamespaceTableIndex
+      responses:
+        '201':
+          description: Index dropped successfully
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/rename:
+    post:
+      operationId: renameDatabase
+      summary: Rename catalog resource
+      tags:
+        - table_management
+      parameters:
+        - name: databaseName
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameCatalogResourceRequest'
+      responses:
+        '204':
+          description: Renamed with stable identity.
+        '400':
+          description: Invalid name.
+        '404':
+          description: Resource not found.
+        '409':
+          description: Name already exists or resource is protected.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/rename:
+    post:
+      operationId: renameNamespace
+      summary: Rename catalog resource
+      tags:
+        - table_management
+      parameters:
+        - name: databaseName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: namespaceName
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameCatalogResourceRequest'
+      responses:
+        '204':
+          description: Renamed with stable identity.
+        '400':
+          description: Invalid name.
+        '404':
+          description: Resource not found.
+        '409':
+          description: Name already exists or resource is protected.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tablespaces/{tablespaceName}/rename:
+    post:
+      operationId: renameTablespace
+      summary: Rename catalog resource
+      tags:
+        - table_management
+      parameters:
+        - name: tablespaceName
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameCatalogResourceRequest'
+      responses:
+        '204':
+          description: Renamed with stable identity.
+        '400':
+          description: Invalid name.
+        '404':
+          description: Resource not found.
+        '409':
+          description: Name already exists or resource is protected.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename:
+    post:
+      operationId: renameNamespaceTable
+      summary: Rename catalog resource
+      tags:
+        - table_management
+      parameters:
+        - name: databaseName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: namespaceName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: tableName
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameCatalogResourceRequest'
+      responses:
+        '204':
+          description: Renamed with stable identity.
+        '400':
+          description: Invalid name.
+        '404':
+          description: Resource not found.
+        '409':
+          description: Name already exists or resource is protected.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+    put:
+      summary: Set namespace tablespace
+      description: Binds the namespace catalog object to an existing tablespace.
+      tags:
+        - table_management
+      operationId: setNamespaceTableTablespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogTablespaceBindingRequest'
+      responses:
+        '204':
+          description: Updated namespace
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      summary: Clear namespace tablespace
+      description: Clears the namespace catalog object's durable tablespace binding.
+      tags:
+        - table_management
+      operationId: clearNamespaceTableTablespace
+      responses:
+        '204':
+          description: Updated namespace
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /auth/v1/me:
     get:
       tags:
@@ -5908,6 +7372,18 @@ paths:
           description: The type of the resource for the permission to be removed.
           schema:
             $ref: '#/components/schemas/ResourceType'
+        - name: database
+          in: query
+          schema:
+            type: string
+        - name: namespace
+          in: query
+          schema:
+            type: string
+        - name: all_tables
+          in: query
+          schema:
+            type: boolean
       responses:
         '204':
           description: Permission removed successfully
@@ -6148,6 +7624,21 @@ paths:
         schema:
           type: string
           example: orders
+      - name: database
+        in: query
+        schema:
+          type: string
+        description: Explicit database; defaults to default when namespace is supplied.
+      - name: namespace
+        in: query
+        schema:
+          type: string
+        description: Explicit namespace; defaults to public when database is supplied.
+      - name: all_tables
+        in: query
+        schema:
+          type: boolean
+        description: Select all tables in the explicit namespace instead of the literal path table.
     get:
       tags:
         - RowFilter
@@ -6249,6 +7740,21 @@ paths:
         schema:
           type: string
           example: orders
+      - name: database
+        in: query
+        schema:
+          type: string
+        description: Explicit database; defaults to default when namespace is supplied.
+      - name: namespace
+        in: query
+        schema:
+          type: string
+        description: Explicit namespace; defaults to public when database is supplied.
+      - name: all_tables
+        in: query
+        schema:
+          type: boolean
+        description: Select all tables in the explicit namespace instead of the literal path table.
     get:
       tags:
         - RowFilter
@@ -8039,6 +9545,126 @@ components:
         type: string
         example: role:tenant_reader
   schemas:
+    DatabaseCatalogRecord:
+      type: object
+      required:
+        - database_id
+        - name
+        - settings_json
+      description: Database catalog object. Tables and namespaces resolve under a database before authorization
+        and routing.
+      properties:
+        database_id:
+          type: integer
+          format: uint64
+          description: Stable database catalog identifier.
+          example: 22
+        name:
+          type: string
+          description: Database name.
+          example: tenant_ops
+        settings_json:
+          type: string
+          description: JSON-encoded database settings owned by the catalog.
+          example: '{}'
+        tablespace_name:
+          type: string
+          nullable: true
+          description: Optional durable tablespace binding inherited by new namespace/table placement
+            policy.
+          example: fastspace
+    NamespaceCatalogRecord:
+      type: object
+      required:
+        - namespace_id
+        - database_id
+        - database_name
+        - name
+      description: Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces.
+      properties:
+        namespace_id:
+          type: integer
+          format: uint64
+          description: Stable namespace catalog identifier.
+          example: 222
+        database_id:
+          type: integer
+          format: uint64
+          description: Parent database identifier.
+          example: 22
+        database_name:
+          type: string
+          description: Parent database name.
+          example: tenant_ops
+        name:
+          type: string
+          description: Namespace name.
+          example: analytics
+        tablespace_name:
+          type: string
+          nullable: true
+          description: Optional durable tablespace binding inherited by new table placement policy in
+            this namespace.
+          example: fastspace
+    CatalogTablespaceBindingRequest:
+      type: object
+      required:
+        - tablespace_name
+      properties:
+        tablespace_name:
+          type: string
+          description: Existing tablespace name to bind to the catalog object.
+          example: fastspace
+    TablespaceCatalogRecord:
+      type: object
+      required:
+        - tablespace_id
+        - name
+        - location_json
+        - placement_policy_json
+      description: Tablespace catalog object. Placement policy resource with a stable identity. SQL adapters
+        consume this native lifecycle surface.
+      properties:
+        tablespace_id:
+          type: integer
+          format: uint64
+          description: Stable tablespace catalog identifier.
+          example: 42
+        name:
+          type: string
+          description: Tablespace name.
+          example: fastspace
+        location_json:
+          type: string
+          description: JSON-encoded location descriptor. String locations are encoded as JSON strings.
+          example: '"/var/lib/antfly/fastspace"'
+        placement_policy_json:
+          type: string
+          description: JSON-encoded placement policy reserved for native placement planning.
+          example: '{}'
+    CreateTablespaceRequest:
+      type: object
+      description: Tablespace creation request. Placement policy is validated and applied when new tables
+        are created.
+      properties:
+        location_json:
+          type: string
+          description: JSON-encoded location descriptor. Defaults to `null`.
+          example: '"/var/lib/antfly/fastspace"'
+        placement_policy_json:
+          type: string
+          description: JSON-encoded placement policy. Supported fields are placement_role, desired_replica_count,
+            and min_ranges. Location is metadata, never a filesystem override.
+          example: '{}'
+    RenameCatalogResourceRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: New logical name. The durable resource identity remains unchanged.
     CommittedMutationOutcome:
       type: object
       required:
@@ -8068,6 +9694,17 @@ components:
         recursively; null removes a member. The resulting document must be a
 
         valid TableSchema and `version` remains server-managed.
+    CatalogMutationVisibilityPending:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - committed_visibility_pending
+      description: The mutation committed. Read the resource to observe it; do not replay the mutation
+        to obtain its representation.
     Error:
       type: object
       properties:
@@ -11198,6 +12835,11 @@ components:
     CreateTableRequest:
       type: object
       properties:
+        tablespace_name:
+          type: string
+          description: Explicit tablespace policy for the new table, overriding namespace and database
+            defaults.
+          maxLength: 128
         storage:
           $ref: '#/components/schemas/TableStorageSettings'
         num_shards:
@@ -12563,6 +14205,9 @@ components:
           required:
             - storage_status
           properties:
+            table_id:
+              type: string
+              description: Immutable physical table identity, preserved by catalog renames.
             storage_status:
               $ref: '#/components/schemas/StorageStatus'
             artifact_enrichments:
@@ -15334,6 +16979,22 @@ components:
         children:
           $ref: '#/components/schemas/HierarchyChildren'
           x-go-type-skip-optional-pointer: false
+    CatalogTableTarget:
+      type: object
+      description: An explicit native table target. Components are literal names; dots do not qualify
+        a string table name.
+      properties:
+        database:
+          type: string
+          default: default
+        namespace:
+          type: string
+          default: public
+        table:
+          type: string
+      required:
+        - table
+      additionalProperties: false
     QueryRequest:
       type: object
       not:
@@ -15497,9 +17158,12 @@ components:
                   - required:
                       - foreign_sources
       properties:
+        table_target:
+          $ref: '#/components/schemas/CatalogTableTarget'
         table:
           type: string
-          description: Name of the table to query. Required for global-query requests.
+          description: Literal table name in default.public. Global queries require exactly one of table
+            or table_target.
           example: wikipedia
         query:
           x-go-type: json.RawMessage
@@ -16421,12 +18085,14 @@ components:
 
         Supports inner, left, and right joins with automatic strategy selection.
       required:
-        - right_table
         - 'on'
       properties:
+        right_target:
+          $ref: '#/components/schemas/CatalogTableTarget'
         right_table:
           type: string
-          description: Name of the table to join with.
+          description: Literal native table name or declared foreign-source alias. Specify exactly one
+            of right_table or right_target.
           example: customers
         join_type:
           $ref: '#/components/schemas/JoinType'
@@ -18318,6 +19984,9 @@ components:
       type: string
       enum:
         - table
+        - database
+        - namespace
+        - tablespace
         - user
         - inference
         - '*'
@@ -18332,20 +20001,48 @@ components:
         - admin
       description: Type of permission.
       example: read
+    CatalogTableScope:
+      type: object
+      description: A table or all tables in an explicit namespace. A missing table selects the namespace;
+        a table named '*' remains literal.
+      properties:
+        database:
+          type: string
+          default: default
+        namespace:
+          type: string
+          default: public
+        table:
+          type: string
+      additionalProperties: false
+    ScopedRowFilter:
+      type: object
+      properties:
+        table_target:
+          $ref: '#/components/schemas/CatalogTableScope'
+        filter:
+          type: object
+          additionalProperties: {}
+      required:
+        - table_target
+        - filter
     Permission:
       type: object
+      description: Specify exactly one of a legacy literal resource or a structured table_target; table_target
+        requires resource_type table.
       properties:
         resource:
           type: string
           description: Resource name (e.g., table name, target username, or '*' for all inference operations
             or a global grant).
           example: orders_table
+        table_target:
+          $ref: '#/components/schemas/CatalogTableScope'
         resource_type:
           $ref: '#/components/schemas/ResourceType'
         type:
           $ref: '#/components/schemas/PermissionType'
       required:
-        - resource
         - resource_type
         - type
     RoleAssignment:
@@ -18440,6 +20137,10 @@ components:
             $ref: '#/components/schemas/Permission'
           nullable: true
           description: Optional permission scoping. If empty, inherits owner's full permissions.
+        scoped_row_filters:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScopedRowFilter'
         row_filter:
           type: object
           additionalProperties: {}
@@ -18487,6 +20188,8 @@ components:
           type: string
           description: Table name (or '*' for all tables).
           example: orders
+        table_target:
+          $ref: '#/components/schemas/CatalogTableScope'
         filter:
           type: object
           additionalProperties: {}
@@ -18516,6 +20219,10 @@ components:
           nullable: true
           description: Optional permission scoping. Each permission must be a subset of the creator's
             permissions.
+        scoped_row_filters:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScopedRowFilter'
         row_filter:
           type: object
           additionalProperties: {}

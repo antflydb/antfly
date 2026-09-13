@@ -88,41 +88,47 @@ pub fn applyObservationsOwnedWithRepairStatus(
     var applied: usize = 0;
     for (observations) |observation| {
         const index = findStoreIndex(records, observation.store_id) orelse return error.UnknownStore;
-        if (!observationChangesRecordWithRepairStatus(records[index], observation, include_repair_status)) {
+        if (!try observationChangesRecordWithRepairStatus(alloc, records[index], observation, include_repair_status)) {
             applied += 1;
             continue;
         }
-        alloc.free(records[index].health_class);
-        records[index].health_class = try alloc.dupe(u8, observation.health_class);
-        if (records[index].reporter_incarnation != 0 and
-            observation.reporter_incarnation == records[index].reporter_incarnation)
-        {
-            records[index].status_generation = observation.status_generation;
-            records[index].artifact_sources_protocol_version = observation.artifact_sources_protocol_version;
-            records[index].dense_native_storage_protocol_version = observation.dense_native_storage_protocol_version;
-        }
-        records[index].live = observation.live;
-        records[index].capacity_bytes = observation.capacity_bytes;
-        records[index].available_bytes = observation.available_bytes;
-        records[index].lease_pressure = observation.lease_pressure;
-        records[index].read_load = observation.read_load;
-        records[index].write_load = observation.write_load;
-        records[index].active_backfills = observation.active_backfills;
-        records[index].backfill_progress_millis = observation.backfill_progress_millis;
+        const next_health_class = try alloc.dupe(u8, observation.health_class);
+        errdefer alloc.free(next_health_class);
         const next_group_statuses = try table_manager.cloneGroupStatuses(alloc, observation.group_statuses);
         errdefer table_manager.freeGroupStatuses(alloc, next_group_statuses);
         const next_runtime_statuses = try table_manager.cloneRuntimeGroupStatusReports(alloc, observation.runtime_statuses);
+        errdefer table_manager.freeRuntimeGroupStatusReports(alloc, next_runtime_statuses);
         stripVolatileEmbeddingActivity(next_runtime_statuses);
         if (!include_repair_status) {
-            preserveCommittedRuntimeRepairStatus(records[index].runtime_statuses, next_runtime_statuses);
+            try preserveCommittedRuntimeRepairStatus(alloc, records[index].runtime_statuses, next_runtime_statuses);
         }
+        var replacement = applyObservation(records[index], observation);
+        replacement.health_class = next_health_class;
+        replacement.group_statuses = next_group_statuses;
+        replacement.runtime_statuses = next_runtime_statuses;
+        alloc.free(records[index].health_class);
         table_manager.freeGroupStatuses(alloc, records[index].group_statuses);
         table_manager.freeRuntimeGroupStatusReports(alloc, records[index].runtime_statuses);
-        records[index].group_statuses = next_group_statuses;
-        records[index].runtime_statuses = next_runtime_statuses;
+        records[index] = replacement;
         applied += 1;
     }
     return applied;
+}
+
+/// Admission borrows the pinned prior record and owns only an accepted
+/// replacement. Comparison and reporter fencing happen exactly once.
+pub fn admitObservation(alloc: std.mem.Allocator, prior: table_manager.StoreRecord, observation: StoreObservation, include_repair_status: bool) !?table_manager.StoreRecord {
+    var lookup: ?RepairLookup = null;
+    defer if (lookup) |*value| value.deinit(alloc);
+    if (!try observationChangesRecordWithLookup(alloc, prior, observation, include_repair_status, &lookup)) return null;
+    const replacement = try table_manager.cloneStore(alloc, applyObservation(prior, observation));
+    errdefer table_manager.freeStore(alloc, replacement);
+    stripVolatileEmbeddingActivity(@constCast(replacement.runtime_statuses));
+    if (!include_repair_status) {
+        if (lookup == null) lookup = try RepairLookup.init(alloc, prior.runtime_statuses);
+        preserveCommittedRuntimeRepairStatusWithLookup(&lookup.?, @constCast(replacement.runtime_statuses));
+    }
+    return replacement;
 }
 
 /// A capability probe that is pending or temporarily unavailable must not turn
@@ -130,17 +136,24 @@ pub fn applyObservationsOwnedWithRepairStatus(
 /// committed with the newer codec. New repair facts remain suppressed until
 /// activation, while facts for a different index incarnation fail closed.
 fn preserveCommittedRuntimeRepairStatus(
+    alloc: std.mem.Allocator,
     existing: []const table_manager.RuntimeGroupStatusReport,
     next: []table_manager.RuntimeGroupStatusReport,
-) void {
+) !void {
+    var lookup = try RepairLookup.init(alloc, existing);
+    defer lookup.deinit(alloc);
+    preserveCommittedRuntimeRepairStatusWithLookup(&lookup, next);
+}
+
+fn preserveCommittedRuntimeRepairStatusWithLookup(lookup: *const RepairLookup, next: []table_manager.RuntimeGroupStatusReport) void {
     for (next) |*next_runtime| {
-        const prior_runtime = findRuntimeRepairIdentity(existing, next_runtime.*);
+        const prior_runtime = lookup.group(next_runtime.*);
         for (next_runtime.indexes) |*next_index| {
             next_index.lifecycle_work_class = .none;
             next_index.repair_status = null;
             next_index.repair_active_generation_serviceable = false;
             const prior = prior_runtime orelse continue;
-            const prior_index = findRuntimeIndexRepairIdentity(prior.indexes, next_index.*) orelse continue;
+            const prior_index = lookup.index(prior, next_index.*) orelse continue;
             next_index.lifecycle_work_class = prior_index.lifecycle_work_class;
             next_index.repair_status = prior_index.repair_status;
             next_index.repair_active_generation_serviceable =
@@ -149,36 +162,74 @@ fn preserveCommittedRuntimeRepairStatus(
     }
 }
 
-fn findRuntimeRepairIdentity(
-    statuses: []const table_manager.RuntimeGroupStatusReport,
-    target: table_manager.RuntimeGroupStatusReport,
-) ?table_manager.RuntimeGroupStatusReport {
-    for (statuses) |status| {
-        if (status.table_id == target.table_id and
-            status.group_id == target.group_id and
-            status.store_id == target.store_id and
-            status.node_id == target.node_id)
-        {
-            return status;
-        }
+const RepairLookup = struct {
+    const Group = struct { table: u64, group: u64, store: u64, node: u64 };
+    const Index = struct {
+        group: Group,
+        name: []const u8,
+        kind: []const u8,
+        generation: u64,
+        config_hash: u64,
+        const Context = struct {
+            pub fn hash(_: @This(), key: Index) u64 {
+                var h = std.hash.Wyhash.init(0);
+                std.hash.autoHashStrat(&h, key, .Deep);
+                return h.final();
+            }
+            pub fn eql(_: @This(), a: Index, b: Index) bool {
+                return std.meta.eql(a.group, b.group) and std.mem.eql(u8, a.name, b.name) and std.mem.eql(u8, a.kind, b.kind) and a.generation == b.generation and a.config_hash == b.config_hash;
+            }
+        };
+    };
+    groups: std.AutoHashMapUnmanaged(Group, *const table_manager.RuntimeGroupStatusReport) = .empty,
+    exact: std.HashMapUnmanaged(Index, *const table_manager.RuntimeIndexStatusReport, Index.Context, 80) = .empty,
+    names: std.HashMapUnmanaged(Index, *const table_manager.RuntimeIndexStatusReport, Index.Context, 80) = .empty,
+    fn groupKey(r: table_manager.RuntimeGroupStatusReport) Group {
+        return .{ .table = r.table_id, .group = r.group_id, .store = r.store_id, .node = r.node_id };
     }
-    return null;
-}
+    fn indexKey(r: table_manager.RuntimeGroupStatusReport, i: table_manager.RuntimeIndexStatusReport) Index {
+        return .{ .group = groupKey(r), .name = i.name, .kind = i.kind, .generation = i.coverage_generation, .config_hash = i.coverage_config_hash };
+    }
+    fn nameKey(r: table_manager.RuntimeGroupStatusReport, name: []const u8) Index {
+        return .{ .group = groupKey(r), .name = name, .kind = "", .generation = 0, .config_hash = 0 };
+    }
+    fn init(alloc: std.mem.Allocator, records: []const table_manager.RuntimeGroupStatusReport) !RepairLookup {
+        var out: RepairLookup = .{};
+        errdefer out.deinit(alloc);
+        for (records) |*record| {
+            const group_entry = try out.groups.getOrPut(alloc, groupKey(record.*));
+            // Match existing first-observation lookup semantics; duplicates
+            // remain in the reports for reconciliation's ambiguity checks.
+            if (group_entry.found_existing) continue;
+            group_entry.value_ptr.* = record;
+            for (record.indexes) |*index_record| {
+                const exact = try out.exact.getOrPut(alloc, indexKey(record.*, index_record.*));
+                if (!exact.found_existing) exact.value_ptr.* = index_record;
+                const name_entry = try out.names.getOrPut(alloc, nameKey(record.*, index_record.name));
+                if (!name_entry.found_existing) name_entry.value_ptr.* = index_record;
+            }
+        }
+        return out;
+    }
+    fn deinit(self: *RepairLookup, alloc: std.mem.Allocator) void {
+        self.groups.deinit(alloc);
+        self.exact.deinit(alloc);
+        self.names.deinit(alloc);
+    }
+    fn group(self: *const RepairLookup, target: table_manager.RuntimeGroupStatusReport) ?table_manager.RuntimeGroupStatusReport {
+        return if (self.groups.get(groupKey(target))) |record| record.* else null;
+    }
+    fn index(self: *const RepairLookup, runtime: table_manager.RuntimeGroupStatusReport, target: table_manager.RuntimeIndexStatusReport) ?table_manager.RuntimeIndexStatusReport {
+        return if (self.exact.get(indexKey(runtime, target))) |record| record.* else null;
+    }
+    fn named(self: *const RepairLookup, runtime: table_manager.RuntimeGroupStatusReport, name: []const u8) ?table_manager.RuntimeIndexStatusReport {
+        return if (self.names.get(nameKey(runtime, name))) |record| record.* else null;
+    }
+};
 
-fn findRuntimeIndexRepairIdentity(
-    indexes: []const table_manager.RuntimeIndexStatusReport,
-    target: table_manager.RuntimeIndexStatusReport,
-) ?table_manager.RuntimeIndexStatusReport {
-    for (indexes) |index| {
-        if (std.mem.eql(u8, index.name, target.name) and
-            std.mem.eql(u8, index.kind, target.kind) and
-            index.coverage_generation == target.coverage_generation and
-            index.coverage_config_hash == target.coverage_config_hash)
-        {
-            return index;
-        }
-    }
-    return null;
+fn hasRepairFacts(records: []const table_manager.RuntimeGroupStatusReport) bool {
+    for (records) |record| for (record.indexes) |index| if (index.repair_status != null) return true;
+    return false;
 }
 
 pub fn findStoreIndex(records: []const table_manager.StoreRecord, store_id: u64) ?usize {
@@ -189,19 +240,59 @@ pub fn findStoreIndex(records: []const table_manager.StoreRecord, store_id: u64)
 }
 
 pub fn observationChangesRecord(
+    alloc: std.mem.Allocator,
     existing: table_manager.StoreRecord,
     observation: StoreObservation,
-) bool {
-    return observationChangesRecordWithRepairStatus(existing, observation, true);
+) !bool {
+    return try observationChangesRecordWithRepairStatus(alloc, existing, observation, true);
+}
+
+/// Runtime references retain the exact inventory and duplicate multiplicity
+/// established by a full report. Live Raft facts may change within that fence.
+pub fn validateHeartbeatInventory(alloc: std.mem.Allocator, prior: []const table_manager.GroupStatusReport, next: []const table_manager.GroupStatusReport) !void {
+    if (prior.len != next.len) return error.StoreReportBaseMismatch;
+    var counts: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    defer counts.deinit(alloc);
+    for (prior) |group| {
+        const entry = try counts.getOrPut(alloc, group.group_id);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += 1;
+    }
+    for (next) |group| {
+        const count = counts.getPtr(group.group_id) orelse return error.StoreReportBaseMismatch;
+        if (count.* == 0) return error.StoreReportBaseMismatch;
+        count.* -= 1;
+    }
 }
 
 pub fn observationChangesRecordWithRepairStatus(
+    alloc: std.mem.Allocator,
     existing: table_manager.StoreRecord,
     observation: StoreObservation,
     include_repair_status: bool,
-) bool {
-    const repair_facts_equal = !include_repair_status or
-        runtimeRepairFactsEqual(existing.runtime_statuses, observation.runtime_statuses);
+) !bool {
+    var prior: ?RepairLookup = null;
+    defer if (prior) |*lookup| lookup.deinit(alloc);
+    return observationChangesRecordWithLookup(alloc, existing, observation, include_repair_status, &prior);
+}
+
+fn observationChangesRecordWithLookup(
+    alloc: std.mem.Allocator,
+    existing: table_manager.StoreRecord,
+    observation: StoreObservation,
+    include_repair_status: bool,
+    retained_prior: *?RepairLookup,
+) !bool {
+    if (existing.reporter_incarnation != 0 and (observation.reporter_incarnation != existing.reporter_incarnation or observation.status_generation < existing.status_generation)) return false;
+    const same_runtime = existing.runtime_statuses.ptr == observation.runtime_statuses.ptr and existing.runtime_statuses.len == observation.runtime_statuses.len;
+    const repair_checks = !same_runtime and (hasRepairFacts(existing.runtime_statuses) or hasRepairFacts(observation.runtime_statuses));
+    if (repair_checks and retained_prior.* == null) retained_prior.* = try RepairLookup.init(alloc, existing.runtime_statuses);
+    const empty: RepairLookup = .{};
+    const prior = if (retained_prior.*) |*lookup| lookup else &empty;
+    var next = if (repair_checks) try RepairLookup.init(alloc, observation.runtime_statuses) else RepairLookup{};
+    defer next.deinit(alloc);
+    const repair_facts_equal = !include_repair_status or !repair_checks or
+        (runtimeRepairFactsContained(existing.runtime_statuses, &next) and runtimeRepairFactsContained(observation.runtime_statuses, prior));
     // Once registration establishes an incarnation, reports from a prior
     // process can never mutate the store projection. Generations order full
     // snapshots within the active process; equal generations remain useful
@@ -213,7 +304,7 @@ pub fn observationChangesRecordWithRepairStatus(
             observation.status_generation == existing.status_generation and
             !repair_facts_equal) return false;
     } else if (!repair_facts_equal and
-        !legacyRepairTransitionCausallySupersedes(existing.runtime_statuses, observation.runtime_statuses))
+        !legacyRepairTransitionCausallySupersedes(existing.runtime_statuses, &next))
     {
         return false;
     }
@@ -225,7 +316,7 @@ pub fn observationChangesRecordWithRepairStatus(
     // only admission-safety fact. Treat the heartbeat as unchanged so callers
     // neither replace the projection nor propose the deletion. A same-name
     // index with a complete new materialization identity remains authoritative.
-    if (observationLacksAuthoritativeCommittedRepairIdentity(existing, observation)) return false;
+    if (repair_checks and observationLacksAuthoritativeCommittedRepairIdentity(existing, observation, &next)) return false;
 
     return existing.live != observation.live or
         !std.mem.eql(u8, existing.health_class, observation.health_class) or
@@ -241,12 +332,13 @@ pub fn observationChangesRecordWithRepairStatus(
         existing.active_backfills != observation.active_backfills or
         existing.backfill_progress_millis != observation.backfill_progress_millis or
         !groupStatusesEqual(existing.group_statuses, observation.group_statuses) or
-        !runtimeStatusesEqual(existing.runtime_statuses, observation.runtime_statuses, include_repair_status);
+        (!same_runtime and !runtimeStatusesEqual(existing.runtime_statuses, observation.runtime_statuses, include_repair_status));
 }
 
 fn observationLacksAuthoritativeCommittedRepairIdentity(
     existing: table_manager.StoreRecord,
     observation: StoreObservation,
+    next: *const RepairLookup,
 ) bool {
     for (existing.runtime_statuses) |prior_runtime| {
         var has_committed_repair = false;
@@ -260,20 +352,13 @@ fn observationLacksAuthoritativeCommittedRepairIdentity(
         // keep the common repair-free store path linear in its own index count.
         if (!has_committed_repair) continue;
 
-        const next_runtime = findRuntimeRepairIdentity(observation.runtime_statuses, prior_runtime) orelse {
+        const next_runtime = next.group(prior_runtime) orelse {
             if (!storeObservationCausallySupersedes(existing, observation, null, null)) return true;
             continue;
         };
         for (prior_runtime.indexes) |prior_index| {
             if (prior_index.repair_status == null) continue;
-            var replacement: ?table_manager.RuntimeIndexStatusReport = null;
-            for (next_runtime.indexes) |next_index| {
-                if (std.mem.eql(u8, prior_index.name, next_index.name)) {
-                    replacement = next_index;
-                    break;
-                }
-            }
-            const next_index = replacement orelse {
+            const next_index = next.named(prior_runtime, prior_index.name) orelse {
                 if (!storeObservationCausallySupersedes(existing, observation, prior_runtime, next_runtime)) return true;
                 continue;
             };
@@ -311,22 +396,14 @@ fn storeObservationCausallySupersedes(
     return prior.updated_at_ns != 0 and next.updated_at_ns > prior.updated_at_ns;
 }
 
-fn runtimeRepairFactsEqual(
-    lhs: []const table_manager.RuntimeGroupStatusReport,
-    rhs: []const table_manager.RuntimeGroupStatusReport,
-) bool {
-    return runtimeRepairFactsContained(lhs, rhs) and runtimeRepairFactsContained(rhs, lhs);
-}
-
 fn runtimeRepairFactsContained(
     expected: []const table_manager.RuntimeGroupStatusReport,
-    actual: []const table_manager.RuntimeGroupStatusReport,
+    actual: *const RepairLookup,
 ) bool {
     for (expected) |expected_runtime| {
         for (expected_runtime.indexes) |expected_index| {
             const expected_status = expected_index.repair_status orelse continue;
-            const actual_runtime = findRuntimeRepairIdentity(actual, expected_runtime) orelse return false;
-            const actual_index = findRuntimeIndexRepairIdentity(actual_runtime.indexes, expected_index) orelse return false;
+            const actual_index = actual.index(expected_runtime, expected_index) orelse return false;
             if (actual_index.repair_status != expected_status or
                 actual_index.repair_active_generation_serviceable !=
                     expected_index.repair_active_generation_serviceable) return false;
@@ -337,11 +414,11 @@ fn runtimeRepairFactsContained(
 
 fn runtimeRepairFactsForGroupContained(
     expected: table_manager.RuntimeGroupStatusReport,
-    actual: table_manager.RuntimeGroupStatusReport,
+    actual: *const RepairLookup,
 ) bool {
     for (expected.indexes) |expected_index| {
         const expected_status = expected_index.repair_status orelse continue;
-        const actual_index = findRuntimeIndexRepairIdentity(actual.indexes, expected_index) orelse return false;
+        const actual_index = actual.index(expected, expected_index) orelse return false;
         if (actual_index.repair_status != expected_status or
             actual_index.repair_active_generation_serviceable !=
                 expected_index.repair_active_generation_serviceable) return false;
@@ -351,10 +428,10 @@ fn runtimeRepairFactsForGroupContained(
 
 fn legacyRepairTransitionCausallySupersedes(
     existing: []const table_manager.RuntimeGroupStatusReport,
-    observation: []const table_manager.RuntimeGroupStatusReport,
+    observation: *const RepairLookup,
 ) bool {
     for (existing) |prior_runtime| {
-        const next_runtime = findRuntimeRepairIdentity(observation, prior_runtime) orelse {
+        const next_runtime = observation.group(prior_runtime) orelse {
             for (prior_runtime.indexes) |index| if (index.repair_status != null) return false;
             continue;
         };
@@ -362,7 +439,7 @@ fn legacyRepairTransitionCausallySupersedes(
         // committed admission-safety fact, so legacy reporters do not need a
         // timestamp proof for that monotonic transition. Removal or mutation
         // still requires a causally newer complete observation below.
-        if (runtimeRepairFactsForGroupContained(prior_runtime, next_runtime)) continue;
+        if (runtimeRepairFactsForGroupContained(prior_runtime, observation)) continue;
         if (prior_runtime.updated_at_ns == 0 or
             next_runtime.updated_at_ns <= prior_runtime.updated_at_ns) return false;
     }
@@ -382,7 +459,7 @@ fn groupStatusesEqual(
     return true;
 }
 
-fn groupStatusEqual(
+pub fn groupStatusEqual(
     lhs: table_manager.GroupStatusReport,
     rhs: table_manager.GroupStatusReport,
 ) bool {
@@ -434,6 +511,7 @@ pub fn reportsDurablyEqual(
     return lhs.store_id == rhs.store_id and
         lhs.reporter_incarnation == rhs.reporter_incarnation and
         lhs.artifact_sources_protocol_version == rhs.artifact_sources_protocol_version and
+        lhs.dense_native_storage_protocol_version == rhs.dense_native_storage_protocol_version and
         lhs.live == rhs.live and
         std.mem.eql(u8, lhs.health_class, rhs.health_class) and
         lhs.capacity_bytes == rhs.capacity_bytes and
@@ -447,7 +525,7 @@ pub fn reportsDurablyEqual(
         runtimeStatusesEqual(lhs.runtime_statuses, rhs.runtime_statuses, true);
 }
 
-fn runtimeStatusEqual(
+pub fn runtimeStatusEqual(
     lhs: table_manager.RuntimeGroupStatusReport,
     rhs: table_manager.RuntimeGroupStatusReport,
     include_repair_status: bool,
@@ -788,16 +866,16 @@ test "store observer coalesces status heartbeat timestamps" {
         .available_bytes = 900,
         .group_statuses = fresh_groups[0..],
     };
-    try std.testing.expect(!observationChangesRecord(existing, observation));
+    try std.testing.expect(!try observationChangesRecord(std.testing.allocator, existing, observation));
 
     // Causal acknowledgements are state transitions, not heartbeats. They
     // must bypass timestamp coalescing even when every storage fact is stable.
     fresh_groups[0].observed_reallocation_request_id = 0x1234;
-    try std.testing.expect(observationChangesRecord(existing, observation));
+    try std.testing.expect(try observationChangesRecord(std.testing.allocator, existing, observation));
     fresh_groups[0].observed_reallocation_request_id = 0;
 
     observation.group_statuses = stale_groups[0..];
-    try std.testing.expect(observationChangesRecord(existing, observation));
+    try std.testing.expect(try observationChangesRecord(std.testing.allocator, existing, observation));
 }
 
 test "store observer can ignore unactivated repair fields without hiding other changes" {
@@ -832,10 +910,10 @@ test "store observer can ignore unactivated repair fields without hiding other c
         .runtime_statuses = observed_runtime[0..],
     };
 
-    try std.testing.expect(observationChangesRecord(existing, observation));
-    try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, false));
+    try std.testing.expect(try observationChangesRecord(std.testing.allocator, existing, observation));
+    try std.testing.expect(!try observationChangesRecordWithRepairStatus(std.testing.allocator, existing, observation, false));
     observed_indexes[0].doc_count += 1;
-    try std.testing.expect(observationChangesRecordWithRepairStatus(existing, observation, false));
+    try std.testing.expect(try observationChangesRecordWithRepairStatus(std.testing.allocator, existing, observation, false));
 }
 
 test "store observer publishes projection-only readiness transitions" {
@@ -864,7 +942,7 @@ test "store observer publishes projection-only readiness transitions" {
         .runtime_statuses = observed_runtime[0..],
     };
 
-    try std.testing.expect(observationChangesRecord(existing, observation));
+    try std.testing.expect(try observationChangesRecord(std.testing.allocator, existing, observation));
 }
 
 test "store observer durable report equality excludes only volatile activity" {
@@ -951,21 +1029,21 @@ test "store observer fences repair transitions by registered reporter incarnatio
         .status_generation = 100,
         .runtime_statuses = next_runtime[0..],
     };
-    try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, true));
+    try std.testing.expect(!try observationChangesRecordWithRepairStatus(std.testing.allocator, existing, observation, true));
 
     observation.reporter_incarnation = existing.reporter_incarnation;
     observation.status_generation = existing.status_generation - 1;
-    try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, true));
+    try std.testing.expect(!try observationChangesRecordWithRepairStatus(std.testing.allocator, existing, observation, true));
 
     observation.status_generation = existing.status_generation;
-    try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, true));
+    try std.testing.expect(!try observationChangesRecordWithRepairStatus(std.testing.allocator, existing, observation, true));
 
     // Generation, rather than incomparable wall time, authorizes the active
     // process to publish the transition and to delete an omitted repair fact.
     observation.status_generation = existing.status_generation + 1;
-    try std.testing.expect(observationChangesRecordWithRepairStatus(existing, observation, true));
+    try std.testing.expect(try observationChangesRecordWithRepairStatus(std.testing.allocator, existing, observation, true));
     observation.runtime_statuses = &.{};
-    try std.testing.expect(observationChangesRecordWithRepairStatus(existing, observation, true));
+    try std.testing.expect(try observationChangesRecordWithRepairStatus(std.testing.allocator, existing, observation, true));
 
     var legacy_existing = existing;
     legacy_existing.reporter_incarnation = 0;
@@ -973,9 +1051,9 @@ test "store observer fences repair transitions by registered reporter incarnatio
     observation.reporter_incarnation = 0;
     observation.status_generation = 0;
     observation.runtime_statuses = next_runtime[0..];
-    try std.testing.expect(!observationChangesRecordWithRepairStatus(legacy_existing, observation, true));
+    try std.testing.expect(!try observationChangesRecordWithRepairStatus(std.testing.allocator, legacy_existing, observation, true));
     next_runtime[0].updated_at_ns = existing_runtime[0].updated_at_ns + 1;
-    try std.testing.expect(observationChangesRecordWithRepairStatus(legacy_existing, observation, true));
+    try std.testing.expect(try observationChangesRecordWithRepairStatus(std.testing.allocator, legacy_existing, observation, true));
 }
 
 test "store observer preserves committed repair facts while capability is unknown" {
@@ -1160,7 +1238,7 @@ test "metadata store observer detects exact voter set changes at a stable count"
         .group_statuses = changed_groups[0..],
     };
 
-    try std.testing.expect(observationChangesRecord(existing, observation));
+    try std.testing.expect(try observationChangesRecord(std.testing.allocator, existing, observation));
 }
 
 test "store observer classifies placement status from health and pressure" {
@@ -1221,4 +1299,59 @@ test "store observer classifies placement status from health and pressure" {
     });
     try std.testing.expectEqual(PlacementStatusTag.excluded, excluded.tag);
     try std.testing.expect(!excluded.retain_current);
+}
+
+test "store observer heartbeat inventory preserves duplicate multiplicity" {
+    const alloc = std.testing.allocator;
+    const prior = [_]table_manager.GroupStatusReport{ .{ .group_id = 1 }, .{ .group_id = 1 }, .{ .group_id = 2 } };
+    try validateHeartbeatInventory(alloc, &prior, &.{ .{ .group_id = 2 }, .{ .group_id = 1 }, .{ .group_id = 1 } });
+    try std.testing.expectError(error.StoreReportBaseMismatch, validateHeartbeatInventory(alloc, &prior, &.{ .{ .group_id = 2 }, .{ .group_id = 2 }, .{ .group_id = 1 } }));
+    try std.testing.expectError(error.StoreReportBaseMismatch, validateHeartbeatInventory(alloc, &prior, prior[0..2]));
+}
+
+test "store observer repair admission allocation failures preserve owned records" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var indexes = [_]table_manager.RuntimeIndexStatusReport{.{ .name = "text", .kind = "full_text", .repair_status = .waiting, .coverage_generation = 1, .coverage_config_hash = 2, .coverage_identity_ready = true }};
+            var runtimes = [_]table_manager.RuntimeGroupStatusReport{.{ .table_id = 1, .group_id = 7, .store_id = 20, .node_id = 30, .indexes = &indexes }};
+            var records = [_]table_manager.StoreRecord{try table_manager.cloneStore(alloc, .{ .store_id = 20, .node_id = 30, .runtime_statuses = &runtimes })};
+            defer table_manager.freeStore(alloc, records[0]);
+            const observation: StoreObservation = .{ .store_id = 20, .health_class = "changed", .available_bytes = 10, .runtime_statuses = &runtimes };
+            _ = applyObservationsOwnedWithRepairStatus(alloc, &records, &.{observation}, false) catch |err| {
+                try std.testing.expectEqual(@as(u64, 0), records[0].available_bytes);
+                try std.testing.expectEqualStrings("healthy", records[0].health_class);
+                return err;
+            };
+            try std.testing.expectEqual(@as(u64, 10), records[0].available_bytes);
+            try std.testing.expect(records[0].runtime_statuses[0].indexes[0].repair_status == .waiting);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "store observer borrowed admission preserves prior ownership through allocation failures" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var indexes = [_]table_manager.RuntimeIndexStatusReport{.{ .name = "text", .kind = "full_text", .lifecycle_work_class = .repair, .repair_status = .waiting, .coverage_generation = 1, .coverage_config_hash = 2, .coverage_identity_ready = true }};
+            var runtimes = [_]table_manager.RuntimeGroupStatusReport{.{ .table_id = 1, .group_id = 7, .store_id = 20, .node_id = 30, .indexes = &indexes }};
+            const prior = try table_manager.cloneStore(alloc, .{ .store_id = 20, .node_id = 30, .runtime_statuses = &runtimes });
+            defer table_manager.freeStore(alloc, prior);
+            const observation: StoreObservation = .{ .store_id = 20, .health_class = "changed", .available_bytes = 10, .runtime_statuses = &runtimes };
+            const admitted = admitObservation(alloc, prior, observation, false) catch |err| {
+                try std.testing.expectEqual(@as(u64, 0), prior.available_bytes);
+                try std.testing.expectEqualStrings("healthy", prior.health_class);
+                try std.testing.expect(prior.runtime_statuses[0].indexes[0].repair_status == .waiting);
+                return err;
+            };
+            const replacement = admitted.?;
+            defer table_manager.freeStore(alloc, replacement);
+            try std.testing.expectEqual(@as(u64, 10), replacement.available_bytes);
+            try std.testing.expect(replacement.runtime_statuses[0].indexes[0].repair_status == .waiting);
+            try std.testing.expectEqual(@as(u64, 0), prior.available_bytes);
+            try std.testing.expectEqualStrings("healthy", prior.health_class);
+            try std.testing.expect(prior.runtime_statuses.ptr != replacement.runtime_statuses.ptr);
+            try std.testing.expect(runtimes[0].indexes[0].repair_status == .waiting);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

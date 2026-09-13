@@ -1311,6 +1311,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     tokenizer_bench_step.dependOn(&b.addInstallArtifact(tokenizer_bench, .{}).step);
 
     const benchmarks = antfly_benches_build.addBenchmarks(b, .{
+        .vopr = vopr_mod,
         .lmdb_engine = lmdb_engine_mod,
         .api_bench_standalone = api_bench_standalone,
         .optimize = optimize,

@@ -32,12 +32,30 @@ pub const GetSubjectRowFilterPathParams = struct {
     table: []const u8,
 };
 
+pub const GetSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
+};
+
 /// Set row filter for an auth subject on a table
 pub const SetSubjectRowFilterPathParams = struct {
     /// Casbin subject name, such as role:tenant_reader or group:eng.
     subject: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const SetSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for setSubjectRowFilter.
@@ -51,6 +69,15 @@ pub const RemoveSubjectRowFilterPathParams = struct {
     subject: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const RemoveSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Get user details
@@ -140,6 +167,9 @@ pub const RemovePermissionFromUserParams = struct {
     resource: []const u8,
     /// The type of the resource for the permission to be removed.
     resource_type: []const u8,
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    all_tables: ?[]const u8 = null,
 };
 
 /// List user roles
@@ -184,12 +214,30 @@ pub const GetRowFilterPathParams = struct {
     table: []const u8,
 };
 
+pub const GetRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
+};
+
 /// Set row filter for a user on a table
 pub const SetRowFilterPathParams = struct {
     /// The username.
     user_name: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const SetRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for setRowFilter.
@@ -203,6 +251,15 @@ pub const RemoveRowFilterPathParams = struct {
     user_name: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const RemoveRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for backup.
@@ -246,6 +303,338 @@ pub const InvokeInferenceConnectionPathParams = struct {
 pub fn parseInvokeInferenceConnectionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.ArrayHashMap(std.json.Value)) {
     return std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator, body, .{ .ignore_unknown_fields = true });
 }
+
+/// Get database
+pub const GetDatabasePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Create database
+pub const CreateDatabasePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Drop database
+pub const DropDatabasePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// List namespaces
+pub const ListNamespacesPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Create namespace
+pub const CreateNamespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// Drop namespace
+pub const DropNamespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// Rename catalog resource
+pub const RenameNamespacePathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+};
+
+/// Parse the JSON request body for renameNamespace.
+pub fn parseRenameNamespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RenameCatalogResourceRequest) {
+    return std.json.parseFromSlice(types.RenameCatalogResourceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// List tables in namespace
+pub const ListNamespaceTablesPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+pub const ListNamespaceTablesParams = struct {
+    /// Filter tables by name prefix.
+    prefix: ?[]const u8 = null,
+    /// Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+    limit: ?[]const u8 = null,
+    /// Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing.
+    cursor: ?[]const u8 = null,
+};
+
+/// Get namespace table details
+pub const GetNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Create namespace table
+pub const CreateNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for createNamespaceTable.
+pub fn parseCreateNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CreateTableRequest) {
+    return std.json.parseFromSlice(types.CreateTableRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Drop namespace table
+pub const DropNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Backup an explicit namespace table
+pub const BackupNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for backupNamespaceTable.
+pub fn parseBackupNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BackupRequest) {
+    return std.json.parseFromSlice(types.BackupRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Perform batch inserts and deletes on an explicit namespace table
+pub const BatchNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for batchNamespaceTable.
+pub fn parseBatchNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BatchRequest) {
+    return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retrieve a document by key from an explicit namespace table
+pub const LookupNamespaceTableDocumentPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+    /// Key of the document to retrieve
+    key: []const u8,
+};
+
+pub const LookupNamespaceTableDocumentParams = struct {
+    /// Comma-separated list of fields to include in the response.
+    fields: ?[]const u8 = null,
+    /// Read consistency; defaults to read_index.
+    consistency: ?[]const u8 = null,
+};
+
+/// List indexes for an explicit namespace table
+pub const ListNamespaceTableIndexesPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Get index details for an explicit namespace table
+pub const GetNamespaceTableIndexPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+    /// Name of the index
+    index_name: []const u8,
+};
+
+/// Add an index to an explicit namespace table
+pub const CreateNamespaceTableIndexPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+    /// Name of the index
+    index_name: []const u8,
+};
+
+/// Parse the JSON request body for createNamespaceTableIndex.
+pub fn parseCreateNamespaceTableIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.CreateIndexRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.CreateIndexRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Drop an index from an explicit namespace table
+pub const DropNamespaceTableIndexPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+    /// Name of the index
+    index_name: []const u8,
+};
+
+/// Execute a graph metric operational action
+pub const ExecuteNamespaceTableGraphMetricActionPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the graph index
+    index_name: []const u8,
+    /// Name of the configured graph metric
+    metric_name: []const u8,
+    /// Operational action to apply to the graph metric materialization
+    action: []const u8,
+};
+
+/// Query an explicit namespace table
+pub const QueryNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryNamespaceTable.
+pub fn parseQueryNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StatefulQueryRequest) {
+    return std.json.parseFromSlice(types.StatefulQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Rename catalog resource
+pub const RenameNamespaceTablePathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for renameNamespaceTable.
+pub fn parseRenameNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RenameCatalogResourceRequest) {
+    return std.json.parseFromSlice(types.RenameCatalogResourceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Restore an explicit namespace table from backup
+pub const RestoreNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for restoreNamespaceTable.
+pub fn parseRestoreNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RestoreRequest) {
+    return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Set namespace tablespace
+pub const SetNamespaceTableTablespacePathParams = struct {
+    table_name: []const u8,
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// Parse the JSON request body for setNamespaceTableTablespace.
+pub fn parseSetNamespaceTableTablespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CatalogTablespaceBindingRequest) {
+    return std.json.parseFromSlice(types.CatalogTablespaceBindingRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Clear namespace tablespace
+pub const ClearNamespaceTableTablespacePathParams = struct {
+    table_name: []const u8,
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// Set namespace tablespace
+pub const SetNamespaceTablespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// Parse the JSON request body for setNamespaceTablespace.
+pub fn parseSetNamespaceTablespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CatalogTablespaceBindingRequest) {
+    return std.json.parseFromSlice(types.CatalogTablespaceBindingRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Clear namespace tablespace
+pub const ClearNamespaceTablespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// Rename catalog resource
+pub const RenameDatabasePathParams = struct {
+    database_name: []const u8,
+};
+
+/// Parse the JSON request body for renameDatabase.
+pub fn parseRenameDatabaseBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RenameCatalogResourceRequest) {
+    return std.json.parseFromSlice(types.RenameCatalogResourceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Set database tablespace
+pub const SetDatabaseTablespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Parse the JSON request body for setDatabaseTablespace.
+pub fn parseSetDatabaseTablespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CatalogTablespaceBindingRequest) {
+    return std.json.parseFromSlice(types.CatalogTablespaceBindingRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Clear database tablespace
+pub const ClearDatabaseTablespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
 
 /// Parse the JSON request body for evaluate.
 pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_eval_openapi.EvalRequest) {
@@ -302,6 +691,10 @@ pub const ListTablesParams = struct {
     prefix: ?[]const u8 = null,
     /// Filter tables by regex pattern (e.g., "^prod_.*_v[0-9]+$")
     pattern: ?[]const u8 = null,
+    /// Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+    limit: ?[]const u8 = null,
+    /// Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing.
+    cursor: ?[]const u8 = null,
 };
 
 /// Get table details
@@ -661,6 +1054,39 @@ pub fn parsePatchSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std
     return std.json.parseFromSlice(types.TableSchemaPatch, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Get tablespace
+pub const GetTablespacePathParams = struct {
+    /// Tablespace name
+    tablespace_name: []const u8,
+};
+
+/// Create tablespace
+pub const CreateTablespacePathParams = struct {
+    /// Tablespace name
+    tablespace_name: []const u8,
+};
+
+/// Parse the JSON request body for createTablespace.
+pub fn parseCreateTablespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CreateTablespaceRequest) {
+    return std.json.parseFromSlice(types.CreateTablespaceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Drop tablespace
+pub const DropTablespacePathParams = struct {
+    /// Tablespace name
+    tablespace_name: []const u8,
+};
+
+/// Rename catalog resource
+pub const RenameTablespacePathParams = struct {
+    tablespace_name: []const u8,
+};
+
+/// Parse the JSON request body for renameTablespace.
+pub fn parseRenameTablespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RenameCatalogResourceRequest) {
+    return std.json.parseFromSlice(types.RenameCatalogResourceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for beginTransaction.
 pub fn parseBeginTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionBeginRequest) {
     return std.json.parseFromSlice(types.TransactionBeginRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -790,6 +1216,36 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/connections", .operation_id = "listConnections", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/connections/{connection_id}/inference/{operation}", .operation_id = "invokeInferenceConnection", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "GET", .path = "/databases", .operation_id = "listDatabases", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}", .operation_id = "getDatabase", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}", .operation_id = "createDatabase", .request_body = .none, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}", .operation_id = "dropDatabase", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces", .operation_id = "listNamespaces", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}", .operation_id = "createNamespace", .request_body = .none, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}", .operation_id = "dropNamespace", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/rename", .operation_id = "renameNamespace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables", .operation_id = "listNamespaceTables", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "getNamespaceTable", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "createNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "dropNamespaceTable", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup", .operation_id = "backupNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch", .operation_id = "batchNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}", .operation_id = "lookupNamespaceTableDocument", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes", .operation_id = "listNamespaceTableIndexes", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "getNamespaceTableIndex", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "dropNamespaceTableIndex", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeNamespaceTableGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename", .operation_id = "renameNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore", .operation_id = "restoreNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "setNamespaceTableTablespace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "clearNamespaceTableTablespace", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tablespace", .operation_id = "setNamespaceTablespace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tablespace", .operation_id = "clearNamespaceTablespace", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/rename", .operation_id = "renameDatabase", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "PUT", .path = "/databases/{databaseName}/tablespace", .operation_id = "setDatabaseTablespace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/tablespace", .operation_id = "clearDatabaseTablespace", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore", .request_body = .buffered, .streaming_response = false },
@@ -836,6 +1292,11 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/tables/{tableName}/schema", .operation_id = "patchSchema", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tablespaces", .operation_id = "listTablespaces", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tablespaces/{tablespaceName}", .operation_id = "getTablespace", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tablespaces/{tablespaceName}", .operation_id = "createTablespace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tablespaces/{tablespaceName}", .operation_id = "dropTablespace", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tablespaces/{tablespaceName}/rename", .operation_id = "renameTablespace", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions", .request_body = .none, .streaming_response = false },
@@ -858,9 +1319,9 @@ pub const routes = [_]Route{
 //   fn getCurrentUser(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listAuthSubjects(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listSubjectRowFilters(self: *Impl, ctx: *httpx.Context, subject: []const u8) !httpx.Response
-//   fn getSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
-//   fn setSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
-//   fn removeSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
+//   fn getSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8, params: GetSubjectRowFilterParams) !httpx.Response
+//   fn setSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8, params: SetSubjectRowFilterParams) !httpx.Response
+//   fn removeSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8, params: RemoveSubjectRowFilterParams) !httpx.Response
 //   fn listUsers(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getUserByName(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
 //   fn createUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
@@ -876,15 +1337,45 @@ pub const routes = [_]Route{
 //   fn addRoleToUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
 //   fn removeRoleFromUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8, params: RemoveRoleFromUserParams) !httpx.Response
 //   fn listRowFilters(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn getRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
-//   fn setRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
-//   fn removeRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
+//   fn getRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8, params: GetRowFilterParams) !httpx.Response
+//   fn setRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8, params: SetRowFilterParams) !httpx.Response
+//   fn removeRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8, params: RemoveRowFilterParams) !httpx.Response
 //   fn backup(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listBackups(self: *Impl, ctx: *httpx.Context, params: ListBackupsParams) !httpx.Response
 //   fn multiBatchWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getCluster(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listConnections(self: *Impl, ctx: *httpx.Context, params: ListConnectionsParams) !httpx.Response
 //   fn invokeInferenceConnection(self: *Impl, ctx: *httpx.Context, connection_id: []const u8, operation: []const u8) !httpx.Response
+//   fn listDatabases(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn createDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn dropDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn listNamespaces(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn createNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn dropNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn renameNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn listNamespaceTables(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, params: ListNamespaceTablesParams) !httpx.Response
+//   fn getNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn createNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn dropNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn backupNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn batchNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn lookupNamespaceTableDocument(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !httpx.Response
+//   fn listNamespaceTableIndexes(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn getNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn dropNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn executeNamespaceTableGraphMetricAction(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn renameNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn restoreNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn setNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn clearNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn setNamespaceTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn clearNamespaceTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn renameDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn setDatabaseTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn clearDatabaseTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
@@ -931,6 +1422,11 @@ pub const routes = [_]Route{
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listTablespaces(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
+//   fn createTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
+//   fn dropTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
+//   fn renameTablespace(self: *Impl, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response
 //   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response

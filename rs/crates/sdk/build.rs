@@ -10,10 +10,11 @@ fn main() {
         serde_yaml::from_str(&yaml).expect("failed to parse OpenAPI spec");
 
     // Progenitor doesn't support multiple media types per operation or
-    // heterogeneous error response schemas. Preprocess the spec to fix both.
+    // heterogeneous response schemas. Adapt the generator input below.
     strip_non_json_media_types(&mut spec);
     unify_error_response_schemas(&mut spec);
     normalize_mutation_success_transport(&mut spec);
+    unify_success_response_schemas(&mut spec);
     mark_openapi_code_fences_as_text(&mut spec);
 
     let openapi: openapiv3::OpenAPI =
@@ -44,7 +45,16 @@ fn normalize_mutation_success_transport(spec: &mut serde_yaml::Value) {
             let Some(id) = operation.get("operationId").and_then(|id| id.as_str()) else {
                 continue;
             };
-            if !["createTable", "dropTable", "updateSchema", "patchSchema"].contains(&id) {
+            if ![
+                "createTable",
+                "dropTable",
+                "updateSchema",
+                "patchSchema",
+                "createNamespaceTable",
+                "dropNamespaceTable",
+            ]
+            .contains(&id)
+            {
                 continue;
             }
             for (status, response) in operation["responses"].as_mapping_mut().unwrap() {
@@ -64,6 +74,8 @@ fn inject_mutation_success_decoding(code: &mut String) {
         "drop_table",
         "update_schema",
         "patch_schema",
+        "create_namespace_table",
+        "drop_namespace_table",
     ] {
         let anchor = format!("    pub async fn {method}<'a>(");
         let start = code.find(&anchor).expect("mutation method must exist");
@@ -79,8 +91,10 @@ fn inject_mutation_success_decoding(code: &mut String) {
                 .count(),
             2
         );
-        let (typ, empty) = if method == "drop_table" {
+        let (typ, empty) = if method == "drop_table" || method == "drop_namespace_table" {
             ("()", "Some(())")
+        } else if method == "create_namespace_table" {
+            ("types::TableStatus", "None")
         } else {
             ("types::Table", "None")
         };
@@ -315,5 +329,87 @@ fn strip_content_map(node: Option<&mut serde_yaml::Value>, keep: &serde_yaml::Va
         node.as_mapping_mut()
             .unwrap()
             .remove(&serde_yaml::Value::String("content".into()));
+    }
+}
+
+/// Preserve heterogeneous JSON success bodies as a typed union. Progenitor
+/// requires one body type per operation, but its ResponseValue still retains
+/// the actual HTTP status. This adapter changes only Rust's generator input.
+fn unify_success_response_schemas(spec: &mut serde_yaml::Value) {
+    use serde_yaml::{Mapping, Value};
+    let mut unions = Vec::new();
+    for methods in spec["paths"].as_mapping_mut().expect("paths").values_mut() {
+        let Some(methods) = methods.as_mapping_mut() else {
+            continue;
+        };
+        for operation in methods.values_mut() {
+            let Some(id) = operation.get("operationId").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut chars = id.chars();
+            let name = format!(
+                "{}{}Success",
+                chars.next().unwrap().to_uppercase(),
+                chars.as_str()
+            );
+            let Some(responses) = operation
+                .get_mut("responses")
+                .and_then(Value::as_mapping_mut)
+            else {
+                continue;
+            };
+            let is_success = |code: &Value| match code {
+                Value::String(s) => s.starts_with('2'),
+                Value::Number(n) => n.as_u64().is_some_and(|n| (200..300).contains(&n)),
+                _ => false,
+            };
+            let mut variants = Vec::new();
+            for (code, response) in responses.iter() {
+                if !is_success(code) {
+                    continue;
+                }
+                if let Some(schema) = response
+                    .get("content")
+                    .and_then(|v| v.get("application/json"))
+                    .and_then(|v| v.get("schema"))
+                {
+                    if !variants.contains(schema) {
+                        variants.push(schema.clone());
+                    }
+                }
+            }
+            if variants.len() < 2 {
+                continue;
+            }
+            let mut union = Mapping::new();
+            union.insert(Value::String("oneOf".into()), Value::Sequence(variants));
+            unions.push((Value::String(name.clone()), Value::Mapping(union)));
+            for (code, response) in responses.iter_mut() {
+                if !is_success(code) {
+                    continue;
+                }
+                let schema = response
+                    .get_mut("content")
+                    .and_then(|v| v.get_mut("application/json"))
+                    .and_then(|v| v.get_mut("schema"))
+                    .expect("heterogeneous success responses must all have JSON bodies");
+                let mut reference = Mapping::new();
+                reference.insert(
+                    Value::String("$ref".into()),
+                    Value::String(format!("#/components/schemas/{name}")),
+                );
+                *schema = Value::Mapping(reference);
+            }
+        }
+    }
+    let schemas = spec["components"]["schemas"]
+        .as_mapping_mut()
+        .expect("schemas");
+    for (name, union) in unions {
+        assert!(
+            !schemas.contains_key(&name),
+            "generated success union collides with a public schema"
+        );
+        schemas.insert(name, union);
     }
 }

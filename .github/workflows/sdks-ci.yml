@@ -172,7 +172,9 @@ jobs:
         run: scripts/ci/check.sh release
 
       - name: Upload canonical Antfarm bundle
-        if: steps.scopes.outputs.antfarm_e2e == 'true'
+        # Preserve the Linux build when the checked-in bundle is stale, so it
+        # can be inspected and updated without reproducing CI on another OS.
+        if: always() && steps.scopes.outputs.antfarm_e2e == 'true' && hashFiles('ts/apps/antfarm/dist/index.html') != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: antfarm-linux-node-${{ github.sha }}

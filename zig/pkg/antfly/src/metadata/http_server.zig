@@ -13,6 +13,9 @@
 // limitations.
 
 const std = @import("std");
+const store_report_update = @import("store_report_update.zig");
+const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog_operations = @import("../system_catalog/operations.zig");
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const group_ids = @import("../common/group_ids.zig");
@@ -85,11 +88,22 @@ pub const ReplaceTableDefinitionRequest = struct {
 
 pub const ReseedExactCutoverResult = table_operations.ReseedExactCutoverResult;
 
+fn systemCatalogServiceCall(comptime Service: type) *const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, system_catalog.Call) anyerror![]u8 {
+    return struct {
+        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: system_catalog.Call) ![]u8 {
+            const svc: *Service = @ptrCast(@alignCast(ptr));
+            return system_catalog_operations.call(svc, alloc, context, input);
+        }
+    }.call;
+}
+
 pub const AdminSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: system_catalog.Call) anyerror![]u8 = null,
+
         head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
         linearizable_head: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.AdminSnapshot = null,
@@ -146,6 +160,7 @@ pub const AdminSource = struct {
         cancel_node_shutdown: ?*const fn (ptr: *anyopaque, node_id: u64) anyerror!void = null,
         finalize_node_shutdown: ?*const fn (ptr: *anyopaque, node_id: u64) anyerror!void = null,
         upsert_store: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord) anyerror!void = null,
+        report_store_update: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, bytes: []const u8) anyerror!store_report_update.Cursor = null,
         report_store_status: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) anyerror!void = null,
         upsert_schema_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) anyerror!void = null,
         upsert_restore_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.RestoreProgressRecord) anyerror!void = null,
@@ -487,6 +502,7 @@ pub const AdminSource = struct {
         return .{
             .ptr = svc,
             .vtable = &.{
+                .system_catalog = comptime systemCatalogServiceCall(service.MetadataService),
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
                 .linearizable_snapshot = metadataServiceLinearizableSnapshot,
@@ -547,6 +563,7 @@ pub const AdminSource = struct {
         return .{
             .ptr = svc,
             .vtable = &.{
+                .system_catalog = comptime systemCatalogServiceCall(service.MetadataHttpService),
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
@@ -584,6 +601,7 @@ pub const AdminSource = struct {
                 .finalize_node_shutdown = metadataHttpServiceFinalizeNodeShutdown,
                 .upsert_store = metadataHttpServiceUpsertStore,
                 .report_store_status = metadataHttpServiceReportStoreStatus,
+                .report_store_update = metadataHttpServiceReportStoreUpdate,
                 .upsert_schema_progress = metadataHttpServiceUpsertSchemaProgress,
                 .upsert_restore_progress = metadataHttpServiceUpsertRestoreProgress,
                 .remove_restore_progress = metadataHttpServiceRemoveRestoreProgress,
@@ -1387,6 +1405,11 @@ pub const AdminSource = struct {
         try flushMetadataHttpServiceMutation(svc);
     }
 
+    fn metadataHttpServiceReportStoreUpdate(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, bytes: []const u8) !store_report_update.Cursor {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return svc.reportStoreUpdate(alloc, context, bytes);
+    }
+
     fn metadataHttpServiceReportStoreStatus(ptr: *anyopaque, alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         defer freeStoreStatusReport(alloc, report);
@@ -1645,6 +1668,9 @@ pub const MetadataHttpServer = struct {
         const node_path = routes.Routes.internal_nodes_prefix ++ ":node_id";
         try server.delete(node_path, httpx.Handler.bind(self, metadataFinalizeNodeShutdown));
         try server.post(node_path ++ routes.Routes.internal_node_status_suffix, httpx.Handler.bind(self, metadataReportNodeStatus));
+        try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/heartbeat", httpx.Handler.bind(self, metadataReportNodeHeartbeat));
+        try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/update", httpx.Handler.bind(self, metadataReportNodeUpdate));
+        try server.post("/internal/v1/system-catalog", httpx.Handler.bind(self, metadataSystemCatalog));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_catalog_group_retirement_check, httpx.Handler.bind(self, metadataCatalogGroupRetirementCheck));
@@ -1692,6 +1718,45 @@ pub const MetadataHttpServer = struct {
         try server.post(table_path ++ routes.Routes.internal_table_replication_sources_infix ++ ":source_ordinal" ++ routes.Routes.internal_table_reseed_exact_cutover_suffix, httpx.Handler.bind(self, metadataReseedReplicationSourceExactCutover));
         try server.post(table_path ++ routes.Routes.internal_split_suffix, httpx.Handler.bind(self, metadataRequestTableSplit));
         try server.post(table_path ++ routes.Routes.internal_merge_suffix, httpx.Handler.bind(self, metadataRequestTableMerge));
+    }
+
+    fn metadataSystemCatalog(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
+        const body = (try ctx.body()) orelse return ctx.status(400).text("missing body");
+        if (body.len > system_catalog.max_command_bytes) return ctx.status(413).text("catalog request too large");
+        var parsed = std.json.parseFromSlice(system_catalog.Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
+        defer parsed.deinit();
+        const forwarding = (raft_mutation_forwarding.parseValues(
+            ctx.header(routes.Routes.raft_mutation_remaining_ms_header),
+            ctx.header(routes.Routes.raft_mutation_forwards_remaining_header),
+            ctx.header(routes.Routes.raft_mutation_campaign_allowed_header),
+            .{ .max_remaining_ms = raft_mutation_forwarding.max_remaining_ms, .max_forwards = raft_mutation_forwarding.max_forwards },
+        ) catch return ctx.status(400).text("invalid forwarding context")) orelse return ctx.status(400).text("missing forwarding context");
+        var context = requestContext(ctx);
+        context.deadline_ns = platform_time.monotonicNs() +| @as(u64, forwarding.remaining_ms) * std.time.ns_per_ms;
+        const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
+        const read_identity = if (parsed.value != .mutate) try self.source.vtable.status(self.source.ptr) else null;
+        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
+        const response = callback(self.source.ptr, ctx.allocator, context, parsed.value) catch |err| {
+            if (err == error.MetadataMutationOutcomeUnknown) try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
+            return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err));
+        };
+        defer ctx.allocator.free(response);
+        if (read_identity) |before| {
+            const after = try self.source.vtable.status(self.source.ptr);
+            if (before.metadata_group_id != after.metadata_group_id or !std.meta.eql(before.metadata_incarnation, after.metadata_incarnation))
+                return ctx.status(503).text("metadata identity changed during catalog read");
+            const incarnation = after.metadata_incarnation orelse return ctx.status(503).text("metadata incarnation unavailable");
+            // Header insertion owns its copy; avoid leaking temporary values
+            // when the HTTP context uses a general-purpose allocator.
+            var group_buf: [20]u8 = undefined;
+            try ctx.setHeader("x-antfly-catalog-metadata-group", try std.fmt.bufPrint(&group_buf, "{d}", .{after.metadata_group_id}));
+            try ctx.setHeader("x-antfly-catalog-metadata-incarnation", &incarnation);
+        }
+        try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_committed);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(response);
+        return ctx.response.build();
     }
 
     fn requestContext(ctx: *httpx.Context) operation.RequestContext {
@@ -2578,8 +2643,9 @@ pub const MetadataHttpServer = struct {
 
     fn nodeMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
-            error.InvalidArgument, error.StoreIdentityMismatch => ctx.status(400).text("invalid node request"),
+            error.InvalidArgument, error.StoreIdentityMismatch, error.InvalidStoreReporterFence, error.InvalidNodeID => ctx.status(400).text("invalid node request"),
             error.NodeNotFound, error.UnknownStore => ctx.status(404).text("node not found"),
+            error.StoreReportBaseMismatch => ctx.status(409).text("store report generation changed; send a full report"),
             error.ActiveNodeFinalizeRejected => ctx.status(409).text("node is not ready to finalize"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             else => metadataReadError(ctx, err),
@@ -2625,6 +2691,29 @@ pub const MetadataHttpServer = struct {
             return ctx.status(400).text("invalid node status request");
         var owned = node_operations.StatusReport{ .value = report };
         defer owned.deinit(ctx.allocator);
+        self.nodeOperations().reportStatus(ctx.allocator, requestContext(ctx), &owned) catch |err| return nodeMutationError(ctx, err);
+        try ctx.setHeader(metadata_table_manager.store_runtime_reference_header, "1");
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataReportNodeUpdate(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
+        const body = (try ctx.body()) orelse return ctx.status(400).text("missing report update");
+        var parsed = std.json.parseFromSlice(store_report_update.Update, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid report update");
+        defer parsed.deinit();
+        if (parsed.value.report.store_id != node_id) return ctx.status(400).text("store identity mismatch");
+        const apply = self.source.vtable.report_store_update orelse return ctx.status(404).text("unsupported");
+        const cursor = apply(self.source.ptr, ctx.allocator, requestContext(ctx), body) catch |err| return nodeMutationError(ctx, err);
+        return ctx.status(200).json(cursor);
+    }
+
+    fn metadataReportNodeHeartbeat(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
+        var report = parseNodeStatusReport(ctx.allocator, (try ctx.body()) orelse "", node_id) catch return ctx.status(400).text("invalid node heartbeat");
+        report.runtime_reference = true;
+        var owned = node_operations.StatusReport{ .value = report };
+        defer owned.deinit(ctx.allocator);
+        if (report.runtime_statuses.len != 0 or report.reporter_incarnation == 0) return ctx.status(400).text("invalid runtime reference");
         self.nodeOperations().reportStatus(ctx.allocator, requestContext(ctx), &owned) catch |err| return nodeMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }
@@ -2825,8 +2914,13 @@ pub const MetadataHttpServer = struct {
         defer forwarded.deinit();
         if (forwarded.value.protocol_version != routes.Routes.table_mutation_protocol_version)
             return ctx.status(426).text("unsupported table mutation protocol");
-        tables_api.validateTableMutationName(forwarded.value.table_name) catch
-            return ctx.status(400).text("invalid table name");
+        if (forwarded.value.kind == .drop_table) {
+            tables_api.validateInternalTableMutationName(forwarded.value.table_name) catch
+                return ctx.status(400).text("invalid table name");
+        } else {
+            tables_api.validateTableMutationName(forwarded.value.table_name) catch
+                return ctx.status(400).text("invalid table name");
+        }
         var create_request: ?tables_api.CreateTableRequest = null;
         defer if (create_request) |*request| request.deinit(ctx.allocator);
         switch (forwarded.value.kind) {
@@ -3373,7 +3467,8 @@ fn loadRestoreMetadataSpec(
     try backups_api.validateTableManifest(alloc, manifest, manifest.backup_id);
     if (manifest.artifact_integrity_mode != .declared)
         return error.BackupIntegrityMissing;
-    if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+    if (!std.mem.eql(u8, manifest.table_name, table_name) and
+        !(system_catalog.isRestoreTarget(table_name) catch false)) return error.InvalidBackupRequest;
     const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest) catch {
         return error.InvalidBackupRequest;
     };

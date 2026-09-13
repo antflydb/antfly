@@ -1931,12 +1931,33 @@ pub const ApiKey = struct {
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
     permissions: OpenApiOptionalNullable([]const Permission) = .absent,
+    scoped_row_filters: ?[]const ScopedRowFilter = null,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// When the API key was created.
     created_at: []const u8,
     /// When the API key expires. Null means never.
     expires_at: OpenApiOptionalNullable([]const u8) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key_id", "key_id", false },
+        .{ "name", "name", false },
+        .{ "username", "username", false },
+        .{ "permissions", "permissions", false },
+        .{ "scoped_row_filters", "scoped_row_filters", true },
+        .{ "row_filter", "row_filter", false },
+        .{ "created_at", "created_at", false },
+        .{ "expires_at", "expires_at", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -1956,6 +1977,10 @@ pub const ApiKey = struct {
                 try jw.objectField("permissions");
                 try jw.write(value);
             },
+        }
+        if (self.scoped_row_filters) |value| {
+            try jw.objectField("scoped_row_filters");
+            try jw.write(value);
         }
         switch (self.row_filter) {
             .absent => {},
@@ -1995,6 +2020,7 @@ pub const ApiKeyWithSecret = struct {
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
     permissions: OpenApiOptionalNullable([]const Permission) = .absent,
+    scoped_row_filters: ?[]const ScopedRowFilter = null,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// When the API key was created.
@@ -2005,6 +2031,28 @@ pub const ApiKeyWithSecret = struct {
     key_secret: []const u8,
     /// Pre-encoded credential ready for the Authorization header: base64(key_id:key_secret).
     encoded: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key_id", "key_id", false },
+        .{ "name", "name", false },
+        .{ "username", "username", false },
+        .{ "permissions", "permissions", false },
+        .{ "scoped_row_filters", "scoped_row_filters", true },
+        .{ "row_filter", "row_filter", false },
+        .{ "created_at", "created_at", false },
+        .{ "expires_at", "expires_at", false },
+        .{ "key_secret", "key_secret", false },
+        .{ "encoded", "encoded", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -2024,6 +2072,10 @@ pub const ApiKeyWithSecret = struct {
                 try jw.objectField("permissions");
                 try jw.write(value);
             },
+        }
+        if (self.scoped_row_filters) |value| {
+            try jw.objectField("scoped_row_filters");
+            try jw.write(value);
         }
         switch (self.row_filter) {
             .absent => {},
@@ -3044,6 +3096,92 @@ pub const CardinalityMode = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// The mutation committed. Read the resource to observe it; do not replay the mutation to obtain its representation.
+pub const CatalogMutationVisibilityPending = struct {
+    status: []const u8,
+};
+
+/// A table or all tables in an explicit namespace. A missing table selects the namespace; a table named '*' remains literal.
+pub const CatalogTableScope = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    table: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "database", "database", true },
+        .{ "namespace", "namespace", true },
+        .{ "table", "table", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.database) |value| {
+            try jw.objectField("database");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// An explicit native table target. Components are literal names; dots do not qualify a string table name.
+pub const CatalogTableTarget = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    table: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "database", "database", true },
+        .{ "namespace", "namespace", true },
+        .{ "table", "table", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.database) |value| {
+            try jw.objectField("database");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.endObject();
+    }
+};
+
+pub const CatalogTablespaceBindingRequest = struct {
+    /// Existing tablespace name to bind to the catalog object.
+    tablespace_name: []const u8,
 };
 
 pub const CdcConnection = struct {
@@ -4974,6 +5112,7 @@ pub const CreateApiKeyRequest = struct {
     expires_in: ?[]const u8 = null,
     /// Optional permission scoping. Each permission must be a subset of the creator's permissions.
     permissions: OpenApiOptionalNullable([]const Permission) = .absent,
+    scoped_row_filters: ?[]const ScopedRowFilter = null,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
 
@@ -4982,6 +5121,7 @@ pub const CreateApiKeyRequest = struct {
         .{ "name", "name", false },
         .{ "expires_in", "expires_in", true },
         .{ "permissions", "permissions", false },
+        .{ "scoped_row_filters", "scoped_row_filters", true },
         .{ "row_filter", "row_filter", false },
     };
 
@@ -5011,6 +5151,10 @@ pub const CreateApiKeyRequest = struct {
                 try jw.objectField("permissions");
                 try jw.write(value);
             },
+        }
+        if (self.scoped_row_filters) |value| {
+            try jw.objectField("scoped_row_filters");
+            try jw.write(value);
         }
         switch (self.row_filter) {
             .absent => {},
@@ -5507,6 +5651,8 @@ pub const CreateIndexRequest = union(enum) {
 };
 
 pub const CreateTableRequest = struct {
+    /// Explicit tablespace policy for the new table, overriding namespace and database defaults.
+    tablespace_name: ?[]const u8 = null,
     storage: ?TableStorageSettings = null,
     /// Number of shards to create for the table. Data is partitioned across shards based on key ranges. **Sizing Guidelines:** - Small datasets (<100K docs): 1-3 shards - Medium datasets (100K-1M docs): 3-10 shards - Large datasets (>1M docs): 10+ shards More shards enable better parallelism but increase overhead. Choose based on expected data size and query patterns. **When to Add More Shards:** Antfly supports **online shard reallocation** without downtime. Add more shards when: - Individual shards exceed size thresholds (configurable) - Query latency increases due to large shard size - Need better parallelism for write-heavy workloads Use the internal `/reallocate` endpoint to trigger automatic shard splitting: ```bash POST /internal/v1/reallocate ``` This enqueues a reallocation request that the leader processes asynchronously, splitting large shards and redistributing data without service interruption. **Advantages over Elasticsearch:** - Automatic shard splitting (no manual reindexing required) - Online operation (no downtime) - Transparent to applications (keys remain accessible during reallocation)
     num_shards: ?i64 = null,
@@ -5521,6 +5667,7 @@ pub const CreateTableRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "tablespace_name", "tablespace_name", true },
         .{ "storage", "storage", true },
         .{ "num_shards", "num_shards", true },
         .{ "description", "description", true },
@@ -5539,6 +5686,10 @@ pub const CreateTableRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.tablespace_name) |value| {
+            try jw.objectField("tablespace_name");
+            try jw.write(value);
+        }
         if (self.storage) |value| {
             try jw.objectField("storage");
             try jw.write(value);
@@ -5561,6 +5712,41 @@ pub const CreateTableRequest = struct {
         }
         if (self.replication_sources) |value| {
             try jw.objectField("replication_sources");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Tablespace creation request. Placement policy is validated and applied when new tables are created.
+pub const CreateTablespaceRequest = struct {
+    /// JSON-encoded location descriptor. Defaults to `null`.
+    location_json: ?[]const u8 = null,
+    /// JSON-encoded placement policy. Supported fields are placement_role, desired_replica_count, and min_ranges. Location is metadata, never a filesystem override.
+    placement_policy_json: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "location_json", "location_json", true },
+        .{ "placement_policy_json", "placement_policy_json", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.location_json) |value| {
+            try jw.objectField("location_json");
+            try jw.write(value);
+        }
+        if (self.placement_policy_json) |value| {
+            try jw.objectField("placement_policy_json");
             try jw.write(value);
         }
         try jw.endObject();
@@ -6873,6 +7059,40 @@ pub const DataShapeKind = enum {
             .{ "tool_schema", .tool_schema },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Database catalog object. Tables and namespaces resolve under a database before authorization and routing.
+pub const DatabaseCatalogRecord = struct {
+    /// Stable database catalog identifier.
+    database_id: i64,
+    /// Database name.
+    name: []const u8,
+    /// JSON-encoded database settings owned by the catalog.
+    settings_json: []const u8,
+    /// Optional durable tablespace binding inherited by new namespace/table placement policy.
+    tablespace_name: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("database_id");
+        try jw.write(self.database_id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("settings_json");
+        try jw.write(self.settings_json);
+        switch (self.tablespace_name) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("tablespace_name");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("tablespace_name");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
     }
 };
 
@@ -12915,7 +13135,8 @@ pub const GeoShapeQuery = struct {
 
 /// A stateful global query. The target table is required on this route.
 pub const GlobalStatefulQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -12990,6 +13211,7 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", false },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -13039,6 +13261,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         try jw.objectField("table");
         try jw.write(self.table);
         if (self.query) |value| {
@@ -22567,8 +22793,9 @@ pub const InstalledExtension = struct {
 
 /// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
 pub const JoinClause = struct {
-    /// Name of the table to join with.
-    right_table: []const u8,
+    right_target: ?CatalogTableTarget = null,
+    /// Literal native table name or declared foreign-source alias. Specify exactly one of right_table or right_target.
+    right_table: ?[]const u8 = null,
     /// Type of join to perform. Defaults to "inner".
     join_type: ?JoinType = null,
     /// Join condition specifying which fields to match.
@@ -22584,7 +22811,8 @@ pub const JoinClause = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "right_table", "right_table", false },
+        .{ "right_target", "right_target", true },
+        .{ "right_table", "right_table", true },
         .{ "join_type", "join_type", true },
         .{ "on", "on", false },
         .{ "right_filters", "right_filters", true },
@@ -22603,8 +22831,14 @@ pub const JoinClause = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("right_table");
-        try jw.write(self.right_table);
+        if (self.right_target) |value| {
+            try jw.objectField("right_target");
+            try jw.write(value);
+        }
+        if (self.right_table) |value| {
+            try jw.objectField("right_table");
+            try jw.write(value);
+        }
         if (self.join_type) |value| {
             try jw.objectField("join_type");
             try jw.write(value);
@@ -24579,6 +24813,44 @@ pub const MultiPhraseQuery = struct {
     }
 };
 
+/// Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces.
+pub const NamespaceCatalogRecord = struct {
+    /// Stable namespace catalog identifier.
+    namespace_id: i64,
+    /// Parent database identifier.
+    database_id: i64,
+    /// Parent database name.
+    database_name: []const u8,
+    /// Namespace name.
+    name: []const u8,
+    /// Optional durable tablespace binding inherited by new table placement policy in this namespace.
+    tablespace_name: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("namespace_id");
+        try jw.write(self.namespace_id);
+        try jw.objectField("database_id");
+        try jw.write(self.database_id);
+        try jw.objectField("database_name");
+        try jw.write(self.database_name);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        switch (self.tablespace_name) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("tablespace_name");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("tablespace_name");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// Filter nodes during graph traversal using existing query primitives
 pub const NodeFilter = struct {
     /// Antfly query to filter nodes (same syntax as search filter_query)
@@ -25591,11 +25863,46 @@ pub const PatternStep = struct {
     }
 };
 
+/// Specify exactly one of a legacy literal resource or a structured table_target; table_target requires resource_type table.
 pub const Permission = struct {
     /// Resource name (e.g., table name, target username, or '*' for all inference operations or a global grant).
-    resource: []const u8,
+    resource: ?[]const u8 = null,
+    table_target: ?CatalogTableScope = null,
     resource_type: ResourceType,
     type: PermissionType,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "resource", "resource", true },
+        .{ "table_target", "table_target", true },
+        .{ "resource_type", "resource_type", false },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.resource) |value| {
+            try jw.objectField("resource");
+            try jw.write(value);
+        }
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
+        try jw.objectField("resource_type");
+        try jw.write(self.resource_type);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Type of permission.
@@ -26789,7 +27096,8 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -26860,6 +27168,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -26907,6 +27216,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);
@@ -27660,6 +27973,11 @@ pub const RegexpQuery = struct {
     }
 };
 
+pub const RenameCatalogResourceRequest = struct {
+    /// New logical name. The durable resource identity remains unchanged.
+    name: []const u8,
+};
+
 /// Bounded request to list table repair issues.
 pub const RepairIssueListRequest = struct {
     /// Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
@@ -28398,6 +28716,9 @@ pub const RerankerProvider = enum {
 /// Type of resource: table, user, inference, or global ('*'). Use inference with resource '*' to grant access to unified inference routes.
 pub const ResourceType = enum {
     table,
+    database,
+    namespace,
+    tablespace,
     user,
     inference,
     @"*",
@@ -28405,6 +28726,9 @@ pub const ResourceType = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .table => "table",
+            .database => "database",
+            .namespace => "namespace",
+            .tablespace => "tablespace",
             .user => "user",
             .inference => "inference",
             .@"*" => "*",
@@ -28419,6 +28743,9 @@ pub const ResourceType = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "table", .table },
+            .{ "database", .database },
+            .{ "namespace", .namespace },
+            .{ "tablespace", .tablespace },
             .{ "user", .user },
             .{ "inference", .inference },
             .{ "*", .@"*" },
@@ -29038,7 +29365,8 @@ pub const RetrievalAgentUsage = struct {
 
 /// A canonical query in the retrieval pipeline with an optional tree search configuration. Each query specifies its own table. Deprecated stateful graph_searches compatibility is intentionally unavailable here. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
 pub const RetrievalQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -29111,6 +29439,7 @@ pub const RetrievalQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -29159,6 +29488,10 @@ pub const RetrievalQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);
@@ -29457,8 +29790,37 @@ pub const RouteType = enum {
 pub const RowFilterEntry = struct {
     /// Table name (or '*' for all tables).
     table: []const u8,
+    table_target: ?CatalogTableScope = null,
     /// Antfly query JSON that documents must match to be visible.
     filter: std.json.ArrayHashMap(std.json.Value),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "table_target", "table_target", true },
+        .{ "filter", "filter", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
+        try jw.objectField("filter");
+        try jw.write(self.filter);
+        try jw.endObject();
+    }
 };
 
 /// Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart.
@@ -29824,6 +30186,11 @@ pub const ScanKeysRequest = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const ScopedRowFilter = struct {
+    table_target: CatalogTableScope,
+    filter: std.json.ArrayHashMap(std.json.Value),
 };
 
 pub const SecretEntry = struct {
@@ -30552,7 +30919,8 @@ pub const StatefulGraphResult = union(enum) {
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -30627,6 +30995,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -30676,6 +31045,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);
@@ -32001,6 +32374,8 @@ pub const TableStatus = struct {
     replication_sources: ?[]const ReplicationSource = null,
     /// Effective runtime field capabilities for this table. Clients can use this to discover concrete field variants and their supported query modes, such as full_text, exact, range, geo, and autocomplete. Public exact field sort is supported only for `_id` or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
     field_capabilities: ?[]const FieldCapability = null,
+    /// Immutable physical table identity, preserved by catalog renames.
+    table_id: ?[]const u8 = null,
     storage_status: StorageStatus,
     /// Table-level generated artifact enrichments registered outside a specific index.
     artifact_enrichments: ?[]const EnrichmentConfig = null,
@@ -32016,6 +32391,7 @@ pub const TableStatus = struct {
         .{ "migration", "migration", true },
         .{ "replication_sources", "replication_sources", true },
         .{ "field_capabilities", "field_capabilities", true },
+        .{ "table_id", "table_id", true },
         .{ "storage_status", "storage_status", false },
         .{ "artifact_enrichments", "artifact_enrichments", true },
     };
@@ -32058,6 +32434,10 @@ pub const TableStatus = struct {
         }
         if (self.field_capabilities) |value| {
             try jw.objectField("field_capabilities");
+            try jw.write(value);
+        }
+        if (self.table_id) |value| {
+            try jw.objectField("table_id");
             try jw.write(value);
         }
         try jw.objectField("storage_status");
@@ -32108,6 +32488,18 @@ pub const TableStorageUnreadableError = struct {
     message: []const u8,
     /// Always false; recovery requires repair, restore, or table replacement.
     retryable: bool,
+};
+
+/// Tablespace catalog object. Placement policy resource with a stable identity. SQL adapters consume this native lifecycle surface.
+pub const TablespaceCatalogRecord = struct {
+    /// Stable tablespace catalog identifier.
+    tablespace_id: i64,
+    /// Tablespace name.
+    name: []const u8,
+    /// JSON-encoded location descriptor. String locations are encoded as JSON strings.
+    location_json: []const u8,
+    /// JSON-encoded placement policy reserved for native placement planning.
+    placement_policy_json: []const u8,
 };
 
 /// Configuration for Tavily AI Search API. Tavily is optimized for RAG and AI applications, providing pre-processed results with summaries and relevance scoring. **Setup:** 1. Sign up at https://tavily.com 2. Get API key from dashboard **Docs:** https://docs.tavily.com

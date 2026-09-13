@@ -1,0 +1,1568 @@
+{
+  "date": "2026-09-11",
+  "sources": {
+    "baseline": "f393d9cdabeb79a9495ca13c647ace44add59adc",
+    "normalized_reports": "c4fe1e215015320c34ea9749446c34537c87f838",
+    "standalone_cache": "74652fe14",
+    "final_production": "13829ab832f5d023e1256e2aa8c50892f01c20d2",
+    "main": "c3bc001353fae2791c5feba6b430240bdf35885a"
+  },
+  "method": {
+    "live": "Debug builds; ten samples, three warmups; macOS ARM64 shared host; sequential runs without this task's builds/tests overlapping measurement",
+    "report_component": "ReleaseFast; c_allocator; seven samples; INNER PROJECTION transaction only. Omits outer committed-apply command decoding and full-batch watermark WAL write, as well as wire encode, Raft replication and network.",
+    "heartbeat_component": "ReleaseFast; page_allocator; seven samples; binary encoding only, no HTTP driver"
+  },
+  "limitations": [
+    "Correction: metadata_report_component wal_bytes_per_apply and apply_p50_ms measure only the inner projection, not full production local apply. See the checkpoint follow-up for matched complete-apply measurements.",
+    "Host load is uncontrolled. These are development measurements, not production capacity claims.",
+    "Cached heartbeats change the compact header in every measured apply. Full StoreRecord command wire bytes remain unchanged.",
+    "Full report reads reconstruct all observations; selected reads use a page directory. Pages bound group count, not arbitrary report byte size.",
+    "Rate-capped clients are closed loop; target rate is not guaranteed delivered traffic.",
+    "The initial one-row-per-group layout regressed full-store reads. Stable 64-group pages replaced it before final validation.",
+    "Sparse payload/clock changes rewrite compact membership plus affected pages; structural hashing remains proportional to incoming reports."
+  ],
+  "metadata_report_component": {
+    "baseline": [
+      {
+        "groups": 100,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 1.026,
+        "wal_bytes_per_apply": 81539,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 2.548,
+        "wal_bytes_per_apply": 179539,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 1.033,
+        "wal_bytes_per_apply": 82519,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 2.432,
+        "wal_bytes_per_apply": 179539,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "full_store_read_p50_ms": 0.048
+      },
+      {
+        "groups": 1000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 9.875,
+        "wal_bytes_per_apply": 812339,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 13.104,
+        "wal_bytes_per_apply": 1792439,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 9.222,
+        "wal_bytes_per_apply": 813319,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 13.628,
+        "wal_bytes_per_apply": 1792439,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "full_store_read_p50_ms": 0.256
+      },
+      {
+        "groups": 10000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 95.25,
+        "wal_bytes_per_apply": 8120339,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 118.539,
+        "wal_bytes_per_apply": 17929539,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 93.266,
+        "wal_bytes_per_apply": 8121319,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 118.055,
+        "wal_bytes_per_apply": 17929539,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "full_store_read_p50_ms": 2.618
+      }
+    ],
+    "final": [
+      {
+        "groups": 100,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 0.206,
+        "wal_bytes_per_apply": 184,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 0.189,
+        "wal_bytes_per_apply": 11040,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 0.198,
+        "wal_bytes_per_apply": 66643,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 0.246,
+        "wal_bytes_per_apply": 99744,
+        "full_record_bytes": 81291
+      },
+      {
+        "groups": 100,
+        "full_store_read_p50_ms": 0.04
+      },
+      {
+        "groups": 1000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 0.836,
+        "wal_bytes_per_apply": 184,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 0.947,
+        "wal_bytes_per_apply": 105720,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 0.938,
+        "wal_bytes_per_apply": 138643,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 1.672,
+        "wal_bytes_per_apply": 992752,
+        "full_record_bytes": 812091
+      },
+      {
+        "groups": 1000,
+        "full_store_read_p50_ms": 0.307
+      },
+      {
+        "groups": 10000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 9.086,
+        "wal_bytes_per_apply": 184,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 15.447,
+        "wal_bytes_per_apply": 1053249,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 8.884,
+        "wal_bytes_per_apply": 858643,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 29.195,
+        "wal_bytes_per_apply": 9923563,
+        "full_record_bytes": 8120091
+      },
+      {
+        "groups": 10000,
+        "full_store_read_p50_ms": 3.639
+      }
+    ]
+  },
+  "heartbeat_framing": [
+    {
+      "groups": 100,
+      "max_groups_per_frame": 1,
+      "frames": 100,
+      "encoded_bytes": 10600,
+      "encode_p50_ms": 0.228
+    },
+    {
+      "groups": 100,
+      "max_groups_per_frame": 64,
+      "frames": 2,
+      "encoded_bytes": 8836,
+      "encode_p50_ms": 0.004
+    },
+    {
+      "groups": 100,
+      "max_groups_per_frame": 256,
+      "frames": 1,
+      "encoded_bytes": 8818,
+      "encode_p50_ms": 0.003
+    },
+    {
+      "groups": 1000,
+      "max_groups_per_frame": 1,
+      "frames": 1000,
+      "encoded_bytes": 106000,
+      "encode_p50_ms": 2.003
+    },
+    {
+      "groups": 1000,
+      "max_groups_per_frame": 64,
+      "frames": 16,
+      "encoded_bytes": 88288,
+      "encode_p50_ms": 0.046
+    },
+    {
+      "groups": 1000,
+      "max_groups_per_frame": 256,
+      "frames": 4,
+      "encoded_bytes": 88072,
+      "encode_p50_ms": 0.02
+    },
+    {
+      "groups": 10000,
+      "max_groups_per_frame": 1,
+      "frames": 10000,
+      "encoded_bytes": 1060000,
+      "encode_p50_ms": 20.817
+    },
+    {
+      "groups": 10000,
+      "max_groups_per_frame": 64,
+      "frames": 157,
+      "encoded_bytes": 882826,
+      "encode_p50_ms": 0.441
+    },
+    {
+      "groups": 10000,
+      "max_groups_per_frame": 256,
+      "frames": 40,
+      "encoded_bytes": 880720,
+      "encode_p50_ms": 0.2
+    }
+  ],
+  "live_runs": {
+    "baseline-scale": {
+      "stage": "baseline",
+      "observations": {
+        "binary": "/private/tmp/antfly-catalog-round7-baseline",
+        "binary_sha256": "da72be79c6565d2cf8772595502a04b6a8ea289df83fe6376f97a1a764d1f3a4",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "binary": "/private/tmp/antfly-catalog-round7-baseline",
+          "scenario": "listing",
+          "deployment": "standalone",
+          "restart_after_ddl": false,
+          "listing_distinct_schemas": false,
+          "listing_page_size": 25,
+          "listing_concurrent": false,
+          "table_counts": [
+            100,
+            1000
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 0,
+          "tenant_counts": [
+            10,
+            100
+          ],
+          "entity_shards": 1,
+          "entity_key_layout": "clustered",
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 3,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115,
+          "output": "/private/tmp/catalog-round7-baseline-scale.json"
+        },
+        "scenarios": {
+          "listing": {
+            "deployment": "standalone",
+            "startup_ms": 542.8649173118174,
+            "checkpoints": [
+              {
+                "unrelated_tables": 100,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.0954795000000002,
+                  "p95_ms": 1.151584,
+                  "max_ms": 1.151584
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 1.1362079999999999,
+                  "p95_ms": 1.330833,
+                  "max_ms": 1.330833
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 12.071667,
+                  "p95_ms": 12.709459,
+                  "max_ms": 12.709459
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 0.6897495,
+                  "p95_ms": 0.765333,
+                  "max_ms": 0.765333
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 0.9263745,
+                  "p95_ms": 1.015125,
+                  "max_ms": 1.015125
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 3.8849165,
+                  "p95_ms": 3.981708,
+                  "max_ms": 3.981708
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 16.7497915,
+                  "p95_ms": 17.56725,
+                  "max_ms": 17.56725
+                }
+              },
+              {
+                "unrelated_tables": 1000,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.4031045,
+                  "p95_ms": 1.565208,
+                  "max_ms": 1.565208
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 1.482125,
+                  "p95_ms": 1.537459,
+                  "max_ms": 1.537459
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 113.7073125,
+                  "p95_ms": 114.2785,
+                  "max_ms": 114.2785
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 0.8975,
+                  "p95_ms": 1.046416,
+                  "max_ms": 1.046416
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.292854,
+                  "p95_ms": 1.377291,
+                  "max_ms": 1.377291
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 4.6311245,
+                  "p95_ms": 4.692125,
+                  "max_ms": 4.692125
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 191.693375,
+                  "p95_ms": 192.925,
+                  "max_ms": 192.925
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "baseline-wide": {
+      "stage": "baseline",
+      "observations": {
+        "binary": "/private/tmp/antfly-catalog-round7-baseline",
+        "binary_sha256": "da72be79c6565d2cf8772595502a04b6a8ea289df83fe6376f97a1a764d1f3a4",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "binary": "/private/tmp/antfly-catalog-round7-baseline",
+          "scenario": "listing",
+          "deployment": "standalone",
+          "restart_after_ddl": false,
+          "listing_distinct_schemas": true,
+          "listing_page_size": 25,
+          "listing_concurrent": true,
+          "table_counts": [
+            200
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 200,
+          "tenant_counts": [
+            10,
+            100
+          ],
+          "entity_shards": 1,
+          "entity_key_layout": "clustered",
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 3,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115,
+          "output": "/private/tmp/catalog-round7-baseline-wide.json"
+        },
+        "scenarios": {
+          "listing": {
+            "deployment": "standalone",
+            "startup_ms": 2534.6754579804838,
+            "checkpoints": [
+              {
+                "unrelated_tables": 200,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 2.159875,
+                  "p95_ms": 2.329959,
+                  "max_ms": 2.329959
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 2.136958,
+                  "p95_ms": 2.2395,
+                  "max_ms": 2.2395
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 510.98512500000004,
+                  "p95_ms": 521.866125,
+                  "max_ms": 521.866125
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 5.085853999999999,
+                  "p95_ms": 5.4255,
+                  "max_ms": 5.4255
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 0.930396,
+                  "p95_ms": 0.949292,
+                  "max_ms": 0.949292
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 26.2321455,
+                  "p95_ms": 26.942459,
+                  "max_ms": 26.942459
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 490.0471455,
+                  "p95_ms": 815.749334,
+                  "max_ms": 815.749334
+                },
+                "inventory_with_readers": {
+                  "elapsed_seconds": 7.343529292,
+                  "detail_requests_per_second": 980.9996955888768,
+                  "inventory": {
+                    "samples": 10,
+                    "p50_ms": 670.157646,
+                    "p95_ms": 1099.719875,
+                    "max_ms": 1099.719875
+                  },
+                  "detail": {
+                    "samples": 7204,
+                    "p50_ms": 7.270728999999999,
+                    "p95_ms": 10.292292,
+                    "max_ms": 71.34775
+                  },
+                  "readers": 8
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "baseline-paced": {
+      "stage": "baseline",
+      "observations": {
+        "binary": "/private/tmp/antfly-catalog-round7-baseline",
+        "binary_sha256": "da72be79c6565d2cf8772595502a04b6a8ea289df83fe6376f97a1a764d1f3a4",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "binary": "/private/tmp/antfly-catalog-round7-baseline",
+          "scenario": "listing",
+          "deployment": "standalone",
+          "restart_after_ddl": false,
+          "listing_distinct_schemas": true,
+          "listing_page_size": 0,
+          "listing_concurrent": true,
+          "listing_reader_rate": 100,
+          "table_counts": [
+            200
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 200,
+          "tenant_counts": [
+            10,
+            100
+          ],
+          "entity_shards": 1,
+          "entity_key_layout": "clustered",
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 3,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115,
+          "output": "/private/tmp/catalog-round7-baseline-paced.json"
+        },
+        "scenarios": {
+          "listing": {
+            "deployment": "standalone",
+            "startup_ms": 656.3419997692108,
+            "checkpoints": [
+              {
+                "unrelated_tables": 200,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.954333,
+                  "p95_ms": 2.094291,
+                  "max_ms": 2.094291
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 2.0465625000000003,
+                  "p95_ms": 2.2025,
+                  "max_ms": 2.2025
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 454.02272949999997,
+                  "p95_ms": 466.329125,
+                  "max_ms": 466.329125
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 4.254646,
+                  "p95_ms": 4.572458,
+                  "max_ms": 4.572458
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 0.8271455000000001,
+                  "p95_ms": 1.272,
+                  "max_ms": 1.272
+                },
+                "inventory_with_readers": {
+                  "elapsed_seconds": 5.408901125,
+                  "detail_requests_per_second": 632.4759726496202,
+                  "inventory": {
+                    "samples": 10,
+                    "p50_ms": 489.2438125,
+                    "p95_ms": 1002.4665,
+                    "max_ms": 1002.4665
+                  },
+                  "detail": {
+                    "samples": 3421,
+                    "p50_ms": 5.222375,
+                    "p95_ms": 8.027417,
+                    "max_ms": 74.199875
+                  },
+                  "readers": 8,
+                  "target_detail_requests_per_second": 800
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "baseline-cluster": {
+      "stage": "baseline",
+      "observations": {
+        "binary": "/private/tmp/antfly-catalog-round7-baseline",
+        "binary_sha256": "da72be79c6565d2cf8772595502a04b6a8ea289df83fe6376f97a1a764d1f3a4",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "binary": "/private/tmp/antfly-catalog-round7-baseline",
+          "scenario": "listing",
+          "deployment": "cluster",
+          "restart_after_ddl": false,
+          "listing_distinct_schemas": false,
+          "listing_page_size": 25,
+          "listing_concurrent": false,
+          "listing_reader_rate": 0,
+          "table_counts": [
+            30
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 200,
+          "tenant_counts": [
+            10,
+            100
+          ],
+          "entity_shards": 1,
+          "entity_key_layout": "clustered",
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 3,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115,
+          "output": "/private/tmp/catalog-round7-baseline-cluster.json"
+        },
+        "scenarios": {
+          "listing": {
+            "deployment": "cluster",
+            "startup_ms": 3637.115416582674,
+            "checkpoints": [
+              {
+                "unrelated_tables": 30,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 27.4114785,
+                  "p95_ms": 184.112791,
+                  "max_ms": 184.112791
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 27.123271,
+                  "p95_ms": 177.295583,
+                  "max_ms": 177.295583
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 98.80841649999999,
+                  "p95_ms": 244.102666,
+                  "max_ms": 244.102666
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 26.3717915,
+                  "p95_ms": 48.001291,
+                  "max_ms": 48.001291
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 33.126979,
+                  "p95_ms": 209.267,
+                  "max_ms": 209.267
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 73.354229,
+                  "p95_ms": 430.162083,
+                  "max_ms": 430.162083
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 126.1999585,
+                  "p95_ms": 338.3855,
+                  "max_ms": 338.3855
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "scale": {
+      "stage": "intermediate: pages without standalone cache",
+      "observations": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "binary_sha256": "ed53be1503a4212203b4c05c1dace5e3f727f913a3f15fea9ed96c2256271d09",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+          "scenario": "listing",
+          "deployment": "standalone",
+          "restart_after_ddl": false,
+          "listing_distinct_schemas": false,
+          "listing_page_size": 25,
+          "listing_concurrent": false,
+          "listing_reader_rate": 0,
+          "table_counts": [
+            100,
+            1000
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 0,
+          "tenant_counts": [
+            10,
+            100
+          ],
+          "entity_shards": 1,
+          "entity_key_layout": "clustered",
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 3,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115,
+          "output": "/private/tmp/catalog-round7-scale.json"
+        },
+        "scenarios": {
+          "listing": {
+            "deployment": "standalone",
+            "startup_ms": 661.4198749884963,
+            "checkpoints": [
+              {
+                "unrelated_tables": 100,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.0612085,
+                  "p95_ms": 1.1325,
+                  "max_ms": 1.1325
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 1.13375,
+                  "p95_ms": 1.316708,
+                  "max_ms": 1.316708
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 12.5450415,
+                  "p95_ms": 13.420791,
+                  "max_ms": 13.420791
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 0.6856249999999999,
+                  "p95_ms": 1.928541,
+                  "max_ms": 1.928541
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.1011665000000002,
+                  "p95_ms": 2.019667,
+                  "max_ms": 2.019667
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 4.1161460000000005,
+                  "p95_ms": 4.20875,
+                  "max_ms": 4.20875
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 18.154062500000002,
+                  "p95_ms": 18.479875,
+                  "max_ms": 18.479875
+                }
+              },
+              {
+                "unrelated_tables": 1000,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.203646,
+                  "p95_ms": 2.149459,
+                  "max_ms": 2.149459
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 1.2627915,
+                  "p95_ms": 1.347291,
+                  "max_ms": 1.347291
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 141.590396,
+                  "p95_ms": 143.818708,
+                  "max_ms": 143.818708
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 0.688021,
+                  "p95_ms": 1.619792,
+                  "max_ms": 1.619792
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.074125,
+                  "p95_ms": 1.976625,
+                  "max_ms": 1.976625
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 4.550146,
+                  "p95_ms": 6.305458,
+                  "max_ms": 6.305458
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 188.4323755,
+                  "p95_ms": 192.265125,
+                  "max_ms": 192.265125
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "wide": {
+      "stage": "intermediate: pages without standalone cache",
+      "observations": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "binary_sha256": "ed53be1503a4212203b4c05c1dace5e3f727f913a3f15fea9ed96c2256271d09",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+          "scenario": "listing",
+          "deployment": "standalone",
+          "restart_after_ddl": false,
+          "listing_distinct_schemas": true,
+          "listing_page_size": 25,
+          "listing_concurrent": true,
+          "table_counts": [
+            200
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 200,
+          "tenant_counts": [
+            10,
+            100
+          ],
+          "entity_shards": 1,
+          "entity_key_layout": "clustered",
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 3,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115,
+          "output": "/private/tmp/catalog-round7-wide.json"
+        },
+        "scenarios": {
+          "listing": {
+            "deployment": "standalone",
+            "startup_ms": 671.6569173149765,
+            "checkpoints": [
+              {
+                "unrelated_tables": 200,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 2.0897505,
+                  "p95_ms": 2.348084,
+                  "max_ms": 2.348084
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 2.2333335,
+                  "p95_ms": 2.333583,
+                  "max_ms": 2.333583
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 496.7814585,
+                  "p95_ms": 501.680334,
+                  "max_ms": 501.680334
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 1.644979,
+                  "p95_ms": 1.874208,
+                  "max_ms": 1.874208
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.203375,
+                  "p95_ms": 1.369208,
+                  "max_ms": 1.369208
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 26.539771000000002,
+                  "p95_ms": 27.194458,
+                  "max_ms": 27.194458
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 505.5383955,
+                  "p95_ms": 769.677542,
+                  "max_ms": 769.677542
+                },
+                "inventory_with_readers": {
+                  "elapsed_seconds": 9.197261208,
+                  "detail_requests_per_second": 1471.52502184322,
+                  "inventory": {
+                    "samples": 10,
+                    "p50_ms": 883.9095835,
+                    "p95_ms": 1243.29575,
+                    "max_ms": 1243.29575
+                  },
+                  "detail": {
+                    "samples": 13534,
+                    "p50_ms": 5.008478500000001,
+                    "p95_ms": 7.549042,
+                    "max_ms": 65.907417
+                  },
+                  "readers": 8
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "scale-final": {
+      "stage": "intermediate: standalone cache before ordered range traversal",
+      "observations": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "binary_sha256": "13f2576e321b31c7143411a9dc1f0bb18d06b24c5775241d16db92a7379591ef",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+          "scenario": "listing",
+          "deployment": "standalone",
+          "restart_after_ddl": false,
+          "listing_distinct_schemas": false,
+          "listing_page_size": 25,
+          "listing_concurrent": false,
+          "listing_reader_rate": 0,
+          "table_counts": [
+            100,
+            1000
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 0,
+          "tenant_counts": [
+            10,
+            100
+          ],
+          "entity_shards": 1,
+          "entity_key_layout": "clustered",
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 3,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115,
+          "output": "/private/tmp/catalog-round7-scale-final.json"
+        },
+        "scenarios": {
+          "listing": {
+            "deployment": "standalone",
+            "startup_ms": 2621.6525831259787,
+            "checkpoints": [
+              {
+                "unrelated_tables": 100,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.361375,
+                  "p95_ms": 1.540292,
+                  "max_ms": 1.540292
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 1.3939374999999998,
+                  "p95_ms": 3.225708,
+                  "max_ms": 3.225708
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 14.2598335,
+                  "p95_ms": 15.080041,
+                  "max_ms": 15.080041
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 0.736146,
+                  "p95_ms": 0.83075,
+                  "max_ms": 0.83075
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.144333,
+                  "p95_ms": 1.306208,
+                  "max_ms": 1.306208
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 4.091938,
+                  "p95_ms": 4.189375,
+                  "max_ms": 4.189375
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 17.543270999999997,
+                  "p95_ms": 17.902875,
+                  "max_ms": 17.902875
+                }
+              },
+              {
+                "unrelated_tables": 1000,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.379354,
+                  "p95_ms": 2.118209,
+                  "max_ms": 2.118209
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 1.306646,
+                  "p95_ms": 1.472625,
+                  "max_ms": 1.472625
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 132.22589599999998,
+                  "p95_ms": 134.589833,
+                  "max_ms": 134.589833
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 0.8953955,
+                  "p95_ms": 1.304875,
+                  "max_ms": 1.304875
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.2712080000000001,
+                  "p95_ms": 1.605416,
+                  "max_ms": 1.605416
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 4.605979,
+                  "p95_ms": 5.584042,
+                  "max_ms": 5.584042
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 178.6607495,
+                  "p95_ms": 182.495541,
+                  "max_ms": 182.495541
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "scale-ordered": {
+      "stage": "final",
+      "observations": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "binary_sha256": "0c488a127056aed42d5cf2199859769f407b8d05318e5a95c780b601da1be960",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+          "scenario": "listing",
+          "deployment": "standalone",
+          "restart_after_ddl": false,
+          "listing_distinct_schemas": false,
+          "listing_page_size": 25,
+          "listing_concurrent": false,
+          "listing_reader_rate": 0,
+          "table_counts": [
+            100,
+            1000
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 0,
+          "tenant_counts": [
+            10,
+            100
+          ],
+          "entity_shards": 1,
+          "entity_key_layout": "clustered",
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 3,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115,
+          "output": "/private/tmp/catalog-round7-scale-ordered.json"
+        },
+        "scenarios": {
+          "listing": {
+            "deployment": "standalone",
+            "startup_ms": 2685.8308748342097,
+            "checkpoints": [
+              {
+                "unrelated_tables": 100,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.3775415,
+                  "p95_ms": 1.985917,
+                  "max_ms": 1.985917
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 1.461646,
+                  "p95_ms": 2.361208,
+                  "max_ms": 2.361208
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 14.0309165,
+                  "p95_ms": 15.16475,
+                  "max_ms": 15.16475
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 0.6859999999999999,
+                  "p95_ms": 0.834375,
+                  "max_ms": 0.834375
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.2165,
+                  "p95_ms": 1.330625,
+                  "max_ms": 1.330625
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 4.518750000000001,
+                  "p95_ms": 4.813,
+                  "max_ms": 4.813
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 18.341229,
+                  "p95_ms": 19.990584,
+                  "max_ms": 19.990584
+                }
+              },
+              {
+                "unrelated_tables": 1000,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.1330835000000001,
+                  "p95_ms": 1.236542,
+                  "max_ms": 1.236542
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 1.226667,
+                  "p95_ms": 2.241708,
+                  "max_ms": 2.241708
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 117.298396,
+                  "p95_ms": 119.339584,
+                  "max_ms": 119.339584
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 0.6954994999999999,
+                  "p95_ms": 0.808667,
+                  "max_ms": 0.808667
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.053229,
+                  "p95_ms": 1.181833,
+                  "max_ms": 1.181833
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 4.317646,
+                  "p95_ms": 4.913834,
+                  "max_ms": 4.913834
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 193.239958,
+                  "p95_ms": 197.980875,
+                  "max_ms": 197.980875
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "wide-final": {
+      "stage": "final",
+      "observations": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "binary_sha256": "0c488a127056aed42d5cf2199859769f407b8d05318e5a95c780b601da1be960",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+          "scenario": "listing",
+          "deployment": "standalone",
+          "restart_after_ddl": false,
+          "listing_distinct_schemas": true,
+          "listing_page_size": 25,
+          "listing_concurrent": true,
+          "listing_reader_rate": 0,
+          "table_counts": [
+            200
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 200,
+          "tenant_counts": [
+            10,
+            100
+          ],
+          "entity_shards": 1,
+          "entity_key_layout": "clustered",
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 3,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115,
+          "output": "/private/tmp/catalog-round7-wide-final.json"
+        },
+        "scenarios": {
+          "listing": {
+            "deployment": "standalone",
+            "startup_ms": 668.3705421164632,
+            "checkpoints": [
+              {
+                "unrelated_tables": 200,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 2.1075625000000002,
+                  "p95_ms": 2.259166,
+                  "max_ms": 2.259166
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 2.0420415,
+                  "p95_ms": 2.114708,
+                  "max_ms": 2.114708
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 490.905187,
+                  "p95_ms": 500.202917,
+                  "max_ms": 500.202917
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 1.6494165,
+                  "p95_ms": 1.937166,
+                  "max_ms": 1.937166
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.051709,
+                  "p95_ms": 1.223042,
+                  "max_ms": 1.223042
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 26.342146,
+                  "p95_ms": 26.919917,
+                  "max_ms": 26.919917
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 463.532771,
+                  "p95_ms": 724.78,
+                  "max_ms": 724.78
+                },
+                "inventory_with_readers": {
+                  "elapsed_seconds": 8.981932583,
+                  "detail_requests_per_second": 1587.9656040834034,
+                  "inventory": {
+                    "samples": 10,
+                    "p50_ms": 864.2525625,
+                    "p95_ms": 1248.470792,
+                    "max_ms": 1248.470792
+                  },
+                  "detail": {
+                    "samples": 14263,
+                    "p50_ms": 4.661417,
+                    "p95_ms": 6.89825,
+                    "max_ms": 59.85
+                  },
+                  "readers": 8,
+                  "target_detail_requests_per_second": null
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "paced-final": {
+      "stage": "final",
+      "observations": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "binary_sha256": "0c488a127056aed42d5cf2199859769f407b8d05318e5a95c780b601da1be960",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+          "scenario": "listing",
+          "deployment": "standalone",
+          "restart_after_ddl": false,
+          "listing_distinct_schemas": true,
+          "listing_page_size": 0,
+          "listing_concurrent": true,
+          "listing_reader_rate": 100,
+          "table_counts": [
+            200
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 200,
+          "tenant_counts": [
+            10,
+            100
+          ],
+          "entity_shards": 1,
+          "entity_key_layout": "clustered",
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 3,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115,
+          "output": "/private/tmp/catalog-round7-paced-final.json"
+        },
+        "scenarios": {
+          "listing": {
+            "deployment": "standalone",
+            "startup_ms": 677.460374776274,
+            "checkpoints": [
+              {
+                "unrelated_tables": 200,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 2.205333,
+                  "p95_ms": 2.262875,
+                  "max_ms": 2.262875
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 2.142646,
+                  "p95_ms": 2.261708,
+                  "max_ms": 2.261708
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 495.814042,
+                  "p95_ms": 499.919209,
+                  "max_ms": 499.919209
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 1.5984785000000001,
+                  "p95_ms": 1.878583,
+                  "max_ms": 1.878583
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 1.0446665,
+                  "p95_ms": 1.157125,
+                  "max_ms": 1.157125
+                },
+                "inventory_with_readers": {
+                  "elapsed_seconds": 5.71084425,
+                  "detail_requests_per_second": 516.9113130689915,
+                  "inventory": {
+                    "samples": 10,
+                    "p50_ms": 499.88904149999996,
+                    "p95_ms": 1171.778166,
+                    "max_ms": 1171.778166
+                  },
+                  "detail": {
+                    "samples": 2952,
+                    "p50_ms": 2.4340625,
+                    "p95_ms": 5.155834,
+                    "max_ms": 52.632959
+                  },
+                  "readers": 8,
+                  "target_detail_requests_per_second": 800
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "cluster-final": {
+      "stage": "final",
+      "observations": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "binary_sha256": "0c488a127056aed42d5cf2199859769f407b8d05318e5a95c780b601da1be960",
+        "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+        "settings": {
+          "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+          "scenario": "listing",
+          "deployment": "cluster",
+          "restart_after_ddl": false,
+          "listing_distinct_schemas": false,
+          "listing_page_size": 25,
+          "listing_concurrent": false,
+          "listing_reader_rate": 0,
+          "table_counts": [
+            30
+          ],
+          "resolution_workload": "exact",
+          "schema_fields": 200,
+          "tenant_counts": [
+            10,
+            100
+          ],
+          "entity_shards": 1,
+          "entity_key_layout": "clustered",
+          "mentions": [
+            10,
+            100
+          ],
+          "documents": 5,
+          "concurrency": 8,
+          "samples": 10,
+          "warmup": 3,
+          "ndjson_lines": 20,
+          "poll_ms": 20,
+          "readiness_timeout": 115,
+          "output": "/private/tmp/catalog-round7-cluster-final.json"
+        },
+        "scenarios": {
+          "listing": {
+            "deployment": "cluster",
+            "startup_ms": 3632.7619161456823,
+            "checkpoints": [
+              {
+                "unrelated_tables": 30,
+                "small_namespace": {
+                  "samples": 10,
+                  "p50_ms": 24.7161455,
+                  "p95_ms": 192.628167,
+                  "max_ms": 192.628167
+                },
+                "selective_prefix": {
+                  "samples": 10,
+                  "p50_ms": 25.086771,
+                  "p95_ms": 33.098125,
+                  "max_ms": 33.098125
+                },
+                "large_namespace": {
+                  "samples": 10,
+                  "p50_ms": 91.2776045,
+                  "p95_ms": 488.187917,
+                  "max_ms": 488.187917
+                },
+                "single_table_status": {
+                  "samples": 10,
+                  "p50_ms": 25.3357295,
+                  "p95_ms": 248.265083,
+                  "max_ms": 248.265083
+                },
+                "empty_default_namespace": {
+                  "samples": 10,
+                  "p50_ms": 22.9059585,
+                  "p95_ms": 197.940083,
+                  "max_ms": 197.940083
+                },
+                "first_page": {
+                  "samples": 10,
+                  "p50_ms": 68.201,
+                  "p95_ms": 501.894375,
+                  "max_ms": 501.894375
+                },
+                "paged_inventory": {
+                  "samples": 10,
+                  "p50_ms": 102.0536245,
+                  "p95_ms": 531.790792,
+                  "max_ms": 531.790792
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

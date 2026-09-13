@@ -13,6 +13,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.api_key_row_filter_type_0 import ApiKeyRowFilterType0
     from ..models.permission import Permission
+    from ..models.scoped_row_filter import ScopedRowFilter
 
 
 T = TypeVar("T", bound="ApiKey")
@@ -29,6 +30,7 @@ class ApiKey:
         created_at (datetime.datetime): When the API key was created.
         permissions (list[Permission] | None | Unset): Optional permission scoping. If empty, inherits owner's full
             permissions.
+        scoped_row_filters (list[ScopedRowFilter] | Unset):
         row_filter (ApiKeyRowFilterType0 | None | Unset): Optional per-table row filter. Keys are table names (or '*'
             for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-
             local filters are applied as additional narrowing.
@@ -40,6 +42,7 @@ class ApiKey:
     username: str
     created_at: datetime.datetime
     permissions: list[Permission] | None | Unset = UNSET
+    scoped_row_filters: list[ScopedRowFilter] | Unset = UNSET
     row_filter: ApiKeyRowFilterType0 | None | Unset = UNSET
     expires_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -66,6 +69,13 @@ class ApiKey:
 
         else:
             permissions = self.permissions
+
+        scoped_row_filters: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.scoped_row_filters, Unset):
+            scoped_row_filters = []
+            for scoped_row_filters_item_data in self.scoped_row_filters:
+                scoped_row_filters_item = scoped_row_filters_item_data.to_dict()
+                scoped_row_filters.append(scoped_row_filters_item)
 
         row_filter: dict[str, Any] | None | Unset
         if isinstance(self.row_filter, Unset):
@@ -95,6 +105,8 @@ class ApiKey:
         )
         if permissions is not UNSET:
             field_dict["permissions"] = permissions
+        if scoped_row_filters is not UNSET:
+            field_dict["scoped_row_filters"] = scoped_row_filters
         if row_filter is not UNSET:
             field_dict["row_filter"] = row_filter
         if expires_at is not UNSET:
@@ -106,6 +118,7 @@ class ApiKey:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.api_key_row_filter_type_0 import ApiKeyRowFilterType0
         from ..models.permission import Permission
+        from ..models.scoped_row_filter import ScopedRowFilter
 
         d = dict(src_dict)
         key_id = d.pop("key_id")
@@ -137,6 +150,15 @@ class ApiKey:
             return cast(list[Permission] | None | Unset, data)
 
         permissions = _parse_permissions(d.pop("permissions", UNSET))
+
+        _scoped_row_filters = d.pop("scoped_row_filters", UNSET)
+        scoped_row_filters: list[ScopedRowFilter] | Unset = UNSET
+        if _scoped_row_filters is not UNSET:
+            scoped_row_filters = []
+            for scoped_row_filters_item_data in _scoped_row_filters:
+                scoped_row_filters_item = ScopedRowFilter.from_dict(scoped_row_filters_item_data)
+
+                scoped_row_filters.append(scoped_row_filters_item)
 
         def _parse_row_filter(data: object) -> ApiKeyRowFilterType0 | None | Unset:
             if data is None:
@@ -178,6 +200,7 @@ class ApiKey:
             username=username,
             created_at=created_at,
             permissions=permissions,
+            scoped_row_filters=scoped_row_filters,
             row_filter=row_filter,
             expires_at=expires_at,
         )

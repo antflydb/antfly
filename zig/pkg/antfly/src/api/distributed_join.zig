@@ -124,12 +124,31 @@ pub const LifecycleHook = struct {
 // ---------------------------------------------------------------------------
 
 pub const JoinContext = struct {
+    /// Borrowed synchronous query state. Background jobs retain only the
+    /// ordinary server context; request bindings never escape their owner.
+    query_execution: ?QueryExecution = null,
+
+    response_label: ?[]const u8 = null,
+
     ptr: *anyopaque,
     vtable: *const VTable,
     /// Absolute deadline in monotonicNowNs(), not the native query clock.
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
     lifecycle_hook: ?LifecycleHook = null,
+
+    pub const QueryExecution = struct {
+        ptr: *anyopaque,
+        plain: @FieldType(VTable, "execute_plain_query"),
+        dispatch: @FieldType(VTable, "execute_query_dispatch"),
+        build: @FieldType(VTable, "build_owned_search_request"),
+    };
+
+    pub fn withResponseLabel(self: @This(), label: ?[]const u8) @This() {
+        var out = self;
+        out.response_label = label;
+        return out;
+    }
 
     pub const VTable = struct {
         admin_snapshot: *const fn (*anyopaque) anyerror!?metadata_api.AdminSnapshot,
@@ -247,8 +266,9 @@ pub const JoinContext = struct {
     }
 
     pub fn executePlainQuery(self: JoinContext, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) !query_api.QueryResponse {
-        return try self.vtable.execute_plain_query(
-            self.ptr,
+        const execute = if (self.query_execution) |q| q.plain else self.vtable.execute_plain_query;
+        return try execute(
+            if (self.query_execution) |q| q.ptr else self.ptr,
             alloc,
             source,
             table_name,
@@ -260,8 +280,9 @@ pub const JoinContext = struct {
     }
 
     pub fn executeQueryDispatch(self: JoinContext, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) ![]u8 {
-        return try self.vtable.execute_query_dispatch(
-            self.ptr,
+        const execute = if (self.query_execution) |q| q.dispatch else self.vtable.execute_query_dispatch;
+        return try execute(
+            if (self.query_execution) |q| q.ptr else self.ptr,
             alloc,
             source,
             table_name,
@@ -273,8 +294,9 @@ pub const JoinContext = struct {
     }
 
     pub fn buildOwnedSearchRequest(self: JoinContext, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value) !query_api.OwnedQueryRequest {
-        return try self.vtable.build_owned_search_request(
-            self.ptr,
+        const execute = if (self.query_execution) |q| q.build else self.vtable.build_owned_search_request;
+        return try execute(
+            if (self.query_execution) |q| q.ptr else self.ptr,
             alloc,
             table_name,
             query_value,
@@ -423,6 +445,61 @@ pub const JoinShuffleResumeState = struct {
     }
 };
 
+/// Internal worker envelope. Public admission replaces native names before
+/// constructing this representation; labels never participate in routing.
+const BoundJoinClause = struct {
+    right_table: ?[]const u8 = null,
+    right_target: ?metadata_openapi.CatalogTableTarget = null,
+    right_label: ?[]const u8 = null,
+    join_type: ?metadata_openapi.JoinType = null,
+    on: metadata_openapi.JoinCondition,
+    right_filters: ?metadata_openapi.JoinFilters = null,
+    right_fields: ?[]const []const u8 = null,
+    strategy_hint: ?metadata_openapi.JoinStrategy = null,
+    nested_join: @FieldType(metadata_openapi.JoinClause, "nested_join") = .absent,
+};
+
+fn supportedBoundJoinFromWire(alloc: std.mem.Allocator, wire: BoundJoinClause) !SupportedJoinRequest {
+    if (wire.right_target != null) return error.InvalidQueryRequest;
+    const physical = wire.right_table orelse return error.InvalidQueryRequest;
+    try tables_api.validateInternalTableMutationName(physical);
+    var result = try supportedJoinRequestFromOpenApi(alloc, .{
+        .right_table = "__bound__",
+        .join_type = wire.join_type,
+        .on = wire.on,
+        .right_filters = wire.right_filters,
+        .right_fields = wire.right_fields,
+        .strategy_hint = wire.strategy_hint,
+    });
+    errdefer result.deinit(alloc);
+    const owned_physical = try alloc.dupe(u8, physical);
+    alloc.free(result.right_table);
+    result.right_table = owned_physical;
+    if (wire.right_label) |label| result.right_label = try alloc.dupe(u8, label);
+    if (wire.nested_join.valueOrNull()) |value| {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(encoded);
+        const parsed = try std.json.parseFromSlice(BoundJoinClause, alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const nested = try alloc.create(SupportedJoinRequest);
+        errdefer alloc.destroy(nested);
+        nested.* = try supportedBoundJoinFromWire(alloc, parsed.value);
+        result.nested_join = nested;
+    }
+    return result;
+}
+
+pub fn parseBoundJoinRequestWithSecrets(alloc: std.mem.Allocator, body: []const u8, secrets: ?*@import("../common/secrets.zig").FileStore) !?ParsedSupportedJoinRequest {
+    const parsed = try std.json.parseFromSlice(struct { join: ?BoundJoinClause = null }, alloc, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const wire = parsed.value.join orelse return null;
+    var bound = try supportedBoundJoinFromWire(alloc, wire);
+    errdefer bound.deinit(alloc);
+    var envelope = try metadata_openapi.server.parseQueryTableBody(alloc, body);
+    defer envelope.deinit();
+    return .{ .join = bound, .foreign_sources = try foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(alloc, envelope.value.foreign_sources, secrets) };
+}
+
 pub const SupportedJoinRequest = struct {
     pub const JoinType = enum {
         inner,
@@ -431,6 +508,7 @@ pub const SupportedJoinRequest = struct {
     };
 
     right_table: []u8,
+    right_label: ?[]u8 = null,
     join_type: JoinType = .inner,
     left_field: []u8,
     right_field: []u8,
@@ -442,6 +520,7 @@ pub const SupportedJoinRequest = struct {
 
     pub fn deinit(self: *SupportedJoinRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.right_table);
+        if (self.right_label) |label| alloc.free(label);
         alloc.free(self.left_field);
         alloc.free(self.right_field);
         if (self.right_filters) |*filters| filters.deinit(alloc);
@@ -767,7 +846,7 @@ pub const JoinFinalizeRequest = struct {
 
 pub const EncodedJoinPartitionRequest = struct {
     job_id: ?u64 = null,
-    join: metadata_openapi.JoinClause,
+    join: BoundJoinClause,
     left_hits: []const std.json.Value,
     appended_left_field: ?bool = null,
     partition_index: ?u64 = null,
@@ -778,14 +857,14 @@ pub const EncodedJoinPartitionRequest = struct {
 
 pub const EncodedJoinRowsRequest = struct {
     job_id: ?u64 = null,
-    join: metadata_openapi.JoinClause,
+    join: BoundJoinClause,
     partition_index: ?u64 = null,
     partition_count: ?u64 = null,
     remaining_timeout_ms: ?u64 = null,
 };
 
 pub const EncodedJoinUnmatchedRequest = struct {
-    join: metadata_openapi.JoinClause,
+    join: BoundJoinClause,
     left_hit_count: ?u64 = null,
     left_fields: ?[]const []const u8 = null,
     appended_left_field: ?bool = null,
@@ -796,7 +875,7 @@ pub const EncodedJoinUnmatchedRequest = struct {
 pub const EncodedJoinFinalizeRequest = struct {
     job_id: ?u64 = null,
     handoff_owner_group_id: ?u64 = null,
-    join: metadata_openapi.JoinClause,
+    join: BoundJoinClause,
     left_hits: []const std.json.Value,
     left_fields: ?[]const std.json.Value = null,
     appended_left_field: ?bool = null,
@@ -925,6 +1004,7 @@ pub const JoinJobStore = struct {
 
     pub fn setContext(self: *JoinJobStore, ctx: JoinContext) void {
         self.ctx = ctx;
+        self.ctx.?.query_execution = null;
     }
 
     pub fn hasDurableStore(self: *const JoinJobStore) bool {
@@ -1657,9 +1737,17 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
 
     var owned_response = json_helpers.parseOwnedJsonValueAlloc(alloc, primary_result.json) catch return error.InternalFailure;
     defer deinitJsonValue(alloc, &owned_response);
+    if (ctx.response_label) |label| {
+        if (owned_response.object.getPtr("responses")) |responses| for (responses.array.items) |*response| {
+            if (response.object.getPtr("table")) |name| {
+                deinitJsonValue(alloc, name);
+                name.* = .{ .string = try alloc.dupe(u8, label) };
+            }
+        };
+    }
     const hits_ptr = queryHitsArrayPtr(&owned_response) catch return error.InternalFailure;
     if (hits_ptr.items.len == 0) {
-        const empty_response = alloc.dupe(u8, primary_result.json) catch return error.InternalFailure;
+        const empty_response = std.json.Stringify.valueAlloc(alloc, owned_response, .{}) catch return error.InternalFailure;
         errdefer alloc.free(empty_response);
         try ctx.ensureExecutionDeadline();
         return empty_response;
@@ -4444,8 +4532,10 @@ pub fn parseSupportedJoinRequestWithSecrets(
     var parsed_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
     defer parsed_request.deinit();
     const join = parsed_request.value.join orelse return null;
+    var owned_join = try supportedJoinRequestFromOpenApi(alloc, join);
+    errdefer owned_join.deinit(alloc);
     return .{
-        .join = try supportedJoinRequestFromOpenApi(alloc, join),
+        .join = owned_join,
         .foreign_sources = foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(alloc, parsed_request.value.foreign_sources, secret_store) catch |err| switch (err) {
             error.UnsupportedSourceKind => return error.UnsupportedQueryRequest,
             else => return err,
@@ -4470,10 +4560,17 @@ pub fn supportedJoinRequestFromOpenApi(
     alloc: std.mem.Allocator,
     join: metadata_openapi.JoinClause,
 ) !SupportedJoinRequest {
-    if (join.right_table.len == 0 or join.on.left_field.len == 0 or join.on.right_field.len == 0) {
+    if ((join.right_table == null) == (join.right_target == null) or join.on.left_field.len == 0 or join.on.right_field.len == 0) {
         return error.InvalidQueryRequest;
     }
-    const right_table = try alloc.dupe(u8, join.right_table);
+    const catalog = @import("../system_catalog/domain.zig");
+    const target: catalog.Target = if (join.right_target) |target| .{
+        .database = target.database orelse catalog.default_database_name,
+        .namespace = target.namespace orelse catalog.default_namespace_name,
+        .table = target.table,
+    } else try catalog.Target.literal(join.right_table.?);
+    try target.validate();
+    const right_table = if (join.right_target != null) try target.resourceNameAlloc(alloc) else try alloc.dupe(u8, join.right_table.?);
     errdefer alloc.free(right_table);
     const left_field = try alloc.dupe(u8, join.on.left_field);
     errdefer alloc.free(left_field);
@@ -4674,7 +4771,7 @@ pub fn parseJoinPartitionRequest(
     errdefer parsed.deinit();
     return .{
         .job_id = parsed.value.job_id,
-        .join = try supportedJoinRequestFromOpenApi(alloc, parsed.value.join),
+        .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .left_hits = parsed.value.left_hits,
         .appended_left_field = parsed.value.appended_left_field orelse false,
         .partition_index = if (parsed.value.partition_index) |value|
@@ -4785,7 +4882,7 @@ pub fn parseJoinRowsRequest(
     errdefer parsed.deinit();
     return .{
         .job_id = parsed.value.job_id,
-        .join = try supportedJoinRequestFromOpenApi(alloc, parsed.value.join),
+        .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .partition_index = if (parsed.value.partition_index) |value|
             std.math.cast(usize, value) orelse return error.InvalidQueryRequest
         else
@@ -4811,7 +4908,7 @@ pub fn parseJoinUnmatchedRequest(
     });
     errdefer parsed.deinit();
     return .{
-        .join = try supportedJoinRequestFromOpenApi(alloc, parsed.value.join),
+        .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .left_hit_count = if (parsed.value.left_hit_count) |value|
             std.math.cast(usize, value) orelse return error.InvalidQueryRequest
         else
@@ -4835,7 +4932,7 @@ pub fn parseJoinFinalizeRequest(
     return .{
         .job_id = parsed.value.job_id,
         .handoff_owner_group_id = parsed.value.handoff_owner_group_id,
-        .join = try supportedJoinRequestFromOpenApi(alloc, parsed.value.join),
+        .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .left_hits = parsed.value.left_hits,
         .left_fields = parsed.value.left_fields orelse &.{},
         .appended_left_field = parsed.value.appended_left_field orelse false,
@@ -5786,6 +5883,7 @@ fn buildSupportedJoinClauseValue(
 ) !std.json.Value {
     var join_obj = std.json.ObjectMap.empty;
     try join_obj.put(alloc, try alloc.dupe(u8, "right_table"), .{ .string = try alloc.dupe(u8, join.right_table) });
+    if (join.right_label) |label| try join_obj.put(alloc, try alloc.dupe(u8, "right_label"), .{ .string = try alloc.dupe(u8, label) });
     try join_obj.put(alloc, try alloc.dupe(u8, "join_type"), .{ .string = try alloc.dupe(u8, switch (join.join_type) {
         .inner => "inner",
         .left => "left",
@@ -6176,7 +6274,7 @@ test "distributed join transports relative budgets and rejects exhausted handoff
     var state: u8 = 0;
     const ctx = JoinContext{
         .ptr = &state,
-        .vtable = undefined,
+        .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
         .execution_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
     };
     const remaining_ms = (try ctx.remainingExecutionBudgetMs()).?;
@@ -6209,7 +6307,7 @@ test "distributed join transports relative budgets and rejects exhausted handoff
     try std.testing.expectEqual(@as(?u64, remaining_ms), parsed.remaining_timeout_ms);
     const worker_ctx = try (JoinContext{
         .ptr = &state,
-        .vtable = undefined,
+        .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
     }).withRemainingExecutionBudgetMs(parsed.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
 }
@@ -6943,8 +7041,8 @@ test "distributed join apply context cancels a linear non-equality merge" {
     var state: u8 = 0;
     const ctx = JoinContext{
         .ptr = &state,
-        .vtable = undefined,
-        .cancellation = &cancellation,
+        .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
+        .cancellation = CancellationToken.fromAtomic(&cancellation),
     };
 
     try std.testing.expectError(

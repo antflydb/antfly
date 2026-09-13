@@ -143,6 +143,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
         }
         allowed_child_fields = {
             "table",
+            "table_target",
             "fields",
             "hierarchy",
             "limit",

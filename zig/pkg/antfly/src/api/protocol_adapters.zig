@@ -377,7 +377,8 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn createTable(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            defer alloc.free(table_name);
             var body = std.json.ObjectMap.empty;
             const default_shards: i64 = if (ctx.server.cfg.deployment_mode.isStandalone()) 1 else 3;
             try body.put(alloc, "num_shards", .{ .integer = jsonIntArg(args, "numShards") orelse default_shards });
@@ -395,7 +396,8 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn createIndex(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            defer alloc.free(table_name);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "name", .{ .string = index_name });
@@ -417,7 +419,8 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            defer alloc.free(table_name);
             const result = try ctx.executeOperation(alloc, .{ .list_indexes = .{ .table_name = table_name } });
             if (result.structured) |structured| {
                 if (structured == .array) {
@@ -430,7 +433,8 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn getDocument(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            defer alloc.free(table_name);
             const key = jsonStringArg(args, "key") orelse return mcpError(alloc, "missing key");
             var fields_csv = std.ArrayListUnmanaged(u8).empty;
             defer fields_csv.deinit(alloc);
@@ -452,7 +456,8 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn sampleDocuments(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            defer alloc.free(table_name);
             const limit = jsonIntArg(args, "limit") orelse 5;
             if (limit <= 0) return mcpError(alloc, "limit must be greater than 0");
             if (limit > max_mcp_sample_documents_limit) return mcpError(alloc, "limit exceeds maximum sample size");
@@ -469,7 +474,8 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn indexRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, body: []const u8) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            defer alloc.free(table_name);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
             _ = body;
             if (method != .DELETE) return error.UnsupportedMethod;
@@ -477,7 +483,8 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn query(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            defer alloc.free(table_name);
             if (jsonValueArg(args, "queryRequest")) |query_request| {
                 if (query_request != .object) return mcpError(alloc, "queryRequest must be an object");
                 if (hasNonRawQueryArg(args)) return mcpError(alloc, "queryRequest cannot be combined with shorthand query arguments");
@@ -527,7 +534,8 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn backupRestore(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, operation: []const u8) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            defer alloc.free(table_name);
             const backup_id = jsonStringArg(args, "backupId") orelse return mcpError(alloc, "missing backupId");
             const location = jsonStringArg(args, "location") orelse return mcpError(alloc, "missing location");
             const connection = jsonStringArg(args, "connection") orelse return mcpError(alloc, "missing connection");
@@ -546,7 +554,8 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn batch(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            defer alloc.free(table_name);
             var body = std.json.ObjectMap.empty;
             const inserts = jsonValueArg(args, "inserts");
             const writes = jsonValueArg(args, "writes");
@@ -564,7 +573,8 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         const TableOperationKind = enum { drop_table, describe_table };
 
         fn tableOperation(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, table_arg: []const u8, kind: TableOperationKind) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, table_arg) orelse return mcpError(alloc, "missing tableName");
+            const table_name = mcpTableNameAlloc(alloc, args, table_arg) catch return mcpError(alloc, "invalid table target");
+            defer alloc.free(table_name);
             return switch (kind) {
                 .drop_table => try ctx.executeOperation(alloc, .{ .drop_table = .{ .table_name = table_name } }),
                 .describe_table => try ctx.executeOperation(alloc, .{ .describe_table = .{ .table_name = table_name } }),
@@ -715,7 +725,7 @@ fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype)
     const identity = authenticated_identity orelse return true;
     const required = permissionTypeForMcpTool(spec.permission) orelse return true;
     if (spec.wildcard_table) {
-        return identityHasPermission(identity.permissions, .table, "*", required);
+        return identityHasAnyPermission(identity.permissions, .table, required);
     }
     return identityHasAnyPermission(identity.permissions, .table, required);
 }
@@ -724,6 +734,16 @@ fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype)
 /// a client can retain an old tool schema or hand-craft tools/call. Enforce the
 /// effective table permission again immediately before dispatch so denied MCP
 /// calls cannot reach an extension, router, or metadata mutation path.
+fn mcpTableNameAlloc(alloc: std.mem.Allocator, args: std.json.Value, argument: []const u8) ![]u8 {
+    const catalog = @import("../system_catalog/domain.zig");
+    const table = jsonStringArg(args, argument) orelse return error.InvalidCatalogName;
+    var target = try catalog.Target.literal(table);
+    if (jsonValueArg(args, "database") != null) target.database = jsonStringArg(args, "database") orelse return error.InvalidCatalogName;
+    if (jsonValueArg(args, "namespace") != null) target.namespace = jsonStringArg(args, "namespace") orelse return error.InvalidCatalogName;
+    if (jsonValueArg(args, "database") == null and jsonValueArg(args, "namespace") == null) return alloc.dupe(u8, table);
+    return target.resourceNameAlloc(alloc);
+}
+
 fn mcpToolInvocationAllowed(
     spec: McpToolSpec,
     args: std.json.Value,
@@ -732,14 +752,16 @@ fn mcpToolInvocationAllowed(
     const effective_permissions = permissions orelse return true;
     const required = permissionTypeForMcpTool(spec.permission) orelse return true;
     if (spec.wildcard_table) {
-        return identityHasPermission(effective_permissions, .table, "*", required);
+        return identityHasAnyPermission(effective_permissions, .table, required);
     }
     const table_argument = spec.table_argument orelse return false;
     // Malformed or missing resource identity must fail closed here. The tool
     // handler will still return its normal validation error to callers that
     // are permitted to invoke it, but an unscoped call must never cross the
     // authorization boundary.
-    const table_name = jsonStringArg(args, table_argument) orelse return false;
+    var buffer: [1024]u8 = undefined;
+    var allocator = std.heap.FixedBufferAllocator.init(&buffer);
+    const table_name = mcpTableNameAlloc(allocator.allocator(), args, table_argument) catch return false;
     return identityHasPermission(effective_permissions, .table, table_name, required);
 }
 
@@ -817,7 +839,7 @@ fn identityHasPermission(
 ) bool {
     for (permissions) |permission| {
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
-        const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);
+        const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource) or (resource_type == .table and @import("../system_catalog/routes.zig").tableResourceMatches(permission.resource, resource));
         if (!type_match or !resource_match) continue;
         if (permission.type == .admin or permission.type == permission_type) return true;
     }
@@ -1344,6 +1366,10 @@ fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
         }
         try out.append(alloc, '}');
     }
+    if (spec.table_argument != null) {
+        if (spec.fields.len > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "\"database\":{\"type\":\"string\",\"default\":\"default\"},\"namespace\":{\"type\":\"string\",\"default\":\"public\"}");
+    }
     try out.appendSlice(alloc, "}}");
     return try out.toOwnedSlice(alloc);
 }
@@ -1653,7 +1679,7 @@ fn hasNonRawQueryArg(args: std.json.Value) bool {
     var it = args.object.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
-        if (std.mem.eql(u8, key, "tableName") or std.mem.eql(u8, key, "queryRequest")) continue;
+        if (std.mem.eql(u8, key, "tableName") or std.mem.eql(u8, key, "database") or std.mem.eql(u8, key, "namespace") or std.mem.eql(u8, key, "queryRequest")) continue;
         // Generated SDKs commonly serialize unset optional properties as null.
         // Raw mode treats those values as absent while still rejecting an
         // actual shorthand value that could make request precedence ambiguous.

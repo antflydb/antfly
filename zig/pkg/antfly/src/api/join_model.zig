@@ -297,7 +297,7 @@ fn mergeRightSourceValueIntoSourceAlloc(
     var it = right_source.object.iterator();
     while (it.next()) |entry| {
         if (join.right_fields.len > 0 and !containsString(join.right_fields, entry.key_ptr.*)) continue;
-        const prefixed_key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ join.right_table, entry.key_ptr.* });
+        const prefixed_key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ if (@hasField(@TypeOf(join), "right_label")) join.right_label orelse join.right_table else join.right_table, entry.key_ptr.* });
         if (source_value.object.getPtr(prefixed_key)) |value_ptr| {
             alloc.free(prefixed_key);
             json_helpers.deinitJsonValue(alloc, value_ptr);
@@ -318,7 +318,7 @@ fn mergeOwnedRightSourceValueIntoSourceAlloc(
     var it = right_source.object.iterator();
     while (it.next()) |entry| {
         if (join.right_fields.len > 0 and !containsString(join.right_fields, entry.key_ptr.*)) continue;
-        const prefixed_key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ join.right_table, entry.key_ptr.* });
+        const prefixed_key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ if (@hasField(@TypeOf(join), "right_label")) join.right_label orelse join.right_table else join.right_table, entry.key_ptr.* });
         if (source_value.object.getPtr(prefixed_key)) |value_ptr| {
             alloc.free(prefixed_key);
             json_helpers.deinitJsonValue(alloc, value_ptr);

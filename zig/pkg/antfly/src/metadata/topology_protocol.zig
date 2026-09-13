@@ -24,9 +24,13 @@ const std = @import("std");
 /// Version 5 adds conditional restore admission; ordinary job updates retain
 /// their existing wire format.
 /// Version 6 adds digest-conditional restore expiry.
-pub const current_version: u16 = 6;
+/// Version 7 adds system catalog records and atomic catalog/table publication.
+/// Version 8 adds acknowledged sparse store reports.
+pub const current_version: u16 = 8;
+pub const store_report_update_version: u16 = 8;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
+pub const system_catalog_version: u16 = 7;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
 /// when a membership change temporarily includes a lower-capability peer.

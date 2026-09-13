@@ -10,6 +10,7 @@
 const std = @import("std");
 
 pub const CreateTableRequest = struct {
+    tablespace_name: ?[]u8 = null,
     storage: @import("../common/table_storage.zig").Settings = .{},
     num_shards: ?u32 = null,
     description: ?[]u8 = null,
@@ -18,6 +19,7 @@ pub const CreateTableRequest = struct {
     replication_sources_json: ?[]u8 = null,
 
     pub fn deinit(self: *CreateTableRequest, alloc: std.mem.Allocator) void {
+        if (self.tablespace_name) |value| alloc.free(value);
         if (self.description) |value| alloc.free(value);
         if (self.indexes_json) |value| alloc.free(value);
         if (self.schema_json) |value| alloc.free(value);

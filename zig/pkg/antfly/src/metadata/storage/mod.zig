@@ -15,7 +15,7 @@
 pub const raft_apply_store = @import("raft_apply_store.zig");
 pub const RaftApplyStore = raft_apply_store.RaftApplyStore;
 pub const RaftApplyStoreConfig = raft_apply_store.RaftApplyStoreConfig;
-pub const AppliedMetadataBatch = raft_apply_store.AppliedMetadataBatch;
+pub const AppliedMetadataCheckpoint = raft_apply_store.AppliedMetadataCheckpoint;
 pub const TransitionCommand = raft_apply_store.TransitionCommand;
 pub const ExtensionLifecycleDelta = raft_apply_store.ExtensionLifecycleDelta;
 pub const ExtensionLifecycleTablePrecondition = raft_apply_store.ExtensionLifecycleTablePrecondition;
@@ -28,7 +28,7 @@ pub const decodeTransitionCommand = raft_apply_store.decodeTransitionCommand;
 test "metadata storage module compiles" {
     _ = RaftApplyStore;
     _ = RaftApplyStoreConfig;
-    _ = AppliedMetadataBatch;
+    _ = AppliedMetadataCheckpoint;
     _ = TransitionCommand;
     _ = ExtensionLifecycleDelta;
     _ = ExtensionLifecycleTablePrecondition;

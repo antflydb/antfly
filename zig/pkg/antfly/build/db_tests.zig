@@ -201,7 +201,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.generated enrichment preparation helpers release partial allocations",
         "storage.db.db.test.storage.ha db waits for remote apply before completing derived enrichment",
         "storage.db.db.test.storage.ha seed snapshot predrains enrichment before exclusive capture",
-        "storage.db.derived.io_threaded_runtime.test.derived enrichment visibility guard observes cancellation and deadline",
+        "storage.db.derived.runtime_types.test.derived visibility wait retains its deadline clock and cancellation",
         "storage.db.derived.replay_source.test.replay source primary store collects enrichment groups from hint lane",
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub configured chunking replaces invalid utf8 before dispatch",
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub makes progress when byte window is smaller than utf8 scalar",

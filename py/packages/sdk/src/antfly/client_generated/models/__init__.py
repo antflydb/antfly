@@ -55,6 +55,7 @@ from .backup_already_exists_conflict_code import BackupAlreadyExistsConflictCode
 from .backup_info import BackupInfo
 from .backup_info_format import BackupInfoFormat
 from .backup_list_response import BackupListResponse
+from .backup_namespace_table_response_201 import BackupNamespaceTableResponse201
 from .backup_outcome_ambiguous_conflict import BackupOutcomeAmbiguousConflict
 from .backup_outcome_ambiguous_conflict_code import BackupOutcomeAmbiguousConflictCode
 from .backup_request import BackupRequest
@@ -76,6 +77,11 @@ from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
 from .capability import Capability
 from .cardinality_mode import CardinalityMode
+from .catalog_mutation_visibility_pending import CatalogMutationVisibilityPending
+from .catalog_mutation_visibility_pending_status import CatalogMutationVisibilityPendingStatus
+from .catalog_table_scope import CatalogTableScope
+from .catalog_table_target import CatalogTableTarget
+from .catalog_tablespace_binding_request import CatalogTablespaceBindingRequest
 from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
@@ -137,6 +143,7 @@ from .create_graph_index_request_type import CreateGraphIndexRequestType
 from .create_index_common import CreateIndexCommon
 from .create_table_request import CreateTableRequest
 from .create_table_request_indexes import CreateTableRequestIndexes
+from .create_tablespace_request import CreateTablespaceRequest
 from .create_user_request import CreateUserRequest
 from .create_user_request_metadata_type_0 import CreateUserRequestMetadataType0
 from .created_algebraic_index import CreatedAlgebraicIndex
@@ -161,6 +168,7 @@ from .created_provider_config import CreatedProviderConfig
 from .credentials import Credentials
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
+from .database_catalog_record import DatabaseCatalogRecord
 from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
 from .dense_native_storage_phase import DenseNativeStoragePhase
@@ -251,6 +259,7 @@ from .exact_sort_error import ExactSortError
 from .exact_sort_error_error import ExactSortErrorError
 from .exact_sort_error_status import ExactSortErrorStatus
 from .execute_graph_metric_action_action import ExecuteGraphMetricActionAction
+from .execute_namespace_table_graph_metric_action_action import ExecuteNamespaceTableGraphMetricActionAction
 from .execution_policy import ExecutionPolicy
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
@@ -740,6 +749,8 @@ from .list_restore_jobs_scope import ListRestoreJobsScope
 from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_consistency import LookupKeyConsistency
 from .lookup_key_response_200 import LookupKeyResponse200
+from .lookup_namespace_table_document_consistency import LookupNamespaceTableDocumentConsistency
+from .lookup_namespace_table_document_response_200 import LookupNamespaceTableDocumentResponse200
 from .lsm_storage_status import LsmStorageStatus
 from .match_all_query import MatchAllQuery
 from .match_all_query_match_all import MatchAllQueryMatchAll
@@ -771,6 +782,7 @@ from .multi_match_body import MultiMatchBody
 from .multi_match_body_type import MultiMatchBodyType
 from .multi_match_query import MultiMatchQuery
 from .multi_phrase_query import MultiPhraseQuery
+from .namespace_catalog_record import NamespaceCatalogRecord
 from .node_filter import NodeFilter
 from .numeric_range_query import NumericRangeQuery
 from .ollama_embedder_config import OllamaEmbedderConfig
@@ -853,6 +865,7 @@ from .rate_limit_config import RateLimitConfig
 from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
 from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
+from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
 from .repair_run_request_control import RepairRunRequestControl
@@ -897,6 +910,8 @@ from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
 from .scan_keys_request import ScanKeysRequest
+from .scoped_row_filter import ScopedRowFilter
+from .scoped_row_filter_filter import ScopedRowFilterFilter
 from .secret_entry import SecretEntry
 from .secret_list import SecretList
 from .secret_status import SecretStatus
@@ -970,6 +985,7 @@ from .table_storage_settings import TableStorageSettings
 from .table_storage_settings_dense_embeddings import TableStorageSettingsDenseEmbeddings
 from .table_storage_unreadable_error import TableStorageUnreadableError
 from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
+from .tablespace_catalog_record import TablespaceCatalogRecord
 from .tavily_search_config import TavilySearchConfig
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
@@ -1112,6 +1128,7 @@ __all__ = (
     "BackupInfo",
     "BackupInfoFormat",
     "BackupListResponse",
+    "BackupNamespaceTableResponse201",
     "BackupOutcomeAmbiguousConflict",
     "BackupOutcomeAmbiguousConflictCode",
     "BackupRequest",
@@ -1133,6 +1150,11 @@ __all__ = (
     "CalendarInterval",
     "Capability",
     "CardinalityMode",
+    "CatalogMutationVisibilityPending",
+    "CatalogMutationVisibilityPendingStatus",
+    "CatalogTableScope",
+    "CatalogTablespaceBindingRequest",
+    "CatalogTableTarget",
     "CdcConnection",
     "ChainCondition",
     "ChainLink",
@@ -1213,9 +1235,11 @@ __all__ = (
     "CreateIndexCommon",
     "CreateTableRequest",
     "CreateTableRequestIndexes",
+    "CreateTablespaceRequest",
     "CreateUserRequest",
     "CreateUserRequestMetadataType0",
     "Credentials",
+    "DatabaseCatalogRecord",
     "DataShapeDecl",
     "DataShapeKind",
     "DateRangeStringQuery",
@@ -1306,6 +1330,7 @@ __all__ = (
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
     "ExecuteGraphMetricActionAction",
+    "ExecuteNamespaceTableGraphMetricActionAction",
     "ExecutionPolicy",
     "ExtensionError",
     "ExtensionMember",
@@ -1793,6 +1818,8 @@ __all__ = (
     "ListUsersResponse200Item",
     "LookupKeyConsistency",
     "LookupKeyResponse200",
+    "LookupNamespaceTableDocumentConsistency",
+    "LookupNamespaceTableDocumentResponse200",
     "LsmStorageStatus",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
@@ -1822,6 +1849,7 @@ __all__ = (
     "MultiMatchBodyType",
     "MultiMatchQuery",
     "MultiPhraseQuery",
+    "NamespaceCatalogRecord",
     "NodeFilter",
     "NumericRangeQuery",
     "OllamaEmbedderConfig",
@@ -1904,6 +1932,7 @@ __all__ = (
     "ReauthorizeTableDestinationsResponse200",
     "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
+    "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
     "RepairRunRequest",
     "RepairRunRequestControl",
@@ -1948,6 +1977,8 @@ __all__ = (
     "RuntimeDecl",
     "RuntimeDeclMode",
     "ScanKeysRequest",
+    "ScopedRowFilter",
+    "ScopedRowFilterFilter",
     "SecretEntry",
     "SecretList",
     "SecretStatus",
@@ -2014,6 +2045,7 @@ __all__ = (
     "TableSchemaDocumentSchemas",
     "TableSchemaPatch",
     "TableShards",
+    "TablespaceCatalogRecord",
     "TableStatistics",
     "TableStatisticsFieldStats",
     "TableStatus",

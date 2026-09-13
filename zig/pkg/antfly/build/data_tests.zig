@@ -190,6 +190,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
         "internal batch forwarding headers are all-or-none and strictly parsed",
         "metadata http client shares deadline and cancellation across retries",
+        "system catalog remote reads survive elections without skipping peers or extending budgets",
         "metadata capability client distinguishes advertised routing from N-1 absence",
         "data server wires configured HA executors into API server",
         "data server mirrors managed primary writes into HA replication log",

@@ -60,7 +60,7 @@ METADATA_MUTATION_NOT_ADMITTED_RESPONSE_HEADERS = {
 }
 
 
-def _new_e2e_deadline() -> "_Deadline":
+def _new_e2e_deadline() -> _Deadline:
     return _Deadline(AUTOGRAPH_E2E_TIMEOUT_S)
 
 
@@ -108,6 +108,23 @@ DOCUMENTS_INDEXES = {
                 "resolution_artifact": "resolution_v1",
                 "key_template": "{{ lower _entity.label }}/{{ slug _entity.text }}",
                 "candidate_search": "prefix",
+                "scorer_json": json.dumps(
+                    {
+                        "comparisons": [
+                            {
+                                "name": "name",
+                                "left": "canonical_text",
+                                "right": "canonical_name",
+                                "levels": [
+                                    {"when": "exact", "weight": 8.0},
+                                    {"else": True, "weight": -6.0},
+                                ],
+                            }
+                        ],
+                        "combine": {"bias": -3.0},
+                        "decision": {"match": 0.9},
+                    }
+                ),
                 "config_generation": 1,
             }
         ],
@@ -160,7 +177,7 @@ class _Api:
         *,
         num_shards: int = 1,
         indexes: dict | None = None,
-        deadline: "_Deadline | None" = None,
+        deadline: _Deadline | None = None,
     ) -> dict:
         payload: dict = {"num_shards": num_shards}
         if indexes is not None:
@@ -222,7 +239,7 @@ class _Api:
         body: dict,
         *,
         sync_level: str = "write",
-        deadline: "_Deadline | None" = None,
+        deadline: _Deadline | None = None,
     ) -> dict:
         payload = {"inserts": {doc_id: body}, "sync_level": sync_level}
         max_timeout = 120.0 if sync_level in {"enrichments", "full_index"} else 30.0
@@ -303,7 +320,7 @@ class _Api:
         doc_id: str,
         body: dict,
         *,
-        deadline: "_Deadline",
+        deadline: _Deadline,
     ) -> bool:
         reconcile_expires_at = min(
             deadline.expires_at,
@@ -641,7 +658,10 @@ def _doc_text(doc: dict) -> str:
 def _transient_poll_error(exc: requests.RequestException) -> bool:
     response = getattr(exc, "response", None)
     if response is not None:
-        return response.status_code >= 500
+        return response.status_code >= 500 or (
+            response.status_code == 409
+            and response.text.strip() == "read topology changed"
+        )
     return isinstance(
         exc,
         (
@@ -723,10 +743,18 @@ def _wait_for_mention_hydration(
     )
 
 
+@pytest.mark.parametrize("candidate_search", ["prefix", "exact_key"])
 def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
     resolution_cluster,
+    candidate_search,
 ):
+    _exercise_autograph(resolution_cluster, candidate_search)
+
+
+def _exercise_autograph(resolution_cluster, candidate_search):
     cluster = resolution_cluster
+    indexes = json.loads(json.dumps(DOCUMENTS_INDEXES))
+    indexes["relations_graph"]["resolvers"][0]["candidate_search"] = candidate_search
     api = _Api(cluster.data_api_urls[0], cluster)
 
     # Entities live in their own table (own shard group); documents are spread
@@ -737,7 +765,7 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
     api.create_table(
         "documents",
         num_shards=3,
-        indexes=DOCUMENTS_INDEXES,
+        indexes=indexes,
         deadline=_new_e2e_deadline(),
     )
 
@@ -766,15 +794,55 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
         deadline=_new_e2e_deadline(),
     )
 
-    # A second document mentioning the same person resolves (prefix blocking) to
-    # the existing entity rather than minting a new one; the entity persists with
-    # its canonical name.
+    # At least two coordinators must forward to the entity shard's owner.
+    # This covers decoding native physical table names on internal lookups.
+    for base_url in resolution_cluster.data_api_urls:
+        node_api = _Api(base_url, resolution_cluster)
+        try:
+            assert "Ada Lovelace" in _doc_text(
+                node_api.lookup("entities", "person/ada_lovelace")
+            )
+        finally:
+            node_api.s.close()
+
+    # A curated redirect makes exact-key candidate reads observable: minting
+    # without reading the existing candidate would choose the old key.
+    second_entity_key = "person/ada_lovelace"
+    if candidate_search == "exact_key":
+        second_entity_key = "person/ada_curated"
+        api.insert(
+            "entities",
+            second_entity_key,
+            {
+                "canonical_name": "Ada Lovelace",
+                "entity_type": "person",
+            },
+            sync_level="full_index",
+            deadline=_new_e2e_deadline(),
+        )
+        api.insert(
+            "entities",
+            "person/ada_lovelace",
+            {
+                "canonical_name": "Ada Lovelace",
+                "entity_type": "person",
+                "merged_into": second_entity_key,
+            },
+            sync_level="full_index",
+            deadline=_new_e2e_deadline(),
+        )
+
+    # Repeated mentions share candidate reads and retain the canonical redirect
+    # destination for every mention in both exact and prefix workloads.
     api.insert(
         "documents",
         "doc:b",
         {
             "relations": {
-                "entities": [{"id": "e0", "label": "person", "text": "Ada Lovelace"}]
+                "entities": [
+                    {"id": f"e{i}", "label": "person", "text": "Ada Lovelace"}
+                    for i in range(100)
+                ]
             }
         },
         deadline=_new_e2e_deadline(),
@@ -795,8 +863,90 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
     second_mentions = _wait_for_mention_hydration(
         api,
         start_node="doc:b",
-        expected_names={"person/ada_lovelace": "Ada Lovelace"},
+        expected_names={second_entity_key: "Ada Lovelace"},
         deadline=_new_e2e_deadline(),
     )
     second_node_keys = {node["key"] for node in second_mentions["nodes"]}
-    assert "person/ada_lovelace" in second_node_keys
+    assert second_entity_key in second_node_keys
+
+
+def test_multinode_exact_candidates_follow_redirects_across_entity_shards(
+    resolution_cluster,
+):
+    """A batch spans owners; redirects cross owners and duplicate mentions reuse it."""
+    api = _Api(resolution_cluster.data_api_urls[0], resolution_cluster)
+    indexes = json.loads(json.dumps(DOCUMENTS_INDEXES))
+    resolver = indexes["relations_graph"]["resolvers"][0]
+    resolver["candidate_search"] = "exact_key"
+    resolver["key_template"] = "{{ slug _entity.text }}"
+    api.create_table("entities", num_shards=8, deadline=_new_e2e_deadline())
+    api.create_table(
+        "documents", num_shards=3, indexes=indexes, deadline=_new_e2e_deadline()
+    )
+    expected = {}
+    names = ["0 Ada", "5 Grace", "a Alan", "f Edsger"]
+    for name, survivor in zip(
+        names, ["f_curated", "a_curated", "5_curated", "0_curated"]
+    ):
+        expected[survivor] = name
+        for key, fields in [
+            (survivor, {}),
+            (name.lower().replace(" ", "_"), {"merged_into": survivor}),
+        ]:
+            api.insert(
+                "entities",
+                key,
+                {"canonical_name": name, "entity_type": "person", **fields},
+                sync_level="full_index",
+                deadline=_new_e2e_deadline(),
+            )
+    api.insert(
+        "documents",
+        "7:batch",
+        {
+            "relations": {
+                "entities": [
+                    {"id": f"e{i}", "label": "person", "text": names[i % len(names)]}
+                    for i in range(100)
+                ]
+            }
+        },
+        deadline=_new_e2e_deadline(),
+    )
+    graph = _wait_for_mention_hydration(
+        api, start_node="7:batch", expected_names=expected, deadline=_new_e2e_deadline()
+    )
+    keys = {node["key"] for node in graph["nodes"]}
+    assert set(expected) <= keys
+    assert not {name.lower().replace(" ", "_") for name in names} & keys
+
+
+def test_multinode_autograph_deleted_target_does_not_fail_surviving_graph(
+    resolution_cluster,
+):
+    _exercise_autograph(resolution_cluster, "exact_key")
+    api = _Api(resolution_cluster.data_api_urls[0], resolution_cluster)
+    response = api.s.delete(f"{api.url}/tables/entities", timeout=30)
+    api._check(response)
+    result = api.query_table(
+        "documents",
+        {
+            "query": {"match_all": {}},
+            "graph_queries": {
+                "mentions": {
+                    "index": "relations_graph",
+                    "traverse": {
+                        "start": {"keys": ["doc:a"]},
+                        "edge_types": ["mentions"],
+                        "max_depth": 1,
+                        "limit": 10,
+                        "include_documents": True,
+                    },
+                }
+            },
+            "limit": 10,
+        },
+    )
+    graph = _graph_result(result, "mentions")
+    assert graph is not None
+    assert not any(node.get("table") == "entities" for node in graph.get("nodes", []))

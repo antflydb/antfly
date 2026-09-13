@@ -20,6 +20,7 @@ const addFilteredTestRunArtifactWithRuntimeFilters = @import("test_support.zig")
 const addFilteredTestRunArtifact = @import("test_support.zig").addFilteredTestRunArtifact;
 
 pub const AddTestsOptions = struct {
+    api_http_runtime_test_mod: *std.Build.Module,
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
     optimize: std.builtin.OptimizeMode,
@@ -283,9 +284,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
 
     const lib_resolution_source_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = options.api_http_runtime_test_mod,
         .filters = &.{
             "DistributedCandidateSource",
+            "SourceCandidateProvider",
             "prefixUpperBoundAlloc",
             "DistributedEntitySink",
         },

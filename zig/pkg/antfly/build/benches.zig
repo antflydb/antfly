@@ -28,6 +28,7 @@ const AntflyRootImports = @import("imports.zig").AntflyRootImports;
 const LmdbBackend = @import("storage.zig").LmdbBackend;
 
 pub const AddBenchmarksOptions = struct {
+    vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
     api_bench_standalone: bool,
     optimize: std.builtin.OptimizeMode,
@@ -66,6 +67,31 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_ha_compat_tests = options.run_lib_ha_compat_tests;
     const compiled_recall_tests = options.compiled_recall_tests;
+    const system_catalog_bench = b.addExecutable(.{
+        .name = "antfly-system-catalog-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/benchmarks/system_catalog.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    system_catalog_bench.root_module.addImport("system_catalog", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/system_catalog/domain.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    b.step("antfly-system-catalog-bench", "Benchmark indexed catalog lookups and mutation planning").dependOn(&b.addRunArtifact(system_catalog_bench).step);
+    const system_catalog_routing_bench = b.addExecutable(.{
+        .name = "antfly-system-catalog-routing-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/system_catalog_routing_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const catalog_bench_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
+    catalog_bench_imports.configure(b, system_catalog_routing_bench.root_module, true, true);
+    b.step("antfly-system-catalog-routing-bench", "Benchmark rebuilt and retained indexed routing generations").dependOn(&b.addRunArtifact(system_catalog_routing_bench).step);
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
     const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, true);
     const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_c);

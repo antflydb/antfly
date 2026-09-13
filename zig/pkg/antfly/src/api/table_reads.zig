@@ -3057,8 +3057,8 @@ test "table reads translate request deadlines into the routing clock" {
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, catalog.budget(lookupRoutingDeadline(catalog, opts)).checkpoint());
     // Same-domain conversion is identity, including already-expired values.
     try std.testing.expectEqual(@as(?u64, 123), lookupRoutingDeadline(catalog, .{ .execution_deadline_ns = 123, .execution_io = catalog.io }));
-    const native_catalog = table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
-    try std.testing.expectEqual(native_deadline, queryRoutingDeadline(native_catalog, req).?);
+    const native_routes = table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
+    try std.testing.expectEqual(native_deadline, queryRoutingDeadline(native_routes, req).?);
 }
 
 fn prepareProvisionedGroupConsistency(
@@ -3651,7 +3651,7 @@ pub const ProvisionedTableReadSource = struct {
             if (consistency == .stale) {
                 var activity = self.beginPreparedRead(table_name, kind);
                 errdefer if (activity) |*held| held.deinit();
-                const route = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, deadline_ns);
+                const route = try requestRoutedSpanSnapshot(alloc, self.catalog, table_name, from_key, to_key, request, deadline_ns);
                 const routes = route.routes;
                 const group_ids = route.group_ids;
                 var route_owned = true;
@@ -3672,7 +3672,7 @@ pub const ProvisionedTableReadSource = struct {
                 return .{ .alloc = alloc, .routes = routes, .group_ids = group_ids, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = route.table_id, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
             }
 
-            const route = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, deadline_ns);
+            const route = try requestRoutedSpanSnapshot(alloc, self.catalog, table_name, from_key, to_key, request, deadline_ns);
             const routes = route.routes;
             const group_ids = route.group_ids;
             var route_owned = true;
@@ -6147,9 +6147,10 @@ pub const HostedProvisionedTableReadSource = struct {
         hosted: *HostedProvisionedTableReadSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
-        req: db_mod.types.SearchRequest,
+        requested: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
+        var req = requested;
         try checkQueryDeadline(req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
             try table_catalog.RoutingSession.init(alloc, hosted.catalog, queryRoutingDeadline(hosted.catalog, req))
@@ -6159,15 +6160,17 @@ pub const HostedProvisionedTableReadSource = struct {
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();
         const self = &routed_source;
-        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(
-            alloc,
-            self.catalog,
-            table_name,
-            "",
-            "",
-            queryRoutingDeadline(self.catalog, req),
-        );
+        var route_snapshot = try requestRoutedSpanSnapshot(alloc, self.catalog, table_name, "", "", .{ .search = req }, queryRoutingDeadline(self.catalog, req));
         defer route_snapshot.deinit(alloc);
+        var lookup_groups: ?[]u64 = null;
+        defer if (lookup_groups) |groups| alloc.free(groups);
+        if (isDocumentLookupBatch(req)) {
+            var keyed = try routing_session.documentKeyRoutes(alloc, table_name, req.filter_doc_ids, queryRoutingDeadline(self.catalog, req));
+            defer keyed.span.deinit(alloc);
+            lookup_groups = keyed.key_groups;
+            req.document_lookup_groups = keyed.key_groups;
+            req.prepared_read_table_id = route_snapshot.table_id;
+        }
         const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return null;
         if (!(@import("builtin").is_test and self.testing_allow_non_global_graph_metric_fanout)) {
@@ -7094,6 +7097,10 @@ fn queryProvisionedAcrossGroupsParallel(
         ) void {
             const arena = slot.arena.allocator();
             var group_req = shard_req_inner.*;
+            _ = selectLookupKeysForGroup(arena, &group_req, group_id) catch |err| {
+                slot.err = err;
+                return;
+            };
             if (required_identity_generation) |generation| group_req.identity_read_generation = generation;
             slot.result = queryHostedLocal(
                 source.resident_db,
@@ -7182,6 +7189,10 @@ fn queryHostedAcrossGroupsParallel(
         ) void {
             const arena = slot.arena.allocator();
             var group_req = shard_req_inner.*;
+            _ = selectLookupKeysForGroup(arena, &group_req, group_id) catch |err| {
+                slot.err = err;
+                return;
+            };
             if (required_identity_generation) |generation| group_req.identity_read_generation = generation;
             slot.result = switch (route) {
                 .local => source.requireSearchResultLocal(arena, group_id, table_name_inner, group_req, consistency_inner) catch |err| {
@@ -10219,6 +10230,31 @@ fn queryProvisionedAcrossGroupsAtGenerations(
     return selected;
 }
 
+fn isDocumentLookupBatch(req: db_mod.types.SearchRequest) bool {
+    return req.filter_doc_ids_positive and req.filter_doc_ids.len > 0 and req.filter_doc_ids.len <= 256 and req.query == .match_all and
+        req.full_text == null and req.full_text_queries.len == 0 and req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.graph_queries.len == 0 and req.graph_metric_queries.len == 0 and req.graph_metric_rerank == null and req.hierarchy_children == null and !req.hierarchy_grouped_matches and req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and req.filter_text == null and req.exclusion_text == null and req.aggregations_json.len == 0 and !searchRequestHasResolvedDocFilter(req);
+}
+
+fn requestRoutedSpanSnapshot(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, from: []const u8, to: []const u8, request: ProvisionedConsistencyRequest, deadline: ?u64) !table_catalog.RoutedSpanSnapshot {
+    if (request == .search and from.len == 0 and to.len == 0 and isDocumentLookupBatch(request.search))
+        return table_catalog.routedDocumentKeysSnapshotUntil(alloc, catalog, table_name, request.search.filter_doc_ids, deadline);
+    return table_catalog.routedSpanSnapshotUntil(alloc, catalog, table_name, from, to, deadline);
+}
+
+fn selectLookupKeysForGroup(alloc: std.mem.Allocator, request: *db_mod.types.SearchRequest, group_id: u64) !?[][]const u8 {
+    if (request.document_lookup_groups.len == 0) return null;
+    if (request.document_lookup_groups.len != request.filter_doc_ids.len) return error.InvalidQueryRequest;
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer keys.deinit(alloc);
+    for (request.filter_doc_ids, request.document_lookup_groups) |key, owner| if (owner == group_id) {
+        try keys.append(alloc, key);
+    };
+    const owned = try keys.toOwnedSlice(alloc);
+    request.filter_doc_ids = owned;
+    request.document_lookup_groups = &.{};
+    return owned;
+}
+
 fn queryHostedAcrossGroups(
     self: *HostedProvisionedTableReadSource,
     alloc: std.mem.Allocator,
@@ -10400,6 +10436,8 @@ fn queryHostedAcrossGroupsPhase(
 
     for (group_ids, 0..) |group_id, i| {
         var group_req = fan_in_shard_req.req;
+        const lookup_keys = try selectLookupKeysForGroup(alloc, &group_req, group_id);
+        defer if (lookup_keys) |keys| alloc.free(keys);
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
@@ -19518,6 +19556,9 @@ fn queryResponseRemote(
     req: db_mod.types.SearchRequest,
 ) !query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
+    const prepared = try @import("prepared_query_routing.zig").encode(alloc, table_name, req);
+    defer if (prepared) |value| alloc.free(value);
+    client.prepared_query_routing = prepared;
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
     const timeout_ms = try queryRemainingTimeoutMs(req);
     var cancellation = queryRequestCancellation(req);
@@ -19549,6 +19590,9 @@ fn preflightRemote(
     max_work: u32,
 ) !db_mod.RuntimePreflightSummary {
     var client = http_client.ApiHttpClient.init(alloc, executor);
+    const prepared = try @import("prepared_query_routing.zig").encode(alloc, table_name, req);
+    defer if (prepared) |value| alloc.free(value);
+    client.prepared_query_routing = prepared;
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
     const timeout_ms = try queryRemainingTimeoutMs(req);
     var cancellation = queryRequestCancellation(req);
@@ -32738,6 +32782,142 @@ test "provisioned storage inspection uses table read admission" {
     try std.testing.expect((try source.source().observedDynamicFieldCapabilitySets(std.testing.allocator, "docs", .{})) == null);
     try std.testing.expectEqual(@as(usize, 2), tracker.begins);
     try std.testing.expectEqual(@as(usize, 2), tracker.ends);
+}
+
+test "system catalog document lookup batches partition keys without broadening empty filters" {
+    const alloc = std.testing.allocator;
+    var request: db_mod.types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "a", "z", "b" }, .document_lookup_groups = &.{ 11, 13, 11 } };
+    try std.testing.expect(isDocumentLookupBatch(request));
+    const selected = (try selectLookupKeysForGroup(alloc, &request, 11)).?;
+    defer alloc.free(selected);
+    try std.testing.expectEqual(@as(usize, 2), request.filter_doc_ids.len);
+    try std.testing.expectEqualStrings("a", request.filter_doc_ids[0]);
+    try std.testing.expectEqualStrings("b", request.filter_doc_ids[1]);
+    try std.testing.expect(request.filter_doc_ids_positive);
+    var excluded: db_mod.types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "a", "z" }, .document_lookup_groups = &.{ 11, 13 } };
+    const empty = (try selectLookupKeysForGroup(alloc, &excluded, 12)).?;
+    defer alloc.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), excluded.filter_doc_ids.len);
+    try std.testing.expect(excluded.filter_doc_ids_positive);
+    request.full_text = .{ .match_all = {} };
+    try std.testing.expect(!isDocumentLookupBatch(request));
+}
+
+test "system catalog document lookup shortcut excludes graph metric reads and reranking" {
+    var request: db_mod.types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{"a"} };
+    try std.testing.expect(isDocumentLookupBatch(request));
+    request.graph_metric_queries = &.{.{ .name = "rank", .query = .{ .index_name = "graph_idx", .metric_name = "pagerank" } }};
+    try std.testing.expect(!isDocumentLookupBatch(request));
+    request.graph_metric_queries = &.{};
+    request.graph_metric_rerank = .{ .index_name = "graph_idx", .metric_name = "pagerank" };
+    try std.testing.expect(!isDocumentLookupBatch(request));
+}
+
+test "system catalog parallel hosted candidate fanout sends only owned keys" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = @import("tables.zig").default_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 8, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 2;
+        }
+
+        fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, allocator: std.mem.Allocator, _: u64) !?[]u8 {
+            return try allocator.dupe(u8, "http://remote.test");
+        }
+    };
+
+    const Capture = struct {
+        keys_seen: std.atomic.Value(usize) = .init(0),
+        calls: std.atomic.Value(usize) = .init(0),
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const left = std.mem.indexOf(u8, req.body, "doc:a") != null;
+            const right = std.mem.indexOf(u8, req.body, "doc:z") != null;
+            _ = self.calls.fetchAdd(1, .monotonic);
+            _ = self.keys_seen.fetchAdd(@as(usize, @intFromBool(left)) + @intFromBool(right), .monotonic);
+            try std.testing.expect(left != right);
+            try std.testing.expectEqual(left, std.mem.indexOf(u8, req.uri, "/groups/7/") != null);
+            try std.testing.expectEqual(right, std.mem.indexOf(u8, req.uri, "/groups/8/") != null);
+            // Stop after wire capture; both fibers must still finish. This
+            // exercises the real parallel dispatch and serializer, not merely
+            // the partition helper or the final result set.
+            return error.CapturedCandidateRequest;
+        }
+    };
+    var capture = Capture{};
+    var routing = try table_catalog.RoutingSession.init(alloc, FakeCatalog.iface(), null);
+    defer routing.deinit();
+    var hosted = HostedProvisionedTableReadSource.init("unused", routing.catalog(), raft_mod.read_gate.alreadyReadSafeBarrier(), FakeRouter.iface(), .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } });
+    _ = hosted.withIo(&io_impl);
+    const req: db_mod.types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "doc:a", "doc:z" }, .document_lookup_groups = &.{ 7, 8 }, .limit = 100 };
+    try std.testing.expect(planQueryFanout(hosted.io_impl, 2, req).parallel);
+    var generations = [_]?u64{ null, null };
+    try std.testing.expectError(error.CapturedCandidateRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
+    try std.testing.expectEqual(@as(usize, 2), capture.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 2), capture.keys_seen.load(.monotonic));
 }
 
 test "graph metric shard request carries internal status without mutating public request" {

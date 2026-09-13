@@ -21689,10 +21689,9 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(local_location);
 
         const source_shard = plan.manifest.shards[0];
-        const group_id = if (plan.replace_existing)
-            (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null
-        else
-            source_shard.group_id;
+        // The source shard identifies the backup artifact. Publication always
+        // targets the current catalog incarnation, including restore-as-new.
+        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const restore_source: backup_restore.RestoreSource = .{

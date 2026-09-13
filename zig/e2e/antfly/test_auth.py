@@ -27,12 +27,11 @@ from pathlib import Path
 
 import pytest
 import requests
-
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     StatefulAntflyServer,
-    _standalone_stateful_command,
     _read_log_tail,
+    _standalone_stateful_command,
     antfly_public_api_url,
     lookup_key_path,
     maybe_preserve_tempdir,
@@ -49,7 +48,7 @@ AUTH_SETUP_RETRY_TIMEOUT_SECONDS = 30.0
 
 
 def _basic_auth(username: str, password: str) -> str:
-    raw = f"{username}:{password}".encode("utf-8")
+    raw = f"{username}:{password}".encode()
     return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
@@ -98,7 +97,7 @@ def _wait_until(predicate, timeout: float = 30.0, interval: float = 0.25):
     return None
 
 
-def _try_lookup(api: "AuthApi", table_name: str, key: str):
+def _try_lookup(api: AuthApi, table_name: str, key: str):
     try:
         return api.lookup_key(table_name, key)
     except requests.HTTPError as err:
@@ -111,7 +110,7 @@ def _try_lookup(api: "AuthApi", table_name: str, key: str):
 
 class AuthApi:
     def __init__(
-        self, base_url: str, server_ref: "StandaloneAuthServer | SplitAuthServer"
+        self, base_url: str, server_ref: StandaloneAuthServer | SplitAuthServer
     ):
         self.url = base_url.rstrip("/")
         self.auth_url = self._auth_url_from_db_url(self.url)
@@ -503,7 +502,8 @@ def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     assert write_resp.status_code == 403
 
     tables_resp = auth_api.s.get(f"{auth_api.url}/tables", timeout=30)
-    assert tables_resp.status_code == 403
+    assert tables_resp.status_code == 200
+    assert [table["name"] for table in tables_resp.json()] == ["docs"]
 
     auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
     escalated = auth_api.s.post(
@@ -666,7 +666,8 @@ def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
     assert write_resp.status_code == 403
 
     tables_resp = stateful_auth_api.request_raw("GET", "/tables", timeout=30)
-    assert tables_resp.status_code == 403
+    assert tables_resp.status_code == 200
+    assert [table["name"] for table in tables_resp.json()] == ["docs"]
 
     admin_resp = stateful_auth_api.request_raw("GET", "/auth/v1/users", timeout=30)
     assert admin_resp.status_code == 403
@@ -739,3 +740,212 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(
     assert [entry["_id"] for entry in scan_result] == ["doc:gold"]
     assert scan_result[0]["tier"] == "gold"
     assert scan_result[0]["title"] == "gold doc"
+
+
+@pytest.mark.parametrize("fixture_name", ["auth_api", "stateful_auth_api"])
+def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name):
+    api = request.getfixturevalue(fixture_name)
+    api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    api.post("/databases/tenant", {})
+    for namespace in ("allowed", "secret"):
+        api.post(f"/databases/tenant/namespaces/{namespace}", {})
+        path = f"/databases/tenant/namespaces/{namespace}/tables/events"
+        api.post(path, {"num_shards": 1})
+        api.post(
+            path + "/batch",
+            {
+                "inserts": {"gold": {"tier": "gold"}, "silver": {"tier": "silver"}},
+                "sync_level": "full_index",
+            },
+        )
+    api.post(
+        "/auth/v1/users/reader",
+        {
+            "password": "reader",
+            "initial_policies": [
+                {
+                    "table_target": {
+                        "database": "tenant",
+                        "namespace": "allowed",
+                        "table": "events",
+                    },
+                    "resource_type": "table",
+                    "type": "read",
+                }
+            ],
+        },
+    )
+    api.put(
+        "/auth/v1/users/reader/row-filters/events?database=tenant&namespace=allowed",
+        {"term": {"tier": "gold"}},
+    )
+    api.s.headers["Authorization"] = _basic_auth("reader", "reader")
+    for path in ("/databases/tenant/namespaces/allowed/tables/events",):
+        assert api.get(path + "/documents/gold") == {"tier": "gold"}
+        hidden = api.s.get(api.url + path + "/documents/silver", timeout=30)
+        assert hidden.status_code == 404, hidden.text
+        result = api.post(
+            path + "/query", {"full_text_search": {"match_all": {}}, "limit": 10}
+        )
+        response = result["responses"][0]
+        assert response["table"] == "tenant.allowed.events"
+        assert response["hits"]["total"]["value"] == 1
+        assert [hit["_id"] for hit in response["hits"]["hits"]] == ["gold"]
+        joined = api.post(
+            path + "/query",
+            {
+                "full_text_search": {"match_all": {}},
+                "join": {
+                    "right_target": {
+                        "database": "tenant",
+                        "namespace": "allowed",
+                        "table": "events",
+                    },
+                    "on": {"left_field": "tier", "right_field": "tier"},
+                    "right_fields": ["tier"],
+                },
+                "limit": 10,
+            },
+        )["responses"][0]
+        assert len(joined["hits"]["hits"]) == 1, joined
+        assert (
+            joined["hits"]["hits"][0]["_source"]["tenant.allowed.events.tier"] == "gold"
+        )
+        forbidden = api.s.post(
+            api.url + path + "/batch", json={"inserts": {"bad": {}}}, timeout=30
+        )
+        assert forbidden.status_code == 403, forbidden.text
+        forbidden = api.s.post(
+            api.url + path + "/indexes/graph_idx/graph-metrics/rank:pause",
+            json={},
+            timeout=30,
+        )
+        assert forbidden.status_code == 403, forbidden.text
+    for path in ("/databases/tenant/namespaces/secret/tables/events",):
+        forbidden = api.s.get(api.url + path + "/documents/gold", timeout=30)
+        assert forbidden.status_code == 403, forbidden.text
+    line = {
+        "table_target": {
+            "database": "tenant",
+            "namespace": "allowed",
+            "table": "events",
+        },
+        "full_text_search": {"match_all": {}},
+        "limit": 10,
+    }
+    allowed = api.s.post(
+        api.url + "/query",
+        data=json.dumps(line) + "\n",
+        headers={"Content-Type": "application/x-ndjson"},
+        timeout=30,
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["responses"][0]["table"] == "tenant.allowed.events"
+    assert allowed.json()["responses"][0]["hits"]["total"]["value"] == 1
+    denied = api.s.post(
+        api.url + "/query",
+        data=json.dumps(line)
+        + "\n"
+        + json.dumps(
+            {
+                **line,
+                "table_target": {
+                    "database": "tenant",
+                    "namespace": "secret",
+                    "table": "events",
+                },
+            }
+        )
+        + "\n",
+        headers={"Content-Type": "application/x-ndjson"},
+        timeout=30,
+    )
+    assert denied.status_code == 403, denied.text
+    api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    original = api.get("/databases/tenant/namespaces/allowed/tables/events")["table_id"]
+    api.post("/databases/tenant/namespaces/allowed/rename", {"name": "moved"})
+    assert (
+        api.get("/databases/tenant/namespaces/moved/tables/events")["table_id"]
+        == original
+    )
+    missing = api.s.get(
+        api.url + "/databases/tenant/namespaces/allowed/tables/events", timeout=30
+    )
+    assert missing.status_code == 404, missing.text
+    api.s.headers["Authorization"] = _basic_auth("reader", "reader")
+    denied = api.s.get(
+        api.url + "/databases/tenant/namespaces/moved/tables/events/documents/gold",
+        timeout=30,
+    )
+    assert denied.status_code == 403, denied.text
+    api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    api.delete("/databases/tenant/namespaces/moved/tables/events")
+    api.delete("/databases/tenant/namespaces/secret/tables/events")
+    api.delete("/databases/tenant")
+
+
+def test_system_catalog_exact_star_grant_is_not_global(auth_api):
+    api = auth_api
+    api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    api.post("/tables/%21", {"num_shards": 1})
+    for name in ("%2A", "other"):
+        api.post("/tables/" + name, {"num_shards": 1})
+        api.post(
+            "/tables/" + name + "/batch",
+            {
+                "inserts": {"gold": {"tier": "gold"}, "silver": {"tier": "silver"}},
+                "sync_level": "full_index",
+            },
+        )
+    api.post(
+        "/auth/v1/users/star_reader",
+        {
+            "password": "reader",
+            "initial_policies": [
+                {
+                    "resource_type": "table",
+                    "table_target": {"table": "*"},
+                    "type": "read",
+                }
+            ],
+        },
+    )
+    api.put(
+        "/auth/v1/users/star_reader/row-filters/%2A?database=default&namespace=public",
+        {"term": {"tier": "gold"}},
+    )
+    api.s.headers["Authorization"] = _basic_auth("star_reader", "reader")
+    assert api.get("/tables/%2A/documents/gold") == {"tier": "gold"}
+    assert (
+        api.s.get(api.url + "/tables/%2A/documents/silver", timeout=30).status_code
+        == 404
+    )
+    assert (
+        api.s.get(api.url + "/tables/other/documents/gold", timeout=30).status_code
+        == 403
+    )
+    assert api.get("/tables/%2A")["name"] == "*"
+    assert api.s.get(api.url + "/tables/other", timeout=30).status_code == 403
+    assert [table["name"] for table in api.get("/tables")] == ["*"]
+    # A bounded page can contain only denied rows. Its cursor must advance
+    # without exposing private names or granting access on the next request.
+    response = api.s.get(api.url + "/tables", params={"limit": 1}, timeout=30)
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+    cursor = response.headers["X-Antfly-Next-Cursor"]
+    response = api.s.get(
+        api.url + "/tables", params={"limit": 1, "cursor": cursor}, timeout=30
+    )
+    assert response.status_code == 200, response.text
+    assert [table["name"] for table in response.json()] == ["*"]
+    cursor = response.headers["X-Antfly-Next-Cursor"]
+    response = api.s.get(
+        api.url + "/tables", params={"limit": 1, "cursor": cursor}, timeout=30
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+    assert "X-Antfly-Next-Cursor" not in response.headers
+    api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    api.delete("/tables/%2A")
+    api.delete("/tables/other")
+    api.delete("/tables/%21")

@@ -1,0 +1,1137 @@
+{
+  "date": "2026-09-12",
+  "source": "44a94167bfb1ddc2766905be809ae61c31533c8d",
+  "baseline_source": "fd4745718ad4d835e687a871458e0f8887a0545c",
+  "merged_main": "014424f599679e99c99b3c1025fc91af35ba23b8",
+  "merge_commit": "8d242c237",
+  "environment": {
+    "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+    "architecture": "arm64",
+    "zig": "0.16.0",
+    "component_optimize": "ReleaseFast",
+    "allocator": "c_allocator",
+    "application_optimize": "Debug",
+    "task_owned_work": "All task-owned builds/tests completed before timing. Benchmarks ran sequentially.",
+    "host_activity": "Unrelated host activity uncontrolled; an unrelated Antfly swarm was running and was left untouched."
+  },
+  "measurement_scope": {
+    "retry": "Same production harness, separately compiled pristine baseline and implementation transports; setup/network excluded; nine samples. Delivery count and empty final queue verified.",
+    "scheduler": "Same binary: reproduced global FIFO versus production ready-peer queue. Same frame freeing/accounting; reference omits old in-flight hash work. Setup/network excluded; nine samples.",
+    "admission": "Same binary: reproduced prior clone/compare/owned-apply versus production admission with borrowed prior. Separate equal report slices, unchanged/header-change repair inventories, allocation/free balance. Proposal sink excludes encoding/replication/commit; nine samples.",
+    "storage": "Cross-revision before/after observations include the graph main merge; not an isolated attribution to the local codec. Seven samples. Full command decoding/projection/checkpoint/commit included, network/replication/callback fanout excluded. Caller hydration allocations counted separately from latency.",
+    "applications": "Unpaired disposable standalone provisioning/restart and scoped packed-row query workloads; verify functional results, do not establish distributed capacity."
+  },
+  "before_original": [
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 0.247,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 0.242,
+      "wal_bytes_per_apply": 4280,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 0.249,
+      "wal_bytes_per_apply": 14591,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 0.231,
+      "wal_bytes_per_apply": 22886,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 0.138,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 82218,
+      "command_bytes": 12424
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "full_store_read_p50_ms": 0.056
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "placement_drain_read_p50_ms": 0.00661
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 1.35,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 1.202,
+      "wal_bytes_per_apply": 35324,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 1.158,
+      "wal_bytes_per_apply": 14591,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 1.141,
+      "wal_bytes_per_apply": 223766,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 0.529,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 821118,
+      "command_bytes": 123124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "full_store_read_p50_ms": 0.509
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "placement_drain_read_p50_ms": 0.00581
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 15.082,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 21.124,
+      "wal_bytes_per_apply": 347228,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 16.62,
+      "wal_bytes_per_apply": 14591,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 21.533,
+      "wal_bytes_per_apply": 2233295,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 8.531,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 8210118,
+      "command_bytes": 1230124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "full_store_read_p50_ms": 5.617
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "placement_drain_read_p50_ms": 0.00574
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 1000,
+      "repair": false,
+      "p50_ms": 0.001
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 1000,
+      "repair": true,
+      "p50_ms": 0.574
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 10000,
+      "repair": false,
+      "p50_ms": 0.012
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 10000,
+      "repair": true,
+      "p50_ms": 5.716
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 1,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 0.017
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 1,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.016
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 10,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 0.16
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 10,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.015
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 100,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 1.519
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 100,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.013
+    }
+  ],
+  "before_reports_rerun": [
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 0.318,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 0.292,
+      "wal_bytes_per_apply": 4280,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 0.293,
+      "wal_bytes_per_apply": 14591,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 0.302,
+      "wal_bytes_per_apply": 22886,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 0.161,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 82218,
+      "command_bytes": 12424
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "full_store_read_p50_ms": 0.067
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "placement_drain_read_p50_ms": 0.00822
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 1.575,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 1.349,
+      "wal_bytes_per_apply": 35324,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 1.196,
+      "wal_bytes_per_apply": 14591,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 1.226,
+      "wal_bytes_per_apply": 223766,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 0.528,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 821118,
+      "command_bytes": 123124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "full_store_read_p50_ms": 0.494
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "placement_drain_read_p50_ms": 0.00582
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 14.916,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 20.231,
+      "wal_bytes_per_apply": 347228,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 16.879,
+      "wal_bytes_per_apply": 14591,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 21.674,
+      "wal_bytes_per_apply": 2233295,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 8.412,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 8210118,
+      "command_bytes": 1230124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "full_store_read_p50_ms": 5.19
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "placement_drain_read_p50_ms": 0.00571
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 1000,
+      "repair": false,
+      "p50_ms": 0.001
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 1000,
+      "repair": true,
+      "p50_ms": 0.568
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 10000,
+      "repair": false,
+      "p50_ms": 0.012
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 10000,
+      "repair": true,
+      "p50_ms": 5.782
+    }
+  ],
+  "after_reports": [
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 0.264,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 0.236,
+      "wal_bytes_per_apply": 4280,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 0.25,
+      "wal_bytes_per_apply": 10111,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 0.236,
+      "wal_bytes_per_apply": 15886,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 0.158,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 82218,
+      "command_bytes": 12424
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "full_store_read_p50_ms": 0.043
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "full_store_read_allocations": 412,
+      "full_store_read_allocated_bytes": 114887
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 100,
+      "placement_drain_read_p50_ms": 0.00636
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 1.289,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 1.153,
+      "wal_bytes_per_apply": 35324,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 1.146,
+      "wal_bytes_per_apply": 10111,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 1.121,
+      "wal_bytes_per_apply": 153766,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 0.477,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 821118,
+      "command_bytes": 123124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "full_store_read_p50_ms": 0.311
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "full_store_read_allocations": 4014,
+      "full_store_read_allocated_bytes": 1216197
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 1000,
+      "placement_drain_read_p50_ms": 0.00569
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 15.223,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 20.619,
+      "wal_bytes_per_apply": 347228,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 16.702,
+      "wal_bytes_per_apply": 10111,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 20.737,
+      "wal_bytes_per_apply": 1533295,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 8.076,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 8210118,
+      "command_bytes": 1230124
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "full_store_read_p50_ms": 3.345
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "full_store_read_allocations": 40015,
+      "full_store_read_allocated_bytes": 12609697
+    },
+    {
+      "workload": "REPORT_BENCH",
+      "groups": 10000,
+      "placement_drain_read_p50_ms": 0.00584
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 1000,
+      "repair": false,
+      "p50_ms": 0.001
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 1000,
+      "repair": true,
+      "p50_ms": 0.607
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 10000,
+      "repair": false,
+      "p50_ms": 0.011
+    },
+    {
+      "workload": "REPAIR_ADMISSION_BENCH",
+      "groups": 10000,
+      "repair": true,
+      "p50_ms": 5.735
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 1,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 0.016
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 1,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.016
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 10,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 0.162
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 10,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.018
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 100,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 1.488
+    },
+    {
+      "workload": "ADMISSION_CACHE_BENCH",
+      "stores": 100,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.013
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 100,
+      "header_change": false,
+      "single_pass": false,
+      "p50_ms": 0.11,
+      "allocations": 763
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 100,
+      "header_change": false,
+      "single_pass": true,
+      "p50_ms": 0.047,
+      "allocations": 33
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 100,
+      "header_change": true,
+      "single_pass": false,
+      "p50_ms": 0.111,
+      "allocations": 1465
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 100,
+      "header_change": true,
+      "single_pass": true,
+      "p50_ms": 0.057,
+      "allocations": 736
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 1000,
+      "header_change": false,
+      "single_pass": false,
+      "p50_ms": 1.307,
+      "allocations": 7111
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 1000,
+      "header_change": false,
+      "single_pass": true,
+      "p50_ms": 0.586,
+      "allocations": 57
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 1000,
+      "header_change": true,
+      "single_pass": false,
+      "p50_ms": 1.395,
+      "allocations": 14113
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 1000,
+      "header_change": true,
+      "single_pass": true,
+      "p50_ms": 0.718,
+      "allocations": 7060
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 10000,
+      "header_change": false,
+      "single_pass": false,
+      "p50_ms": 13.314,
+      "allocations": 70147
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 10000,
+      "header_change": false,
+      "single_pass": true,
+      "p50_ms": 5.91,
+      "allocations": 75
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 10000,
+      "header_change": true,
+      "single_pass": false,
+      "p50_ms": 14.464,
+      "allocations": 140149
+    },
+    {
+      "workload": "ADMISSION_PLAN_BENCH",
+      "groups": 10000,
+      "header_change": true,
+      "single_pass": true,
+      "p50_ms": 8.442,
+      "allocations": 70078
+    }
+  ],
+  "retry_before": [
+    {
+      "workload": "RETRY_DRAIN",
+      "groups": 100,
+      "p50_ms": 0.007,
+      "frames": 100
+    },
+    {
+      "workload": "RETRY_DRAIN",
+      "groups": 1000,
+      "p50_ms": 0.354,
+      "frames": 1000
+    },
+    {
+      "workload": "RETRY_DRAIN",
+      "groups": 4096,
+      "p50_ms": 9.168,
+      "frames": 4096
+    }
+  ],
+  "retry_after": [
+    {
+      "workload": "RETRY_DRAIN",
+      "groups": 100,
+      "p50_ms": 0.002,
+      "frames": 100
+    },
+    {
+      "workload": "RETRY_DRAIN",
+      "groups": 1000,
+      "p50_ms": 0.015,
+      "frames": 1000
+    },
+    {
+      "workload": "RETRY_DRAIN",
+      "groups": 4096,
+      "p50_ms": 0.064,
+      "frames": 4096
+    }
+  ],
+  "scheduler": [
+    {
+      "workload": "HTTP_SCHEDULER_BENCH",
+      "frames": 256,
+      "ready_peers": false,
+      "p50_ms": 0.031
+    },
+    {
+      "workload": "HTTP_SCHEDULER_BENCH",
+      "frames": 256,
+      "ready_peers": true,
+      "p50_ms": 0.01
+    },
+    {
+      "workload": "HTTP_SCHEDULER_BENCH",
+      "frames": 1024,
+      "ready_peers": false,
+      "p50_ms": 0.395
+    },
+    {
+      "workload": "HTTP_SCHEDULER_BENCH",
+      "frames": 1024,
+      "ready_peers": true,
+      "p50_ms": 0.041
+    },
+    {
+      "workload": "HTTP_SCHEDULER_BENCH",
+      "frames": 4096,
+      "ready_peers": false,
+      "p50_ms": 9.691
+    },
+    {
+      "workload": "HTTP_SCHEDULER_BENCH",
+      "frames": 4096,
+      "ready_peers": true,
+      "p50_ms": 0.15
+    }
+  ],
+  "applications": {
+    "relational_catalog": {
+      "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+      "binary_sha256": "dbe7f5cc7bef8e26174bc16eb7c34bdb50b8f5efbc54fdf8aa661fbdc797e7cd",
+      "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+      "settings": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "scenario": "catalog",
+        "deployment": "standalone",
+        "restart_after_ddl": false,
+        "listing_distinct_schemas": false,
+        "listing_page_size": 0,
+        "listing_concurrent": false,
+        "listing_reader_rate": 0,
+        "table_counts": [
+          10
+        ],
+        "resolution_workload": "exact",
+        "schema_fields": 0,
+        "tenant_counts": [
+          10,
+          100
+        ],
+        "storage_mode": "relational",
+        "entity_shards": 1,
+        "entity_key_layout": "clustered",
+        "mentions": [
+          10,
+          100
+        ],
+        "documents": 5,
+        "concurrency": 8,
+        "samples": 9,
+        "warmup": 2,
+        "ndjson_lines": 20,
+        "poll_ms": 20,
+        "readiness_timeout": 115,
+        "output": "/private/tmp/catalog-round12-app-relational.json"
+      },
+      "scenarios": {
+        "catalog": {
+          "deployment": "standalone",
+          "startup_ms": 643.2341667823493,
+          "checkpoints": [
+            {
+              "table_count": 10,
+              "table_create": {
+                "samples": 10,
+                "p50_ms": 23.957709,
+                "p95_ms": 38.392625,
+                "max_ms": 38.392625
+              },
+              "shard_readiness": {
+                "samples": 10,
+                "p50_ms": 0.0,
+                "p95_ms": 0.0,
+                "max_ms": 0.0
+              },
+              "operations": {
+                "qualified_lookup": {
+                  "samples": 9,
+                  "p50_ms": 0.456292,
+                  "p95_ms": 0.556125,
+                  "max_ms": 0.556125
+                },
+                "qualified_query": {
+                  "samples": 9,
+                  "p50_ms": 0.606375,
+                  "p95_ms": 0.644667,
+                  "max_ms": 0.644667
+                },
+                "qualified_join": {
+                  "samples": 9,
+                  "p50_ms": 1.129958,
+                  "p95_ms": 1.2355,
+                  "max_ms": 1.2355
+                },
+                "ndjson_repeated_target": {
+                  "samples": 9,
+                  "p50_ms": 4.795667,
+                  "p95_ms": 5.062375,
+                  "max_ms": 5.062375
+                },
+                "scoped_listing": {
+                  "samples": 9,
+                  "p50_ms": 2.363625,
+                  "p95_ms": 2.554709,
+                  "max_ms": 2.554709
+                },
+                "concurrent_qualified_lookup": {
+                  "samples": 72,
+                  "p50_ms": 1.9377495,
+                  "p95_ms": 3.3655,
+                  "max_ms": 4.030042,
+                  "concurrency": 8,
+                  "elapsed_seconds": 0.019467042,
+                  "requests_per_second": 3698.5588257322297
+                },
+                "table_rename": {
+                  "samples": 9,
+                  "p50_ms": 0.574459,
+                  "p95_ms": 0.597458,
+                  "max_ms": 0.597458
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "management_restart": {
+      "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+      "binary_sha256": "dbe7f5cc7bef8e26174bc16eb7c34bdb50b8f5efbc54fdf8aa661fbdc797e7cd",
+      "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+      "settings": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "scenario": "management",
+        "deployment": "standalone",
+        "restart_after_ddl": true,
+        "listing_distinct_schemas": false,
+        "listing_page_size": 0,
+        "listing_concurrent": false,
+        "listing_reader_rate": 0,
+        "table_counts": [
+          10,
+          100
+        ],
+        "resolution_workload": "exact",
+        "schema_fields": 0,
+        "tenant_counts": [
+          10
+        ],
+        "storage_mode": "document",
+        "entity_shards": 1,
+        "entity_key_layout": "clustered",
+        "mentions": [
+          10,
+          100
+        ],
+        "documents": 5,
+        "concurrency": 8,
+        "samples": 9,
+        "warmup": 2,
+        "ndjson_lines": 20,
+        "poll_ms": 20,
+        "readiness_timeout": 115,
+        "output": "/private/tmp/catalog-round12-app-management.json"
+      },
+      "scenarios": {
+        "management": {
+          "deployment": "standalone",
+          "startup_ms": 695.3042079694569,
+          "checkpoints": [
+            {
+              "tenant_count": 10,
+              "restart_recovery": {
+                "elapsed_ms": 823.195459,
+                "verified_databases": 11
+              },
+              "database_create": {
+                "samples": 10,
+                "p50_ms": 1.324667,
+                "p95_ms": 5.152208,
+                "max_ms": 5.152208
+              },
+              "operations": {
+                "point_get": {
+                  "samples": 9,
+                  "p50_ms": 0.544625,
+                  "p95_ms": 0.647458,
+                  "max_ms": 0.647458
+                },
+                "list_databases": {
+                  "samples": 9,
+                  "p50_ms": 0.607791,
+                  "p95_ms": 0.695125,
+                  "max_ms": 0.695125
+                },
+                "namespace_create_drop": {
+                  "samples": 9,
+                  "p50_ms": 1.247041,
+                  "p95_ms": 2.754,
+                  "max_ms": 2.754
+                },
+                "rename_round_trip": {
+                  "samples": 9,
+                  "p50_ms": 1.492709,
+                  "p95_ms": 1.935666,
+                  "max_ms": 1.935666
+                },
+                "concurrent_reads": {
+                  "samples": 36,
+                  "p50_ms": 2.3317085,
+                  "p95_ms": 5.966166,
+                  "max_ms": 6.574708
+                },
+                "concurrent_namespace_create_drop": {
+                  "samples": 36,
+                  "p50_ms": 4.2840205000000005,
+                  "p95_ms": 8.809333,
+                  "max_ms": 10.001292
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "binary_sha256": {
+    "retry_before": "0842939525cbb505a65173c4bae71560626b7b23aef5f8645de5c7bd7612ec0f",
+    "retry_after": "39ed1109c5d6cf11184fb2a2c813616eb1d8d29d46ada810c6a3ee2be11f5eea",
+    "report_before": "a6ade6fc3bad22a83f13452eafecc08a1b279ee49b4dfa43b8f9ae2c29203660",
+    "server": "dbe7f5cc7bef8e26174bc16eb7c34bdb50b8f5efbc54fdf8aa661fbdc797e7cd",
+    "report_after": "96fdf67f31168cb46394eafa1a61a10d5416706904a3ace1fed5f949b355b8b8",
+    "report_after_1": "a03b6aa8a26cc32a9417c6e03c8970ea2e20106583cb0b31822e3129aa80f212",
+    "scheduler": "471fd13e2671bd964eb32bc55782edd1e9a9c4e32f56a1f8f3b7e0fb61da1ac7"
+  },
+  "validation_limitations": [
+    "Focused checks, not a full repository suite.",
+    "At the benchmark revision, Raft Debug passed all 409 tests and ReleaseFast passed 403, with six joint-consensus trace failures also reproduced on pristine baseline. Resolved by the harness-only validation follow-up recorded below."
+  ],
+  "validation": {
+    "catalog_store": 73,
+    "catalog_durability": 26,
+    "catalog_transport": 9,
+    "metadata_service": 123,
+    "catalog_standalone": 61,
+    "catalog_api": 60,
+    "http_transport": 48,
+    "http_router": 20,
+    "store_observer": 15,
+    "graph_fan_in": 54,
+    "graph_remote_wire": 14,
+    "raft_debug": 409,
+    "e2e": "23 passed in the combined run; all three remaining graph/auth cases passed after the router fix (26 total selected cases).",
+    "sdk": "Go packages, Rust 16 tests, Python 14 response tests, TypeScript 286 passed/one skipped and typecheck, generated Zig API check."
+  },
+  "commands": {
+    "precompile": "zig build antfly-system-catalog-report-bench antfly-http-scheduler-bench -Doptimize=ReleaseFast -j1",
+    "reports": "ANTFLY_CATALOG_REPORT_BENCH=1 zig build antfly-system-catalog-report-bench -Doptimize=ReleaseFast -j1",
+    "scheduler": "ANTFLY_HTTP_SCHEDULER_BENCH=1 zig build antfly-http-scheduler-bench -Doptimize=ReleaseFast -j1",
+    "retry": "zig build retry-bench -Doptimize=ReleaseFast -j1 (from zig/lib/raft; baseline compiled with same bench/retries.zig and pristine fd4745718 library sources)",
+    "relational": "uv run --project e2e/antfly python tools/benchmark_system_catalog.py --scenario catalog --deployment standalone --storage-mode relational --table-counts 10 --samples 9 --warmup 2 --output /tmp/catalog-relational.json",
+    "management": "uv run --project e2e/antfly python tools/benchmark_system_catalog.py --scenario management --deployment standalone --tenant-counts 10 --restart-after-ddl --samples 9 --warmup 2 --output /tmp/catalog-management.json"
+  },
+  "validation_follow_up": {
+    "source_commit": "c5a91d4af95f933e3d0c9fb37df541aafdc807a1",
+    "scope": "Simulation harness membership ownership and Ready message publication ordering; production code and benchmark measurements unchanged.",
+    "resolved_trace_failures": 6,
+    "raft_tests_passed": {
+      "Debug": 410,
+      "ReleaseSafe": 410,
+      "ReleaseFast": 410
+    },
+    "unchanged_traces_matched_etcd_raft_v3_6_0": 6,
+    "regression": "Both configuration-change formats retain exactly two messages. Old Debug retained four; old ReleaseFast retained one.",
+    "commands": [
+      "zig build test -Doptimize=Debug --summary all (from zig/lib/raft)",
+      "zig build test -Doptimize=ReleaseSafe --summary all (from zig/lib/raft)",
+      "zig build test -Doptimize=ReleaseFast --summary all (from zig/lib/raft)",
+      "go run . -trace ../../src/testing/testdata/<fixture>.json (from zig/lib/raft/tools/tracecmp, for each of the six affected fixtures)"
+    ]
+  }
+}

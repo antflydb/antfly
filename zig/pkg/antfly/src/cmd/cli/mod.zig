@@ -17,6 +17,9 @@ const platform = @import("antfly_platform");
 const antfly_client = @import("antfly-client");
 const httpx = @import("httpx");
 
+pub const database_cmd = @import("database.zig");
+pub const namespace_cmd = @import("namespace.zig");
+pub const tablespace = @import("tablespace.zig");
 pub const table = @import("table.zig");
 pub const index = @import("index.zig");
 pub const artifact = @import("artifact.zig");
@@ -33,6 +36,35 @@ pub const GlobalConfig = struct {
     url: []const u8 = "http://127.0.0.1:8080",
     token: ?[]const u8 = null,
     output: OutputFormat = .json,
+};
+
+pub const CatalogFlags = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+
+    pub const Explicit = struct {
+        database: []const u8,
+        namespace: []const u8,
+    };
+
+    pub fn defaultsFromEnv() CatalogFlags {
+        return .{
+            .database = @import("antfly_platform").env.getenv("ANTFLY_DATABASE"),
+            .namespace = @import("antfly_platform").env.getenv("ANTFLY_NAMESPACE"),
+        };
+    }
+
+    pub fn explicit(self: CatalogFlags) ?Explicit {
+        if (self.database == null and self.namespace == null) return null;
+        return .{
+            .database = self.database orelse fatal("--database is required when --namespace is set or ANTFLY_NAMESPACE is configured", .{}),
+            .namespace = self.namespace orelse fatal("--namespace is required when --database is set or ANTFLY_DATABASE is configured", .{}),
+        };
+    }
+
+    pub fn databaseOrFatal(self: CatalogFlags) []const u8 {
+        return self.database orelse fatal("--database is required or ANTFLY_DATABASE must be configured", .{});
+    }
 };
 
 pub fn isHelpArg(arg: []const u8) bool {
@@ -126,6 +158,10 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
 pub fn printCommandUsage(command: []const u8) void {
     const usage = commandUsage(command) orelse return;
     std.debug.print("{s}", .{usage});
+    for ([_][]const u8{ "table", "index", "query", "lookup", "load", "insert", "delete", "backup", "restore" }) |name| if (std.mem.eql(u8, command, name)) {
+        std.debug.print("\nTable scope: --database NAME --namespace NAME (defaults: default/public).\nTable names are literal; dots do not select a namespace.\n", .{});
+        break;
+    };
 }
 
 pub fn takeUniqueValue(

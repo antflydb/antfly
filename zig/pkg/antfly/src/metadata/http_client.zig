@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const store_report_update = @import("store_report_update.zig");
+const system_catalog = @import("../system_catalog/domain.zig");
 const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const tables_api = @import("../api/tables.zig");
@@ -581,14 +583,41 @@ pub const MetadataHttpClient = struct {
         try self.requestNoBody(base_uri, .DELETE, path, null, null, null);
     }
 
-    pub fn reportNodeStatus(
-        self: *MetadataHttpClient,
-        base_uri: []const u8,
-        body: []const u8,
-    ) !void {
-        const status_route = try nodeStatusRouteForBody(self.alloc, body);
-        defer self.alloc.free(status_route);
-        try self.requestWithBody(base_uri, .POST, status_route, body, error.InvalidStoreStatusRequest, error.UnknownStore, null);
+    pub fn reportNodeStatus(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !void {
+        _ = try self.reportNodeStatusWithReferenceSupport(base_uri, body);
+    }
+
+    pub fn reportNodeStatusWithReferenceSupport(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !bool {
+        const route = try nodeStatusRouteForBody(self.alloc, body);
+        defer self.alloc.free(route);
+        const uri = try join(self.alloc, base_uri, route);
+        defer self.alloc.free(uri);
+        var resp = try self.executeWithRetry(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms });
+        defer resp.deinit(self.alloc);
+        try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnknownStore, null);
+        return responseHasHeaderValueAnyStatus(resp, metadata_table_manager.store_runtime_reference_header, "1");
+    }
+
+    pub fn reportNodeUpdate(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8) !store_report_update.Cursor {
+        const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/nodes/{d}/status/update", .{store_id});
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        var resp = try self.executeWithRetry(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms });
+        defer resp.deinit(self.alloc);
+        if (resp.status == 405) return error.UnsupportedOperation;
+        try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch);
+        var parsed = try std.json.parseFromSlice(store_report_update.Cursor, self.alloc, resp.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    pub fn reportNodeHeartbeat(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !void {
+        const route = try nodeStatusRouteForBody(self.alloc, body);
+        defer self.alloc.free(route);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/heartbeat", .{route});
+        defer self.alloc.free(path);
+        try self.requestWithBody(base_uri, .POST, path, body, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch);
     }
 
     pub fn upsertSchemaProgress(
@@ -792,6 +821,93 @@ pub const MetadataHttpClient = struct {
         );
     }
 
+    pub const CatalogRead = struct {
+        body: []u8,
+        metadata_group_id: u64,
+        metadata_incarnation: metadata_api.MetadataClusterIncarnation,
+
+        pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.body);
+        }
+    };
+
+    /// Read-only retries are safe. The response proves the metadata identity;
+    /// callers need no preceding status/discovery round trip on the happy path.
+    pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
+        if (input == .mutate) return error.InvalidCatalogMutation;
+        if (remaining_ms == 0) return error.Timeout;
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+        const uri = try join(self.alloc, base_uri, "/internal/v1/system-catalog");
+        defer self.alloc.free(uri);
+        var remaining_buf: [10]u8 = undefined;
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
+            .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = "0" },
+            .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
+        };
+        var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
+        defer response.deinit(self.alloc);
+        if (response.status != 200) return switch (response.status) {
+            400 => error.InvalidCatalogName,
+            404 => error.CatalogNotFound,
+            409 => error.CatalogGenerationChanged,
+            413 => error.CatalogCommandTooLarge,
+            426 => error.TableTopologyProtocolUpgradeRequired,
+            503 => error.NotLeader,
+            else => error.RemoteUnavailable,
+        };
+        const group = responseHeader(response, "x-antfly-catalog-metadata-group") orelse return error.MetadataIncarnationUnavailable;
+        const raw_incarnation = responseHeader(response, "x-antfly-catalog-metadata-incarnation") orelse return error.MetadataIncarnationUnavailable;
+        if (raw_incarnation.len != 32) return error.InvalidMetadataIncarnation;
+        const incarnation: metadata_api.MetadataClusterIncarnation = raw_incarnation[0..32].*;
+        if (!@import("incarnation.zig").isValid(incarnation)) return error.InvalidMetadataIncarnation;
+        return .{
+            .metadata_group_id = std.fmt.parseInt(u64, group, 10) catch return error.MetadataGroupMismatch,
+            .metadata_incarnation = incarnation,
+            .body = try self.alloc.dupe(u8, response.body),
+        };
+    }
+
+    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, forwarding: raft_mutation_forwarding.Context) ![]u8 {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+        const uri = try join(self.alloc, base_uri, "/internal/v1/system-catalog");
+        defer self.alloc.free(uri);
+        var remaining_buf: [10]u8 = undefined;
+        var forwards_buf: [3]u8 = undefined;
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{forwarding.remaining_ms}) },
+            .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{forwarding.forwards_remaining}) },
+            .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = if (forwarding.campaign_allowed) "true" else "false" },
+        };
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery }, self.internal_service) catch |err| {
+            if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) return error.RaftMutationRequestNotSent;
+            return error.MetadataMutationOutcomeUnknown;
+        };
+        defer response.deinit(self.alloc);
+        const outcome = responseHeader(response, routes.Routes.raft_mutation_outcome_header) orelse {
+            if (response.status == 404 or response.status == 405 or response.status == 426) return error.TableTopologyProtocolUpgradeRequired;
+            return error.MetadataMutationOutcomeUnknown;
+        };
+        if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_unknown)) return error.MetadataMutationOutcomeUnknown;
+        if (response.status >= 200 and response.status < 300 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return self.alloc.dupe(u8, response.body);
+        if (!std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) return error.MetadataMutationOutcomeUnknown;
+        return switch (response.status) {
+            400 => error.InvalidCatalogMutation,
+            404 => error.CatalogNotFound,
+            409 => error.CatalogGenerationChanged,
+            413 => error.CatalogCommandTooLarge,
+            426 => error.TableTopologyProtocolUpgradeRequired,
+            503 => error.NotLeader,
+            else => error.MetadataMutationOutcomeUnknown,
+        };
+    }
+
     pub fn forwardTableMutation(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -833,7 +949,7 @@ pub const MetadataHttpClient = struct {
         definition_json: ?[]const u8,
         forwarding: raft_mutation_forwarding.Context,
     ) !?topology_protocol.DropResult {
-        try tables_api.validateTableMutationName(table_name);
+        if (kind == .drop_table) try tables_api.validateInternalTableMutationName(table_name) else try tables_api.validateTableMutationName(table_name);
         const body = try std.json.Stringify.valueAlloc(self.alloc, routes.ForwardedTableMutation{
             .kind = kind,
             .table_name = table_name,
@@ -3300,6 +3416,7 @@ test "metadata http client round-trips server endpoints" {
         upsert_node_count: usize = 0,
         upsert_store_count: usize = 0,
         report_store_status_count: usize = 0,
+        referenced_report_count: usize = 0,
         forwarded_create_deadline_seen: bool = false,
         forwarded_drop_deadline_seen: bool = false,
 
@@ -3531,6 +3648,7 @@ test "metadata http client round-trips server endpoints" {
             try std.testing.expectEqual(@as(u64, 7), report.store_id);
             try std.testing.expectEqualStrings("healthy", report.health_class);
             self.report_store_status_count += 1;
+            if (report.runtime_reference) self.referenced_report_count += 1;
         }
 
         fn requestSplit(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.SplitRequest) !void {
@@ -3620,7 +3738,9 @@ test "metadata http client round-trips server endpoints" {
     try client.dropTable(base_uri, "docs");
     try client.dropTableForwarded(base_uri, "docs");
     try client.upsertNode(base_uri, "{\"store_id\":7,\"node_id\":7}");
-    try client.reportNodeStatus(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}");
+    try std.testing.expect(try client.reportNodeStatusWithReferenceSupport(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}"));
+    try client.reportNodeHeartbeat(base_uri, "{\"store_id\":7,\"reporter_incarnation\":77,\"status_generation\":1}");
+    try std.testing.expectError(error.InvalidStoreStatusRequest, client.reportNodeHeartbeat(base_uri, "{\"store_id\":7}"));
     try client.requestTableSplit(base_uri, "docs", "{\"split_key\":\"doc:m\"}");
     try client.requestTableMerge(base_uri, "docs", "{\"donor_group_id\":11,\"receiver_group_id\":10}");
     try std.testing.expectEqual(@as(usize, 2), source.create_count);
@@ -3634,7 +3754,8 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqual(@as(usize, 1), source.delete_artifact_enrichment_count);
     try std.testing.expectEqual(@as(usize, 1), source.upsert_node_count);
     try std.testing.expectEqual(@as(usize, 1), source.upsert_store_count);
-    try std.testing.expectEqual(@as(usize, 1), source.report_store_status_count);
+    try std.testing.expectEqual(@as(usize, 2), source.report_store_status_count);
+    try std.testing.expectEqual(@as(usize, 1), source.referenced_report_count);
     try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
     try std.testing.expectEqual(@as(usize, 1), source.split_count);
     try std.testing.expectEqual(@as(usize, 1), source.merge_count);
@@ -3699,4 +3820,37 @@ test "metadata http client parses legacy range records without doc identity fiel
     try std.testing.expectEqual(@as(u64, 4200), metadata_table_manager.rangeDocIdentityRangeId(parsed.value[0]));
     try std.testing.expectEqual(@as(u64, 42), metadata_table_manager.rangeDocIdentityShardId(parsed.value[1]));
     try std.testing.expectEqual(@as(u64, 4200), metadata_table_manager.rangeDocIdentityRangeId(parsed.value[1]));
+}
+
+test "system catalog direct read carries identity and deadline without a discovery RPC" {
+    const alloc = std.testing.allocator;
+    const Executor = struct {
+        calls: usize = 0,
+        valid_identity: bool = true,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            try std.testing.expectEqual(@as(?u32, 25), request.timeout_ms);
+            try std.testing.expectEqualStrings("0", request.header(routes.Routes.raft_mutation_forwards_remaining_header).?);
+            try std.testing.expectEqualStrings("false", request.header(routes.Routes.raft_mutation_campaign_allowed_header).?);
+            const headers = try a.alloc(http_common.Header, 2);
+            headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "9") };
+            headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, if (self.valid_identity) "11111111111111111111111111111111" else "invalid") };
+            return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "null") };
+        }
+    };
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    const read = try client.readSystemCatalog("http://metadata.invalid", .{ .resolve = .{ .table = "a.b" } }, 25, null);
+    defer read.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expectEqual(@as(u64, 9), read.metadata_group_id);
+    try std.testing.expectEqualStrings("null", read.body);
+    executor.valid_identity = false;
+    try std.testing.expectError(error.InvalidMetadataIncarnation, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    try std.testing.expectError(error.Timeout, client.readSystemCatalog("http://metadata.invalid", .snapshot, 0, null));
+    try std.testing.expectError(error.InvalidCatalogMutation, client.readSystemCatalog("http://metadata.invalid", .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "denied" } } }, 25, null));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
 }

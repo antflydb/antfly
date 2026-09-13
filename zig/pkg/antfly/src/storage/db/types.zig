@@ -1502,6 +1502,12 @@ pub const GraphQueryTransport = struct {
 };
 
 pub const SearchRequest = struct {
+    /// Set only after catalog schema/index preparation; never populated by public JSON.
+    prepared_read_table_id: u64 = 0,
+    /// Request-owned routing map parallel to filter_doc_ids; never serialized.
+    document_lookup_groups: []const u64 = &.{},
+    /// Borrowed coordinator label; routing and storage continue using immutable identities.
+    response_table_name: ?[]const u8 = null,
     query: Query = .{ .match_all = {} },
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
@@ -1632,6 +1638,9 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "response_table_name",
+    "prepared_read_table_id",
+    "document_lookup_groups",
     "filter_query_json",
     "exclusion_query_json",
     "authorization_filter_query_json",
@@ -1831,10 +1840,15 @@ pub fn canonicalGroupedMatchDescendantRequest(
 
 pub const GraphTableReadAuthorization = struct {
     allowed: bool,
+    /// Binding alone does not require a document-existence or predicate read.
+    requires_document_admission: bool = true,
+    /// Owned physical routing name; authorization remains against the logical target.
+    physical_table_name: ?[]u8 = null,
     /// Owned by this value when non-null.
     filter_query_json: ?[]u8 = null,
 
     pub fn deinit(self: *GraphTableReadAuthorization, alloc: std.mem.Allocator) void {
+        if (self.physical_table_name) |value| alloc.free(value);
         if (self.filter_query_json) |value| alloc.free(value);
         self.* = undefined;
     }
