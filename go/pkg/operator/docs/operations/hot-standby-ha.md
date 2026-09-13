@@ -17,13 +17,16 @@ Use the typed admin API for normal automation:
 
 The old `/admin/v1/ha` paths and the `antfly ha` command name still work as
 aliases for one minor release. The Kubernetes operator negotiates the spelling
-per server (`--ha-admin-path-style=auto`, the default): it sends the
+per server (`--standby-admin-path-style=auto`, the default): it sends the
 `/admin/v1/standby` path first and, if a node answers with an unrouted 404,
 retries the old spelling once and remembers the answer for that node's URL.
 Mixed-version clusters therefore keep working through a rolling upgrade, and
 nothing has to be flipped when 0.3 becomes the minimum server. `legacy` and
-`canonical` force one spelling for troubleshooting. The operator still reads
-its own token from `ANTFLY_HA_ADMIN_TOKEN`.
+`canonical` force one spelling for troubleshooting. The operator reads its
+own token from `ANTFLY_STANDBY_ADMIN_TOKEN`, falling back to
+`ANTFLY_HA_ADMIN_TOKEN`; the variable injected into managed pods keeps its
+`ANTFLY_HA_ADMIN_TOKEN` default (`spec.highAvailability.admin.tokenEnvVar`),
+since renaming it would roll every cluster.
 
 The Kubernetes operator lives in `go/pkg/operator` and should use the Go SDK
 admin wrapper generated from `specs/openapi/antfly/admin.yaml`. It should not
@@ -57,10 +60,12 @@ URLs for every node the operator may promote, demote, rewind, or reseed.
 
 ## Admin Token Handling
 
-Prefer `ANTFLY_HA_ADMIN_TOKEN` for both the operator and Antfly pods.
-Kubernetes should inject it from a Secret into process environments; the
-operator does not need broad Secret read permissions just to call the HA admin
-API.
+Inject the token from a Secret into process environments; the operator does
+not need broad Secret read permissions just to call the admin API. The
+operator itself reads `ANTFLY_STANDBY_ADMIN_TOKEN`, falling back to
+`ANTFLY_HA_ADMIN_TOKEN`. Antfly pods keep `ANTFLY_HA_ADMIN_TOKEN` as the
+default injected name (`spec.highAvailability.admin.tokenEnvVar` overrides it),
+and the server accepts whatever name it is told, so the two sides can differ.
 
 When Antfly pods use `spec.highAvailability.runtime.adminTokenSecretRef`, set
 `optional: false` or omit `optional` so Kubernetes fails pod startup if the

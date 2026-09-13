@@ -36,8 +36,9 @@ All notable changes to Antfly will be documented in this file.
   `/ha/v1/...`, and `/internal/v1/ha/...` paths are served as aliases for one
   minor release, and the CLI and a replicating standby fall back to them once
   when they meet a 0.2 server, so either side of a pair may be upgraded first.
-  The Kubernetes operator negotiates per server (`--ha-admin-path-style`,
-  default `auto`) instead of waiting for a minimum server version.
+  The Kubernetes operator negotiates per server (`--standby-admin-path-style`,
+  default `auto`) instead of waiting for a minimum server version, and reads
+  its own token from `ANTFLY_STANDBY_ADMIN_TOKEN` before `ANTFLY_HA_ADMIN_TOKEN`.
 - **Schemas renamed `HA*` -> `Standby*`** — in the admin and internal OpenAPI
   specs and the generated SDKs. The Go SDK keeps every `HA*` name as a
   deprecated alias, adds `PathStyleAuto` (canonical first, one fallback to the

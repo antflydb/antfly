@@ -72,7 +72,8 @@ For authenticated HA automation, create `antfly-ha-admin-token` before starting
 the operator and the HA clusters. The Antfly runtime pods use
 `spec.highAvailability.runtime.adminTokenSecretRef` with `optional: false` so a
 missing token fails pod startup instead of exposing an unauthenticated admin
-surface. The operator deployment also needs `ANTFLY_HA_ADMIN_TOKEN` in its own
+surface. The operator deployment also needs `ANTFLY_STANDBY_ADMIN_TOKEN` (or the
+older `ANTFLY_HA_ADMIN_TOKEN`) in its own
 environment for typed hot-standby admin calls; Kubernetes injects it into the pod,
 so the operator does not need broad Secret read permissions. Restart the
 operator deployment after changing the Secret so the process environment is

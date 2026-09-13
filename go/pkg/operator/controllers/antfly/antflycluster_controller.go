@@ -68,11 +68,11 @@ type AntflyClusterReconciler struct {
 	KubeClient       kubernetes.Interface
 	NodeStatsFetcher func(context.Context, string) (*kubeletStatsSummary, error)
 	HTTPClient       *http.Client
-	// HAAdminPathStyle selects which spelling of the hot-standby admin API the
+	// StandbyAdminPathStyle selects which spelling of the hot-standby admin API the
 	// operator sends. The zero value keeps the pre-0.3 /admin/v1/ha paths;
 	// the binary defaults to adminsdk.PathStyleAuto, which negotiates per
 	// server so mixed-version clusters keep working during an upgrade.
-	HAAdminPathStyle      adminsdk.PathStyle
+	StandbyAdminPathStyle adminsdk.PathStyle
 	Recorder              events.EventRecorder
 	ManageInferencePools  bool
 	DefaultInferenceImage string
@@ -146,40 +146,44 @@ const (
 	haPrimaryRouteFenceGenerationAnnotation = "antfly.io/ha-primary-route-fence-generation"
 	haPrimaryRouteSelectorAnnotation        = "antfly.io/ha-primary-route-selector-applied"
 	haAdminTokenDefaultEnvVar               = "ANTFLY_HA_ADMIN_TOKEN" // #nosec G101 -- environment variable name, not a credential
-	defaultHAPrimaryLogPath                 = "/antflydb/ha/primary.wal"
-	defaultHAPrimarySlotsPath               = "/antflydb/ha/slots"
-	defaultHASeedCaptureRoot                = "/antflydb/ha/seed-captures"
-	defaultHAFencePath                      = "/antflydb/ha/fence.wal"
-	defaultHAStandbyLogPath                 = "/antflydb/ha/standby.wal"
-	defaultHAStandbyProgressPath            = "/antflydb/ha/standby-progress.wal"
-	defaultHADirectAdminRetryLimit          = int32(8)
-	defaultHADirectAdminRetryBase           = 5 * time.Second
-	defaultHADirectAdminRetryMaximum        = 2 * time.Minute
-	defaultHADirectAdminReservation         = 30 * time.Second
-	defaultHADirectPrerequisiteTimeout      = 10 * time.Minute
-	haStartupGateReceiptHashAnnotation      = "antfly.io/ha-startup-receipt-hash"
-	haSeedRoleAnnotation                    = "antfly.io/ha-seed-role"
-	haTopologyIDAnnotation                  = "antfly.io/ha-topology-id"
-	haTopologyGenerationAnnotation          = "antfly.io/ha-topology-generation"
-	haNodeIDAnnotation                      = "antfly.io/ha-node-id"
-	haSlotNameAnnotation                    = "antfly.io/ha-slot-name"
-	haSeedGenerationAnnotation              = "antfly.io/ha-seed-generation"
-	haSeedManifestIDAnnotation              = "antfly.io/ha-seed-manifest-id"
-	haSeedManifestSHA256Annotation          = "antfly.io/ha-seed-manifest-sha256"
-	haSeedSourcePVCNameAnnotation           = "antfly.io/ha-seed-source-pvc-name"
-	haSeedSourcePVCUIDAnnotation            = "antfly.io/ha-seed-source-pvc-uid"
-	haSeedTargetPVCNameAnnotation           = "antfly.io/ha-seed-target-pvc-name"
-	haSeedTargetPVCUIDAnnotation            = "antfly.io/ha-seed-target-pvc-uid"
-	haSeedCheckpointLSNAnnotation           = "antfly.io/ha-seed-checkpoint-lsn"
-	haSeedLiveDataPath                      = "/antflydb/data"
-	haSeedLiveMetadataPath                  = "/antflydb/metadata"
-	haSeedLiveExtensionsPath                = "/antflydb/extensions"
-	haSeedActivationRelativeRoot            = ".antfly-ha/active"
-	cloudHAPromotionReceiptAnnotation       = "cloud.antfly.io/ha-promotion-receipt"
-	cloudHATopologyGenerationAnnotation     = "cloud.antfly.io/ha-topology-generation"
-	haPromotedProcessBindingAnnotation      = "antfly.io/ha-promoted-process-binding"
-	cloudHARoleLabel                        = "cloud.antfly.io/ha-role"
-	cloudHAStandbyRole                      = "standby"
+	// standbyAdminTokenDefaultEnvVar is the preferred name for the operator's
+	// own token. Managed pods keep haAdminTokenDefaultEnvVar as their default
+	// (it is a CRD-visible default and changing it would roll every cluster).
+	standbyAdminTokenDefaultEnvVar      = "ANTFLY_STANDBY_ADMIN_TOKEN" // #nosec G101 -- environment variable name, not a credential
+	defaultHAPrimaryLogPath             = "/antflydb/ha/primary.wal"
+	defaultHAPrimarySlotsPath           = "/antflydb/ha/slots"
+	defaultHASeedCaptureRoot            = "/antflydb/ha/seed-captures"
+	defaultHAFencePath                  = "/antflydb/ha/fence.wal"
+	defaultHAStandbyLogPath             = "/antflydb/ha/standby.wal"
+	defaultHAStandbyProgressPath        = "/antflydb/ha/standby-progress.wal"
+	defaultHADirectAdminRetryLimit      = int32(8)
+	defaultHADirectAdminRetryBase       = 5 * time.Second
+	defaultHADirectAdminRetryMaximum    = 2 * time.Minute
+	defaultHADirectAdminReservation     = 30 * time.Second
+	defaultHADirectPrerequisiteTimeout  = 10 * time.Minute
+	haStartupGateReceiptHashAnnotation  = "antfly.io/ha-startup-receipt-hash"
+	haSeedRoleAnnotation                = "antfly.io/ha-seed-role"
+	haTopologyIDAnnotation              = "antfly.io/ha-topology-id"
+	haTopologyGenerationAnnotation      = "antfly.io/ha-topology-generation"
+	haNodeIDAnnotation                  = "antfly.io/ha-node-id"
+	haSlotNameAnnotation                = "antfly.io/ha-slot-name"
+	haSeedGenerationAnnotation          = "antfly.io/ha-seed-generation"
+	haSeedManifestIDAnnotation          = "antfly.io/ha-seed-manifest-id"
+	haSeedManifestSHA256Annotation      = "antfly.io/ha-seed-manifest-sha256"
+	haSeedSourcePVCNameAnnotation       = "antfly.io/ha-seed-source-pvc-name"
+	haSeedSourcePVCUIDAnnotation        = "antfly.io/ha-seed-source-pvc-uid"
+	haSeedTargetPVCNameAnnotation       = "antfly.io/ha-seed-target-pvc-name"
+	haSeedTargetPVCUIDAnnotation        = "antfly.io/ha-seed-target-pvc-uid"
+	haSeedCheckpointLSNAnnotation       = "antfly.io/ha-seed-checkpoint-lsn"
+	haSeedLiveDataPath                  = "/antflydb/data"
+	haSeedLiveMetadataPath              = "/antflydb/metadata"
+	haSeedLiveExtensionsPath            = "/antflydb/extensions"
+	haSeedActivationRelativeRoot        = ".antfly-ha/active"
+	cloudHAPromotionReceiptAnnotation   = "cloud.antfly.io/ha-promotion-receipt"
+	cloudHATopologyGenerationAnnotation = "cloud.antfly.io/ha-topology-generation"
+	haPromotedProcessBindingAnnotation  = "antfly.io/ha-promoted-process-binding"
+	cloudHARoleLabel                    = "cloud.antfly.io/ha-role"
+	cloudHAStandbyRole                  = "standby"
 
 	haAdminJobPhaseWaitingDependency   = "WaitingDependency"
 	haAdminJobPhaseWaitingPrerequisite = "WaitingPrerequisite"
@@ -1302,10 +1306,10 @@ type dataNodeShutdownStatus struct {
 	Message         string `json:"message,omitempty"`
 }
 
-// ParseHAAdminPathStyle maps the --ha-admin-path-style flag value onto the
+// ParseStandbyAdminPathStyle maps the --standby-admin-path-style flag value onto the
 // SDK setting: "auto" (negotiate per server), "legacy" (/admin/v1/ha), or
 // "canonical" (/admin/v1/standby).
-func ParseHAAdminPathStyle(value string) (adminsdk.PathStyle, error) {
+func ParseStandbyAdminPathStyle(value string) (adminsdk.PathStyle, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "auto":
 		return adminsdk.PathStyleAuto, nil
@@ -1314,7 +1318,7 @@ func ParseHAAdminPathStyle(value string) (adminsdk.PathStyle, error) {
 	case "canonical":
 		return adminsdk.PathStyleCanonical, nil
 	}
-	return adminsdk.PathStyleLegacy, fmt.Errorf("unknown HA admin path style %q (want auto, legacy, or canonical)", value)
+	return adminsdk.PathStyleLegacy, fmt.Errorf("unknown standby admin path style %q (want auto, legacy, or canonical)", value)
 }
 
 func (r *AntflyClusterReconciler) httpClient() *http.Client {
@@ -7871,7 +7875,7 @@ func (r *AntflyClusterReconciler) haAdminSDKClient(cluster *antflyv1.AntflyClust
 	if err != nil {
 		return nil, err
 	}
-	client.WithPathStyle(r.HAAdminPathStyle)
+	client.WithPathStyle(r.StandbyAdminPathStyle)
 	token, err := r.haAdminBearerToken(cluster)
 	if err != nil {
 		return nil, err
@@ -7887,12 +7891,19 @@ func (r *AntflyClusterReconciler) haAdminBearerToken(cluster *antflyv1.AntflyClu
 	if cluster != nil && cluster.Spec.HighAvailability != nil && cluster.Spec.HighAvailability.Admin != nil {
 		admin = cluster.Spec.HighAvailability.Admin
 	}
-	envVar := haAdminTokenEnvVar(admin)
-	token := strings.TrimSpace(os.Getenv(envVar))
-	if haAdminConfiguredTokenEnvVar(admin) != "" && token == "" {
-		return "", fmt.Errorf("configured HA admin token env var %s is empty or unset: %w", envVar, errHAAdminTokenEnvMissing)
+	if configured := haAdminConfiguredTokenEnvVar(admin); configured != "" {
+		token := strings.TrimSpace(os.Getenv(configured))
+		if token == "" {
+			return "", fmt.Errorf("configured HA admin token env var %s is empty or unset: %w", configured, errHAAdminTokenEnvMissing)
+		}
+		return token, nil
 	}
-	return token, nil
+	// Without a configured name, prefer the current spelling and fall back
+	// to the pre-0.3 one, as the CLI does.
+	if token := strings.TrimSpace(os.Getenv(standbyAdminTokenDefaultEnvVar)); token != "" {
+		return token, nil
+	}
+	return strings.TrimSpace(os.Getenv(haAdminTokenDefaultEnvVar)), nil
 }
 
 func haPlannedActionHasDirectAdminOperation(action antflyv1.HAPlannedActionStatus) bool {

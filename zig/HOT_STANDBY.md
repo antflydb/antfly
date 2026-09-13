@@ -837,11 +837,13 @@ environment variable names (`ANTFLY_HA_ADMIN_URL`, `ANTFLY_HA_ADMIN_TOKEN`)
 all continue to work for one minor release and are scheduled for removal in
 0.4. Every client negotiates rather than assuming: the CLI, a replicating
 standby, and the Kubernetes operator (Go SDK `PathStyleAuto`, the operator's
-`--ha-admin-path-style=auto` default) send the canonical path first and fall
+`--standby-admin-path-style=auto` default) send the canonical path first and fall
 back to the old spelling once on an unrouted 404, remembering the answer per
 peer. Either side of a primary/standby pair, or of an operator/server pair,
-can therefore be upgraded first. The operator keeps reading its own token from
-`ANTFLY_HA_ADMIN_TOKEN`.
+can therefore be upgraded first. The operator reads its own token from
+`ANTFLY_STANDBY_ADMIN_TOKEN` with `ANTFLY_HA_ADMIN_TOKEN` as the fallback; the
+variable it injects into managed pods keeps the old default name, because that
+is a CRD-visible default and renaming it would roll every cluster.
 
 ### Target resolution
 

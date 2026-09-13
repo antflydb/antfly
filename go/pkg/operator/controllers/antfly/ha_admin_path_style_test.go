@@ -43,12 +43,12 @@ func pathStyleServer(t *testing.T, servedPrefix string) (*httptest.Server, func(
 	}
 }
 
-func TestHAAdminPathStyleAutoUsesCanonicalPathsOnNewServers(t *testing.T) {
+func TestStandbyAdminPathStyleAutoUsesCanonicalPathsOnNewServers(t *testing.T) {
 	t.Setenv(haAdminTokenDefaultEnvVar, "operator-token")
 	adminsdk.ResetNegotiatedPathStyles()
 	server, seen := pathStyleServer(t, adminsdk.StandbyPath)
 
-	reconciler := &AntflyClusterReconciler{HTTPClient: server.Client(), HAAdminPathStyle: adminsdk.PathStyleAuto}
+	reconciler := &AntflyClusterReconciler{HTTPClient: server.Client(), StandbyAdminPathStyle: adminsdk.PathStyleAuto}
 	client, err := reconciler.haAdminSDKClient(&antflyv1.AntflyCluster{}, server.URL)
 	if err != nil {
 		t.Fatalf("haAdminSDKClient: %v", err)
@@ -61,12 +61,12 @@ func TestHAAdminPathStyleAutoUsesCanonicalPathsOnNewServers(t *testing.T) {
 	}
 }
 
-func TestHAAdminPathStyleAutoFallsBackToLegacyPathsOnOldServers(t *testing.T) {
+func TestStandbyAdminPathStyleAutoFallsBackToLegacyPathsOnOldServers(t *testing.T) {
 	t.Setenv(haAdminTokenDefaultEnvVar, "operator-token")
 	adminsdk.ResetNegotiatedPathStyles()
 	server, seen := pathStyleServer(t, adminsdk.HAPath)
 
-	reconciler := &AntflyClusterReconciler{HTTPClient: server.Client(), HAAdminPathStyle: adminsdk.PathStyleAuto}
+	reconciler := &AntflyClusterReconciler{HTTPClient: server.Client(), StandbyAdminPathStyle: adminsdk.PathStyleAuto}
 	for i := 0; i < 2; i++ {
 		// A fresh client per reconcile, as the controller does.
 		client, err := reconciler.haAdminSDKClient(&antflyv1.AntflyCluster{}, server.URL)
@@ -84,7 +84,7 @@ func TestHAAdminPathStyleAutoFallsBackToLegacyPathsOnOldServers(t *testing.T) {
 	}
 }
 
-func TestHAAdminPathStyleZeroValueKeepsLegacyPaths(t *testing.T) {
+func TestStandbyAdminPathStyleZeroValueKeepsLegacyPaths(t *testing.T) {
 	t.Setenv(haAdminTokenDefaultEnvVar, "operator-token")
 	server, seen := pathStyleServer(t, adminsdk.HAPath)
 
@@ -101,15 +101,39 @@ func TestHAAdminPathStyleZeroValueKeepsLegacyPaths(t *testing.T) {
 	}
 }
 
-func TestParseHAAdminPathStyle(t *testing.T) {
+func TestParseStandbyAdminPathStyle(t *testing.T) {
 	cases := map[string]adminsdk.PathStyle{"auto": adminsdk.PathStyleAuto, " Legacy ": adminsdk.PathStyleLegacy, "canonical": adminsdk.PathStyleCanonical}
 	for input, want := range cases {
-		got, err := ParseHAAdminPathStyle(input)
+		got, err := ParseStandbyAdminPathStyle(input)
 		if err != nil || got != want {
-			t.Fatalf("ParseHAAdminPathStyle(%q) = %v, %v; want %v", input, got, err, want)
+			t.Fatalf("ParseStandbyAdminPathStyle(%q) = %v, %v; want %v", input, got, err, want)
 		}
 	}
-	if _, err := ParseHAAdminPathStyle("v2"); err == nil {
-		t.Fatal("ParseHAAdminPathStyle accepted an unknown style")
+	if _, err := ParseStandbyAdminPathStyle("v2"); err == nil {
+		t.Fatal("ParseStandbyAdminPathStyle accepted an unknown style")
+	}
+}
+
+func TestHAAdminBearerTokenPrefersStandbyEnvNameWithLegacyFallback(t *testing.T) {
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{}
+
+	t.Setenv(standbyAdminTokenDefaultEnvVar, "")
+	t.Setenv(haAdminTokenDefaultEnvVar, "legacy-token")
+	if token, err := reconciler.haAdminBearerToken(cluster); err != nil || token != "legacy-token" {
+		t.Fatalf("legacy fallback = %q, %v; want legacy-token", token, err)
+	}
+
+	t.Setenv(standbyAdminTokenDefaultEnvVar, "standby-token")
+	if token, err := reconciler.haAdminBearerToken(cluster); err != nil || token != "standby-token" {
+		t.Fatalf("preferred name = %q, %v; want standby-token", token, err)
+	}
+
+	// A configured name is authoritative and does not fall back.
+	configured := &antflyv1.AntflyCluster{}
+	configured.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{Admin: &antflyv1.HAAdminSpec{TokenEnvVar: "CUSTOM_TOKEN"}}
+	t.Setenv("CUSTOM_TOKEN", "")
+	if _, err := reconciler.haAdminBearerToken(configured); err == nil {
+		t.Fatal("configured but unset env var was accepted")
 	}
 }
