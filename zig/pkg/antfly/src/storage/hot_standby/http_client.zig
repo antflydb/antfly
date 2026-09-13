@@ -708,9 +708,29 @@ fn legacyUriAlloc(alloc: Allocator, uri: []const u8) !?[]u8 {
     const path_start = std.mem.indexOf(u8, uri, admin_api.routes.standby) orelse
         std.mem.indexOf(u8, uri, admin_api.routes.standby_v1_base) orelse
         return null;
-    const legacy_path = (try admin_api.routes.legacyAdminPathAlloc(alloc, uri[path_start..])) orelse return null;
+    // Rewrite the path only: the exact-route table (`/standby/status` and
+    // friends) must see the path without its query string.
+    const query_start = std.mem.indexOfScalarPos(u8, uri, path_start, '?') orelse uri.len;
+    const legacy_path = (try admin_api.routes.legacyAdminPathAlloc(alloc, uri[path_start..query_start])) orelse return null;
     defer alloc.free(legacy_path);
-    return try std.mem.concat(alloc, u8, &.{ uri[0..path_start], legacy_path });
+    return try std.mem.concat(alloc, u8, &.{ uri[0..path_start], legacy_path, uri[query_start..] });
+}
+
+test "storage.hot_standby http client legacy uri rewrite keeps the query string out of route matching" {
+    const alloc = std.testing.allocator;
+    const with_query = (try legacyUriAlloc(alloc, "http://primary:8080/admin/v1/standby/status?upstream_lsn=2")).?;
+    defer alloc.free(with_query);
+    try std.testing.expectEqualStrings("http://primary:8080/admin/v1/ha/standby/status?upstream_lsn=2", with_query);
+
+    const plain = (try legacyUriAlloc(alloc, "http://primary:8080/admin/v1/standby/fence/current")).?;
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("http://primary:8080/admin/v1/ha/fence/current", plain);
+
+    const health = (try legacyUriAlloc(alloc, "http://primary:8080/standby/v1/health")).?;
+    defer alloc.free(health);
+    try std.testing.expectEqualStrings("http://primary:8080/ha/v1/health", health);
+
+    try std.testing.expect((try legacyUriAlloc(alloc, "http://primary:8080/db/v1/tables")) == null);
 }
 
 fn validateClientSlotName(slot_name: []const u8) !void {
