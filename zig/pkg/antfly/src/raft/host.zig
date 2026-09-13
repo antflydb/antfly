@@ -15,7 +15,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
-const platform_time = @import("antfly_platform").time;
 const tracing = @import("../tracing/mod.zig");
 pub const catalog = @import("catalog.zig");
 const backup_restore = @import("storage/backup_restore.zig");
@@ -121,7 +120,7 @@ pub fn stableRandomSeed(group_id: u64, local_node_id: u64) u64 {
 }
 
 pub const HostDeps = struct {
-    /// Borrowed synchronization context; must outlive the host. The default
+    /// Borrowed synchronization and monotonic clock authority; must outlive the host. The default
     /// supports blocking mutex waits without allocating a worker pool.
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
     replica_catalog: ?catalog.ReplicaCatalog = null,
@@ -970,6 +969,10 @@ pub const Host = struct {
         return snapshot;
     }
 
+    pub fn monotonicNs(self: *const Host) u64 {
+        return @intCast(@max(0, std.Io.Clock.now(.awake, self.deps.io).nanoseconds));
+    }
+
     pub fn listGroupIds(self: *Host, alloc: std.mem.Allocator) ![]u64 {
         return try self.runtime_host.listGroupIds(alloc);
     }
@@ -984,9 +987,9 @@ pub const Host = struct {
         max_tick_groups: usize,
         max_ready_steps: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
-        const inbound_start_ns = platform_time.monotonicNs();
+        const inbound_start_ns = self.monotonicNs();
         _ = try self.drainInboundMessages(max_inbound_messages);
-        const inbound_elapsed_ns = platform_time.monotonicNs() -| inbound_start_ns;
+        const inbound_elapsed_ns = self.monotonicNs() -| inbound_start_ns;
         var round = try self.runtime_host.runRound(max_tick_groups, max_ready_steps);
         round.inbound_drain_elapsed_ns = inbound_elapsed_ns;
         round.elapsed_ns += round.inbound_drain_elapsed_ns;
@@ -998,9 +1001,9 @@ pub const Host = struct {
         max_inbound_messages: usize,
         max_ready_steps: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
-        const inbound_start_ns = platform_time.monotonicNs();
+        const inbound_start_ns = self.monotonicNs();
         _ = try self.drainInboundMessages(max_inbound_messages);
-        const inbound_elapsed_ns = platform_time.monotonicNs() -| inbound_start_ns;
+        const inbound_elapsed_ns = self.monotonicNs() -| inbound_start_ns;
         var round = try self.runtime_host.runProgressRound(max_ready_steps);
         round.inbound_drain_elapsed_ns = inbound_elapsed_ns;
         round.elapsed_ns += inbound_elapsed_ns;
@@ -1287,7 +1290,7 @@ pub const Host = struct {
         restore: ?catalog.BackupRestoreBootstrapRecord,
         bump_attempt: bool,
     ) void {
-        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        const now_ms: u64 = @intCast(@divTrunc(self.monotonicNs(), std.time.ns_per_ms));
         if (self.bootstrap_statuses.getPtr(group_id)) |existing| {
             if (existing.last_error) |msg| self.alloc.free(msg);
             if (existing.backup_id) |value| self.alloc.free(value);
@@ -1477,6 +1480,7 @@ pub const HttpHost = struct {
         const host = try alloc.create(Host);
         errdefer alloc.destroy(host);
         var host_deps = deps.host;
+        if (transport_io) |io| host_deps.io = io;
         host_deps.runtime_hooks = mergeRuntimeHooks(host_deps.runtime_hooks, transport_stack.runtimeHooks());
         host.* = Host.init(alloc, cfg.host, host_deps);
         errdefer host.deinit();
@@ -2976,6 +2980,45 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
     const doc = (try restored_db.get(std.testing.allocator, "doc:a")) orelse return error.TestExpectedEqual;
     defer std.testing.allocator.free(doc);
     try std.testing.expect(std.mem.indexOf(u8, doc, "\"alpha\"") != null);
+}
+
+test "http host shares its borrowed clock with raft reconciliation" {
+    const alloc = std.testing.allocator;
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer clock.deinit();
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = clock.io(), .raft_outbound = clock.io() },
+    });
+    defer runtime.deinit();
+    const Unused = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: transport.http_common.HttpRequest) !transport.http_common.HttpResponse {
+            return error.UnexpectedRequest;
+        }
+        fn put(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            return error.UnexpectedSnapshot;
+        }
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedSnapshot;
+        }
+    };
+    var http_host = try HttpHost.init(alloc, .{
+        .host = .{ .local_node_id = 1 },
+        .transport = .{ .driver = .{ .async_send_worker_count = 0 }, .snapshot = .{ .root_dir = "/host-clock" } },
+    }, .{
+        .backend_runtime = runtime.ptr(),
+        .listener_disabled = true,
+        .request_executor = .{ .ptr = undefined, .vtable = &.{ .execute = Unused.execute } },
+        .snapshot_store = .{ .ptr = undefined, .vtable = &.{ .put_snapshot = Unused.put, .get_snapshot = Unused.get } },
+    });
+    defer http_host.deinit();
+    defer {
+        http_host.beginTransportShutdown();
+        _ = clock.cancelAndDrainTasksForTeardown(alloc, 64) catch @panic("host clock test cleanup failed");
+    }
+    try std.testing.expectEqual(@as(u64, 7 * std.time.ns_per_s), http_host.host.monotonicNs());
+    try clock.advance(std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u64, 7001 * std.time.ns_per_ms), http_host.host.monotonicNs());
 }
 
 test "http host starts listener and serves health route" {

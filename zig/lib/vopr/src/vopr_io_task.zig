@@ -37,8 +37,12 @@ pub const Status = enum {
 
 pub const TaskSnapshot = struct {
     id: ids.StableId,
+    identity_scope: ids.StableId,
+    resource_owner_id: ids.StableId,
     status: Status,
     sleep_deadline_ns: ?i96,
+    sleep_clock: ?std.Io.Clock,
+    awaited_task_id: ?ids.StableId,
     waiting_on_futex: bool,
     external_resource_id: ?ids.StableId,
 };
@@ -275,17 +279,29 @@ pub const Kernel = struct {
 
     pub fn futureSnapshot(self: *const Kernel, any_future: *std.Io.AnyFuture) ?TaskSnapshot {
         const target: *Task = @ptrCast(@alignCast(any_future));
-        for (self.tasks.items) |task| {
+        for (self.tasks.items, 0..) |task, index| {
             if (task != target) continue;
-            return .{
-                .id = task.id,
-                .status = task.status,
-                .sleep_deadline_ns = if (task.sleep) |sleep| sleep.deadline_ns else null,
-                .waiting_on_futex = task.futex_ptr != null,
-                .external_resource_id = task.external_id,
-            };
+            return self.snapshotAt(index);
         }
         return null;
+    }
+
+    /// Allocation-free inspection of retained owners, including wait edges
+    /// and their actual clock deadlines. This never advances scheduler state.
+    pub fn snapshotAt(self: *const Kernel, index: usize) ?TaskSnapshot {
+        if (index >= self.tasks.items.len) return null;
+        const task = self.tasks.items[index];
+        return .{
+            .id = task.id,
+            .identity_scope = task.identity_parent,
+            .resource_owner_id = task.resource_owner_id,
+            .status = task.status,
+            .sleep_deadline_ns = if (task.sleep) |sleep| sleep.deadline_ns else null,
+            .sleep_clock = if (task.sleep) |sleep| sleep.clock else null,
+            .awaited_task_id = if (task.waiting_on_future) |awaited| awaited.id else null,
+            .waiting_on_futex = task.futex_ptr != null,
+            .external_resource_id = task.external_id,
+        };
     }
 
     pub fn isQuiescent(self: *const Kernel) bool {

@@ -362,6 +362,94 @@ pub const PrefixedCooperativeSeeded = struct {
     }
 };
 
+/// Scheduling intent is explicit and independent of the exact recorded choices.
+/// Bounded fairness ages continuously enabled alternatives; once overdue the
+/// oldest alternative wins, including timers. Transient alternatives cannot
+/// reset an existing waiter's age.
+pub const ExplorationPolicy = enum {
+    cooperative,
+    bounded_fair,
+    adversarial,
+
+    pub fn parse(value: []const u8) !ExplorationPolicy {
+        if (std.mem.eql(u8, value, "bounded-fair")) return .bounded_fair;
+        if (std.mem.eql(u8, value, "cooperative")) return .cooperative;
+        if (std.mem.eql(u8, value, "adversarial")) return .adversarial;
+        return error.InvalidExplorationPolicy;
+    }
+};
+
+pub const Exploring = struct {
+    pub const fairness_window: u64 = 256;
+    pub const adversarial_delay_choices: u64 = 128;
+    const Age = struct { since: u64, seen: u64 };
+    allocator: std.mem.Allocator,
+    policy: ExplorationPolicy,
+    cooperative: PrefixedCooperativeSeeded,
+    ages: std.AutoHashMapUnmanaged(ids.StableId, Age) = .empty,
+    turn: u64 = 0,
+    delayed_actor: ?ids.StableId = null,
+
+    pub fn init(allocator: std.mem.Allocator, policy: ExplorationPolicy, seed: u64) Exploring {
+        return .{ .allocator = allocator, .policy = policy, .cooperative = PrefixedCooperativeSeeded.init(&.{}, seed) };
+    }
+    pub fn deinit(self: *Exploring) void {
+        self.ages.deinit(self.allocator);
+    }
+    pub fn source(self: *Exploring) Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+    fn finish(_: *anyopaque) !void {}
+    fn choose(ptr: *anyopaque, request: Request) !ids.StableId {
+        const self: *Exploring = @ptrCast(@alignCast(ptr));
+        if (self.policy == .cooperative) return self.cooperative.source().choose(request);
+        self.turn += 1;
+        var oldest: ?transition.Transition = null;
+        var oldest_since = self.turn;
+        for (request.enabled) |candidate| {
+            const entry = try self.ages.getOrPut(self.allocator, candidate.id);
+            if (!entry.found_existing or entry.value_ptr.seen + 1 < self.turn)
+                entry.value_ptr.* = .{ .since = self.turn, .seen = self.turn };
+            entry.value_ptr.seen = self.turn;
+            if (oldest == null or entry.value_ptr.since < oldest_since) {
+                oldest = candidate;
+                oldest_since = entry.value_ptr.since;
+            }
+        }
+        // Bound bookkeeping by the live enabled frontier, not history length.
+        var obsolete: std.ArrayListUnmanaged(ids.StableId) = .empty;
+        defer obsolete.deinit(self.allocator);
+        var entries = self.ages.iterator();
+        while (entries.next()) |entry| if (entry.value_ptr.seen != self.turn)
+            try obsolete.append(self.allocator, entry.key_ptr.*);
+        for (obsolete.items) |id| _ = self.ages.remove(id);
+
+        const selected = blk: {
+            if (self.policy == .adversarial and self.turn <= adversarial_delay_choices) {
+                if (self.delayed_actor == null) for (request.enabled) |candidate| {
+                    if (candidate.actor_id) |actor| {
+                        self.delayed_actor = actor;
+                        break;
+                    }
+                };
+                // Deliberately let deadlines overtake ready work, then restore
+                // fair scheduling so the scenario must demonstrate recovery.
+                for (request.enabled) |candidate| if (PrefixedCooperativeSeeded.isTimeAdvance(candidate.name))
+                    break :blk self.cooperative.noteSelection(request, candidate.id);
+                for (request.enabled) |candidate| if (candidate.actor_id != self.delayed_actor)
+                    break :blk self.cooperative.noteSelection(request, candidate.id);
+            }
+            if (self.turn - oldest_since >= fairness_window)
+                break :blk self.cooperative.noteSelection(request, oldest.?.id);
+            // Randomize runnable work without affinity to the last actor.
+            self.cooperative.preferred_actor = null;
+            break :blk try self.cooperative.source().choose(request);
+        };
+        if (self.ages.getPtr(selected)) |age| age.since = self.turn + 1;
+        return selected;
+    }
+};
+
 /// Deterministic depth-first enumeration of a dynamic choice tree.
 ///
 /// Call `beginHistory` before each clean-world execution, run the scenario
@@ -580,6 +668,7 @@ pub const Mutating = struct {
     prng: std.Random.DefaultPrng,
     cursor: usize = 0,
     mutated: bool = false,
+    suffix: ?Source = null,
 
     pub fn init(base: []const trace.ChoiceRecord, mutation_index: usize, replacement_id: ids.StableId, suffix_seed: u64) Mutating {
         return initAt(base, mutation_index, replacement_id, suffix_seed, 0);
@@ -625,6 +714,7 @@ pub const Mutating = struct {
             self.mutated = true;
             return self.replacement_id;
         }
+        if (self.suffix) |source_| return source_.choose(request);
         const selected_index = self.prng.random().intRangeLessThan(usize, 0, request.enabled.len);
         return request.enabled[selected_index].id;
     }
@@ -1076,4 +1166,41 @@ test "structured-choice audit rejects deferred interpretation" {
     try std.testing.expectEqual(@as(u64, 1), audited.parameterized_choices);
     history.transitions.items[0].id = 3;
     try std.testing.expectError(error.DeferredChoiceInterpretation, auditTrace(&history));
+}
+
+test "bounded fair exploration services an overdue alternative despite weighted competitors" {
+    var exploration = Exploring.init(std.testing.allocator, .bounded_fair, 7);
+    defer exploration.deinit();
+    const enabled = [_]transition.Transition{
+        .{ .id = 10, .name = "favored", .kind = .workload, .weight = 1_000_000 },
+        .{ .id = 20, .name = "waiting", .kind = .workload },
+    };
+    var last_waiter: u64 = 0;
+    for (0..1024) |turn| {
+        const selected = try exploration.source().choose(.{ .site_id = 1, .site_name = "fairness", .occurrence = turn, .enabled = &enabled });
+        if (selected == 20) last_waiter = turn;
+        try std.testing.expect(turn - last_waiter <= Exploring.fairness_window + enabled.len);
+    }
+    try std.testing.expect(last_waiter > 0);
+    try std.testing.expectEqual(enabled.len, exploration.ages.count());
+}
+
+test "adversarial exploration delays ready work then restores fair progress reproducibly" {
+    var left = Exploring.init(std.testing.allocator, .adversarial, 42);
+    defer left.deinit();
+    var right = Exploring.init(std.testing.allocator, .adversarial, 42);
+    defer right.deinit();
+    // A forced timer must reset pacing just like a randomly selected timer.
+    left.cooperative.non_time_choices = left.cooperative.max_non_time_choices;
+    right.cooperative.non_time_choices = right.cooperative.max_non_time_choices;
+    const enabled = [_]transition.Transition{
+        .{ .id = 10, .name = "vopr-io.task_resume", .kind = .workload, .actor_id = 30 },
+        .{ .id = 20, .name = "vopr-io.time_advance", .kind = .workload },
+    };
+    for (0..Exploring.adversarial_delay_choices + 1) |turn| {
+        const request: Request = .{ .site_id = 1, .site_name = "delay", .occurrence = turn, .enabled = &enabled };
+        const selected = try left.source().choose(request);
+        try std.testing.expectEqual(selected, try right.source().choose(request));
+        try std.testing.expectEqual(@as(u64, if (turn < Exploring.adversarial_delay_choices) 20 else 10), selected);
+    }
 }

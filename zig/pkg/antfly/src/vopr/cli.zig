@@ -131,7 +131,7 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         break :blk try antfly.lsm_vopr.record(alloc, seed);
     } else if (std.mem.eql(u8, scenario, "ha-scaling")) blk: {
         try validateCampaignTransitions(scenario, transition_budget);
-        break :blk try antfly.full_cluster_vopr.recordHAScaling(alloc, seed);
+        break :blk try antfly.full_cluster_vopr.recordHAScaling(alloc, seed, transition_budget);
     } else if (std.mem.eql(u8, scenario, "ha")) blk: {
         if (transition_budget != 33) return error.HaScenarioRequiresThirtyThreeTransitions;
         break :blk try antfly.ha_vopr.record(alloc, seed);
@@ -381,6 +381,7 @@ fn corpusMergeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []cons
     var base_path: ?[]const u8 = null;
     var output_dir: ?[]const u8 = null;
     var force = false;
+    var max_replay_transitions: u64 = 8_000_000;
     var trace_paths: std.ArrayListUnmanaged([]const u8) = .empty;
     defer trace_paths.deinit(alloc);
     var index: usize = 0;
@@ -391,12 +392,15 @@ fn corpusMergeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []cons
             try trace_paths.append(alloc, try nextValue(args, &index));
         } else if (std.mem.eql(u8, args[index], "--out-dir")) {
             output_dir = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--max-replay-transitions")) {
+            max_replay_transitions = try std.fmt.parseInt(u64, try nextValue(args, &index), 10);
         } else if (std.mem.eql(u8, args[index], "--force")) {
             force = true;
         } else return error.UnknownArgument;
         index += 1;
     }
-    const base_input = base_path orelse return error.CorpusBaseTraceRequired;
+    if (base_path) |path| try trace_paths.insert(alloc, 0, path);
+    if (trace_paths.items.len == 0) return error.CorpusTraceRequired;
     const output = output_dir orelse return error.CorpusOutputDirectoryRequired;
     const manifest_path = try std.fmt.allocPrint(alloc, "{s}/index.json", .{output});
     defer alloc.free(manifest_path);
@@ -407,59 +411,117 @@ fn corpusMergeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []cons
             error.FileNotFound => {},
             else => return err,
         }
+    } else {
+        // Invalidate the old completion marker before an explicit replacement.
+        std.Io.Dir.cwd().deleteFile(io, manifest_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
     }
 
-    var owned_bytes: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (owned_bytes.items) |bytes| alloc.free(bytes);
-        owned_bytes.deinit(alloc);
-    }
-    try owned_bytes.append(alloc, try std.Io.Dir.cwd().readFileAlloc(io, base_input, alloc, .limited(max_trace_bytes)));
-    for (trace_paths.items) |path| try owned_bytes.append(
-        alloc,
-        try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_trace_bytes)),
-    );
-    var base = try vopr.trace.parseAlloc(alloc, owned_bytes.items[0]);
-    defer base.deinit();
-    var base_replay = try replayKnownScenario(alloc, &base);
-    base_replay.deinit();
-    const compatibility = vopr.corpus.Compatibility{
-        .scenario = base.header.scenario,
-        .scenario_version = base.header.scenario_version,
-        .backend_ids = base.config.backend_ids,
-    };
-    var corpus = vopr.corpus.Corpus.init(alloc);
-    defer corpus.deinit();
-    var candidates: std.ArrayListUnmanaged(vopr.corpus.MergeCandidate) = .empty;
-    defer candidates.deinit(alloc);
-    var replay_quarantined: u64 = 0;
-    for (owned_bytes.items) |bytes| {
-        var candidate = vopr.trace.parseAlloc(alloc, bytes) catch {
-            try candidates.append(alloc, .{ .bytes = bytes });
-            continue;
-        };
-        defer candidate.deinit();
-        const compatible = std.mem.eql(u8, candidate.header.scenario, compatibility.scenario) and
-            candidate.header.scenario_version == compatibility.scenario_version and
-            std.mem.eql(vopr.id.StableId, candidate.config.backend_ids, compatibility.backend_ids);
-        if (compatible) {
-            var replayed = replayKnownScenario(alloc, &candidate) catch {
-                _ = try corpus.quarantineBytes(bytes, .replay_diverged);
-                replay_quarantined += 1;
-                continue;
-            };
-            replayed.deinit();
-        }
-        try candidates.append(alloc, .{ .bytes = bytes });
-    }
-    var merge_report = try corpus.merge(candidates.items, compatibility);
-    merge_report.candidates += replay_quarantined;
-    merge_report.quarantined += replay_quarantined;
     try ensureDir(io, output);
     const quarantine_dir = try std.fmt.allocPrint(alloc, "{s}/quarantine", .{output});
     defer alloc.free(quarantine_dir);
-    if (corpus.quarantined.items.len != 0) try ensureDir(io, quarantine_dir);
-
+    try ensureDir(io, quarantine_dir);
+    var compatibility: ?vopr.corpus.Compatibility = null;
+    defer if (compatibility) |value| {
+        alloc.free(value.scenario);
+        alloc.free(value.backend_ids);
+    };
+    var corpus = vopr.corpus.Corpus.init(alloc);
+    defer corpus.deinit();
+    var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer seen.deinit(alloc);
+    var merge_report: vopr.corpus.MergeReport = .{};
+    var replay_count: u64 = 0;
+    var replay_transitions: u64 = 0;
+    var validated_bytes: u64 = 0;
+    const started = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    for (trace_paths.items) |path| {
+        merge_report.candidates += 1;
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_trace_bytes));
+        defer alloc.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        if ((try seen.getOrPut(alloc, digest)).found_existing) {
+            merge_report.duplicates += 1;
+            continue;
+        }
+        try writeCorpusProgress(alloc, io, output, path, "validating", replay_count, validated_bytes, started);
+        var reason: ?vopr.corpus.QuarantineReason = null;
+        var parsed = vopr.trace.parseAlloc(alloc, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
+        defer if (parsed) |*candidate| candidate.deinit();
+        if (parsed) |*candidate| {
+            if (compatibility) |active| {
+                reason = if (!std.mem.eql(u8, candidate.header.scenario, active.scenario))
+                    .scenario_changed
+                else if (candidate.header.scenario_version != active.scenario_version)
+                    .scenario_version_changed
+                else if (!std.mem.eql(vopr.id.StableId, candidate.config.backend_ids, active.backend_ids))
+                    .backend_changed
+                else
+                    null;
+            }
+            if (reason == null) {
+                const cost = candidate.summary.?.transitions;
+                if (cost > max_replay_transitions - replay_transitions) {
+                    try writeCorpusProgress(alloc, io, output, path, "transition_budget_exhausted", replay_count, validated_bytes, started);
+                    return error.CorpusValidationTransitionBudgetExceeded;
+                }
+                replay_transitions += cost;
+                replay_count += 1;
+                var replayed = replayKnownScenario(alloc, candidate) catch |err| blk: {
+                    std.debug.print("VOPR corpus rejected path={s} error={s}\n", .{ path, @errorName(err) });
+                    reason = switch (err) {
+                        error.OutOfMemory => return err,
+                        error.IncompatibleScenario, error.UnsupportedScenario => .scenario_changed,
+                        error.IncompatibleScenarioVersion, error.IncompatibleMetadataVoprTrace, error.IncompatibleDistributedDataVoprTrace => .scenario_version_changed,
+                        else => .replay_diverged,
+                    };
+                    break :blk null;
+                };
+                if (replayed) |*artifact| artifact.deinit();
+            }
+            if (reason == null) {
+                if (compatibility == null) {
+                    const scenario = try alloc.dupe(u8, candidate.header.scenario);
+                    errdefer alloc.free(scenario);
+                    compatibility = .{
+                        .scenario = scenario,
+                        .scenario_version = candidate.header.scenario_version,
+                        .backend_ids = try alloc.dupe(vopr.id.StableId, candidate.config.backend_ids),
+                    };
+                }
+                const added = try corpus.add(candidate, .{});
+                if (added.inserted) {
+                    const entry = &corpus.entries.items[added.index];
+                    const full_path = try std.fmt.allocPrint(alloc, "{s}/trace-{x}.voprtrace", .{ output, entry.key.trace_digest });
+                    defer alloc.free(full_path);
+                    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full_path, .data = entry.bytes });
+                    // Keep only keys and property history in memory across inputs.
+                    alloc.free(entry.bytes);
+                    entry.bytes = &.{};
+                    merge_report.inserted += 1;
+                } else merge_report.duplicates += 1;
+            }
+        } else reason = .invalid_trace;
+        if (reason) |rejection| {
+            const entry_index = try corpus.quarantineBytes(bytes, rejection);
+            const entry = &corpus.quarantined.items[entry_index];
+            const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}-{x}.voprquarantine", .{ quarantine_dir, @tagName(rejection), entry.trace_digest });
+            defer alloc.free(full_path);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full_path, .data = entry.bytes });
+            alloc.free(entry.bytes);
+            entry.bytes = &.{};
+            merge_report.quarantined += 1;
+        }
+        validated_bytes += bytes.len;
+        try writeCorpusProgress(alloc, io, output, path, if (reason) |value| @tagName(value) else "validated", replay_count, validated_bytes, started);
+    }
+    const active = compatibility orelse return error.NoReplayableCorpusAuthority;
     const ManifestArtifact = struct { trace_digest: u64, path: []const u8 };
     const ManifestQuarantine = struct { trace_digest: u64, reason: vopr.corpus.QuarantineReason, path: []const u8 };
     const artifacts = try alloc.alloc(ManifestArtifact, corpus.entries.items.len);
@@ -470,9 +532,6 @@ fn corpusMergeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []cons
         const relative_path = try std.fmt.allocPrint(alloc, "trace-{x}.voprtrace", .{entry.key.trace_digest});
         artifacts[entry_index] = .{ .trace_digest = entry.key.trace_digest, .path = relative_path };
         artifacts_initialized += 1;
-        const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ output, relative_path });
-        defer alloc.free(full_path);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full_path, .data = entry.bytes });
     }
     const quarantined = try alloc.alloc(ManifestQuarantine, corpus.quarantined.items.len);
     defer alloc.free(quarantined);
@@ -490,16 +549,27 @@ fn corpusMergeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []cons
             .path = relative_path,
         };
         quarantine_initialized += 1;
-        const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ output, relative_path });
-        defer alloc.free(full_path);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full_path, .data = entry.bytes });
     }
+    std.mem.sort(ManifestArtifact, artifacts, {}, struct {
+        fn lessThan(_: void, lhs: ManifestArtifact, rhs: ManifestArtifact) bool {
+            return lhs.trace_digest < rhs.trace_digest;
+        }
+    }.lessThan);
+    std.mem.sort(ManifestQuarantine, quarantined, {}, struct {
+        fn lessThan(_: void, lhs: ManifestQuarantine, rhs: ManifestQuarantine) bool {
+            return @intFromEnum(lhs.reason) < @intFromEnum(rhs.reason) or (lhs.reason == rhs.reason and lhs.trace_digest < rhs.trace_digest);
+        }
+    }.lessThan);
     const manifest = try std.json.Stringify.valueAlloc(alloc, .{
         .format = "vopr-corpus-merge-v1",
-        .scenario = compatibility.scenario,
-        .scenario_version = compatibility.scenario_version,
-        .backend_ids = compatibility.backend_ids,
+        .scenario = active.scenario,
+        .scenario_version = active.scenario_version,
+        .backend_ids = active.backend_ids,
         .report = merge_report,
+        .exact_replays = replay_count,
+        .validated_bytes = validated_bytes,
+        .replay_transitions = replay_transitions,
+        .max_replay_transitions = max_replay_transitions,
         .artifacts = artifacts,
         .quarantine = quarantined,
         .property_history = corpus.property_history.items,
@@ -507,7 +577,7 @@ fn corpusMergeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []cons
     defer alloc.free(manifest);
     // The manifest is the completion marker and is written after every
     // referenced retained/quarantined byte artifact is durable to the API.
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest });
+    try writeAtomicArtifact(alloc, io, manifest_path, manifest);
     std.debug.print("VOPR corpus merge candidates={d} retained={d} duplicates={d} quarantined={d} out={s}\n", .{
         merge_report.candidates,
         merge_report.inserted,
@@ -515,6 +585,21 @@ fn corpusMergeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []cons
         merge_report.quarantined,
         output,
     });
+}
+
+fn writeCorpusProgress(alloc: std.mem.Allocator, io: std.Io, output: []const u8, path: []const u8, status: []const u8, replays: u64, bytes: u64, started: i96) !void {
+    const progress_path = try std.fmt.allocPrint(alloc, "{s}/validation.json", .{output});
+    defer alloc.free(progress_path);
+    const data = try std.json.Stringify.valueAlloc(alloc, .{
+        .path = path,
+        .status = status,
+        .exact_replays = replays,
+        .validated_bytes = bytes,
+        .elapsed_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() - started,
+    }, .{ .whitespace = .indent_2 });
+    defer alloc.free(data);
+    try writeAtomicArtifact(alloc, io, progress_path, data);
+    std.debug.print("VOPR corpus validation status={s} replays={} bytes={} path={s}\n", .{ status, replays, bytes, path });
 }
 
 fn indexCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -737,14 +822,13 @@ fn replayKnownScenarioWithRecorder(
     recorded: *const vopr.trace.Trace,
     recorder: *vopr.flight_recorder.Recorder,
 ) !vopr.trace.Trace {
-    var source = vopr.choice.Replay{ .records = recorded.choices.items };
+    var source = vopr.choice.Replay{
+        .records = recorded.choices.items,
+        .expected_transitions = recorded.transitions.items,
+    };
     var replayed = try runKnownScenarioWithChoicesAndRecorder(alloc, recorded, source.source(), recorder);
     errdefer replayed.deinit();
-    const expected = try recorded.renderAlloc(alloc);
-    defer alloc.free(expected);
-    const actual = try replayed.renderAlloc(alloc);
-    defer alloc.free(actual);
-    if (!std.mem.eql(u8, expected, actual)) return error.VoprReplayArtifactDiverged;
+    if (!try recorded.canonicalEqual(&replayed, alloc)) return error.VoprReplayArtifactDiverged;
     return replayed;
 }
 
@@ -874,7 +958,7 @@ fn defaultCampaignTransitions(scenario: []const u8) !usize {
 }
 
 fn validateCampaignTransitions(scenario: []const u8, transitions: usize) !void {
-    if (std.mem.eql(u8, scenario, "metadata")) return;
+    if (std.mem.eql(u8, scenario, "metadata") or std.mem.eql(u8, scenario, "ha-scaling")) return;
     if (transitions != try defaultCampaignTransitions(scenario)) return error.ScenarioRequiresFixedTransitionBudget;
 }
 
@@ -908,7 +992,7 @@ fn recordCampaignScenario(
     if (std.mem.eql(u8, scenario, "lmdb")) return antfly.lmdb_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "lsm")) return antfly.lsm_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "ha")) return antfly.ha_vopr.record(alloc, seed);
-    if (std.mem.eql(u8, scenario, "ha-scaling")) return antfly.full_cluster_vopr.recordHAScaling(alloc, seed);
+    if (std.mem.eql(u8, scenario, "ha-scaling")) return antfly.full_cluster_vopr.recordHAScaling(alloc, seed, transitions);
     if (antfly.domain_vopr.kindFromCliName(scenario) != null) return antfly.domain_vopr.recordNamed(alloc, scenario, seed);
     return error.UnsupportedScenario;
 }
@@ -1258,6 +1342,7 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
     var histories: u64 = 100;
     var fail_on_findings = false;
     var defer_diagnostics = false;
+    var exploration_policy: vopr.choice.ExplorationPolicy = .bounded_fair;
     var requested_transitions: ?usize = null;
     var workers: usize = 1;
     var seed: u64 = 0xa17f_1000;
@@ -1273,6 +1358,8 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
             fail_on_findings = true;
         } else if (std.mem.eql(u8, arg, "--defer-diagnostics")) {
             defer_diagnostics = true;
+        } else if (std.mem.eql(u8, arg, "--exploration-policy")) {
+            exploration_policy = try vopr.choice.ExplorationPolicy.parse(try nextValue(args, &index));
         } else if (std.mem.eql(u8, arg, "--histories")) {
             histories = try std.fmt.parseInt(u64, try nextValue(args, &index), 10);
         } else if (std.mem.eql(u8, arg, "--transitions")) {
@@ -1305,13 +1392,14 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
         .base_seed = seed,
         .artifact_dir = artifact_dir,
         .defer_diagnostics = defer_diagnostics,
+        .exploration_policy = exploration_policy,
         .coverage = vopr.coverage.Tracker.init(std.heap.smp_allocator),
         .corpus = vopr.corpus.Corpus.init(std.heap.smp_allocator),
     };
     defer context.deinitReport();
-    try context.primeCorpus(alloc);
     defer context.corpus.deinit();
     defer context.coverage.deinit();
+    try context.primeCorpus(alloc);
     const worker_count = @min(workers, @as(usize, @intCast(histories)));
     context.worker_count = worker_count;
     const threads = try alloc.alloc(std.Thread, worker_count);
@@ -1736,6 +1824,7 @@ const CampaignContext = struct {
     base_seed: u64,
     artifact_dir: []const u8,
     defer_diagnostics: bool = false,
+    exploration_policy: vopr.choice.ExplorationPolicy = .bounded_fair,
     worker_count: usize = 0,
     next_history: std.atomic.Value(u64) = .init(0),
     mutex: std.Io.Mutex = .init,
@@ -1809,7 +1898,7 @@ const CampaignContext = struct {
         defer alloc.free(bytes);
         const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.voprtrace", .{ self.artifact_dir, history_index, seed });
         defer alloc.free(path);
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
+        try writeAtomicArtifact(alloc, self.io, path, bytes);
         const retained_path = try std.heap.smp_allocator.dupe(u8, path);
         errdefer std.heap.smp_allocator.free(retained_path);
         try self.mutex.lock(self.io);
@@ -1823,10 +1912,12 @@ const CampaignContext = struct {
     fn runHistory(self: *@This(), history_index: u64) !void {
         const alloc = std.heap.smp_allocator;
         const seed = self.base_seed +% history_index *% 0x9e37_79b9_7f4a_7c15;
-        const candidate = (try self.mutateCorpusEntry(alloc, seed)) orelse blk: {
+        try self.writeHistoryProgress(alloc, history_index, seed, "recording");
+        const candidate = (try self.mutateCorpusEntry(alloc, seed, history_index)) orelse blk: {
             // Keep semantic identities stable across a campaign. The history
             // seed still varies scheduling, while stable IDs allow compatible
             // observation states from independent histories to be spliced.
+            try self.writeScheduleProvenance(alloc, history_index, seed, .{ .operation = "initial", .source = "scenario-default" });
             break :blk Candidate{
                 .artifact = try recordCampaignScenario(alloc, self.scenario, seed, self.transitions, self.base_seed),
             };
@@ -1834,10 +1925,23 @@ const CampaignContext = struct {
         var artifact = candidate.artifact;
         defer artifact.deinit();
 
+        // Exact replay can outlive the subprocess budget. Preserve the first
+        // execution before starting it, so interruption never loses the input
+        // needed to diagnose or resume that validation.
+        const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.voprtrace", .{ self.artifact_dir, history_index, seed });
+        defer alloc.free(path);
+        {
+            const bytes = try artifact.renderAlloc(alloc);
+            defer alloc.free(bytes);
+            try writeAtomicArtifact(alloc, self.io, path, bytes);
+        }
+        try self.writeHistoryProgress(alloc, history_index, seed, "replaying");
+
         var recorder = try vopr.flight_recorder.Recorder.init(alloc, 1024);
         defer recorder.deinit();
         var replayed = replayKnownScenarioWithRecorder(alloc, &artifact, &recorder) catch |err| {
             try self.retainReplayDivergence(alloc, history_index, seed, &artifact, err);
+            try self.writeHistoryProgress(alloc, history_index, seed, "replay_diverged");
             return;
         };
         replayed.deinit();
@@ -1869,13 +1973,11 @@ const CampaignContext = struct {
         self.mutex.unlock(self.io);
         // Corpus retention is deduplicated, but every failing history still
         // receives a standalone artifact and a stable report entry.
-        if (!inserted and !failed) return;
-
-        const bytes = try artifact.renderAlloc(alloc);
-        defer alloc.free(bytes);
-        const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.voprtrace", .{ self.artifact_dir, history_index, seed });
-        defer alloc.free(path);
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
+        if (!inserted and !failed) {
+            try std.Io.Dir.cwd().deleteFile(self.io, path);
+            try self.writeHistoryProgress(alloc, history_index, seed, "completed_duplicate");
+            return;
+        }
         try self.mutex.lock(self.io);
         const retained_path = alloc.dupe(u8, path) catch |err| {
             self.mutex.unlock(self.io);
@@ -1917,6 +2019,7 @@ const CampaignContext = struct {
                 self.mutex.unlock(self.io);
             }
         }
+        try self.writeHistoryProgress(alloc, history_index, seed, if (failed) "completed_finding" else "completed_clean");
     }
 
     fn observeArtifactLocked(self: *@This(), artifact: *const vopr.trace.Trace) !void {
@@ -2194,7 +2297,35 @@ const CampaignContext = struct {
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = html_path, .data = html });
     }
 
-    fn mutateCorpusEntry(self: *@This(), alloc: std.mem.Allocator, seed: u64) !?Candidate {
+    fn writeHistoryProgress(self: *@This(), alloc: std.mem.Allocator, history_index: u64, seed: u64, phase: []const u8) !void {
+        const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.progress.json", .{ self.artifact_dir, history_index, seed });
+        defer alloc.free(path);
+        const bytes = try std.json.Stringify.valueAlloc(alloc, .{
+            .history = history_index,
+            .seed = seed,
+            .scenario = self.scenario,
+            .phase = phase,
+        }, .{ .whitespace = .indent_2 });
+        defer alloc.free(bytes);
+        try writeAtomicArtifact(alloc, self.io, path, bytes);
+    }
+
+    fn writeScheduleProvenance(self: *@This(), alloc: std.mem.Allocator, history_index: u64, seed: u64, schedule: anytype) !void {
+        const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.schedule.json", .{ self.artifact_dir, history_index, seed });
+        defer alloc.free(path);
+        const bytes = try std.json.Stringify.valueAlloc(alloc, .{
+            .format = "vopr-schedule-v1",
+            .history = history_index,
+            .seed = seed,
+            .scenario = self.scenario,
+            .transition_budget = self.transitions,
+            .schedule = schedule,
+        }, .{ .whitespace = .indent_2 });
+        defer alloc.free(bytes);
+        try writeAtomicArtifact(alloc, self.io, path, bytes);
+    }
+
+    fn mutateCorpusEntry(self: *@This(), alloc: std.mem.Allocator, seed: u64, history_index: u64) !?Candidate {
         var prng = std.Random.DefaultPrng.init(seed ^ 0x6d75_7461_7465_3031);
         try self.mutex.lock(self.io);
         if (self.corpus.entries.items.len == 0) {
@@ -2204,7 +2335,8 @@ const CampaignContext = struct {
         const should_splice = self.corpus.entries.items.len >= 2 and prng.random().uintLessThan(u8, 100) < 20;
         self.mutex.unlock(self.io);
         if (should_splice) {
-            if (try self.spliceCorpusEntries(alloc, &prng)) |artifact| return artifact;
+            try self.writeScheduleProvenance(alloc, history_index, seed, .{ .operation = "splice", .source = "exact-recorded-suffix" });
+            if (try self.spliceCorpusEntries(alloc, &prng, history_index, seed)) |artifact| return artifact;
         }
 
         try self.mutex.lock(self.io);
@@ -2247,7 +2379,19 @@ const CampaignContext = struct {
             }
             replacement_ordinal -= 1;
         }
+        try self.writeScheduleProvenance(alloc, history_index, seed, .{
+            .operation = "mutation",
+            .parent_digest = vopr.id.digest(parent_bytes),
+            .mutation_index = mutation_index,
+            .replacement_id = replacement,
+            .suffix_policy = if (self.exploration_policy == .bounded_fair) "bounded-fair" else @tagName(self.exploration_policy),
+            .fairness_window = vopr.choice.Exploring.fairness_window,
+            .adversarial_delay_choices = vopr.choice.Exploring.adversarial_delay_choices,
+        });
+        var exploration = vopr.choice.Exploring.init(alloc, self.exploration_policy, seed);
+        defer exploration.deinit();
         var source = vopr.choice.Mutating.init(parent.choices.items, mutation_index, replacement, seed);
+        source.suffix = exploration.source();
         const artifact = runKnownScenarioWithChoices(alloc, &parent, source.source()) catch |err| switch (err) {
             error.MutationPointNotReached,
             error.MutationPointOutOfRange,
@@ -2265,6 +2409,8 @@ const CampaignContext = struct {
         self: *@This(),
         alloc: std.mem.Allocator,
         prng: *std.Random.DefaultPrng,
+        history_index: u64,
+        seed: u64,
     ) !?Candidate {
         try self.mutex.lock(self.io);
         if (self.corpus.entries.items.len < 2) {
@@ -2324,6 +2470,13 @@ const CampaignContext = struct {
             if (ordinal == 0) break candidate;
             ordinal -= 1;
         } else unreachable;
+        try self.writeScheduleProvenance(alloc, history_index, seed, .{
+            .operation = "splice",
+            .left_parent_digest = vopr.id.digest(left_bytes),
+            .right_parent_digest = vopr.id.digest(right_bytes),
+            .point = point,
+            .source = "exact-recorded-suffix",
+        });
         var source = try vopr.splice.Source.init(left.choices.items, right.choices.items, point);
         var artifact = runKnownScenarioWithChoices(alloc, &left, source.source()) catch |err| switch (err) {
             error.SpliceChoiceExhausted,
@@ -2338,8 +2491,6 @@ const CampaignContext = struct {
             else => return err,
         };
         errdefer artifact.deinit();
-        var replayed = try replayKnownScenario(alloc, &artifact);
-        replayed.deinit();
         try self.recordSpliceResult(true);
         return .{
             .artifact = artifact,
@@ -2383,7 +2534,8 @@ const CampaignContext = struct {
         for (names.items) |name| {
             const encoded = try dir.readFileAlloc(self.io, name, alloc, .limited(max_trace_bytes));
             defer alloc.free(encoded);
-            var artifact = vopr.trace.parseAlloc(alloc, encoded) catch {
+            var artifact = vopr.trace.parseAlloc(alloc, encoded) catch |err| {
+                if (err == error.OutOfMemory) return err;
                 _ = try self.corpus.quarantineBytes(encoded, .invalid_trace);
                 continue;
             };
@@ -2395,6 +2547,7 @@ const CampaignContext = struct {
             // Corpus files must still be executable under the current ABI.
             var replayed = replayKnownScenario(alloc, &artifact) catch |err| {
                 switch (err) {
+                    error.OutOfMemory => return err,
                     error.IncompatibleScenarioVersion, error.IncompatibleMetadataVoprTrace, error.IncompatibleDistributedDataVoprTrace => {
                         _ = try self.corpus.quarantineBytes(encoded, .scenario_version_changed);
                     },
@@ -2497,7 +2650,7 @@ fn usage() error{InvalidUsage} {
         \\usage:
         \\  vopr run --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha|ha-scaling --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
         \\  vopr replay --trace <path>
-        \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha|ha-scaling --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path> [--fail-on-findings] [--defer-diagnostics]
+        \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha|ha-scaling --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path> [--fail-on-findings] [--defer-diagnostics] [--exploration-policy cooperative|bounded-fair|adversarial]
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
         \\  vopr tla --trace <path> --domain raft|transaction --out <path.ndjson>
@@ -2507,7 +2660,7 @@ fn usage() error{InvalidUsage} {
         \\  vopr events [--trace <path> ...] --query <query.json> [--validate] [--count] [--out <matches.json>]
         \\  vopr recipe --trace <path> [--failure <ordinal>] [--attempts <n>] [--flight-filter <filter.json>] [--flight-before <n>] [--flight-after <n>] [--flight-limit <n>] [--flight-capacity <n>] [--flight-anywhere] --out <recipe.json> --reduced-out <reduced.voprtrace>
         \\  vopr index --index <index.json> [--add <results.json> ...] [--run-id <id>] [--revision <revision>] [--scenario <name>] [--property <id>] [--property-name <name>] [--fingerprint <id>] [--corpus retained|quarantined] [--artifact-contains <text>] [--min-transitions <n>] [--max-transitions <n>] [--min-resources <n>] [--max-resources <n>] [--min-histories <n>] [--limit <n>] [--json-out <query.json>] [--html-out <summary.html>]
-        \\  vopr corpus-merge --base <trace> [--trace <trace> ...] --out-dir <directory> [--force]
+        \\  vopr corpus-merge --trace <trace> [--trace <trace> ...] [--base <preferred-trace>] --out-dir <directory> [--max-replay-transitions <n>] [--force]
         \\
     , .{});
     return error.InvalidUsage;
@@ -2516,9 +2669,13 @@ fn usage() error{InvalidUsage} {
 test "VOPR command entrypoint" {
     const init_ptr: *const std.process.Init.Minimal = @ptrCast(@alignCast(antflyVoprProcessInit()));
     const init = init_ptr.*;
-    const argv = try init.args.toSlice(std.testing.allocator);
-    defer std.testing.allocator.free(argv);
-    try dispatch(std.testing.allocator, std.testing.io, argv);
+    // This test-runner entrypoint is the installed CLI. Multi-gigabyte replay
+    // parsing must not capture debug allocation stack traces for every JSON
+    // token. The actual unit tests below retain std.testing.allocator checks.
+    const alloc = std.heap.smp_allocator;
+    const argv = try init.args.toSlice(alloc);
+    defer alloc.free(argv);
+    try dispatch(alloc, std.testing.io, argv);
 }
 
 extern fn antflyVoprProcessInit() *const anyopaque;
@@ -2683,7 +2840,7 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     try std.testing.expectEqual(@as(u64, 1), context.seeded_findings);
     try std.testing.expectError(error.CampaignPropertyFailure, checkCampaignFindings(context.seeded_findings, true));
     try std.testing.expectEqual(@as(usize, 1), context.corpus.entries.items.len);
-    if (try context.mutateCorpusEntry(alloc, 0xA17F_FA12)) |mutated_value| {
+    if (try context.mutateCorpusEntry(alloc, 0xA17F_FA12, 1)) |mutated_value| {
         var mutated = mutated_value;
         defer mutated.artifact.deinit();
         var mutation_replay = try antfly.metadata_vopr_harness.replayMetadataVoprCampaign(alloc, &mutated.artifact);
@@ -2877,6 +3034,21 @@ test "VOPR scenario registry records and exactly replays every context-free doma
         var replayed = try replayKnownScenario(alloc, &artifact);
         replayed.deinit();
     }
+}
+
+test "VOPR scenario registry recorder replay checks selected transition payloads" {
+    const alloc = std.testing.allocator;
+    var artifact = try antfly.transaction_vopr.record(alloc, 1);
+    defer artifact.deinit();
+    var recorder = try vopr.flight_recorder.Recorder.init(alloc, 16);
+    defer recorder.deinit();
+    var replayed = try replayKnownScenarioWithRecorder(alloc, &artifact, &recorder);
+    replayed.deinit();
+
+    // The same stable choice can carry different bytes. Diagnose that at the
+    // selected transition, before executing the rest of a long campaign.
+    artifact.transitions.items[0].payload_digest ^= 1;
+    try std.testing.expectError(error.ReplaySelectedTransitionDiverged, replayKnownScenarioWithRecorder(alloc, &artifact, &recorder));
 }
 
 test "VOPR scenario registry accepts production HA scaling in run and campaign" {

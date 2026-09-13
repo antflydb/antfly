@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const platform_time = @import("antfly_platform").time;
 const raft_engine = @import("raft_engine");
 const catalog = @import("catalog.zig");
 const host_mod = @import("host.zig");
@@ -1220,7 +1219,7 @@ pub const Reconciler = struct {
         errdefer route_peers.deinit(self.alloc);
         var policies = std.ArrayListUnmanaged(PreparedPolicyValidation).empty;
         errdefer policies.deinit(self.alloc);
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.host.monotonicNs();
 
         var scanned: usize = 0;
         var scheduled: usize = 0;
@@ -1386,7 +1385,7 @@ pub const Reconciler = struct {
         errdefer catalog_upserts.deinit(self.alloc);
         var catalog_upsert_hashes = std.ArrayListUnmanaged(u64).empty;
         errdefer catalog_upsert_hashes.deinit(self.alloc);
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.host.monotonicNs();
 
         for (intents, 0..) |intent, intent_index| {
             try intent.desiredMembership().validate();
@@ -1564,7 +1563,7 @@ pub const Reconciler = struct {
         else
             1;
         const next_retry_ns = if (classification == .retryable)
-            platform_time.monotonicNs() +| routeRetryDelayNs(group_id ^ @intFromEnum(phase), attempts)
+            self.host.monotonicNs() +| routeRetryDelayNs(group_id ^ @intFromEnum(phase), attempts)
         else
             0;
         self.failure_retries.putAssumeCapacity(key, .{
@@ -1677,7 +1676,7 @@ pub const Reconciler = struct {
                 const attempts = previous_retry.attempts +| 1;
                 self.route_retries.putAssumeCapacity(group_id, .{
                     .attempts = attempts,
-                    .next_retry_ns = platform_time.monotonicNs() +|
+                    .next_retry_ns = self.host.monotonicNs() +|
                         routeRetryDelayNs(group_id, attempts),
                 });
             },
@@ -1707,7 +1706,7 @@ pub const Reconciler = struct {
         conflict_remains: ?bool,
         last_error: ?anyerror,
     ) void {
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.host.monotonicNs();
         if (last_error) |err| {
             const previous = self.policy_retries.get(group_id) orelse RouteRetryState{};
             const attempts = previous.attempts +| 1;
@@ -1959,6 +1958,51 @@ test "reconcile result preserves aggregate placement failure disposition" {
     });
     try std.testing.expectEqual(error.ReplicaReconcileRestartRequired, result.placementFailureError().?);
     try std.testing.expectEqual(@as(usize, 1), result.restart_required_placement_failures);
+}
+
+test "reconciler retries advance only with the borrowed monotonic clock" {
+    const alloc = std.testing.allocator;
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer clock.deinit();
+    var host = host_mod.Host.init(alloc, .{ .local_node_id = 1 }, .{ .io = clock.io() });
+    defer host.deinit();
+    var provider = MemoryPlacementProvider.init(alloc);
+    defer provider.deinit();
+    var owner = Reconciler{ .alloc = alloc, .host = &host, .provider = provider.provider() };
+    defer owner.deinit();
+    try owner.ensureConvergenceCapacity(1);
+    owner.recordRouteRefreshResult(71, error.UnknownPeer);
+    const deadline = owner.routeDiagnostics(71).?.next_retry_ns;
+    try std.testing.expect(deadline >= 50 * std.time.ns_per_ms and deadline < 63 * std.time.ns_per_ms);
+    const intents = &.{PlacementIntent{
+        .record = .{ .group_id = 71, .replica_id = 1, .local_node_id = 1 },
+        .peer_node_ids = &.{ 1, 2 },
+    }};
+    try clock.advanceClocks(0, 100 * std.time.ns_per_s, true);
+    try clock.advance(deadline - 1);
+    {
+        var waiting = try owner.prepareLiveConvergence(intents);
+        defer waiting.deinit();
+        try std.testing.expectEqual(@as(usize, 0), waiting.route_groups.len);
+    }
+    try clock.advance(1);
+    {
+        var ready = try owner.prepareLiveConvergence(intents);
+        defer ready.deinit();
+        try std.testing.expectEqual(@as(usize, 1), ready.route_groups.len);
+    }
+    owner.recordPolicyValidationResult(71, true, null);
+    try std.testing.expectEqual(deadline + std.time.ns_per_s, owner.policy_retries.get(71).?.next_retry_ns);
+    var accumulator: FailureAccumulator = .{};
+    defer accumulator.deinit(alloc);
+    try accumulator.groups.ensureTotalCapacity(alloc, 1);
+    var result: ReconcileResult = .{};
+    owner.recordIntentFailure(&result, &accumulator, 71, 0xabc, .admission_prepare, error.InjectedPrepareFailure);
+    const admission_deadline = owner.failureDiagnosticsForDomain(71, .admission).?.next_retry_ns;
+    try std.testing.expect(admission_deadline > deadline and admission_deadline < deadline + 63 * std.time.ns_per_ms);
+    try std.testing.expect(owner.admissionAttemptDeferred(71, 0xabc, host.monotonicNs()));
+    try clock.advance(admission_deadline - deadline);
+    try std.testing.expect(!owner.admissionAttemptDeferred(71, 0xabc, host.monotonicNs()));
 }
 
 test "reconcile retry domains preserve admission backoff and primary diagnostics" {

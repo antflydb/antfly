@@ -1691,9 +1691,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const raft_transport_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "raft integration module compiles", "raft.transport." },
+        .filters = &.{ "raft integration module compiles", "raft.transport.", "raft.reconciler.", "http host shares its borrowed clock" },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
+    // Queued delivery lives in the harness root, outside antfly_test_mod's
+    // reachable tests. Exercise its HTTP boundary in the transport gate too.
+    const raft_queued_transport_tests = b.addTest(.{
+        .root_module = raft_harness_test_mod,
+        .filters = &.{"virtual http network"},
+    });
+    const run_raft_queued_transport_tests = addFilteredTestRunArtifact(b, raft_queued_transport_tests);
+    const data_runtime_vopr_tests = b.addTest(.{
+        .root_module = data_implementation_module,
+        .filters = &.{
+            "DataServer LSM maintenance",
+            "DataServer store status",
+            "data runtime runRound backs off retryable provision metadata failures",
+            "data runtime provisioned root refresh worker backs off retryable metadata failures",
+            "data runtime split apply store seeding reuses cached source writer",
+        },
+        .max_rss = production_vopr_compile_max_rss,
+    });
+    const run_data_runtime_vopr_tests = addFilteredTestRunArtifact(b, data_runtime_vopr_tests);
 
     // Snapshot artifact storage has its own root because Zig does not collect
     // tests from the implementation behind the transport compatibility alias.
@@ -2645,8 +2664,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "production DataServer public HTTP",
             "production HTTP lifecycle runs chunked keep-alive pipeline and stream on VoprIo",
-            "DataServer LSM maintenance owner runs on borrowed VoprIo",
-            "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo",
             "DataServer VOPR background owner executes and cancels maintenance on VoprIo",
             "production DataServer replicated merge actions run on VoprIo",
         },
@@ -2670,9 +2687,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "Run production DataServer HTTP, ownership, and replicated merge/split actions on VoprIo",
     );
     data_server_vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
+    data_server_vopr_test_step.dependOn(&run_data_runtime_vopr_tests.step);
     data_server_vopr_test_step.dependOn(&run_data_server_transition_vopr_tests.step);
     data_server_vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
     data_plane_vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
+    data_plane_vopr_test_step.dependOn(&run_data_runtime_vopr_tests.step);
 
     const serverless_object_store_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -3610,20 +3629,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     domain_vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
     domain_vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);
 
+    const vopr_runtime_adapter_filters = &.{
+        "VOPR durable job",
+        "backend runtime durable owner lifecycle",
+        "backend runtime borrows backend-agnostic std.Io lanes",
+        "ttl runtime executes production pass on borrowed VoprIo",
+        "transaction recovery executes production pass on borrowed VoprIo",
+        "background maintenance services lifecycle runs on borrowed VoprIo",
+        "generation publication replays durable identities on borrowed VoprIo",
+        "graph ownership cleanup runs on borrowed VoprIo before replicated merge",
+        "replicated split destination seeds inherited doc identity before range publication",
+        "replicated merge retains its resident writer while graph ownership cleanup is pending",
+        "table provisioner materializes metadata indexes into hosted group dbs",
+    };
     const vopr_runtime_adapter_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{
-            "VOPR durable job",
-            "backend runtime durable owner lifecycle",
-            "backend runtime borrows backend-agnostic std.Io lanes",
-            "ttl runtime executes production pass on borrowed VoprIo",
-            "transaction recovery executes production pass on borrowed VoprIo",
-            "background maintenance services lifecycle runs on borrowed VoprIo",
-        },
+        // The physical-owner adapter root peaks at 11.49 GB on native macOS
+        // ReleaseSafe; reserve enough memory before admitting compilation.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 10) * 1024 * 1024 * 1024,
+        // These named module tests make the schema admission regressions
+        // reachable; runtime filtering executes only the selected tests.
+        .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, vopr_runtime_adapter_filters),
     });
-    const run_vopr_runtime_adapter_tests = b.addRunArtifact(vopr_runtime_adapter_tests);
+    const run_vopr_runtime_adapter_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, vopr_runtime_adapter_tests, vopr_runtime_adapter_filters);
     const vopr_runtime_adapter_test_step = b.step("vopr-runtime-test", "Run Antfly background-service adapters on the deterministic VOPR runtime");
     vopr_runtime_adapter_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
+    vopr_runtime_adapter_test_step.dependOn(&run_data_runtime_vopr_tests.step);
     derived_workflow_vopr_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
 
     b.step("vopr-build", "Install the VOPR campaign and replay executable").dependOn(&b.addInstallArtifact(vopr_cli, .{}).step);
@@ -3717,6 +3748,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     vopr_test_step.dependOn(&run_supervision_vopr_tests.step);
     vopr_test_step.dependOn(&run_auth_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
+    vopr_test_step.dependOn(&run_data_runtime_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_object_store_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_workflow_vopr_tests.step);
     vopr_test_step.dependOn(&run_db_index_race_vopr_tests.step);
@@ -3976,8 +4008,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_restore_test_step = b.step("antfly-raft-restore-test", "Run focused Raft restore authority and restart tests");
     raft_restore_test_step.dependOn(&run_raft_restore_tests.step);
 
-    const raft_transport_test_step = b.step("antfly-raft-transport-test", "Run raft transport unit tests");
+    const raft_transport_test_step = b.step("antfly-raft-transport-test", "Run raft transport and route reconciliation unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
+    raft_transport_test_step.dependOn(&run_raft_queued_transport_tests.step);
 
     const raft_storage_test_step = b.step("antfly-raft-storage-test", "Run Raft snapshot artifact storage tests");
     raft_storage_test_step.dependOn(&run_raft_storage_tests.step);

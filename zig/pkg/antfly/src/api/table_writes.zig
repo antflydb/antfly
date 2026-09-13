@@ -2310,7 +2310,7 @@ pub const ProvisionedTableWriteCache = struct {
         metadata: StartupCatchUpMetadata,
     ) bool {
         return entryManagedConfigMatches(entry, metadata.indexes_json) and
-            optionalMetadataBytesEqual(entry.schema_json, metadata.schema_json) and
+            optionalSchemaJsonEqual(entry.schema_json, metadata.schema_json) and
             entryIdentityMatchesMetadata(entry, metadata);
     }
 
@@ -2326,12 +2326,12 @@ pub const ProvisionedTableWriteCache = struct {
         };
     }
 
-    fn optionalMetadataBytesEqual(
+    fn optionalSchemaJsonEqual(
         lhs: ?[]const u8,
         rhs: ?[]const u8,
     ) bool {
         if (lhs == null or rhs == null) return lhs == null and rhs == null;
-        return std.mem.eql(u8, lhs.?, rhs.?);
+        return std.mem.eql(u8, tables_api.effectiveSchemaJson(lhs.?), tables_api.effectiveSchemaJson(rhs.?));
     }
 
     fn publishEntryManagedConfig(entry: *Entry, indexes_json: ?[]const u8) void {
@@ -4487,9 +4487,9 @@ pub const ProvisionedTableWriteCache = struct {
                     else
                         current.indexes_json.len == 0;
                     const schema_match = if (metadata.schema_json) |cached|
-                        std.mem.eql(u8, cached, current.schema_json)
+                        std.mem.eql(u8, tables_api.effectiveSchemaJson(cached), tables_api.effectiveSchemaJson(current.schema_json))
                     else
-                        current.schema_json.len == 0;
+                        false;
                     if (indexes_match and schema_match) return metadata;
                 } else if (metadata.indexes_json == null and metadata.schema_json == null) {
                     return metadata;
@@ -4505,7 +4505,7 @@ pub const ProvisionedTableWriteCache = struct {
         }
 
         const indexes_json = if (table) |current| current.indexes_json else null;
-        const schema_json = if (table) |current| current.schema_json else null;
+        const schema_json = if (table) |current| tables_api.effectiveSchemaJson(current.schema_json) else null;
         var replacement = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
         errdefer replacement.deinit(self.alloc);
 
@@ -13162,6 +13162,11 @@ pub const ProvisionedTableWriteSource = struct {
                 .{}
             else
                 self.transactionRecoveryConfig();
+            const direct_schema = if (prepared_open.?.indexes_json == null)
+                try prepareManagedSchemaBeforeIndexLoad(cache.alloc, mode, prepared_open.?.schema_json)
+            else
+                null;
+            defer if (direct_schema) |schema| storage_schema.freeSchema(cache.alloc, schema.runtime_schema);
             var retry_prepared_open = false;
             var opened: ?db_mod.DB = while (true) {
                 // The initial identity lookup happens before cold-open
@@ -13201,6 +13206,7 @@ pub const ProvisionedTableWriteSource = struct {
                     )
                 else
                     db_mod.DB.open(cache.alloc, path, .{
+                        .schema_before_index_load = direct_schema,
                         .lsm_cache = cache.lsm_cache,
                         .hbc_cache = cache.hbc_cache,
                         .lsm_root_generation = lsm_root_generation,
@@ -14394,6 +14400,11 @@ pub const ProvisionedTableWriteSource = struct {
             return error.DocIdentityNamespaceUnavailable;
         const lsm_root_generation = self.visibleRootGeneration(group_id);
         const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default, self.ha_async_mirror);
+        const direct_schema = if (metadata.indexes_json == null)
+            try prepareManagedSchemaBeforeIndexLoad(alloc, .default, metadata.schema_json)
+        else
+            null;
+        defer if (direct_schema) |schema| storage_schema.freeSchema(alloc, schema.runtime_schema);
         var db = if (metadata.indexes_json) |indexes_json|
             try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 alloc,
@@ -14422,6 +14433,7 @@ pub const ProvisionedTableWriteSource = struct {
             )
         else
             try db_mod.DB.open(alloc, path, .{
+                .schema_before_index_load = direct_schema,
                 .lsm_root_generation = lsm_root_generation,
                 .backend_runtime = self.backend_runtime,
                 .secret_store = self.secret_store,
@@ -22926,11 +22938,16 @@ pub const ProvisionedTableWriteSource = struct {
             defer self.local_db_mutex.unlock();
             self.invalidateReadCache(table_name);
         }
+        var preserve_writer_on_error = false;
         errdefer {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
             self.invalidateReadCache(table_name);
-            self.invalidateWriteCache(table_name);
+            // Graph ownership cleanup runs on the resident writer. A retry
+            // before mutation must leave that owner alive to clear its fence;
+            // retiring it on every retry cancels the work Raft is waiting for.
+            if (!preserve_writer_on_error)
+                self.invalidateWriteCache(table_name);
         }
         if (self.write_cache) |cache| {
             const target_generation = self.visibleRootGeneration(group_id);
@@ -22974,10 +22991,12 @@ pub const ProvisionedTableWriteSource = struct {
                         try applyReplicatedTransactionMutationAtRaftEntry(alloc, cached.db, table_name, group_id, apply_req, entry)
                     else
                         try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
-                } else if (raft_entry) |entry|
-                    try cached.db.batchRaftReplicatedApply(apply_req, entry)
-                else
-                    try cached.db.batchReplicatedApply(apply_req);
+                } else if (raft_entry) |entry| {
+                    cached.db.batchRaftReplicatedApply(apply_req, entry) catch |err| {
+                        preserve_writer_on_error = err == error.RaftApplyWriterUnavailable;
+                        return err;
+                    };
+                } else try cached.db.batchReplicatedApply(apply_req);
             }
             cache.publishCachedLeaseGeneration(&cached, target_generation);
             {
@@ -31975,7 +31994,9 @@ fn loadTableManagedMetadata(
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
     const indexes_json = if (table.indexes_json.len == 0) null else try alloc.dupe(u8, table.indexes_json);
     errdefer if (indexes_json) |value| alloc.free(value);
-    const schema_json = if (table.schema_json.len == 0) null else try alloc.dupe(u8, table.schema_json);
+    // This is a complete catalog contract. Persist the default schema for an
+    // empty contract so a later Raft apply can reopen without catalog access.
+    const schema_json = try alloc.dupe(u8, tables_api.effectiveSchemaJson(table.schema_json));
     return .{
         .indexes_json = indexes_json,
         .schema_json = schema_json,
@@ -32337,6 +32358,8 @@ fn validateSplitReplicationIdentityAgainstCatalog(
     if (!source_namespace.eql(replication.identity_namespace)) return error.DocIdentityNamespaceMismatch;
 }
 
+const prepareManagedSchemaBeforeIndexLoad = physical_local_write.prepareManagedSchemaBeforeIndexLoad;
+
 fn openManagedDbForReplicatedApply(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -32360,6 +32383,11 @@ fn openManagedDbForReplicatedApply(
     const indexes_json = if (metadata) |owned| owned.indexes_json else null;
     const schema_json = if (metadata) |owned| owned.schema_json else null;
     const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default_async, ha_async_mirror);
+    const direct_schema = if (indexes_json == null)
+        try prepareManagedSchemaBeforeIndexLoad(alloc, .default_async, schema_json)
+    else
+        null;
+    defer if (direct_schema) |schema| storage_schema.freeSchema(alloc, schema.runtime_schema);
     var db = if (indexes_json) |value|
         try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
             alloc,
@@ -32387,6 +32415,7 @@ fn openManagedDbForReplicatedApply(
         )
     else
         try db_mod.DB.open(alloc, path, .{
+            .schema_before_index_load = direct_schema,
             .backend_runtime = backend_runtime,
             .identity_namespace = namespace,
             .prefer_existing_identity_namespace = true,
@@ -39760,6 +39789,69 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "replicated merge retains its resident writer while graph ownership cleanup is pending" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-graph-owner", .{tmp.sub_path});
+            defer alloc.free(root);
+            const Catalog = struct {
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogAccess;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn source() table_catalog.CatalogSource {
+                    return .{ .ptr = undefined, .vtable = &.{
+                        .admin_snapshot = snapshot,
+                        .free_admin_snapshot = free,
+                        .routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot,
+                        .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
+                        .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
+                    } };
+                }
+            };
+            var cache = ProvisionedTableWriteCache.init(alloc);
+            defer cache.deinit();
+            var source = ProvisionedTableWriteSource.init(root, Catalog.source());
+            defer source.deinit();
+            source.write_cache = &cache;
+            const namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+            var writer = (try source.leaseCachedGroupWriterWithMetadata(alloc, 1, "docs", .{
+                .indexes_json = "{}",
+                .schema_json = tables_api.default_schema_json,
+                .identity_namespace = namespace,
+            })) orelse return error.TestUnexpectedResult;
+            defer writer.deinit(alloc);
+            try writer.db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+            try writer.db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
+            try writer.db.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
+            const merge = db_mod.types.BatchRequest{ .merge_checkpoint = .{
+                .kind = .accept,
+                .transition_id = 10,
+                .donor_group_id = 2,
+                .receiver_group_id = 1,
+                .receiver_base_start = "",
+                .receiver_base_end = "m",
+                .merged_start = "",
+                .merged_end = "",
+            }, .merge_replication = .{
+                .transition_id = 10,
+                .donor_group_id = 2,
+                .receiver_group_id = 1,
+                .identity_namespace = namespace,
+            } };
+            try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", merge, .{ .term = 1, .index = 2 }));
+            try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+            try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+            try std.testing.expectEqual(@as(u64, 1), (try writer.db.raftAppliedEntry()).?.index);
+            // Unit tests explicitly drive the same maintenance pass; the borrowed-I/O
+            // regression separately proves its production scheduler advances it.
+            try writer.db.runArtifactRepairMetadataMaintenanceUntilIdle();
+            _ = try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", merge, .{ .term = 1, .index = 2 });
+            try std.testing.expectEqual(@as(u64, 2), (try writer.db.raftAppliedEntry()).?.index);
+            try std.testing.expectEqualStrings("", writer.db.getRange().end);
+        }
+
         test "hosted index lifecycle owner retries transient activation failure" {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});
@@ -43061,6 +43153,10 @@ fn implementationTests() type {
         }
 
         test "replicated split destination seeds inherited doc identity before range publication" {
+            inline for (.{ "", "{}" }) |indexes_json| try testReplicatedSplitDestinationAdmission(indexes_json);
+        }
+
+        fn testReplicatedSplitDestinationAdmission(comptime indexes_json: []const u8) !void {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
@@ -43091,8 +43187,8 @@ fn implementationTests() type {
                             .table_id = 7,
                             .name = "docs",
                             .placement_role = "data",
-                            .indexes_json = "{}",
-                            .schema_json = tables_api.default_schema_json,
+                            .indexes_json = indexes_json,
+                            .schema_json = "",
                         }})[0..]),
                         // The destination deliberately remains unpublished until cutover.
                         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -43154,10 +43250,21 @@ fn implementationTests() type {
                 var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
                     return error.TestUnexpectedResult;
                 defer destination.deinit(alloc);
-                // Production admission persists this manifest before the Raft group
-                // can accept writes. This focused test provisions the destination
-                // through the lower-level apply path, so establish the same invariant.
-                try applyLocalTableSchemaJson(alloc, destination.db, tables_api.default_schema_json);
+                // An empty catalog contract still has an authoritative default schema.
+                // Admission must persist it before any catalog-free Raft reopen.
+                const schema_json = (try loadLocalTableSchemaJson(alloc, destination.db)) orelse
+                    return error.TestExpectedLocalTableManifest;
+                defer alloc.free(schema_json);
+                try std.testing.expectEqualStrings(tables_api.default_schema_json, schema_json);
+                // Equivalent complete contracts must share the resident writer rather
+                // than retiring it while a transition still holds its lease.
+                var equivalent = (try source.leaseCachedGroupWriterWithMetadata(alloc, 7002, "docs", .{
+                    .indexes_json = indexes_json,
+                    .schema_json = "",
+                    .identity_namespace = namespace,
+                })) orelse return error.TestUnexpectedResult;
+                defer equivalent.deinit(alloc);
+                try std.testing.expect(equivalent.db == destination.db);
                 try std.testing.expect(destination.db.core.identity_namespace.eql(namespace));
                 var doc = (try destination.db.lookup(alloc, "doc:m", .{})) orelse return error.TestUnexpectedResult;
                 defer doc.deinit(alloc);
@@ -48816,7 +48923,9 @@ fn implementationTests() type {
                     "docs",
                     .{
                         .indexes_json = managed_indexes_json,
-                        .schema_json = "{}",
+                        // Reconcile the index change against the catalog's admitted
+                        // default schema; {} would change that schema at version zero.
+                        .schema_json = tables_api.default_schema_json,
                     },
                     &observations,
                 );

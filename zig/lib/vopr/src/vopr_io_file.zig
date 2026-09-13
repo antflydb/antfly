@@ -739,9 +739,15 @@ pub const FileSystem = struct {
         for (self.nodes.items) |node| {
             node.durable_exists = node.exists;
             if (!node.exists) continue;
-            const durable_path = try self.allocator.dupe(u8, node.path);
-            self.allocator.free(node.durable_path);
-            node.durable_path = durable_path;
+            // Most directory syncs publish content or metadata, not a rename.
+            // Preserve the existing durable name instead of reallocating every
+            // live path at each WAL checkpoint (especially costly with a page
+            // allocator). Renames still snapshot their new name atomically.
+            if (!std.mem.eql(u8, node.durable_path, node.path)) {
+                const durable_path = try self.allocator.dupe(u8, node.path);
+                self.allocator.free(node.durable_path);
+                node.durable_path = durable_path;
+            }
             if (node.kind == .directory) persistMetadata(node);
         }
     }
@@ -1077,6 +1083,31 @@ test "virtual filesystem separates file and namespace durability" {
     file = try fs.openFile(.cwd(), "db/wal", .{});
     var bytes: [3]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 3), try fs.readPositional(file, &.{&bytes}, 0));
+    try std.testing.expectEqualStrings("one", &bytes);
+}
+
+test "virtual filesystem unchanged namespace sync allocates nothing and preserves rename durability" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var fs = try FileSystem.init(failing.allocator(), .{});
+    defer fs.deinit();
+    const file = try fs.createFile(.cwd(), "before", .{ .read = true }, 1);
+    _ = try fs.writePositional(file, &.{}, &.{"one"}, 1, 0, 2);
+    try fs.syncFile(file);
+    try fs.syncNamespace();
+    failing.fail_index = failing.alloc_index;
+    try fs.syncNamespace();
+    try std.testing.expect(!failing.has_induced_failure);
+    failing.fail_index = std.math.maxInt(usize);
+
+    try fs.rename(.cwd(), "before", .cwd(), "published", false);
+    try fs.syncNamespace();
+    try fs.rename(.cwd(), "published", .cwd(), "unpublished", false);
+    try fs.crash();
+    try std.testing.expectError(error.FileNotFound, fs.openFile(.cwd(), "before", .{}));
+    try std.testing.expectError(error.FileNotFound, fs.openFile(.cwd(), "unpublished", .{}));
+    const reopened = try fs.openFile(.cwd(), "published", .{});
+    var bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try fs.readPositional(reopened, &.{&bytes}, 0));
     try std.testing.expectEqualStrings("one", &bytes);
 }
 

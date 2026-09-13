@@ -15,9 +15,10 @@ const Source = struct {
 };
 
 const metadata_vopr_source = @embedFile("../metadata/vopr_harness.zig");
+const raft_reconciler_source = @embedFile("../raft/reconciler.zig");
 
 fn region(comptime source: []const u8, comptime begin: []const u8, comptime end: []const u8) []const u8 {
-    @setEvalBranchQuota(100_000);
+    @setEvalBranchQuota(1_000_000);
     const start = std.mem.indexOf(u8, source, begin) orelse @compileError("determinism audit region start not found: " ++ begin);
     const tail = source[start..];
     const finish = std.mem.indexOf(u8, tail, end) orelse @compileError("determinism audit region end not found: " ++ end);
@@ -57,6 +58,48 @@ const replayable_sources = [_]Source{
     .{ .path = "vopr/supervision.zig", .bytes = @embedFile("supervision.zig") },
     .{ .path = "vopr/upgrade_compatibility.zig", .bytes = @embedFile("upgrade_compatibility.zig") },
     .{ .path = "raft/vopr.zig", .bytes = @embedFile("../raft/vopr.zig") },
+    .{
+        .path = "data/runtime.zig#maintenance-worker",
+        .bytes = region(@embedFile("../data/runtime.zig"), "    fn lsmMaintenanceWorkerMain(", "    pub fn baseUri("),
+    },
+    .{
+        .path = "raft/host.zig#monotonic-clock",
+        .bytes = region(@embedFile("../raft/host.zig"), "    pub fn monotonicNs(", "    pub fn listGroupIds("),
+    },
+    .{
+        .path = "raft/reconciler.zig#live-retry-clock",
+        .bytes = region(raft_reconciler_source, "    fn buildLiveConvergence(", "        var scanned:"),
+    },
+    .{
+        .path = "raft/reconciler.zig#admission-retry-clock",
+        .bytes = region(raft_reconciler_source, "    pub fn prepare(self: *Reconciler)", "        for (intents, 0..) |intent, intent_index|"),
+    },
+    .{
+        .path = "raft/reconciler.zig#failure-retry-clock",
+        .bytes = region(raft_reconciler_source, "    fn recordGroupFailureImpl(", "        self.failure_retries.putAssumeCapacity("),
+    },
+    .{
+        .path = "raft/reconciler.zig#route-retry-clock",
+        .bytes = region(raft_reconciler_source, "    fn recordRouteRefreshResult(", "    fn deferRouteRefresh("),
+    },
+    .{
+        .path = "raft/reconciler.zig#policy-retry-clock",
+        .bytes = region(raft_reconciler_source, "    fn recordPolicyValidationResult(", "    fn countRouteRetrying("),
+    },
+    // These production retry/deadline consumers must use the same borrowed
+    // clock as their sleeps; host time can change an exact replay's timers.
+    .{
+        .path = "raft/transport/http_driver.zig#retry-queue",
+        .bytes = region(@embedFile("../raft/transport/http_driver.zig"), "    fn retryQueuedFrame(", "fn pseudoJitter("),
+    },
+    .{
+        .path = "raft/transport/http_snapshot.zig#transfer-deadline",
+        .bytes = region(@embedFile("../raft/transport/http_snapshot.zig"), "    fn transferDeadlineNs(", "    /// Completion-barrier transport"),
+    },
+    .{
+        .path = "raft/transport/http_snapshot.zig#retry-clock",
+        .bytes = region(@embedFile("../raft/transport/http_snapshot.zig"), "    fn nextSnapshotSendSleepMs(", "    fn snapshotRetryDelayMs("),
+    },
     .{ .path = "storage/lsm_vopr.zig", .bytes = @embedFile("../storage/lsm_vopr.zig") },
     .{ .path = "storage/lmdb_vopr.zig", .bytes = @embedFile("../storage/lmdb_vopr.zig") },
     .{ .path = "storage/ha/vopr.zig", .bytes = @embedFile("../storage/ha/vopr.zig") },

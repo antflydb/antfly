@@ -27793,13 +27793,23 @@ pub const DB = struct {
     const artifact_repair_metadata_poll_ns: u64 = 5 * std.time.ns_per_s;
     const artifact_repair_metadata_active_poll_ns: u64 = 100 * std.time.ns_per_ms;
 
+    fn independentMaintenanceNowNs(self: *DB) u64 {
+        const io = self.backend_runtime.io() orelse return platform_time.monotonicNs();
+        return @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds));
+    }
+
     /// Start only after the DB has reached its final address. DB.open returns
     /// by value, so cache owners invoke this after installing that value in a
     /// stable heap entry rather than letting an async task capture the open
     /// function's temporary stack address.
     pub fn startArtifactRepairMetadataWorkerIfNeeded(self: *DB) void {
         if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
-        if (comptime builtin.is_test) return;
+        // Ordinary unit tests drive maintenance explicitly. Borrowed runtimes
+        // schedule the production owner deterministically, including VOPR's
+        // test-artifact runner; disabling it strands durable graph cleanup.
+        if (comptime builtin.is_test) {
+            if (!self.backend_runtime.usesBorrowedIo()) return;
+        }
         if (!self.start_index_workers) return;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
         if (self.artifact_repair_metadata_future != null) return;
@@ -27829,7 +27839,7 @@ pub const DB = struct {
         self.runIndependentMaintenancePass();
         const artifact_active = self.artifact_repair_metadata_pending or
             (if (self.source_vectors) |source| source.collectionPending() else false);
-        const active = (platform_time.monotonicNs() >= self.artifact_metadata_retry_after_ns and artifact_active) or
+        const active = (self.independentMaintenanceNowNs() >= self.artifact_metadata_retry_after_ns and artifact_active) or
             (self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire));
         const scan_pause = if (self.source_vectors) |source| source.activeScanPauseNs() else null;
         return std.math.divCeil(u64, scan_pause orelse if (active) artifact_repair_metadata_active_poll_ns else artifact_repair_metadata_poll_ns, std.time.ns_per_ms) catch unreachable;
@@ -27837,10 +27847,10 @@ pub const DB = struct {
 
     fn runIndependentMaintenancePass(self: *DB) void {
         self.enforcePortableRuntimeGate() catch return;
-        if (platform_time.monotonicNs() >= self.artifact_metadata_retry_after_ns) {
+        if (self.independentMaintenanceNowNs() >= self.artifact_metadata_retry_after_ns) {
             _ = self.runArtifactRepairMaintenanceTurn() catch |err| failed: {
                 if (err == error.PortableRuntimeActivationPending) return;
-                self.artifact_metadata_retry_after_ns = platform_time.monotonicNs() +| artifact_repair_metadata_poll_ns;
+                self.artifact_metadata_retry_after_ns = self.independentMaintenanceNowNs() +| artifact_repair_metadata_poll_ns;
                 std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
                 break :failed false;
             };
@@ -27854,7 +27864,7 @@ pub const DB = struct {
     }
 
     pub fn runRelationalColumnMaintenancePass(self: *DB) !usize {
-        const started = platform_time.monotonicNs();
+        const started = self.independentMaintenanceNowNs();
         // Artifact repair can keep the shared worker on its active cadence;
         // enforce columnar backoff independently of that worker's sleep.
         if (started < self.relational_column_maintenance.retry_after_ns.load(.acquire)) return 0;
@@ -27865,11 +27875,11 @@ pub const DB = struct {
                 // create a 100 ms retry storm or masquerade as a clean table.
                 self.relational_column_maintenance.notePending(true);
                 self.relational_column_maintenance.backing_off.store(true, .release);
-                self.relational_column_maintenance.retry_after_ns.store(platform_time.monotonicNs() +| artifact_repair_metadata_poll_ns, .release);
+                self.relational_column_maintenance.retry_after_ns.store(self.independentMaintenanceNowNs() +| artifact_repair_metadata_poll_ns, .release);
                 return err;
             };
             if (!changed) break;
-            if (platform_time.monotonicNs() -| started >= 50 * std.time.ns_per_ms) return completed + 1;
+            if (self.independentMaintenanceNowNs() -| started >= 50 * std.time.ns_per_ms) return completed + 1;
         }
         return completed;
     }
@@ -27888,9 +27898,9 @@ pub const DB = struct {
         if (view.storageMode() != .relational) return false;
         if (self.relational_columns_building.swap(true, .acq_rel)) return false;
         defer self.relational_columns_building.store(false, .release);
-        const started = platform_time.monotonicNs();
+        const started = self.independentMaintenanceNowNs();
         _ = self.relational_column_maintenance.passes.fetchAdd(1, .monotonic);
-        defer self.relational_column_maintenance.last_pass_ns.store(platform_time.monotonicNs() -| started, .monotonic);
+        defer self.relational_column_maintenance.last_pass_ns.store(self.independentMaintenanceNowNs() -| started, .monotonic);
         errdefer _ = self.relational_column_maintenance.failures.fetchAdd(1, .monotonic);
         var preparation: RequestPreparationContext = undefined;
         preparation.init(self);
@@ -28132,7 +28142,7 @@ pub const DB = struct {
 
     fn runArtifactRepairMaintenanceTurn(self: *DB) !void {
         const independent = if (self.source_vectors) |source| source.independent_scan else false;
-        const now = monotonicTimeNs();
+        const now = self.independentMaintenanceNowNs();
         if (!independent or now >= self.artifact_repair_metadata_due_ns)
             self.artifact_repair_metadata_pending = self.artifactRepairMetadataRebuildPending();
         if (independent) {
@@ -31829,6 +31839,12 @@ pub const DB = struct {
     }
 
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
+        // These bytes enter compressed durable tables, so even a diagnostic
+        // timestamp can change disk usage and subsequent placement decisions.
+        const now = if (index_manager.io) |io|
+            @as(u64, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds)))
+        else
+            platform_time.monotonicNs();
         if (index_manager.textIndex(index_name)) |entry| {
             // Applied-sequence persistence runs outside the DB apply lock; keep this
             // snapshot cheap and avoid walking full-text segment internals here.
@@ -31837,7 +31853,7 @@ pub const DB = struct {
             return .{
                 .kind = .full_text,
                 .doc_count = text_snapshot.liveDocCount(),
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = now,
             };
         }
         if (index_manager.denseIndex(index_name)) |entry| {
@@ -31847,7 +31863,7 @@ pub const DB = struct {
                 .doc_count = dense_stats.active_count,
                 .node_count = dense_stats.node_count,
                 .root_node = dense_stats.root_node,
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = now,
             };
         }
         if (index_manager.sparseIndex(index_name)) |entry| {
@@ -31856,7 +31872,7 @@ pub const DB = struct {
                 .kind = .sparse_vector,
                 .doc_count = sparse_stats.doc_count,
                 .term_count = sparse_stats.term_count,
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = now,
             };
         }
         if (index_manager.graphIndex(index_name)) |entry| {
@@ -31867,7 +31883,7 @@ pub const DB = struct {
                 .edge_count = graph_stats.edge_count,
                 .graph_counts_pending = graph_stats.counts_pending,
                 .node_count = graph_stats.node_count,
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = now,
             };
         }
         return null;
@@ -66251,6 +66267,87 @@ test "db implicit batch timestamps use the borrowed runtime clock" {
     try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), try db.getTimestamp(alloc, "doc:b"));
     try db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{}" }}, .timestamp_ns = 99, .sync_level = .write });
     try std.testing.expectEqual(@as(u64, 99), try db.getTimestamp(alloc, "doc:c"));
+}
+
+test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    var runtime_io = try vopr.vopr_io.VoprIo.init(.{ .seed = 704, .file_allocator = alloc });
+    defer runtime_io.deinit();
+    runtime_io.monotonic_ns = 200 * std.time.ns_per_day;
+    var backend = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = runtime_io.io() },
+    });
+    var owners_closed = false;
+    defer if (!owners_closed) backend.deinit();
+    var db = try DB.open(alloc, "/graph-maintenance-vopr", .{
+        .backend_runtime = backend.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .index_backends = .{ .graph_reverse_backend = .lsm, .graph_lsm_storage = backend.ptr().storage() },
+        .start_optional_runtimes = false,
+    });
+    defer if (!owners_closed) db.close();
+    const Run = struct {
+        fn run(database: *DB, owner: *background_runtime_mod.BackendRuntimeHandle, io: std.Io, closed: *bool) !void {
+            defer {
+                database.close();
+                owner.deinit();
+                closed.* = true;
+            }
+            try database.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+            const initial_status = (try database.loadIndexStatusSnapshot(std.testing.allocator, "g")) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(u64, 200 * std.time.ns_per_day), initial_status.updated_at_ns);
+            try database.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
+            try database.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
+            const merge = types.BatchRequest{ .merge_checkpoint = .{
+                .kind = .accept,
+                .transition_id = 10,
+                .donor_group_id = 2,
+                .receiver_group_id = 1,
+                .receiver_base_start = "",
+                .receiver_base_end = "m",
+                .merged_start = "",
+                .merged_end = "",
+            } };
+            try std.testing.expectError(error.RaftApplyWriterUnavailable, database.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 }));
+            try std.testing.expectEqual(@as(u64, 1), (try database.raftAppliedEntry()).?.index);
+            database.startResidentBackgroundWorkersIfNeeded();
+            try std.testing.expect(database.artifact_repair_metadata_future != null);
+            const graph = &database.core.index_manager.graphIndex("g").?.index;
+            for (0..100) |_| {
+                if (!graph.ownershipTransitionPending()) break;
+                try io.sleep(.fromMilliseconds(100), .awake);
+            }
+            try std.testing.expect(!graph.ownershipTransitionPending());
+            try database.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 });
+            try std.testing.expectEqual(@as(u64, 2), (try database.raftAppliedEntry()).?.index);
+            try std.testing.expectEqualStrings("", database.getRange().end);
+            const retired = try database.getEdges(std.testing.allocator, "g", "a", "link", .in);
+            defer graph_mod.GraphIndex.freeEdges(std.testing.allocator, retired);
+            try std.testing.expectEqual(@as(usize, 0), retired.len);
+        }
+    };
+    var future = runtime_io.io().async(Run.run, .{ &db, &backend, runtime_io.io(), &owners_closed });
+    const scheduler = runtime_io.scheduler();
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    for (0..10_000) |_| {
+        if (scheduler.quiescent()) break;
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
+    }
+    try std.testing.expect(scheduler.quiescent());
+    try future.await(runtime_io.io());
+    try std.testing.expect(owners_closed);
+    try runtime_io.ensureNoCapabilityViolation();
 }
 
 test "background maintenance services lifecycle runs on borrowed VoprIo" {
@@ -108735,10 +108832,12 @@ test "db dense artifact rebuild preserves stable vector ids distinct from ordina
         var repaired: DB.IndexRepairAdvanceResult = undefined;
         var documents_reprocessed: u64 = 0;
         for (0..4) |_| {
-            repaired = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+            repaired = try db.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
             documents_reprocessed +|= repaired.documents_reprocessed;
             if (repaired.repaired) break;
             try std.testing.expect(repaired.deferred or repaired.busy);
+            try std.testing.expect(!repaired.terminal);
+            try std.testing.expectEqual(@as(u64, 0), repaired.next_retry_at_ms);
         }
         try std.testing.expect(repaired.repaired);
         try std.testing.expectEqual(@as(u64, 2), documents_reprocessed);

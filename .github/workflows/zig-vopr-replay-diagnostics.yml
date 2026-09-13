@@ -1,0 +1,77 @@
+name: Zig VOPR replay diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Soak run containing the original executable and trace
+        type: string
+        required: true
+      shard_artifact:
+        description: Shard artifact name
+        type: string
+        required: true
+      trace_name:
+        description: Retained trace filename within the artifact
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      run_id:
+        description: Soak run containing the original executable and trace
+        type: string
+        required: true
+      shard_artifact:
+        description: Shard artifact name
+        type: string
+        required: true
+      trace_name:
+        description: Retained trace filename within the artifact
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  replay:
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install debugger
+        run: sudo apt-get update && sudo apt-get install -y gdb
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vopr-runner
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/original-runner
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.shard_artifact }}
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/original-traces
+      - name: Inspect the original executable during exact replay
+        timeout-minutes: 165
+        env:
+          TRACE_NAME: ${{ inputs.trace_name }}
+        run: |
+          tar -C "$RUNNER_TEMP/original-runner" -xzf "$RUNNER_TEMP/original-runner/vopr.tar.gz"
+          mkdir -p "$RUNNER_TEMP/replay-diagnostics"
+          sha256sum "$RUNNER_TEMP/original-runner/vopr" "$RUNNER_TEMP/original-traces/$TRACE_NAME" > "$RUNNER_TEMP/replay-diagnostics/inputs.sha256"
+          timeout --signal=TERM --kill-after=30s 9600s \
+            gdb -batch -x scripts/ci/vopr_gdb_diagnostics.py --args \
+            "$RUNNER_TEMP/original-runner/vopr" replay --trace "$RUNNER_TEMP/original-traces/$TRACE_NAME" \
+            > "$RUNNER_TEMP/replay-diagnostics/replay.log" 2>&1
+      - name: Retain replay diagnostics
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-replay-diagnostics
+          path: ${{ runner.temp }}/replay-diagnostics
+          retention-days: 90
+          if-no-files-found: error

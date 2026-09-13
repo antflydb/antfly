@@ -917,6 +917,7 @@ pub const Scenario = struct {
         deployment_sound: bool = false,
         complete: bool = false,
         tearing_down: bool = false,
+        runtime_released: bool = false,
 
         fn init(alloc: std.mem.Allocator) !*State {
             const self = try alloc.create(State);
@@ -1030,7 +1031,9 @@ pub const Scenario = struct {
             return self;
         }
 
-        fn deinit(self: *State) void {
+        fn releaseRuntime(self: *State) void {
+            if (self.runtime_released) return;
+            self.runtime_released = true;
             self.tearing_down = true;
             // Producer compute is an intentionally uncancelable production
             // callback boundary. Release it before draining so a bounded run
@@ -1078,6 +1081,10 @@ pub const Scenario = struct {
             if (self.public_cluster) |fixture| fixture.deinit();
             if (self.production_cluster) |fixture| fixture.deinit();
             self.service_rate_model.deinit();
+        }
+
+        fn deinit(self: *State) void {
+            self.releaseRuntime();
             self.sim.deinit();
             std.debug.assert(self.fixture_allocator.deinit() == .ok);
             self.owner_alloc.destroy(self);
@@ -1756,6 +1763,14 @@ pub const Scenario = struct {
         }
 
         fn initializeAndRun(self: *State) void {
+            // Replay can reject the first enabled task before initialization
+            // ever runs. Teardown then resumes that canceled task to unwind it;
+            // it must not admit a new deployment after owners were stopped.
+            if (self.tearing_down) return;
+            defer if (self.tearing_down) {
+                if (self.production_cluster) |fixture| fixture.beginTeardown();
+                if (self.public_cluster) |fixture| fixture.beginTeardown();
+            };
             const mode = self.mode orelse {
                 self.initialization_failed = true;
                 self.initialization_done = true;
@@ -3266,7 +3281,7 @@ pub const Scenario = struct {
 /// but fixes the workload family so corpus mutation explores its interleavings.
 pub const HAScalingScenario = struct {
     pub const name: []const u8 = "production-ha-scaling";
-    pub const version: u32 = 1;
+    pub const version: u32 = 2;
     pub const World = Scenario.World;
     const safety_id = vopr.id.stable(name, "promotion-and-topology-converge");
     const complete_id = vopr.id.stable(name, "history-completes");
@@ -3318,30 +3333,71 @@ pub const HAScalingScenario = struct {
         const fixture = state.production_cluster;
         try sink.check(alloc, safety_id, !state.initialization_failed and
             (if (fixture) |f| f.failure == null and (!state.complete or f.ha_scaling_sound) else !state.complete));
-        try sink.check(alloc, cleanup_id, !state.complete or state.deployment_sound);
         try sink.check(alloc, complete_id, state.complete and
             (if (fixture) |f| f.ha_scaling_sound else false));
     }
+    pub fn finalize(world: *World, sink: *vopr.property.Sink, alloc: std.mem.Allocator) !void {
+        const state = world.state;
+        state.releaseRuntime();
+        const resources = state.sim.resourceSnapshot();
+        const quiet = state.sim.scheduler().quiescent() and resources.active_tasks == 0 and
+            resources.total_tasks == 0 and resources.open_file_handles == 0 and resources.open_sockets == 0;
+        std.debug.print("HA teardown verified quiet={} resources={any}\n", .{ quiet, resources });
+        try sink.check(alloc, cleanup_id, quiet);
+    }
+
+    pub fn budgetFailure(_: *World) []const u8 {
+        // A finite exploration cutoff proves incompletion, not starvation or
+        // a production deadlock. Keep that distinction in the replay artifact.
+        return name ++ ".transition-budget-exhausted";
+    }
 };
 
-pub fn recordHAScaling(alloc: std.mem.Allocator, seed: u64) !vopr.trace.Trace {
+pub fn recordHAScaling(alloc: std.mem.Allocator, seed: u64, transition_budget: u64) !vopr.trace.Trace {
     var choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{}, seed);
     const backends = vopr.vopr_io.artifactBackendIds();
     return vopr.runner.run(HAScalingScenario, alloc, choices.source(), .{
         .system = "antfly",
         .seed = seed,
-        .transition_budget = 600_000,
+        .transition_budget = transition_budget,
         .resource_budget = 256,
         .backend_ids = &backends,
-        .source_revision = "production-ha-scaling-v1",
+        .source_revision = "production-ha-scaling-v2",
     });
+}
+
+test "production HA scaling VOPR exact replays bounded startup cleanup" {
+    for ([_]u64{ 1, 2, 4, 8, 16, 32 }) |budget| {
+        var history_allocator: FixtureAllocator = .init;
+        defer std.debug.assert(history_allocator.deinit() == .ok);
+        const alloc = history_allocator.allocator();
+        var choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{}, 42);
+        const backends = vopr.vopr_io.artifactBackendIds();
+        var recorded = try vopr.runner.run(HAScalingScenario, alloc, choices.source(), .{
+            .seed = 42,
+            .transition_budget = budget,
+            .resource_budget = 256,
+            .backend_ids = &backends,
+        });
+        defer recorded.deinit();
+        var checked_cleanup = false;
+        for (recorded.properties.items) |record| {
+            if (!std.mem.eql(u8, record.name, "production-ha-scaling.owners-quiesce")) continue;
+            checked_cleanup = true;
+            try std.testing.expect(record.condition);
+        }
+        try std.testing.expect(checked_cleanup);
+        try std.testing.expect(recorded.failures.items.len > 0);
+        var replayed = try vopr.replay.exact(HAScalingScenario, alloc, &recorded);
+        defer replayed.deinit();
+    }
 }
 
 test "production HA scaling VOPR exact replays standby promotion automatic sharding and drain" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
     const alloc = history_allocator.allocator();
-    var recorded = try recordHAScaling(alloc, 0x4655_4c4c + Scenario.production_split_ordinal);
+    var recorded = try recordHAScaling(alloc, 0x4655_4c4c + Scenario.production_split_ordinal, 600_000);
     defer recorded.deinit();
     for (recorded.failures.items) |failure| std.debug.print("HA scaling failure: {any}\n", .{failure});
     try std.testing.expectEqual(@as(usize, 0), recorded.failures.items.len);
