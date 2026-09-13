@@ -163,8 +163,9 @@ enum ordinals must never become persisted tags.
 Catalog ownership and schema/restore publication are integrated into DBCore.
 Prepared index keys and record effects are consumed by production row mutations.
 Generation selection alone does not constitute a uniqueness check or predicate
-evaluation. Local readiness now has a durable coverage proof, but public row
-query/constraint execution has not yet been extracted.
+evaluation. The FK and typed-row extension below adds coordinated uniqueness,
+FK enforcement, and public primary-order row execution; secondary-index query
+routing is still a separate integration gate.
 
 ## Shared row execution and transaction dependencies
 
@@ -207,14 +208,11 @@ query/constraint execution has not yet been extracted.
   separate child-write shard. TTL now checks transaction locks under apply and
   skips locked rows without blocking unrelated expiration candidates.
 
-Remaining: public/generated query and mutation contracts and adapters; bounded
-distributed query execution; primary/unique claims and FK enforcement/action
-jobs; CHECK activation and validation coverage; generated/default values;
-cross-shard integrity/topology/failover tests. Shared read guards are necessary
-for FK safety but do not enforce foreign keys by themselves. In particular,
-FK key-to-parent resolution, globally routed unique claims, parent-delete
-admission, and cascade/restrict semantics are not implemented yet. Nothing in
-this section changes that remaining feature scope or makes the PR ready to push.
+This foundation's read guards are consumed by the FK extension below. Remaining
+work includes distributed secondary-index queries, generated/default values,
+coordinated constraint retirement and repair, and claim-aware online topology
+handoffs. Local CHECK coverage remains separate from the public UNIQUE/FK
+activation status endpoint.
 
 ## Remaining integration gates
 
@@ -235,7 +233,7 @@ this section changes that remaining feature scope or makes the PR ready to push.
       from selected reverse records, not copy the global forward namespace.
       Local DB split, portable restore, and local readiness/retry are covered;
       distributed transition replay and owner-coordination still need audit.
-- [ ] Commit primary rows, old/new index effects, unique claims, catalog changes,
+- [x] Commit primary rows, old/new index effects, unique claims, catalog changes,
       and HA/outbox records atomically across normal writes and transaction replay.
 - [x] Enforce named typed scalar CHECKs and add bounded local coverage/retry.
 - [ ] Implement covering payloads, deterministic expression/partial indexes,
@@ -245,18 +243,94 @@ this section changes that remaining feature scope or makes the PR ready to push.
       ownership fencing, failed status/retry, and range-local coverage proofs.
 - [ ] Finish integrity repair/orphan scrubs, retirement admission headroom,
       schema-dependency generation reuse, and public query-readiness gates.
-- [ ] Port foreign-key validation/enforcement and distributed job coordination.
-- [ ] Extract shared row read/mutation execution from SQL-owned code, then expose
+- [x] Port foreign-key validation/enforcement and distributed activation pages.
+      Ordinary referential actions stay atomic, not asynchronous sagas.
+- [x] Extract shared row read/mutation execution from SQL-owned code, then expose
       supported operations and generate all SDK request/response types.
 - [ ] Benchmark actual index writes, rebuilds, range queries, and post-churn
       storage/read amplification on the LSM before declaring performance wins.
 
-## Current verification scope
+## FK and typed-row extension
 
-CHECK work is not FK enforcement/actions and does not expose public typed-row
-query/mutation endpoints. Those remain unfinished, along with distributed
-constraint-coverage aggregation. Generated CHECK declarations must not be
-represented as completion of those features.
+The extension uses generation-bound unique claims and per-child FK references,
+routed by a logical tuple digest rather than the common metadata prefix. Child
+attachments retain shared exact-value claim guards; parent removal takes the
+exclusive claim intent and rechecks reference-prefix emptiness under the same
+apply fence as durable intent admission. Primary rows, relational indexes,
+integrity records, and activation continuations join the existing transaction
+decision and recovery path. Raw integrity operations are not a public API.
+
+Incoming JSON is prepared against a pinned typed schema. Public row mutations
+require an exact schema version and decimal-string row-version preconditions.
+Row queries use the routed scan/read-barrier path, exact typed conditions, and
+authorization before projection. A historical row layout does not replace the
+request's active schema-version fence.
+
+The schema version supplied by a public client is not proof that integrity
+planning ran. Internal prepares additionally carry the catalog generation-set
+proof, and storage compares the prepared catalog with the current durable
+catalog under the apply fence. This also fences declaration changes that leave
+the physical layout version unchanged.
+
+Ordinary CASCADE and SET NULL operations use bounded fixed-point discovery
+before the existing atomic distributed commit. They do not silently become a
+background saga. The closure has explicit row, byte, and time limits; exceeding
+them must fail before publication. Native asynchronous action-job primitives
+are not an alternative completion contract for ordinary batch writes.
+
+FK declarations require administrative permission on every referenced parent.
+Cascade and SET NULL closure additionally require write permission on every
+table whose primary rows change, using the admitted credential scope and live
+permission intersection. Claim-only participants do not require primary-write
+permission. This follows the existing explicit multi-table transaction policy;
+it does not silently elevate the requesting principal for referential actions.
+
+Coordinated activation scans unique claims before foreign-key references.
+Each bounded page retains source-row versions and atomically commits its
+derived effects and owner/generation-bound continuation. Normal writes must
+not assume a first shard's coverage proves the entire table. Positive coverage
+is deduplicated within a request, not cached across independent restores without
+a durable restore-incarnation proof.
+
+Explicit boundaries still matter:
+
+- Constraint retirement and coordinated table DROP are rejected until a
+  distributed reference-retirement proof exists. Retaining old descriptors is
+  necessary for recovery, but does not itself constitute that proof.
+- Constrained TTL is rejected; local expiration cannot bypass FK actions.
+- Split/merge transitions for UNIQUE/FK tables are rejected until ownership
+  transfer can atomically hand off routed integrity records and retained locks.
+- Portable export and independent historical table restore are rejected for
+  coordinated constraints. A cluster-consistent restore/activation barrier is
+  needed before those operations can preserve cross-table references.
+- Coherent HA seed replica materialization has a distinct internal entry point
+  after topology validation and requires exact durable namespace identity.
+  It does not enable independently restoring historical table backups.
+- Online split/merge admission is blocked for coordinated constraints until
+  the distributed delta protocol carries logically routed claims/references,
+  not just document mutations. Local range-copy helpers are not proof that
+  the distributed handoff protocol is complete.
+- Deferred constraints, MATCH PARTIAL, and constrained raw transforms are not
+  exposed as supported operations.
+- Failed-activation repair needs an explicit administrative recovery contract;
+  retrying coverage must not authorize ordinary writes to bypass constraints.
+
+## Verification
+
+The FK extension's final focused runs pass 50 native storage/transaction/HA
+tests, 34 coordinator/activation/security tests, 10 public row/status tests,
+two actual HTTP row/DDL authorization tests, and two authoritative metadata
+constraint tests, with no test leaks. The root regression suite also passed
+766 tests before the final review fixes; the focused runs above cover those
+fixes. The complete Go SDK suite, 10 Python tests, seven TypeScript tests and
+TypeScript typechecking passed. Full generation and OpenAPI freshness checks
+passed. These are correctness/allocation-bound tests, not an end-to-end FK
+throughput benchmark or proof of distributed topology handoff support.
+
+### Historical foundation verification
+
+The CHECK-only foundation below was committed as `5f42cf694`. These historical
+test results do not certify the newer FK or public typed-row extension.
 
 The CHECK implementation passed 90 combined storage tests and 765 root tests.
 The final six-test CHECK/activation run also covers malformed declarations,

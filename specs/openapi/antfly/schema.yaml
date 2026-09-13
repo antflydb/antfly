@@ -201,6 +201,74 @@ components:
           type: string
           description: String comparison collation; uses the same rules as ordered indexes.
 
+    RelationalUniqueConstraint:
+      type: object
+      additionalProperties: false
+      required: [name, columns]
+      description: |
+        A named, ordered composite unique key. Validation status is maintained
+        by the server. TTL expiry cannot be combined with unique or foreign-key
+        declarations until expiry uses the distributed integrity coordinator.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        columns:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+        nulls_not_distinct:
+          type: boolean
+          description: When true, NULL components compare equal for uniqueness.
+
+    RelationalForeignKeyConstraint:
+      type: object
+      additionalProperties: false
+      required: [name, child_columns, parent_table, parent_columns]
+      description: |
+        Composite foreign key. Child and parent columns correspond by position
+        and must have the same physical comparison types. The parent columns
+        must identify a unique key. Existing-row validation is independent of
+        new-write enforcement and is never client-writable.
+        Deferred timing, MATCH PARTIAL, and TTL expiry are not supported.
+        SET NULL requires every child column to accept explicit NULL.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        child_columns:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+        parent_table:
+          type: string
+          minLength: 1
+        parent_columns:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+        on_delete:
+          $ref: "#/components/schemas/ForeignKeyAction"
+        on_update:
+          $ref: "#/components/schemas/ForeignKeyAction"
+        timing:
+          $ref: "#/components/schemas/ForeignKeyTiming"
+        match:
+          $ref: "#/components/schemas/ForeignKeyMatch"
+        deferrable:
+          type: boolean
+
     RelationalIndexDefinition:
       type: object
       additionalProperties: false
@@ -244,6 +312,18 @@ components:
             part of the complete schema: omission or [] declares no checks.
             New writes enforce every check. Existing-row validation status is
             maintained separately and is never accepted from the client.
+        unique_constraints:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/RelationalUniqueConstraint"
+          description: Complete set of composite unique declarations. Omission or [] declares none.
+        foreign_keys:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/RelationalForeignKeyConstraint"
+          description: Complete set of outgoing composite foreign keys. Omission or [] declares none.
         relational_indexes:
           type: array
           x-go-type-skip-optional-pointer: false

@@ -498,6 +498,24 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !LookupResponse {
+        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "");
+    }
+
+    pub fn fetchGroupLookupWithMode(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        key: []const u8,
+        fields: ?[]const u8,
+        read_consistency: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+        relational_integrity_catalog: bool,
+        relational_integrity_action: bool,
+        relational_integrity_jobs_json: []const u8,
+        relational_activation_json: []const u8,
+    ) !LookupResponse {
         // Group lookups are also used for routed derived-artifact hydration.
         // Those storage keys are binary and contain namespace bytes and NUL
         // component terminators, so every externally represented component
@@ -506,7 +524,10 @@ pub const ApiHttpClient = struct {
         // value even when they contain URI delimiters.
         const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(encoded_table_name);
-        const encoded_key = try percentEncodePathComponent(self.alloc, key);
+        const special = relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0;
+        // Routing uses the actual logical key, including empty first-range
+        // boundaries. Only the already-routed HTTP path needs a placeholder.
+        const encoded_key = try percentEncodePathComponent(self.alloc, if (special and key.len == 0) "\x00relational_control" else key);
         defer self.alloc.free(encoded_key);
         const encoded_consistency = try percentEncodePathComponent(self.alloc, read_consistency);
         defer self.alloc.free(encoded_consistency);
@@ -533,7 +554,15 @@ pub const ApiHttpClient = struct {
                 encoded_consistency,
             });
         defer self.alloc.free(suffix);
-        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        const jobs = if (relational_integrity_jobs_json.len != 0) try percentEncodePathComponent(self.alloc, relational_integrity_jobs_json) else "";
+        defer if (jobs.len != 0) self.alloc.free(jobs);
+        const activation = if (relational_activation_json.len != 0) try percentEncodePathComponent(self.alloc, relational_activation_json) else "";
+        defer if (activation.len != 0) self.alloc.free(activation);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}{s}{s}{s}{s}", .{
+            routes.Routes.internal_groups_prefix,                                            group_id,                                                                      suffix,
+            if (relational_integrity_catalog) "&_relational_integrity_catalog=true" else "", if (relational_integrity_action) "&_relational_integrity_action=true" else "", if (jobs.len != 0) "&_relational_integrity_jobs=" else "",
+            jobs,                                                                            if (activation.len != 0) "&_relational_activation=" else "",                   activation,
+        });
         defer self.alloc.free(path);
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
@@ -4188,6 +4217,7 @@ fn isTxnPreDecisionNotProposedResponse(resp: http_common.HttpResponse) bool {
 }
 
 fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
+    if (@import("relational_integrity_errors.zig").decode(body)) |err| return err;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;

@@ -16,4 +16,9 @@ const public_table_http = @import("api/public_table_http.zig");
 
 test {
     _ = public_table_http;
+    _ = @import("api/relational_rows.zig");
+    _ = @import("api/http_route_helpers.zig");
+    _ = @import("schema/relational_declarations.zig");
+    _ = @import("api/table_reads.zig");
+    _ = @import("api/relational_constraint_status.zig");
 }

@@ -1,14 +1,20 @@
 """Public relational storage-mode request and response contracts."""
 
+import httpx
 import pytest
 
 from antfly.client_generated.models.create_table_request import CreateTableRequest
+from antfly.client_generated.models.foreign_key_action import ForeignKeyAction
 from antfly.client_generated.models.relational_check_constraint import RelationalCheckConstraint
 from antfly.client_generated.models.relational_comparison_op import RelationalComparisonOp
+from antfly.client_generated.models.relational_foreign_key_constraint import RelationalForeignKeyConstraint
 from antfly.client_generated.models.relational_index_definition import RelationalIndexDefinition
 from antfly.client_generated.models.relational_index_key import RelationalIndexKey
 from antfly.client_generated.models.relational_index_key_direction import RelationalIndexKeyDirection
 from antfly.client_generated.models.relational_index_key_nulls import RelationalIndexKeyNulls
+from antfly.client_generated.models.relational_row import RelationalRow
+from antfly.client_generated.models.relational_row_mutation_request import RelationalRowMutationRequest
+from antfly.client_generated.models.relational_unique_constraint import RelationalUniqueConstraint
 from antfly.client_generated.models.table_schema import TableSchema
 from antfly.client_generated.models.table_status import TableStatus
 from antfly.client_generated.models.table_storage_mode import TableStorageMode
@@ -64,3 +70,45 @@ def test_composite_index_declarations_and_explicit_drop_round_trip() -> None:
         assert isinstance(decoded.relational_indexes, list)
         assert len(decoded.relational_indexes) == len(indexes)
     assert "relational_indexes" not in TableSchema().to_dict()
+
+
+def test_generated_composite_foreign_key_and_unique_contracts() -> None:
+    schema = TableSchema(
+        storage_mode=TableStorageMode.RELATIONAL,
+        unique_constraints=[RelationalUniqueConstraint(name="tenant_id", columns=["tenant", "id"])],
+        foreign_keys=[
+            RelationalForeignKeyConstraint(
+                name="parent",
+                child_columns=["tenant", "parent_id"],
+                parent_table="parents",
+                parent_columns=["tenant", "id"],
+                on_delete=ForeignKeyAction.CASCADE,
+            )
+        ],
+    )
+    assert TableSchema.from_dict(schema.to_dict()).to_dict() == schema.to_dict()
+    assert schema.to_dict()["foreign_keys"][0]["on_delete"] == "cascade"
+
+
+def test_generated_typed_rows_preserve_integer_and_version_precision() -> None:
+    row = {"_id": "a", "row": {"id": 9223372036854775807}, "version": "18446744073709551615", "schema_version": 7}
+    assert RelationalRow.from_dict(row).to_dict() == row
+    mutation = {
+        "schema_version": 7,
+        "mutations": [
+            {"key": "a", "expected_version": row["version"], "row": row["row"]},
+            {"key": "b", "expected_version": "1"},
+        ],
+    }
+    assert RelationalRowMutationRequest.from_dict(mutation).to_dict() == mutation
+
+
+def test_generated_row_query_returns_ndjson_text_without_number_coercion() -> None:
+    from antfly.client_generated.api.data_operations.query_relational_rows import _parse_response
+    from antfly.client_generated.client import Client
+
+    page = '{"_id":"a","row":{"id":9223372036854775807},"version":"18446744073709551615","schema_version":7}\n'
+    assert (
+        _parse_response(client=Client(base_url="http://example.invalid"), response=httpx.Response(200, text=page))
+        == page
+    )

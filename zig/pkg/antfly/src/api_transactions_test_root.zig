@@ -19,6 +19,12 @@ const transactions = @import("api/transactions.zig");
 
 test {
     _ = distributed_txn;
+    _ = @import("api/relational_integrity.zig");
+    _ = @import("api/relational_integrity_wire.zig");
+    _ = @import("api/relational_integrity_errors.zig");
+    _ = @import("api/relational_integrity_commit.zig");
+    _ = @import("api/relational_activation_worker.zig");
+    _ = @import("api/batch.zig");
     _ = distributed_entity_sink;
     _ = internal_group_operations;
     _ = transactions;

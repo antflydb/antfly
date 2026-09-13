@@ -2942,6 +2942,7 @@ pub const ApiHttpServer = struct {
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
     last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
+    relational_activation_range_cursor: std.atomic.Value(usize) = .init(0),
     created_at_ns: u64 = 0,
     request_count: std.atomic.Value(u64) = .init(0),
     first_request_started_at_ns: std.atomic.Value(u64) = .init(0),
@@ -4016,6 +4017,24 @@ pub const ApiHttpServer = struct {
         // primary-local. Their mutating routes are rejected in continuous HA,
         // and their cleanup/resume loop must remain frozen for the same reason.
         if (!self.mutationBackgroundExecutionPermitted()) return;
+        self.advanceRelationalActivationOnce() catch |err| switch (err) {
+            error.ConstraintActivationChanged,
+            error.ConstraintActivationNotReady,
+            error.ConstraintActivationPending,
+            error.ConstraintActivationInProgress,
+            error.ConstraintActivationUnavailable,
+            error.PreparedGenerationChanged,
+            error.ConstraintNotFound,
+            error.KeyOutOfRange,
+            error.RelationalTableRequired,
+            error.IntegrityCatalogUnavailable,
+            error.IntegrityCatalogChanged,
+            error.TopologyChanged,
+            error.Canceled,
+            error.DeadlineExceeded,
+            => {},
+            else => std.log.warn("relational constraint activation deferred err={s}", .{@errorName(err)}),
+        };
         // Queue insertion is durable in server memory even when the bounded
         // executor temporarily rejects the worker submission. The periodic
         // supervisor is the independent wake source that makes such an
@@ -4044,6 +4063,16 @@ pub const ApiHttpServer = struct {
                 std.log.warn("failed to reap table repair background jobs err={s}", .{@errorName(err)});
             };
         }
+    }
+
+    fn advanceRelationalActivationOnce(self: *ApiHttpServer) !void {
+        const reader = self.table_reads orelse return;
+        const writer = self.table_writes orelse return;
+        var snapshot = (try self.source.cachedAdminSnapshot()) orelse return;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        if (snapshot.ranges.len == 0) return;
+        const next = self.relational_activation_range_cursor.fetchAdd(1, .monotonic) % snapshot.ranges.len;
+        _ = try @import("relational_activation_worker.zig").runPage(self.alloc, reader, writer, snapshot.tables, snapshot.ranges, snapshot.ranges[next]);
     }
 
     fn mutationBackgroundExecutionPermitted(self: *const ApiHttpServer) bool {
@@ -10902,6 +10931,33 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn commitPublicTableBatchWithIntegrity(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        source: table_writes.TableWriteSource,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        request: api_operation.RequestContext,
+    ) !?distributed_txn.CommitOutcome {
+        const integrity = @import("relational_integrity_commit.zig");
+        var snapshot_opt = try self.source.cachedAdminSnapshot();
+        if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
+        var snapshot = snapshot_opt orelse {
+            _ = try integrity.metadataRequiresCoordination(alloc, null, tables);
+            return source.commitBatchWithCancellation(alloc, tables, sync_level, request.cancellation);
+        };
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const coordinated = try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables);
+        if (!coordinated) return source.commitBatchWithCancellation(alloc, tables, sync_level, request.cancellation);
+        try ensureTableOperationActive(request);
+        const reader = self.table_reads orelse return error.IntegrityCatalogUnavailable;
+        var prepared = try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, request);
+        defer prepared.deinit();
+        try ensureTableOperationActive(request);
+        try integrity.authorizePrimaryMutations(request, self.cfg.auth_enabled, prepared.tables);
+        return source.commitBatchWithCancellation(alloc, prepared.tables, sync_level, request.cancellation);
+    }
+
     fn executePublicTableBatch(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -10932,23 +10988,39 @@ pub const ApiHttpServer = struct {
             .deletes = req.deletes,
             .transforms = req.transforms,
             .predicates = req.predicates,
+            .relational_schema_version = req.relational_schema_version,
         }};
         // Cancellation is safe before commit begins. Once commitBatch enters
         // the transaction protocol, preserve its typed outcome instead of
         // reporting cancellation for a write that may already be durable.
         try ensureTableOperationActive(request);
-        const outcome = (source.commitBatchWithCancellation(alloc, &tables, req.sync_level, request.cancellation) catch |err| switch (err) {
+        const outcome = (self.commitPublicTableBatchWithIntegrity(alloc, source, &tables, req.sync_level, request) catch |err| switch (err) {
+            error.Forbidden => return error.Forbidden,
             error.InvalidBatchRequest,
             error.RelationalCheckViolation,
             error.InvalidArgument,
             error.InvalidGraphEdges,
             error.UnsupportedTransformOperation,
+            error.TransactionTooLarge,
             => return error.InvalidBatchRequest,
             error.TableNotFound, error.UnknownGroup => return error.NotFound,
             error.TopologyChanged,
             error.DecisionConflict,
             error.TxnNotFound,
             error.InvalidTxnRecord,
+            error.ForeignKeyParentMissing,
+            error.ForeignKeyReferenced,
+            error.UniqueConstraintViolation,
+            error.ForeignKeyMatchFullViolation,
+            error.ForeignKeyActionInProgress,
+            error.ForeignKeyActionConflict,
+            error.ForeignKeyTargetNotUnique,
+            error.ForeignKeyTypeMismatch,
+            error.ConstraintActivationFailed,
+            error.VersionConflict,
+            error.PreparedGenerationChanged,
+            error.PreparedSchemaChanged,
+            error.SchemaVersionChanged,
             => return error.Conflict,
             error.CommitVisibilityNotSatisfied,
             error.CommitPropagationIncomplete,
@@ -10966,6 +11038,13 @@ pub const ApiHttpServer = struct {
             error.CatalogRoutingSnapshotTimeout,
             error.CatalogRoutingUnavailable,
             error.CatalogProjectionRefreshRequired,
+            error.IntegrityCatalogUnavailable,
+            error.ConstraintActivationPending,
+            error.ConstraintActivationInProgress,
+            error.ConstraintActivationChanged,
+            error.ConstraintActivationOwnerChanged,
+            error.ForeignKeyCoordinationRequired,
+            error.IntegrityCatalogChanged,
             => return error.WriteUnavailable,
             error.CommitDecisionUnknown => return error.OutcomeUnknown,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -12340,6 +12419,7 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.NativeBackupStorageBackendUnsupported, error.NativeBackupProjectionBackendUnsupported => return error.UnsupportedBackupFormat,
+            error.CoordinatedConstraintPortableBackupUnsupported => return error.CoordinatedConstraintPortableBackupUnsupported,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => return error.UnsupportedMultiRangeTable,
             else => {
@@ -12502,6 +12582,8 @@ pub const ApiHttpServer = struct {
         if (metadata_authority.isRetryableError(err)) return error.NotLeader;
         return switch (err) {
             error.RestoreDestinationReauthorizationRequired => error.RestoreDestinationReauthorizationRequired,
+            error.CoordinatedConstraintPortableBackupUnsupported => error.CoordinatedConstraintPortableBackupUnsupported,
+            error.CoordinatedConstraintRestoreRequired => error.CoordinatedConstraintRestoreRequired,
             error.TableAlreadyExists => error.TableAlreadyExists,
             error.UnsupportedBackupMigrationState => error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => error.UnsupportedMultiRangeTable,
@@ -19837,6 +19919,9 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchTableDestinationAuthorization(path)) |adoption| return try tablePermission(alloc, adoption.table_name, .admin);
     if (routes.Routes.matchTableQuery(path)) |query| return try tablePermission(alloc, query.table_name, .read);
     if (routes.Routes.matchTableScan(path)) |scan| return try tablePermission(alloc, scan.table_name, .read);
+    if (routes.Routes.matchRelationalRowsQuery(path)) |rows| return try tablePermission(alloc, rows.table_name, .read);
+    if (routes.Routes.matchRelationalRowsMutation(path)) |rows| return try tablePermission(alloc, rows.table_name, .write);
+    if (routes.Routes.matchRelationalConstraintStatus(path)) |status| return try tablePermission(alloc, status.table_name, .admin);
     if (routes.Routes.matchTableDocumentArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
         .GET => .read,
         .POST, .PUT, .DELETE => return null,
@@ -20242,7 +20327,7 @@ fn admittedTablePermissionAllowed(
 /// current policy. The snapshot prevents a later grant from broadening an
 /// in-flight request; the live check makes deletion, expiry, or revocation
 /// effective before the next protected table operation.
-fn tablePermissionCurrentlyAllowed(
+pub fn tablePermissionCurrentlyAllowed(
     authenticated_identity: ?AuthenticatedIdentity,
     table_name: []const u8,
     permission_type: usermgr.PermissionType,

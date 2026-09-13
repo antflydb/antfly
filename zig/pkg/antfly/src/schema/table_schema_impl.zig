@@ -35,10 +35,14 @@ pub const TableSchema = struct {
     index_sort: []IndexSortField = &.{},
     relational_indexes: ?std.json.Parsed([]const relational_wire.RelationalIndexDefinition) = null,
     checks: ?std.json.Parsed([]const relational_wire.RelationalCheckConstraint) = null,
+    unique_constraints: ?std.json.Parsed([]const relational_wire.RelationalUniqueConstraint) = null,
+    foreign_keys: ?std.json.Parsed([]const relational_wire.RelationalForeignKeyConstraint) = null,
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
         if (self.relational_indexes) |*indexes| indexes.deinit();
         if (self.checks) |*checks| checks.deinit();
+        if (self.unique_constraints) |*constraints| constraints.deinit();
+        if (self.foreign_keys) |*constraints| constraints.deinit();
         alloc.free(self.default_type);
         alloc.free(self.ttl_field);
         for (self.document_schemas) |*document_schema| document_schema.deinit(alloc);
@@ -53,6 +57,41 @@ pub const TableSchema = struct {
     /// Borrow definition strings from this schema and allocate only the
     /// binding arrays in a caller-owned preparation arena. Wire enum ordinals
     /// are deliberately not used as native/durable tags.
+    pub fn relationalUniqueDefinitions(self: TableSchema, alloc: std.mem.Allocator) ![]const relational_native.UniqueConstraint {
+        const declarations = self.unique_constraints orelse return &.{};
+        const definitions = try alloc.alloc(relational_native.UniqueConstraint, declarations.value.len);
+        for (declarations.value, definitions) |declaration, *definition| definition.* = .{
+            .name = declaration.name,
+            .columns = declaration.columns,
+            .nulls_not_distinct = declaration.nulls_not_distinct orelse false,
+            .validation_state = .unvalidated,
+        };
+        return definitions;
+    }
+
+    pub fn relationalForeignKeyDefinitions(self: TableSchema, alloc: std.mem.Allocator) ![]const relational_native.ForeignKey {
+        const declarations = self.foreign_keys orelse return &.{};
+        const definitions = try alloc.alloc(relational_native.ForeignKey, declarations.value.len);
+        for (declarations.value, definitions) |declaration, *definition| definition.* = .{
+            .name = declaration.name,
+            .child_columns = declaration.child_columns,
+            .parent_table = declaration.parent_table,
+            .parent_columns = declaration.parent_columns,
+            .on_delete = nativeEnum(relational_native.ForeignKeyAction, declaration.on_delete orelse .restrict),
+            .on_update = nativeEnum(relational_native.ForeignKeyAction, declaration.on_update orelse .restrict),
+            .timing = nativeEnum(relational_native.ForeignKeyTiming, declaration.timing orelse .immediate),
+            .match = nativeEnum(relational_native.ForeignKeyMatch, declaration.match orelse .simple),
+            .deferrable = declaration.deferrable orelse false,
+            .validation_state = .unvalidated,
+        };
+        return definitions;
+    }
+
+    fn nativeEnum(comptime T: type, wire: anytype) T {
+        inline for (@typeInfo(T).@"enum".fields) |field| if (std.mem.eql(u8, @tagName(wire), field.name)) return @field(T, field.name);
+        unreachable;
+    }
+
     pub fn relationalIndexDefinitions(self: TableSchema, alloc: std.mem.Allocator) !?[]const relational_native.RelationalIndexDefinition {
         const declarations = self.relational_indexes orelse return null;
         const definitions = try alloc.alloc(relational_native.RelationalIndexDefinition, declarations.value.len);
@@ -2276,6 +2315,12 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
                 return error.InvalidSchemaUpdateRequest;
         }
     }
+    if (root.get("unique_constraints")) |declarations| {
+        parsed.unique_constraints = try parseRelationalDeclarations(relational_wire.RelationalUniqueConstraint, alloc, declarations);
+    }
+    if (root.get("foreign_keys")) |declarations| {
+        parsed.foreign_keys = try parseRelationalDeclarations(relational_wire.RelationalForeignKeyConstraint, alloc, declarations);
+    }
     if (parsed.storage_mode == .relational) {
         if (root.get("enforce_types")) |enforce_types| {
             if (enforce_types != .null and !enforce_types.bool) return error.InvalidSchemaUpdateRequest;
@@ -2283,6 +2328,35 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
         parsed.enforce_types = true;
     }
     return parsed;
+}
+
+fn parseRelationalDeclarations(comptime T: type, alloc: std.mem.Allocator, value: std.json.Value) !std.json.Parsed([]const T) {
+    if (value != .array or value.array.items.len > 256) return error.InvalidSchemaUpdateRequest;
+    var parsed = std.json.parseFromValue([]const T, alloc, value, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    errdefer parsed.deinit();
+    for (parsed.value, 0..) |item, i| {
+        if (item.name.len == 0 or item.name.len > 256 or !std.unicode.utf8ValidateSlice(item.name)) return error.InvalidSchemaUpdateRequest;
+        for (parsed.value[0..i]) |prior| if (std.mem.eql(u8, prior.name, item.name)) return error.InvalidSchemaUpdateRequest;
+        const columns = if (T == relational_wire.RelationalUniqueConstraint) item.columns else item.child_columns;
+        try validateConstraintColumns(columns);
+        if (T == relational_wire.RelationalForeignKeyConstraint) {
+            if (item.parent_table.len == 0 or !std.unicode.utf8ValidateSlice(item.parent_table) or item.parent_columns.len != columns.len)
+                return error.InvalidSchemaUpdateRequest;
+            try validateConstraintColumns(item.parent_columns);
+        }
+    }
+    return parsed;
+}
+
+fn validateConstraintColumns(columns: []const []const u8) !void {
+    if (columns.len == 0 or columns.len > 32) return error.InvalidSchemaUpdateRequest;
+    for (columns, 0..) |column, i| {
+        if (column.len == 0 or !std.unicode.utf8ValidateSlice(column)) return error.InvalidSchemaUpdateRequest;
+        for (columns[0..i]) |prior| if (std.mem.eql(u8, prior, column)) return error.InvalidSchemaUpdateRequest;
+    }
 }
 
 fn parseIndexSort(alloc: std.mem.Allocator, value: std.json.Value) ![]IndexSortField {
@@ -2371,7 +2445,7 @@ fn propertyContainsRelationalOnlySchemaType(property: DocumentProperty) bool {
 
 fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.storage_mode != .relational) {
-        if (schema.relational_indexes != null or schema.checks != null) return error.InvalidSchemaUpdateRequest;
+        if (schema.relational_indexes != null or schema.checks != null or schema.unique_constraints != null or schema.foreign_keys != null) return error.InvalidSchemaUpdateRequest;
         return;
     }
     if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;
@@ -2379,6 +2453,15 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.document_schemas.len != 1) return error.InvalidSchemaUpdateRequest;
 
     const document_schema = schema.document_schemas[0];
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| {
+        for (constraint.columns) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
+        if (schema.checks) |checks| for (checks.value) |check| if (std.mem.eql(u8, check.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
+    };
+    if (schema.foreign_keys) |constraints| for (constraints.value) |constraint| {
+        for (constraint.child_columns) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
+        if (schema.checks) |checks| for (checks.value) |check| if (std.mem.eql(u8, check.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
+        if (schema.unique_constraints) |uniques| for (uniques.value) |unique| if (std.mem.eql(u8, unique.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
+    };
     if (schema.checks) |checks| for (checks.value) |check| {
         if (findDocumentProperty(document_schema.properties, check.column) == null) return error.InvalidSchemaUpdateRequest;
     };

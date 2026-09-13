@@ -26,6 +26,8 @@ const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
 const contract = @import("distributed_txn_contract.zig");
+const integrity_wire = @import("relational_integrity_wire.zig");
+const integrity_activation = @import("../storage/db/relational_integrity_activation.zig");
 
 pub const table_participant_prefix = "table:";
 const table_participant_v2_prefix = "table2:";
@@ -43,6 +45,9 @@ pub const TxnPrepareRequest = struct {
     txn_id: db_mod.types.TxnId,
     topology_epoch: u64 = 0,
     req: db_mod.types.TransactionIntentRequest,
+    /// Internal parser ownership only; never serialized as a request field.
+    integrity_commands_owner: ?std.json.Parsed([]const integrity_wire.Command) = null,
+    relational_activation_owner: ?std.json.Parsed(integrity_activation.Command) = null,
 };
 
 pub const TxnResolveRequest = struct {
@@ -1746,6 +1751,11 @@ pub fn executeCrossGroup(
         .deletes = req.deletes,
         .transforms = req.transforms,
         .predicates = req.predicates,
+        .integrity = req.integrity,
+        .integrity_commands = req.integrity_commands,
+        .relational_activation = req.relational_activation,
+        .relational_schema_version = req.relational_schema_version,
+        .relational_integrity_generation_set = req.relational_integrity_generation_set,
     }};
     const outcome = try executeMultiTableCommit(
         alloc,
@@ -1846,6 +1856,34 @@ fn executeMultiTableCommitOnce(
             const group_id = routing.resolveGroupForKey(transform.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.transforms.append(alloc, transform);
+        }
+        for (table.integrity) |operation| {
+            const group_id = routing.resolveGroupForKey(operation.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            try participant.integrity.append(alloc, operation);
+        }
+        for (table.integrity_commands) |command| {
+            const group_id = routing.resolveGroupForKey(&command.address.routing) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            try participant.integrity_commands.append(alloc, command);
+        }
+        if (table.relational_activation) |command| {
+            const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            if (participant.relational_activation != null) return error.InvalidTxnRequest;
+            participant.relational_activation = command;
+        }
+        for (participants.items) |*participant| {
+            if (!std.mem.eql(u8, participant.table_name, table.table_name)) continue;
+            if (participant.relational_schema_version) |existing| {
+                if (table.relational_schema_version) |requested| {
+                    if (existing != requested) return error.InvalidTxnRequest;
+                }
+            } else participant.relational_schema_version = table.relational_schema_version;
+            if (participant.relational_integrity_generation_set) |existing| {
+                const requested = table.relational_integrity_generation_set orelse return error.PreparedGenerationChanged;
+                if (!std.mem.eql(u8, &existing, &requested)) return error.PreparedGenerationChanged;
+            } else participant.relational_integrity_generation_set = table.relational_integrity_generation_set;
         }
     }
 
@@ -2002,13 +2040,13 @@ fn executeMultiTableCommitOnce(
             const participant = participants.items[participant_index];
             const err = fanout_slots[participant_index].err.?;
             switch (err) {
-                error.IntentConflict, error.VersionConflict => {
+                error.IntentConflict, error.VersionConflict, error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => {
                     if (trace_writer) |tw| {
                         tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
                     }
                     abort_on_error = false;
                     try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
-                    return .{ .conflict = participantConflict(participant) };
+                    return .{ .conflict = participantConflict(participant, err) };
                 },
                 error.UnknownGroup,
                 error.RaftBatchWriteOutcomeUnknown,
@@ -2364,16 +2402,23 @@ const ParticipantTxn = struct {
     table_name: []const u8,
     group_id: u64,
     topology_epoch: u64,
+    relational_schema_version: ?u32 = null,
+    relational_integrity_generation_set: ?[32]u8 = null,
     writes: std.ArrayListUnmanaged(db_mod.types.TransactionWrite) = .empty,
     deletes: std.ArrayListUnmanaged([]const u8) = .empty,
     transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
     predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
+    integrity: std.ArrayListUnmanaged(db_mod.types.TransactionIntegrityOperation) = .empty,
+    integrity_commands: std.ArrayListUnmanaged(integrity_wire.Command) = .empty,
+    relational_activation: ?integrity_activation.Command = null,
 
     fn deinit(self: *ParticipantTxn, alloc: std.mem.Allocator) void {
         self.writes.deinit(alloc);
         self.deletes.deinit(alloc);
         self.transforms.deinit(alloc);
         self.predicates.deinit(alloc);
+        self.integrity.deinit(alloc);
+        self.integrity_commands.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2475,6 +2520,11 @@ const PrepareFanoutTask = struct {
                 .deletes = participant.deletes.items,
                 .transforms = participant.transforms.items,
                 .predicates = participant.predicates.items,
+                .integrity = participant.integrity.items,
+                .integrity_commands = participant.integrity_commands.items,
+                .relational_activation = participant.relational_activation,
+                .relational_schema_version = participant.relational_schema_version,
+                .relational_integrity_generation_set = participant.relational_integrity_generation_set,
             },
         }) catch |err| {
             slot.err = err;
@@ -3098,7 +3148,28 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
-    try out.appendSlice(alloc, "]}");
+    try out.appendSlice(alloc, "],\"integrity\":");
+    try integrity_wire.append(alloc, &out, req.req.integrity);
+    try out.appendSlice(alloc, ",\"integrity_commands\":");
+    try integrity_wire.appendCommands(alloc, &out, req.req.integrity_commands);
+    if (req.req.relational_activation) |activation| {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, activation, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, ",\"relational_activation\":");
+        try out.appendSlice(alloc, encoded);
+    }
+    if (req.req.relational_schema_version) |version| {
+        const field = try std.fmt.allocPrint(alloc, ",\"relational_schema_version\":{d}", .{version});
+        defer alloc.free(field);
+        try out.appendSlice(alloc, field);
+    }
+    if (req.req.relational_integrity_generation_set) |generation_set| {
+        try out.appendSlice(alloc, ",\"relational_integrity_generation_set\":");
+        const encoded = try integrity_wire.encodeGenerationSet(alloc, generation_set);
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -3200,6 +3271,18 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     errdefer freeTxnTransforms(alloc, transforms);
     const predicates = try parseTxnPredicates(alloc, obj.get("predicates") orelse return error.InvalidTxnRequest);
     errdefer freeTxnPredicates(alloc, predicates);
+    const integrity = if (obj.get("integrity")) |value| try integrity_wire.parse(alloc, value) else &.{};
+    errdefer integrity_wire.free(alloc, integrity);
+    var integrity_commands_owner = if (obj.get("integrity_commands")) |value| try integrity_wire.parseCommands(alloc, value) else null;
+    errdefer if (integrity_commands_owner) |*owner| owner.deinit();
+    var relational_activation_owner = if (obj.get("relational_activation")) |value| try std.json.parseFromValue(integrity_activation.Command, alloc, value, .{ .allocate = .alloc_always }) else null;
+    errdefer if (relational_activation_owner) |*owner| owner.deinit();
+    const relational_schema_version: ?u32 = if (obj.get("relational_schema_version")) |_| blk: {
+        const version = try optionalU64(obj, "relational_schema_version");
+        if (version == 0 or version > std.math.maxInt(u32)) return error.InvalidTxnRequest;
+        break :blk @intCast(version);
+    } else null;
+    const generation_set: ?[32]u8 = if (obj.get("relational_integrity_generation_set")) |value| try integrity_wire.parseGenerationSet(value) else null;
     return .{
         .txn_id = txn_id,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
@@ -3208,7 +3291,14 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
             .deletes = deletes,
             .transforms = transforms,
             .predicates = predicates,
+            .integrity = integrity,
+            .integrity_commands = if (integrity_commands_owner) |owner| owner.value else &.{},
+            .relational_activation = if (relational_activation_owner) |owner| owner.value else null,
+            .relational_schema_version = relational_schema_version,
+            .relational_integrity_generation_set = generation_set,
         },
+        .integrity_commands_owner = integrity_commands_owner,
+        .relational_activation_owner = relational_activation_owner,
     };
 }
 
@@ -3217,7 +3307,30 @@ pub fn freeTxnPrepareRequest(alloc: std.mem.Allocator, req: *TxnPrepareRequest) 
     freeTxnDeletes(alloc, req.req.deletes);
     freeTxnTransforms(alloc, req.req.transforms);
     freeTxnPredicates(alloc, req.req.predicates);
+    integrity_wire.free(alloc, req.req.integrity);
+    if (req.integrity_commands_owner) |*owner| owner.deinit();
+    if (req.relational_activation_owner) |*owner| owner.deinit();
     req.* = undefined;
+}
+
+test "distributed txn prepare roundtrips activation checkpoint and schema fence" {
+    const alloc = std.testing.allocator;
+    const request: TxnPrepareRequest = .{
+        .txn_id = @splat(1),
+        .topology_epoch = 9,
+        .req = .{
+            .relational_schema_version = 7,
+            .relational_integrity_generation_set = [_]u8{9} ** 32,
+            .relational_activation = .{ .routing_key = "\xff\x00", .expected = "\xfe\x00", .next = "\xfd\x00", .retry = true },
+        },
+    };
+    const bytes = try encodeTxnPrepareRequest(alloc, request);
+    defer alloc.free(bytes);
+    var parsed = try parseTxnPrepareRequest(alloc, bytes);
+    defer freeTxnPrepareRequest(alloc, &parsed);
+    try std.testing.expectEqual(request.req.relational_schema_version, parsed.req.relational_schema_version);
+    try std.testing.expectEqual(request.req.relational_integrity_generation_set, parsed.req.relational_integrity_generation_set);
+    try std.testing.expectEqualDeep(request.req.relational_activation, parsed.req.relational_activation);
 }
 
 pub fn parseTxnResolveRequest(alloc: std.mem.Allocator, body: []const u8) !TxnResolveRequest {
@@ -3922,7 +4035,26 @@ test "distributed txn abort durably resolves attempted participants and acknowle
     try std.testing.expectEqual(@as(usize, 2), fully_begun.acknowledgement_count);
 }
 
-fn participantConflict(participant: ParticipantTxn) CommitConflict {
+fn participantConflict(participant: ParticipantTxn, cause: anyerror) CommitConflict {
+    const reason: ?contract.CommitConflictReason = switch (cause) {
+        error.UniqueConstraintViolation => .unique_constraint_violation,
+        error.ForeignKeyParentMissing => .foreign_key_parent_missing,
+        error.ForeignKeyReferenced => .foreign_key_referenced,
+        else => null,
+    };
+    if (reason != null or participant.integrity.items.len != 0 or participant.integrity_commands.items.len != 0 or participant.relational_activation != null) return .{
+        .table_name = participant.table_name,
+        .key = "",
+        .message = if (reason) |value| switch (value) {
+            .unique_constraint_violation => "unique constraint violation",
+            .foreign_key_parent_missing => "referenced parent does not exist",
+            .foreign_key_referenced => "parent is still referenced",
+        } else "relational dependency changed; retry the mutation",
+        .group_id = participant.group_id,
+        .phase = .prepare,
+        .reason = reason,
+        .retryable = reason == null,
+    };
     if (participant.predicates.items.len > 0) {
         return .{
             .table_name = participant.table_name,
@@ -4026,6 +4158,9 @@ test "distributed txn coordinator groups by range and commits all participants" 
         begins: std.ArrayListUnmanaged(u64) = .empty,
         prepares: std.ArrayListUnmanaged(u64) = .empty,
         read_only_prepares: usize = 0,
+        integrity_prepares: usize = 0,
+        semantic_prepares: usize = 0,
+        activation_prepares: usize = 0,
         coordinator_group: u64 = 7001,
         resolves: std.ArrayListUnmanaged(struct {
             group_id: u64,
@@ -4062,7 +4197,26 @@ test "distributed txn coordinator groups by range and commits all participants" 
 
         fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnPrepareRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expect(req.req.writes.len + req.req.deletes.len + req.req.predicates.len > 0);
+            try std.testing.expect(req.req.writes.len + req.req.deletes.len + req.req.predicates.len + req.req.integrity.len > 0);
+            if (req.req.integrity.len != 0) {
+                // Physical metadata keys sort on the first range, but their
+                // explicit claim routing key must choose the second owner.
+                try std.testing.expectEqual(@as(u64, 7002), group_id);
+                try std.testing.expectEqualStrings("\x00\x00claim", req.req.integrity[0].key);
+                self.integrity_prepares += 1;
+            }
+            if (req.req.integrity_commands.len != 0) {
+                try std.testing.expectEqual(@as(u64, 7002), group_id);
+                try std.testing.expectEqual(@as(?u32, 77), req.req.relational_schema_version);
+                try std.testing.expectEqual(@as(?[32]u8, [_]u8{8} ** 32), req.req.relational_integrity_generation_set);
+                self.semantic_prepares += 1;
+            }
+            if (req.req.relational_activation) |checkpoint| {
+                try std.testing.expectEqual(@as(u64, 7002), group_id);
+                try std.testing.expectEqualStrings("doc:z", checkpoint.routing_key);
+                try std.testing.expectEqualStrings("progress", checkpoint.next);
+                self.activation_prepares += 1;
+            }
             if (req.req.writes.len == 0 and req.req.deletes.len == 0) self.read_only_prepares += 1;
             try self.prepares.append(std.testing.allocator, group_id);
         }
@@ -4176,6 +4330,36 @@ test "distributed txn coordinator groups by range and commits all participants" 
     try std.testing.expectEqual(@as(usize, 2), dependent_outcome.committed.participant_count);
     try std.testing.expectEqual(@as(usize, 1), recorder.read_only_prepares);
     try std.testing.expectEqual(@as(usize, 6), recorder.resolves.items.len);
+
+    recorder.coordinator_group = 7001;
+    var routed_address = try @import("../storage/db/relational_integrity.zig").Address.init([_]u8{1} ** 16, "tuple");
+    // This transport test deliberately supplies an explicit routing digest;
+    // native address validation is separately tested at the storage boundary.
+    routed_address.routing = [_]u8{'z'} ** 32;
+    const claim_outcome = try executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        try parseTxnIdHex("30112233445566778899aabbccddeeff"),
+        40_000,
+        40_001,
+        &.{.{
+            .table_name = "docs",
+            .relational_schema_version = 77,
+            .relational_integrity_generation_set = [_]u8{8} ** 32,
+            .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+            .integrity = &.{.{ .routing_key = "doc:z", .key = "\x00\x00claim", .kind = .guard, .expected_value = "live" }},
+            .integrity_commands = &.{.{ .address = routed_address, .operation = .{ .check_owner = .{ .parent_table = "docs", .parent_key = "doc:a" } } }},
+            .relational_activation = .{ .routing_key = "doc:z", .expected = null, .next = "progress" },
+        }},
+        .write,
+        null,
+    );
+    try std.testing.expect(claim_outcome == .committed);
+    try std.testing.expectEqual(@as(usize, 2), claim_outcome.committed.participant_count);
+    try std.testing.expectEqual(@as(usize, 1), recorder.integrity_prepares);
+    try std.testing.expectEqual(@as(usize, 1), recorder.semantic_prepares);
+    try std.testing.expectEqual(@as(usize, 1), recorder.activation_prepares);
 }
 
 test "stable distributed transaction retry resumes a durable commit decision" {
@@ -4453,6 +4637,18 @@ test "distributed txn coordinator aborts only participants that may have begun" 
         .{ .key = "doc:a", .value = "{\"count\":0}" },
         .{ .key = "doc:z", .value = "{\"count\":0}" },
     } }};
+    for ([_]anyerror{ error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced }, [_]contract.CommitConflictReason{ .unique_constraint_violation, .foreign_key_parent_missing, .foreign_key_referenced }) |failure, reason| {
+        recorder.prepare_failure = failure;
+        recorder.resolves.clearRetainingCapacity();
+        recorder.abort_failure = false;
+        recorder.observed_status = .aborted;
+        const outcome = try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null);
+        try std.testing.expect(outcome == .conflict);
+        try std.testing.expectEqual(reason, outcome.conflict.reason.?);
+        try std.testing.expect(!outcome.conflict.retryable);
+        try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
+        for (recorder.resolves.items) |status| try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, status);
+    }
     for ([_]anyerror{ error.RaftBatchWriteOutcomeUnknown, error.ClientShuttingDown }) |prepare_failure| {
         recorder.prepare_failure = prepare_failure;
         for ([_]bool{ false, true }) |abort_failure| {

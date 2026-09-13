@@ -287,12 +287,19 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    relational_schema_version: ?u32 = null,
+    /// Internal coordinator evidence; never populated from public request JSON.
+    relational_integrity_generation_set: ?[32]u8 = null,
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
+    /// Internal transaction-only effects; never accepted from public batch JSON.
+    integrity: []const TransactionIntegrityOperation = &.{},
+    integrity_commands: []const @import("relational_integrity.zig").Command = &.{},
+    relational_activation: ?@import("relational_integrity_activation.zig").Command = null,
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
@@ -319,6 +326,21 @@ pub const BatchRequest = struct {
     merge_artifacts: []const BatchWrite = &.{},
     /// Internal 2PC phase. Public batch parsing never accepts this field.
     transaction: ?TransactionMutation = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (std.meta.fields(@This())) |field| {
+            try jw.objectField(field.name);
+            if (comptime std.mem.eql(u8, field.name, "relational_integrity_generation_set")) {
+                if (self.relational_integrity_generation_set) |digest| {
+                    try jw.beginArray();
+                    for (digest) |byte| try jw.write(byte);
+                    try jw.endArray();
+                } else try jw.write(null);
+            } else try jw.write(@field(self, field.name));
+        }
+        try jw.endObject();
+    }
 };
 
 pub fn validateMergeArtifacts(req: BatchRequest) !void {
@@ -1204,6 +1226,11 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Authenticated group-local control read; never accepted by public lookup parsing.
+    relational_integrity_catalog: bool = false,
+    relational_integrity_action: bool = false,
+    relational_integrity_jobs_json: []const u8 = "",
+    relational_activation_json: []const u8 = "",
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     /// Internal, absolute monotonic deadline used by routed lookups. It is not
@@ -1271,6 +1298,9 @@ pub const ColumnarScanStats = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Schema-bound typed row query carried by the routed scan transport. It
+    /// is never interpreted as a search DSL or permitted to replace RLS filters.
+    relational_query_json: []const u8 = "",
     /// Internal differential-testing and benchmark baseline; never serialized.
     disable_columnar_scan: bool = false,
     /// Internal request-local decoded payload reuse budget. Includes retained
@@ -1312,6 +1342,7 @@ pub const ScanHash = struct {
     id: []u8,
     hash: u64,
     content_hash: ?DocumentContentHash = null,
+    relational_schema_version: ?u32 = null,
 
     pub fn deinit(self: *ScanHash, alloc: Allocator) void {
         alloc.free(self.id);
@@ -1325,6 +1356,7 @@ pub const ScanVisitEntry = struct {
     id: []const u8,
     hash: u64,
     content_hash: ?DocumentContentHash = null,
+    relational_schema_version: ?u32 = null,
     document_json: ?[]const u8 = null,
 };
 
@@ -1427,11 +1459,53 @@ pub const TransactionVersionPredicate = struct {
     expected_version: u64,
 };
 
+/// Server-compiled integrity effects. The logical routing key is separate from
+/// the protected physical key: routing a metadata prefix would concentrate all
+/// claims on the first shard. Public mutation parsers must never populate this
+/// envelope directly. Participants validate its namespace before admission.
+pub const TransactionIntegrityOperation = struct {
+    routing_key: []const u8,
+    key: []const u8,
+    kind: enum { guard, put, delete },
+    value: ?[]const u8 = null,
+    /// Exact previous physical bytes; null asserts absence. Guards retain this
+    /// comparison through the durable transaction decision, not just preflight.
+    expected_value: ?[]const u8 = null,
+
+    /// HA uses the native JSON envelope. Integrity keys and checksummed values
+    /// are arbitrary bytes, not UTF-8; encode only these fields as byte arrays.
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("routing_key");
+        try writeBytes(jw, self.routing_key);
+        try jw.objectField("key");
+        try writeBytes(jw, self.key);
+        try jw.objectField("kind");
+        try jw.write(@tagName(self.kind));
+        try jw.objectField("value");
+        if (self.value) |value| try writeBytes(jw, value) else try jw.write(null);
+        try jw.objectField("expected_value");
+        if (self.expected_value) |value| try writeBytes(jw, value) else try jw.write(null);
+        try jw.endObject();
+    }
+
+    fn writeBytes(jw: anytype, bytes: []const u8) !void {
+        try jw.beginArray();
+        for (bytes) |byte| try jw.write(byte);
+        try jw.endArray();
+    }
+};
+
 pub const TransactionIntentRequest = struct {
+    relational_activation: ?@import("relational_integrity_activation.zig").Command = null,
+    relational_schema_version: ?u32 = null,
+    relational_integrity_generation_set: ?[32]u8 = null,
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
+    integrity: []const TransactionIntegrityOperation = &.{},
+    integrity_commands: []const @import("relational_integrity.zig").Command = &.{},
 };
 
 pub const SplitState = struct {

@@ -32,7 +32,7 @@ const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const platform_time = @import("antfly_platform").time;
 
-pub const Error = operation.ApiError || error{
+pub const Error = operation.ApiError || @import("relational_integrity_errors.zig").Error || error{
     TopologyChanged,
     IdentityReadGenerationChanged,
     HierarchyCursorStale,
@@ -515,6 +515,18 @@ pub const Operations = struct {
             },
             error.TopologyChanged => return error.TopologyChanged,
             error.VersionConflict, error.IntentConflict => return error.TransactionConflict,
+            error.ForeignKeyParentMissing,
+            error.ForeignKeyCoordinationRequired,
+            error.ForeignKeyReferenced,
+            error.UniqueConstraintViolation,
+            error.ForeignKeyActionInProgress,
+            error.PreparedGenerationChanged,
+            error.IntegrityCatalogChanged,
+            error.ConstraintActivationChanged,
+            error.ConstraintActivationInProgress,
+            error.ConstraintActivationFailed,
+            error.ConstraintActivationOwnerChanged,
+            => return @import("relational_integrity_errors.zig").classify(err).?,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,

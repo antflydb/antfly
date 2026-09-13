@@ -38,10 +38,15 @@ pub const PreDecisionContext = struct {
 
 pub const TableCommitRequest = struct {
     table_name: []const u8,
+    relational_schema_version: ?u32 = null,
+    relational_integrity_generation_set: ?[32]u8 = null,
     writes: []const db_types.TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const db_types.DocumentTransform = &.{},
     predicates: []const db_types.TransactionVersionPredicate = &.{},
+    integrity: []const db_types.TransactionIntegrityOperation = &.{},
+    integrity_commands: []const @import("../storage/db/relational_integrity.zig").Command = &.{},
+    relational_activation: ?@import("../storage/db/relational_integrity_activation.zig").Command = null,
 };
 
 pub const CommitConflict = struct {
@@ -50,6 +55,14 @@ pub const CommitConflict = struct {
     message: []const u8,
     group_id: ?u64 = null,
     phase: ?ParticipantPhase = null,
+    reason: ?CommitConflictReason = null,
+    retryable: bool = false,
+};
+
+pub const CommitConflictReason = enum {
+    unique_constraint_violation,
+    foreign_key_parent_missing,
+    foreign_key_referenced,
 };
 
 pub const ParticipantPhase = enum {

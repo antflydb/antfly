@@ -3893,6 +3893,117 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/constraints/status:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getRelationalConstraintStatus
+      summary: Read distributed unique and foreign-key validation coverage
+      tags:
+        - data_operations
+      responses:
+        '200':
+          description: Epoch- and owner-fenced validation status for every active range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RelationalConstraintStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Schema or ownership changed during status collection.
+        '503':
+          description: One or more current owners could not report authoritative coverage.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/rows/query:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: queryRelationalRows
+      summary: Query projected typed relational rows
+      tags:
+        - data_operations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RelationalRowQueryRequest'
+      responses:
+        '200':
+          description: Bounded newline-delimited typed rows in primary-key order.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Requested schema epoch is stale.
+        '503':
+          description: Read ownership or storage is temporarily unavailable.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/rows/mutate:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: mutateRelationalRows
+      summary: Atomically replace or delete version-conditional typed rows
+      tags:
+        - data_operations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RelationalRowMutationRequest'
+      responses:
+        '201':
+          description: Atomic mutations committed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
+        '202':
+          description: Durable commit decision; participant visibility or recovery is pending.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: A version precondition or relational constraint conflicted.
+        '503':
+          description: Write coordination is temporarily unavailable.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/batch:
     parameters:
       - name: tableName
@@ -12644,6 +12755,125 @@ components:
 
             matching keys in the range. Useful for pagination or sampling.
           example: 100
+    RelationalRowCondition:
+      type: object
+      additionalProperties: false
+      required:
+        - column
+        - op
+      properties:
+        column:
+          type: string
+          minLength: 1
+        op:
+          $ref: '#/components/schemas/RelationalComparisonOp'
+        value:
+          description: Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal
+            strings.
+        collation:
+          type: string
+    RelationalRowQueryRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - fields
+      description: >
+        Bounded relational scan in primary-key order. Each shard read pins an
+
+        immutable schema and row snapshot. Resume with the last returned _id
+
+        as from; a resumed request opens a fresh snapshot, not a retained cursor.
+
+        An empty projection returns row identities and versions only.
+      properties:
+        fields:
+          type: array
+          maxItems: 256
+          items:
+            type: string
+            minLength: 1
+        conditions:
+          type: array
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/RelationalRowCondition'
+        from:
+          type: string
+          description: Exclusive lower primary-key bound, including pagination continuation.
+        to:
+          type: string
+          description: Exclusive upper primary-key bound.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 4096
+          default: 128
+        schema_version:
+          type: integer
+          format: uint32
+          description: Reject the read if an owning shard has a different active schema epoch.
+    RelationalRow:
+      type: object
+      required:
+        - _id
+        - row
+        - version
+        - schema_version
+      properties:
+        _id:
+          type: string
+        row:
+          type: object
+          additionalProperties: true
+        version:
+          type: string
+          pattern: ^[0-9]+$
+          description: Exact row version for mutation preconditions, encoded as decimal text.
+        schema_version:
+          type: integer
+          format: uint32
+          description: Active pinned schema epoch, not the historical physical row layout.
+    RelationalRowMutation:
+      type: object
+      additionalProperties: false
+      required:
+        - key
+        - expected_version
+      description: A complete row replacement, or deletion when row is omitted. No read-modify-write is
+        implied.
+      properties:
+        key:
+          type: string
+          minLength: 1
+        expected_version:
+          type: string
+          pattern: ^[0-9]+$
+          description: Exact observed version. Zero requires that the row does not exist.
+        row:
+          type: object
+          additionalProperties: true
+    RelationalRowMutationRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - schema_version
+        - mutations
+      description: Atomic version-conditional typed-row replacements and deletions using the durable distributed
+        transaction coordinator.
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          description: Required active relational schema epoch, fenced during every participant prepare.
+        mutations:
+          type: array
+          minItems: 1
+          maxItems: 4096
+          items:
+            $ref: '#/components/schemas/RelationalRowMutation'
+        sync_level:
+          $ref: '#/components/schemas/SyncLevel'
     BatchRequest:
       type: object
       description: >
@@ -12999,6 +13229,65 @@ components:
             - prepare
             - resolve
           description: 2PC participant phase that reported the conflict.
+    RelationalConstraintConflictReason:
+      type: string
+      enum:
+        - unique_constraint_violation
+        - foreign_key_parent_missing
+        - foreign_key_referenced
+      description: Deterministic relational integrity failure; changing the mutation or data is required
+        before retry.
+    RelationalConstraintActivationPhase:
+      type: string
+      enum:
+        - unique
+        - foreign_key
+    RelationalConstraintRangeStatus:
+      type: object
+      required:
+        - group_id
+        - state
+        - phase
+        - rows_scanned
+        - owner
+      properties:
+        group_id:
+          type: string
+          description: Exact owner group identifier as decimal text.
+        state:
+          $ref: '#/components/schemas/RelationalConstraintValidationState'
+        phase:
+          $ref: '#/components/schemas/RelationalConstraintActivationPhase'
+        rows_scanned:
+          type: string
+          description: Exact cumulative validation row count as decimal text.
+        owner:
+          type: string
+          description: Opaque namespace-and-range ownership digest.
+        failure:
+          type: string
+    RelationalConstraintStatus:
+      type: object
+      required:
+        - schema_version
+        - coverage_kind
+        - state
+        - ranges
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+        coverage_kind:
+          type: string
+          enum:
+            - unique_and_foreign_key
+          description: This endpoint reports distributed unique/FK coverage, not local scalar CHECK validation.
+        state:
+          $ref: '#/components/schemas/RelationalConstraintValidationState'
+        ranges:
+          type: array
+          items:
+            $ref: '#/components/schemas/RelationalConstraintRangeStatus'
     TransactionConflict:
       type: object
       description: Structured details for an aborted transaction attempt.
@@ -13018,6 +13307,8 @@ components:
         message:
           type: string
           description: Human-readable conflict description.
+        reason:
+          $ref: '#/components/schemas/RelationalConstraintConflictReason'
         kind:
           type: string
           enum:
@@ -20129,6 +20420,106 @@ components:
         collation:
           type: string
           description: String comparison collation; uses the same rules as ordered indexes.
+    RelationalUniqueConstraint:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - columns
+      description: >
+        A named, ordered composite unique key. Validation status is maintained
+
+        by the server. TTL expiry cannot be combined with unique or foreign-key
+
+        declarations until expiry uses the distributed integrity coordinator.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        columns:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+        nulls_not_distinct:
+          type: boolean
+          description: When true, NULL components compare equal for uniqueness.
+    ForeignKeyAction:
+      type: string
+      enum:
+        - restrict
+        - set_null
+        - cascade
+        - no_action
+      description: Action on referencing rows when a referenced row is changed or removed.
+    ForeignKeyTiming:
+      type: string
+      enum:
+        - immediate
+        - deferred
+      description: Whether foreign-key enforcement occurs immediately or at transaction commit.
+    ForeignKeyMatch:
+      type: string
+      enum:
+        - simple
+        - full
+        - partial
+      description: Null matching semantics of a composite foreign key.
+    RelationalForeignKeyConstraint:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - child_columns
+        - parent_table
+        - parent_columns
+      description: >
+        Composite foreign key. Child and parent columns correspond by position
+
+        and must have the same physical comparison types. The parent columns
+
+        must identify a unique key. Existing-row validation is independent of
+
+        new-write enforcement and is never client-writable.
+
+        Deferred timing, MATCH PARTIAL, and TTL expiry are not supported.
+
+        SET NULL requires every child column to accept explicit NULL.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        child_columns:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+        parent_table:
+          type: string
+          minLength: 1
+        parent_columns:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+        on_delete:
+          $ref: '#/components/schemas/ForeignKeyAction'
+        on_update:
+          $ref: '#/components/schemas/ForeignKeyAction'
+        timing:
+          $ref: '#/components/schemas/ForeignKeyTiming'
+        match:
+          $ref: '#/components/schemas/ForeignKeyMatch'
+        deferrable:
+          type: boolean
     RelationalIndexKeyDirection:
       type: string
       enum:
@@ -20483,6 +20874,18 @@ components:
             New writes enforce every check. Existing-row validation status is
 
             maintained separately and is never accepted from the client.
+        unique_constraints:
+          type: array
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/RelationalUniqueConstraint'
+          description: Complete set of composite unique declarations. Omission or [] declares none.
+        foreign_keys:
+          type: array
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/RelationalForeignKeyConstraint'
+          description: Complete set of outgoing composite foreign keys. Omission or [] declares none.
         relational_indexes:
           type: array
           x-go-type-skip-optional-pointer: false
@@ -22593,6 +22996,14 @@ components:
         - $ref: '#/components/schemas/EmbeddingsIndexStats'
         - $ref: '#/components/schemas/GraphIndexStats'
         - $ref: '#/components/schemas/AlgebraicIndexStats'
+    RelationalConstraintValidationState:
+      type: string
+      enum:
+        - enforced
+        - unvalidated
+        - validating
+        - invalid
+      description: Validation state of an existing-row constraint.
     ChatToolName:
       type: string
       description: >

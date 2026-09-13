@@ -600,6 +600,73 @@ pub const RelationalConstraintValidationState = enum {
     }
 };
 
+/// Composite foreign key. Child and parent columns correspond by position and must have the same physical comparison types. The parent columns must identify a unique key. Existing-row validation is independent of new-write enforcement and is never client-writable. Deferred timing, MATCH PARTIAL, and TTL expiry are not supported. SET NULL requires every child column to accept explicit NULL.
+pub const RelationalForeignKeyConstraint = struct {
+    name: []const u8,
+    child_columns: []const []const u8,
+    parent_table: []const u8,
+    parent_columns: []const []const u8,
+    on_delete: ?ForeignKeyAction = null,
+    on_update: ?ForeignKeyAction = null,
+    timing: ?ForeignKeyTiming = null,
+    match: ?ForeignKeyMatch = null,
+    deferrable: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "child_columns", "child_columns", false },
+        .{ "parent_table", "parent_table", false },
+        .{ "parent_columns", "parent_columns", false },
+        .{ "on_delete", "on_delete", true },
+        .{ "on_update", "on_update", true },
+        .{ "timing", "timing", true },
+        .{ "match", "match", true },
+        .{ "deferrable", "deferrable", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("child_columns");
+        try jw.write(self.child_columns);
+        try jw.objectField("parent_table");
+        try jw.write(self.parent_table);
+        try jw.objectField("parent_columns");
+        try jw.write(self.parent_columns);
+        if (self.on_delete) |value| {
+            try jw.objectField("on_delete");
+            try jw.write(value);
+        }
+        if (self.on_update) |value| {
+            try jw.objectField("on_update");
+            try jw.write(value);
+        }
+        if (self.timing) |value| {
+            try jw.objectField("timing");
+            try jw.write(value);
+        }
+        if (self.match) |value| {
+            try jw.objectField("match");
+            try jw.write(value);
+        }
+        if (self.deferrable) |value| {
+            try jw.objectField("deferrable");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Physical access method of a relational index.
 pub const RelationalIndexAccessMethod = enum {
     scalar_column,
@@ -811,6 +878,42 @@ pub const RelationalIndexOwnerKind = enum {
     }
 };
 
+/// A named, ordered composite unique key. Validation status is maintained by the server. TTL expiry cannot be combined with unique or foreign-key declarations until expiry uses the distributed integrity coordinator.
+pub const RelationalUniqueConstraint = struct {
+    name: []const u8,
+    columns: []const []const u8,
+    /// When true, NULL components compare equal for uniqueness.
+    nulls_not_distinct: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "columns", "columns", false },
+        .{ "nulls_not_distinct", "nulls_not_distinct", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("columns");
+        try jw.write(self.columns);
+        if (self.nulls_not_distinct) |value| {
+            try jw.objectField("nulls_not_distinct");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
@@ -818,6 +921,10 @@ pub const TableSchema = struct {
     storage_mode: ?TableStorageMode = null,
     /// Named scalar CHECK constraints for a relational schema. This is part of the complete schema: omission or [] declares no checks. New writes enforce every check. Existing-row validation status is maintained separately and is never accepted from the client.
     checks: ?[]const RelationalCheckConstraint = null,
+    /// Complete set of composite unique declarations. Omission or [] declares none.
+    unique_constraints: ?[]const RelationalUniqueConstraint = null,
+    /// Complete set of outgoing composite foreign keys. Omission or [] declares none.
+    foreign_keys: ?[]const RelationalForeignKeyConstraint = null,
     /// Desired ordered indexes for a relational table. Names must be unique. An explicit array replaces the declarations; an empty array drops them. Omission preserves existing declarations during schema updates. Index definitions commit atomically with the schema; build progress and readiness are local to each owning shard, not client-writable.
     relational_indexes: ?[]const RelationalIndexDefinition = null,
     /// Default type to use from the document_types.
@@ -840,6 +947,8 @@ pub const TableSchema = struct {
         .{ "version", "version", true },
         .{ "storage_mode", "storage_mode", true },
         .{ "checks", "checks", true },
+        .{ "unique_constraints", "unique_constraints", true },
+        .{ "foreign_keys", "foreign_keys", true },
         .{ "relational_indexes", "relational_indexes", true },
         .{ "default_type", "default_type", true },
         .{ "enforce_types", "enforce_types", true },
@@ -870,6 +979,14 @@ pub const TableSchema = struct {
         }
         if (self.checks) |value| {
             try jw.objectField("checks");
+            try jw.write(value);
+        }
+        if (self.unique_constraints) |value| {
+            try jw.objectField("unique_constraints");
+            try jw.write(value);
+        }
+        if (self.foreign_keys) |value| {
+            try jw.objectField("foreign_keys");
             try jw.write(value);
         }
         if (self.relational_indexes) |value| {

@@ -1115,6 +1115,17 @@ pub const Client = struct {
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Read distributed unique and foreign-key validation coverage
+    /// GET /db/v1/tables/{tableName}/constraints/status
+    pub fn getRelationalConstraintStatus(self: *@This(), table_name: []const u8) !ApiResponse(types.RelationalConstraintStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/constraints/status", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalConstraintStatus).fromResponse(self.allocator, &resp);
+    }
+
     /// Adopt stored write destinations with the current credential
     /// POST /db/v1/tables/{tableName}/destination-authorization
     pub fn reauthorizeTableDestinations(self: *@This(), table_name: []const u8) !ApiResponse(std.json.Value) {
@@ -1435,6 +1446,33 @@ pub const Client = struct {
         if (idempotency_key) |value| try request_headers.append(self.allocator, .{ "Idempotency-Key", value });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Atomically replace or delete version-conditional typed rows
+    /// POST /db/v1/tables/{tableName}/rows/mutate
+    pub fn mutateRelationalRows(self: *@This(), table_name: []const u8, body: types.RelationalRowMutationRequest) !ApiResponse(types.BatchResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/mutate", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Query projected typed relational rows
+    /// POST /db/v1/tables/{tableName}/rows/query
+    pub fn queryRelationalRows(self: *@This(), table_name: []const u8, body: types.RelationalRowQueryRequest) !RawResponse {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/query", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// Replace a table's schema

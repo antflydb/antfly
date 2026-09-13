@@ -12,7 +12,9 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.dynamic_template import DynamicTemplate
     from ..models.relational_check_constraint import RelationalCheckConstraint
+    from ..models.relational_foreign_key_constraint import RelationalForeignKeyConstraint
     from ..models.relational_index_definition import RelationalIndexDefinition
+    from ..models.relational_unique_constraint import RelationalUniqueConstraint
     from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
     from ..models.ttl_config import TtlConfig
 
@@ -38,6 +40,10 @@ class TableSchema:
             part of the complete schema: omission or [] declares no checks.
             New writes enforce every check. Existing-row validation status is
             maintained separately and is never accepted from the client.
+        unique_constraints (list[RelationalUniqueConstraint] | Unset): Complete set of composite unique declarations.
+            Omission or [] declares none.
+        foreign_keys (list[RelationalForeignKeyConstraint] | Unset): Complete set of outgoing composite foreign keys.
+            Omission or [] declares none.
         relational_indexes (list[RelationalIndexDefinition] | Unset): Desired ordered indexes for a relational table.
             Names must be unique.
             An explicit array replaces the declarations; an empty array drops
@@ -61,6 +67,8 @@ class TableSchema:
     version: int | Unset = UNSET
     storage_mode: TableStorageMode | Unset = UNSET
     checks: list[RelationalCheckConstraint] | Unset = UNSET
+    unique_constraints: list[RelationalUniqueConstraint] | Unset = UNSET
+    foreign_keys: list[RelationalForeignKeyConstraint] | Unset = UNSET
     relational_indexes: list[RelationalIndexDefinition] | Unset = UNSET
     default_type: str | Unset = UNSET
     enforce_types: bool | Unset = UNSET
@@ -86,6 +94,20 @@ class TableSchema:
             for checks_item_data in self.checks:
                 checks_item = checks_item_data.to_dict()
                 checks.append(checks_item)
+
+        unique_constraints: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.unique_constraints, Unset):
+            unique_constraints = []
+            for unique_constraints_item_data in self.unique_constraints:
+                unique_constraints_item = unique_constraints_item_data.to_dict()
+                unique_constraints.append(unique_constraints_item)
+
+        foreign_keys: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.foreign_keys, Unset):
+            foreign_keys = []
+            for foreign_keys_item_data in self.foreign_keys:
+                foreign_keys_item = foreign_keys_item_data.to_dict()
+                foreign_keys.append(foreign_keys_item)
 
         relational_indexes: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.relational_indexes, Unset):
@@ -130,6 +152,10 @@ class TableSchema:
             field_dict["storage_mode"] = storage_mode
         if checks is not UNSET:
             field_dict["checks"] = checks
+        if unique_constraints is not UNSET:
+            field_dict["unique_constraints"] = unique_constraints
+        if foreign_keys is not UNSET:
+            field_dict["foreign_keys"] = foreign_keys
         if relational_indexes is not UNSET:
             field_dict["relational_indexes"] = relational_indexes
         if default_type is not UNSET:
@@ -153,7 +179,9 @@ class TableSchema:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.dynamic_template import DynamicTemplate
         from ..models.relational_check_constraint import RelationalCheckConstraint
+        from ..models.relational_foreign_key_constraint import RelationalForeignKeyConstraint
         from ..models.relational_index_definition import RelationalIndexDefinition
+        from ..models.relational_unique_constraint import RelationalUniqueConstraint
         from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
         from ..models.ttl_config import TtlConfig
 
@@ -175,6 +203,24 @@ class TableSchema:
                 checks_item = RelationalCheckConstraint.from_dict(checks_item_data)
 
                 checks.append(checks_item)
+
+        _unique_constraints = d.pop("unique_constraints", UNSET)
+        unique_constraints: list[RelationalUniqueConstraint] | Unset = UNSET
+        if _unique_constraints is not UNSET:
+            unique_constraints = []
+            for unique_constraints_item_data in _unique_constraints:
+                unique_constraints_item = RelationalUniqueConstraint.from_dict(unique_constraints_item_data)
+
+                unique_constraints.append(unique_constraints_item)
+
+        _foreign_keys = d.pop("foreign_keys", UNSET)
+        foreign_keys: list[RelationalForeignKeyConstraint] | Unset = UNSET
+        if _foreign_keys is not UNSET:
+            foreign_keys = []
+            for foreign_keys_item_data in _foreign_keys:
+                foreign_keys_item = RelationalForeignKeyConstraint.from_dict(foreign_keys_item_data)
+
+                foreign_keys.append(foreign_keys_item)
 
         _relational_indexes = d.pop("relational_indexes", UNSET)
         relational_indexes: list[RelationalIndexDefinition] | Unset = UNSET
@@ -230,6 +276,8 @@ class TableSchema:
             version=version,
             storage_mode=storage_mode,
             checks=checks,
+            unique_constraints=unique_constraints,
+            foreign_keys=foreign_keys,
             relational_indexes=relational_indexes,
             default_type=default_type,
             enforce_types=enforce_types,

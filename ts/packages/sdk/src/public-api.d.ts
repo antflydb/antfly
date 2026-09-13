@@ -910,6 +910,63 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/constraints/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** Read distributed unique and foreign-key validation coverage */
+        get: operations["getRelationalConstraintStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Query projected typed relational rows */
+        post: operations["queryRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/mutate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Atomically replace or delete version-conditional typed rows */
+        post: operations["mutateRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/batch": {
         parameters: {
             query?: never;
@@ -5652,6 +5709,69 @@ export interface components {
              */
             limit?: number;
         };
+        RelationalRowCondition: {
+            column: string;
+            op: components["schemas"]["RelationalComparisonOp"];
+            /** @description Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings. */
+            value?: unknown;
+            collation?: string;
+        };
+        /**
+         * @description Bounded relational scan in primary-key order. Each shard read pins an
+         *     immutable schema and row snapshot. Resume with the last returned _id
+         *     as from; a resumed request opens a fresh snapshot, not a retained cursor.
+         *     An empty projection returns row identities and versions only.
+         */
+        RelationalRowQueryRequest: {
+            fields: string[];
+            conditions?: components["schemas"]["RelationalRowCondition"][];
+            /** @description Exclusive lower primary-key bound, including pagination continuation. */
+            from?: string;
+            /** @description Exclusive upper primary-key bound. */
+            to?: string;
+            /**
+             * Format: uint32
+             * @default 128
+             */
+            limit?: number;
+            /**
+             * Format: uint32
+             * @description Reject the read if an owning shard has a different active schema epoch.
+             */
+            schema_version?: number;
+        };
+        RelationalRow: {
+            _id: string;
+            row: {
+                [key: string]: unknown;
+            };
+            /** @description Exact row version for mutation preconditions, encoded as decimal text. */
+            version: string;
+            /**
+             * Format: uint32
+             * @description Active pinned schema epoch, not the historical physical row layout.
+             */
+            schema_version: number;
+        };
+        /** @description A complete row replacement, or deletion when row is omitted. No read-modify-write is implied. */
+        RelationalRowMutation: {
+            key: string;
+            /** @description Exact observed version. Zero requires that the row does not exist. */
+            expected_version: string;
+            row?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator. */
+        RelationalRowMutationRequest: {
+            /**
+             * Format: uint32
+             * @description Required active relational schema epoch, fenced during every participant prepare.
+             */
+            schema_version: number;
+            mutations: components["schemas"]["RelationalRowMutation"][];
+            sync_level?: components["schemas"]["SyncLevel"];
+        };
         /**
          * @description Batch insert, delete, and transform operations in a single request.
          *
@@ -5929,6 +6049,35 @@ export interface components {
              */
             phase?: "begin" | "prepare" | "resolve";
         };
+        /**
+         * @description Deterministic relational integrity failure; changing the mutation or data is required before retry.
+         * @enum {string}
+         */
+        RelationalConstraintConflictReason: "unique_constraint_violation" | "foreign_key_parent_missing" | "foreign_key_referenced";
+        /** @enum {string} */
+        RelationalConstraintActivationPhase: "unique" | "foreign_key";
+        RelationalConstraintRangeStatus: {
+            /** @description Exact owner group identifier as decimal text. */
+            group_id: string;
+            state: components["schemas"]["RelationalConstraintValidationState"];
+            phase: components["schemas"]["RelationalConstraintActivationPhase"];
+            /** @description Exact cumulative validation row count as decimal text. */
+            rows_scanned: string;
+            /** @description Opaque namespace-and-range ownership digest. */
+            owner: string;
+            failure?: string;
+        };
+        RelationalConstraintStatus: {
+            /** Format: uint32 */
+            schema_version: number;
+            /**
+             * @description This endpoint reports distributed unique/FK coverage, not local scalar CHECK validation.
+             * @enum {string}
+             */
+            coverage_kind: "unique_and_foreign_key";
+            state: components["schemas"]["RelationalConstraintValidationState"];
+            ranges: components["schemas"]["RelationalConstraintRangeStatus"][];
+        };
         /** @description Structured details for an aborted transaction attempt. */
         TransactionConflict: {
             /** @description Table where the conflict was detected. */
@@ -5937,6 +6086,7 @@ export interface components {
             key: string;
             /** @description Human-readable conflict description. */
             message: string;
+            reason?: components["schemas"]["RelationalConstraintConflictReason"];
             /**
              * @description Stable machine-readable conflict classification.
              * @enum {string}
@@ -10355,6 +10505,51 @@ export interface components {
             collation?: string;
         };
         /**
+         * @description A named, ordered composite unique key. Validation status is maintained
+         *     by the server. TTL expiry cannot be combined with unique or foreign-key
+         *     declarations until expiry uses the distributed integrity coordinator.
+         */
+        RelationalUniqueConstraint: {
+            name: string;
+            columns: string[];
+            /** @description When true, NULL components compare equal for uniqueness. */
+            nulls_not_distinct?: boolean;
+        };
+        /**
+         * @description Action on referencing rows when a referenced row is changed or removed.
+         * @enum {string}
+         */
+        ForeignKeyAction: "restrict" | "set_null" | "cascade" | "no_action";
+        /**
+         * @description Whether foreign-key enforcement occurs immediately or at transaction commit.
+         * @enum {string}
+         */
+        ForeignKeyTiming: "immediate" | "deferred";
+        /**
+         * @description Null matching semantics of a composite foreign key.
+         * @enum {string}
+         */
+        ForeignKeyMatch: "simple" | "full" | "partial";
+        /**
+         * @description Composite foreign key. Child and parent columns correspond by position
+         *     and must have the same physical comparison types. The parent columns
+         *     must identify a unique key. Existing-row validation is independent of
+         *     new-write enforcement and is never client-writable.
+         *     Deferred timing, MATCH PARTIAL, and TTL expiry are not supported.
+         *     SET NULL requires every child column to accept explicit NULL.
+         */
+        RelationalForeignKeyConstraint: {
+            name: string;
+            child_columns: string[];
+            parent_table: string;
+            parent_columns: string[];
+            on_delete?: components["schemas"]["ForeignKeyAction"];
+            on_update?: components["schemas"]["ForeignKeyAction"];
+            timing?: components["schemas"]["ForeignKeyTiming"];
+            match?: components["schemas"]["ForeignKeyMatch"];
+            deferrable?: boolean;
+        };
+        /**
          * @description Direction of one ordered index key component. Omission selects asc.
          * @enum {string}
          */
@@ -10580,6 +10775,10 @@ export interface components {
              *     maintained separately and is never accepted from the client.
              */
             checks?: components["schemas"]["RelationalCheckConstraint"][];
+            /** @description Complete set of composite unique declarations. Omission or [] declares none. */
+            unique_constraints?: components["schemas"]["RelationalUniqueConstraint"][];
+            /** @description Complete set of outgoing composite foreign keys. Omission or [] declares none. */
+            foreign_keys?: components["schemas"]["RelationalForeignKeyConstraint"][];
             /**
              * @description Desired ordered indexes for a relational table. Names must be unique.
              *     An explicit array replaces the declarations; an empty array drops
@@ -11805,6 +12004,11 @@ export interface components {
         };
         /** @description Statistics for an index */
         IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
+        /**
+         * @description Validation state of an existing-row constraint.
+         * @enum {string}
+         */
+        RelationalConstraintValidationState: "enforced" | "unvalidated" | "validating" | "invalid";
         /**
          * @description Available tool names for retrieval agents.
          *     - add_filter: Add search filters (field constraints)
@@ -17169,6 +17373,137 @@ export interface operations {
             502: components["responses"]["QueryBadGateway"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
             504: components["responses"]["QueryGatewayTimeout"];
+        };
+    };
+    getRelationalConstraintStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Epoch- and owner-fenced validation status for every active range. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Schema or ownership changed during status collection. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description One or more current owners could not report authoritative coverage. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowQueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded newline-delimited typed rows in primary-key order. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Requested schema epoch is stale. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Read ownership or storage is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mutateRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Atomic mutations committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Durable commit decision; participant visibility or recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description A version precondition or relational constraint conflicted. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     batchWrite: {

@@ -38,6 +38,7 @@ const schema_mod = @import("../schema.zig");
 const public_schema_mod = @import("../../schema/mod.zig");
 const schema_registry_mod = @import("schema_registry.zig");
 const relational_index_catalog_mod = @import("relational_index_catalog.zig");
+const integrity_catalog_mod = @import("relational_integrity_catalog.zig");
 const table_catalog_mod = @import("table_catalog.zig");
 const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 const shard_mod = @import("../shard.zig");
@@ -86,6 +87,7 @@ pub const PreparedSchemaMetadata = struct {
     base_schema_view: ?schema_registry_mod.SchemaView = null,
     base_relational_indexes: ?relational_index_catalog_mod.WriteSnapshot = null,
     relational_indexes: ?relational_index_catalog_mod.PreparedPublication = null,
+    integrity_catalog: ?integrity_catalog_mod.Update = null,
     same_version_layout_matches: bool = false,
     combined_writes: []docstore_mod.KVPair,
 
@@ -126,6 +128,7 @@ pub const PreparedSchemaMetadata = struct {
     }
 
     pub fn deinit(self: *PreparedSchemaMetadata) void {
+        if (self.integrity_catalog) |*catalog| catalog.deinit();
         if (self.relational_indexes) |*indexes| indexes.deinit();
         if (self.base_relational_indexes) |*indexes| indexes.deinit();
         if (self.publication) |*publication| publication.deinit();
@@ -1347,6 +1350,37 @@ pub const DBCore = struct {
             break :declarations try self.relational_indexes.prepareSchemaChange(next_view);
         };
         prepared.publication = try self.schema_registry.preparePublish(table_schema.version);
+        var declaration_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer declaration_arena.deinit();
+        const definitions = if (next_view.validator()) |validator|
+            try @import("../../schema/relational_declarations.zig").definitionFingerprints(declaration_arena.allocator(), validator.schema, table_schema)
+        else
+            &.{};
+        const previous_integrity = try self.getStoreValue(self.alloc, integrity_catalog_mod.key);
+        defer if (previous_integrity) |bytes| self.alloc.free(bytes);
+        if (definitions.len != 0 or previous_integrity != null) {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(prepared.encoded, &digest, .{});
+            prepared.integrity_catalog = try integrity_catalog_mod.prepare(
+                self.alloc,
+                previous_integrity,
+                try integrity_catalog_mod.incarnationFromTableId(self.identity_namespace.table_id),
+                table_schema.version,
+                digest,
+                definitions,
+            );
+            if (previous_integrity) |previous| {
+                var prior = try integrity_catalog_mod.decode(self.alloc, previous);
+                defer prior.deinit();
+                for (prior.bindings) |binding| {
+                    if (binding.retired) continue;
+                    const next = prepared.integrity_catalog.?.catalog.findGeneration(binding.generation) orelse return error.IntegrityCatalogChanged;
+                    // Retaining a descriptor is necessary for recovery, but
+                    // is not proof that cross-table dependents have retired.
+                    if (next.retired) return error.ConstraintRetirementRequired;
+                }
+            }
+        }
         return prepared;
     }
 
@@ -1387,7 +1421,7 @@ pub const DBCore = struct {
         // leases must finish before an indexed table changes its schema.
         const check_constraints = (if (prepared.base_schema_view) |view| if (view.validator()) |validator| validator.execution.checks != null else false else false) or
             (if (prepared.epoch.?.validator) |validator| validator.execution.checks != null else false);
-        if (!same_active_epoch and (prepared.base_relational_indexes != null or prepared.relational_indexes != null or check_constraints)) {
+        if (!same_active_epoch and (prepared.base_relational_indexes != null or prepared.relational_indexes != null or check_constraints or prepared.integrity_catalog != null)) {
             var manager = try self.initTxnManager();
             defer manager.deinit();
             if (try manager.hasSchemaLeases()) return error.SchemaInUse;
@@ -1412,21 +1446,34 @@ pub const DBCore = struct {
         const catalog_data = next_catalog.encode();
         @memcpy(prepared.combined_writes[0..metadata_writes.len], metadata_writes);
         prepared.combined_writes[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = &catalog_data };
-        const changed = if (prepared.relational_indexes) |*indexes| try schema_mod.saveEncodedSchemaWithMetadataAndStage(
+        const Participants = struct {
+            prepared: *PreparedSchemaMetadata,
+            row_count: u64,
+            namespace: doc_identity.Namespace,
+
+            pub fn stage(participants: @This(), txn: anytype) !void {
+                if (participants.prepared.relational_indexes) |*indexes| _ = try indexes.metadata.stage(txn);
+                if (participants.prepared.integrity_catalog) |*catalog| {
+                    if (try doc_identity.loadNamespaceTxn(txn)) |stored| {
+                        if (!stored.eql(participants.namespace)) return error.IdentityNamespaceMismatch;
+                    } else {
+                        var encoded_namespace: [24]u8 = undefined;
+                        doc_identity.encodeNamespace(&encoded_namespace, participants.namespace);
+                        try txn.put(&internal_keys.identity_namespace_key, &encoded_namespace);
+                    }
+                    try catalog.stage(txn);
+                    try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
+                }
+            }
+        };
+        const changed = try schema_mod.saveEncodedSchemaWithMetadataAndStage(
             self.store,
             self.alloc,
             table_schema.version,
             prepared.encoded,
             prepared.combined_writes,
             metadata_deletes,
-            &indexes.metadata,
-        ) else try schema_mod.saveEncodedSchemaWithMetadata(
-            self.store,
-            self.alloc,
-            table_schema.version,
-            prepared.encoded,
-            prepared.combined_writes,
-            metadata_deletes,
+            Participants{ .prepared = prepared, .row_count = next_catalog.row_count, .namespace = self.identity_namespace },
         );
         const next_schema = prepared.resident_schema orelse unreachable;
         if (!changed or self.schema == null) {
@@ -1881,7 +1928,7 @@ pub const DBCore = struct {
         }
     }
 
-    fn initTxnManager(self: *DBCore) !transactions_mod.TxnManager {
+    pub fn initTxnManager(self: *DBCore) !transactions_mod.TxnManager {
         return try transactions_mod.TxnManager.init(self.alloc, self.store);
     }
 

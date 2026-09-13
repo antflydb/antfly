@@ -158,6 +158,19 @@ export type Table = components["schemas"]["Table"];
 export type CommittedMutationOutcome = components["schemas"]["CommittedMutationOutcome"];
 export type CreateTableRequest = components["schemas"]["CreateTableRequest"];
 export type TableSchema = components["schemas"]["TableSchema"];
+export type RelationalUniqueConstraint = components["schemas"]["RelationalUniqueConstraint"];
+export type RelationalForeignKeyConstraint =
+  components["schemas"]["RelationalForeignKeyConstraint"];
+export type RelationalRow = components["schemas"]["RelationalRow"];
+export type RelationalRowCondition = components["schemas"]["RelationalRowCondition"];
+export type RelationalRowQueryRequest = components["schemas"]["RelationalRowQueryRequest"];
+export type RelationalRowMutation = components["schemas"]["RelationalRowMutation"];
+export type RelationalRowMutationRequest = components["schemas"]["RelationalRowMutationRequest"];
+export type RelationalConstraintStatus = components["schemas"]["RelationalConstraintStatus"];
+export type RelationalConstraintRangeStatus =
+  components["schemas"]["RelationalConstraintRangeStatus"];
+export type RelationalConstraintConflictReason =
+  components["schemas"]["RelationalConstraintConflictReason"];
 export type TableMigration = components["schemas"]["TableMigration"];
 export type TableStatus = components["schemas"]["TableStatus"];
 

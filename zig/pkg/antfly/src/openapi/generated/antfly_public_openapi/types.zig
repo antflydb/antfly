@@ -8162,6 +8162,326 @@ pub const QueryUnprocessableError = union(enum) {
 /// An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
 pub const RawQuery = @import("antfly-json").RawValue;
 
+pub const RelationalConstraintActivationPhase = enum {
+    unique,
+    foreign_key,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unique => "unique",
+            .foreign_key => "foreign_key",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unique", .unique },
+            .{ "foreign_key", .foreign_key },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Deterministic relational integrity failure; changing the mutation or data is required before retry.
+pub const RelationalConstraintConflictReason = enum {
+    unique_constraint_violation,
+    foreign_key_parent_missing,
+    foreign_key_referenced,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unique_constraint_violation => "unique_constraint_violation",
+            .foreign_key_parent_missing => "foreign_key_parent_missing",
+            .foreign_key_referenced => "foreign_key_referenced",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unique_constraint_violation", .unique_constraint_violation },
+            .{ "foreign_key_parent_missing", .foreign_key_parent_missing },
+            .{ "foreign_key_referenced", .foreign_key_referenced },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalConstraintRangeStatus = struct {
+    /// Exact owner group identifier as decimal text.
+    group_id: []const u8,
+    state: antfly_schema_openapi.RelationalConstraintValidationState,
+    phase: RelationalConstraintActivationPhase,
+    /// Exact cumulative validation row count as decimal text.
+    rows_scanned: []const u8,
+    /// Opaque namespace-and-range ownership digest.
+    owner: []const u8,
+    failure: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "group_id", "group_id", false },
+        .{ "state", "state", false },
+        .{ "phase", "phase", false },
+        .{ "rows_scanned", "rows_scanned", false },
+        .{ "owner", "owner", false },
+        .{ "failure", "failure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("group_id");
+        try jw.write(self.group_id);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("rows_scanned");
+        try jw.write(self.rows_scanned);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalConstraintStatus = struct {
+    schema_version: i64,
+    /// This endpoint reports distributed unique/FK coverage, not local scalar CHECK validation.
+    coverage_kind: []const u8,
+    state: antfly_schema_openapi.RelationalConstraintValidationState,
+    ranges: []const RelationalConstraintRangeStatus,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "coverage_kind", "coverage_kind", false },
+        .{ "state", "state", false },
+        .{ "ranges", "ranges", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.objectField("coverage_kind");
+        try jw.write(self.coverage_kind);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("ranges");
+        try jw.write(self.ranges);
+        try jw.endObject();
+    }
+};
+
+pub const RelationalRow = struct {
+    _id: []const u8,
+    row: std.json.ArrayHashMap(std.json.Value),
+    /// Exact row version for mutation preconditions, encoded as decimal text.
+    version: []const u8,
+    /// Active pinned schema epoch, not the historical physical row layout.
+    schema_version: i64,
+};
+
+pub const RelationalRowCondition = struct {
+    column: []const u8,
+    op: antfly_schema_openapi.RelationalComparisonOp,
+    /// Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings.
+    value: ?std.json.Value = null,
+    collation: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "column", "column", false },
+        .{ "op", "op", false },
+        .{ "value", "value", true },
+        .{ "collation", "collation", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("column");
+        try jw.write(self.column);
+        try jw.objectField("op");
+        try jw.write(self.op);
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        if (self.collation) |value| {
+            try jw.objectField("collation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// A complete row replacement, or deletion when row is omitted. No read-modify-write is implied.
+pub const RelationalRowMutation = struct {
+    key: []const u8,
+    /// Exact observed version. Zero requires that the row does not exist.
+    expected_version: []const u8,
+    row: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key", "key", false },
+        .{ "expected_version", "expected_version", false },
+        .{ "row", "row", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("expected_version");
+        try jw.write(self.expected_version);
+        if (self.row) |value| {
+            try jw.objectField("row");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator.
+pub const RelationalRowMutationRequest = struct {
+    /// Required active relational schema epoch, fenced during every participant prepare.
+    schema_version: i64,
+    mutations: []const RelationalRowMutation,
+    sync_level: ?SyncLevel = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "mutations", "mutations", false },
+        .{ "sync_level", "sync_level", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.objectField("mutations");
+        try jw.write(self.mutations);
+        if (self.sync_level) |value| {
+            try jw.objectField("sync_level");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Bounded relational scan in primary-key order. Each shard read pins an immutable schema and row snapshot. Resume with the last returned _id as from; a resumed request opens a fresh snapshot, not a retained cursor. An empty projection returns row identities and versions only.
+pub const RelationalRowQueryRequest = struct {
+    fields: []const []const u8,
+    conditions: ?[]const RelationalRowCondition = null,
+    /// Exclusive lower primary-key bound, including pagination continuation.
+    from: ?[]const u8 = null,
+    /// Exclusive upper primary-key bound.
+    to: ?[]const u8 = null,
+    limit: ?i64 = null,
+    /// Reject the read if an owning shard has a different active schema epoch.
+    schema_version: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "fields", "fields", false },
+        .{ "conditions", "conditions", true },
+        .{ "from", "from", true },
+        .{ "to", "to", true },
+        .{ "limit", "limit", true },
+        .{ "schema_version", "schema_version", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("fields");
+        try jw.write(self.fields);
+        if (self.conditions) |value| {
+            try jw.objectField("conditions");
+            try jw.write(value);
+        }
+        if (self.from) |value| {
+            try jw.objectField("from");
+            try jw.write(value);
+        }
+        if (self.to) |value| {
+            try jw.objectField("to");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.schema_version) |value| {
+            try jw.objectField("schema_version");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Bounded request to list table repair issues.
 pub const RepairIssueListRequest = struct {
     /// Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
@@ -12147,6 +12467,7 @@ pub const TransactionConflict = struct {
     key: []const u8,
     /// Human-readable conflict description.
     message: []const u8,
+    reason: ?RelationalConstraintConflictReason = null,
     /// Stable machine-readable conflict classification.
     kind: []const u8,
     /// Whether retrying the transaction may succeed without changing its writes.
@@ -12166,6 +12487,7 @@ pub const TransactionConflict = struct {
         .{ "table", "table", false },
         .{ "key", "key", false },
         .{ "message", "message", false },
+        .{ "reason", "reason", true },
         .{ "kind", "kind", false },
         .{ "retryable", "retryable", false },
         .{ "retry_after_ms", "retry_after_ms", true },
@@ -12191,6 +12513,10 @@ pub const TransactionConflict = struct {
         try jw.write(self.key);
         try jw.objectField("message");
         try jw.write(self.message);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
         try jw.objectField("kind");
         try jw.write(self.kind);
         try jw.objectField("retryable");

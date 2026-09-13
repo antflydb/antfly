@@ -27,6 +27,11 @@ comptime {
     _ = @import("db/relational_index_records.zig");
     _ = @import("db/relational_index_jobs.zig");
     _ = @import("db/relational_constraint_jobs.zig");
+    _ = @import("db/relational_integrity.zig");
+    _ = @import("db/relational_integrity_catalog.zig");
+    _ = @import("db/relational_integrity_integration_test.zig");
+    _ = @import("db/relational_integrity_range.zig");
+    _ = @import("db/relational_integrity_activation.zig");
     _ = @import("db/relational_index_gc.zig");
     _ = @import("db/relational_predicate.zig");
     _ = @import("admission_waiter.zig");

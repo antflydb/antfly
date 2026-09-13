@@ -294,6 +294,9 @@ from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
 from .followup_step_config import FollowupStepConfig
 from .foreign_column import ForeignColumn
+from .foreign_key_action import ForeignKeyAction
+from .foreign_key_match import ForeignKeyMatch
+from .foreign_key_timing import ForeignKeyTiming
 from .foreign_source import ForeignSource
 from .foreign_source_type import ForeignSourceType
 from .full_text_artifact_index_source import FullTextArtifactIndexSource
@@ -814,10 +817,25 @@ from .reauthorize_table_destinations_response_200_status import ReauthorizeTable
 from .regexp_query import RegexpQuery
 from .relational_check_constraint import RelationalCheckConstraint
 from .relational_comparison_op import RelationalComparisonOp
+from .relational_constraint_activation_phase import RelationalConstraintActivationPhase
+from .relational_constraint_conflict_reason import RelationalConstraintConflictReason
+from .relational_constraint_range_status import RelationalConstraintRangeStatus
+from .relational_constraint_status import RelationalConstraintStatus
+from .relational_constraint_status_coverage_kind import RelationalConstraintStatusCoverageKind
+from .relational_constraint_validation_state import RelationalConstraintValidationState
+from .relational_foreign_key_constraint import RelationalForeignKeyConstraint
 from .relational_index_definition import RelationalIndexDefinition
 from .relational_index_key import RelationalIndexKey
 from .relational_index_key_direction import RelationalIndexKeyDirection
 from .relational_index_key_nulls import RelationalIndexKeyNulls
+from .relational_row import RelationalRow
+from .relational_row_condition import RelationalRowCondition
+from .relational_row_mutation import RelationalRowMutation
+from .relational_row_mutation_request import RelationalRowMutationRequest
+from .relational_row_mutation_row import RelationalRowMutationRow
+from .relational_row_query_request import RelationalRowQueryRequest
+from .relational_row_row import RelationalRowRow
+from .relational_unique_constraint import RelationalUniqueConstraint
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
 from .repair_run_request_control import RepairRunRequestControl
@@ -1315,6 +1333,9 @@ __all__ = (
     "FilterSpecOperator",
     "FollowupStepConfig",
     "ForeignColumn",
+    "ForeignKeyAction",
+    "ForeignKeyMatch",
+    "ForeignKeyTiming",
     "ForeignSource",
     "ForeignSourceType",
     "FullTextArtifactIndexSource",
@@ -1831,10 +1852,25 @@ __all__ = (
     "RegexpQuery",
     "RelationalCheckConstraint",
     "RelationalComparisonOp",
+    "RelationalConstraintActivationPhase",
+    "RelationalConstraintConflictReason",
+    "RelationalConstraintRangeStatus",
+    "RelationalConstraintStatus",
+    "RelationalConstraintStatusCoverageKind",
+    "RelationalConstraintValidationState",
+    "RelationalForeignKeyConstraint",
     "RelationalIndexDefinition",
     "RelationalIndexKey",
     "RelationalIndexKeyDirection",
     "RelationalIndexKeyNulls",
+    "RelationalRow",
+    "RelationalRowCondition",
+    "RelationalRowMutation",
+    "RelationalRowMutationRequest",
+    "RelationalRowMutationRow",
+    "RelationalRowQueryRequest",
+    "RelationalRowRow",
+    "RelationalUniqueConstraint",
     "RepairIssueListRequest",
     "RepairRunRequest",
     "RepairRunRequestControl",

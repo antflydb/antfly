@@ -468,6 +468,15 @@ test "portable backup namespace seeks preserve adjacent binary and legacy keys" 
 }
 
 fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput) !void {
+    // A table-local portable stream cannot prove cross-table FK coverage or
+    // relocate globally routed claims. Do not silently export declarations
+    // while dropping their enforcement records. Native coordinated snapshots
+    // retain these records; portable support needs its distributed barrier.
+    const integrity_catalog = scan.get(@import("db/relational_integrity_catalog.zig").key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (integrity_catalog != null) return error.CoordinatedConstraintPortableBackupUnsupported;
     if (out.stats) |stats| stats.snapshot_passes += 1;
     const backup_id = [_]u8{0} ** 16; // zero UUID for now
     try out.writeHeader(.{
@@ -1724,6 +1733,7 @@ pub fn validateCompleteDatabaseImageAlloc(alloc: Allocator, store: *DocStore) !v
                 else => return error.InvalidBackupRequest,
             };
             defer public_schema.deinit(alloc);
+            if (public_schema.unique_constraints != null or public_schema.foreign_keys != null) return error.CoordinatedConstraintPortableBackupUnsupported;
             const derived = public_table_schema.deriveRuntimeTableSchema(alloc, public_schema) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidBackupRequest,
@@ -2693,6 +2703,7 @@ fn validateMetadataEntries(
                 error.OutOfMemory => return err,
                 else => return error.InvalidMetadataBatch,
             };
+            if (archive.active_public_validator.?.schema.unique_constraints != null or archive.active_public_validator.?.schema.foreign_keys != null) return error.CoordinatedConstraintPortableBackupUnsupported;
             var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
             std.crypto.hash.Blake3.hash(entry.value, &digest, .{});
             archive.active_public_digest = digest;
@@ -2711,6 +2722,7 @@ fn validateMetadataEntries(
                 return error.InvalidMetadataBatch;
             }
             defer validator.deinit(alloc);
+            if (validator.schema.unique_constraints != null or validator.schema.foreign_keys != null) return error.CoordinatedConstraintPortableBackupUnsupported;
             if (archive.public_validators.contains(key_version)) return error.InvalidMetadataBatch;
             const ref = try archive.retainSchema(alloc, entry.value);
             try archive.public_validators.putNoClobber(alloc, key_version, ref);

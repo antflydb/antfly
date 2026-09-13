@@ -2614,7 +2614,7 @@ pub const BoundTableReadSource = struct {
         var result = (try self.reads.lookupWithConsistency(alloc, self.db, key, opts, consistency)) orelse return null;
         defer result.deinit(alloc);
 
-        return try controlledLookupResponseAlloc(alloc, result.json, try self.db.getTimestamp(alloc, key), opts);
+        return try controlledLookupResponseAlloc(alloc, result.json, if (integrityLookupMode(opts)) 0 else try self.db.getTimestamp(alloc, key), opts);
     }
 
     fn scan(
@@ -6020,6 +6020,7 @@ pub const HostedProvisionedTableReadSource = struct {
         const Capture = struct {
             alloc: std.mem.Allocator,
             bytes: std.ArrayListUnmanaged(u8) = .empty,
+            max_bytes: usize = std.math.maxInt(usize),
 
             fn sink(state: *@This()) ScanStreamSink {
                 return .{ .context = state, .start_fn = start, .write_fn = write };
@@ -6029,10 +6030,11 @@ pub const HostedProvisionedTableReadSource = struct {
 
             fn write(raw: ?*anyopaque, bytes: []const u8) anyerror!void {
                 const state: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+                if (bytes.len > state.max_bytes -| state.bytes.items.len) return error.RelationalRowsOutputBudgetExceeded;
                 try state.bytes.appendSlice(state.alloc, bytes);
             }
         };
-        var capture = Capture{ .alloc = alloc };
+        var capture = Capture{ .alloc = alloc, .max_bytes = if (opts.relational_query_json.len == 0) std.math.maxInt(usize) else 16 * 1024 * 1024 };
         defer capture.bytes.deinit(alloc);
         if (!(try scanStream(ptr, alloc, table_name, from_key, to_key, opts, consistency, capture.sink())))
             return null;
@@ -10990,7 +10992,7 @@ fn lookupLocal(
     var result = (try reads.lookupWithConsistency(alloc, &db, key, opts, consistency)) orelse return null;
     defer result.deinit(alloc);
     try checkLookupOptionsActive(opts);
-    const version = try db.getTimestamp(alloc, key);
+    const version = if (integrityLookupMode(opts)) 0 else try db.getTimestamp(alloc, key);
     try checkLookupOptionsActive(opts);
     return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
 }
@@ -11033,7 +11035,7 @@ fn lookupProvisionedLocal(
             var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
             var result = (try reads.lookupWithConsistency(alloc, lease.db, key, opts, consistency)) orelse return null;
             defer result.deinit(alloc);
-            const version = try lease.db.getTimestamp(alloc, key);
+            const version = if (integrityLookupMode(opts)) 0 else try lease.db.getTimestamp(alloc, key);
             try checkLookupOptionsActive(opts);
             return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
         }
@@ -11051,7 +11053,7 @@ fn lookupProvisionedLocal(
         var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
         var result = (try reads.lookupWithConsistency(alloc, lease.db, key, opts, consistency)) orelse return null;
         defer result.deinit(alloc);
-        const version = try lease.db.getTimestamp(alloc, key);
+        const version = if (integrityLookupMode(opts)) 0 else try lease.db.getTimestamp(alloc, key);
         try checkLookupOptionsActive(opts);
         return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
     }
@@ -11071,7 +11073,7 @@ fn lookupProvisionedLocal(
     const reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     var result = (try reads.lookupWithConsistency(alloc, &db, key, opts, consistency)) orelse return null;
     defer result.deinit(alloc);
-    const version = try db.getTimestamp(alloc, key);
+    const version = if (integrityLookupMode(opts)) 0 else try db.getTimestamp(alloc, key);
     try checkLookupOptionsActive(opts);
     return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
 }
@@ -18994,7 +18996,7 @@ fn lookupRemote(
         .leader_lease => "leader_lease",
         .read_index => "read_index",
     };
-    var result = try client.fetchGroupLookupWithControl(
+    var result = try client.fetchGroupLookupWithMode(
         base_uri,
         group_id,
         table_name,
@@ -19003,6 +19005,10 @@ fn lookupRemote(
         read_consistency,
         timeout_ms,
         cancellation,
+        opts.relational_integrity_catalog,
+        opts.relational_integrity_action,
+        opts.relational_integrity_jobs_json,
+        opts.relational_activation_json,
     );
     defer result.deinit(alloc);
     try checkLookupOptionsActive(opts);
@@ -19012,6 +19018,10 @@ fn lookupRemote(
         if (result.version) |version| try std.fmt.parseUnsigned(u64, version, 10) else 0,
         opts,
     );
+}
+
+fn integrityLookupMode(opts: db_mod.types.LookupOptions) bool {
+    return opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_activation_json.len != 0;
 }
 
 const RemoteDocumentArtifactManifest = struct {
@@ -19752,6 +19762,12 @@ fn encodeScanRequest(
     if (opts.include_content_hashes) {
         try appendJsonFieldBool(alloc, &out, &first, "_include_content_hashes", true);
     }
+    if (opts.relational_query_json.len != 0) {
+        try appendJsonFieldName(alloc, &out, &first, "_relational_query");
+        try out.appendSlice(alloc, opts.relational_query_json);
+        try appendJsonFieldBool(alloc, &out, &first, "exclusive_to", opts.exclusive_to);
+        try appendJsonFieldBool(alloc, &out, &first, "inclusive_from", opts.inclusive_from);
+    }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
@@ -19772,6 +19788,22 @@ test "internal scan content hash mode round trips without public document fields
     var public_parsed = try http_route_helpers.parseScanKeysRequest(std.testing.allocator, body);
     defer public_parsed.deinit(std.testing.allocator);
     try std.testing.expect(!public_parsed.opts.include_content_hashes);
+}
+
+test "relational row query internal forwarding retains exact operands and bounds" {
+    const alloc = std.testing.allocator;
+    const query =
+        \\{"fields":[],"conditions":[{"column":"id","op":"eq","value":9007199254740993}],"schema_version":4}
+    ;
+    const body = try encodeScanRequest(alloc, "a", "z", .{ .relational_query_json = query, .exclusive_to = true, .limit = 4, .include_documents = true });
+    defer alloc.free(body);
+    var parsed = try http_route_helpers.parseInternalScanKeysRequest(alloc, body);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualStrings(query, parsed.opts.relational_query_json);
+    try std.testing.expect(parsed.opts.exclusive_to and parsed.opts.include_documents);
+    var public = try http_route_helpers.parseScanKeysRequest(alloc, body);
+    defer public.deinit(alloc);
+    try std.testing.expectEqualStrings("", public.opts.relational_query_json);
 }
 
 fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
@@ -22185,6 +22217,7 @@ fn scanNdjsonWithConsistencyAlloc(
 
         fn visit(raw_context: ?*anyopaque, entry: db_mod.types.ScanVisitEntry) anyerror!void {
             const visitor: *@This() = @ptrCast(@alignCast(raw_context orelse return error.InvalidArgument));
+            if (entry.relational_schema_version) |version| return appendRelationalScanLine(visitor.alloc, &visitor.out, entry, version);
             try appendScanLine(
                 visitor.alloc,
                 &visitor.out,
@@ -22222,7 +22255,9 @@ fn scanNdjsonWithConsistencyToSink(
         fn visit(raw_context: ?*anyopaque, entry: db_mod.types.ScanVisitEntry) anyerror!void {
             const visitor: *@This() = @ptrCast(@alignCast(raw_context orelse return error.InvalidArgument));
             visitor.line.clearRetainingCapacity();
-            try appendScanLine(
+            if (entry.relational_schema_version) |version| {
+                try appendRelationalScanLine(visitor.alloc, &visitor.line, entry, version);
+            } else try appendScanLine(
                 visitor.alloc,
                 &visitor.line,
                 entry.id,
@@ -22241,6 +22276,16 @@ fn scanNdjsonWithConsistencyToSink(
         .context = &visitor,
         .visit = NdjsonVisitor.visit,
     });
+}
+
+fn appendRelationalScanLine(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: db_mod.types.ScanVisitEntry, schema_version: u32) !void {
+    const projected = entry.document_json orelse "{}";
+    if (out.items.len +| projected.len +| entry.id.len > 16 * 1024 * 1024) return error.RelationalRowsOutputBudgetExceeded;
+    const header = try std.fmt.allocPrint(alloc, "{{\"_id\":{f},\"version\":\"{d}\",\"schema_version\":{d},\"row\":", .{ std.json.fmt(entry.id, .{}), entry.hash, schema_version });
+    defer alloc.free(header);
+    try out.appendSlice(alloc, header);
+    try out.appendSlice(alloc, projected);
+    try out.appendSlice(alloc, "}\n");
 }
 
 fn appendScanLine(
@@ -22450,6 +22495,39 @@ test "bound table read source scans keys as ndjson" {
     try std.testing.expectEqual(@as(usize, 2), rows.len);
     try std.testing.expectEqualStrings("doc:a", rows[0]._id);
     try std.testing.expectEqualStrings("alpha", rows[0].title);
+}
+
+test "relational row query executes typed projection through routed read contract" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("antfly-relational-public-read");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"id\":9007199254740992,\"name\":\"first\"}" },
+        .{ .key = "b", .value = "{\"id\":9007199254740993,\"name\":\"second\"}" },
+    }, .timestamp_ns = 9007199254740994 });
+    var source = BoundTableReadSource.init("rows", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var request = try http_route_helpers.parseRelationalRowQueryRequest(alloc,
+        \\{"fields":["name"],"conditions":[{"column":"id","op":"gt","value":"9007199254740992"}],"schema_version":1,"limit":1}
+    );
+    defer request.deinit(alloc);
+    var result = (try source.source().scan(alloc, "rows", request.from, request.to, request.opts, .read_index)).?;
+    defer result.deinit(alloc);
+    const rows = try parseNdjsonTestRowsAlloc(struct { _id: []const u8, row: struct { name: []const u8 }, version: []const u8, schema_version: u32 }, alloc, result.ndjson);
+    defer alloc.free(rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("b", rows[0]._id);
+    try std.testing.expectEqualStrings("second", rows[0].row.name);
+    try std.testing.expectEqualStrings("9007199254740994", rows[0].version);
+    request.opts.fields = &.{"id"};
+    request.opts.filter_query_json = "{\"term\":{\"name\":\"first\"}}";
+    var filtered = (try source.source().scan(alloc, "rows", "", "", request.opts, .read_index)).?;
+    defer filtered.deinit(alloc);
+    try std.testing.expectEqualStrings("", filtered.ndjson);
 }
 
 test "bound table read source formats query responses" {

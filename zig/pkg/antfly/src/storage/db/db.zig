@@ -8694,6 +8694,8 @@ pub const DB = struct {
         // batchInternal repeats this check under the mutation lock, which is
         // the correctness fence if another caller advances the marker here.
         if (try self.raftEntryAlreadyApplied(identity)) return;
+        if (req.split_replication != null or req.split_checkpoint != null or req.split_transition != null)
+            try self.requireSupportedRelationalTopology();
         if (req.split_transition) |transition| {
             if (transition.kind != .finalize) return error.InvalidBatchRequest;
             return self.applyRaftSplitFinalization(transition, identity);
@@ -8722,6 +8724,10 @@ pub const DB = struct {
         defer snapshot_mutation.release();
         lockApply(self);
         defer self.core.unlockApply();
+        try self.requireSupportedRelationalTopology();
+        var transaction_manager = try self.core.initTxnManager();
+        defer transaction_manager.deinit();
+        if (try transaction_manager.hasSchemaLeases()) return error.SchemaInUse;
         switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
             .already_applied => return,
             .apply => {},
@@ -9293,6 +9299,11 @@ pub const DB = struct {
         };
 
         const effective_req: types.BatchRequest = .{
+            .relational_schema_version = req.relational_schema_version,
+            .relational_integrity_generation_set = req.relational_integrity_generation_set,
+            .integrity = req.integrity,
+            .integrity_commands = req.integrity_commands,
+            .relational_activation = req.relational_activation,
             .writes = effective_ops.writes,
             .deletes = effective_ops.deletes,
             .graph_writes = effective_graph_writes,
@@ -9316,6 +9327,19 @@ pub const DB = struct {
         const transaction_schema_binding = if (opts.transaction_resolution) |resolution| resolution.schema_binding else null;
         var request_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, transaction_schema_binding);
         defer if (request_schema_view) |*view| view.release();
+        if (opts.transaction_resolution == null) {
+            for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key)) return error.InvalidIntegrityOperation;
+            for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key)) return error.InvalidIntegrityOperation;
+            if (hasCoordinatedConstraints(request_schema_view) and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
+                return error.ForeignKeyCoordinationRequired;
+        }
+        if (req.relational_schema_version) |version| {
+            const view = request_schema_view orelse return error.InvalidRelationalRowsRequest;
+            if (view.storageMode() != .relational) return error.InvalidRelationalRowsRequest;
+            if (view.version() != version) return error.PreparedGenerationChanged;
+        }
+        // Integrity effects may only enter through durable transaction prepare.
+        if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null) return error.InvalidIntegrityOperation;
         var relational_index_snapshot = self.core.relational_indexes.acquire();
         defer if (relational_index_snapshot) |*index_snapshot| index_snapshot.deinit();
         const index_ready = try preparation_alloc.alloc(bool, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan.boundIndexes().len else 0);
@@ -21188,8 +21212,228 @@ pub const DB = struct {
         return try self.lookup(alloc, key, opts);
     }
 
+    fn lookupRelationalIntegrityCatalog(self: *DB, alloc: Allocator) !?types.LookupResult {
+        const catalog_mod = @import("relational_integrity_catalog.zig");
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var pinned = self.core.acquireSchemaView() orelse return error.InvalidRelationalRowsRequest;
+        defer pinned.release();
+        if (pinned.storageMode() != .relational) return error.InvalidRelationalRowsRequest;
+        const bytes = (try self.core.getStoreValue(alloc, catalog_mod.key)) orelse return null;
+        defer alloc.free(bytes);
+        var catalog = try catalog_mod.decode(alloc, bytes);
+        defer catalog.deinit();
+        if (catalog.schema_version != pinned.version()) return error.IntegrityCatalogChanged;
+        const incarnation = try catalog_mod.incarnationFromTableId(self.core.identity_namespace.table_id);
+        if (!std.mem.eql(u8, &incarnation, &catalog.incarnation)) return error.IntegrityCatalogIncarnationMismatch;
+        const layout = try schema_mod.serializeSchema(alloc, pinned.tableSchema().*);
+        defer alloc.free(layout);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(layout, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &catalog.schema_digest)) return error.IntegrityCatalogChanged;
+        const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, bytes);
+        return .{ .json = try std.fmt.allocPrint(alloc, "{{\"catalog\":{f},\"schema_version\":{d},\"table_id\":\"{d}\"}}", .{
+            std.json.fmt(encoded, .{}), pinned.version(), self.core.identity_namespace.table_id,
+        }) };
+    }
+
+    fn lookupRelationalIntegrityAction(self: *DB, alloc: Allocator, routing: []const u8) !?types.LookupResult {
+        const integrity = @import("relational_integrity.zig");
+        if (routing.len != 32) return error.InvalidIntegrityAddress;
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        if (!self.core.byteRange().contains(routing)) return error.KeyOutOfRange;
+        var read = try integrity.CurrentView.init(self.core.store);
+        defer read.deinit();
+        var prefix: [integrity.namespace.len + 1 + 32]u8 = undefined;
+        @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);
+        prefix[integrity.namespace.len] = @intFromEnum(integrity.Kind.job);
+        @memcpy(prefix[integrity.namespace.len + 1 ..], routing);
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const first = (try cursor.seekAtOrAfter(&prefix)) orelse return null;
+        if (!std.mem.startsWith(u8, first.key, &prefix)) return null;
+        const address = (try integrity.parseKey(first.key)).address;
+        const action_id = (try integrity.Job.decode(first.key, first.value)).action_id;
+        if (try cursor.next()) |next| if (std.mem.startsWith(u8, next.key, &prefix)) return error.IntegrityAddressMismatch;
+        var page = try integrity.actionPageWithBudget(alloc, self.backend_runtime.io(), &read, address, action_id, .{ .rows = 128 });
+        defer page.deinit();
+        const Response = struct {
+            address: integrity.Address,
+            page: *const integrity.ActionPage,
+
+            pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+                try @import("relational_integrity_json.zig").write(.{
+                    .address = response.address,
+                    .claim = response.page.claim,
+                    .job = response.page.job,
+                    .references = response.page.references,
+                    .complete = response.page.complete,
+                    .next_cursor = response.page.next_cursor,
+                }, stream);
+            }
+        };
+        return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .address = address, .page = &page }, .{}) };
+    }
+
+    fn lookupRelationalIntegrityJobs(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
+        const integrity = @import("relational_integrity.zig");
+        if (request_json.len > 4096) return error.InvalidIntegrityBudget;
+        var request = try std.json.parseFromSlice(struct {
+            kind: enum { discover, references } = .discover,
+            address: ?integrity.Address = null,
+            after: ?[]const u8 = null,
+            limit: u32 = 16,
+        }, alloc, request_json, .{ .allocate = .alloc_always });
+        defer request.deinit();
+        if (request.value.limit == 0 or request.value.limit > 128) return error.InvalidIntegrityBudget;
+        if (request.value.kind == .references) return self.lookupRelationalIntegrityReferences(alloc, request.value.address orelse return error.InvalidIntegrityAddress, request.value.after, request.value.limit);
+        if (request.value.address != null) return error.InvalidIntegrityAddress;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const owned = scratch.allocator();
+        const after = if (request.value.after) |encoded| after: {
+            const decoded = try owned.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(encoded));
+            try std.base64.standard.Decoder.decode(decoded, encoded);
+            if ((try integrity.parseKey(decoded)).kind != .job) return error.InvalidIntegrityKey;
+            break :after decoded;
+        } else null;
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        const range = self.core.byteRange();
+        var read = try integrity.CurrentView.init(self.core.store);
+        defer read.deinit();
+        const prefix = integrity.namespace ++ &[_]u8{@intFromEnum(integrity.Kind.job)};
+        const lower = try std.mem.concat(owned, u8, &.{ prefix, range.start });
+        const start = if (after) |key| if (std.mem.order(u8, key, lower) == .gt) key else lower else lower;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(start);
+        if (entry) |item| if (after) |key| if (std.mem.eql(u8, item.key, key)) {
+            entry = try cursor.next();
+        };
+        const Item = struct { address: integrity.Address, action_id: integrity.Generation };
+        var jobs: std.ArrayList(Item) = .empty;
+        var last_key: ?[]const u8 = null;
+        const started = platform_time.monotonicNs();
+        var more = false;
+        while (entry) |item| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, item.key, prefix)) break;
+            const parsed = try integrity.parseKey(item.key);
+            if (!range.contains(&parsed.address.routing)) break;
+            if (jobs.items.len >= request.value.limit or (jobs.items.len != 0 and platform_time.monotonicNs() -| started >= 5 * std.time.ns_per_ms)) {
+                more = true;
+                break;
+            }
+            if (self.backend_runtime.io()) |io| try io.checkCancel();
+            const job = try integrity.Job.decode(item.key, item.value);
+            try jobs.append(owned, .{ .address = parsed.address, .action_id = job.action_id });
+            last_key = try owned.dupe(u8, item.key);
+        }
+        const next: ?[]const u8 = if (more) next: {
+            const raw = last_key orelse return error.InvalidIntegrityBudget;
+            const encoded = try owned.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len));
+            break :next std.base64.standard.Encoder.encode(encoded, raw);
+        } else null;
+        const Response = struct {
+            jobs: []const Item,
+            next: ?[]const u8,
+
+            pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+                try stream.beginObject();
+                try stream.objectField("jobs");
+                try @import("relational_integrity_json.zig").write(response.jobs, stream);
+                try stream.objectField("next");
+                try stream.write(response.next);
+                try stream.endObject();
+            }
+        };
+        return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .jobs = jobs.items, .next = next }, .{}) };
+    }
+
+    fn lookupRelationalIntegrityReferences(self: *DB, alloc: Allocator, address: @import("relational_integrity.zig").Address, after: ?[]const u8, limit: u32) !?types.LookupResult {
+        const integrity = @import("relational_integrity.zig");
+        const prefix = address.referencePrefix();
+        _ = try integrity.parseKey(&address.claimKey());
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const owned = scratch.allocator();
+        const decoded_after = if (after) |encoded| decoded: {
+            const raw = try owned.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(encoded));
+            try std.base64.standard.Decoder.decode(raw, encoded);
+            if ((try integrity.parseKey(raw)).kind != .reference or !std.mem.startsWith(u8, raw, &prefix)) return error.InvalidIntegrityKey;
+            break :decoded raw;
+        } else null;
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        if (!self.core.byteRange().contains(&address.routing)) return error.KeyOutOfRange;
+        var read = try integrity.CurrentView.init(self.core.store);
+        defer read.deinit();
+        const raw_claim = read.get(&address.claimKey()) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const claim = try integrity.Claim.decode(&address.claimKey(), raw_claim);
+        if (claim.state != .live) return error.ForeignKeyActionInProgress;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(decoded_after orelse &prefix);
+        if (entry) |item| if (decoded_after) |key| if (std.mem.eql(u8, key, item.key)) {
+            entry = try cursor.next();
+        };
+        var references: std.ArrayList(integrity.Reference) = .empty;
+        var last_key: ?[]const u8 = null;
+        var more = false;
+        var bytes: usize = 0;
+        const started = platform_time.monotonicNs();
+        while (entry) |item| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, item.key, &prefix)) break;
+            if (references.items.len >= limit or (references.items.len != 0 and platform_time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) or item.value.len > 1024 * 1024 - bytes) {
+                if (references.items.len == 0) return error.IntegrityRecordTooLarge;
+                more = true;
+                break;
+            }
+            if (self.backend_runtime.io()) |io| try io.checkCancel();
+            const copy = try owned.dupe(u8, item.value);
+            try references.append(owned, try integrity.Reference.decode(item.key, copy));
+            last_key = try owned.dupe(u8, item.key);
+            bytes += copy.len;
+        }
+        const next: ?[]const u8 = if (more) next: {
+            const raw = last_key orelse return error.InvalidIntegrityBudget;
+            const encoded = try owned.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len));
+            break :next std.base64.standard.Encoder.encode(encoded, raw);
+        } else null;
+        const Response = struct {
+            address: integrity.Address,
+            claim: integrity.Claim,
+            references: []const integrity.Reference,
+            next: ?[]const u8,
+
+            pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+                try stream.beginObject();
+                try stream.objectField("address");
+                try @import("relational_integrity_json.zig").write(response.address, stream);
+                try stream.objectField("claim");
+                try @import("relational_integrity_json.zig").write(response.claim, stream);
+                try stream.objectField("references");
+                try @import("relational_integrity_json.zig").write(response.references, stream);
+                try stream.objectField("next");
+                try stream.write(response.next);
+                try stream.endObject();
+            }
+        };
+        return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .address = address, .claim = claim, .references = references.items, .next = next }, .{}) };
+    }
+
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         try checkLookupOptionsActive(opts);
+        if (opts.relational_activation_json.len != 0) return self.lookupRelationalActivation(alloc, opts.relational_activation_json);
+        if (opts.relational_integrity_catalog) return self.lookupRelationalIntegrityCatalog(alloc);
+        if (opts.relational_integrity_action) return self.lookupRelationalIntegrityAction(alloc, key);
+        if (opts.relational_integrity_jobs_json.len != 0) return self.lookupRelationalIntegrityJobs(alloc, opts.relational_integrity_jobs_json);
         // Pin the schema once and keep the physical row intact through TTL and
         // projection. Relational rows carry their timestamp in the authenticated
         // AROW header, so a point read does not need a second store lookup.
@@ -21276,6 +21520,91 @@ pub const DB = struct {
         return .{ .json = stored };
     }
 
+    fn lookupRelationalActivation(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
+        const activation = @import("relational_integrity_activation.zig");
+        const catalog_mod = @import("relational_integrity_catalog.zig");
+        if (request_json.len > 1024) return error.InvalidConstraintActivation;
+        var request = try std.json.parseFromSlice(struct { mode: enum { status, page } = .status, max_rows: u32 = 128 }, alloc, request_json, .{});
+        defer request.deinit();
+        if (request.value.max_rows == 0 or request.value.max_rows > 128) return error.InvalidConstraintActivation;
+        if (request.value.mode == .page) {
+            var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+            defer view.release();
+            const public_schema = (view.validator() orelse return error.ConstraintNotFound).schema;
+            var fields = std.ArrayList([]const u8).empty;
+            defer fields.deinit(alloc);
+            var selected = std.StringHashMapUnmanaged(void).empty;
+            defer selected.deinit(alloc);
+            // Backfill derives only constraint tuples, not replacement rows.
+            // Project the union of their columns and preserve source versions
+            // rather than materializing unrelated potentially large payloads.
+            if (public_schema.unique_constraints) |constraints| for (constraints.value) |constraint| {
+                for (constraint.columns) |column| if (!(try selected.getOrPut(alloc, column)).found_existing) try fields.append(alloc, column);
+            };
+            if (public_schema.foreign_keys) |constraints| for (constraints.value) |constraint| {
+                for (constraint.child_columns) |column| if (!(try selected.getOrPut(alloc, column)).found_existing) try fields.append(alloc, column);
+            };
+            // Reserve half the native admission credits for encoded tuple and
+            // existing claim bytes. The worker can shrink further when actual
+            // values exceed this declaration-only estimate.
+            const unique_count = if (public_schema.unique_constraints) |values| values.value.len else 0;
+            const foreign_count = if (public_schema.foreign_keys) |values| values.value.len else 0;
+            const per_row = @max(@as(usize, 1), @max(unique_count, foreign_count));
+            const declaration_limit = @max(@as(usize, 1), @import("relational_integrity.zig").max_commands / (2 * per_row));
+            var page = (try activation.Page.prepare(alloc, self.backend_runtime.io(), self.core, fields.items, .{ .rows = @min(request.value.max_rows, declaration_limit), .output_bytes = 1024 * 1024 })) orelse return null;
+            defer page.deinit();
+            if (page.progress.schema_version != view.version()) return error.PreparedGenerationChanged;
+            const Row = struct { key: []const u8, json: []const u8, version: u64 };
+            const rows = try alloc.alloc(Row, page.rows.rows.len);
+            defer alloc.free(rows);
+            for (rows, page.rows.rows) |*row, source| row.* = .{ .key = source.key, .json = source.json, .version = source.version };
+            const Response = struct {
+                rows: []const Row,
+                command: activation.Command,
+                phase: activation.Phase,
+
+                pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+                    try @import("relational_integrity_json.zig").write(response, stream);
+                }
+            };
+            return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .rows = rows, .command = page.command, .phase = page.phase }, .{}) };
+        }
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        var read = try @import("relational_integrity.zig").CurrentView.init(self.core.store);
+        defer read.deinit();
+        const raw_catalog = read.get(catalog_mod.key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        var catalog = try catalog_mod.decode(alloc, raw_catalog);
+        defer catalog.deinit();
+        const progress = try activation.status(&read, catalog);
+        const range = self.core.byteRange();
+        const Response = struct {
+            progress: activation.Progress,
+            catalog: *const catalog_mod.Catalog,
+            range: types.ByteRange,
+
+            pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+                try @import("relational_integrity_json.zig").write(.{
+                    .schema_version = response.progress.schema_version,
+                    .schema_digest = response.catalog.schema_digest,
+                    .generation_set = response.progress.generation_set,
+                    .owner = response.progress.owner,
+                    .range_start = response.range.start,
+                    .range_end = response.range.end,
+                    .unique_covered = response.progress.readyForReferences(),
+                    .state = response.progress.state,
+                    .phase = response.progress.phase,
+                    .rows_scanned = response.progress.rows_scanned,
+                    .failure = response.progress.failure,
+                }, stream);
+            }
+        };
+        return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .progress = progress, .catalog = &catalog, .range = range }, .{}) };
+    }
+
     pub fn getTimestamp(self: *DB, alloc: Allocator, key: []const u8) !u64 {
         if (internal_keys.isInternalUserKey(key)) return 0;
         return try self.core.readTimestamp(alloc, key);
@@ -21357,6 +21686,7 @@ pub const DB = struct {
             try self.core.setSplitState(null);
             return;
         }
+        try self.requireSupportedRelationalTopology();
         try self.core.setSplitState(.{
             .phase = state.?.phase,
             .split_key = state.?.split_key,
@@ -21535,6 +21865,7 @@ pub const DB = struct {
     ) !bool {
         lockAtomicWithBackoff(&self.generation_replace_mutex);
         defer self.generation_replace_mutex.unlock();
+        try self.requireSupportedRelationalTopology();
 
         if (marker.transition_id == 0 or marker.attempt_epoch == 0 or
             marker.source_group_id == 0 or marker.destination_group_id == 0 or
@@ -21848,6 +22179,14 @@ pub const DB = struct {
         return shadow.indexes_path;
     }
 
+    fn requireSupportedRelationalTopology(self: *DB) !void {
+        var view = self.core.acquireSchemaView();
+        defer if (view) |*pinned| pinned.release();
+        // Initial physical transfer understands routed integrity records, but
+        // the online delta/intent handoff does not yet carry those namespaces.
+        if (hasCoordinatedConstraints(view)) return error.CoordinatedConstraintTopologyUnsupported;
+    }
+
     pub fn split(
         self: *DB,
         curr_range: types.ByteRange,
@@ -21873,8 +22212,14 @@ pub const DB = struct {
         }
         defer self.core.unlockApply();
 
+        try self.requireSupportedRelationalTopology();
         if (!byteRangesEqual(self.core.byteRange(), curr_range)) return error.KeyOutOfRange;
         if (!curr_range.contains(split_key)) return error.KeyOutOfRange;
+        // Shared FK guards and private metadata intents cannot move owners
+        // midway through a durable decision. Drain them before range transfer.
+        var transaction_manager = try self.core.initTxnManager();
+        defer transaction_manager.deinit();
+        if (try transaction_manager.hasSchemaLeases()) return error.SchemaInUse;
 
         const range2 = types.ByteRange{
             .start = split_key,
@@ -22465,6 +22810,9 @@ pub const DB = struct {
             self.core.unlockApply();
         };
 
+        try self.requireSupportedRelationalTopology();
+        try donor.requireSupportedRelationalTopology();
+
         const store_lower = try documentRangeLowerAlloc(self.alloc, byte_range.start);
         defer self.alloc.free(store_lower);
         const store_upper = if (byte_range.end.len > 0)
@@ -22514,6 +22862,13 @@ pub const DB = struct {
         try self.core.syncStore(true);
     }
 
+    const RestorePurpose = union(enum) {
+        historical_table,
+        /// Only the authenticated, whole-generation HA seed installer supplies
+        /// this identity. Never derived from a request or OpenOptions flag.
+        coherent_ha_seed: doc_identity.Namespace,
+    };
+
     fn restoreSnapshotStoreTo(
         alloc: Allocator,
         snapshot_root: []const u8,
@@ -22523,6 +22878,7 @@ pub const DB = struct {
         restore_io: ?Io,
         cancellation: types.CancellationToken,
         native_manifest: ?*const native_backup.Manifest,
+        purpose: RestorePurpose,
     ) !void {
         try cancellation.check();
         const shared_io = restore_io orelse if (opts.backend_runtime) |runtime| runtime.filesystemIo() else null;
@@ -22569,6 +22925,27 @@ pub const DB = struct {
         try cancellation.check();
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
         try validateRestoredIdentityNamespace(&opened_primary.store, opts);
+        // A table-local historical image cannot certify references owned by
+        // other tables at a later cut. Keep the candidate unpublished until a
+        // cluster-coordinated restore/activation barrier is available.
+        const restored_integrity = opened_primary.store.get(alloc, @import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (restored_integrity) |bytes| {
+            defer alloc.free(bytes);
+            var catalog = try @import("relational_integrity_catalog.zig").decode(alloc, bytes);
+            defer catalog.deinit();
+            if (@import("relational_integrity_activation.zig").hasActive(catalog)) switch (purpose) {
+                .historical_table => return error.CoordinatedConstraintRestoreRequired,
+                .coherent_ha_seed => |expected_namespace| {
+                    const stored_namespace = (try doc_identity.loadNamespaceFromStore(&opened_primary.store)) orelse return error.IdentityNamespaceMismatch;
+                    if (!stored_namespace.eql(expected_namespace)) return error.IdentityNamespaceMismatch;
+                    const incarnation = try @import("relational_integrity_catalog.zig").incarnationFromTableId(expected_namespace.table_id);
+                    if (!std.mem.eql(u8, &incarnation, &catalog.incarnation)) return error.IntegrityCatalogIncarnationMismatch;
+                },
+            };
+        }
         if (!streaming_store)
             try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
         // The candidate root owns its identity. Creating it while the staged
@@ -22593,7 +22970,11 @@ pub const DB = struct {
     }
 
     fn restoreSnapshotTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions) !void {
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null, null, .none, null);
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null, null, .none, null, .historical_table);
+        try finishSnapshotRuntimeRepair(alloc, path, opts);
+    }
+
+    fn finishSnapshotRuntimeRepair(alloc: Allocator, path: []const u8, opts: OpenOptions) !void {
         // Graph reverse indexes are derived from stored outgoing edge keys, so
         // restore them after the logical store and derived log are rehydrated.
         var restored = try DB.open(alloc, path, opts);
@@ -22615,6 +22996,28 @@ pub const DB = struct {
         var staged_opts = opts;
         staged_opts.staged_generation = staged_generation;
         try restoreSnapshotTo(alloc, snapshot_root, path, staged_opts);
+    }
+
+    /// Internal HA seed installation only. The caller must have authenticated
+    /// the complete seed topology and every replica artifact before invoking
+    /// this entry point, and must publish the whole seed before serving reads.
+    /// Historical table restore APIs deliberately cannot select this purpose.
+    pub fn restoreCoherentHASeedReplicaToStagedGeneration(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+        expected_namespace: doc_identity.Namespace,
+    ) !void {
+        try staged_generation.validatePath(path);
+        if (expected_namespace.table_id == 0 or opts.prefer_existing_identity_namespace or
+            !(opts.identity_namespace orelse return error.IdentityNamespaceMismatch).eql(expected_namespace))
+            return error.IdentityNamespaceMismatch;
+        var staged_opts = opts;
+        staged_opts.staged_generation = staged_generation;
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, staged_opts, null, null, .none, null, .{ .coherent_ha_seed = expected_namespace });
+        try finishSnapshotRuntimeRepair(alloc, path, staged_opts);
     }
 
     pub fn restoreSnapshotToDeferredRuntimeRepair(
@@ -22689,7 +23092,7 @@ pub const DB = struct {
             generation,
             cancellation,
         );
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, io, cancellation, null);
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, io, cancellation, null, .historical_table);
     }
 
     /// Installs a generation whose declared files were already authenticated
@@ -22760,6 +23163,7 @@ pub const DB = struct {
             io,
             cancellation,
             native_generation.value(),
+            .historical_table,
         );
         var validation_opts = opts;
         validation_opts.open_mode = .query_readonly;
@@ -22845,6 +23249,7 @@ pub const DB = struct {
             io,
             cancellation,
             if (native_generation) |*generation| generation.value() else null,
+            .historical_table,
         );
         if (native_generation) |*generation| {
             try validateInstalledNativeBackupGeneration(staged_generation, alloc, io, path, opts, generation, false);
@@ -23206,7 +23611,7 @@ pub const DB = struct {
             .group_id = identity_state.group_id,
         };
         std.log.warn("recovering incomplete restore import phase=startup", .{});
-        try restoreSnapshotStoreTo(alloc, import_state.snapshot_root, path, opts, identity, io, .none, null);
+        try restoreSnapshotStoreTo(alloc, import_state.snapshot_root, path, opts, identity, io, .none, null, .historical_table);
         return true;
     }
 
@@ -24417,6 +24822,11 @@ pub const DB = struct {
         const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
         var view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (view) |*pinned| pinned.release();
+        for (intents) |intent| {
+            if (isProtectedIntegrityKey(intent.key)) return error.InvalidIntegrityOperation;
+            if (hasCoordinatedConstraints(view) and !isMetadataKey(intent.key)) return error.ForeignKeyCoordinationRequired;
+        }
+        for (predicates) |predicate| if (isProtectedIntegrityKey(predicate.key)) return error.InvalidIntegrityOperation;
         try self.prepareTransactionRows(preparation_alloc, prepared_intents, view);
 
         try self.lockApplyForPortableRuntime();
@@ -24515,18 +24925,21 @@ pub const DB = struct {
         defer predicates.deinit(preparation_alloc);
 
         for (effective_ops.writes) |write| {
+            if (isProtectedIntegrityKey(write.key)) return error.InvalidIntegrityOperation;
             try intents.append(preparation_alloc, .{
                 .key = write.key,
                 .value = write.value,
             });
         }
         for (effective_ops.deletes) |key| {
+            if (isProtectedIntegrityKey(key)) return error.InvalidIntegrityOperation;
             try intents.append(preparation_alloc, .{
                 .key = key,
                 .value = null,
             });
         }
         for (req.predicates) |predicate| {
+            if (isProtectedIntegrityKey(predicate.key)) return error.InvalidIntegrityOperation;
             try predicates.append(preparation_alloc, .{
                 .key = predicate.key,
                 .expected_version = predicate.expected_version,
@@ -24543,13 +24956,90 @@ pub const DB = struct {
         const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
         var prepared_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (prepared_schema_view) |*view| view.release();
+        if (hasCoordinatedConstraints(prepared_schema_view) and
+            (req.relational_schema_version == null or req.relational_integrity_generation_set == null) and
+            (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0)) return error.ForeignKeyCoordinationRequired;
+        if (req.relational_schema_version) |version| {
+            const view = prepared_schema_view orelse return error.InvalidRelationalRowsRequest;
+            if (view.storageMode() != .relational) return error.InvalidRelationalRowsRequest;
+            if (view.version() != version) return error.PreparedGenerationChanged;
+        }
         defer freePreparedIntentRows(preparation_alloc, intents.items);
         try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
+
+        const integrity_catalog_mod = @import("relational_integrity_catalog.zig");
+        var integrity_catalog: ?integrity_catalog_mod.Catalog = null;
+        var integrity_catalog_digest: ?[32]u8 = null;
+        defer if (integrity_catalog) |*catalog| catalog.deinit();
+        if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or hasCoordinatedConstraints(prepared_schema_view)) {
+            const raw_catalog = (try self.core.getStoreValue(preparation_alloc, integrity_catalog_mod.key)) orelse return error.IntegrityCatalogChanged;
+            defer preparation_alloc.free(raw_catalog);
+            integrity_catalog = try integrity_catalog_mod.decode(preparation_alloc, raw_catalog);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(raw_catalog, &digest, .{});
+            integrity_catalog_digest = digest;
+            if (req.relational_integrity_generation_set) |expected| {
+                const actual = @import("relational_integrity_activation.zig").generationSet(integrity_catalog.?);
+                if (!std.mem.eql(u8, &expected, &actual)) return error.IntegrityCatalogChanged;
+            }
+            const view = prepared_schema_view orelse return error.IntegrityCatalogChanged;
+            if (integrity_catalog.?.schema_version != view.version()) return error.PreparedGenerationChanged;
+            const incarnation = try integrity_catalog_mod.incarnationFromTableId(self.core.identity_namespace.table_id);
+            if (!std.mem.eql(u8, &incarnation, &integrity_catalog.?.incarnation)) return error.IntegrityCatalogIncarnationMismatch;
+            for (req.integrity_commands) |command| {
+                const generation = integrity_catalog.?.findGeneration(command.address.generation) orelse return error.IntegrityCatalogChanged;
+                if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
+                if (generation.retired and (command.operation == .establish or command.operation == .attach)) return error.IntegrityCatalogChanged;
+            }
+        }
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
+        const integrity_mod = @import("relational_integrity.zig");
+        const activation_mod = @import("relational_integrity_activation.zig");
+        var integrity_effects: ?integrity_mod.Effects = null;
+        defer if (integrity_effects) |*effects| effects.deinit();
+        if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or integrity_catalog != null) {
+            var integrity_read = try integrity_mod.CurrentView.init(self.core.store);
+            defer integrity_read.deinit();
+            // Layout epochs alone do not fence changes to UNIQUE/FK declarations.
+            // Compare the exact catalog observed during preparation under apply.
+            const current_catalog = integrity_read.get(integrity_catalog_mod.key) catch |err| switch (err) {
+                error.NotFound => return error.IntegrityCatalogChanged,
+                else => return err,
+            };
+            var current_digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(current_catalog, &current_digest, .{});
+            if (!std.mem.eql(u8, &current_digest, &integrity_catalog_digest.?)) return error.IntegrityCatalogChanged;
+            if (req.relational_activation) |command| {
+                // A backfill page changes claims and its durable cursor, never
+                // primary rows. Its observed rows are retained read guards.
+                if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0) return error.InvalidConstraintActivation;
+                if (!self.core.byteRange().contains(command.routing_key)) return error.KeyOutOfRange;
+                const activation = try activation_mod.prepareCommand(preparation_alloc, &integrity_read, integrity_catalog.?, command);
+                try intents.append(preparation_alloc, activation.intent);
+                try predicates.append(preparation_alloc, activation.predicate);
+            } else if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0) {
+                try activation_mod.requireReady(&integrity_read, integrity_catalog.?);
+            }
+            if (req.integrity.len != 0 and req.integrity_commands.len != 0) return error.InvalidIntegrityOperation;
+            const integrity_operations = if (req.integrity_commands.len != 0) operations: {
+                integrity_effects = try integrity_mod.prepare(preparation_alloc, &integrity_read, req.integrity_commands);
+                break :operations integrity_effects.?.operations;
+            } else req.integrity;
+            try integrity_mod.validatePreparedEffects(preparation_alloc, &integrity_read, integrity_operations);
+            for (integrity_operations) |operation| {
+                if (!self.core.byteRange().contains(operation.routing_key)) return error.KeyOutOfRange;
+                const parsed_key = try integrity_mod.parseKey(operation.key);
+                const generation = integrity_catalog.?.findGeneration(parsed_key.address.generation) orelse return error.IntegrityCatalogChanged;
+                if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
+                if (req.integrity_commands.len == 0 and generation.retired and operation.kind != .delete) return error.IntegrityCatalogChanged;
+                try predicates.append(preparation_alloc, integrity_mod.predicate(operation));
+                if (operation.kind != .guard) try intents.append(preparation_alloc, .{ .key = operation.key, .value = operation.value });
+            }
+        }
         try self.validateTransformReadSnapshot(transform_snapshot);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         if (raft_entry) |identity| {
@@ -24579,6 +25069,17 @@ pub const DB = struct {
         else
             null;
         return self.core.acquireSchemaView();
+    }
+
+    fn isProtectedIntegrityKey(key: []const u8) bool {
+        return @import("relational_integrity.zig").isKey(key) or std.mem.eql(u8, key, @import("relational_integrity_catalog.zig").key) or
+            std.mem.eql(u8, key, @import("relational_integrity_activation.zig").key);
+    }
+
+    fn hasCoordinatedConstraints(view: ?schema_registry_mod.SchemaView) bool {
+        const validator = (view orelse return false).validator() orelse return false;
+        return (if (validator.schema.unique_constraints) |constraints| constraints.value.len != 0 else false) or
+            (if (validator.schema.foreign_keys) |constraints| constraints.value.len != 0 else false);
     }
 
     fn validatePreparedSchemaViewLocked(self: *DB, prepared: ?schema_registry_mod.SchemaView) !void {
@@ -34238,6 +34739,7 @@ pub const DB = struct {
                     .id = hash_id,
                     .hash = entry.hash,
                     .content_hash = entry.content_hash,
+                    .relational_schema_version = entry.relational_schema_version,
                 });
             }
         };
@@ -34257,6 +34759,106 @@ pub const DB = struct {
         return .{ .hashes = hashes, .documents = documents };
     }
 
+    fn scanRelationalRowsVisit(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) !void {
+        if (opts.relational_query_json.len > 1024 * 1024 or opts.limit > 4096) return error.InvalidRelationalRowsRequest;
+        const Input = struct {
+            fields: []const []const u8,
+            conditions: []const struct {
+                column: []const u8,
+                op: @import("../relational_index.zig").RelationalCheckOp,
+                value: ?std.json.Value = null,
+                collation: ?[]const u8 = null,
+            } = &.{},
+            schema_version: ?u32 = null,
+        };
+        var parsed = std.json.parseFromSlice(Input, alloc, opts.relational_query_json, .{ .allocate = .alloc_always, .parse_numbers = false, .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidRelationalRowsRequest,
+        };
+        defer parsed.deinit();
+        if (parsed.value.conditions.len > 256 or parsed.value.fields.len > 256) return error.InvalidRelationalRowsRequest;
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        if (view.storageMode() != .relational) return error.RelationalTableRequired;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const conditions = try scratch.alloc(RelationalRows.Condition, parsed.value.conditions.len);
+        for (parsed.value.conditions, conditions) |condition, *compiled| {
+            const ordinal = view.physicalLayout().ordinalForName(view.tableSchema().relational_columns, condition.column) orelse return error.RelationalIndexColumnNotFound;
+            compiled.* = .{
+                .column = condition.column,
+                .op = condition.op,
+                .value = try @import("../../schema/relational_checks.zig").valueFromJson(scratch, view.tableSchema().relational_columns[ordinal].column_type, condition.value orelse .null, true),
+                .collation = condition.collation,
+            };
+        }
+        const Filter = struct {
+            alloc: Allocator,
+            source: db_query_graph.PreparedPatternFilter,
+            bound: ?db_query_graph.PreparedOrdinalPatternFilter = null,
+            version: ?u32 = null,
+
+            fn deinit(filter: *@This()) void {
+                if (filter.bound) |*bound| bound.deinit();
+                filter.source.deinit();
+            }
+
+            fn matches(raw: *anyopaque, temporary: Allocator, key: []const u8, row: relational_row_codec.OrdinalRowView) !bool {
+                const filter: *@This() = @ptrCast(@alignCast(raw));
+                if (filter.version == null or filter.version.? != row.table_schema.version) {
+                    if (filter.bound) |*bound| bound.deinit();
+                    filter.bound = null;
+                    filter.version = null;
+                    filter.bound = try db_query_graph.PreparedOrdinalPatternFilter.init(filter.alloc, &filter.source, row.table_schema, row.layout);
+                    filter.version = row.table_schema.version;
+                }
+                if (try filter.bound.?.matches(temporary, key, row)) |matched| return matched;
+                // Keep authorization semantics for filters which cannot yet
+                // execute against ordinal cells. Never evaluate on the user's
+                // projection or silently omit the security predicate.
+                const json = try row.reconstructValueAlloc(temporary);
+                defer temporary.free(json);
+                return try filter.source.matchesStored(temporary, key, json);
+            }
+        };
+        var filter = if (opts.filter_query_json.len != 0) Filter{ .alloc = alloc, .source = try db_query_graph.PreparedPatternFilter.init(alloc, opts.filter_query_json) } else null;
+        defer if (filter) |*active| active.deinit();
+        var reader = try self.beginRelationalRows(alloc, .{
+            .fields = parsed.value.fields,
+            .conditions = conditions,
+            .primary_lower = if (from_key.len != 0) .{ .key = from_key, .inclusive = opts.inclusive_from } else null,
+            .primary_upper = if (to_key.len != 0) .{ .key = to_key, .inclusive = !opts.exclusive_to } else null,
+            .expected_schema_version = parsed.value.schema_version orelse view.version(),
+            .row_filter = if (filter) |*active| .{ .context = active, .matches = Filter.matches } else null,
+        });
+        defer reader.deinit();
+        const limit = if (opts.limit == 0) @as(u32, 128) else opts.limit;
+        var delivered: usize = 0;
+        var remaining_bytes: usize = 16 * 1024 * 1024;
+        while (delivered < limit) {
+            if (opts.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Canceled;
+            if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            if (remaining_bytes == 0) return error.RelationalRowResultTooLarge;
+            var page = try reader.nextPage(alloc, self.backend_runtime.io(), .{ .rows = @min(128, limit - delivered), .output_bytes = remaining_bytes });
+            defer page.deinit();
+            for (page.rows) |row| {
+                if (opts.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Canceled;
+                try visitor.visit(visitor.context, .{
+                    .id = row.key,
+                    .hash = row.version,
+                    .content_hash = if (opts.include_content_hashes) row.semantic_hash else null,
+                    .relational_schema_version = reader.active.version(),
+                    .document_json = if (opts.include_documents) row.json else null,
+                });
+                delivered += 1;
+            }
+            remaining_bytes -= page.output_bytes;
+            if (!page.more) break;
+            if (delivered < limit) if (self.backend_runtime.io()) |io| try io.sleep(.fromNanoseconds(1), .awake);
+        }
+    }
+
     /// Stream a scan directly from one storage snapshot. This is the bounded
     /// primitive for transports and maintenance jobs: only the current row and
     /// caller-owned output are resident, and callback failure aborts promptly.
@@ -34268,6 +34870,7 @@ pub const DB = struct {
         opts: types.ScanOptions,
         visitor: types.ScanVisitor,
     ) !void {
+        if (opts.relational_query_json.len != 0) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
         const projection_plan = db_query_projection.buildLookupFieldSelectionPlan(.{
             .fields = opts.fields,
             .include_all_fields = opts.include_all_fields,
@@ -59862,6 +60465,7 @@ fn finalizePrimarySplitPreservingMetadata(
     _ = try tryFinalizePrimarySplitFast(self, split_lower);
     try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
     try reconcileRelationalIndexRange(self, self.core.store, retained_range);
+    try @import("relational_integrity_range.zig").pruneOutside(self.alloc, self.backend_runtime.io(), self.core.store, retained_range.start, retained_range.end);
     try rebaseRangeCoverageMetadata(
         self.alloc,
         self.core.store,
@@ -59913,6 +60517,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     try range_state_mod.saveRange(dest_store, byte_range);
     try self.core.saveSchemaCloneTo(dest_store);
     try relational_index_catalog.copyToUnpublished(self.alloc, self.core.store, dest_store);
+    try @import("relational_integrity_range.zig").copyToUnpublished(self.alloc, self.backend_runtime.io(), self.core.store, dest_store, byte_range.start, byte_range.end);
     try dest_indexes.seedSplitArtifactCatalogsFrom(dest_store, self.core.index_manager);
 
     const configs = try self.core.listIndexes(self.alloc);
@@ -60722,6 +61327,10 @@ fn indexExistingSplitDestinationDirect(
 }
 
 fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
+    try self.requireSupportedRelationalTopology();
+    var transaction_manager = try self.core.initTxnManager();
+    defer transaction_manager.deinit();
+    if (try transaction_manager.hasSchemaLeases()) return error.SchemaInUse;
     const split_state = self.core.splitState() orelse return error.SplitInProgress;
     if (!std.mem.eql(u8, split_state.split_key, new_range.end)) return error.KeyOutOfRange;
     // A committed user write must never make a split publish an incomplete
@@ -66639,6 +67248,27 @@ test "relational rows snapshot projects exact composite ranges through writes DD
         if (!page.more) break;
     }
     try std.testing.expectEqual(@as(usize, 1), found);
+    {
+        // Exercise the routed public scan adapter, including exact integer
+        // operands and authorization before projection.
+        const query = "{\"fields\":[\"id\"],\"conditions\":[{\"column\":\"id\",\"op\":\"gt\",\"value\":0}],\"schema_version\":3}";
+        var result = try db.scan(alloc, "", "", .{
+            .relational_query_json = query,
+            .include_documents = true,
+            .limit = 16,
+        });
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), result.hashes.len);
+        try std.testing.expectEqual(@as(?u32, 3), result.hashes[0].relational_schema_version);
+        var excluded = try db.scan(alloc, "b", "", .{
+            .relational_query_json = query,
+            .include_documents = true,
+            .inclusive_from = false,
+            .limit = 16,
+        });
+        defer excluded.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), excluded.hashes.len);
+    }
 }
 
 test "relational constraint activation fences prepared writes and resumes CHECK coverage" {

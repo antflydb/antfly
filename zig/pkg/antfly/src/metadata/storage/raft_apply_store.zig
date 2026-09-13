@@ -794,6 +794,88 @@ test "table topology mutation decoder rejects frames above the legal command cei
     );
 }
 
+test "relational integrity metadata FK target validates ordered uniqueness types and self references" {
+    try @import("../../schema/relational_foreign_key_target.zig").testTargetContract();
+}
+
+test "relational integrity metadata drop is fenced against coordinated ownership and incoming references" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/relational-drop", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const group_id = 21;
+    const parent: metadata.TableRecord = .{
+        .table_id = 7,
+        .name = "parents",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        ,
+    };
+    const child: metadata.TableRecord = .{
+        .table_id = 8,
+        .name = "children",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"parent_fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        ,
+    };
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    // An FK publication arriving after its parent's DROP cannot create an
+    // orphan, even if API preflight previously observed the parent.
+    try store.applyTableUpsertTxn(&txn, group_id, child);
+    var key_buf: [160]u8 = undefined;
+    const child_key = try tableKeyForGroup(&key_buf, group_id, child.table_id);
+    try std.testing.expectError(error.NotFound, txn.get(child_key));
+    try store.applyTableUpsertTxn(&txn, group_id, parent);
+    try store.applyTableUpsertTxn(&txn, group_id, child);
+    try std.testing.expect(!try store.tableMatchesTransitionContractTxn(&txn, group_id, .{
+        .table_id = parent.table_id,
+        .table_name = parent.name,
+        .schema_json = parent.schema_json,
+        .indexes_json = parent.indexes_json,
+    }));
+    var changed_parent = parent;
+    changed_parent.schema_json = try std.mem.replaceOwned(u8, std.testing.allocator, parent.schema_json, "integer", "number");
+    defer std.testing.allocator.free(changed_parent.schema_json);
+    try store.applyTableUpsertTxn(&txn, group_id, changed_parent);
+    var unchanged_parent_key_buf: [160]u8 = undefined;
+    const unchanged_parent = try decodeTableRecord(std.testing.allocator, try txn.get(try tableKeyForGroup(&unchanged_parent_key_buf, group_id, parent.table_id)));
+    defer metadata_table_manager.freeTable(std.testing.allocator, unchanged_parent);
+    try std.testing.expectEqualStrings(parent.schema_json, unchanged_parent.schema_json);
+    try std.testing.expect(try store.relationalDropBlockedTxn(&txn, group_id, parent));
+    var legacy_parent = parent;
+    legacy_parent.schema_json = "{}";
+    try std.testing.expect(try store.relationalDropBlockedTxn(&txn, group_id, legacy_parent));
+    try std.testing.expect(try store.relationalDropBlockedTxn(&txn, group_id, child));
+    var erased_child = child;
+    erased_child.schema_json = "{}";
+    try store.applyTableUpsertTxn(&txn, group_id, erased_child);
+    const retained_child = try decodeTableRecord(std.testing.allocator, try txn.get(child_key));
+    defer metadata_table_manager.freeTable(std.testing.allocator, retained_child);
+    try std.testing.expectEqualStrings(child.schema_json, retained_child.schema_json);
+    var reordered_child = child;
+    reordered_child.schema_json = try std.mem.replaceOwned(u8, std.testing.allocator, child.schema_json, "\"name\":\"parent_fk\"", "\"on_delete\":\"restrict\",\"name\":\"parent_fk\"");
+    defer std.testing.allocator.free(reordered_child.schema_json);
+    try std.testing.expect(try store.relationalDefinitionsRetained(child, reordered_child));
+    const fence = try store.loadTableTransitionFenceTxn(&txn, group_id, parent.table_id);
+    try store.applyTableTopologyMutationTxn(&txn, group_id, .{ .drop = .{
+        .table_id = parent.table_id,
+        .expected_name = parent.name,
+        .expected_transition_generation = fence.generation,
+        .range_contract = .{ .membership = fence.membership(parent.table_id) },
+    } });
+    var parent_key_buf: [160]u8 = undefined;
+    _ = try txn.get(try tableKeyForGroup(&parent_key_buf, group_id, parent.table_id));
+    try store.applyTransitionCommandTxn(&txn, group_id, .{ .remove_table = .{
+        .table_id = parent.table_id,
+        .expected_transition_generation = fence.generation,
+    } });
+    _ = try txn.get(try tableKeyForGroup(&parent_key_buf, group_id, parent.table_id));
+    try std.testing.expect(!try store.relationalDropBlockedTxn(&txn, group_id, .{ .table_id = 9, .name = "unrelated" }));
+}
+
 test "table topology recreate is fenced by the durable transition generation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3509,6 +3591,8 @@ pub const RaftApplyStore = struct {
         const table = try decodeTableRecord(alloc, encoded_table);
         errdefer metadata_table_manager.freeTable(alloc, table);
         if (!std.mem.eql(u8, table.name, table_name)) return error.InvalidDerivedCatalogIndex;
+        if (try self.relationalDropBlockedTxn(&txn, group_id, table))
+            return error.ConstraintRetirementRequired;
 
         var fence_key_buf: [192]u8 = undefined;
         const fence_key = try tableTransitionFenceKeyForGroup(&fence_key_buf, group_id, table_id);
@@ -4595,6 +4679,11 @@ pub const RaftApplyStore = struct {
                 defer if (existing_table_name) |name| self.alloc.free(name);
                 var key_buf: [160]u8 = undefined;
                 const key = try tableKeyForGroup(&key_buf, group_id, record.table_id);
+                if (txn.get(key)) |encoded| {
+                    const existing = try decodeTableRecord(self.alloc, encoded);
+                    defer metadata_table_manager.freeTable(self.alloc, existing);
+                    if (try self.relationalDropBlockedTxn(txn, group_id, existing)) return;
+                } else |err| if (err != error.NotFound) return err;
                 txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
@@ -5153,6 +5242,7 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         record: metadata.TableRecord,
     ) !void {
+        if (!try self.relationalParentsExistTxn(txn, group_id, record)) return;
         var key_buf: [160]u8 = undefined;
         const key = try tableKeyForGroup(&key_buf, group_id, record.table_id);
         const encoded_existing = txn.get(key) catch |err| switch (err) {
@@ -5163,6 +5253,9 @@ pub const RaftApplyStore = struct {
             const existing = try decodeTableRecord(self.alloc, encoded);
             defer metadata_table_manager.freeTable(self.alloc, existing);
             if (metadata_table_manager.tableDefinitionsEqual(existing, record)) return;
+            if (!std.mem.eql(u8, existing.name, record.name) and
+                try self.relationalDropBlockedTxn(txn, group_id, existing)) return;
+            if (!try self.relationalDefinitionsRetained(existing, record)) return;
         }
         if ((try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id)).active()) return;
         try self.putTableRecordTxn(txn, group_id, key, record);
@@ -5307,6 +5400,7 @@ pub const RaftApplyStore = struct {
     ) !void {
         switch (mutation) {
             .create => |create| {
+                if (!try self.relationalParentsExistTxn(txn, group_id, create.table)) return;
                 const fence = try self.loadTableTransitionFenceTxn(
                     txn,
                     group_id,
@@ -5426,6 +5520,9 @@ pub const RaftApplyStore = struct {
                 defer metadata_table_manager.freeTable(self.alloc, existing);
                 if (!std.mem.eql(u8, existing.name, drop.expected_name)) return;
                 if (try self.extensionOwnsTableTxn(txn, group_id, existing.name)) return;
+                // Recheck under the authoritative metadata transaction: an FK
+                // can have been published since the DROP admission snapshot.
+                if (try self.relationalDropBlockedTxn(txn, group_id, existing)) return;
 
                 var owned_range_group_ids: ?[]u64 = null;
                 defer if (owned_range_group_ids) |ids| self.alloc.free(ids);
@@ -5722,6 +5819,7 @@ pub const RaftApplyStore = struct {
         expected: metadata.TableRecord,
         replacement: metadata.TableRecord,
     ) !void {
+        if (!try self.relationalParentsExistTxn(txn, group_id, replacement)) return;
         var key_buf: [160]u8 = undefined;
         const key = try tableKeyForGroup(&key_buf, group_id, expected.table_id);
         const encoded = txn.get(key) catch |err| switch (err) {
@@ -5731,9 +5829,148 @@ pub const RaftApplyStore = struct {
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
         if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return;
+        if (!std.mem.eql(u8, current.name, replacement.name) and
+            try self.relationalDropBlockedTxn(txn, group_id, current)) return;
+        if (!try self.relationalDefinitionsRetained(current, replacement)) return;
         if ((try self.loadTableTransitionFenceTxn(txn, group_id, expected.table_id)).active()) return;
         if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
         try self.putTableRecordTxn(txn, group_id, key, replacement);
+    }
+
+    fn relationalDefinitionsRetained(self: *RaftApplyStore, previous: metadata.TableRecord, next: metadata.TableRecord) !bool {
+        for ([_][]const u8{ previous.schema_json, previous.read_schema_json }) |schema| {
+            var old = try RelationalDeclarations.parse(self.alloc, schema);
+            defer old.deinit();
+            if (!old.value.coordinated()) continue;
+            const retained = @import("../../schema/relational_foreign_key_target.zig").retains(self.alloc, schema, next.schema_json) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return false;
+            };
+            if (!retained) return false;
+        }
+        return true;
+    }
+
+    const RelationalDeclarations = struct {
+        unique_constraints: ?[]const struct {} = null,
+        foreign_keys: ?[]const struct { parent_table: []const u8 = "" } = null,
+
+        fn parse(alloc: std.mem.Allocator, schema: []const u8) !std.json.Parsed(RelationalDeclarations) {
+            return std.json.parseFromSlice(RelationalDeclarations, alloc, if (schema.len == 0) "{}" else schema, .{
+                .ignore_unknown_fields = true,
+            });
+        }
+
+        fn coordinated(self: RelationalDeclarations) bool {
+            return (if (self.unique_constraints) |items| items.len else 0) != 0 or
+                (if (self.foreign_keys) |items| items.len else 0) != 0;
+        }
+
+        fn references(self: RelationalDeclarations, table_name: []const u8) bool {
+            for (self.foreign_keys orelse &.{}) |fk| {
+                if (std.mem.eql(u8, fk.parent_table, table_name)) return true;
+            }
+            return false;
+        }
+    };
+
+    /// No coordinated table may be removed until durable claim/reference
+    /// retirement exists. Incoming references are checked from primary catalog
+    /// rows, not an asynchronously maintained dependency projection. The cursor
+    /// retains one table at a time and exits at the first dependency.
+    fn relationalDropBlockedTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table: metadata.TableRecord,
+    ) !bool {
+        for ([_][]const u8{ table.schema_json, table.read_schema_json }) |schema| {
+            var declarations = try RelationalDeclarations.parse(self.alloc, schema);
+            defer declarations.deinit();
+            if (declarations.value.coordinated()) return true;
+        }
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try tablePrefixForGroup(&prefix_buf, group_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            const candidate = try decodeTableRecord(self.alloc, row.value);
+            defer metadata_table_manager.freeTable(self.alloc, candidate);
+            for ([_][]const u8{ candidate.schema_json, candidate.read_schema_json }) |schema| {
+                var declarations = try RelationalDeclarations.parse(self.alloc, schema);
+                defer declarations.deinit();
+                if (declarations.value.references(table.name)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn relationalParentsExistTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table: metadata.TableRecord,
+    ) !bool {
+        for ([_][]const u8{ table.schema_json, table.read_schema_json }) |schema| {
+            var declarations = try RelationalDeclarations.parse(self.alloc, schema);
+            defer declarations.deinit();
+            for (declarations.value.foreign_keys orelse &.{}) |fk| {
+                if (std.mem.eql(u8, fk.parent_table, table.name)) {
+                    if (!try self.relationalTargetValid(schema, table.name, table.schema_json)) return false;
+                    continue;
+                }
+                var prefix_buf: [128]u8 = undefined;
+                const prefix = try tablePrefixForGroup(&prefix_buf, group_id);
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                var entry = try cursor.seekAtOrAfter(prefix);
+                var found = false;
+                while (entry) |row| : (entry = try cursor.next()) {
+                    if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                    const candidate = try decodeTableRecord(self.alloc, row.value);
+                    defer metadata_table_manager.freeTable(self.alloc, candidate);
+                    if (std.mem.eql(u8, fk.parent_table, candidate.name)) {
+                        if (!try self.relationalTargetValid(schema, candidate.name, candidate.schema_json)) return false;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return false;
+            }
+        }
+        // Changing a parent column's type must not publish an incompatible
+        // definition between child admission and activation. Revalidate every
+        // incoming edge against the proposed parent in the same transaction.
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try tablePrefixForGroup(&prefix_buf, group_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            const candidate = try decodeTableRecord(self.alloc, row.value);
+            defer metadata_table_manager.freeTable(self.alloc, candidate);
+            if (candidate.table_id == table.table_id) continue;
+            for ([_][]const u8{ candidate.schema_json, candidate.read_schema_json }) |schema| {
+                var declarations = try RelationalDeclarations.parse(self.alloc, schema);
+                defer declarations.deinit();
+                if (declarations.value.references(table.name) and
+                    !try self.relationalTargetValid(schema, table.name, table.schema_json)) return false;
+            }
+        }
+        return true;
+    }
+
+    fn relationalTargetValid(self: *RaftApplyStore, child: []const u8, parent_name: []const u8, parent: []const u8) !bool {
+        @import("../../schema/relational_foreign_key_target.zig").validate(self.alloc, child, parent_name, parent) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            // Invalid declarations deterministically reject the proposal;
+            // they must not turn into a permanently failing Raft apply loop.
+            return false;
+        };
+        return true;
     }
 
     fn putTableRecordTxn(
@@ -6114,6 +6351,13 @@ pub const RaftApplyStore = struct {
         };
         const table = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, table);
+        for ([_][]const u8{ table.schema_json, table.read_schema_json }) |schema| {
+            var declarations = try RelationalDeclarations.parse(self.alloc, schema);
+            defer declarations.deinit();
+            // Neither split nor merge may admit a transition while its online
+            // delta protocol cannot transfer routed claims and shared guards.
+            if (declarations.value.coordinated()) return false;
+        }
         return table.table_id == contract.table_id and
             std.mem.eql(u8, table.name, contract.table_name) and
             std.mem.eql(u8, table.schema_json, contract.schema_json) and
@@ -6197,6 +6441,7 @@ pub const RaftApplyStore = struct {
         // table write before touching any extension row so an active range
         // transition rejects the whole delta rather than publishing half of it.
         for (delta.upsert_tables) |record| {
+            if (!try self.relationalParentsExistTxn(txn, group_id, record)) return;
             var key_buf: [160]u8 = undefined;
             const key = try tableKeyForGroup(&key_buf, group_id, record.table_id);
             const encoded_existing = txn.get(key) catch |err| switch (err) {
@@ -6207,6 +6452,9 @@ pub const RaftApplyStore = struct {
                 const existing = try decodeTableRecord(self.alloc, encoded);
                 defer metadata_table_manager.freeTable(self.alloc, existing);
                 if (metadata_table_manager.tableDefinitionsEqual(existing, record)) continue;
+                if (!std.mem.eql(u8, existing.name, record.name) and
+                    try self.relationalDropBlockedTxn(txn, group_id, existing)) return;
+                if (!try self.relationalDefinitionsRetained(existing, record)) return;
             }
             if ((try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id)).active()) return;
         }

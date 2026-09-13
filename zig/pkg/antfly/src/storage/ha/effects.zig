@@ -51,6 +51,29 @@ pub const BatchMutationPayload = struct {
     request: db_types.BatchRequest,
 };
 
+test "HA integrity mutations preserve binary keys and absent versus empty guards" {
+    const alloc = std.testing.allocator;
+    const binary = &[_]u8{ 0, 255, 192, 128, 34 };
+    const encoded = try encodeBatchMutationRequestAlloc(alloc, .{
+        .relational_schema_version = 7,
+        .relational_integrity_generation_set = @splat(255),
+        .integrity = &.{
+            .{ .routing_key = binary, .key = binary, .kind = .guard },
+            .{ .routing_key = binary, .key = binary, .kind = .put, .value = binary, .expected_value = "" },
+        },
+    });
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(BatchMutationPayload, alloc, encoded, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, 7), parsed.value.request.relational_schema_version);
+    try std.testing.expectEqual([_]u8{255} ** 32, parsed.value.request.relational_integrity_generation_set.?);
+    const operations = parsed.value.request.integrity;
+    try std.testing.expectEqualSlices(u8, binary, operations[0].key);
+    try std.testing.expect(operations[0].expected_value == null);
+    try std.testing.expectEqualSlices(u8, "", operations[1].expected_value.?);
+    try std.testing.expectEqualSlices(u8, binary, operations[1].value.?);
+}
+
 pub const MetadataMutationKind = enum {
     schema,
 };

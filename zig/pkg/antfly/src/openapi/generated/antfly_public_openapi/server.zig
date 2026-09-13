@@ -432,6 +432,11 @@ pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Read distributed unique and foreign-key validation coverage
+pub const GetRelationalConstraintStatusPathParams = struct {
+    table_name: []const u8,
+};
+
 /// Adopt stored write destinations with the current credential
 pub const ReauthorizeTableDestinationsPathParams = struct {
     /// Name of the table whose stored destinations should be adopted
@@ -627,6 +632,26 @@ pub fn parseRestoreTableBody(allocator: std.mem.Allocator, body: []const u8) !st
     return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Atomically replace or delete version-conditional typed rows
+pub const MutateRelationalRowsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for mutateRelationalRows.
+pub fn parseMutateRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Query projected typed relational rows
+pub const QueryRelationalRowsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryRelationalRows.
+pub fn parseQueryRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowQueryRequest) {
+    return std.json.parseFromSlice(types.RelationalRowQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Replace a table's schema
 pub const UpdateSchemaPathParams = struct {
     /// Name of the table
@@ -802,6 +827,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/constraints/status", .operation_id = "getRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/destination-authorization", .operation_id = "reauthorizeTableDestinations", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey", .request_body = .none, .streaming_response = false },
@@ -821,6 +847,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/cancel", .operation_id = "cancelTableRepairJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/mutate", .operation_id = "mutateRelationalRows", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/query", .operation_id = "queryRelationalRows", .request_body = .buffered, .streaming_response = true },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/tables/{tableName}/schema", .operation_id = "patchSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions", .request_body = .none, .streaming_response = false },
@@ -896,6 +924,7 @@ pub const routes = [_]Route{
 //   fn cancelDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reauthorizeTableDestinations(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
@@ -915,6 +944,8 @@ pub const routes = [_]Route{
 //   fn cancelTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn mutateRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn queryRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response

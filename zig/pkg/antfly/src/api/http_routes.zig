@@ -483,6 +483,25 @@ pub const Routes = struct {
         return .{ .table_name = table_name };
     }
 
+    pub fn matchRelationalRowsQuery(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/rows/query");
+    }
+
+    pub fn matchRelationalRowsMutation(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/rows/mutate");
+    }
+
+    pub fn matchRelationalConstraintStatus(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/constraints/status");
+    }
+
+    fn matchRelationalRowsPath(path: []const u8, suffix: []const u8) ?TableScan {
+        if (!std.mem.startsWith(u8, path, tables_prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+        const name = path[tables_prefix.len .. path.len - suffix.len];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .table_name = name };
+    }
+
     pub fn matchTableQuery(path: []const u8) ?TableQuery {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, query_suffix)) return null;

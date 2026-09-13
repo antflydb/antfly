@@ -491,7 +491,9 @@ pub fn reassignNamespaceAlloc(
     try validateStoreAlloc(alloc, store);
 }
 
-fn encodeNamespace(buf: []u8, namespace: Namespace) void {
+/// Canonical durable namespace bytes, shared by identity initialization and
+/// the atomic schema/constraint activation bootstrap transaction.
+pub fn encodeNamespace(buf: []u8, namespace: Namespace) void {
     std.debug.assert(buf.len == 24);
     std.mem.writeInt(u64, buf[0..8], namespace.table_id, .big);
     std.mem.writeInt(u64, buf[8..16], namespace.shard_id, .big);

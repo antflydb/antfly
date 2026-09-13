@@ -142,10 +142,33 @@ pub const OwnedIntentMutation = struct {
 
 pub const VersionPredicate = struct {
     key: []const u8,
-    expected_version: u64, // 0 = key must not exist
+    expected_version: u64 = 0, // 0 = key must not exist
+    /// Internal integrity records are raw metadata, not timestamped primary
+    /// rows. Their CAS compares complete bytes and retains the same shared
+    /// dependency guard as a document predicate. NULL means absent, not empty.
+    comparison: enum { document_version, exact_value } = .document_version,
+    expected_value: ?[]const u8 = null,
     // Successful prepare retains this dependency through terminal resolution.
     // A predicate on a write key uses that write's exclusive intent instead.
 };
+
+fn validReadMember(bytes: []const u8) bool {
+    return bytes.len == 8 or (bytes.len == 33 and (bytes[0] == 2 or bytes[0] == 3));
+}
+
+fn readPredicateIdentity(predicate: VersionPredicate, out: *[33]u8) []const u8 {
+    switch (predicate.comparison) {
+        .document_version => {
+            std.mem.writeInt(u64, out[0..8], predicate.expected_version, .little);
+            return out[0..8];
+        },
+        .exact_value => {
+            out[0] = if (predicate.expected_value != null) 3 else 2;
+            std.crypto.hash.Blake3.hash(predicate.expected_value orelse "", out[1..33], .{});
+            return out;
+        },
+    }
+}
 
 pub const TxnError = error{
     VersionConflict,
@@ -893,7 +916,7 @@ pub const TxnManager = struct {
         if (read_entries.len != 0) {
             const remaining = std.math.sub(u64, try self.readGuardCount(), read_entries.len) catch return error.InvalidTxnRecord;
             for (read_entries) |entry| {
-                if (entry.value.len != 8) return error.InvalidTxnRecord;
+                if (!validReadMember(entry.value)) return error.InvalidTxnRecord;
                 const user_key = entry.key[read_prefix.len..];
                 const guard_key = try makeReadGuardKey(self.alloc, user_key, txn_id);
                 try appendOwnedBytes(self.alloc, &owned_apply_keys, guard_key);
@@ -936,6 +959,15 @@ pub const TxnManager = struct {
 
                 const intent = try IntentValue.decode(entry.value);
                 if (intent.prepared_row != null) return error.PreparedIntentRequiresMaterialization;
+                // Integrity participants store private physical records, not
+                // primary JSON rows. Recovery without a DB materialization
+                // hook must preserve exactly the same physical namespace.
+                if (std.mem.startsWith(u8, user_key, "\x00\x00__metadata__:relational_integrity:") or std.mem.eql(u8, user_key, "\x00\x00__metadata__:relational_integrity_activation")) {
+                    if (intent.value) |value| {
+                        try writes.append(self.alloc, .{ .key = user_key, .value = value });
+                    } else try deletes.append(self.alloc, user_key);
+                    continue;
+                }
                 if (intent.value == null) {
                     // Delete — also remove the timestamp entry
                     const store_key = try internal_keys.documentKeyAlloc(self.alloc, user_key);
@@ -1568,12 +1600,27 @@ pub const TxnManager = struct {
         exclude_txn: ?TxnId,
     ) !void {
         for (predicates) |pred| {
-            const current_ts = try self.readTimestamp(pred.key);
-            if (pred.expected_version == 0) {
-                if (current_ts != null) return TxnError.VersionConflict;
-            } else {
-                const ts = current_ts orelse return TxnError.VersionConflict;
-                if (ts != pred.expected_version) return TxnError.VersionConflict;
+            switch (pred.comparison) {
+                .document_version => {
+                    const current_ts = try self.readTimestamp(pred.key);
+                    if (pred.expected_version == 0) {
+                        if (current_ts != null) return TxnError.VersionConflict;
+                    } else {
+                        const ts = current_ts orelse return TxnError.VersionConflict;
+                        if (ts != pred.expected_version) return TxnError.VersionConflict;
+                    }
+                },
+                .exact_value => {
+                    if (!std.mem.startsWith(u8, pred.key, "\x00\x00__metadata__:relational_integrity:") and !std.mem.eql(u8, pred.key, "\x00\x00__metadata__:relational_integrity_activation")) return error.InvalidArgument;
+                    const current = self.getAlloc(self.alloc, pred.key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    defer if (current) |bytes| self.alloc.free(bytes);
+                    if (pred.expected_value) |expected| {
+                        if (!std.mem.eql(u8, current orelse return TxnError.VersionConflict, expected)) return TxnError.VersionConflict;
+                    } else if (current != null) return TxnError.VersionConflict;
+                },
             }
 
             if (try self.hasPendingIntentForKey(pred.key, exclude_txn)) {
@@ -1751,17 +1798,18 @@ pub const TxnManager = struct {
                 else => return err,
             };
             defer if (old) |bytes| self.alloc.free(bytes);
+            var identity_buf: [33]u8 = undefined;
+            const identity = readPredicateIdentity(predicate, &identity_buf);
             if (old) |bytes| {
-                if (bytes.len != 8) return error.InvalidTxnRecord;
-                if (std.mem.readInt(u64, bytes[0..8], .little) != predicate.expected_version) return error.VersionConflict;
+                if (!validReadMember(bytes)) return error.InvalidTxnRecord;
+                if (!std.mem.eql(u8, bytes, identity)) return error.VersionConflict;
                 continue;
             }
             next.count = std.math.add(u64, next.count, 1) catch return error.TransactionTooLarge;
             if (next.count > max_read_guards_per_transaction) return error.TransactionTooLarge;
             next.bytes = std.math.add(u64, next.bytes, try intentAdmissionBytes(.{ .key = predicate.key, .value = null })) catch return error.TransactionTooLarge;
-            const version = try self.alloc.alloc(u8, 8);
+            const version = try self.alloc.dupe(u8, identity);
             try appendOwnedBytes(self.alloc, owned_values, version);
-            std.mem.writeInt(u64, version[0..8], predicate.expected_version, .little);
             try writes.append(self.alloc, .{ .key = member, .value = version });
             const guard = try makeReadGuardKey(self.alloc, predicate.key, txn_id);
             try appendOwnedBytes(self.alloc, owned_keys, guard);

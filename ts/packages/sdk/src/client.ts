@@ -48,6 +48,9 @@ import type {
   QueryRequest,
   QueryResponses,
   QueryResult,
+  RelationalConstraintStatus,
+  RelationalRowMutationRequest,
+  RelationalRowQueryRequest,
   ResourceType,
   RestoreJob,
   RestoreRequest,
@@ -353,12 +356,26 @@ function normalizedWriteOptions(
   };
 }
 
-function encodeBoundedJSON(value: unknown, maxBytes: number): string {
-  const encoded = JSON.stringify(value);
+function encodeBoundedJSON(value: unknown, maxBytes: number, relational = false): string {
+  const encoded = JSON.stringify(value, relational ? relationalNumberReplacer : undefined);
   if (new TextEncoder().encode(encoded).byteLength > maxBytes) {
     throw new Error(`encoded request exceeded ${maxBytes} bytes`);
   }
   return encoded;
+}
+
+/** Typed cells and predicate operands must not silently acquire a different
+ * integer value on the wire. JavaScript bigint is not a JSON number either;
+ * callers needing the full int64 domain can use a lossless JSON raw value. */
+function relationalNumberReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) {
+      throw new Error(
+        "Relational numbers must be finite; integer values must be safe JavaScript integers or lossless JSON raw values"
+      );
+    }
+  }
+  return value;
 }
 
 export async function readLimitedResponseBytes(
@@ -494,12 +511,13 @@ export class AntflyClient {
     body: unknown,
     options: WriteOptions | undefined,
     errorPrefix: string,
-    marshalErrorPrefix: string
+    marshalErrorPrefix: string,
+    relational = false
   ): Promise<{ data?: T; text: string }> {
     const opts = normalizedWriteOptions(options);
     let encodedBody: string;
     try {
-      encodedBody = encodeBoundedJSON(body, opts.maxRequestBytes);
+      encodedBody = encodeBoundedJSON(body, opts.maxRequestBytes, relational);
     } catch (error) {
       throw new Error(`${marshalErrorPrefix}: ${(error as Error).message}`);
     }
@@ -1242,6 +1260,69 @@ export class AntflyClient {
           transformed: request.transforms?.length ?? 0,
         }
       );
+    },
+
+    rows: {
+      /** One bounded NDJSON page. Raw text preserves int64 cells for a lossless
+       * JSON parser; ordinary JSON.parse would round integers above 2^53. */
+      queryRaw: async (
+        tableName: string,
+        request: RelationalRowQueryRequest,
+        signal?: AbortSignal
+      ): Promise<string> => {
+        const response = await fetch(
+          this.url(`/db/v1/tables/${encodeURIComponent(tableName)}/rows/query`),
+          {
+            method: "POST",
+            headers: this.requestHeaders(),
+            body: encodeBoundedJSON(request, DEFAULT_WRITE_MAX_REQUEST_BYTES, true),
+            signal,
+          }
+        );
+        const { text, truncated } = await readLimitedResponseText(
+          response,
+          response.ok ? 16 * 1024 * 1024 : MAX_ERROR_RESPONSE_BYTES
+        );
+        if (truncated) throw new Error("Relational row query exceeded its response byte limit");
+        if (!response.ok)
+          throw new Error(
+            `Relational row query failed: ${response.status} ${apiErrorMessage(text)}`
+          );
+        return text;
+      },
+
+      /** Atomic schema- and version-conditional mutations; ambiguous results
+       * are never retried automatically. */
+      mutate: async (
+        tableName: string,
+        request: RelationalRowMutationRequest,
+        options?: WriteOptions
+      ): Promise<BatchResult> => {
+        const { data } = await this.postBoundedJSON<BatchResult>(
+          `/db/v1/tables/${encodeURIComponent(tableName)}/rows/mutate`,
+          request,
+          options,
+          "Relational mutation failed",
+          "marshalling relational mutation",
+          true
+        );
+        if (!data) throw new Error("Relational mutation returned no commit outcome");
+        return data;
+      },
+    },
+
+    constraints: {
+      /** Distributed UNIQUE/FK coverage; local CHECK validation is separate. */
+      status: async (tableName: string): Promise<RelationalConstraintStatus> => {
+        const { data, error } = await this.client.GET(
+          "/db/v1/tables/{tableName}/constraints/status",
+          {
+            params: { path: { tableName } },
+          }
+        );
+        if (error || !data) throw new Error(`Constraint status failed: ${apiErrorMessage(error)}`);
+        return data;
+      },
     },
 
     /**

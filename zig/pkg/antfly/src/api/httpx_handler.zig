@@ -332,6 +332,44 @@ fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []cons
     return http_server_mod.permissionsAllow(authenticated.permissions, .table, table_name, .write);
 }
 
+fn foreignKeyParentsAllowed(alloc: std.mem.Allocator, identity: ?AuthenticatedIdentity, schema_json: []const u8) !bool {
+    _ = identity orelse return true;
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    if (parsed.foreign_keys) |foreign_keys| for (foreign_keys.value) |foreign_key| {
+        // Defining a cross-table dependency can expose existence and block
+        // parent writes. Require REFERENCES-like authority, conservatively
+        // represented by table admin until a dedicated privilege exists.
+        if (!(try http_server_mod.tablePermissionCurrentlyAllowed(identity, foreign_key.parent_table, .admin))) return false;
+    };
+    return true;
+}
+
+test "relational foreign key DDL requires referenced parent admin for create replace and patch" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"parent","child_columns":["parent_id"],"parent_table":"parents","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var permissions = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "children", .admin),
+        try usermgr.Permission.initOwned(alloc, .table, "parents", .read),
+    };
+    defer for (&permissions) |*permission| permission.deinit(alloc);
+    const identity = AuthenticatedIdentity{ .username = @constCast("author"), .permissions = &permissions };
+    try std.testing.expect(!(try foreignKeyParentsAllowed(alloc, identity, schema_json)));
+    const replacement = try table_contract.parseSchemaUpdateRequest(alloc, schema_json);
+    defer alloc.free(replacement);
+    try std.testing.expect(!(try foreignKeyParentsAllowed(alloc, identity, replacement)));
+    const patched = try table_contract.mergeSchemaPatchRequest(alloc, schema_json, "{}");
+    defer alloc.free(patched);
+    try std.testing.expect(!(try foreignKeyParentsAllowed(alloc, identity, patched)));
+    permissions[1].deinit(alloc);
+    permissions[1] = try usermgr.Permission.initOwned(alloc, .table, "parents", .admin);
+    try std.testing.expect(try foreignKeyParentsAllowed(alloc, identity, schema_json));
+    try std.testing.expect(try foreignKeyParentsAllowed(alloc, identity, replacement));
+    try std.testing.expect(try foreignKeyParentsAllowed(alloc, identity, patched));
+}
+
 fn replicationDestinationsAllowed(
     alloc: std.mem.Allocator,
     identity: ?AuthenticatedIdentity,
@@ -1171,13 +1209,14 @@ pub const AntflyApiHandler = struct {
         table_name: []const u8,
         body_data: []const u8,
         api: public_table_http.TableApi,
+        handler: *const fn (std.mem.Allocator, []const u8, []const u8, public_table_http.TableApi) anyerror!public_table_http.OwnedResponse,
         done: std.atomic.Value(bool) = .init(false),
         result: ?public_table_http.OwnedResponse = null,
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
             defer self.done.store(true, .release);
-            self.result = public_table_http.handleTableBatch(
+            self.result = self.handler(
                 self.alloc,
                 self.table_name,
                 self.body_data,
@@ -1195,8 +1234,9 @@ pub const AntflyApiHandler = struct {
         table_name: []const u8,
         body_data: []const u8,
         api: public_table_http.TableApi,
+        handler: *const fn (std.mem.Allocator, []const u8, []const u8, public_table_http.TableApi) anyerror!public_table_http.OwnedResponse,
     ) !httpx.Response {
-        var resp = try public_table_http.handleTableBatch(alloc, table_name, body_data, api);
+        var resp = try handler(alloc, table_name, body_data, api);
         return respondOwnedApiResponseWithAllocator(ctx, &resp, alloc);
     }
 
@@ -1206,18 +1246,19 @@ pub const AntflyApiHandler = struct {
         table_name: []const u8,
         body_data: []const u8,
         api: public_table_http.TableApi,
+        handler: *const fn (std.mem.Allocator, []const u8, []const u8, public_table_http.TableApi) anyerror!public_table_http.OwnedResponse,
     ) !httpx.Response {
-        const runtime = backend_runtime orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
-        var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+        const runtime = backend_runtime orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
+        var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
         const job_alloc = std.heap.page_allocator;
         const owned_table_name = job_alloc.dupe(u8, table_name) catch |err| {
             std.log.warn("batch offload table-name allocation failed; executing inline err={s}", .{@errorName(err)});
-            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
         };
         defer job_alloc.free(owned_table_name);
         const owned_body_data = job_alloc.dupe(u8, body_data) catch |err| {
             std.log.warn("batch offload body allocation failed; executing inline err={s}", .{@errorName(err)});
-            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
         };
         defer job_alloc.free(owned_body_data);
         var job = OffloadedTableBatch{
@@ -1225,13 +1266,14 @@ pub const AntflyApiHandler = struct {
             .table_name = owned_table_name,
             .body_data = owned_body_data,
             .api = api,
+            .handler = handler,
         };
         var future = runtime_io.concurrent(OffloadedTableBatch.run, .{&job}) catch |err| {
             // Saturating the backend executor must not turn a valid write into
             // an empty HTTP disconnect. The request still owns its buffers, so
             // executing synchronously is a safe bounded degradation path.
             std.log.warn("batch offload scheduling failed; executing inline err={s}", .{@errorName(err)});
-            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
         };
         while (!job.done.load(.acquire)) {
             // The borrowed request token is consumed only by post-commit
@@ -1530,6 +1572,21 @@ pub const AntflyApiHandler = struct {
                 }
             }.call else null,
         };
+    }
+
+    fn tableMutationContext(ctx: *httpx.Context, identity: *const ?AuthenticatedIdentity) operation_contract.RequestContext {
+        var request = operationContext(ctx, identity.*);
+        request.table_write_authorization = .{
+            .ptr = identity,
+            .allows = struct {
+                fn allowed(ptr: *const anyopaque, table: []const u8) bool {
+                    const admitted: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
+                    const authenticated = admitted.* orelse return true;
+                    return http_server_mod.permissionsAllow(authenticated.permissions, .table, table, .write);
+                }
+            }.allowed,
+        };
+        return request;
     }
 
     fn probeOperations(self: *AntflyApiHandler) probe_operations.Operations {
@@ -2007,11 +2064,13 @@ pub const AntflyApiHandler = struct {
         const key = (try decodePathParamOrBadRequest(ctx, encoded_key)) orelse
             return textResponse(ctx, 400, "invalid path parameter");
         defer ctx.allocator.free(key);
-        var lookup_options = http_route_helpers.parseLookupOptions(
+        var lookup_options = http_route_helpers.parseInternalLookupOptions(
             ctx.allocator,
             ctx.request.uri.query orelse "",
         ) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
+        const control_lookup = lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0;
+        const logical_key = if (control_lookup and std.mem.eql(u8, key, "\x00relational_control")) "" else key;
         const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch
             return textResponse(ctx, 400, "invalid read consistency");
         var result = self.internalGroupOperations().lookup(
@@ -2020,7 +2079,7 @@ pub const AntflyApiHandler = struct {
             .{
                 .group_id = group_id,
                 .table_name = table_name,
-                .key = key,
+                .key = logical_key,
                 .options = lookup_options.opts,
                 .consistency = consistency,
             },
@@ -2913,6 +2972,8 @@ pub const AntflyApiHandler = struct {
         err: internal_group_operations.Error,
         phase: InternalTxnPhase,
     ) !httpx.Response {
+        if (@import("relational_integrity_errors.zig").classify(err)) |relational_error|
+            return textResponse(ctx, 409, @errorName(relational_error));
         if (txnErrorProvesNotProposed(err, phase))
             try ctx.setHeader(distributed_txn_contract.pre_decision_outcome_header, distributed_txn_contract.pre_decision_not_proposed_v1);
         return switch (err) {
@@ -4990,6 +5051,8 @@ pub const AntflyApiHandler = struct {
             return ctx.text(table_contract.createTableRequestErrorMessage(err, body_data));
         };
         defer create_req.deinit(alloc);
+        if (!(try foreignKeyParentsAllowed(alloc, authenticated_identity, tables_api.effectiveSchemaJson(create_req.schema_json))))
+            return jsonErrorResponse(ctx, 403, "foreign key declarations require admin permission on every referenced parent table");
         const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
             alloc,
             create_req.indexes_json orelse tables_api.default_indexes_json,
@@ -5131,6 +5194,10 @@ pub const AntflyApiHandler = struct {
                 error.InvalidCreateTableRequest => {
                     _ = ctx.status(400);
                     return ctx.text("invalid table configuration");
+                },
+                error.ForeignKeyTargetNotUnique, error.ForeignKeyTypeMismatch, error.ForeignKeyParentTableNotFound => {
+                    _ = ctx.status(400);
+                    return ctx.text("foreign key requires an existing parent with a matching ordered unique key and compatible scalar column types");
                 },
                 error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => {
                     _ = ctx.status(400);
@@ -5275,6 +5342,10 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(409);
                     return ctx.text("table topology changed or is extension-owned");
                 },
+                error.ConstraintRetirementRequired => {
+                    _ = ctx.status(409);
+                    return ctx.text("table has active relational constraints or incoming foreign keys; coordinated constraint retirement is required before deletion");
+                },
                 error.TableTopologyProtocolUpgradeRequired => {
                     return metadataMutationNotAdmittedTextResponse(ctx, "metadata cluster upgrade in progress; retry later");
                 },
@@ -5388,8 +5459,24 @@ pub const AntflyApiHandler = struct {
             self.api_server.cfg.backend_runtime,
             decoded_table_name,
             body_data,
-            self.api_server.tableApi(operationContext(ctx, authenticated_identity)),
+            self.api_server.tableApi(tableMutationContext(ctx, &authenticated_identity)),
+            public_table_http.handleTableBatch,
         );
+    }
+
+    pub fn mutateRelationalRows(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer alloc.free(decoded_table_name);
+        const body = (try ctx.body()) orelse {
+            return jsonErrorResponse(ctx, 400, "missing body");
+        };
+        if (try self.acquirePublicOperation(ctx, "mutateRelationalRows")) |response| return response;
+        defer self.releasePublicOperation("mutateRelationalRows");
+        return handleTableBatchOffEventLoop(ctx, self.api_server.cfg.backend_runtime, decoded_table_name, body, self.api_server.tableApi(tableMutationContext(ctx, &authenticated_identity)), public_table_http.handleRelationalRowsMutation);
     }
 
     pub fn linearMerge(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -5543,12 +5630,36 @@ pub const AntflyApiHandler = struct {
             };
         }
         var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, body_data);
+        if (authenticated_identity != null) {
+            // For PATCH, authorize the complete proposed schema and bind the
+            // later mutation to the same epoch so concurrent DDL cannot add
+            // an unexamined parent dependency between admission and commit.
+            var snapshot = (try self.api_server.source.adminSnapshot()) orelse return jsonErrorResponse(ctx, 503, "schema authorization snapshot unavailable");
+            defer self.api_server.source.freeAdminSnapshot(&snapshot);
+            const current = tables_api.findTableByName(&snapshot, decoded_table_name) orelse return jsonErrorResponse(ctx, 404, "not found");
+            const proposed = (if (mode == .merge_patch)
+                table_contract.mergeSchemaPatchRequest(alloc, current.schema_json, body_data)
+            else
+                table_contract.parseSchemaUpdateRequest(alloc, body_data)) catch return jsonErrorResponse(ctx, 400, "invalid schema update request");
+            defer alloc.free(proposed);
+            if (!(foreignKeyParentsAllowed(alloc, authenticated_identity, proposed) catch return jsonErrorResponse(ctx, 400, "invalid schema update request")))
+                return jsonErrorResponse(ctx, 403, "foreign key declarations require admin permission on every referenced parent table");
+            if (mode == .merge_patch and expected_version == null) {
+                var current_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, current.schema_json);
+                defer current_schema.deinit(alloc);
+                expected_version = current_schema.version;
+            }
+        }
         var local_schema_applied = false;
         var mutation = self.api_server.source.mutateSchema(alloc, decoded_table_name, mode, body_data, expected_version) catch |err| switch (err) {
             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest, error.SchemaVersionManagedByBackend => {
                 invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
                 _ = ctx.status(400);
                 return ctx.text(invalid_schema_message);
+            },
+            error.ForeignKeyTargetNotUnique, error.ForeignKeyTypeMismatch, error.ForeignKeyParentTableNotFound => {
+                _ = ctx.status(400);
+                return ctx.text("foreign key requires an existing parent with a matching ordered unique key and compatible scalar column types");
             },
             error.TableNotFound => {
                 _ = ctx.status(404);
@@ -5557,6 +5668,10 @@ pub const AntflyApiHandler = struct {
             error.SchemaVersionChanged, error.TableGenerationChanged => {
                 _ = ctx.status(409);
                 return ctx.text("schema version changed; refresh and retry");
+            },
+            error.ConstraintRetirementRequired => {
+                _ = ctx.status(409);
+                return ctx.text("coordinated constraint retirement is required before changing or removing these declarations");
             },
             error.MetadataMutationOutcomeUnknown => {
                 return metadataMutationOutcomeUnknownResponse(ctx);
@@ -5584,6 +5699,10 @@ pub const AntflyApiHandler = struct {
                     error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                         _ = ctx.status(400);
                         return ctx.text(invalid_schema_message);
+                    },
+                    error.ConstraintRetirementRequired => {
+                        _ = ctx.status(409);
+                        return ctx.text("coordinated constraint retirement is required before changing or removing these declarations");
                     },
                     else => return write_err,
                 };
@@ -5639,6 +5758,36 @@ pub const AntflyApiHandler = struct {
     }
 
     pub fn scanKeys(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.scanKeysImpl(ctx, table_name, false);
+    }
+
+    pub fn queryRelationalRows(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.scanKeysImpl(ctx, table_name, true);
+    }
+
+    pub fn getRelationalConstraintStatus(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const alloc = ctx.allocator;
+        const name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return textResponse(ctx, 400, "invalid table name");
+        defer alloc.free(name);
+        if (try self.acquirePublicOperation(ctx, "getRelationalConstraintStatus")) |response| return response;
+        defer self.releasePublicOperation("getRelationalConstraintStatus");
+        const reads = self.api_server.table_reads orelse return jsonErrorResponse(ctx, 503, "constraint owners unavailable");
+        const body = @import("relational_constraint_status.zig").collect(alloc, self.api_server.source, reads, name, operationContext(ctx, identity)) catch |err| switch (err) {
+            error.TableNotFound => return jsonErrorResponse(ctx, 404, "not found"),
+            error.RelationalTableRequired => return jsonErrorResponse(ctx, 400, "relational table required"),
+            error.TopologyChanged, error.PreparedGenerationChanged, error.IntegrityCatalogChanged => return jsonErrorResponse(ctx, 409, "constraint schema or ownership changed; refresh and retry"),
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.DeadlineExceeded, error.Timeout => return jsonErrorResponse(ctx, 504, "constraint status deadline exceeded"),
+            else => return jsonErrorResponse(ctx, 503, "constraint owners unavailable"),
+        };
+        defer alloc.free(body);
+        return jsonResponse(ctx, 200, body);
+    }
+
+    fn scanKeysImpl(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, comptime relational: bool) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -5648,8 +5797,10 @@ pub const AntflyApiHandler = struct {
         // The OpenAPI request body is optional; an absent body is the default
         // unbounded-range scan, just like an explicitly empty legacy request.
         const body_data = (try ctx.body()) orelse "";
-        var scan_req = http_route_helpers.parseScanKeysRequest(alloc, body_data) catch |err| {
+        const parse = if (relational) http_route_helpers.parseRelationalRowQueryRequest else http_route_helpers.parseScanKeysRequest;
+        var scan_req = parse(alloc, body_data) catch |err| {
             if (http_route_helpers.scanRequestError(err)) |response| {
+                if (relational) return jsonErrorResponse(ctx, response.status, response.message);
                 _ = ctx.status(response.status);
                 return ctx.text(response.message);
             }
@@ -5666,12 +5817,39 @@ pub const AntflyApiHandler = struct {
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| try http_server_mod.injectRowFilterIntoScanRequest(alloc, &scan_req, value);
 
-        if (try self.acquirePublicOperation(ctx, "scanKeys")) |response| return response;
-        defer self.releasePublicOperation("scanKeys");
+        const operation_id = if (relational) "queryRelationalRows" else "scanKeys";
+        if (try self.acquirePublicOperation(ctx, operation_id)) |response| return response;
+        defer self.releasePublicOperation(operation_id);
         const source = self.api_server.table_reads orelse {
+            if (relational) return jsonErrorResponse(ctx, 404, "not found");
             _ = ctx.status(404);
             return ctx.text("not found");
         };
+
+        // A bounded relational page is published only after every selected
+        // owner accepts its schema fence. This keeps late shard failures from
+        // masquerading as a successful, truncated NDJSON response.
+        if (relational) {
+            var result = (source.scan(alloc, decoded_table_name, scan_req.from, scan_req.to, scan_req.opts, .read_index) catch |err| {
+                if (http_route_helpers.scanRequestError(err)) |response| {
+                    return jsonErrorResponse(ctx, response.status, response.message);
+                }
+                return switch (err) {
+                    error.TableNotFound => jsonErrorResponse(ctx, 404, "not found"),
+                    error.TopologyChanged, error.IdentityReadGenerationChanged, error.DocIdentityNamespaceMismatch => jsonErrorResponse(ctx, 409, "read topology changed"),
+                    error.Canceled, error.Cancelled => error.Canceled,
+                    error.Timeout, error.DeadlineExceeded => jsonErrorResponse(ctx, 504, "request deadline exceeded"),
+                    else => jsonErrorResponse(ctx, 503, "relational read unavailable"),
+                };
+            }) orelse {
+                return jsonErrorResponse(ctx, 404, "not found");
+            };
+            defer result.deinit(alloc);
+            var writer = try ctx.streamResponseWithContentType(200, "application/x-ndjson");
+            try writer.write(result.ndjson);
+            try writer.close();
+            return ctx.response.build();
+        }
 
         const HttpScanSink = struct {
             ctx: *httpx.Context,
@@ -5704,6 +5882,10 @@ pub const AntflyApiHandler = struct {
             stream.sink(),
         ) catch |err| {
             if (stream.writer != null) return err;
+            if (http_route_helpers.scanRequestError(err)) |response| {
+                _ = ctx.status(response.status);
+                return ctx.text(response.message);
+            }
             return switch (err) {
                 error.TableNotFound => {
                     _ = ctx.status(404);
@@ -9464,6 +9646,59 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     var me_body = try std.json.parseFromSlice(struct { username: []const u8 }, alloc, me_resp.body.?, .{ .ignore_unknown_fields = true });
     defer me_body.deinit();
     try std.testing.expectEqualStrings("admin", me_body.value.username);
+}
+
+test "httpx relational row query mutation endpoints enforce exact versions and schema epochs" {
+    const alloc = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-httpx-relational-rows");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, schema_json);
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"id\":9007199254740993,\"name\":\"first\"}" }}, .timestamp_ns = 9007199254740994 });
+    var reads = table_reads.BoundTableReadSource.init("docs", 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = table_writes.BoundTableWriteSource.init("docs", &db);
+    // Admission and participants must agree on the authoritative schema.
+    // The generic lookup fixture advertises a document table at epoch zero,
+    // which should be rejected for this schema-fenced relational mutation.
+    var status_source = SchemaUpdateStatusSource{ .schema_json = schema_json };
+    var server = ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), writes.source());
+    var e2e: HttpxE2eServer = undefined;
+    try e2e.init(alloc, &server);
+    defer e2e.deinit();
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try e2e.baseUrl(alloc);
+    defer alloc.free(base);
+    const query_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/rows/query", .{base});
+    defer alloc.free(query_url);
+    const mutation_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/rows/mutate", .{base});
+    defer alloc.free(mutation_url);
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var query_response = try requestWithRetry(&client, io.io(), .POST, query_url,
+        \\{"fields":["name"],"conditions":[{"column":"id","op":"eq","value":"9007199254740993"}],"schema_version":1}
+    , &headers, 20);
+    defer query_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), query_response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, query_response.body.?, "\"version\":\"9007199254740994\"") != null);
+    var mutation = try requestWithRetry(&client, io.io(), .POST, mutation_url,
+        \\{"schema_version":1,"mutations":[{"key":"doc:a","expected_version":"9007199254740994","row":{"id":9007199254740993,"name":"changed"}}]}
+    , &headers, 20);
+    defer mutation.deinit();
+    try std.testing.expectEqual(@as(u16, 201), mutation.status.code);
+    var stale = try requestWithRetry(&client, io.io(), .POST, mutation_url,
+        \\{"schema_version":1,"mutations":[{"key":"doc:a","expected_version":"9007199254740994"}]}
+    , &headers, 20);
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(u16, 409), stale.status.code);
+    var stale_schema = try requestWithRetry(&client, io.io(), .POST, query_url, "{\"fields\":[],\"schema_version\":99}", &headers, 20);
+    defer stale_schema.deinit();
+    try std.testing.expectEqual(@as(u16, 409), stale_schema.status.code);
 }
 
 test "httpx antfly lookup route preserves projection and headers" {

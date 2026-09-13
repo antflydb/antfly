@@ -117,9 +117,13 @@ pub fn ndjsonResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !
 
 pub const OwnedLookupOptions = struct {
     fields: [][]const u8 = &.{},
+    relational_integrity_jobs_json: []const u8 = "",
+    relational_activation_json: []const u8 = "",
     opts: @import("../storage/db/types.zig").LookupOptions = .{},
 
     pub fn deinit(self: *OwnedLookupOptions, alloc: std.mem.Allocator) void {
+        if (self.relational_integrity_jobs_json.len != 0) alloc.free(self.relational_integrity_jobs_json);
+        if (self.relational_activation_json.len != 0) alloc.free(self.relational_activation_json);
         for (self.fields) |field| alloc.free(field);
         if (self.fields.len > 0) alloc.free(self.fields);
         self.* = undefined;
@@ -131,6 +135,7 @@ pub const OwnedScanKeysRequest = struct {
     to: []const u8 = "",
     fields: [][]const u8 = &.{},
     filter_query_json: []const u8 = "",
+    relational_query_json: []const u8 = "",
     opts: @import("../storage/db/types.zig").ScanOptions = .{},
 
     pub fn deinit(self: *OwnedScanKeysRequest, alloc: std.mem.Allocator) void {
@@ -139,6 +144,7 @@ pub const OwnedScanKeysRequest = struct {
         for (self.fields) |field| alloc.free(field);
         if (self.fields.len > 0) alloc.free(self.fields);
         if (self.filter_query_json.len > 0) alloc.free(@constCast(self.filter_query_json));
+        if (self.relational_query_json.len > 0) alloc.free(self.relational_query_json);
         self.* = undefined;
     }
 };
@@ -176,6 +182,56 @@ pub fn parseLookupOptions(alloc: std.mem.Allocator, query: []const u8) !OwnedLoo
         };
     }
     return .{};
+}
+
+pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !OwnedLookupOptions {
+    var result = try parseLookupOptions(alloc, query);
+    errdefer result.deinit(alloc);
+    var parts = std.mem.splitScalar(u8, query, '&');
+    var seen = false;
+    while (parts.next()) |part| {
+        if (std.mem.startsWith(u8, part, "_relational_integrity_catalog=")) {
+            if (seen or !std.mem.eql(u8, part, "_relational_integrity_catalog=true")) return error.InvalidQueryRequest;
+            seen = true;
+            result.opts.relational_integrity_catalog = true;
+        } else if (std.mem.startsWith(u8, part, "_relational_integrity_action=")) {
+            if (seen or !std.mem.eql(u8, part, "_relational_integrity_action=true")) return error.InvalidQueryRequest;
+            seen = true;
+            result.opts.relational_integrity_action = true;
+        } else if (std.mem.startsWith(u8, part, "_relational_integrity_jobs=")) {
+            if (seen) return error.InvalidQueryRequest;
+            seen = true;
+            result.relational_integrity_jobs_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_relational_integrity_jobs=".len..]);
+            if (result.relational_integrity_jobs_json.len == 0 or result.relational_integrity_jobs_json.len > 4096) return error.InvalidQueryRequest;
+            result.opts.relational_integrity_jobs_json = result.relational_integrity_jobs_json;
+        } else if (std.mem.startsWith(u8, part, "_relational_activation=")) {
+            if (seen) return error.InvalidQueryRequest;
+            seen = true;
+            result.relational_activation_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_relational_activation=".len..]);
+            if (result.relational_activation_json.len == 0 or result.relational_activation_json.len > 4096) return error.InvalidQueryRequest;
+            result.opts.relational_activation_json = result.relational_activation_json;
+        }
+    }
+    return result;
+}
+
+test "relational row query control modes require authenticated internal parsing" {
+    const alloc = std.testing.allocator;
+    const query = "_relational_activation=%7B%22mode%22%3A%22status%22%7D";
+    var internal = try parseInternalLookupOptions(alloc, query);
+    defer internal.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"mode\":\"status\"}", internal.opts.relational_activation_json);
+    var public = try parseLookupOptions(alloc, query);
+    defer public.deinit(alloc);
+    try std.testing.expectEqualStrings("", public.opts.relational_activation_json);
+    try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, "_relational_integrity_catalog=true&_relational_integrity_action=true"));
+}
+
+test "relational mutation endpoints are not aliased to serverless ingestion" {
+    const serverless = @import("../serverless/api/http_routes.zig");
+    try std.testing.expect(serverless.match(.post, "/db/v1/tables/rows/rows/mutate") == null);
+    try std.testing.expect(serverless.match(.post, "/db/v1/tables/rows/rows/query") == null);
+    try std.testing.expect(serverless.match(.get, "/db/v1/tables/rows/constraints/status") == null);
 }
 
 pub fn decodePercentEncodedPathComponentAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -224,8 +280,64 @@ pub fn parseInternalScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) 
     return parseScanKeysRequestImpl(alloc, body, true);
 }
 
+pub fn parseRelationalRowQueryRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedScanKeysRequest {
+    var parsed = std.json.parseFromSlice(metadata_openapi.types.RelationalRowQueryRequest, alloc, body, .{ .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidQueryRequest,
+    };
+    defer parsed.deinit();
+    const req = parsed.value;
+    const limit = std.math.cast(u32, req.limit orelse 128) orelse return error.InvalidQueryRequest;
+    if (req.schema_version) |version| if (std.math.cast(u32, version) == null or version == 0) return error.InvalidQueryRequest;
+    const conditions: []const metadata_openapi.types.RelationalRowCondition = req.conditions orelse &.{};
+    if (req.fields.len > 256 or conditions.len > 256 or limit == 0 or limit > 4096) return error.InvalidQueryRequest;
+    for (req.fields, 0..) |field, i| {
+        if (field.len == 0) return error.InvalidQueryRequest;
+        for (req.fields[0..i]) |prior| if (std.mem.eql(u8, prior, field)) return error.InvalidQueryRequest;
+    }
+    for (conditions) |condition| if (condition.column.len == 0) return error.InvalidQueryRequest;
+    var result: OwnedScanKeysRequest = .{};
+    errdefer result.deinit(alloc);
+    result.from = if (req.from) |value| try alloc.dupe(u8, value) else "";
+    result.to = if (req.to) |value| try alloc.dupe(u8, value) else "";
+    result.fields = try cloneFieldList(alloc, req.fields);
+    result.relational_query_json = try alloc.dupe(u8, body);
+    result.opts = .{
+        .exclusive_to = true,
+        .include_documents = true,
+        .limit = limit,
+        .fields = result.fields,
+        .include_all_fields = false,
+        .relational_query_json = result.relational_query_json,
+    };
+    return result;
+}
+
+test "relational row query preserves exact operands and empty projection" {
+    const alloc = std.testing.allocator;
+    var req = try parseRelationalRowQueryRequest(alloc,
+        \\{"fields":[],"conditions":[{"column":"id","op":"eq","value":9007199254740993}],"schema_version":3,"from":"a","limit":5}
+    );
+    defer req.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), req.opts.limit);
+    try std.testing.expect(req.opts.include_documents and !req.opts.include_all_fields);
+    try std.testing.expect(std.mem.indexOf(u8, req.opts.relational_query_json, "9007199254740993") != null);
+    try std.testing.expectError(error.InvalidQueryRequest, parseRelationalRowQueryRequest(alloc, "{\"fields\":[],\"limit\":-1}"));
+    try std.testing.expectError(error.InvalidQueryRequest, parseRelationalRowQueryRequest(alloc, "{\"fields\":[\"x\",\"x\"]}"));
+}
+
 fn parseScanKeysRequestImpl(alloc: std.mem.Allocator, body: []const u8, allow_internal_options: bool) !OwnedScanKeysRequest {
     if (body.len == 0) return .{};
+
+    const relational_query_json: []const u8 = if (allow_internal_options) blk: {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
+        defer raw.deinit();
+        if (raw.value != .object) return error.InvalidQueryRequest;
+        const query = raw.value.object.get("_relational_query") orelse break :blk "";
+        if (query != .object) return error.InvalidQueryRequest;
+        break :blk try std.json.Stringify.valueAlloc(alloc, query, .{});
+    } else "";
+    errdefer if (relational_query_json.len != 0) alloc.free(relational_query_json);
 
     const include_content_hashes = if (allow_internal_options) blk: {
         var raw = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
@@ -267,10 +379,11 @@ fn parseScanKeysRequestImpl(alloc: std.mem.Allocator, body: []const u8, allow_in
         .to = to,
         .fields = fields,
         .filter_query_json = filter_query_json,
+        .relational_query_json = relational_query_json,
         .opts = .{
             .inclusive_from = parsed.value.inclusive_from orelse false,
             .exclusive_to = parsed.value.exclusive_to orelse false,
-            .include_documents = fields.len > 0,
+            .include_documents = fields.len > 0 or relational_query_json.len != 0,
             .limit = if (parsed.value.limit) |limit|
                 std.math.cast(u32, limit) orelse return error.InvalidQueryRequest
             else
@@ -279,6 +392,7 @@ fn parseScanKeysRequestImpl(alloc: std.mem.Allocator, body: []const u8, allow_in
             .include_all_fields = false,
             .filter_query_json = filter_query_json,
             .include_content_hashes = include_content_hashes,
+            .relational_query_json = relational_query_json,
         },
     };
 }
@@ -290,7 +404,18 @@ pub const ScanRequestError = struct {
 
 pub fn scanRequestError(err: anyerror) ?ScanRequestError {
     return switch (err) {
-        error.InvalidQueryRequest => .{ .status = 400, .message = "invalid scan request" },
+        error.InvalidQueryRequest,
+        error.InvalidRelationalRowsRequest,
+        error.RelationalTableRequired,
+        error.RelationalIndexColumnNotFound,
+        error.UnsupportedRelationalIndexColumn,
+        error.InvalidBatchRequest,
+        => .{ .status = 400, .message = "invalid scan request" },
+        error.PreparedSchemaChanged,
+        error.PreparedGenerationChanged,
+        error.SchemaVersionChanged,
+        => .{ .status = 409, .message = "relational schema epoch changed" },
+        error.RelationalRowsOutputBudgetExceeded => .{ .status = 413, .message = "projected row exceeds output budget" },
         // scanKeys declares BadRequest, not an operation-specific 422, in the
         // public OpenAPI contract. Keep every server and generated SDK aligned.
         error.UnsupportedQueryRequest => .{ .status = 400, .message = "unsupported scan filter query" },

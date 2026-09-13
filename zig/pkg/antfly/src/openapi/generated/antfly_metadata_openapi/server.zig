@@ -246,6 +246,11 @@ pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Read distributed unique and foreign-key validation coverage
+pub const GetRelationalConstraintStatusPathParams = struct {
+    table_name: []const u8,
+};
+
 /// Adopt stored write destinations with the current credential
 pub const ReauthorizeTableDestinationsPathParams = struct {
     /// Name of the table whose stored destinations should be adopted
@@ -441,6 +446,26 @@ pub fn parseRestoreTableBody(allocator: std.mem.Allocator, body: []const u8) !st
     return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Atomically replace or delete version-conditional typed rows
+pub const MutateRelationalRowsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for mutateRelationalRows.
+pub fn parseMutateRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Query projected typed relational rows
+pub const QueryRelationalRowsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryRelationalRows.
+pub fn parseQueryRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowQueryRequest) {
+    return std.json.parseFromSlice(types.RelationalRowQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Replace a table's schema
 pub const UpdateSchemaPathParams = struct {
     /// Name of the table
@@ -592,6 +617,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/constraints/status", .operation_id = "getRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/destination-authorization", .operation_id = "reauthorizeTableDestinations", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey", .request_body = .none, .streaming_response = false },
@@ -611,6 +637,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/cancel", .operation_id = "cancelTableRepairJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/mutate", .operation_id = "mutateRelationalRows", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/query", .operation_id = "queryRelationalRows", .request_body = .buffered, .streaming_response = true },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/tables/{tableName}/schema", .operation_id = "patchSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions", .request_body = .none, .streaming_response = false },
@@ -671,6 +699,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "cancelDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'cancelDocumentArtifactReprocessJob'");
         if (!@hasDecl(Impl, "backupTable")) @compileError("ServerRouter: Impl missing required method 'backupTable'");
         if (!@hasDecl(Impl, "batchWrite")) @compileError("ServerRouter: Impl missing required method 'batchWrite'");
+        if (!@hasDecl(Impl, "getRelationalConstraintStatus")) @compileError("ServerRouter: Impl missing required method 'getRelationalConstraintStatus'");
         if (!@hasDecl(Impl, "reauthorizeTableDestinations")) @compileError("ServerRouter: Impl missing required method 'reauthorizeTableDestinations'");
         if (!@hasDecl(Impl, "scanKeys")) @compileError("ServerRouter: Impl missing required method 'scanKeys'");
         if (!@hasDecl(Impl, "lookupKey")) @compileError("ServerRouter: Impl missing required method 'lookupKey'");
@@ -690,6 +719,8 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "cancelTableRepairJob")) @compileError("ServerRouter: Impl missing required method 'cancelTableRepairJob'");
         if (!@hasDecl(Impl, "runTableRepair")) @compileError("ServerRouter: Impl missing required method 'runTableRepair'");
         if (!@hasDecl(Impl, "restoreTable")) @compileError("ServerRouter: Impl missing required method 'restoreTable'");
+        if (!@hasDecl(Impl, "mutateRelationalRows")) @compileError("ServerRouter: Impl missing required method 'mutateRelationalRows'");
+        if (!@hasDecl(Impl, "queryRelationalRows")) @compileError("ServerRouter: Impl missing required method 'queryRelationalRows'");
         if (!@hasDecl(Impl, "updateSchema")) @compileError("ServerRouter: Impl missing required method 'updateSchema'");
         if (!@hasDecl(Impl, "patchSchema")) @compileError("ServerRouter: Impl missing required method 'patchSchema'");
         if (!@hasDecl(Impl, "listTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'listTransactionSessions'");
@@ -748,6 +779,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId/cancel", httpx.Handler.bind(self.impl, cancelDocumentArtifactReprocessJob));
             try server.post("/tables/:tableName/backup", httpx.Handler.bind(self.impl, backupTable));
             try server.post("/tables/:tableName/batch", httpx.Handler.bind(self.impl, batchWrite));
+            try server.get("/tables/:tableName/constraints/status", httpx.Handler.bind(self.impl, getRelationalConstraintStatus));
             try server.post("/tables/:tableName/destination-authorization", httpx.Handler.bind(self.impl, reauthorizeTableDestinations));
             try server.post("/tables/:tableName/documents", httpx.Handler.bind(self.impl, scanKeys));
             try server.get("/tables/:tableName/documents/:key", httpx.Handler.bind(self.impl, lookupKey));
@@ -767,6 +799,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/repair/jobs/:jobId/cancel", httpx.Handler.bind(self.impl, cancelTableRepairJob));
             try server.post("/tables/:tableName/repair/run", httpx.Handler.bind(self.impl, runTableRepair));
             try server.post("/tables/:tableName/restore", httpx.Handler.bind(self.impl, restoreTable));
+            try server.post("/tables/:tableName/rows/mutate", httpx.Handler.bind(self.impl, mutateRelationalRows));
+            try server.post("/tables/:tableName/rows/query", httpx.Handler.bind(self.impl, queryRelationalRows));
             try server.put("/tables/:tableName/schema", httpx.Handler.bind(self.impl, updateSchema));
             try server.patch("/tables/:tableName/schema", httpx.Handler.bind(self.impl, patchSchema));
             try server.get("/transactions", httpx.Handler.bind(self.impl, listTransactionSessions));
@@ -1026,6 +1060,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.batchWrite(ctx, table_name);
         }
 
+        /// Read distributed unique and foreign-key validation coverage
+        /// GET /tables/{tableName}/constraints/status
+        fn getRelationalConstraintStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.getRelationalConstraintStatus(ctx, table_name);
+        }
+
         /// Adopt stored write destinations with the current credential
         /// POST /tables/{tableName}/destination-authorization
         fn reauthorizeTableDestinations(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1181,6 +1222,20 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.restoreTable(ctx, table_name);
         }
 
+        /// Atomically replace or delete version-conditional typed rows
+        /// POST /tables/{tableName}/rows/mutate
+        fn mutateRelationalRows(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.mutateRelationalRows(ctx, table_name);
+        }
+
+        /// Query projected typed relational rows
+        /// POST /tables/{tableName}/rows/query
+        fn queryRelationalRows(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.queryRelationalRows(ctx, table_name);
+        }
+
         /// Replace a table's schema
         /// PUT /tables/{tableName}/schema
         fn updateSchema(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1322,6 +1377,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn cancelDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reauthorizeTableDestinations(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
@@ -1341,6 +1397,8 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn cancelTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn mutateRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn queryRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response

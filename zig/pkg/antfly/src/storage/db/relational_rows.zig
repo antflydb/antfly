@@ -37,12 +37,23 @@ pub const Condition = predicates.Condition;
 /// Bounds use index order, including descending components. A partial tuple
 /// denotes the whole matching left prefix, not an implicit NULL suffix.
 pub const Bound = struct { values: []const Value, inclusive: bool = true };
+pub const PrimaryBound = struct { key: []const u8, inclusive: bool = true };
+/// Internal authorization/legacy-filter adapter. Context is borrowed for the
+/// reader's lifetime; it sees the verified full typed row before projection.
+pub const RowFilter = struct {
+    context: *anyopaque,
+    matches: *const fn (*anyopaque, Allocator, []const u8, codec.OrdinalRowView) anyerror!bool,
+};
 pub const Request = struct {
     /// Null selects primary-key order. Named indexes must have a durable
     /// ready proof for this exact generation and owned range.
     index: ?[]const u8 = null,
     lower: ?Bound = null,
     upper: ?Bound = null,
+    primary_lower: ?PrimaryBound = null,
+    primary_upper: ?PrimaryBound = null,
+    expected_schema_version: ?u32 = null,
+    row_filter: ?RowFilter = null,
     /// Explicit column names. Empty means an empty projection, not SELECT *.
     fields: []const []const u8 = &.{},
     /// Conjunction of typed comparisons; SQL UNKNOWN does not match WHERE.
@@ -97,6 +108,7 @@ pub const Reader = struct {
     fields: []const []const u8,
     now_ns: u64,
     authenticated: bool,
+    row_filter: ?RowFilter,
     source: ?registry.SchemaView = null,
     selected: ?codec.OrdinalProjectionPlan = null,
     conditions: []predicates.Plan,
@@ -105,11 +117,14 @@ pub const Reader = struct {
     done: bool = false,
 
     /// Caller fences schema/catalog publication while this snapshot is opened.
-    /// The returned reader owns all inputs, but must close before its DB closes.
+    /// Owns request data except row_filter.context, which the caller retains
+    /// through reader.deinit. The reader must close before its DB closes.
     pub fn open(alloc: Allocator, store: *docstore.DocStore, active_view: registry.SchemaView, indexes: ?catalog.WriteSnapshot, request: Request, now_ns: u64) !Reader {
         if (active_view.storageMode() != .relational) return error.RelationalTableRequired;
+        if (request.expected_schema_version) |version| if (version != active_view.version()) return error.PreparedGenerationChanged;
         if (request.fields.len > 256 or request.conditions.len > 256 or (request.index == null and (request.lower != null or request.upper != null)))
             return error.InvalidRelationalRowsRequest;
+        if (request.index != null and (request.primary_lower != null or request.primary_upper != null)) return error.InvalidRelationalRowsRequest;
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const owned = arena.allocator();
@@ -132,6 +147,16 @@ pub const Reader = struct {
         var lower: []const u8 = owned_lower;
         var upper: []const u8 = owned_upper;
         var selected_index: ?plans.BoundIndex = null;
+        if (request.primary_lower) |bound| {
+            const prefix = try internal.documentExactPrefixAlloc(owned, bound.key);
+            const requested = if (bound.inclusive) prefix else (try internal.nextPrefixAlloc(owned, prefix)) orelse return error.InvalidRelationalRowsRequest;
+            if (std.mem.order(u8, requested, lower) == .gt) lower = requested;
+        }
+        if (request.primary_upper) |bound| {
+            const prefix = try internal.documentExactPrefixAlloc(owned, bound.key);
+            const requested = if (!bound.inclusive) prefix else (try internal.nextPrefixAlloc(owned, prefix)) orelse return error.InvalidRelationalRowsRequest;
+            if (std.mem.order(u8, requested, upper) == .lt) upper = requested;
+        }
         if (request.index) |name| {
             const pinned = indexes orelse return error.IndexNotFound;
             if (pinned.plan.schemaView().epoch != active_view.epoch) return error.PreparedGenerationChanged;
@@ -172,7 +197,9 @@ pub const Reader = struct {
             .fields = fields,
             .now_ns = now_ns,
             .authenticated = store.valuesAreAuthenticated(),
+            .row_filter = request.row_filter,
             .conditions = conditions,
+            .done = std.mem.order(u8, lower, upper) != .lt,
         };
     }
 
@@ -301,17 +328,22 @@ pub const Reader = struct {
                 const row = try self.rowView(raw);
                 const expired = self.active.tableSchema().ttl_duration_ns != 0 and row.writeTimestampNs() != 0 and
                     ttl.isExpired(row.writeTimestampNs(), self.active.tableSchema().ttl_duration_ns, self.now_ns);
+                var decoded_key: ?[]const u8 = null;
                 const matches = check: {
                     if (expired) break :check false;
                     for (self.source_conditions) |condition| {
                         if (io) |runtime_io| try runtime_io.checkCancel();
                         if (!(try condition.evaluate(alloc, &predicate_scratch, row)).matches()) break :check false;
                     }
+                    if (self.row_filter) |filter| {
+                        decoded_key = (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
+                        if (!try filter.matches(filter.context, temporary, decoded_key.?, row)) break :check false;
+                    }
                     break :check true;
                 };
                 if (matches) {
                     const json = try row.projectAlloc(temporary, self.selected.?);
-                    const document = (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
+                    const document = decoded_key orelse (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
                     const size = json.len + document.len;
                     if (size > budget.output_bytes) return error.RelationalRowResultTooLarge;
                     if (size > budget.output_bytes - result.output_bytes) {

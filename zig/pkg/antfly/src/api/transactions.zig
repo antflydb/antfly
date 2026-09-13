@@ -187,12 +187,17 @@ pub const CommitConflict = struct {
     group_id: ?u64 = null,
     phase: ?distributed_txn.ParticipantPhase = null,
     kind: CommitConflictKind = .transaction_conflict,
+    reason: ?CommitConflictReason = null,
     retryable: bool = false,
     retry_after_ms: ?u32 = null,
     retry_scope: ?[]const u8 = null,
     expected_version: ?u64 = null,
     current_version: ?u64 = null,
 };
+
+/// Stable validation causes survive participant transport and durable abort.
+/// They must not be mistaken for transient contention by activation workers.
+pub const CommitConflictReason = @import("distributed_txn_contract.zig").CommitConflictReason;
 
 pub const CommitConflictKind = enum {
     version_conflict,
@@ -556,6 +561,7 @@ pub const CommitConflictResponse = struct {
     key: []const u8,
     message: []const u8,
     kind: []const u8,
+    reason: ?CommitConflictReason = null,
     retryable: bool,
     retry_after_ms: ?u32 = null,
     retry_scope: ?[]const u8 = null,
@@ -2671,6 +2677,7 @@ fn buildCommitConflictResponse(info: CommitConflict) CommitConflictResponse {
         .key = info.key,
         .message = info.message,
         .kind = conflictKindText(info.kind),
+        .reason = info.reason,
         .retryable = info.retryable,
         .retry_after_ms = info.retry_after_ms,
         .retry_scope = info.retry_scope,
@@ -2888,8 +2895,9 @@ pub fn conflictFromOutcome(outcome: distributed_txn.CommitConflict) CommitConfli
         .message = outcome.message,
         .group_id = outcome.group_id,
         .phase = outcome.phase,
+        .reason = outcome.reason,
         .kind = classifyConflictKind(outcome.message),
-        .retryable = isRetryableConflict(outcome.message),
+        .retryable = outcome.reason == null and (outcome.retryable or isRetryableConflict(outcome.message)),
         .retry_after_ms = retryAfterMsForKind(classifyConflictKind(outcome.message)),
         .retry_scope = retryScopeForKind(classifyConflictKind(outcome.message)),
     };

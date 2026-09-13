@@ -621,6 +621,79 @@ func (c *AntflyClient) LookupKeyWithFields(ctx context.Context, tableName, key, 
 	return document, nil
 }
 
+// QueryRelationalRows reads one bounded primary-key-ordered page. Integer row
+// values decode as json.Number, preserving int64 precision. Resume using the
+// final row's Id as From; pagination opens a new snapshot on each request.
+func (c *AntflyClient) QueryRelationalRows(ctx context.Context, tableName string, request RelationalRowQueryRequest) ([]RelationalRow, error) {
+	resp, err := c.client.QueryRelationalRows(ctx, tableName, request)
+	if err != nil {
+		return nil, fmt.Errorf("querying relational rows: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("querying relational rows: %w", readErrorResponse(resp))
+	}
+	body, truncated, err := readLimitedBody(resp.Body, 16<<20)
+	if err != nil {
+		return nil, fmt.Errorf("reading relational rows: %w", err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("relational row response exceeds 16 MiB")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	rows := make([]RelationalRow, 0)
+	for {
+		var row RelationalRow
+		if err := decoder.Decode(&row); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return nil, fmt.Errorf("decoding relational row: %w", err)
+		}
+		if len(rows) == 4096 {
+			return nil, fmt.Errorf("relational row response exceeds 4096 rows")
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+// MutateRelationalRows atomically replaces/deletes rows with exact row-version
+// and schema-epoch preconditions. It never retries an ambiguous commit.
+func (c *AntflyClient) MutateRelationalRows(ctx context.Context, tableName string, request RelationalRowMutationRequest) (*BatchResult, error) {
+	body, err := boundedJSONBody(request, DefaultWriteMaxRequestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("encoding relational mutations: %w", err)
+	}
+	resp, err := c.client.MutateRelationalRowsWithBody(ctx, tableName, "application/json", body)
+	if err != nil {
+		return nil, fmt.Errorf("mutating relational rows: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("mutating relational rows: %w", readErrorResponse(resp))
+	}
+	response, truncated, err := readLimitedBody(resp.Body, DefaultWriteMaxResponseBytes)
+	if err != nil {
+		return nil, fmt.Errorf("reading relational mutation outcome: %w", err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("relational mutation outcome exceeded response limit")
+	}
+	var result BatchResult
+	if err := json.Unmarshal(response, &result); err != nil {
+		return nil, fmt.Errorf("decoding relational mutation outcome: %w", err)
+	}
+	if result.Status == "" {
+		if resp.StatusCode == http.StatusAccepted {
+			result.Status = "committed_pending"
+		} else {
+			result.Status = "committed"
+		}
+	}
+	return &result, nil
+}
+
 // ScanKeys scans keys in a table within an optional key range.
 // Returns keys and optionally document data based on the request parameters.
 func (c *AntflyClient) ScanKeys(ctx context.Context, tableName string, request ScanKeysRequest) ([]map[string]any, error) {

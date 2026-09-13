@@ -435,6 +435,14 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
 
     const relational_columns = try deriveRuntimeRelationalColumns(alloc, schema);
     errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
+    if (schema.unique_constraints != null or schema.foreign_keys != null) {
+        const definitions = try @import("relational_declarations.zig").definitionFingerprints(alloc, schema, .{
+            .version = schema.version,
+            .storage_mode = .relational,
+            .relational_columns = relational_columns,
+        });
+        @import("relational_declarations.zig").freeDefinitions(alloc, definitions);
+    }
     if (schema.checks) |checks| @import("relational_checks.zig").validateDefinitions(alloc, .{
         .version = schema.version,
         .storage_mode = .relational,

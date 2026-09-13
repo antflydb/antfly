@@ -71,6 +71,10 @@ pub const RequestContext = struct {
     /// the caller did not supply one; adapters may generate one in middleware.
     request_id: []const u8 = "",
     principal: ?Principal = null,
+    /// Request-lifetime capability for writes discovered after initial route
+    /// admission (for example FK cascades). Adapters retain the admitted
+    /// credential scopes; a username alone cannot reconstruct API-key rights.
+    table_write_authorization: ?TableWriteAuthorization = null,
     admission: ?*AdmissionReservation = null,
     /// Durable hash of an externally sourced table definition that was
     /// authorized before asynchronous restore admission.
@@ -93,6 +97,11 @@ pub const RequestContext = struct {
             if (now_ns >= deadline) return error.DeadlineExceeded;
         }
     }
+};
+
+pub const TableWriteAuthorization = struct {
+    ptr: *const anyopaque,
+    allows: *const fn (*const anyopaque, []const u8) bool,
 };
 
 /// A synchronous sink applies backpressure by not returning from `writeAll`
