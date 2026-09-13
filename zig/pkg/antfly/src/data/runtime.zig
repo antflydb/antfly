@@ -33152,28 +33152,14 @@ fn consumerTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
             };
 
-            const nonce = platform_time.monotonicNs();
-            const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-log-{d}", .{nonce});
-            defer alloc.free(primary_log_raw);
-            const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+            var fixture = try @import("../common/test_directory.zig").TestDirectory.init("ha-node");
+            defer fixture.cleanup();
+            const primary_log = try std.fmt.allocPrintSentinel(alloc, "{s}-primary-log", .{fixture.path()}, 0);
             defer alloc.free(primary_log);
-            const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-slots-{d}", .{nonce});
-            defer alloc.free(primary_slots_raw);
-            const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+            const primary_slots = try std.fmt.allocPrintSentinel(alloc, "{s}-primary-slots", .{fixture.path()}, 0);
             defer alloc.free(primary_slots);
-            const fence_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-fence-{d}", .{nonce});
-            defer alloc.free(fence_raw);
-            const fence_path = try alloc.dupeZ(u8, fence_raw);
+            const fence_path = try std.fmt.allocPrintSentinel(alloc, "{s}-primary-fence", .{fixture.path()}, 0);
             defer alloc.free(fence_path);
-
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_path) catch {};
-            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
-            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
-            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_path) catch {};
 
             const identity = antfly.ha.primary.Identity{
                 .cluster_id = 100,
@@ -33191,7 +33177,7 @@ fn consumerTests() type {
             defer fence_store.close();
 
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
-                .replica_root_dir = ".",
+                .replica_root_dir = fixture.path(),
                 .ha = .{
                     .admin_context = .{
                         .primary = &primary,
@@ -43104,22 +43090,12 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
             };
 
-            const nonce = platform_time.monotonicNs();
-            const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-standby-log-{d}", .{nonce});
-            defer alloc.free(standby_log_raw);
-            const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+            var fixture = try @import("../common/test_directory.zig").TestDirectory.init("ha-node");
+            defer fixture.cleanup();
+            const standby_log = try std.fmt.allocPrintSentinel(alloc, "{s}-standby-log", .{fixture.path()}, 0);
             defer alloc.free(standby_log);
-            const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-standby-progress-{d}", .{nonce});
-            defer alloc.free(standby_progress_raw);
-            const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+            const standby_progress = try std.fmt.allocPrintSentinel(alloc, "{s}-standby-progress", .{fixture.path()}, 0);
             defer alloc.free(standby_progress);
-
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
-            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
-            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
 
             var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
                 .cluster_id = 100,
@@ -43131,7 +43107,7 @@ fn implementationTests() type {
             defer standby.close();
 
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
-                .replica_root_dir = ".",
+                .replica_root_dir = fixture.path(),
                 .ha = .{
                     .admin_context = .{
                         .standby = &standby,

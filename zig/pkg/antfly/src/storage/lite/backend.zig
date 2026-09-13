@@ -248,6 +248,7 @@ pub const Handle = struct {
                 opts.storage = storage;
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
+                opts.index_backends.vector_block_storage = storage;
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.index_repair_checkpoint_storage = storage;
@@ -269,6 +270,7 @@ pub const Handle = struct {
                 opts.index_backends.graph_reverse_backend = .lsm;
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
+                opts.index_backends.vector_block_storage = storage;
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.index_backends.text_main_lsm_options.storage = storage;
@@ -341,6 +343,7 @@ pub const Handle = struct {
         opts.index_backends.graph_reverse_backend = .lsm;
         opts.index_backends.text_lsm_storage = storage;
         opts.index_backends.dense_lsm_storage = storage;
+        opts.index_backends.vector_block_storage = storage;
         opts.index_backends.sparse_lsm_storage = storage;
         opts.index_backends.graph_lsm_storage = storage;
         opts.index_backends.text_main_lsm_options.storage = storage;
@@ -1546,4 +1549,27 @@ test "lite backend native open requires an existing file" {
         .engine = .native_single_file,
         .read_only = true,
     }));
+}
+
+test "lite backend keeps vector blocks inside each single file and namespace" {
+    const alloc = std.testing.allocator;
+    var fixture = try @import("../../common/test_directory.zig").TestDirectory.init("vectors.aflite");
+    defer fixture.cleanup();
+    for ([_]bool{ false, true }) |reopen| {
+        var handle = if (reopen) try Handle.open(alloc, fixture.path(), .{}) else try Handle.create(alloc, fixture.path(), true);
+        defer handle.deinit();
+        for ([_]?[]const u8{ null, "tables/a", "tables/b" }, 0..) |namespace, index| {
+            var opts = db_mod.OpenOptions{};
+            if (namespace) |name| try handle.configureDbOpenOptionsForNamespace(&opts, name) else try handle.configureDbOpenOptions(&opts);
+            const storage = opts.index_backends.vector_block_storage orelse return error.MissingVectorBlockStorage;
+            const path = try std.fmt.allocPrint(alloc, "{s}/vector-blocks/test.afvb", .{opts.index_base_path.?});
+            defer alloc.free(path);
+            const payload = try std.fmt.allocPrint(alloc, "namespace-{d}", .{index});
+            defer alloc.free(payload);
+            if (!reopen) try storage.writeFileAbsolute(path, payload);
+            const read = try storage.readFileAlloc(alloc, path, 64);
+            defer alloc.free(read);
+            try std.testing.expectEqualStrings(payload, read);
+        }
+    }
 }
