@@ -14,8 +14,8 @@ import type {
   EmbedResponse,
   EntityExtractionResult,
   ExtractRequest,
-  ExtractV2Request,
   ExtractResponse,
+  ExtractV2Request,
   GenerateChunk,
   GenerateRequest,
   GenerateResponse,
@@ -430,9 +430,8 @@ export class InferenceClient {
    */
   async extractRaw(request: ExtractRequest): Promise<ExtractResponse> {
     const expectedModel = request.model;
-    const expectedIds = request.schema_version === 2
-      ? request.inputs.map((input) => input.id)
-      : undefined;
+    const expectedIds =
+      request.schema_version === 2 ? request.inputs.map((input) => input.id) : undefined;
     const { data, error, response } = await this.client.POST("/ai/v1/extract", {
       body: request,
     });
@@ -653,7 +652,7 @@ function validateExtractionV2Response(
       throw new Error(`Invalid extraction v2 response: item ${index} must be an object`);
     }
     const item = row as Record<string, unknown>;
-    const hasId = Object.prototype.hasOwnProperty.call(item, "id");
+    const hasId = Object.hasOwn(item, "id");
     if ((hasId && typeof item.id !== "string") || item.id !== expectedIds[index]) {
       throw new Error(`Invalid extraction v2 response: item ${index} id mismatch`);
     }

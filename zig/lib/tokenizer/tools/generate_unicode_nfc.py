@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Generate canonical normalization data from pinned CPython Unicode 15.0.0."""
+
 from pathlib import Path
 import hashlib
 import unicodedata as ud
@@ -30,11 +31,17 @@ lines = [
     "pub const Composition = struct { pair: u64, cp: u21 };",
     "pub const decompositions = [_]Decomposition{",
 ]
-lines += [f"    .{{ .cp = 0x{cp:x}, .first = 0x{a:x}, .second = 0x{b:x} }}," for cp, a, b in decompositions]
+lines += [
+    f"    .{{ .cp = 0x{cp:x}, .first = 0x{a:x}, .second = 0x{b:x} }},"
+    for cp, a, b in decompositions
+]
 lines += ["};", "pub const combining = [_]Combining{"]
 lines += [f"    .{{ .cp = 0x{cp:x}, .value = {value} }}," for cp, value in combining]
 lines += ["};", "pub const compositions = [_]Composition{"]
-lines += [f"    .{{ .pair = 0x{pair:x}, .cp = 0x{cp:x} }}," for pair, cp in sorted(compositions)]
+lines += [
+    f"    .{{ .pair = 0x{pair:x}, .cp = 0x{cp:x} }},"
+    for pair, cp in sorted(compositions)
+]
 lines += ["};", ""]
 output = Path(__file__).resolve().parents[1] / "src" / "unicode_nfc_data.zig"
 data = "\n".join(lines).encode()

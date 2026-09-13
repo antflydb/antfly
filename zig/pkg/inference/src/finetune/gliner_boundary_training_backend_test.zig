@@ -142,6 +142,7 @@ fn deviceAvailable() !void {
 }
 
 test "boundary training backend Metal uploads frozen weights once and owns temporary selection metadata" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
     try deviceAvailable();
     const a = std.testing.allocator;
     var store = try source(a);
@@ -193,6 +194,7 @@ fn bindAllocation(a: Allocator, owner: *backend.Owner, g: *const ml.Graph) !void
 }
 
 test "boundary training backend Metal validates bindings and recovers cancellation and allocation failures" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
     try deviceAvailable();
     const a = std.testing.allocator;
     var store = try source(a);
@@ -229,6 +231,7 @@ test "boundary training backend Metal validates bindings and recovers cancellati
 }
 
 test "boundary training backend Metal preflight finite checks and cancelled initialization release uploads" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
     try deviceAvailable();
     const a = std.testing.allocator;
     var store = try source(a);

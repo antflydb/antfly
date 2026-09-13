@@ -60,7 +60,7 @@ test "GLiNER2.5 resident Metal PEFT matches all pinned LoRA DoRA shared dropout 
 fn peftOracle(comptime resident: bool) !void {
     const a = std.testing.allocator;
     var device: ?resident_fixture.Device = if (resident) try resident_fixture.Device.init(a) else null;
-    defer if (device) |*value| value.deinit();
+    defer if (resident) if (device) |*value| value.deinit();
     const metadata = try fixture.fixtureBytes(a, "training_peft/capture.json");
     defer a.free(metadata);
     var manifest = try std.json.parseFromSlice(struct {
@@ -171,7 +171,8 @@ fn peftOracle(comptime resident: bool) !void {
             const expected = try reference.floats(try std.fmt.allocPrint(scratch, "{s}.gradient.{s}", .{ case.id, name }));
             try compare(a, &cb, value, expected);
         }
-        if (device) |*value| {
+        if (resident) {
+            const value = &device.?;
             const gpu = value.backend.computeBackend();
             var actual = try resident_fixture.run(a, &gpu, &cb, &session, runtime.items, cotangents.items);
             defer actual.deinit(&gpu);

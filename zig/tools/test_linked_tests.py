@@ -153,7 +153,7 @@ test "fixture consumer" {
     def test_concurrent_execution_retains_diagnostics_and_runs_again(self):
         self.write(
             "barrier.py",
-            '''import pathlib, sys, time
+            """import pathlib, sys, time
 root = pathlib.Path(__file__).parent
 name = sys.argv[1]
 own = root / (name + ".count")
@@ -169,7 +169,7 @@ while not other.exists() or int(other.read_text()) != generation:
     time.sleep(.01)
 print("stdout-" + name)
 print("diagnostic-" + name, file=sys.stderr)
-''',
+""",
         )
         for generation in (1, 2):
             output = self.build("concurrency")

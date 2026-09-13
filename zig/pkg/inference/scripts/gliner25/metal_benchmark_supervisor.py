@@ -9,6 +9,7 @@ supervision for our workers, not a sandbox against an escaping double-fork.
 Only the direct Popen child can be reaped here. Cleanup reports descendant exit
 and any zombies separately, without claiming to have waited on nonchildren.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -58,17 +59,28 @@ def strict_json(data: bytes) -> dict[str, Any]:
         return parsed if math.isfinite(parsed) else invalid(value)
 
     try:
-        result = json.loads(data, object_pairs_hook=unique, parse_constant=invalid,
-                            parse_float=finite_float)
+        result = json.loads(
+            data,
+            object_pairs_hook=unique,
+            parse_constant=invalid,
+            parse_float=finite_float,
+        )
     except (ValueError, UnicodeError, RecursionError) as error:
-        raise BenchmarkError(f"invalid protocol JSON: {type(error).__name__}") from error
+        raise BenchmarkError(
+            f"invalid protocol JSON: {type(error).__name__}"
+        ) from error
     if not isinstance(result, dict):
         raise BenchmarkError("protocol event must be an object")
     return result
 
 
 def _deadline(timeout: float) -> float:
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
         raise BenchmarkError("timeout must be positive and finite")
     return time.monotonic() + timeout
 
@@ -97,10 +109,18 @@ class _ProcessTree:
                 return
             if len(self.known) >= MAX_PROCESSES:
                 raise BenchmarkError("owned process identity ceiling exceeded")
-            self.known[key] = {"process": process, "pid": key[0], "create_time": key[1], "relation": relation}
+            self.known[key] = {
+                "process": process,
+                "pid": key[0],
+                "create_time": key[1],
+                "relation": relation,
+            }
             # Every separately created session whose leader is an observed
             # descendant can also be scanned after that leader has exited.
-            if os.getpgid(process.pid) == process.pid and os.getsid(process.pid) == process.pid:
+            if (
+                os.getpgid(process.pid) == process.pid
+                and os.getsid(process.pid) == process.pid
+            ):
                 self.groups[process.pid] = key
         except (self.psutil.NoSuchProcess, ProcessLookupError):
             return
@@ -108,7 +128,9 @@ class _ProcessTree:
     def alive(self, entry, *, include_zombie=False):
         process = entry["process"]
         try:
-            return process.is_running() and (include_zombie or process.status() != self.psutil.STATUS_ZOMBIE)
+            return process.is_running() and (
+                include_zombie or process.status() != self.psutil.STATUS_ZOMBIE
+            )
         except self.psutil.NoSuchProcess:
             return False
 
@@ -145,7 +167,9 @@ class _ProcessTree:
                     continue
                 process = self.psutil.Process(pid)
                 if process.create_time() < self.groups[group][1]:
-                    raise BenchmarkError("owned process group creation identity differs")
+                    raise BenchmarkError(
+                        "owned process group creation identity differs"
+                    )
                 self._register(process, "owned_process_group")
             except (ProcessLookupError, self.psutil.NoSuchProcess):
                 continue
@@ -208,28 +232,42 @@ class _ProcessTree:
         zombies = []
         for entry in self.known.values():
             try:
-                if entry["relation"] != "direct_child" and self.alive(entry, include_zombie=True) and not self.alive(entry):
+                if (
+                    entry["relation"] != "direct_child"
+                    and self.alive(entry, include_zombie=True)
+                    and not self.alive(entry)
+                ):
                     zombies.append(self.public(entry))
             except Exception as error:
                 self.record_error(error)
         living_keys = {(entry["pid"], entry["create_time"]) for entry in survivors}
         return {
             "tracked_processes": [self.public(entry) for entry in self.known.values()],
-            "signals": self.actions.copy(), "inspection_errors": self.errors.copy(),
+            "signals": self.actions.copy(),
+            "inspection_errors": self.errors.copy(),
             "survivors": [self.public(entry) for entry in survivors],
-            "observed_exited": [self.public(entry) for key, entry in self.known.items() if key not in living_keys],
+            "observed_exited": [
+                self.public(entry)
+                for key, entry in self.known.items()
+                if key not in living_keys
+            ],
             "unreaped_descendant_zombies": zombies,
             "nonchild_reaping": "not attempted; descendant waiters or the OS own reaping",
         }
 
 
 class ResourceGuard:
-    def __init__(self, max_rss_bytes: int = 8 * 1024**3, max_log_bytes: int = MAX_LOG_BYTES):
+    def __init__(
+        self, max_rss_bytes: int = 8 * 1024**3, max_log_bytes: int = MAX_LOG_BYTES
+    ):
         if type(max_rss_bytes) is not int or max_rss_bytes <= 0:
             raise BenchmarkError("RSS ceiling must be a positive integer")
         if type(max_log_bytes) is not int or not 0 < max_log_bytes <= MAX_LOG_BYTES:
-            raise BenchmarkError("log ceiling must be a positive integer at most 64 MiB")
+            raise BenchmarkError(
+                "log ceiling must be a positive integer at most 64 MiB"
+            )
         import psutil
+
         # A sandbox without process enumeration cannot provide tree ownership.
         # Detect that before launching any worker, including a model loader.
         own = psutil.Process(os.getpid())
@@ -248,8 +286,12 @@ class ResourceGuard:
         self._completed: list[dict[str, Any]] = []
 
     def _register(self, worker):
-        if len(self.workers) >= 2 or any(item.arm == worker.arm for item in self.workers):
-            raise BenchmarkError("at most two distinct benchmark arms may be owned at once")
+        if len(self.workers) >= 2 or any(
+            item.arm == worker.arm for item in self.workers
+        ):
+            raise BenchmarkError(
+                "at most two distinct benchmark arms may be owned at once"
+            )
         self.workers.append(worker)
 
     def _unregister(self, worker):
@@ -262,7 +304,9 @@ class ResourceGuard:
     def check(self) -> None:
         now = time.monotonic()
         if self._last_sample is not None:
-            self.max_sample_interval_seconds = max(self.max_sample_interval_seconds, now - self._last_sample)
+            self.max_sample_interval_seconds = max(
+                self.max_sample_interval_seconds, now - self._last_sample
+            )
         self._last_sample = now
         self.samples += 1
         combined = {}
@@ -270,28 +314,47 @@ class ResourceGuard:
             worker._pump()
             rss = worker._tree.sample()
             combined.update(rss)
-            self.peak_rss_by_arm[worker.arm] = max(self.peak_rss_by_arm.get(worker.arm, 0), sum(rss.values()))
+            self.peak_rss_by_arm[worker.arm] = max(
+                self.peak_rss_by_arm.get(worker.arm, 0), sum(rss.values())
+            )
         total = sum(combined.values())
         self.peak_rss_bytes = max(self.peak_rss_bytes, total)
         if total > self.max_rss_bytes:
-            raise BenchmarkError(f"combined worker RSS {total} exceeds {self.max_rss_bytes}")
+            raise BenchmarkError(
+                f"combined worker RSS {total} exceeds {self.max_rss_bytes}"
+            )
 
     def receipt(self) -> dict[str, Any]:
         return {
-            "max_rss_bytes": self.max_rss_bytes, "max_log_bytes_per_arm": self.max_log_bytes,
-            "peak_rss_bytes": self.peak_rss_bytes, "peak_rss_by_arm": self.peak_rss_by_arm.copy(),
-            "samples": self.samples, "poll_seconds": POLL_SECONDS,
+            "max_rss_bytes": self.max_rss_bytes,
+            "max_log_bytes_per_arm": self.max_log_bytes,
+            "peak_rss_bytes": self.peak_rss_bytes,
+            "peak_rss_by_arm": self.peak_rss_by_arm.copy(),
+            "samples": self.samples,
+            "poll_seconds": POLL_SECONDS,
             "max_sample_interval_seconds": self.max_sample_interval_seconds,
             "rss_measurement": "sampled owned-process RSS; shared pages may count twice",
-            "psutil_version": self.psutil.__version__, "completed_workers": self._completed.copy(),
+            "psutil_version": self.psutil.__version__,
+            "completed_workers": self._completed.copy(),
         }
 
 
 class Worker:
-    def __init__(self, arm: str, command: list[str], env: dict[str, str], directory: Path, guard: ResourceGuard):
+    def __init__(
+        self,
+        arm: str,
+        command: list[str],
+        env: dict[str, str],
+        directory: Path,
+        guard: ResourceGuard,
+    ):
         if not isinstance(arm, str) or not _ARM.fullmatch(arm):
             raise BenchmarkError("invalid bounded worker arm identity")
-        if not isinstance(command, list) or not command or not all(isinstance(item, str) and "\0" not in item for item in command):
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(item, str) and "\0" not in item for item in command)
+        ):
             raise BenchmarkError("worker argv must be a nonempty string list")
         self.arm = arm
         self.guard = guard
@@ -314,12 +377,23 @@ class Worker:
         self.cleanup: dict[str, Any] | None = None
         try:
             self.log = self.log_path.open("xb", buffering=0)
-            self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                            stderr=subprocess.PIPE, env=env, bufsize=0, start_new_session=True)
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                bufsize=0,
+                start_new_session=True,
+            )
             # Register the owner before any fallible selector/stream setup.
             self.guard._register(self)
             self._tree = _ProcessTree(self.process, self.guard.psutil)
-            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+            for stream in (
+                self.process.stdin,
+                self.process.stdout,
+                self.process.stderr,
+            ):
                 os.set_blocking(stream.fileno(), False)
             self.selector = selectors.DefaultSelector()
             self.selector.register(self.process.stdout, selectors.EVENT_READ)
@@ -370,7 +444,9 @@ class Worker:
                 self.log.write(data[:available])
                 self._stderr_bytes += len(data)
                 window = self._stderr_tail + data.lower()
-                fallback = b"mps" in window and b"cpu" in window and _FALLBACK.search(window)
+                fallback = (
+                    b"mps" in window and b"cpu" in window and _FALLBACK.search(window)
+                )
                 self._stderr_tail = window[-8192:]
                 if self._stderr_bytes > self.guard.max_log_bytes:
                     self._violation("stderr log byte ceiling exceeded", cleanup)
@@ -403,7 +479,9 @@ class Worker:
                     raise BenchmarkError(f"{self.arm}: response deadline exceeded")
                 return event
             if self._stdout_eof:
-                raise BenchmarkError(f"{self.arm}: exited before response (code {self.process.poll()}); see {self.log_path}")
+                raise BenchmarkError(
+                    f"{self.arm}: exited before response (code {self.process.poll()}); see {self.log_path}"
+                )
             self._wait(deadline)
 
     def _validate(self, event):
@@ -411,7 +489,12 @@ class Worker:
         if kind not in ("ready", "result", "error", "stopped"):
             raise BenchmarkError(f"{self.arm}: unknown protocol event")
         if self._pending is None:
-            if self._ready or kind != "ready" or event.get("arm") != self.arm or "request_id" in event:
+            if (
+                self._ready
+                or kind != "ready"
+                or event.get("arm") != self.arm
+                or "request_id" in event
+            ):
                 raise BenchmarkError(f"{self.arm}: ready identity mismatch")
             self._ready = True
             return
@@ -419,16 +502,23 @@ class Worker:
         if type(event.get("request_id")) is not int or event["request_id"] != seq:
             raise BenchmarkError(f"{self.arm}: response request identity mismatch")
         if kind == "stopped" and op == "stop":
-            if event.get("arm", self.arm) != self.arm or event.get("case_id", case_id) != case_id:
+            if (
+                event.get("arm", self.arm) != self.arm
+                or event.get("case_id", case_id) != case_id
+            ):
                 raise BenchmarkError(f"{self.arm}: stopped identity mismatch")
             self._stopped = True
         elif kind in ("result", "error") and (kind == "error" or op != "stop"):
             if event.get("arm") != self.arm or event.get("case_id") != case_id:
                 raise BenchmarkError(f"{self.arm}: result identity mismatch")
-            if kind == "result" and (type(event.get("duration_ns")) is not int or event["duration_ns"] <= 0):
+            if kind == "result" and (
+                type(event.get("duration_ns")) is not int or event["duration_ns"] <= 0
+            ):
                 raise BenchmarkError(f"{self.arm}: invalid result duration_ns")
             if kind == "error" and "duration_ns" in event:
-                raise BenchmarkError(f"{self.arm}: error event contains successful timing")
+                raise BenchmarkError(
+                    f"{self.arm}: error event contains successful timing"
+                )
         else:
             raise BenchmarkError(f"{self.arm}: unexpected protocol event for request")
         self._pending = None
@@ -437,32 +527,57 @@ class Worker:
         try:
             if self._closed:
                 raise BenchmarkError(f"{self.arm}: worker is closed")
-            self.guard._last_sample = None  # Caller work between waits is not a sampling interval.
+            self.guard._last_sample = (
+                None  # Caller work between waits is not a sampling interval.
+            )
             return self._receive(_deadline(timeout))
         except BaseException as error:
             self._rollback(error)
             raise
 
-    def request(self, op: str, case_id: str = "", timeout: float = 35) -> dict[str, Any]:
+    def request(
+        self, op: str, case_id: str = "", timeout: float = 35
+    ) -> dict[str, Any]:
         try:
             deadline = _deadline(timeout)
             self.guard._last_sample = None
-            if self._closed or not self._ready or self._stopped or self._pending is not None:
-                raise BenchmarkError(f"{self.arm}: request outside ready protocol state")
-            if op not in ("validate", "run", "stop") or not isinstance(case_id, str) or (op == "stop" and case_id) or (op != "stop" and not case_id):
+            if (
+                self._closed
+                or not self._ready
+                or self._stopped
+                or self._pending is not None
+            ):
+                raise BenchmarkError(
+                    f"{self.arm}: request outside ready protocol state"
+                )
+            if (
+                op not in ("validate", "run", "stop")
+                or not isinstance(case_id, str)
+                or (op == "stop" and case_id)
+                or (op != "stop" and not case_id)
+            ):
                 raise BenchmarkError(f"{self.arm}: invalid command identity")
             if self.sequence >= MAX_COMMANDS:
                 raise BenchmarkError(f"{self.arm}: command count ceiling exceeded")
             if len(case_id) > MAX_COMMAND_BYTES:
                 raise BenchmarkError(f"{self.arm}: command exceeds 2048 bytes")
             seq = self.sequence + 1
-            data = (json.dumps({"request_id": seq, "op": op, "case_id": case_id}, ensure_ascii=False,
-                               allow_nan=False, separators=(",", ":")) + "\n").encode()
+            data = (
+                json.dumps(
+                    {"request_id": seq, "op": op, "case_id": case_id},
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
             if len(data) > MAX_COMMAND_BYTES:
                 raise BenchmarkError(f"{self.arm}: command exceeds 2048 bytes")
             self.guard.check()
             if self.buffer:
-                raise BenchmarkError(f"{self.arm}: unsolicited protocol output before request")
+                raise BenchmarkError(
+                    f"{self.arm}: unsolicited protocol output before request"
+                )
             self.sequence = seq
             self._pending = (seq, op, case_id)
             self.selector.register(self.process.stdin, selectors.EVENT_WRITE)
@@ -473,11 +588,15 @@ class Worker:
                         raise BenchmarkError(f"{self.arm}: command deadline exceeded")
                     self.guard.check()
                     try:
-                        position += os.write(self.process.stdin.fileno(), data[position:])
+                        position += os.write(
+                            self.process.stdin.fileno(), data[position:]
+                        )
                     except BlockingIOError:
                         self._wait(deadline)
                     except BrokenPipeError as error:
-                        raise BenchmarkError(f"{self.arm}: worker command pipe closed") from error
+                        raise BenchmarkError(
+                            f"{self.arm}: worker command pipe closed"
+                        ) from error
             finally:
                 self.selector.unregister(self.process.stdin)
             return self._receive(deadline)
@@ -495,15 +614,24 @@ class Worker:
             # Preserve failure attribution even if unexpected teardown errors
             # interrupt the normal receipt construction. Idempotent subsequent
             # close calls must not erase evidence of incomplete ownership.
-            self.cleanup = {"complete": False, "direct_child_reaped": False, "errors": errors}
+            self.cleanup = {
+                "complete": False,
+                "direct_child_reaped": False,
+                "errors": errors,
+            }
         try:
             if self.process is not None:
                 if self._tree is None:
                     try:
                         self._tree = _ProcessTree(self.process, self.guard.psutil)
                     except Exception as error:
-                        errors.append(f"process registration: {type(error).__name__}: {error}")
-                for requested, duration in ((signal.SIGTERM, TERM_SECONDS), (signal.SIGKILL, KILL_SECONDS)):
+                        errors.append(
+                            f"process registration: {type(error).__name__}: {error}"
+                        )
+                for requested, duration in (
+                    (signal.SIGTERM, TERM_SECONDS),
+                    (signal.SIGKILL, KILL_SECONDS),
+                ):
                     deadline = time.monotonic() + duration
                     while True:
                         if self._tree is not None:
@@ -524,44 +652,78 @@ class Worker:
                             self._pump(cleanup=True)
                         except Exception as error:
                             if len(errors) < MAX_PROCESSES:
-                                errors.append(f"pipe drain: {type(error).__name__}: {error}"[:1024])
+                                errors.append(
+                                    f"pipe drain: {type(error).__name__}: {error}"[
+                                        :1024
+                                    ]
+                                )
                         direct_done = self.process.poll() is not None
                         pipes_done = self._stdout_eof and self._stderr_eof
-                        if direct_done and pipes_done and (self._tree is None or not self._tree.survivors()):
+                        if (
+                            direct_done
+                            and pipes_done
+                            and (self._tree is None or not self._tree.survivors())
+                        ):
                             break
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             break
                         time.sleep(min(POLL_SECONDS, remaining))
-                    if direct_done and pipes_done and (self._tree is None or not self._tree.survivors()):
+                    if (
+                        direct_done
+                        and pipes_done
+                        and (self._tree is None or not self._tree.survivors())
+                    ):
                         break
                 if self.process.returncode is None:
                     errors.append("direct child did not exit within TERM 2s + KILL 2s")
-                tree = self._tree.receipt() if self._tree is not None else {"survivors": [], "inspection_errors": []}
-                self.cleanup = {**tree, "direct_child_reaped": self.process.returncode is not None,
-                                "returncode": self.process.returncode, "errors": errors,
-                                "stdout_drained": self._stdout_eof, "stderr_drained": self._stderr_eof,
-                                "guard_violations": self._violations.copy(),
-                                "elapsed_seconds": time.monotonic() - started,
-                                "complete": self.process.returncode is not None and self._stdout_eof and self._stderr_eof and not tree["survivors"] and not tree["inspection_errors"] and not errors}
+                tree = (
+                    self._tree.receipt()
+                    if self._tree is not None
+                    else {"survivors": [], "inspection_errors": []}
+                )
+                self.cleanup = {
+                    **tree,
+                    "direct_child_reaped": self.process.returncode is not None,
+                    "returncode": self.process.returncode,
+                    "errors": errors,
+                    "stdout_drained": self._stdout_eof,
+                    "stderr_drained": self._stderr_eof,
+                    "guard_violations": self._violations.copy(),
+                    "elapsed_seconds": time.monotonic() - started,
+                    "complete": self.process.returncode is not None
+                    and self._stdout_eof
+                    and self._stderr_eof
+                    and not tree["survivors"]
+                    and not tree["inspection_errors"]
+                    and not errors,
+                }
         except BaseException as error:
-            errors.append(f"cleanup interrupted: {type(error).__name__}: {error}"[:1024])
+            errors.append(
+                f"cleanup interrupted: {type(error).__name__}: {error}"[:1024]
+            )
             raise
         finally:
             resources = [self.selector]
             if self.process is not None:
-                resources.extend((self.process.stdin, self.process.stdout, self.process.stderr))
+                resources.extend(
+                    (self.process.stdin, self.process.stdout, self.process.stderr)
+                )
             resources.append(self.log)
             for resource in resources:
                 if resource is not None:
                     try:
                         resource.close()
                     except Exception as error:
-                        errors.append(f"descriptor close: {type(error).__name__}: {error}"[:1024])
+                        errors.append(
+                            f"descriptor close: {type(error).__name__}: {error}"[:1024]
+                        )
             if errors and self.cleanup is not None:
                 self.cleanup["complete"] = False
             self.guard._unregister(self)
         if self.cleanup is not None and not self.cleanup["complete"]:
-            raise BenchmarkError(f"{self.arm}: owned process cleanup incomplete: {self.cleanup}")
+            raise BenchmarkError(
+                f"{self.arm}: owned process cleanup incomplete: {self.cleanup}"
+            )
         if self._violations:
             raise BenchmarkError(f"{self.arm}: {'; '.join(self._violations)}")

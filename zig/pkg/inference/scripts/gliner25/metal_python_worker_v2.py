@@ -4,6 +4,7 @@
 Extraction, strict device checks, fallback rejection, clocks and command
 handling are the v1 functions. Only the enclosing comparison scope changes.
 """
+
 from __future__ import annotations
 
 import sys
@@ -27,14 +28,28 @@ def python_worker(args) -> int:
         torch.set_num_interop_threads(1)
         reference.verify_runtime(torch, args.device)
         bundle = reference.oracle.verify_model_dir(args.model, args.model_dir)
-        requests, digest = reference.read_requests(reference.oracle.FIXTURES / "requests.json")
+        requests, digest = reference.read_requests(
+            reference.oracle.FIXTURES / "requests.json"
+        )
         from gliner2 import AutoExtractor
+
         with reference.reject_mps_fallback():
             model = reference.load_model(AutoExtractor, args.model_dir, args.device)
             reference.synchronize(torch, args.device)
-            reference.bench.emit(event_v2(reference.ready_event(args, model, torch, bundle, provenance, digest)))
+            reference.bench.emit(
+                event_v2(
+                    reference.ready_event(
+                        args, model, torch, bundle, provenance, digest
+                    )
+                )
+            )
         return reference.serve_commands(
-            args, model, torch, bundle, requests, digest,
+            args,
+            model,
+            torch,
+            bundle,
+            requests,
+            digest,
             emit=lambda event: reference.bench.emit(event_v2(event)),
         )
 
@@ -43,7 +58,11 @@ def main(argv=None) -> int:
     try:
         return python_worker(reference.parse_args(argv))
     except Exception as error:
-        print(f"{type(error).__name__}: {str(error)[:reference.MAX_ERROR_CHARS]}", file=sys.stderr, flush=True)
+        print(
+            f"{type(error).__name__}: {str(error)[: reference.MAX_ERROR_CHARS]}",
+            file=sys.stderr,
+            flush=True,
+        )
         return 1
 
 

@@ -1,4 +1,5 @@
 """Pure ownership/admission tests; no subprocess or numerical runtime executes."""
+
 import os
 import io
 from pathlib import Path
@@ -16,19 +17,34 @@ class TrainingAttentionSupervisorTest(unittest.TestCase):
         self.assertEqual(capture.HERE, capture.SUPERVISOR.parent)
         raw = capture.require_pin(capture.SUPERVISOR, capture.SUPERVISOR_PIN)
         self.assertEqual(12474, len(raw))
-        runtime = capture.json.loads((capture.HERE / "oracle_manifest.json").read_text())["runtime"]
+        runtime = capture.json.loads(
+            (capture.HERE / "oracle_manifest.json").read_text()
+        )["runtime"]
         generator = SimpleNamespace(
-            preflight=mock.Mock(return_value=({"runtime": runtime, "source_commit": "pinned"}, Path("source.py"))),
+            preflight=mock.Mock(
+                return_value=(
+                    {"runtime": runtime, "source_commit": "pinned"},
+                    Path("source.py"),
+                )
+            ),
             digest=mock.Mock(return_value={"sha256": "source"}),
         )
-        identity = {"python_invocation": "/chosen/venv/bin/python", "python_executable": {"sha256": "python"}, "pyvenv_cfg": None}
-        with mock.patch.object(capture, "module_from_bytes", return_value=generator), \
-                mock.patch.object(capture, "python_identity", return_value=identity):
+        identity = {
+            "python_invocation": "/chosen/venv/bin/python",
+            "python_executable": {"sha256": "python"},
+            "pyvenv_cfg": None,
+        }
+        with (
+            mock.patch.object(capture, "module_from_bytes", return_value=generator),
+            mock.patch.object(capture, "python_identity", return_value=identity),
+        ):
             _, _, admitted = capture.preflight(Path("/chosen/upstream"))
         generator.preflight.assert_called_once_with(Path("/chosen/upstream"))
         self.assertEqual(identity["python_invocation"], admitted["python_invocation"])
         self.assertNotIn("prior_checks", admitted)
-        self.assertEqual("gliner25_training_attention_supervision/v2", admitted["scope"])
+        self.assertEqual(
+            "gliner25_training_attention_supervision/v2", admitted["scope"]
+        )
 
     def test_interpreter_identity_preserves_virtualenv_invocation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -44,18 +60,31 @@ class TrainingAttentionSupervisorTest(unittest.TestCase):
             with mock.patch.object(capture.sys, "executable", str(invocation)):
                 identity = capture.python_identity()
                 self.assertEqual(str(invocation), identity["python_invocation"])
-                self.assertEqual(capture.pin(actual.read_bytes()), identity["python_executable"])
-                self.assertEqual(capture.pin(config.read_bytes()), identity["pyvenv_cfg"])
+                self.assertEqual(
+                    capture.pin(actual.read_bytes()), identity["python_executable"]
+                )
+                self.assertEqual(
+                    capture.pin(config.read_bytes()), identity["pyvenv_cfg"]
+                )
                 config.unlink()
                 self.assertIsNone(capture.python_identity()["pyvenv_cfg"])
 
     def test_capture_requires_explicit_paths_but_preflight_needs_no_old_outputs(self):
-        args = capture.parse_args(["--upstream", "/chosen/upstream", "--preflight-only"])
+        args = capture.parse_args(
+            ["--upstream", "/chosen/upstream", "--preflight-only"]
+        )
         self.assertIsNone(args.output_dir)
         self.assertIsNone(args.evidence_dir)
-        for arguments in ([], ["--upstream", "/chosen/upstream"],
-                ["--upstream", "/chosen/upstream", "--output-dir", "/fresh/capture"]):
-            with self.subTest(arguments=arguments), mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as error:
+        for arguments in (
+            [],
+            ["--upstream", "/chosen/upstream"],
+            ["--upstream", "/chosen/upstream", "--output-dir", "/fresh/capture"],
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch("sys.stderr", io.StringIO()),
+                self.assertRaises(SystemExit) as error,
+            ):
                 capture.parse_args(arguments)
             self.assertEqual(2, error.exception.code)
 
@@ -90,7 +119,10 @@ class TrainingAttentionSupervisorTest(unittest.TestCase):
             root = Path(temporary)
             (root / "capture.json").write_bytes(b"abc")
             (root / "weights.safetensors").write_bytes(b"1234")
-            self.assertEqual({"capture.json": 3, "weights.safetensors": 4}, capture.artifact_sizes(root, 7))
+            self.assertEqual(
+                {"capture.json": 3, "weights.safetensors": 4},
+                capture.artifact_sizes(root, 7),
+            )
             with self.assertRaisesRegex(ValueError, "byte ceiling"):
                 capture.artifact_sizes(root, 6)
             (root / "unexpected").write_bytes(b"")
@@ -138,7 +170,9 @@ class TrainingAttentionSupervisorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "bad-entry").write_bytes(b"")
-            tree = capture.tree_factory(SimpleNamespace(ProcessTree=ProcessTree), root)(None, None)
+            tree = capture.tree_factory(SimpleNamespace(ProcessTree=ProcessTree), root)(
+                None, None
+            )
             with self.assertRaisesRegex(ValueError, "unexpected attention artifact"):
                 tree.sample()
             tree.cleanup_sample()
@@ -160,7 +194,13 @@ class TrainingAttentionSupervisorTest(unittest.TestCase):
         with mock.patch.object(capture.signal, "signal") as replace:
             with self.assertRaises(KeyboardInterrupt):
                 capture.stop_signal(signal.SIGINT, None)
-        self.assertEqual([mock.call(signal.SIGINT, signal.SIG_IGN), mock.call(signal.SIGTERM, signal.SIG_IGN)], replace.call_args_list)
+        self.assertEqual(
+            [
+                mock.call(signal.SIGINT, signal.SIG_IGN),
+                mock.call(signal.SIGTERM, signal.SIG_IGN),
+            ],
+            replace.call_args_list,
+        )
 
 
 if __name__ == "__main__":

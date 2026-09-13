@@ -1105,6 +1105,7 @@ pub const MetalTensor = struct {
 };
 
 test "MetalTensor borrowed does not free" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const buf = try allocator.alloc(f32, 4);
     defer allocator.free(buf);
@@ -1118,6 +1119,7 @@ test "MetalTensor borrowed does not free" {
 }
 
 test "MetalTensor owned frees its buffer" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     const shape_arr = [_]i32{4};
     var t = try MetalTensor.ownedCloneFrom(&[_]f32{ 1, 2, 3, 4 }, &shape_arr);
     try std.testing.expect(t.owned_by_c_allocator);
@@ -1126,6 +1128,7 @@ test "MetalTensor owned frees its buffer" {
 }
 
 test "MetalTensor retainedCopy reports stale device refs without aborting" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     const ref = try std.heap.c_allocator.create(DeviceBufferRef);
     defer std.heap.c_allocator.destroy(ref);
     ref.* = .{
@@ -1137,7 +1140,7 @@ test "MetalTensor retainedCopy reports stale device refs without aborting" {
         .release_on_drop = true,
     };
     const shape_arr = [_]i32{4};
-    var stale = MetalTensor.deviceView(ref, 0, 4 * @sizeOf(f32), &shape_arr);
+    var stale = MetalTensor.deviceView(ref, 0, 4 * @sizeOf(f32), &shape_arr, .f32);
     defer stale.deinit();
 
     try std.testing.expectError(error.ReleasedDeviceBuffer, stale.retainedCopy());

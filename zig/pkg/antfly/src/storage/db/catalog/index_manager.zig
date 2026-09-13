@@ -3092,10 +3092,14 @@ pub const IndexManager = struct {
     }
 
     fn bindPrimaryStore(self: *IndexManager, store: anytype) void {
+        self.bindPrimaryStoreWithMode(store, false);
+    }
+
+    fn bindPrimaryStoreWithMode(self: *IndexManager, store: anytype, read_only: bool) void {
         const Store = @TypeOf(store);
         if (comptime Store == *docstore_mod.DocStore) {
             self.primary_store = store;
-            self.loadVectorBlockGenerationIfPresent() catch |err| {
+            self.loadVectorBlockGenerationIfPresent(read_only) catch |err| {
                 std.log.warn("shared vector-block generation open failed; primary artifact fallback remains active err={s}", .{@errorName(err)});
             };
         }
@@ -4339,7 +4343,7 @@ pub const IndexManager = struct {
         return error.VectorBlockSnapshotAdvancedWithoutWal;
     }
 
-    fn loadVectorBlockGenerationIfPresent(self: *IndexManager) !void {
+    fn loadVectorBlockGenerationIfPresent(self: *IndexManager, read_only: bool) !void {
         if (self.vector_block_storage == null) return;
         if (self.acquireVectorBlockGeneration()) |current| {
             current.release();
@@ -4357,6 +4361,9 @@ pub const IndexManager = struct {
             break :blk true;
         };
         if (!current_exists) {
+            // A reader may open while the writer is staging its first base.
+            // Only the writer can distinguish live staging from crash debt.
+            if (read_only) return;
             // A crash may leave first-generation blocks before CURRENT. Avoid
             // creating vector state for tables that have never staged it, but
             // still enter recovery when the native root contains debt.
@@ -4367,12 +4374,17 @@ pub const IndexManager = struct {
             defer lsm_backend_mod.Storage.freeFileNames(self.alloc, names);
             if (names.len == 0) return;
         }
-        var opened = try vector_block_store_mod.Store.openWithBlocks(self.alloc, self.vector_block_storage.?, root);
+        var opened = if (read_only)
+            try vector_block_store_mod.Store.openReadOnlyWithBlocks(self.alloc, self.vector_block_storage.?, root)
+        else
+            try vector_block_store_mod.Store.openWithBlocks(self.alloc, self.vector_block_storage.?, root);
         var opened_owned = true;
         errdefer if (opened_owned) opened.deinit();
-        _ = opened.store.reclaimUnreferencedFiles() catch |err| {
-            std.log.warn("shared vector-block startup cleanup deferred root={s} err={s}", .{ root, @errorName(err) });
-        };
+        if (!read_only) {
+            _ = opened.store.reclaimUnreferencedFiles() catch |err| {
+                std.log.warn("shared vector-block startup cleanup deferred root={s} err={s}", .{ root, @errorName(err) });
+            };
+        }
         if (opened.store.manifest == null) {
             opened.deinit();
             opened_owned = false;
@@ -4541,7 +4553,7 @@ pub const IndexManager = struct {
         };
         defer store.deinit();
         if (store.manifest != null and store.covered_source_sequence == applied_sequence) {
-            try self.loadVectorBlockGenerationIfPresent();
+            try self.loadVectorBlockGenerationIfPresent(false);
             if (self.vectorBlockReadyAtSequenceAndCount(
                 applied_sequence,
                 entry,
@@ -10545,7 +10557,7 @@ pub const IndexManager = struct {
 
     fn loadWithBackfill(self: *IndexManager, store: anytype, allow_backfill: bool, read_only: bool) !void {
         const load_started_ns = nowNs();
-        self.bindPrimaryStore(store);
+        self.bindPrimaryStoreWithMode(store, read_only);
         self.clearStatusOnlyIndexConfigs();
         self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);
@@ -42719,6 +42731,42 @@ test "completed native publication defers to capture ownership without starting 
     try std.testing.expectEqual(@as(usize, 0), idle.published);
     try std.testing.expect(!idle.deferred);
     try std.testing.expect(entry.index.experimental_posting_checkpoint_build == null);
+}
+
+test "read-only vector generation load preserves unpublished writer files" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "readonly-vector-staging");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var writer = try IndexManager.init(alloc, std.mem.span(path));
+    defer writer.deinit();
+    const storage = writer.vector_block_storage.?;
+    const root = try writer.vectorBlockRootAlloc();
+    defer alloc.free(root);
+    var publisher = try vector_block_store_mod.Store.open(alloc, storage, root);
+    defer publisher.deinit();
+    const staged_path = try std.fs.path.join(alloc, &.{ root, "block-2-0.afvb" });
+    defer alloc.free(staged_path);
+    const current_path = try std.fs.path.join(alloc, &.{ root, "CURRENT" });
+    defer alloc.free(current_path);
+
+    // Exercise both first-base staging and replacement-base staging. A
+    // read-only catalog open must neither recover nor reclaim writer files.
+    inline for (.{ false, true }) |published| {
+        if (published) try publisher.publishEmptyBase(1, 0, .{});
+        try storage.writeFileAbsolute(staged_path, "unpublished writer block");
+        var reader = try IndexManager.init(alloc, std.mem.span(path));
+        defer reader.deinit();
+        try reader.loadNoBackfill(&store);
+        try std.testing.expectEqual(@as(u64, "unpublished writer block".len), try storage.fileSize(staged_path));
+        const generation = reader.acquireVectorBlockGeneration();
+        defer if (generation) |lease| lease.release();
+        try std.testing.expectEqual(published, generation != null);
+        if (!published) try std.testing.expectError(error.FileNotFound, storage.fileSize(current_path));
+    }
 }
 
 test "stable native finalization certifies an empty dense index" {

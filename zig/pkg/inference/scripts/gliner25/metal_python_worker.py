@@ -7,6 +7,7 @@ outputs, and temporary-lifetime semantics; it and the oracle stay unchanged.
 MPS operator fallback is forbidden. Explicit upstream host decoding is part
 of the synchronized full-extraction clock, including its device transfers.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -56,10 +57,16 @@ def configure_environment(environ=None, modules=None) -> None:
     environ = os.environ if environ is None else environ
     modules = sys.modules if modules is None else modules
     if any(name == "torch" or name.startswith("torch.") for name in modules):
-        raise WorkerError("Torch was imported before the worker established its MPS policy")
-    for name, expected in [(key, "0") for key in MPS_ENV] + [(key, "1") for key in bench.THREAD_ENV]:
+        raise WorkerError(
+            "Torch was imported before the worker established its MPS policy"
+        )
+    for name, expected in [(key, "0") for key in MPS_ENV] + [
+        (key, "1") for key in bench.THREAD_ENV
+    ]:
         if environ.get(name) not in (None, expected):
-            raise WorkerError(f"worker environment disagrees with pinned policy: {name}")
+            raise WorkerError(
+                f"worker environment disagrees with pinned policy: {name}"
+            )
         environ[name] = expected
 
 
@@ -90,12 +97,19 @@ def normalized_device(value: Any) -> str:
 
 def verify_runtime(torch: Any, device: str) -> None:
     check_environment()
-    if (torch.get_num_threads() != 1 or torch.get_num_interop_threads() != 1
-            or torch.get_default_dtype() != torch.float32
-            or torch.are_deterministic_algorithms_enabled() is not True
-            or torch.is_deterministic_algorithms_warn_only_enabled() is not False):
-        raise WorkerError("Torch thread/dtype/determinism profile differs from the oracle")
-    if device == "mps" and (not torch.backends.mps.is_built() or not torch.backends.mps.is_available()):
+    if (
+        torch.get_num_threads() != 1
+        or torch.get_num_interop_threads() != 1
+        or torch.get_default_dtype() != torch.float32
+        or torch.are_deterministic_algorithms_enabled() is not True
+        or torch.is_deterministic_algorithms_warn_only_enabled() is not False
+    ):
+        raise WorkerError(
+            "Torch thread/dtype/determinism profile differs from the oracle"
+        )
+    if device == "mps" and (
+        not torch.backends.mps.is_built() or not torch.backends.mps.is_available()
+    ):
         raise WorkerError("requested MPS backend is not built and available")
 
 
@@ -105,15 +119,26 @@ def verify_model_tensors(model: Any, torch: Any, device: str) -> dict[str, Any]:
         raise WorkerError("worker requires an eval-mode boundary model")
     if model.strict_extraction is not True:
         raise WorkerError("strict_extraction must remain True")
-    summary = {"parameters": 0, "parameter_elements": 0, "floating_buffers": 0,
-               "other_buffers": 0, "parameter_device": device, "buffer_devices": [],
-               "floating_dtype": "float32"}
+    summary = {
+        "parameters": 0,
+        "parameter_elements": 0,
+        "floating_buffers": 0,
+        "other_buffers": 0,
+        "parameter_device": device,
+        "buffer_devices": [],
+        "floating_dtype": "float32",
+    }
     buffer_devices = set()
-    for kind, tensors in (("parameter", model.named_parameters()), ("buffer", model.named_buffers())):
+    for kind, tensors in (
+        ("parameter", model.named_parameters()),
+        ("buffer", model.named_buffers()),
+    ):
         for name, tensor in tensors:
             actual = normalized_device(tensor.device)
             if actual != device:
-                raise WorkerError(f"{kind} {name}: device {actual} differs from {device}")
+                raise WorkerError(
+                    f"{kind} {name}: device {actual} differs from {device}"
+                )
             floating = tensor.is_floating_point()
             if tensor.is_complex() or (floating and tensor.dtype != torch.float32):
                 raise WorkerError(f"{kind} {name}: expected FP32 floating tensors")
@@ -135,10 +160,19 @@ def load_model(auto_extractor: Any, model_dir: Path, device: str) -> Any:
     # The pinned loader strictly restores every checkpoint tensor on CPU first.
     # Do not use a global default device: source preprocessing/decoding has
     # deliberate host operations, while batch.to() follows model parameters.
-    model = auto_extractor.from_pretrained(
-        str(model_dir.resolve()), local_files_only=True, map_location="cpu",
-        quantize=False, compile=False, use_flashdeberta=False,
-    ).float().eval().to(device)
+    model = (
+        auto_extractor.from_pretrained(
+            str(model_dir.resolve()),
+            local_files_only=True,
+            map_location="cpu",
+            quantize=False,
+            compile=False,
+            use_flashdeberta=False,
+        )
+        .float()
+        .eval()
+        .to(device)
+    )
     # This is a RuntimeMixin attribute, not an accepted extract() keyword.
     model.strict_extraction = True
     return model
@@ -162,11 +196,18 @@ def synchronize(torch: Any, device: str) -> None:
         try:
             torch.mps.synchronize()
         except Exception as exc:
-            raise DeviceSynchronizationError(f"MPS synchronization failed: {exc}") from exc
+            raise DeviceSynchronizationError(
+                f"MPS synchronization failed: {exc}"
+            ) from exc
 
 
-def timed_call(torch: Any, device: str, execute: Callable[[], Any],
-               *, clock: Callable[[], int] = time.perf_counter_ns) -> tuple[Any, int]:
+def timed_call(
+    torch: Any,
+    device: str,
+    execute: Callable[[], Any],
+    *,
+    clock: Callable[[], int] = time.perf_counter_ns,
+) -> tuple[Any, int]:
     """Fence old work outside the clock and all extraction work before stop.
 
     Exceptions never become timing samples. Before continuing a recoverable
@@ -208,9 +249,15 @@ def capture_validation_inputs(model: Any, torch: Any, device: str):
             if torch.is_tensor(value):
                 actual = normalized_device(value.device)
                 if actual != device:
-                    raise WorkerError(f"encoder input {path}: device {actual} differs from {device}")
-                if value.is_complex() or (value.is_floating_point() and value.dtype != torch.float32):
-                    raise WorkerError(f"encoder input {path}: floating dtype differs from FP32")
+                    raise WorkerError(
+                        f"encoder input {path}: device {actual} differs from {device}"
+                    )
+                if value.is_complex() or (
+                    value.is_floating_point() and value.dtype != torch.float32
+                ):
+                    raise WorkerError(
+                        f"encoder input {path}: floating dtype differs from FP32"
+                    )
                 observed[path] = actual
             elif isinstance(value, (tuple, list)):
                 for index, item in enumerate(value):
@@ -221,7 +268,12 @@ def capture_validation_inputs(model: Any, torch: Any, device: str):
 
         visit(positional, "args")
         visit(keyword, "kwargs")
-        devices.append({"input_device": normalized_device(ids.device), "encoder_input_devices": observed})
+        devices.append(
+            {
+                "input_device": normalized_device(ids.device),
+                "encoder_input_devices": observed,
+            }
+        )
 
     handle = model.encoder.register_forward_pre_hook(capture, with_kwargs=True)
     try:
@@ -258,23 +310,43 @@ def error_details(exc: Exception, device: str) -> dict[str, Any]:
         recoverable = False
     elif isinstance(exc, DeviceSynchronizationError):
         category, unsafe, recoverable = "device_synchronization", True, False
-    elif isinstance(exc, MemoryError) or any(word in lower for word in ("out of memory", "outofmemory", "bad allocation")):
+    elif isinstance(exc, MemoryError) or any(
+        word in lower for word in ("out of memory", "outofmemory", "bad allocation")
+    ):
         category, unsafe, recoverable = "out_of_memory", True, False
-    elif "cuda" in lower or any(word in lower for word in ("command buffer", "device lost", "gpu fault", "gpu hang")):
+    elif "cuda" in lower or any(
+        word in lower
+        for word in ("command buffer", "device lost", "gpu fault", "gpu hang")
+    ):
         category, unsafe, recoverable = "device_failure", True, False
-    elif isinstance(exc, NotImplementedError) or any(word in lower for word in (
-            "not implemented for", "not currently implemented", "not currently supported",
-            "does not have a deterministic implementation", "doesn't support float64")):
+    elif isinstance(exc, NotImplementedError) or any(
+        word in lower
+        for word in (
+            "not implemented for",
+            "not currently implemented",
+            "not currently supported",
+            "does not have a deterministic implementation",
+            "doesn't support float64",
+        )
+    ):
         category = "unsupported_operation"
-    elif device == "mps" and isinstance(exc, RuntimeError) and any(word in lower for word in ("mps", "metal", "gpu")):
+    elif (
+        device == "mps"
+        and isinstance(exc, RuntimeError)
+        and any(word in lower for word in ("mps", "metal", "gpu"))
+    ):
         category, unsafe, recoverable = "device_failure", True, False
     elif isinstance(exc, (WorkerError, bench.BenchmarkError, oracle.ContractError)):
         category, recoverable = "contract", False
     else:
         category = "extraction"
-    return {"category": category, "error_type": type(exc).__name__,
-            "message": message[:MAX_ERROR_CHARS], "recoverable": recoverable,
-            "device_unsafe": unsafe}
+    return {
+        "category": category,
+        "error_type": type(exc).__name__,
+        "message": message[:MAX_ERROR_CHARS],
+        "recoverable": recoverable,
+        "device_unsafe": unsafe,
+    }
 
 
 def read_requests(path: Path) -> tuple[list[dict[str, Any]], str]:
@@ -283,17 +355,27 @@ def read_requests(path: Path) -> tuple[list[dict[str, Any]], str]:
     if len(raw) > MAX_REQUEST_BYTES:
         raise WorkerError("fixed requests exceed byte limit")
     parsed = bench.strict_json(raw)
-    if not isinstance(parsed, dict) or set(parsed) != {"format_version", "requests"} or parsed["format_version"] != 1:
+    if (
+        not isinstance(parsed, dict)
+        or set(parsed) != {"format_version", "requests"}
+        or parsed["format_version"] != 1
+    ):
         raise WorkerError("unsupported fixed request envelope")
     requests = parsed["requests"]
     if not isinstance(requests, list) or len(requests) != 10:
         raise WorkerError("worker requires the fixed ten task requests")
     seen = set()
     for request in requests:
-        if (not isinstance(request, dict) or set(request) != {"id", "kind", "text", "schema"}
-                or not isinstance(request["id"], str) or not request["id"] or request["id"] in seen
-                or request["kind"] not in ("extract", "classification", "joint_ie")
-                or not isinstance(request["text"], str) or not isinstance(request["schema"], dict)):
+        if (
+            not isinstance(request, dict)
+            or set(request) != {"id", "kind", "text", "schema"}
+            or not isinstance(request["id"], str)
+            or not request["id"]
+            or request["id"] in seen
+            or request["kind"] not in ("extract", "classification", "joint_ie")
+            or not isinstance(request["text"], str)
+            or not isinstance(request["schema"], dict)
+        ):
             raise WorkerError("invalid fixed task request")
         seen.add(request["id"])
     return requests, hashlib.sha256(raw).hexdigest()
@@ -302,40 +384,84 @@ def read_requests(path: Path) -> tuple[list[dict[str, Any]], str]:
 def ready_event(args, model, torch, bundle, provenance, requests_sha256):
     verify_runtime(torch, args.device)
     summary = verify_model_tensors(model, torch, args.device)
-    provenance = {**provenance, "device": summary["parameter_device"], "dtype": "float32",
-                  "threads": 1, "interop_threads": 1, "deterministic_algorithms": True,
-                  "mps_environment": {key: os.environ[key] for key in MPS_ENV}}
-    return {"event": "ready", "arm": f"fastino_{args.device}", "scope": SCOPE,
-            "timing_boundary": TIMING_BOUNDARY, "model": args.model,
-            "model_id": bundle["model_id"], "revision": bundle["revision"], "model_files": bundle["files"],
-            "requests_sha256": requests_sha256, "dtype": "float32", "device": summary["parameter_device"],
-            "parameter_device": summary["parameter_device"], "floating_dtype": "float32",
-            "model_tensor_summary": summary, "threads": 1, "interop_threads": 1,
-            "deterministic_algorithms": True, "strict_extraction": True,
-            "provenance": provenance, "qualification": False,
-            "synchronization_policy": SYNC_POLICIES[args.device], "math_policy": MATH_POLICY,
-            "mps_memory": mps_memory(torch, args.device)}
+    provenance = {
+        **provenance,
+        "device": summary["parameter_device"],
+        "dtype": "float32",
+        "threads": 1,
+        "interop_threads": 1,
+        "deterministic_algorithms": True,
+        "mps_environment": {key: os.environ[key] for key in MPS_ENV},
+    }
+    return {
+        "event": "ready",
+        "arm": f"fastino_{args.device}",
+        "scope": SCOPE,
+        "timing_boundary": TIMING_BOUNDARY,
+        "model": args.model,
+        "model_id": bundle["model_id"],
+        "revision": bundle["revision"],
+        "model_files": bundle["files"],
+        "requests_sha256": requests_sha256,
+        "dtype": "float32",
+        "device": summary["parameter_device"],
+        "parameter_device": summary["parameter_device"],
+        "floating_dtype": "float32",
+        "model_tensor_summary": summary,
+        "threads": 1,
+        "interop_threads": 1,
+        "deterministic_algorithms": True,
+        "strict_extraction": True,
+        "provenance": provenance,
+        "qualification": False,
+        "synchronization_policy": SYNC_POLICIES[args.device],
+        "math_policy": MATH_POLICY,
+        "mps_memory": mps_memory(torch, args.device),
+    }
 
 
-def serve_commands(args, model, torch, bundle, requests, requests_sha256, *,
-                   source=None, emit=None, execute=None, canonical=None, clock=time.perf_counter_ns) -> int:
+def serve_commands(
+    args,
+    model,
+    torch,
+    bundle,
+    requests,
+    requests_sha256,
+    *,
+    source=None,
+    emit=None,
+    execute=None,
+    canonical=None,
+    clock=time.perf_counter_ns,
+) -> int:
     source = sys.stdin.buffer if source is None else source
     emit = bench.emit if emit is None else emit
     execute = bench.execute_python if execute is None else execute
     canonical = bench.canonical_python if canonical is None else canonical
     by_id = {request["id"]: request for request in requests}
-    schemas = {request["id"]: json.dumps(request["schema"], ensure_ascii=False) for request in requests}
+    schemas = {
+        request["id"]: json.dumps(request["schema"], ensure_ascii=False)
+        for request in requests
+    }
     validated = set()
     previous_id = count = 0
     arm = f"fastino_{args.device}"
     while line := source.readline(MAX_COMMAND_BYTES + 1):
-        if len(line) > MAX_COMMAND_BYTES or not line.endswith(b"\n") or count >= args.max_commands:
+        if (
+            len(line) > MAX_COMMAND_BYTES
+            or not line.endswith(b"\n")
+            or count >= args.max_commands
+        ):
             raise WorkerError("worker command limit exceeded")
         count += 1
         command = bench.strict_json(line)
-        if (not isinstance(command, dict) or not {"op", "request_id"} <= command.keys()
-                or not command.keys() <= {"op", "request_id", "case_id"}
-                or type(command["request_id"]) is not int or command["request_id"] <= previous_id):
+        if (
+            not isinstance(command, dict)
+            or not {"op", "request_id"} <= command.keys()
+            or not command.keys() <= {"op", "request_id", "case_id"}
+            or type(command["request_id"]) is not int
+            or command["request_id"] <= previous_id
+        ):
             raise WorkerError("invalid worker command identity")
         previous_id = command["request_id"]
         if command["op"] == "stop":
@@ -348,11 +474,23 @@ def serve_commands(args, model, torch, bundle, requests, requests_sha256, *,
                 raise WorkerError("fixed requests changed during benchmark")
             verify_runtime(torch, args.device)
             verify_model_tensors(model, torch, args.device)
-            emit({"event": "stopped", "arm": arm, "request_id": previous_id, "scope": SCOPE,
-                  "qualification": False, "requests_sha256": requests_sha256})
+            emit(
+                {
+                    "event": "stopped",
+                    "arm": arm,
+                    "request_id": previous_id,
+                    "scope": SCOPE,
+                    "qualification": False,
+                    "requests_sha256": requests_sha256,
+                }
+            )
             return 0
         case_id = command.get("case_id")
-        if command["op"] not in ("validate", "run") or not isinstance(case_id, str) or case_id not in by_id:
+        if (
+            command["op"] not in ("validate", "run")
+            or not isinstance(case_id, str)
+            or case_id not in by_id
+        ):
             raise WorkerError("unknown benchmark command")
         request = by_id[case_id]
         try:
@@ -364,26 +502,59 @@ def serve_commands(args, model, torch, bundle, requests, requests_sha256, *,
                 verify_model_tensors(model, torch, args.device)
                 validated.discard(case_id)
             elif case_id not in validated:
-                raise WorkerError("run requires successful input-device validation for this case")
-            capture = capture_validation_inputs(model, torch, args.device) if validating else contextlib.nullcontext(([], []))
+                raise WorkerError(
+                    "run requires successful input-device validation for this case"
+                )
+            capture = (
+                capture_validation_inputs(model, torch, args.device)
+                if validating
+                else contextlib.nullcontext(([], []))
+            )
             with reject_mps_fallback(), capture as (input_ids, inputs):
-                output, duration = timed_call(torch, args.device,
-                                              lambda: execute(model, request, schemas[case_id]), clock=clock)
+                output, duration = timed_call(
+                    torch,
+                    args.device,
+                    lambda: execute(model, request, schemas[case_id]),
+                    clock=clock,
+                )
             if validating and (len(input_ids) != 1 or len(inputs) != 1):
-                raise WorkerError(f"{case_id}: validation requires exactly one encoder execution")
+                raise WorkerError(
+                    f"{case_id}: validation requires exactly one encoder execution"
+                )
             output = canonical(request, output)
             finite_output(output)
-            memory = mps_memory(torch, args.device)  # deliberately outside both clock reads
+            memory = mps_memory(
+                torch, args.device
+            )  # deliberately outside both clock reads
             if validating:
                 validated.add(case_id)
-            emit({"event": "result", "arm": arm, "request_id": previous_id, "case_id": case_id,
-                  "duration_ns": duration, "input_ids": input_ids[0] if input_ids else None,
-                  "input_device": inputs[0]["input_device"] if inputs else None,
-                  "encoder_input_devices": inputs[0]["encoder_input_devices"] if inputs else None,
-                  "output": output, "mps_memory": memory})
+            emit(
+                {
+                    "event": "result",
+                    "arm": arm,
+                    "request_id": previous_id,
+                    "case_id": case_id,
+                    "duration_ns": duration,
+                    "input_ids": input_ids[0] if input_ids else None,
+                    "input_device": inputs[0]["input_device"] if inputs else None,
+                    "encoder_input_devices": inputs[0]["encoder_input_devices"]
+                    if inputs
+                    else None,
+                    "output": output,
+                    "mps_memory": memory,
+                }
+            )
         except Exception as exc:
             details = error_details(exc, args.device)
-            emit({"event": "error", "arm": arm, "request_id": previous_id, "case_id": case_id, **details})
+            emit(
+                {
+                    "event": "error",
+                    "arm": arm,
+                    "request_id": previous_id,
+                    "case_id": case_id,
+                    **details,
+                }
+            )
             if not details["recoverable"]:
                 return 1
     raise WorkerError("protocol ended without explicit stop")
@@ -401,11 +572,14 @@ def python_worker(args) -> int:
         bundle = oracle.verify_model_dir(args.model, args.model_dir)
         requests, requests_sha256 = read_requests(oracle.FIXTURES / "requests.json")
         from gliner2 import AutoExtractor
+
         # Reinstall after third-party imports, which may add warning filters.
         with reject_mps_fallback():
             model = load_model(AutoExtractor, args.model_dir, args.device)
             synchronize(torch, args.device)
-            bench.emit(ready_event(args, model, torch, bundle, provenance, requests_sha256))
+            bench.emit(
+                ready_event(args, model, torch, bundle, provenance, requests_sha256)
+            )
         return serve_commands(args, model, torch, bundle, requests, requests_sha256)
 
 
@@ -423,7 +597,11 @@ def main(argv=None) -> int:
     try:
         return python_worker(parse_args(argv))
     except Exception as exc:
-        print(f"{type(exc).__name__}: {str(exc)[:MAX_ERROR_CHARS]}", file=sys.stderr, flush=True)
+        print(
+            f"{type(exc).__name__}: {str(exc)[:MAX_ERROR_CHARS]}",
+            file=sys.stderr,
+            flush=True,
+        )
         return 1
 
 

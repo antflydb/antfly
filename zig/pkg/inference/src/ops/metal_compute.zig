@@ -37897,6 +37897,7 @@ test "strict GLiNER boundary scope controls retire owned work without a GPU" {
 }
 
 test "strict GLiNER boundary request metadata fails before any device call" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const before = metal_tensor_mod.memoryStatsSnapshot();
     inline for (.{ false, true }) |fresh| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });

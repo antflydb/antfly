@@ -73,7 +73,9 @@ def _find_repo_root(start: Path | None = None) -> Path:
 
 REPO_ROOT = _find_repo_root()
 INFERENCE_DIR = REPO_ROOT / "zig" / "pkg" / "inference"
-COMPARE_SCRIPT = INFERENCE_DIR / "scripts" / "gliner2" / "compare_gliner2_lora_python_zig.py"
+COMPARE_SCRIPT = (
+    INFERENCE_DIR / "scripts" / "gliner2" / "compare_gliner2_lora_python_zig.py"
+)
 FIXTURE_DIR = INFERENCE_DIR / "testdata" / "gliner2"
 TRAIN_FIXTURE = FIXTURE_DIR / "ner_smoke.jsonl"
 ALL_TASK_FIXTURE = FIXTURE_DIR / "full_task_smoke.jsonl"

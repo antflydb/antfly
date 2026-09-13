@@ -15,16 +15,26 @@ import training_export_runtime as runtime
 
 
 def package(entries=None):
-    entries = entries or [("peft/__init__.py", b'__version__ = "0.18.0"\n'),
-                          ("peft-0.18.0.dist-info/METADATA", b"Name: peft\nVersion: 0.18.0\n")]
+    entries = entries or [
+        ("peft/__init__.py", b'__version__ = "0.18.0"\n'),
+        ("peft-0.18.0.dist-info/METADATA", b"Name: peft\nVersion: 0.18.0\n"),
+    ]
     target = io.BytesIO()
     with zipfile.ZipFile(target, "w") as archive:
         for name, data in entries:
             archive.writestr(name, data)
     value = target.getvalue()
-    return value, {"wheel": runtime.pin(value), "wheel_files": {
-        name.filename if isinstance(name, zipfile.ZipInfo) else name: runtime.pin(data) for name, data in entries},
-        "max_uncompressed_bytes": 1024, "max_file_bytes": 512}
+    return value, {
+        "wheel": runtime.pin(value),
+        "wheel_files": {
+            name.filename if isinstance(name, zipfile.ZipInfo) else name: runtime.pin(
+                data
+            )
+            for name, data in entries
+        },
+        "max_uncompressed_bytes": 1024,
+        "max_file_bytes": 512,
+    }
 
 
 class ExportRuntimeTest(unittest.TestCase):
@@ -56,16 +66,22 @@ class ExportRuntimeTest(unittest.TestCase):
             with self.assertRaises(OSError):
                 runtime.wheel_bytes(link, profile)
             path.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
-            with self.assertRaisesRegex(runtime.oracle.ContractError, "wheel hash differs"):
+            with self.assertRaisesRegex(
+                runtime.oracle.ContractError, "wheel hash differs"
+            ):
                 runtime.wheel_bytes(path, profile)
 
     def test_zip_paths_symlinks_duplicate_inventory_and_expansion_are_bounded(self):
         symbolic = zipfile.ZipInfo("peft/link.py")
         symbolic.create_system = 3
         symbolic.external_attr = (stat.S_IFLNK | 0o777) << 16
-        for entries in ([('/outside.py', b'pass')], [('peft/../outside.py', b'pass')],
-                        [('other/__init__.py', b'pass')], [('peft/hook.pth', b'pass')],
-                        [(symbolic, b'../outside.py')]):
+        for entries in (
+            [("/outside.py", b"pass")],
+            [("peft/../outside.py", b"pass")],
+            [("other/__init__.py", b"pass")],
+            [("peft/hook.pth", b"pass")],
+            [(symbolic, b"../outside.py")],
+        ):
             with self.subTest(entries=entries), tempfile.TemporaryDirectory() as raw:
                 data, profile = package(entries)
                 with self.assertRaises(runtime.oracle.ContractError):
@@ -96,32 +112,83 @@ class ExportRuntimeTest(unittest.TestCase):
                 imports = runtime.verify_imports(root, root, profile)
                 self.assertEqual(imports["peft"], "peft/__init__.py")
                 package_module.__file__ = str(root.parent / "foreign/__init__.py")
-                with self.assertRaisesRegex(runtime.oracle.ContractError, "outside isolated wheel"):
+                with self.assertRaisesRegex(
+                    runtime.oracle.ContractError, "outside isolated wheel"
+                ):
                     runtime.verify_imports(root, root, profile)
 
     def test_profile_selects_only_peft_override_and_pins_other_dependencies(self):
         profile = runtime.load_profile()
-        expected = {**profile["original_oracle_runtime"]["packages"], **profile["additional_dependency_pins"], "peft": "0.18.0"}
-        metadata = types.SimpleNamespace(get_all=lambda name: profile["metadata_requires_dist"])
+        expected = {
+            **profile["original_oracle_runtime"]["packages"],
+            **profile["additional_dependency_pins"],
+            "peft": "0.18.0",
+        }
+        metadata = types.SimpleNamespace(
+            get_all=lambda name: profile["metadata_requires_dist"]
+        )
+
         def version(name):
             canonical = name.lower().replace("_", "-")
-            return next(value for key, value in expected.items() if key.lower().replace("_", "-") == canonical)
-        with mock.patch.object(runtime.importlib.metadata, "version", side_effect=version), \
-             mock.patch.object(runtime.importlib.metadata, "distribution", return_value=types.SimpleNamespace(metadata=metadata)), \
-             mock.patch.object(runtime.platform, "python_version", return_value=profile["original_oracle_runtime"]["python"]), \
-             mock.patch.object(runtime.unicodedata, "unidata_version", profile["original_oracle_runtime"]["unicode"]):
-            self.assertEqual(runtime.verify_dependency_profile(profile)["packages"], expected)
+            return next(
+                value
+                for key, value in expected.items()
+                if key.lower().replace("_", "-") == canonical
+            )
+
+        with (
+            mock.patch.object(
+                runtime.importlib.metadata, "version", side_effect=version
+            ),
+            mock.patch.object(
+                runtime.importlib.metadata,
+                "distribution",
+                return_value=types.SimpleNamespace(metadata=metadata),
+            ),
+            mock.patch.object(
+                runtime.platform,
+                "python_version",
+                return_value=profile["original_oracle_runtime"]["python"],
+            ),
+            mock.patch.object(
+                runtime.unicodedata,
+                "unidata_version",
+                profile["original_oracle_runtime"]["unicode"],
+            ),
+        ):
+            self.assertEqual(
+                runtime.verify_dependency_profile(profile)["packages"], expected
+            )
             expected["transformers"] = "4.55.5"
-            with self.assertRaisesRegex(runtime.oracle.ContractError, "dependency profile differs"):
+            with self.assertRaisesRegex(
+                runtime.oracle.ContractError, "dependency profile differs"
+            ):
                 runtime.verify_dependency_profile(profile)
 
-    def test_cli_rejects_implicit_or_incomplete_runtime_profiles_before_artifact_reads(self):
-        base = ["--variant", "small", "--source-dir", "/absent-source", "--export-dir", "/absent-export", "--output-dir", "/absent-output"]
-        invalid = [["--peft-wheel", "/absent-wheel"], ["--runtime-profile", runtime.PROFILE],
-                   ["--runtime", "--runtime-profile", runtime.PROFILE],
-                   ["--runtime", "--peft-wheel", "/absent-wheel"]]
+    def test_cli_rejects_implicit_or_incomplete_runtime_profiles_before_artifact_reads(
+        self,
+    ):
+        base = [
+            "--variant",
+            "small",
+            "--source-dir",
+            "/absent-source",
+            "--export-dir",
+            "/absent-export",
+            "--output-dir",
+            "/absent-output",
+        ]
+        invalid = [
+            ["--peft-wheel", "/absent-wheel"],
+            ["--runtime-profile", runtime.PROFILE],
+            ["--runtime", "--runtime-profile", runtime.PROFILE],
+            ["--runtime", "--peft-wheel", "/absent-wheel"],
+        ]
         for options in invalid:
-            with self.subTest(options=options), mock.patch.object(checker, "audit_export") as audit:
+            with (
+                self.subTest(options=options),
+                mock.patch.object(checker, "audit_export") as audit,
+            ):
                 with self.assertRaises(runtime.oracle.ContractError):
                     checker.main(base + options)
                 audit.assert_not_called()

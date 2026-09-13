@@ -26,7 +26,11 @@ class BoundedZigBuildTest(unittest.TestCase):
         # the product graph. In particular, host/target and backend fallbacks
         # must not inherit claims measured only for native Linux CPU releases.
         subprocess.run(
-            [os.environ.get("ZIG", "zig"), "test", "pkg/antfly/build/runtime_memory.zig"],
+            [
+                os.environ.get("ZIG", "zig"),
+                "test",
+                "pkg/antfly/build/runtime_memory.zig",
+            ],
             cwd=SCRIPT.parents[1],
             check=True,
         )

@@ -25,13 +25,17 @@ class SourceControlTests(unittest.TestCase):
         row = self.rows["six_negative_edges"]
         self.assertEqual(row["beam"]["score"], 117)
         self.assertEqual(row["beam"]["node_indices"], list(range(12)))
-        self.assertEqual([edge["source_edge_index"] for edge in row["beam"]["edges"]], [0, 1, 2])
+        self.assertEqual(
+            [edge["source_edge_index"] for edge in row["beam"]["edges"]], [0, 1, 2]
+        )
         self.assertEqual(row["greedy"]["score"], 114)
         # Prove the120 assignment using the source's own final constraints.
         with target.source_modules(UPSTREAM, CONTRACT["source_files"]) as modules:
             problem = target.make_problem(row["input"], modules)
             optimizer = modules["beam"].BeamOptimizer(32)
-            all_nodes = optimizer.solution(problem, [node.candidate_id for node in problem.nodes], (), 120)
+            all_nodes = optimizer.solution(
+                problem, [node.candidate_id for node in problem.nodes], (), 120
+            )
             self.assertTrue(optimizer.validate_solution(problem, all_nodes))
 
     def test_independent_greedy_baseline_can_beat_every_beam_finish(self):
@@ -46,7 +50,9 @@ class SourceControlTests(unittest.TestCase):
         row = self.rows["semantic_tie_slots_2_10"]
         self.assertEqual(row["source_keys"]["node_strings"][0], "('组织', 2, 3)")
         self.assertEqual(row["source_keys"]["node_strings"][2], "('组织', 10, 11)")
-        self.assertLess(row["source_keys"]["node_strings"][2], row["source_keys"]["node_strings"][0])
+        self.assertLess(
+            row["source_keys"]["node_strings"][2], row["source_keys"]["node_strings"][0]
+        )
         self.assertEqual(row["source_keys"]["slot_strings"], ["2", "10"])
         self.assertEqual(row["beam"]["edges"][0]["source_edge_index"], 0)
         self.assertEqual(row["greedy"]["edges"][0]["source_edge_index"], 1)
@@ -74,14 +80,21 @@ class SourceControlTests(unittest.TestCase):
         valid = self.rows["derived_inverse_valid"]["beam"]
         self.assertEqual(valid["score"], 5)
         self.assertEqual([edge["derived"] for edge in valid["edges"]], [False, True])
-        self.assertEqual(valid["edges"][1]["candidate_id"], ("derived", "reverse'Ω", ("B", 10, 11), ("A", 2, 3)))
+        self.assertEqual(
+            valid["edges"][1]["candidate_id"],
+            ("derived", "reverse'Ω", ("B", 10, 11), ("A", 2, 3)),
+        )
 
     def test_count_alternative_compatibility_and_free_node_overlap_tie(self):
         row = self.rows["count_alternatives_and_slots"]
         self.assertEqual(row["beam"]["score"], 9)
-        self.assertEqual([edge["count_alternative"] for edge in row["beam"]["edges"]], [1, 1])
+        self.assertEqual(
+            [edge["count_alternative"] for edge in row["beam"]["edges"]], [1, 1]
+        )
         self.assertEqual(row["greedy"]["score"], 8)
-        self.assertEqual(self.rows["positive_free_node_overlap_tie"]["beam"]["node_indices"], [1])
+        self.assertEqual(
+            self.rows["positive_free_node_overlap_tie"]["beam"]["node_indices"], [1]
+        )
 
     def test_source_pins_and_import_allowlist_fail_closed(self):
         pins = dict(CONTRACT["source_files"])
@@ -91,25 +104,46 @@ class SourceControlTests(unittest.TestCase):
             with target.source_modules(UPSTREAM, pins):
                 self.fail("tampered source admitted")
         with target.source_modules(UPSTREAM, CONTRACT["source_files"]):
-            for name in ("torch", "transformers", "numpy", "gliner2.model", "gliner2.unlisted"):
-                with self.assertRaisesRegex(RuntimeError, "forbidden|outside fixed allowlist"):
+            for name in (
+                "torch",
+                "transformers",
+                "numpy",
+                "gliner2.model",
+                "gliner2.unlisted",
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "forbidden|outside fixed allowlist"
+                ):
                     importlib.import_module(name)
         self.assertEqual(target.forbidden_loaded(), [])
-        self.assertFalse(any(name == "gliner2" or name.startswith("gliner2.") for name in sys.modules))
+        self.assertFalse(
+            any(
+                name == "gliner2" or name.startswith("gliner2.") for name in sys.modules
+            )
+        )
 
     def test_source_exception_restores_observer_and_packages(self):
         class FailingConstraint:
             def allow_edge(self, *_args):
                 raise RuntimeError("controlled source-call failure")
+
         with target.source_modules(UPSTREAM, CONTRACT["source_files"]) as modules:
             case = target.fixed_cases()[0]
             problem = target.make_problem(case, modules)
-            broken = modules["candidates"].JointProblem(problem.nodes, problem.edges, (FailingConstraint(),))
+            broken = modules["candidates"].JointProblem(
+                problem.nodes, problem.edges, (FailingConstraint(),)
+            )
             with mock.patch.object(target, "make_problem", return_value=broken):
-                with self.assertRaisesRegex(RuntimeError, "controlled source-call failure"):
+                with self.assertRaisesRegex(
+                    RuntimeError, "controlled source-call failure"
+                ):
                     target.capture_case(case, modules)
             self.assertIsNone(sys.getprofile())
-        self.assertFalse(any(name == "gliner2" or name.startswith("gliner2.") for name in sys.modules))
+        self.assertFalse(
+            any(
+                name == "gliner2" or name.startswith("gliner2.") for name in sys.modules
+            )
+        )
 
     def test_repeated_source_capture_is_exact_and_bounded(self):
         repeated = target.capture(UPSTREAM, CONTRACT)
@@ -121,7 +155,9 @@ class SourceControlTests(unittest.TestCase):
     def test_saved_compact_capture_matches_source_replay_and_provenance(self):
         path = ROOT / "capture.json"
         if not path.exists() and not path.is_symlink():
-            self.skipTest("GLiNER2.5 external joint optimizer capture omitted; restore the pinned file")
+            self.skipTest(
+                "GLiNER2.5 external joint optimizer capture omitted; restore the pinned file"
+            )
         raw = target.read_regular(ROOT / "capture.json", target.MAX_OUTPUT)
         reproduced = {
             **self.report,

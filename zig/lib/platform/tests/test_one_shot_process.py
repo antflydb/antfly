@@ -16,7 +16,12 @@ FIXTURE = os.path.abspath(sys.argv.pop(1))
 
 class OneShotTests(unittest.TestCase):
     def start(
-        self, mode="blocked", *, timeout=1500, grace=300, cancel=False,
+        self,
+        mode="blocked",
+        *,
+        timeout=1500,
+        grace=300,
+        cancel=False,
         parent_atexit=False,
     ):
         environment = os.environ.copy()
@@ -180,9 +185,7 @@ class OneShotTests(unittest.TestCase):
         # The embedding cancellation API returns an error only after its
         # force-reap and caller-owned cleanup. The executable maps that error
         # to a failed outcome and must bypass the parent handler as well.
-        process, workers = self.start(
-            timeout=10_000, cancel=True, parent_atexit=True
-        )
+        process, workers = self.start(timeout=10_000, cancel=True, parent_atexit=True)
         pid = self.worker(process, workers)
         output, error = self.finish(process)
         self.assertEqual(process.returncode, 1)

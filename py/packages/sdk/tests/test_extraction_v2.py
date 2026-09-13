@@ -13,6 +13,7 @@ from antfly.client_generated.models import (
     ExtractionOptionsWordSplitter,
     ExtractionRequest,
 )
+from antfly.client_generated.types import Unset
 
 
 def client_with_transport(handler, **kwargs):
@@ -157,8 +158,14 @@ def test_extraction_v2_preserves_long_document_and_record_solver_metadata():
         }
     )
     assert response.data[0].to_dict() == output
-    assert response.data[0].long_document.version == 1
-    assert response.data[0].solvers.records.exhausted is True
+    long_document = response.data[0].long_document
+    assert not isinstance(long_document, Unset)
+    assert long_document.version == 1
+    solvers = response.data[0].solvers
+    assert not isinstance(solvers, Unset)
+    records = solvers.records
+    assert not isinstance(records, Unset)
+    assert records.exhausted is True
 
 
 def identified_request():
@@ -256,8 +263,12 @@ def test_extraction_v2_ids_are_positional_and_extensions_and_offsets_survive():
     ]
     response = client_with_transport(lambda _: httpx.Response(200, json=payload)).extract_v2(request)
     assert response.to_dict() == payload
-    assert response.data[0].entities[0].start == 0
-    assert "start" not in response.data[1].entities[0].to_dict()
+    first_entities = response.data[0].entities
+    second_entities = response.data[1].entities
+    assert not isinstance(first_entities, Unset)
+    assert not isinstance(second_entities, Unset)
+    assert first_entities[0].start == 0
+    assert "start" not in second_entities[0].to_dict()
     assert "id" not in response.data[3].to_dict()
 
 

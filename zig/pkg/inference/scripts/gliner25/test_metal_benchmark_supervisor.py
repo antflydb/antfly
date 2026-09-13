@@ -1,4 +1,5 @@
 """Bounded protocol/process tests. No models, Torch, GPU, or network access."""
+
 import json
 import os
 from pathlib import Path
@@ -111,8 +112,20 @@ class MetalBenchmarkSupervisorTest(unittest.TestCase):
     def worker(self, mode="normal", *, arm="antfly_metal", argument="", guard=None):
         destination = self.directory / str(len(self.workers))
         destination.mkdir()
-        command = [sys.executable, "-B", "-u", "-c", FIXTURE, mode, str(destination), arm, argument]
-        worker = supervision.Worker(arm, command, os.environ.copy(), destination, guard or self.guard)
+        command = [
+            sys.executable,
+            "-B",
+            "-u",
+            "-c",
+            FIXTURE,
+            mode,
+            str(destination),
+            arm,
+            argument,
+        ]
+        worker = supervision.Worker(
+            arm, command, os.environ.copy(), destination, guard or self.guard
+        )
         self.workers.append(worker)
         return worker
 
@@ -132,13 +145,17 @@ class MetalBenchmarkSupervisorTest(unittest.TestCase):
         for worker in self.workers:
             result = worker.request("validate", "unicode-東京", timeout=2)
             self.assertEqual((1, 100), (result["request_id"], result["duration_ns"]))
-            self.assertEqual(2, worker.request("run", "unicode-東京", timeout=2)["request_id"])
+            self.assertEqual(
+                2, worker.request("run", "unicode-東京", timeout=2)["request_id"]
+            )
             self.assertEqual(3, worker.request("stop", timeout=2)["request_id"])
             self.assertEqual(0, worker.process.wait(timeout=2))
             worker.close()
             self.assert_clean(worker)
         self.assertGreater(self.guard.peak_rss_bytes, 4 * 1024**2)
-        self.assertEqual({"antfly_metal", "fastino_mps"}, set(self.guard.peak_rss_by_arm))
+        self.assertEqual(
+            {"antfly_metal", "fastino_mps"}, set(self.guard.peak_rss_by_arm)
+        )
         receipt = self.guard.receipt()
         self.assertEqual(2, len(receipt["completed_workers"]))
         json.dumps(receipt, allow_nan=False)
@@ -152,13 +169,15 @@ class MetalBenchmarkSupervisorTest(unittest.TestCase):
         self.assertEqual("bounded test failure", error["message"])
         self.assertIs(error["recoverable"], True)
         self.assertNotIn("duration_ns", error)
-        self.assertEqual("result", worker.request("validate", "case", timeout=2)["event"])
+        self.assertEqual(
+            "result", worker.request("validate", "case", timeout=2)["event"]
+        )
 
     def test_timeout_cleans_owner_and_next_worker_recovers(self):
         worker = self.worker("sleep")
         start = time.monotonic()
         with self.assertRaisesRegex(supervision.BenchmarkError, "deadline"):
-            worker.receive(.08)
+            worker.receive(0.08)
         self.assertLess(time.monotonic() - start, 2)
         self.assert_clean(worker)
         replacement = self.worker()
@@ -176,7 +195,7 @@ class MetalBenchmarkSupervisorTest(unittest.TestCase):
         self.assertLess(written, 1024**2, "fixture did not fill its bounded pipe")
         start = time.monotonic()
         with self.assertRaisesRegex(supervision.BenchmarkError, "deadline"):
-            worker.request("run", "case", timeout=.08)
+            worker.request("run", "case", timeout=0.08)
         self.assertLess(time.monotonic() - start, 2)
         self.assert_clean(worker)
 
@@ -191,9 +210,14 @@ class MetalBenchmarkSupervisorTest(unittest.TestCase):
         self.assert_clean(worker)
         tracked = worker.cleanup["tracked_processes"]
         self.assertIn(child.pid, [entry["pid"] for entry in tracked])
-        self.assertIn((child.pid, signal.SIGKILL), [(entry["pid"], entry["signal"]) for entry in worker.cleanup["signals"]])
+        self.assertIn(
+            (child.pid, signal.SIGKILL),
+            [(entry["pid"], entry["signal"]) for entry in worker.cleanup["signals"]],
+        )
         self.assertGreaterEqual(self.guard.peak_rss_by_arm[worker.arm], 16 * 1024**2)
-        self.assertTrue(not child.is_running() or child.status() == self.guard.psutil.STATUS_ZOMBIE)
+        self.assertTrue(
+            not child.is_running() or child.status() == self.guard.psutil.STATUS_ZOMBIE
+        )
         self.assertIn("not attempted", worker.cleanup["nonchild_reaping"])
         self.assertLess(worker.cleanup["elapsed_seconds"], 4.6)
 
@@ -206,41 +230,72 @@ class MetalBenchmarkSupervisorTest(unittest.TestCase):
         self.assertEqual(0, worker.process.wait(timeout=2))
         worker.close()
         self.assert_clean(worker)
-        self.assertIn(child.pid, [entry["pid"] for entry in worker.cleanup["observed_exited"]])
+        self.assertIn(
+            child.pid, [entry["pid"] for entry in worker.cleanup["observed_exited"]]
+        )
 
     def test_selector_failures_roll_back_launched_process_and_registration(self):
         original_popen = supervision.subprocess.Popen
         launched = []
+
         def capture(*args, **kwargs):
             process = original_popen(*args, **kwargs)
             launched.append(process)
             return process
+
         for where in ("create", "register"):
             with self.subTest(where=where):
                 selector = mock.Mock()
-                selector.register.side_effect = OSError("injected selector registration")
-                selected = mock.Mock(side_effect=OSError("injected selector creation")) if where == "create" else mock.Mock(return_value=selector)
+                selector.register.side_effect = OSError(
+                    "injected selector registration"
+                )
+                selected = (
+                    mock.Mock(side_effect=OSError("injected selector creation"))
+                    if where == "create"
+                    else mock.Mock(return_value=selector)
+                )
                 destination = self.directory / where
                 destination.mkdir()
-                with mock.patch.object(supervision.subprocess, "Popen", side_effect=capture), \
-                     mock.patch.object(supervision.selectors, "DefaultSelector", selected), \
-                     self.assertRaisesRegex(OSError, "injected selector"):
-                    supervision.Worker("antfly_metal", [sys.executable, "-c", "import time; time.sleep(60)"],
-                                       os.environ.copy(), destination, self.guard)
+                with (
+                    mock.patch.object(
+                        supervision.subprocess, "Popen", side_effect=capture
+                    ),
+                    mock.patch.object(
+                        supervision.selectors, "DefaultSelector", selected
+                    ),
+                    self.assertRaisesRegex(OSError, "injected selector"),
+                ):
+                    supervision.Worker(
+                        "antfly_metal",
+                        [sys.executable, "-c", "import time; time.sleep(60)"],
+                        os.environ.copy(),
+                        destination,
+                        self.guard,
+                    )
                 self.assertIsNotNone(launched[-1].returncode)
                 self.assertEqual([], self.guard.workers)
-                self.assertTrue(self.guard.receipt()["completed_workers"][-1]["cleanup"]["complete"])
+                self.assertTrue(
+                    self.guard.receipt()["completed_workers"][-1]["cleanup"]["complete"]
+                )
 
     def test_launch_failure_preserves_existing_log_and_has_no_registered_owner(self):
         destination = self.directory / "launch"
         destination.mkdir()
         with self.assertRaises(FileNotFoundError):
-            supervision.Worker("antfly_metal", ["/does/not/exist/gliner25-test"], {}, destination, self.guard)
+            supervision.Worker(
+                "antfly_metal",
+                ["/does/not/exist/gliner25-test"],
+                {},
+                destination,
+                self.guard,
+            )
         self.assertEqual([], self.guard.workers)
         log = destination / "antfly_metal.stderr.log"
         log.write_bytes(b"preserve failed startup")
         with self.assertRaises(FileExistsError):
-            supervision.Worker("antfly_metal", [sys.executable], {}, destination, self.guard)
+            supervision.Worker(
+                "antfly_metal", [sys.executable], {}, destination, self.guard
+            )
         self.assertEqual(b"preserve failed startup", log.read_bytes())
 
     def test_oversized_stdout_is_rejected_and_cleanup_does_not_retain_it(self):
@@ -257,7 +312,9 @@ class MetalBenchmarkSupervisorTest(unittest.TestCase):
             worker.receive(3)
         self.assertEqual(1024, worker.log_path.stat().st_size)
         self.assert_clean(worker)
-        self.assertIn("stderr log byte ceiling exceeded", worker.cleanup["guard_violations"])
+        self.assertIn(
+            "stderr log byte ceiling exceeded", worker.cleanup["guard_violations"]
+        )
 
     def test_fallback_warning_split_across_protocol_waits_is_rejected(self):
         worker = self.worker("fallback_split")
@@ -276,8 +333,17 @@ class MetalBenchmarkSupervisorTest(unittest.TestCase):
         self.assertIn(b"falling back", worker.log_path.read_bytes())
 
     def test_bad_request_identity_arm_case_event_and_timings_fail_closed(self):
-        cases = [("bad_id", ""), ("bad_arm", ""), ("bad_case", ""), ("bad_event", ""), ("error_timing", "")]
-        cases += [("invalid_duration", json.dumps(value)) for value in (0, -1, True, None, 1.5, "100")]
+        cases = [
+            ("bad_id", ""),
+            ("bad_arm", ""),
+            ("bad_case", ""),
+            ("bad_event", ""),
+            ("error_timing", ""),
+        ]
+        cases += [
+            ("invalid_duration", json.dumps(value))
+            for value in (0, -1, True, None, 1.5, "100")
+        ]
         for mode, argument in cases:
             with self.subTest(mode=mode, argument=argument):
                 worker = self.worker(mode, argument=argument)
@@ -287,12 +353,17 @@ class MetalBenchmarkSupervisorTest(unittest.TestCase):
                 self.assert_clean(worker)
 
     def test_ready_rejects_unknown_identity_event_and_nonfinite_json(self):
-        messages = [b'{"event":"ready","arm":"wrong"}\n', b'{"event":"heartbeat"}\n',
-                    b'{"event":"ready","arm":"antfly_metal","request_id":0}\n',
-                    b'{"event":"ready","arm":"antfly_metal","value":NaN}\n',
-                    b'{"event":"ready","arm":"antfly_metal","value":1e999}\n',
-                    b'{"event":"ready","event":"ready","arm":"antfly_metal"}\n',
-                    b'[]\n', b'null\n', b'\xff\n']
+        messages = [
+            b'{"event":"ready","arm":"wrong"}\n',
+            b'{"event":"heartbeat"}\n',
+            b'{"event":"ready","arm":"antfly_metal","request_id":0}\n',
+            b'{"event":"ready","arm":"antfly_metal","value":NaN}\n',
+            b'{"event":"ready","arm":"antfly_metal","value":1e999}\n',
+            b'{"event":"ready","event":"ready","arm":"antfly_metal"}\n',
+            b"[]\n",
+            b"null\n",
+            b"\xff\n",
+        ]
         for raw in messages:
             with self.subTest(raw=raw):
                 worker = self.worker("raw", argument=raw.hex())
@@ -311,13 +382,23 @@ class MetalBenchmarkSupervisorTest(unittest.TestCase):
 
     def test_combined_rss_includes_each_arm_and_deduplicates_creation_identity(self):
         guard = supervision.ResourceGuard(max_rss_bytes=599)
-        guard.workers = [SimpleNamespace(arm="antfly_metal", _pump=lambda: None,
-            _tree=SimpleNamespace(sample=lambda: {(10, 1.0): 100, (11, 1.0): 200})),
-            SimpleNamespace(arm="fastino_mps", _pump=lambda: None,
-            _tree=SimpleNamespace(sample=lambda: {(11, 1.0): 200, (12, 1.0): 300}))]
+        guard.workers = [
+            SimpleNamespace(
+                arm="antfly_metal",
+                _pump=lambda: None,
+                _tree=SimpleNamespace(sample=lambda: {(10, 1.0): 100, (11, 1.0): 200}),
+            ),
+            SimpleNamespace(
+                arm="fastino_mps",
+                _pump=lambda: None,
+                _tree=SimpleNamespace(sample=lambda: {(11, 1.0): 200, (12, 1.0): 300}),
+            ),
+        ]
         with self.assertRaisesRegex(supervision.BenchmarkError, "RSS 600 exceeds 599"):
             guard.check()
-        self.assertEqual({"antfly_metal": 300, "fastino_mps": 500}, guard.peak_rss_by_arm)
+        self.assertEqual(
+            {"antfly_metal": 300, "fastino_mps": 500}, guard.peak_rss_by_arm
+        )
         self.assertEqual(600, guard.peak_rss_bytes)
 
     def test_command_bound_precedes_write_and_is_measured_in_utf8_bytes(self):
@@ -341,12 +422,23 @@ class MetalBenchmarkSupervisorTest(unittest.TestCase):
 
     def test_invalid_limits_and_json_are_rejected_without_launch(self):
         for value in (0, -1, True, 1.5):
-            with self.subTest(value=value), self.assertRaises(supervision.BenchmarkError):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(supervision.BenchmarkError),
+            ):
                 supervision.ResourceGuard(max_rss_bytes=value)
         with self.assertRaises(supervision.BenchmarkError):
             supervision.ResourceGuard(max_log_bytes=supervision.MAX_LOG_BYTES + 1)
-        for value in (b'{"x":Infinity}', b'{"x":-Infinity}', b'{"x":1e309}', b'{"x":{"y":1,"y":2}}'):
-            with self.subTest(value=value), self.assertRaises(supervision.BenchmarkError):
+        for value in (
+            b'{"x":Infinity}',
+            b'{"x":-Infinity}',
+            b'{"x":1e309}',
+            b'{"x":{"y":1,"y":2}}',
+        ):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(supervision.BenchmarkError),
+            ):
                 supervision.strict_json(value)
 
 

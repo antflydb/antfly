@@ -86,7 +86,7 @@ fn encoderOracle(comptime resident: bool) !void {
     defer compute.deinit();
     const cb = compute.computeBackend();
     var device: ?resident_fixture.Device = if (resident) try resident_fixture.Device.init(a) else null;
-    defer if (device) |*value| value.deinit();
+    defer if (resident) if (device) |*value| value.deinit();
     const cfg = config();
     for ([_][]const u8{ "padded7", "buckets19" }) |case| for ([_]encoder.Mode{ .eval, .train }) |mode| {
         errdefer std.debug.print("encoder numerical fixture {s}/{s}\n", .{ case, @tagName(mode) });
@@ -153,7 +153,8 @@ fn encoderOracle(comptime resident: bool) !void {
         const expected = try reference.floats(try std.fmt.allocPrint(scratch, "{s}.{s}.output", .{ case, @tagName(mode) }));
         try compare(a, &cb, try tape.logits(0), expected, 3e-5, 3e-5);
         if (mode == .eval) {
-            if (device) |*value| {
+            if (resident) {
+                const value = &device.?;
                 const gpu = value.backend.computeBackend();
                 var actual = try resident_fixture.run(a, &gpu, &cb, &session, runtime.items, null);
                 defer actual.deinit(&gpu);
@@ -177,7 +178,8 @@ fn encoderOracle(comptime resident: bool) !void {
             const expected_gradient = try reference.floats(try std.fmt.allocPrint(scratch, "{s}.gradient.{s}", .{ case, name }));
             try compare(a, &cb, value, expected_gradient, 3e-4, 5e-5);
         }
-        if (device) |*value| {
+        if (resident) {
+            const value = &device.?;
             const gpu = value.backend.computeBackend();
             var actual = try resident_fixture.run(a, &gpu, &cb, &session, runtime.items, &.{seed});
             defer actual.deinit(&gpu);
@@ -243,7 +245,7 @@ fn routedOracle(comptime resident: bool) !void {
     defer compute.deinit();
     const cb = compute.computeBackend();
     var device: ?resident_fixture.Device = if (resident) try resident_fixture.Device.init(a) else null;
-    defer if (device) |*value| value.deinit();
+    defer if (resident) if (device) |*value| value.deinit();
     var runtime = std.ArrayListUnmanaged(interpreter.RuntimeInput).empty;
     defer {
         for (runtime.items) |value| cb.free(value.value);
@@ -312,7 +314,8 @@ fn routedOracle(comptime resident: bool) !void {
     defer backward.deinit(&cb);
     try std.testing.expectEqual(@as(usize, 1), backward.gradients.outputs.len);
     try compare(a, &cb, backward.gradients.outputs[0], &gradients, 1e-6, 1e-6);
-    if (device) |*value| {
+    if (resident) {
+        const value = &device.?;
         const gpu = value.backend.computeBackend();
         var actual = try resident_fixture.run(a, &gpu, &cb, &session, runtime.items, &cotangents);
         defer actual.deinit(&gpu);
