@@ -4,6 +4,43 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-14: standby VOPR promotion overtakes apply (#704)
+
+[Full soak 34878521929](https://github.com/antflydb/antfly/actions/runs/34878521929)
+on `03e1a8e0d2` stopped both standalone standby shards with
+`PromotionRequiresForce`, at histories 171 and 759. The other six campaign
+shards and all four corpus jobs passed. Those partial results do not qualify
+the full soak, and no second required-seed run was started.
+
+The lifecycle scenario obtained a non-forced fence after catching up, then
+allowed another primary append and standby receive before promotion. The
+production standby correctly rejected promotion with unapplied received data;
+the scenario propagated that expected refusal as a fatal harness error.
+The scripted regression reproduces the same error, then covers rejection,
+restart, another rejection, apply, successful promotion, and former-primary
+assessment with exact replay. Explicit forced promotion remains covered too.
+
+The scenario now records the refusal as a rejected transition. A separate
+safety property checks the applied-tail requirement and verifies rejection
+preserves identity and progress. Unexpected errors still escape. Production
+promotion rules and force authorization are unchanged. Scenario version 3
+marks the changed trace/property contract, and the reusable qualification job
+runs the standby lifecycle regressions before admitting full campaigns.
+
+The initial scripted regression failed with `PromotionRequiresForce`; after
+the fix it passed with exact replay and no leaks. Evidence is retained in
+`/tmp/pr704-promotion-regression-red.log` and
+`/tmp/pr704-promotion-regression-green.log`. New complete soaks must validate
+the corrected revision; earlier successful shards are historical evidence.
+
+The same revision's ordinary CI independently failed
+`test_session_stage_transform_commit` with HTTP 503 (446 other tests passed).
+Its retained server log contained no underlying error, and 30 unchanged-binary
+native repetitions passed. The transaction helper now retains the response
+body through its existing error checker; it does not retry commits or treat
+503 as success. There is no evidence establishing a common cause with the
+standby rejection or proving #723 resolves that transaction failure.
+
 ## 2026-09-14: producer readiness snapshot loss (#723)
 
 [The Antfly E2E job on #723](https://github.com/antflydb/antfly/actions/runs/34801864332/job/103853126220)

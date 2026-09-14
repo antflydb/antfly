@@ -79,7 +79,7 @@ jobs:
       - name: Test production transport, runtime scheduling, and determinism boundaries
         working-directory: zig
         run: |
-          zig build antfly-raft-transport-test vopr-runtime-test vopr-determinism-audit \
+          zig build antfly-raft-transport-test ha-vopr-test vopr-runtime-test vopr-determinism-audit \
             -Doptimize=ReleaseSafe -j1 --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
 

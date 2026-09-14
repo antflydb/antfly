@@ -41,6 +41,7 @@ const applied_prefix_id = vopr.id.stable("property", "storage.hot_standby.applie
 const durability_sound_id = vopr.id.stable("property", "storage.hot_standby.remote_apply_ack_is_sound");
 const backup_pinned_id = vopr.id.stable("property", "storage.hot_standby.base_backup_pin_survives_restart");
 const fenced_promotion_id = vopr.id.stable("property", "storage.hot_standby.promotion_requires_durable_fence");
+const applied_promotion_id = vopr.id.stable("property", "storage.hot_standby.promotion_respects_applied_tail");
 const timeline_id = vopr.id.stable("property", "storage.hot_standby.timeline_and_epoch_are_monotonic");
 const rejoin_safe_id = vopr.id.stable("property", "storage.hot_standby.former_primary_never_rejoins_unsafely");
 const complete_id = vopr.id.stable("property", "storage.hot_standby.campaign_completed");
@@ -71,13 +72,14 @@ const ApplyModel = struct {
 pub fn Scenario(comptime action_budget: u64) type {
     return struct {
         pub const name: []const u8 = "ha-lifecycle";
-        pub const version: u32 = 2;
+        pub const version: u32 = 3;
         pub const properties = &[_]vopr.property.Declaration{
             .{ .id = progress_ordered_id, .name = "storage.hot_standby.progress_is_ordered", .kind = .always },
             .{ .id = applied_prefix_id, .name = "storage.hot_standby.applied_payloads_are_primary_prefix", .kind = .always },
             .{ .id = durability_sound_id, .name = "storage.hot_standby.remote_apply_ack_is_sound", .kind = .always },
             .{ .id = backup_pinned_id, .name = "storage.hot_standby.base_backup_pin_survives_restart", .kind = .always },
             .{ .id = fenced_promotion_id, .name = "storage.hot_standby.promotion_requires_durable_fence", .kind = .always },
+            .{ .id = applied_promotion_id, .name = "storage.hot_standby.promotion_respects_applied_tail", .kind = .always },
             .{ .id = timeline_id, .name = "storage.hot_standby.timeline_and_epoch_are_monotonic", .kind = .always },
             .{ .id = rejoin_safe_id, .name = "storage.hot_standby.former_primary_never_rejoins_unsafely", .kind = .always },
             .{ .id = complete_id, .name = "storage.hot_standby.campaign_completed", .kind = .reachable },
@@ -107,6 +109,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             unfenced_rejections: u64 = 0,
             promoted: bool = false,
             promotion_fenced: bool = true,
+            promotion_applied_tail_safe: bool = true,
             timeline_monotonic: bool = true,
             rejoin_safe: bool = true,
             durability_sound: bool = true,
@@ -172,6 +175,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             state.unfenced_rejections = 0;
             state.promoted = false;
             state.promotion_fenced = true;
+            state.promotion_applied_tail_safe = true;
             state.timeline_monotonic = true;
             state.rejoin_safe = true;
             state.durability_sound = true;
@@ -304,7 +308,23 @@ pub fn Scenario(comptime action_budget: u64) type {
                 try events.emitNamed(allocator, .state_change, "storage.hot_standby.promotion_fence_acquired", state.receipt.?.generation);
             } else if (selected.id == promote_id) {
                 const receipt = state.receipt orelse return error.PromotionFenceMissing;
-                _ = try state.standby.promote(receipt.promotionRequest());
+                const before = state.standby.snapshot();
+                const needs_apply = !receipt.forced and
+                    (before.progress.received_lsn < receipt.required_lsn or
+                        before.progress.applied_lsn < before.progress.received_lsn or
+                        before.progress.applied_lsn < receipt.required_lsn);
+                // A receipt captures the fence boundary, not a promise that
+                // every later receive has been applied. Keep exploring early
+                // promotion attempts and observe the production rejection;
+                // never silently turn them into forced promotions.
+                _ = state.standby.promote(receipt.promotionRequest()) catch |err| {
+                    if (err != error.PromotionRequiresForce) return err;
+                    state.promotion_applied_tail_safe = state.promotion_applied_tail_safe and
+                        needs_apply and std.meta.eql(before, state.standby.snapshot());
+                    try events.emitNamed(allocator, .client_response, "storage.hot_standby.promotion_waiting_for_apply", before.progress.applied_lsn);
+                    return vopr.outcome.TransitionOutcome.rejected("storage.hot_standby.promotion_requires_apply", before.progress.applied_lsn);
+                };
+                state.promotion_applied_tail_safe = state.promotion_applied_tail_safe and !needs_apply;
                 state.promoted = true;
                 state.promotion_fenced = state.promotion_fenced and true;
                 const identity = state.standby.identitySnapshot();
@@ -362,6 +382,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             try sink.check(allocator, durability_sound_id, state.durability_sound);
             try sink.check(allocator, backup_pinned_id, state.backup_pin_valid);
             try sink.check(allocator, fenced_promotion_id, !state.promoted or (state.receipt != null and state.promotion_fenced));
+            try sink.check(allocator, applied_promotion_id, state.promotion_applied_tail_safe);
             try sink.check(allocator, timeline_id, state.timeline_monotonic);
             try sink.check(allocator, rejoin_safe_id, state.rejoin_safe);
             try sink.check(allocator, complete_id, state.finished);
@@ -640,6 +661,53 @@ test "HA VOPR scripted partition rejects unfenced promotion and safely fences pr
     defer artifact.deinit();
     try expectEvent(&artifact, "storage.hot_standby.unfenced_promotion_rejected");
     try expectEvent(&artifact, "storage.hot_standby.promotion_fence_acquired");
+    try expectEvent(&artifact, "storage.hot_standby.standby_promoted");
+    try expectEvent(&artifact, "storage.hot_standby.former_primary_assessed");
+}
+
+test "HA VOPR promotion rejects a newly received tail then catches up across restart" {
+    const selections = [_]vopr.id.StableId{
+        append_id,
+        receive_id,
+        apply_id,
+        partitionSpec().startTransition().id,
+        acquire_fence_id,
+        partitionSpec().stopTransition().id,
+        append_id,
+        receive_id,
+        promote_id,
+        restart_standby_id,
+        promote_id,
+        apply_id,
+        promote_id,
+        rejoin_id,
+        finish_id,
+    };
+    var artifact = try runScripted(selections.len - 1, &selections);
+    defer artifact.deinit();
+    var rejections: usize = 0;
+    for (artifact.events.items) |event| {
+        if (std.mem.eql(u8, event.name, "storage.hot_standby.promotion_waiting_for_apply"))
+            rejections += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), rejections);
+    try expectEvent(&artifact, "storage.hot_standby.standby_promoted");
+    try expectEvent(&artifact, "storage.hot_standby.former_primary_assessed");
+}
+
+test "HA VOPR an explicitly forced fence permits promotion behind the required tail" {
+    const selections = [_]vopr.id.StableId{
+        append_id,
+        append_id,
+        receive_id,
+        partitionSpec().startTransition().id,
+        acquire_fence_id,
+        promote_id,
+        rejoin_id,
+        finish_id,
+    };
+    var artifact = try runScripted(selections.len - 1, &selections);
+    defer artifact.deinit();
     try expectEvent(&artifact, "storage.hot_standby.standby_promoted");
     try expectEvent(&artifact, "storage.hot_standby.former_primary_assessed");
 }
