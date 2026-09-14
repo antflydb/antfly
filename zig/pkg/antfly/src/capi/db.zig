@@ -6412,7 +6412,14 @@ pub fn storageOwnerBufferDestroy(buffer: *kernel_owner_abi.OwnedBytes) callconv(
 }
 
 fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
-    return kernel_error_identity.statusFromError(err);
+    const status = kernel_error_identity.statusFromError(err);
+    if (status == .internal) {
+        // This status-only boundary cannot carry undeclared error names.
+        // Preserve the originating diagnostic before consumers see the
+        // intentionally generic StorageKernelFailure control-flow status.
+        std.log.warn("storage owner returned undeclared error err={s}", .{@errorName(err)});
+    }
+    return status;
 }
 
 fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
