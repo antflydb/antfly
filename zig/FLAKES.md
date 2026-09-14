@@ -75,6 +75,53 @@ retained at `/tmp/pr723-merged-snapshot-suite.log`. Linux validation remains
 CI's responsibility; passing native soaks do not establish the precise
 interleaving of the original CI counter reset.
 
+### Snapshot review follow-up
+
+A review of the same ABI copy path reproduced two further defects. After
+replacing the source buffer, both table and index `last_merge_error` contained
+`xxxxxxxxxxxx` instead of `InvalidChunk`. A snapshot with schema epoch 7,
+catalog generation 8, and an enabled two-worker graph-metric runtime returned
+zero/disabled defaults. The original reproductions are retained in
+`/tmp/pr723-review-snapshot.log`.
+
+Table and index merge error names, and the graph-metric runtime error name,
+now contain their own bytes using the existing inline status-text convention
+(256-byte identifiers; oversized JSON values are rejected). JSON remains a
+string, or null for the optional graph-metric diagnostic. Copies, retained
+artifact visibility, and aggregates need no new allocation or ownership
+transfer. The C ABI's JSON projection retains the value too.
+
+`LocalTableRuntimeStatus`, `DBStats`, and `DBIndexStats` cloning now preserve
+value fields by default. A recursive compile-time pointer check requires an
+explicit ownership override for pointer-bearing fields. Schema state labels
+are re-interned through the catalog enum. This preserves columnar maintenance,
+schema/catalog/row-format facts, visibility, and graph-metric runtime facts
+without maintaining a second list of every counter.
+
+The regression seeds scalar fields, compares the complete snapshot after an
+ABI JSON round trip, destroys the response/parser and intermediate cache,
+and checks diagnostic ownership through allocation-free copies and JSON
+serialization. Allocation-failure injection also covers optional algebraic
+candidate/progress diagnostics; their partial-clone cleanup is now complete.
+All **111 snapshot checks** passed with no leaks, including existing
+allocation-free commit checks (`/tmp/pr723-snapshot-focused-final.log`). The
+repository's locked Ruff formatter and Python format check also pass; Black
+is not the repository formatter.
+
+The final linked Debug build passed **49/49 steps**, and the expanded
+owner/snapshot/source-readiness suite passed **116 checks**, with no leaks.
+The three affected E2E modules passed **54 tests** with the existing opt-in
+scale case skipped. Evidence is in `/tmp/pr723-snapshot-fix-build-final.log`
+and `/tmp/pr723-snapshot-fix-modules.log`. The native macOS arm64 executable
+SHA-256 is `cfe5769abc4a2a3fe11dbc2fd1024e903da1449ff0f30409976126dd893be68a`.
+Temporary validation target/root changes were removed.
+The same executable passed **500/500 flake repetitions**, exactly 100 per
+scenario, using four workers and 25 iterations each. The complete E2E modules
+ran concurrently with the beginning of the soak; there were no failed-case
+retries, skips in the soak, or timeout increases. The final soak evidence is
+`/tmp/pr723-snapshot-fix-soak-500.log`. `origin/main` was fetched again and was
+already included before this push. Linux validation remains CI's responsibility.
+
 ## 2026-09-13: overlapping storage owner E2E failures (#626, #722)
 
 [PR #626's Antfly E2E job](https://github.com/antflydb/antfly/actions/runs/34781521711/job/103794277696)

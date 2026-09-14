@@ -98,19 +98,7 @@ pub const LocalTableRuntimeStatus = struct {
     }
 
     pub fn clone(self: *const @This(), alloc: std.mem.Allocator) !@This() {
-        return .{
-            .group_id = self.group_id,
-            .cache_observation_generation = self.cache_observation_generation,
-            .cache_publication_epoch = self.cache_publication_epoch,
-            .disk_observation_generation = self.disk_observation_generation,
-            .metadata = self.metadata,
-            .disk_bytes = self.disk_bytes,
-            .disk_bytes_known = self.disk_bytes_known,
-            .created_at_millis = self.created_at_millis,
-            .stats = try cloneDBStats(alloc, self.stats),
-            .lsm_storage_stats = self.lsm_storage_stats,
-            .source_vectors = self.source_vectors,
-        };
+        return copySnapshotWithOverrides(self.*, .{ .stats = try cloneDBStats(alloc, self.stats) });
     }
 
     pub fn withMetadataDefaults(self: *@This(), source: RuntimeStatusSource, now_ns: u64) void {
@@ -5300,6 +5288,92 @@ fn testSourceReplayStatsClone(alloc: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("backoff", index.index_repair_wait_reason);
 }
 
+// Exercise every scalar recursively, including fields added after this fixture.
+// Pointer-bearing values get explicit fixtures and independent lifetime checks.
+fn seedSnapshotValues(value: anytype) @TypeOf(value) {
+    var result = value;
+    switch (@typeInfo(@TypeOf(value))) {
+        .@"struct" => |info| inline for (info.fields) |field| {
+            @field(result, field.name) = seedSnapshotValues(@field(value, field.name));
+        },
+        .bool => result = !value,
+        .int => result = if (value == 0) 1 else 0,
+        .float => result = 1,
+        .@"enum" => |info| result = @enumFromInt(info.fields[info.fields.len - 1].value),
+        else => {},
+    }
+    return result;
+}
+
+fn testSnapshotStatsCompleteness(alloc: std.mem.Allocator) !void {
+    var indexes = [_]db_mod.types.DBIndexStats{seedSnapshotValues(db_mod.types.DBIndexStats{ .name = "text", .kind = .full_text })};
+    indexes[0].text_merge.last_merge_error = .init("IndexSpecificMergeFailure");
+    indexes[0].algebraic_top_candidate = .{
+        .recommendation = "candidate",
+        .materialization_id = "materialization",
+        .lifecycle = "ready",
+        .decision = "keep",
+    };
+    indexes[0].algebraic_active_progress = .{
+        .recommendation = "candidate",
+        .materialization_id = "materialization",
+        .lifecycle = "ready",
+    };
+    var expected = seedSnapshotValues(db_mod.types.DBStats{});
+    expected.indexes = &indexes;
+    expected.index_count = 1;
+    expected.schema_index_state = "building";
+    expected.text_merge.last_merge_error = .init("TableSpecificMergeFailure");
+    expected.graph_metric_runtime.last_error_name = .init("WorkerSpecificFailure");
+    expected.graph_metric_runtime.role = .worker_pool;
+
+    // Reproduce the ABI lifetime: destroy both the JSON and parser before
+    // publishing the clone, and destroy the cache before inspecting a reader.
+    var cloned = cloned: {
+        const json = try std.json.Stringify.valueAlloc(alloc, expected, .{});
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(db_mod.types.DBStats, alloc, json, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const copy = try cloneDBStats(alloc, parsed.value);
+        parsed.value.text_merge.last_merge_error = .init("overwritten");
+        parsed.value.indexes[0].text_merge.last_merge_error = .init("overwritten");
+        parsed.value.graph_metric_runtime.last_error_name = .init("overwritten");
+        break :cloned copy;
+    };
+    defer db_mod.types.freeDBStats(alloc, cloned);
+    // Deep equality covers every member, not a second hand-maintained field list.
+    try std.testing.expectEqualDeep(expected, cloned);
+    var snapshot = snapshot: {
+        var cache = TableRuntimeSnapshotCache.init(alloc);
+        defer cache.deinit();
+        _ = try publishGroupForTest(&cache, "docs", .{ .group_id = 7, .stats = cloned });
+        break :snapshot (try cache.snapshotGroupStatus(alloc, "docs", 7)) orelse return error.OutOfMemory;
+    };
+    defer snapshot.deinit(alloc);
+    var cached_expected = expected;
+    var cached_indexes = indexes;
+    cached_indexes[0].runtime_observation_serviceable = false;
+    cached_indexes[0].runtime_observation_targeted_sibling = false;
+    cached_indexes[0].runtime_target_observation_complete = true;
+    cached_expected.indexes = &cached_indexes;
+    try std.testing.expectEqualDeep(cached_expected, snapshot.stats);
+
+    // These merge operations intentionally copy diagnostics without allocation.
+    var retained_index = indexes[0];
+    preserveIndexArtifactVisibility(&retained_index, cloned.indexes[0]);
+    cloned.indexes[0].text_merge.last_merge_error = .init("overwritten");
+    try std.testing.expectEqualStrings("IndexSpecificMergeFailure", retained_index.text_merge.last_merge_error.slice());
+    var aggregate: db_mod.types.TextMergeStats = .{};
+    db_mod.types.accumulateTextMergeStats(&aggregate, cloned.text_merge);
+    cloned.text_merge.last_merge_error = .init("overwritten");
+    try std.testing.expectEqualStrings("TableSpecificMergeFailure", aggregate.last_merge_error.slice());
+    try std.testing.expectEqualStrings("WorkerSpecificFailure", snapshot.stats.graph_metric_runtime.last_error_name.?.slice());
+    const encoded = try std.json.Stringify.valueAlloc(alloc, snapshot.stats, .{});
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"last_merge_error\":\"TableSpecificMergeFailure\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"last_error_name\":\"WorkerSpecificFailure\"") != null);
+}
+
 pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_mod.types.DBStats {
     const resolver_replay = try cloneResolverReplayDiagnostics(alloc, stats.resolver_replay);
     errdefer db_mod.types.freeResolverReplayDiagnostics(alloc, resolver_replay);
@@ -5368,20 +5442,30 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         else
             null;
         errdefer if (algebraic_last_recommended_materialization) |value| alloc.free(value);
-        const algebraic_top_candidate: ?db_mod.types.AlgebraicCandidateStatus = if (item.algebraic_top_candidate) |candidate| .{
-            .recommendation = try alloc.dupe(u8, candidate.recommendation),
-            .materialization_id = try alloc.dupe(u8, candidate.materialization_id),
-            .lifecycle = try alloc.dupe(u8, candidate.lifecycle),
-            .decision = try alloc.dupe(u8, candidate.decision),
-            .observation_count = candidate.observation_count,
-            .estimated_scan_rows_saved = candidate.estimated_scan_rows_saved,
-            .estimated_write_cost = candidate.estimated_write_cost,
-            .estimated_tensor_rows = candidate.estimated_tensor_rows,
-            .estimated_storage_bytes = candidate.estimated_storage_bytes,
-            .estimated_write_amplification = candidate.estimated_write_amplification,
-            .score = candidate.score,
-            .idle_miss_count = candidate.idle_miss_count,
-            .generation = candidate.generation,
+        const algebraic_top_candidate: ?db_mod.types.AlgebraicCandidateStatus = if (item.algebraic_top_candidate) |candidate| blk: {
+            const recommendation = try alloc.dupe(u8, candidate.recommendation);
+            errdefer alloc.free(recommendation);
+            const materialization_id = try alloc.dupe(u8, candidate.materialization_id);
+            errdefer alloc.free(materialization_id);
+            const lifecycle = try alloc.dupe(u8, candidate.lifecycle);
+            errdefer alloc.free(lifecycle);
+            const decision = try alloc.dupe(u8, candidate.decision);
+            errdefer alloc.free(decision);
+            break :blk .{
+                .recommendation = recommendation,
+                .materialization_id = materialization_id,
+                .lifecycle = lifecycle,
+                .decision = decision,
+                .observation_count = candidate.observation_count,
+                .estimated_scan_rows_saved = candidate.estimated_scan_rows_saved,
+                .estimated_write_cost = candidate.estimated_write_cost,
+                .estimated_tensor_rows = candidate.estimated_tensor_rows,
+                .estimated_storage_bytes = candidate.estimated_storage_bytes,
+                .estimated_write_amplification = candidate.estimated_write_amplification,
+                .score = candidate.score,
+                .idle_miss_count = candidate.idle_miss_count,
+                .generation = candidate.generation,
+            };
         } else null;
         errdefer if (algebraic_top_candidate) |candidate| {
             alloc.free(candidate.recommendation);
@@ -5389,14 +5473,22 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             alloc.free(candidate.lifecycle);
             alloc.free(candidate.decision);
         };
-        const algebraic_active_progress: ?db_mod.types.AlgebraicProgressStatus = if (item.algebraic_active_progress) |progress| .{
-            .recommendation = try alloc.dupe(u8, progress.recommendation),
-            .materialization_id = try alloc.dupe(u8, progress.materialization_id),
-            .lifecycle = try alloc.dupe(u8, progress.lifecycle),
-            .target_sequence = progress.target_sequence,
-            .applied_sequence = progress.applied_sequence,
-            .rows_processed = progress.rows_processed,
-            .target_rows = progress.target_rows,
+        const algebraic_active_progress: ?db_mod.types.AlgebraicProgressStatus = if (item.algebraic_active_progress) |progress| blk: {
+            const recommendation = try alloc.dupe(u8, progress.recommendation);
+            errdefer alloc.free(recommendation);
+            const materialization_id = try alloc.dupe(u8, progress.materialization_id);
+            errdefer alloc.free(materialization_id);
+            const lifecycle = try alloc.dupe(u8, progress.lifecycle);
+            errdefer alloc.free(lifecycle);
+            break :blk .{
+                .recommendation = recommendation,
+                .materialization_id = materialization_id,
+                .lifecycle = lifecycle,
+                .target_sequence = progress.target_sequence,
+                .applied_sequence = progress.applied_sequence,
+                .rows_processed = progress.rows_processed,
+                .target_rows = progress.target_rows,
+            };
         } else null;
         errdefer if (algebraic_active_progress) |progress| {
             alloc.free(progress.recommendation);
@@ -5411,136 +5503,24 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         errdefer freeAlgebraicProgressStatuses(alloc, algebraic_progress);
         const graph_metric_status = try db_mod.types.cloneGraphMetricStatuses(alloc, item.graph_metric_status);
         errdefer db_mod.types.freeGraphMetricStatuses(alloc, graph_metric_status);
-        indexes[i] = .{
+        indexes[i] = copySnapshotWithOverrides(item, .{
             .source_replay = source_replay,
             .graph_metric_status = graph_metric_status,
             .name = try alloc.dupe(u8, item.name),
-            .kind = item.kind,
-            .runtime_observation_stale = item.runtime_observation_stale,
-            .runtime_observation_serviceable = item.runtime_observation_serviceable,
-            .runtime_observation_targeted_sibling = item.runtime_observation_targeted_sibling,
-            .runtime_target_observation_complete = item.runtime_target_observation_complete,
-            .runtime_serving_applied_sequence = item.runtime_serving_applied_sequence,
-            .runtime_coverage_applied_sequence = item.runtime_coverage_applied_sequence,
-            .runtime_coverage_source_sequence = item.runtime_coverage_source_sequence,
-            .serving_publication = item.serving_publication,
-            .coverage_publication = item.coverage_publication,
             .load_error = load_error,
-            .doc_count = item.doc_count,
-            .term_count = item.term_count,
-            .edge_count = item.edge_count,
-            .graph_counts_pending = item.graph_counts_pending,
-            .node_count = item.node_count,
-            .root_node = item.root_node,
-            .publication_target_count = item.publication_target_count,
-            .publication_target_ready = item.publication_target_ready,
-            .serving_snapshot_ready = item.serving_snapshot_ready,
-            .serving_snapshot_revision = item.serving_snapshot_revision,
-            .serving_snapshot_owner_id = item.serving_snapshot_owner_id,
-            .coverage_produced_count = item.coverage_produced_count,
-            .coverage_skipped_count = item.coverage_skipped_count,
-            .coverage_terminal_failed_count = item.coverage_terminal_failed_count,
-            .coverage_config_hash = item.coverage_config_hash,
-            .coverage_summary_ready = item.coverage_summary_ready,
-            .coverage_generation = item.coverage_generation,
-            .coverage_identity_ready = item.coverage_identity_ready,
-            .embedding_activity_observed = item.embedding_activity_observed,
-            .embedding_activity_sample_fresh = item.embedding_activity_sample_fresh,
-            .embedding_activity = item.embedding_activity,
-            .backfill_active = item.backfill_active,
-            .backfill_progress = item.backfill_progress,
-            .dense_vector_projection_pending = item.dense_vector_projection_pending,
-            .dense_native_storage_phase = item.dense_native_storage_phase,
-            .enrichment_failed = item.enrichment_failed,
-            .repair_degraded = item.repair_degraded,
-            .repair_issue_count = item.repair_issue_count,
-            .repair_summary_ready = item.repair_summary_ready,
-            .repair_issue_count_estimated = item.repair_issue_count_estimated,
-            .repair_scan_issue_count = item.repair_scan_issue_count,
-            .index_repair_id = item.index_repair_id,
-            .index_lifecycle_work_class = item.index_lifecycle_work_class,
             .index_repair_trigger = stableStatusLabel(@import("../storage/db/derived/index_repair_state.zig").Trigger, item.index_repair_trigger, &.{ "none", "index_activation", "corrupt_local_repair_state" }),
             .index_repair_phase = stableStatusLabel(@import("../storage/db/derived/index_repair_state.zig").Phase, item.index_repair_phase, &.{"none"}),
             .index_repair_automation = stableStatusLabel(@import("../storage/db/derived/index_repair_state.zig").Automation, item.index_repair_automation, &.{"none"}),
-            .index_repair_attempts = item.index_repair_attempts,
-            .index_repair_started_at_ms = item.index_repair_started_at_ms,
-            .index_repair_updated_at_ms = item.index_repair_updated_at_ms,
-            .index_repair_build_floor_sequence = item.index_repair_build_floor_sequence,
-            .index_repair_applied_sequence = item.index_repair_applied_sequence,
-            .index_repair_target_sequence = item.index_repair_target_sequence,
-            .index_repair_next_retry_at_ms = item.index_repair_next_retry_at_ms,
             .index_repair_last_error = index_repair_last_error,
             .index_repair_wait_reason = stableStatusLabel(enum {}, item.index_repair_wait_reason, &.{ "none", "paused", "terminal", "backoff", "rollback", "convergence", "action_required" }),
-            .index_repair_status = item.index_repair_status,
-            .index_repair_action_required = item.index_repair_action_required,
-            .index_repair_active_generation_serviceable = item.index_repair_active_generation_serviceable,
             .projection_checkpoint_status = stableProjectionStatus(item.projection_checkpoint_status),
-            .projection_checkpoint_applied_sequence = item.projection_checkpoint_applied_sequence,
-            .projection_checkpoint_generation = item.projection_checkpoint_generation,
-            .projection_checkpoint_config_hash = item.projection_checkpoint_config_hash,
-            .replay_applied_sequence = item.replay_applied_sequence,
-            .replay_target_sequence = item.replay_target_sequence,
-            .checkpoint_replay_tail_sequence_count = item.checkpoint_replay_tail_sequence_count,
-            .replay_catch_up_required = item.replay_catch_up_required,
-            .catch_up_active = item.catch_up_active,
-            .catch_up_phase = item.catch_up_phase,
-            .catch_up_applied_sequence = item.catch_up_applied_sequence,
-            .catch_up_target_sequence = item.catch_up_target_sequence,
-            .text_merge = item.text_merge,
-            .hbc_cache = item.hbc_cache,
-            .hbc_posting = item.hbc_posting,
-            .algebraic_parse_error_count = item.algebraic_parse_error_count,
             .algebraic_last_error_doc_key = algebraic_last_error_doc_key,
             .algebraic_last_error_reason = algebraic_last_error_reason,
-            .algebraic_schema_version = item.algebraic_schema_version,
             .algebraic_capability_fingerprint = algebraic_capability_fingerprint,
             .algebraic_capability_lifecycle_status = algebraic_capability_lifecycle_status,
-            .algebraic_capability_change_added_fields = item.algebraic_capability_change_added_fields,
-            .algebraic_capability_change_removed_fields = item.algebraic_capability_change_removed_fields,
-            .algebraic_capability_change_changed_type_fields = item.algebraic_capability_change_changed_type_fields,
-            .algebraic_skipped_dynamic_fields = item.algebraic_skipped_dynamic_fields,
-            .algebraic_skipped_complex_fields = item.algebraic_skipped_complex_fields,
-            .algebraic_skipped_unbounded_fields = item.algebraic_skipped_unbounded_fields,
-            .algebraic_minmax_cache_hits = item.algebraic_minmax_cache_hits,
-            .algebraic_minmax_cache_misses = item.algebraic_minmax_cache_misses,
-            .algebraic_minmax_support_scans = item.algebraic_minmax_support_scans,
-            .algebraic_planner_selected = item.algebraic_planner_selected,
-            .algebraic_planner_fallback_count = item.algebraic_planner_fallback_count,
             .algebraic_planner_last_decision = algebraic_planner_last_decision,
             .algebraic_planner_last_fallback_reason = algebraic_planner_last_fallback_reason,
-            .algebraic_planner_last_estimated_scan_rows = item.algebraic_planner_last_estimated_scan_rows,
-            .algebraic_planner_last_estimated_result_buckets = item.algebraic_planner_last_estimated_result_buckets,
-            .algebraic_planner_lifecycle_ready = item.algebraic_planner_lifecycle_ready,
             .algebraic_planner_lifecycle_blocking_reason = algebraic_planner_lifecycle_blocking_reason,
-            .algebraic_dictionary_registry_claimed_count = item.algebraic_dictionary_registry_claimed_count,
-            .algebraic_dictionary_registry_already_owned_count = item.algebraic_dictionary_registry_already_owned_count,
-            .algebraic_dictionary_registry_owned_by_other_count = item.algebraic_dictionary_registry_owned_by_other_count,
-            .algebraic_dictionary_registry_ready_hit_count = item.algebraic_dictionary_registry_ready_hit_count,
-            .algebraic_dictionary_registry_ready_miss_count = item.algebraic_dictionary_registry_ready_miss_count,
-            .algebraic_distributed_partial_validation_proven_count = item.algebraic_distributed_partial_validation_proven_count,
-            .algebraic_distributed_partial_validation_rejected_count = item.algebraic_distributed_partial_validation_rejected_count,
-            .algebraic_distributed_partial_rows_exported_count = item.algebraic_distributed_partial_rows_exported_count,
-            .algebraic_vector_filter_attempt_count = item.algebraic_vector_filter_attempt_count,
-            .algebraic_vector_filter_resolved_count = item.algebraic_vector_filter_resolved_count,
-            .algebraic_vector_filter_unsupported_count = item.algebraic_vector_filter_unsupported_count,
-            .algebraic_vector_filter_fail_closed_count = item.algebraic_vector_filter_fail_closed_count,
-            .algebraic_vector_filter_include_doc_id_count = item.algebraic_vector_filter_include_doc_id_count,
-            .algebraic_vector_filter_exclude_doc_id_count = item.algebraic_vector_filter_exclude_doc_id_count,
-            .algebraic_graph_traversal_attempt_count = item.algebraic_graph_traversal_attempt_count,
-            .algebraic_graph_traversal_proven_count = item.algebraic_graph_traversal_proven_count,
-            .algebraic_graph_traversal_rejected_count = item.algebraic_graph_traversal_rejected_count,
-            .algebraic_graph_traversal_fallback_count = item.algebraic_graph_traversal_fallback_count,
-            .algebraic_graph_traversal_result_node_count = item.algebraic_graph_traversal_result_node_count,
-            .algebraic_observed_query_shape_count = item.algebraic_observed_query_shape_count,
-            .algebraic_recommendation_count = item.algebraic_recommendation_count,
-            .algebraic_adaptive_candidate_count = item.algebraic_adaptive_candidate_count,
-            .algebraic_adaptive_progress_count = item.algebraic_adaptive_progress_count,
-            .algebraic_adaptive_backfilling_count = item.algebraic_adaptive_backfilling_count,
-            .algebraic_adaptive_ready_count = item.algebraic_adaptive_ready_count,
-            .algebraic_adaptive_stale_count = item.algebraic_adaptive_stale_count,
-            .algebraic_adaptive_dematerialize_recommended_count = item.algebraic_adaptive_dematerialize_recommended_count,
-            .algebraic_adaptive_decision_history_count = item.algebraic_adaptive_decision_history_count,
-            .algebraic_adaptive_policy_drift_count = item.algebraic_adaptive_policy_drift_count,
             .algebraic_last_observed_query_shape = algebraic_last_observed_query_shape,
             .algebraic_last_recommended_materialization = algebraic_last_recommended_materialization,
             .algebraic_top_candidate = algebraic_top_candidate,
@@ -5548,33 +5528,44 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .algebraic_candidates = algebraic_candidates,
             .algebraic_candidate_decision_history = algebraic_candidate_decision_history,
             .algebraic_progress = algebraic_progress,
-        };
+        });
         initialized += 1;
     }
 
-    return .{
-        .runtime_owner_id = stats.runtime_owner_id,
-        .storage_change_token = stats.storage_change_token,
-        .source_doc_count = stats.source_doc_count,
-        .doc_count = stats.doc_count,
-        .index_count = stats.index_count,
+    return copySnapshotWithOverrides(stats, .{
         .indexes = indexes,
-        .repair_degraded = stats.repair_degraded,
-        .repair_issue_count = stats.repair_issue_count,
-        .repair_summary_ready = stats.repair_summary_ready,
-        .repair_issue_count_estimated = stats.repair_issue_count_estimated,
-        .doc_identity = stats.doc_identity,
-        .doc_set_planning = stats.doc_set_planning,
+        .resolver_replay = resolver_replay,
         .enrichment = cloneEnrichmentStats(stats.enrichment),
         .resolution = cloneReplayStageStats(stats.resolution),
         .promotion = cloneReplayStageStats(stats.promotion),
-        .resolver_replay = resolver_replay,
-        .ttl_cleanup = stats.ttl_cleanup,
-        .transaction_recovery = stats.transaction_recovery,
-        .text_merge = stats.text_merge,
-        .term_doc_freq_cache_hits = stats.term_doc_freq_cache_hits,
-        .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
-        .async_indexing = stats.async_indexing,
+        .schema_index_state = stableStatusLabel(@import("../storage/db/table_catalog.zig").IndexState, stats.schema_index_state, &.{}),
+    });
+}
+
+// New value fields copy automatically. Adding a pointer-bearing field requires
+// an explicit ownership decision here instead of silently borrowing its storage.
+fn copySnapshotWithOverrides(value: anytype, overrides: anytype) @TypeOf(value) {
+    var result = value;
+    inline for (std.meta.fields(@TypeOf(value))) |field| {
+        if (@hasField(@TypeOf(overrides), field.name)) {
+            @field(result, field.name) = @field(overrides, field.name);
+        } else if (comptime snapshotHasPointers(field.type)) {
+            @compileError("snapshot ownership must be explicit for " ++ @typeName(@TypeOf(value)) ++ "." ++ field.name);
+        }
+    }
+    return result;
+}
+
+fn snapshotHasPointers(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => true,
+        .optional => |info| snapshotHasPointers(info.child),
+        .array => |info| snapshotHasPointers(info.child),
+        .@"struct", .@"union" => blk: {
+            for (std.meta.fields(T)) |field| if (snapshotHasPointers(field.type)) break :blk true;
+            break :blk false;
+        },
+        else => false,
     };
 }
 
@@ -6412,6 +6403,24 @@ fn consumerTests() type {
             try std.testing.expect(failing.has_induced_failure);
             try std.testing.expect((try cache.snapshot(std.testing.allocator, "docs")) == null);
             try std.testing.expectEqual(@as(u64, 8), cache.tables.get("docs").?.groups.get(8).?.stats.doc_count);
+        }
+
+        test "table runtime snapshot cache clones stored status diagnostic wire bounds" {
+            const maximum = [_]u8{'E'} ** 256;
+            const json = try std.json.Stringify.valueAlloc(std.testing.allocator, &maximum, .{});
+            defer std.testing.allocator.free(json);
+            const decoded = try std.json.parseFromSlice(db_mod.types.RuntimeErrorName, std.testing.allocator, json, .{});
+            defer decoded.deinit();
+            try std.testing.expectEqualStrings(&maximum, decoded.value.slice());
+            const too_long = [_]u8{'E'} ** 257;
+            const invalid = try std.json.Stringify.valueAlloc(std.testing.allocator, &too_long, .{});
+            defer std.testing.allocator.free(invalid);
+            try std.testing.expectError(error.Overflow, std.json.parseFromSlice(db_mod.types.RuntimeErrorName, std.testing.allocator, invalid, .{}));
+        }
+
+        test "table runtime snapshot cache clones stored status complete values and diagnostic ownership" {
+            try testSnapshotStatsCompleteness(std.testing.allocator);
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, testSnapshotStatsCompleteness, .{});
         }
 
         test "table runtime snapshot cache clones stored status source replay with independent ownership" {

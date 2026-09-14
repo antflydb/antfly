@@ -472,7 +472,9 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
                     >= (
                         4
                         if doc_key in {"pdf-inline", "pdf-url"}
-                        else 2 if doc_key == "pdf-scanned-table" else 1
+                        else 2
+                        if doc_key == "pdf-scanned-table"
+                        else 1
                     )
                 )
                 else None
