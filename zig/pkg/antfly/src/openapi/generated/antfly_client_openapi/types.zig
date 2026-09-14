@@ -32074,9 +32074,9 @@ pub const TableStatus = struct {
     }
 };
 
-/// Immutable source embedding storage selected when creating a table.
+/// Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required.
 pub const TableStorageSettings = struct {
-    /// Experimental vector_store mode requires a fresh local single-shard table without HA or replication.
+    /// Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
     dense_embeddings: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

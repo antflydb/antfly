@@ -26092,7 +26092,7 @@ pub const IndexManager = struct {
         const replay_reads = if (getenv("ANTFLY_SOURCE_VECTOR_REPLAY_READS")) |raw|
             std.mem.eql(u8, std.mem.span(raw), "1")
         else
-            false;
+            true;
         return loadDenseVectorsForHbcBatchIntoTransformedMatrixWithReplay(
             ctx,
             vector_ids,
@@ -26284,7 +26284,7 @@ pub const IndexManager = struct {
         const raw_values = try manager.alloc.alloc(?[]const u8, key_count);
         defer manager.alloc.free(raw_values);
         if (load_session) |session| session.matrix_fallback_vectors += key_count;
-        const batch_source_reads = if (getenv("ANTFLY_SOURCE_VECTOR_BATCH_READS")) |raw| std.mem.eql(u8, std.mem.span(raw), "1") else false;
+        const batch_source_reads = if (getenv("ANTFLY_SOURCE_VECTOR_BATCH_READS")) |raw| std.mem.eql(u8, std.mem.span(raw), "1") else true;
         if (manager.source_payload_store != null and batch_source_reads) {
             const Sink = struct {
                 reads: []const DenseArtifactReadKey,

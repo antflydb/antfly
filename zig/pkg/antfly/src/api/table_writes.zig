@@ -6268,7 +6268,7 @@ pub const BoundTableWriteSource = struct {
         const db = try self.activeDb();
 
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-        try db.configureTableStorage(req.storage);
+        try db.configureTableStorage(req.storage orelse db.table_storage);
         const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
         const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, raw_indexes_json, schema_json);
         defer alloc.free(expanded_indexes_json);
@@ -20923,7 +20923,7 @@ pub const ProvisionedTableWriteSource = struct {
                         }
                         target_generations[group_index] = entry.lsm_root_generation;
                         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
-                        try cached.db.configureTableStorage(req.storage);
+                        try cached.db.configureTableStorage(req.storage orelse cached.db.table_storage);
                         try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                         // Catalog admission and local create can race an earlier
                         // startup/status open of this generation. The entry
@@ -21056,7 +21056,7 @@ pub const ProvisionedTableWriteSource = struct {
                 },
             );
             defer if (opened) |*db| db.close();
-            try opened.?.configureTableStorage(req.storage);
+            try opened.?.configureTableStorage(req.storage orelse opened.?.table_storage);
             try applyLocalTableSchemaJson(alloc, &opened.?, schema_json);
             // Register entity resolvers declared in the index config. Indexes
             // and enrichments are provisioned through the managed-open path, but

@@ -447,6 +447,7 @@ pub const Store = struct {
 
     fn installOpened(self: *Store, next: *native.Opened) !void {
         try self.prepareOpened(next);
+        errdefer if (self.incremental_inventory) self.inventory.deinit(self.alloc);
         const publication = try self.prepareReadPublication(next);
         self.opened.deinit();
         self.opened = next.*;
@@ -1194,11 +1195,11 @@ pub const Store = struct {
         self.preparation_alloc = self.alloc;
         self.unlocked_checkpoint = experimentEnabled("ANTFLY_SOURCE_VECTOR_UNLOCKED_CHECKPOINT");
         self.background_checkpoint = experimentEnabled("ANTFLY_SOURCE_VECTOR_BACKGROUND_CHECKPOINT");
-        self.positional_batch_reads = experimentEnabled("ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS");
+        self.positional_batch_reads = @import("dense_perf_experiments.zig").enabledDefault("ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS", true);
         self.coalesce_directory = experimentEnabled("ANTFLY_SOURCE_VECTOR_COALESCE_DIRECTORY");
         self.mark_outside_lock = experimentEnabled("ANTFLY_SOURCE_VECTOR_MARK_OUTSIDE_LOCK");
         self.rescue_reappends = experimentEnabled("ANTFLY_SOURCE_VECTOR_RESCUE_REAPPENDS");
-        self.shared_catalog = experimentEnabled("ANTFLY_SOURCE_VECTOR_SHARED_CATALOG");
+        self.shared_catalog = @import("dense_perf_experiments.zig").enabledDefault("ANTFLY_SOURCE_VECTOR_SHARED_CATALOG", true);
         self.independent_scan = experimentEnabled("ANTFLY_SOURCE_VECTOR_INDEPENDENT_SCAN");
         self.incremental_inventory = experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY");
         self.delta_inventory = experimentEnabled("ANTFLY_SOURCE_VECTOR_DELTA_INVENTORY");
@@ -2831,11 +2832,12 @@ pub const Store = struct {
         else
             null;
         try self.prepareOpened(&next);
+        // Inventory describes next already. Any subsequent failure, including
+        // read-view allocation before commit, must discard that unpublished
+        // cache so a retry reconstructs it from the still-current authority.
+        errdefer if (self.incremental_inventory) self.inventory.deinit(self.alloc);
         const publication = try self.prepareReadPublication(&next);
         errdefer if (publication) |view| view.release();
-        // Inventory is a cache: a failed commit leaves old authority intact
-        // and must discard any precomputed cache for the unpublished view.
-        errdefer if (self.incremental_inventory) self.inventory.deinit(self.alloc);
         collection.publication_attempted = true;
         self.opened.store.commitPrepared(&prepared) catch |err| {
             collection.publication_attempted = self.opened.store.poisoned;
@@ -5067,6 +5069,9 @@ test "source vector payloads publication allocation failures preserve usable aut
         defer raw.deinit();
         var source = try Store.open(alloc, memory.storage(), "/publication-failure", false);
         defer source.deinit();
+        // Include fallible read-view preparation after inventory has already
+        // advanced to the candidate, even when an environment override is off.
+        source.positional_batch_reads = true;
         source.append_only = true;
         source.selective_gc = true;
         source.mark_outside_lock = true;

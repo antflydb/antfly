@@ -6474,7 +6474,9 @@ pub const HBCIndex = struct {
             effective_config.metric,
         );
         errdefer quantizer.deinit();
+        quantizer.query_packing = .reduce;
         if (platform.env.getenv("ANTFLY_EXPERIMENT_QUERY_PACKING")) |mode| {
+            if (std.mem.eql(u8, mode, "lanes")) quantizer.query_packing = .lanes;
             if (std.mem.eql(u8, mode, "reduce")) quantizer.query_packing = .reduce;
             if (std.mem.eql(u8, mode, "mask")) quantizer.query_packing = .mask;
         }

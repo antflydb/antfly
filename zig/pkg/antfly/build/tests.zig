@@ -1335,6 +1335,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "table storage creation intent survives",
         "model-directed",
         "tool query builder",
         "agent conversation",
@@ -3925,6 +3926,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
+            "standalone table storage defaults persist",
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
@@ -4123,7 +4125,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const vector_payload_tests = b.addTest(.{
         .root_module = vector_payload_test_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
-        .filters = &.{ "source vector payloads", "vector references", "table storage settings" },
+        .filters = &.{ "source vector payloads", "vector references", "table storage settings", "table storage creation policy" },
     });
     const run_vector_payload_tests = b.addRunArtifact(vector_payload_tests);
     const vector_payload_test_step = b.step("vector-payload-test", "Run source vector payload ownership and recovery tests");

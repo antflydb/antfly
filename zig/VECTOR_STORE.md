@@ -2,6 +2,205 @@
 
 > Paths under `.benchmark-results/` refer to local benchmark output that is not tracked in git.
 
+## September 14: scoped default promotion
+
+New local, single-shard standalone tables now select `vector_store` when the
+create request omits `storage`, provided HA and replication are disabled.
+Explicit `{"storage":{"dense_embeddings":"primary_lsm"}}` retains LSM source
+ownership. An explicitly supplied empty storage object also selects
+`primary_lsm`; omission selects the deployment's creation policy. Unsupported
+deployments retain `primary_lsm` on omission and reject explicit `vector_store`.
+Catalog persistence records the resolved choice before provisioning. Public and
+internal forwarding preserve omission until the authoritative creation boundary.
+Existing tables, including older catalog records without a storage field, keep
+`primary_lsm`; DB open does not reinterpret them using today's creation default.
+Snapshot/backup and split operations on vector-store tables currently reject
+with `VectorStoreLifecycleUnsupported`. Tables needing those operations must
+explicitly select `primary_lsm` until source-reference closure is supported.
+
+The completed [50K/1M ABBA qualification](../.benchmark-results/vector-store-owner-admission-20260914/RESULTS.md)
+supports this scoped promotion. Both 1M pairs reduced disk by about 43% and
+observed peak RSS by about 28%, with peak QPS up 5.8–7.3% and mixed QPS up
+10.2–19.1%. This is an overall tradeoff, not a win on every measurement: one
+50K peak-QPS arm regressed 22.5%, 1M churn took longer, and source GC settled
+in 149–155 seconds versus 33 seconds for LSM ownership. All eight arms passed
+workload, restart and reclamation gates. Keep these costs visible in follow-up
+work; broader deployment admission needs its own lifecycle qualification.
+
+Promotion includes the measured read settings, so ordinary launches obtain the
+qualified implementation without benchmark environment setup:
+
+| Default behavior | Retained qualification override |
+| --- | --- |
+| Direct ANN member bindings | `ANTFLY_SOURCE_VECTOR_MEMBER_BINDINGS=0` disables |
+| Exact mapped reads | `ANTFLY_EXPERIMENT_EXACT_MAPPED=0` disables |
+| Reduction-based query packing | `ANTFLY_EXPERIMENT_QUERY_PACKING=lanes` restores the prior path |
+| One bounded vector-read helper | `ANTFLY_EXPERIMENT_VECTOR_READ_SINGLE_HELPER=0` disables |
+| Batched source reads and positional batches | `ANTFLY_SOURCE_VECTOR_BATCH_READS=0`, `ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS=0` disable |
+| Shared immutable source catalogs | `ANTFLY_SOURCE_VECTOR_SHARED_CATALOG=0` disables |
+| Replay-aware matrix loads | `ANTFLY_SOURCE_VECTOR_REPLAY_READS=0` disables |
+
+These read settings apply wherever their existing capability checks permit,
+including applicable LSM-serving paths; the ownership comparisons used the same
+settings in both arms. They do not change a persisted format or metric. Other
+experimental GC, admission, cache and read policies remain off. Historical
+entries below describe the defaults at the time of each experiment.
+
+Promotion fault injection also exposed a cache rollback gap: incremental
+inventory advanced to a candidate before read-view allocation, but an allocation
+failure there did not discard it. The next retry subtracted old WAL contributions
+from the candidate cache and raised `InvalidVectorInventory`. Both installation
+and collection now discard candidate inventory on every subsequent failure,
+including read-view preparation. The allocation-failure test explicitly enables
+published reads and checks foreground reads, retry and repeated reopen.
+
+[Promotion validation](../.benchmark-results/vector-store-default-20260914/README.md)
+passed 67 source tests, 43 native tests (two skipped), the standalone catalog
+suite, request-forwarding/policy and quantizer checks, and 11 public API tests
+with no experiment flags. The API gate covers omitted and explicit ownership,
+multiple models, updates/deletes, restart, last-index removal/rebuild, enrichment,
+full-text preservation and explicit-LSM backup/restore. Supported restore requests
+explicitly retain primary ownership rather than applying fresh-table policy.
+OpenAPI/generated-doc checks pass. These are correctness checks for promotion;
+the performance evidence remains the completed ABBA comparison above.
+
+## Existing-table migration plan (not yet implemented)
+
+Treat the new ANN physical storage and source-vector ownership as separate
+transitions. The public logical index type remains `embeddings`; changing a
+model, dimension, distance metric or source definition is a separate index
+configuration/re-embedding operation. A format conversion must preserve the
+existing logical contract and exact source vectors.
+
+| Transition | Authority that changes | Completion evidence |
+| --- | --- | --- |
+| ANN LSM projection to native generation | Per-index serving generation and its posting/vector manifests | Validated generation, mutation coverage fence, matching index incarnation/configuration and restart recovery |
+| `primary_lsm` to `vector_store` | Table-wide source payload ownership | Every live artifact resolves through a durable source reference, with concurrent mutations caught up and all protected generations retained |
+
+The existing native-storage phases (`legacy`, `native_building`,
+`native_validating`, `native_authoritative`) describe ANN authority. Preserve
+that machinery and its supported pre-PR compatibility path. Those phases are
+not proof that source ownership has migrated: a native ANN index can still
+serve a `primary_lsm` table. Do not add decoders for discarded experimental
+formats from this PR. Unsupported source/native formats must fail closed.
+
+### Durable job and admission
+
+Introduce a separately versioned storage-migration job, rather than allowing a
+PATCH of the immutable ownership field. Persist the job ID/idempotency key,
+table incarnation, source and target ownership, ownership epoch, target format
+capabilities, artifact/schema configuration revision, snapshot fence, replay
+cursor, backfill cursor, candidate manifests, publication decision and error.
+Expose distinct source and per-index progress. Retries consult the same durable
+job; an ambiguous response must not start a second migration.
+
+Start with the same qualified local single-shard deployment. Reject overlapping
+restore, split/move, ownership migration and incompatible schema/index changes;
+serialize index create/drop and producer-definition changes for the first online
+implementation. Ordinary document updates, deletes and enrichment completion
+must continue under version fencing. Admit only when the binary can read both
+representations, sufficient disk exists for the temporary overlap plus journals,
+and the operator's I/O, memory and journal-lag budgets can be enforced. No
+automatic conversion on open, and no new HA/replication admission by implication.
+
+### Preparation, backfill and publication
+
+1. **Prepare.** Establish a durable primary snapshot fence and a durable mutation
+   capture cursor atomically with respect to writes. Pin their recovery inputs.
+   The old ownership and serving generations remain authoritative while the
+   candidate is built. Reuse the source store and its prepare-before-primary-
+   commit protocol; do not create a third permanent vector corpus.
+2. **Backfill.** Stream all table-owned dense artifacts, including chunk artifacts,
+   externally supplied embeddings and artifacts with zero ANN consumers. Read in
+   bounded batches, bypass one-pass cache admission, and persist restartable
+   progress only after candidate payloads and reference mappings are durable.
+   Bind references to the complete artifact identity/version: document and shard
+   identity, artifact/producer identity, source hash, dimensions and model/config
+   identity. Never key migration by docid alone or assume one vector per document.
+3. **Catch up.** Replay committed mutations in order, including tombstones and
+   producer removals. Compare artifact versions when applying snapshot work so
+   an old row cannot overwrite a newer update or resurrect a deletion. Stale
+   enrichment completion must pass the normal producer/source-version checks.
+   Prepared but uncommitted payloads are orphans, not visible documents. Bound
+   replay retention and pause backfill or apply backpressure if it falls behind.
+4. **Prepare serving generations.** Reuse a compatible native index generation
+   where its immutable reference bindings remain valid; otherwise construct a
+   candidate version map/posting generation against the migrated source snapshot.
+   Keep the healthy old index queryable during replacement. Validate every
+   index's incarnation, config, artifact coverage and mutation fence, then check
+   representative query results and recall. Counts alone do not prove coverage.
+5. **Cut over.** Use a short write-admission fence to drain admitted mutations,
+   apply the final replay suffix and durably publish the selected ownership
+   epoch, source manifest/reference root and required serving manifests. This
+   needs a recoverable publication decision across catalog and DB state, not
+   independent flag/file renames. On reopen, resolve an uncertain decision before
+   admitting writes or GC. New writes then prepare durable source payloads before
+   committing primary references, as fresh vector-store tables already do.
+6. **Drain and reclaim.** Convert remaining inline primary values in bounded
+   version-checked batches. A transitional resolver must accept the proven old
+   inline representation and new references until conversion completes. Mark
+   the migration complete only after a full coverage check proves no live inline
+   payload remains and every committed reference resolves. Retain old files and
+   versions for old query/transaction snapshots, serving generations, recovery
+   journals and pinned backups. Reclaim only after those owners release them.
+
+For online conversion, the candidate reference root in step 5 must cover the
+entire cutover snapshot, including artifacts not yet rewritten in the primary
+LSM. Readers resolve against their captured ownership epoch; they must never
+combine an old primary snapshot with a new mutable reference map. Either retain
+the inline bytes for those readers or pin the corresponding immutable mapping.
+The migration state must explicitly distinguish published ownership from fully
+rewritten/reclaimed storage. This avoids an unbounded cutover transaction while
+preserving snapshot correctness.
+
+The temporary mapping/journal is migration machinery. Retire it once primary
+references, serving bindings and the durable publication record suffice for
+recovery; include its bytes in accounting until then. Source GC must protect
+candidate preparations and migration snapshot/replay inputs. Cancellation before
+publication releases only candidate-owned data after proving no references were
+published. Once publication may have committed, cancellation requires resolving
+that outcome first.
+
+### Rollback, restore and delivery order
+
+Before cutover, rollback discards the unreferenced candidate and leaves the old
+table authoritative. After cutover, returning to `primary_lsm` requires a reverse
+backfill and mutation replay, or restoration of a consistent pre-migration
+backup with an explicit data-loss boundary. Changing the setting or booting an
+older binary is not rollback. Do not retain two payload copies indefinitely to
+make downgrade appear free.
+
+Backups must capture catalog ownership/job state, primary references, all source
+files needed for reference closure and the selected ANN manifests at one proven
+fence. Restore either reproduces that state and resumes the job or rejects it
+before exposing the table. Until this is implemented, reject migration-overlap
+backups/restores; copying the primary LSM alone cannot back up a reference table.
+
+Deliver in this order:
+
+1. A bounded, resumable offline migration command with exclusive table admission,
+   a streaming shadow-root copy that preserves internal document identities,
+   versions, all artifact namespaces and catalog definitions, and native ANN
+   rebuild with recoverable atomic publication. A public document-only export
+   is insufficient. Validate it on real legacy tables; this
+   provides an initial conversion route without immediately adding online replay.
+2. Durable online mutation capture, mixed-representation reads, candidate reference
+   roots and version-checked conversion. Reuse the offline builder and verifier;
+   add fault injection at every durability boundary before enabling publication.
+3. Online generation publication, cancellation and reverse conversion, followed
+   by backup/restore and broader topology support as separately qualified work.
+
+Require restart/crash tests between preparation, payload sync, reference commit,
+manifest publication and WAL retirement; repeated restarts and ambiguous retries;
+same-dimension different models and multiple indexes per artifact; updates,
+deletes and stale completions racing backfill; zero indexes and last-index drop
+followed by rebuild; old readers across cutover/GC; disk exhaustion, cancellation,
+backup/restore and rollback. Report progress, replay lag, lock-wait tails,
+temporary/retained/orphan bytes, primary/vector/journal write I/O, readiness,
+recall and query latency throughout. Run 50K then 1M with fixed-count churn, and
+compare migrated tables with freshly created vector-store tables to detect a
+permanent migration tax.
+
 ## September 13: compiled-owner maintenance and fresh ownership comparison
 
 The post-merge 1M GC screen stopped before its first arm qualified: automatic
@@ -2563,7 +2762,7 @@ and failed gates are preserved in
 `scale/Performance1536D50K-comparison.json` (`.benchmark-results/vector-next-experiments/scale/Performance1536D50K-comparison.json`)
 (`qualified: false`) and the experiment report (`.benchmark-results/vector-next-experiments/RESULTS.md`).
 
-## Experimental implementation
+## Implemented ownership paths
 
 Create a fresh standalone table with:
 
@@ -2571,7 +2770,8 @@ Create a fresh standalone table with:
 {"num_shards": 1, "storage": {"dense_embeddings": "vector_store"}}
 ```
 
-`primary_lsm` remains the default. The setting is persisted in the table catalog
+Omitting `storage` now selects `vector_store` for the qualified local standalone
+deployment described above. Explicit `primary_lsm` remains available. The setting is persisted in the table catalog
 and primary store, reported by table status, and immutable after creation.
 Existing populated roots cannot be switched in place. Local single-shard LSM
 tables are the initial supported deployment. Replication/HA, split and snapshot
@@ -3423,7 +3623,7 @@ not by themselves prove that all primary embedding payloads can be removed.
 Source ownership, transactions, repair, replication, and backup must first
 support the reference-only representation.
 
-## Experimental table setting
+## Table setting
 
 The optional, persisted setting at table creation lets fresh tables exercise
 either ownership model with the same binary and public API. Implemented request
@@ -3440,8 +3640,8 @@ shape:
 
 | Mode | Source embedding ownership |
 | --- | --- |
-| `primary_lsm` (default) | Preserve the current primary artifact representation and existing serving behavior |
-| `vector_store` (experimental) | Store exact payloads in the shared vector store and committed references in primary artifact records |
+| `primary_lsm` | Preserve the primary artifact representation; default for legacy records and unqualified deployments |
+| `vector_store` | Store exact payloads in the shared vector store and committed references in primary artifact records; default for fresh qualified standalone tables |
 
 These modes select source ownership. `primary_lsm` may still use shared vector
 files for serving; it does not mean disabling the existing vector read path.
@@ -3471,10 +3671,10 @@ for the experimental mode until their lifecycle contracts are implemented and
 validated. Supported backup/restore paths must preserve reference closure; any
 unimplemented path must reject the operation explicitly.
 
-Switching an existing table requires a separate migration protocol. For the
-initial experiment, returning to the default means creating a fresh default-mode
-table and reloading it from the benchmark source. A runtime toggle is not a
-rollback mechanism for reference-only artifacts.
+Switching an existing table requires the separate migration protocol planned
+above. Until it is implemented, select ownership explicitly on a fresh table
+and reload the complete source data. A runtime toggle is not a rollback
+mechanism for reference-only artifacts.
 
 ## Implementation sequence and acceptance
 
