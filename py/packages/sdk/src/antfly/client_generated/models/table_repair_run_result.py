@@ -36,8 +36,8 @@ class TableRepairRunResult:
         has_more (bool): Whether another repair scan page is available via next_cursor.
         debt_remaining (bool): Whether repair debt remains after this bounded pass. If true and next_cursor is absent,
             rerun repair from the beginning after addressing failed or unsupported records.
-        next_cursor (None | str | Unset): Opaque cursor for the next artifact repair pass when has_more is true. Index
-            repair currently repairs one named index per request and does not return a continuation cursor.
+        next_cursor (None | str | Unset): Opaque cursor for the next artifact repair pass when has_more is true. Named-
+            index operations may return a continuation cursor when table groups remain.
     """
 
     scanned: int

@@ -13,6 +13,7 @@
 // limitations.
 
 test {
+    _ = @import("vopr/index_maintenance.zig");
     _ = @import("antfly_source_root").antfly_sources.physical_db;
     _ = @import("graph/query.zig");
     _ = @import("storage/db/graph_runtime.zig");

@@ -1,9 +1,15 @@
+<!-- Reproduction commands use the consolidated graph benchmark binary. -->
+
+Build once from `zig/` with `zig build antfly-graph-bench -Doptimize=ReleaseFast`
+(or `ReleaseSafe` for checked runs), then use the `prepare` subcommand below.
+The recorded optimization profiles and measurements describe the original runs.
+
 # Graph metric execution and query benchmarks
 
 ## Streaming page-tree bootstrap (2026-09-11)
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --page-bootstrap-only
+./zig-out/bin/antfly-graph-bench prepare --page-bootstrap-only
 ```
 
 Apple M4 Max, Zig 0.16.0, five measured samples after one warmup, generated
@@ -28,8 +34,8 @@ build speedup; the complete publication benchmark below covers that path.
 ## Committed status and immutable memory-run pins (2026-09-10)
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --ownership-reads-only
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --ownership-disk-reads-only
+./zig-out/bin/antfly-graph-bench prepare --ownership-reads-only
+./zig-out/bin/antfly-graph-bench prepare --ownership-disk-reads-only
 ```
 
 Apple M4 Max, Zig 0.16.0, median of five samples after one warmup. These
@@ -54,8 +60,8 @@ aborted/staged counts cannot escape through operational status.
 ## Ownership fences and lazy type runs (2026-09-10)
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --filtered-prefix-only
-zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --prune-only
+./zig-out/bin/antfly-graph-bench prepare --filtered-prefix-only
+./zig-out/bin/antfly-graph-bench prepare --prune-only
 ```
 
 Apple M4 Max, Zig 0.16.0, five measured samples after one warmup. The filtered
@@ -112,7 +118,7 @@ scans close their resources on exhaustion, errors, or explicit early stopping;
 they do not advance into the unrequested tail just to manufacture a resume key.
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --native-scans-only
+./zig-out/bin/antfly-graph-bench prepare --native-scans-only
 ```
 
 Apple M4 Max / Zig 0.16.0; warm default durable LSM, 65,536 outgoing hub edges
@@ -173,8 +179,8 @@ input bound. Tests separately interrupt pruning after the forward commit and
 counter reconstruction between pages, then verify recovery on reopen.
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --paged-only
-zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --prune-only
+./zig-out/bin/antfly-graph-bench prepare --paged-only
+./zig-out/bin/antfly-graph-bench prepare --prune-only
 ```
 
 ## Streaming cursors, paged control, and tree batches (2026-09-10)
@@ -187,8 +193,8 @@ lazily, and request sessions share authenticated blocks with single-flight fills
 Reproduce the updated `--paged-only` benchmark and tree validation comparison:
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --paged-only
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --tree-only
+./zig-out/bin/antfly-graph-bench prepare --paged-only
+./zig-out/bin/antfly-graph-bench prepare --tree-only
 ```
 
 Apple M4 Max / Zig 0.16.0, ReleaseFast; five timed samples after one warmup.
@@ -238,9 +244,9 @@ remains capped at 1 MiB; oversized controls explicitly omit the accelerator.
 Reproduce with:
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --paged-only
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --presence-only
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only
+./zig-out/bin/antfly-graph-bench prepare --paged-only
+./zig-out/bin/antfly-graph-bench prepare --presence-only
+./zig-out/bin/antfly-graph-bench prepare --indexing-only
 ```
 
 Apple M4 Max / Zig 0.16.0; medians of five measurements after one discarded
@@ -297,7 +303,7 @@ optimizations; it is not an isolated estimate of the presence-check gain.
 
 ## Block-authenticated preparation and committed counters (2026-09-09)
 
-Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
+Run `./zig-out/bin/antfly-graph-bench prepare --indexing-only`.
 At that measurement, graph wire was v6, manifest wire v21. Both ingestion paths emitted the same
 authenticated block table, and the published manifest binds its control root.
 Selected preparation retains authenticated semantic digests instead of hashing
@@ -347,7 +353,7 @@ object and retain only their own selected topology.
 
 ## Earlier v5 addressed plans and topology preparation (2026-09-09)
 
-Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
+Run `./zig-out/bin/antfly-graph-bench prepare --indexing-only`.
 Apple M4 Max / Zig 0.16.0, shared host; six samples, first discarded. This run
 includes the merge of main `aa44bddd1`. That run used wire v5. The following are
 local phase measurements, not cloud/HTTP latency.
@@ -410,7 +416,7 @@ but exclude fixture writes and the numerical kernel.
 
 ## Earlier v4 transactional indexing and directory-first reuse (2026-09-09)
 
-Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
+Run `./zig-out/bin/antfly-graph-bench prepare --indexing-only`.
 Apple M4 Max / Zig 0.16.0, shared development host, six samples with the first
 discarded. These are phase measurements, not HTTP or cloud latency guarantees.
 
@@ -489,7 +495,7 @@ The compact-query comparison below uses 21 measured samples instead of five.
 Measured 2026-09-08 on the same host/toolchain with:
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --ordinal-cursors-only
+./zig-out/bin/antfly-graph-bench prepare --ordinal-cursors-only
 ```
 
 Each fixture is a 256-node cycle in the default durable storage backend. Both
@@ -534,7 +540,7 @@ task admission or HTTP latency.
 Measured 2026-09-08 with:
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --topology-only
+./zig-out/bin/antfly-graph-bench prepare --topology-only
 ```
 
 The real default-storage fixture has 1,024 nodes and 16,384 directed edges,
@@ -567,7 +573,7 @@ reclamation, and rejection of retirement tasks targeting winning packed tiles.
 ## Adaptive decoded-score joins
 
 Measured 2026-09-08 with
-`zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --score-join-only`.
+`./zig-out/bin/antfly-graph-bench prepare --score-join-only`.
 The fixture borrows one decoded 1,024-row block and verifies exact results for
 each candidate count. Six samples, first discarded, 4,096 repetitions per sample:
 
@@ -585,7 +591,7 @@ Separate parity tests include duplicate, missing and invalid row ordinals.
 ## Shared admission, sparse work, and publication checkpoints
 
 Measured 2026-09-08 on the same host/toolchain with
-`zig build -Doptimize=ReleaseFast graph-metric-preparation-bench --summary all`.
+`./zig-out/bin/antfly-graph-bench prepare`.
 One warmup and five measured samples; medians below. Development tests were
 running on this shared host. These are bounded phase measurements, not promises
 about whole-build, HTTP, or cloud-network latency.
@@ -735,7 +741,7 @@ records. No wall-clock speedup is claimed for that regression.
 Run from `zig/`:
 
 ```sh
-zig build -Doptimize=ReleaseFast graph-metric-preparation-bench --summary all > /tmp/graph-metric-bench.jsonl 2> /tmp/graph-metric-bench-build.log
+./zig-out/bin/antfly-graph-bench prepare
 ```
 
 The executable emits JSONL including min/max time, allocation count, cumulative
@@ -846,7 +852,7 @@ for the associated admission, checkpoint, and integrity contracts.
 Run just this case with:
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --staged-only
+./zig-out/bin/antfly-graph-bench prepare --staged-only
 ```
 
 The fixture seeds 16 published score columns in the default storage backend,
@@ -913,7 +919,7 @@ shared lease identity and completion under fill-table saturation.
 
 ## Ordinal ingestion and selected-type discovery
 
-Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
+Run `./zig-out/bin/antfly-graph-bench prepare --indexing-only`.
 On Apple M4 Max / Zig 0.16.0, the following medians discard one warmup and
 retain five samples. Each ingestion fixture has 1,024 nodes and 65,536 edges;
 JSON parsing, construction and encoding are timed, input residency is excluded.
@@ -978,8 +984,8 @@ reduction. The reuse assertion also requires the exact prior metric artifact ID.
 ## Ownership reads and adaptive type routing (2026-09-10)
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --ownership-reads-only
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --filtered-prefix-only
+./zig-out/bin/antfly-graph-bench prepare --ownership-reads-only
+./zig-out/bin/antfly-graph-bench prepare --filtered-prefix-only
 ```
 
 Apple M4 Max, Zig 0.16.0, five samples after one warmup. Diagnostic before/after
@@ -1019,7 +1025,7 @@ during retirement. Exact diagnostic scans remain available, but are no longer
 used by operational status, live replay snapshots or cached status refresh.
 ## Shared graph-impact planning (2026-09-11)
 
-Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --graph-impact-only`.
+Run `./zig-out/bin/antfly-graph-bench prepare --graph-impact-only`.
 M4 Max, Zig 0.16; median of five samples after one warmup. This compares repeated
 per-alias calls with one shared result using the **same bounded comparator**;
 it is not an end-to-end before/after publisher benchmark. The source document's
@@ -1042,7 +1048,7 @@ regression verifies every retry deadline survives three polling passes at 65,
 Run the normalized graph-plan and copy-on-write storage benchmark with:
 
 ```sh
-zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --page-updates-only
+./zig-out/bin/antfly-graph-bench prepare --page-updates-only
 ```
 
 The initial fixture is a chain with one outgoing edge per source document.

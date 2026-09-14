@@ -12,9 +12,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const graph_metric_maintenance = @import("cmd/graph_metric_maintenance.zig");
+const maintenance_worker = @import("testing/maintenance_worker.zig");
 pub const antfly_sources = @import("source_owner_physical.zig");
 
 test {
-    _ = graph_metric_maintenance;
+    _ = maintenance_worker;
 }

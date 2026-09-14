@@ -25,7 +25,7 @@ const SweepResult = antfly.db.IndexManager.GraphMetricPlannedSchedulerSweepResul
 const HttpQueryResponse = antfly.public_api.http_client.QueryResponse;
 const local_db_writer_lock_retries: usize = 10_000;
 const local_db_writer_lock_sleep_ms: u64 = 5;
-const process_subcommand = "__graph-metric-maintenance";
+const process_subcommand = "__maintenance-worker";
 
 const ExitReason = enum {
     max_ticks,
@@ -1811,7 +1811,7 @@ fn writeJsonFile(io: std.Io, alloc: std.mem.Allocator, path: []const u8, value: 
 
 fn printUsage(argv0: []const u8) void {
     std.debug.print(
-        \\usage: {s} graph-metric-maintenance (--db-path <path> | --base-uri <uri> --group-id <id> --table-name <table>) [options]
+        \\usage: {s} __maintenance-worker (--db-path <path> | --base-uri <uri> --group-id <id> --table-name <table>) [options]
         \\
         \\options:
         \\  --base-uri <uri>
@@ -1848,7 +1848,7 @@ fn printUsage(argv0: []const u8) void {
 
 fn printSupervisorUsage(argv0: []const u8) void {
     std.debug.print(
-        \\usage: {s} graph-metric-maintenance supervise (--db-path <path> | --base-uri <uri> --group-id <id> --table-name <table>) [options]
+        \\usage: {s} __maintenance-worker supervise (--db-path <path> | --base-uri <uri> --group-id <id> --table-name <table>) [options]
         \\
         \\options:
         \\  --base-uri <uri>
@@ -1876,7 +1876,7 @@ fn printSupervisorUsage(argv0: []const u8) void {
 
 fn printLaunchUsage(argv0: []const u8) void {
     std.debug.print(
-        \\usage: {s} graph-metric-maintenance launch (--db-path <path> | --base-uri <uri> --group-id <id> --table-name <table>) [options]
+        \\usage: {s} __maintenance-worker launch (--db-path <path> | --base-uri <uri> --group-id <id> --table-name <table>) [options]
         \\
         \\options:
         \\  --base-uri <uri>

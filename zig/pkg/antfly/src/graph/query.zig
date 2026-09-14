@@ -1599,7 +1599,7 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys, 0..) |sk, start_index| {
+        outer: for (start_keys, 0..) |sk, start_index| {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |tk| {
                 const path = try paths_mod.findShortestPath(self.alloc, graph_index, sk, tk, opts);
@@ -1610,6 +1610,7 @@ pub const GraphQueryEngine = struct {
                     errdefer if (node_owned) node.deinit(self.alloc);
                     try all_results.append(self.alloc, node);
                     node_owned = false;
+                    if (gq.params.max_results != 0 and all_results.items.len >= gq.params.max_results) break :outer;
                 }
             }
         }
@@ -1721,10 +1722,13 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys, 0..) |sk, start_index| {
+        outer: for (start_keys, 0..) |sk, start_index| {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |tk| {
-                const found = try paths_mod.findKShortestPaths(self.alloc, graph_index, sk, tk, gq.k, opts);
+                // Limit search work as well as output allocation. Metric
+                // filtering/order supplies its larger candidate bound here.
+                const remaining: u32 = if (gq.params.max_results == 0) gq.k else @intCast(gq.params.max_results - all_results.items.len);
+                const found = try paths_mod.findKShortestPaths(self.alloc, graph_index, sk, tk, @min(gq.k, remaining), opts);
                 defer paths_mod.freePaths(self.alloc, found);
 
                 for (found) |p| {
@@ -1733,6 +1737,7 @@ pub const GraphQueryEngine = struct {
                     errdefer if (node_owned) node.deinit(self.alloc);
                     try all_results.append(self.alloc, node);
                     node_owned = false;
+                    if (gq.params.max_results != 0 and all_results.items.len >= gq.params.max_results) break :outer;
                 }
             }
         }
@@ -2857,11 +2862,11 @@ test "NodeSelector keys vs result_ref" {
     }
 }
 
-test "QueryParams defaults match TraversalRules defaults" {
+test "QueryParams uses the public one-hop default and shared traversal options" {
     const qp = QueryParams{};
     const tr = traversal_mod.TraversalRules{};
     try std.testing.expectEqual(qp.direction, tr.direction);
-    try std.testing.expectEqual(qp.max_depth, tr.max_depth);
+    try std.testing.expectEqual(@as(u32, 1), qp.max_depth);
     try std.testing.expectEqual(qp.min_weight, tr.min_weight);
     try std.testing.expectEqual(qp.max_weight, tr.max_weight);
     try std.testing.expectEqual(qp.max_results, tr.max_results);
@@ -3513,7 +3518,7 @@ test "shortest_path via engine" {
         .index_name = "test",
         .start_nodes = .{ .keys = start_keys },
         .target_nodes = .{ .keys = &.{"C"} },
-        .params = .{ .weight_mode = .min_weight },
+        .params = .{ .max_depth = 2, .include_paths = true, .weight_mode = .min_weight },
     }, start_keys);
     defer result.deinit(alloc);
 
@@ -4236,7 +4241,7 @@ test "k_shortest_paths via engine" {
         .start_nodes = .{ .keys = start_keys },
         .target_nodes = .{ .keys = &.{"C"} },
         .k = 2,
-        .params = .{ .weight_mode = .min_weight },
+        .params = .{ .max_depth = 2, .include_paths = true, .weight_mode = .min_weight },
     }, start_keys);
     defer result.deinit(alloc);
 
@@ -4250,10 +4255,25 @@ test "k_shortest_paths via engine" {
         .start_nodes = .{ .keys = start_keys },
         .target_nodes = .{ .keys = &.{"C"} },
         .k = 2,
-        .params = .{ .weight_mode = .min_weight, .max_results = 1 },
+        .params = .{ .max_depth = 2, .include_paths = true, .weight_mode = .min_weight, .max_results = 1 },
     }, start_keys);
     defer limited.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), limited.nodes.len);
+    // The response limit applies across start/target pairs on both ordinary
+    // pathfinders, not independently to each pair or only to algebraic paths.
+    for ([_]QueryType{ .shortest_path, .k_shortest_paths }) |query_type| {
+        var bounded = try engine.execute(&ctx.graph, .{
+            .query_type = query_type,
+            .index_name = "test",
+            .start_nodes = .{ .keys = &.{ "A", "B" } },
+            .target_nodes = .{ .keys = &.{ "C", "D" } },
+            .k = 64,
+            .params = .{ .max_depth = 2, .weight_mode = .min_weight, .max_results = 1 },
+        }, &.{ "A", "B" });
+        defer bounded.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), bounded.nodes.len);
+        try std.testing.expectEqualStrings("C", bounded.nodes[0].key);
+    }
 }
 
 test "path result node conversion preserves endpoint semantics and allocation safety" {
@@ -4344,6 +4364,7 @@ test "k_shortest_paths k greater than one stays on normal pathfinder" {
         .start_nodes = .{ .keys = start_keys },
         .target_nodes = .{ .keys = &.{"C"} },
         .k = 2,
+        .params = .{ .max_depth = 2 },
     }, start_keys);
     defer result.deinit(alloc);
 

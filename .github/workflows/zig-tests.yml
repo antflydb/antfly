@@ -421,10 +421,10 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
-      - name: Compile consolidated storage benchmark contracts
+      - name: Compile consolidated storage and graph benchmark contracts
         if: needs.changes.outputs.zig_tests == 'true'
         working-directory: zig
-        run: zig build antfly-storage-bench -Doptimize=Debug
+        run: zig build antfly-storage-bench antfly-graph-bench -Doptimize=Debug
 
       # Keep inexpensive tooling checks beside the normal unit gate. The
       # isolated compilation/cache matrix runs in zig-full / build-cache.
@@ -814,6 +814,8 @@ jobs:
           ANTFLY_TLA_TRACE_VALIDATE: "true"
         run: scripts/ci/zig-tla-verify.sh
 
+      # Includes index-maintenance and index-ownership replay campaigns. The
+      # fixed maintenance seed is already part of the zig-base unit aggregate.
       - name: Run Zig VOPR tests
         working-directory: zig
         run: >-
@@ -843,6 +845,8 @@ jobs:
             ${{ runner.temp }}/vopr-qualification/**/*.voprquarantine
           retention-days: 90
 
+      # Includes complete graph owner coverage and the native maintenance fixture;
+      # no graph-specific CLI or promotion matrix is built here.
       - name: Run Zig integration tests
         working-directory: zig
         run: >-

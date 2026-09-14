@@ -82,14 +82,25 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\
     ;
     if (std.mem.eql(u8, command, "index")) return
-    \\usage: antfly index <create|drop|list|get|wait> --table <table> [options]
+    \\usage: antfly index <create|drop|list|get|wait|maintenance> --table <table> [options]
     \\
     \\  index create --table <table> --index <index> --type <type> [--publication-policy progressive|atomic] [--coverage-policy strict|partial|best_effort] [--distance-metric l2_squared|inner_product|cosine] [--external]
+    \\  index maintenance <issues|status|repair|rebuild|pause|resume|cancel> --table <table> --index <index>
+    \\  index maintenance <refresh|rebuild|pause|resume|delete> --table <table> --index <graph-index> --metric <metric>
+    \\  maintenance repair/rebuild/controls create durable jobs; --once runs one bounded pass
+    \\  maintenance <status|advance|cancel> --table <table> --job <job-id>
+    \\  repair controls accept --repair-id; issues/repair/controls accept --limit and --cursor
     \\  index list --table <table> [--output json|--verbose]
     \\  index wait --table <table> --index <index> --until <complete|searchable-artifacts=N|source-covered=N%> [--timeout 10m]
     \\
     ;
-    if (std.mem.eql(u8, command, "artifact")) return "usage: antfly artifact <list|get|put|delete|reprocess|job> [options]\n";
+    if (std.mem.eql(u8, command, "artifact")) return
+    \\usage: antfly artifact <list|get|put|delete|reprocess|job|maintenance> [options]
+    \\  artifact maintenance <issues|repair> --table <table> [--kind <kind>] [--index <index>] [--limit <n>] [--cursor <cursor>]
+    \\  repair creates a durable job; --once runs one bounded pass
+    \\  artifact maintenance <status|advance|cancel> --table <table> --job <job-id>
+    \\  reprocess and job retain their existing artifact reprocessing semantics
+    ;
     if (std.mem.eql(u8, command, "lookup")) return "usage: antfly lookup --table <table> --key <key> [--read-consistency read_index|stale]\n";
     if (std.mem.eql(u8, command, "insert")) return
     \\usage: antfly insert --table <table> --key <key> --document <json> [options]
