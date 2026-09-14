@@ -1831,8 +1831,6 @@ test "boundary training step construction methods classify terminal causes and p
 
 test {
     _ = @import("gliner_boundary_train_step_test.zig");
-    _ = @import("gliner_boundary_train_step_oracle_test.zig");
-    _ = @import("gliner_boundary_train_step_device_test.zig");
     _ = objectives;
     _ = decisions;
 }

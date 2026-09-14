@@ -14,7 +14,7 @@
       "size_bytes": 2238
     }
   },
-  "generator_sha256": "9eb3685f4335305892985e8b2d2f379df2b64da3e094ae1a7ad1f2873d5d79a6",
+  "generator_sha256": "4a356272e954e27511d60ddc799895d2a43fa0425870c57f28570e27edf87a82",
   "heldout_quality_claim": false,
   "limitations": [
     "Four authored examples test job plumbing only; validation is not a production or benchmark holdout.",
@@ -148,5 +148,5 @@
   "unicode_version": "15.0.0",
   "upstream_commit": "3c913c7369301133d3b7699252074c4303ada50e",
   "version": 1,
-  "word_pattern_helper_sha256": "4543ec9710ce2c973f6e4a21f8169cc966b21896b20882b831796ca31fa8d606"
+  "word_pattern_helper_sha256": "4a356272e954e27511d60ddc799895d2a43fa0425870c57f28570e27edf87a82"
 }

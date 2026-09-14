@@ -6,9 +6,9 @@ multilingual FP32 checkpoints, the ten existing task requests, batch size one,
 and one CPU math thread per process. These short correctness fixtures are not
 a representative throughput corpus or a serving performance qualification.
 
-This document specifies the original request-owned reference profile. Use the
-[v2 comparison and scaling profiles](METAL_BENCHMARK_V2.md) to compare the
-optimized runtime or check native CPU preservation.
+This is the canonical checked-in Metal comparison. Historical scaling and
+optimization campaigns remain in external evidence rather than parallel
+versioned harnesses in the source tree.
 
 ## Measurement contract
 

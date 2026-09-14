@@ -66,11 +66,7 @@ intervals, observed RSS, and a content manifest. Ratios below one mean native
 latency was lower on that particular workload.
 
 These benchmark scripts and outputs are intentionally outside the oracle
-reference-generator closure. Validate the harness without importing ML models:
-
-```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s zig/pkg/inference/scripts/gliner25 -p test_benchmark_cpu.py -v
-```
+reference-generator closure.
 
 ## Recorded CPU run, 2026-09-09
 

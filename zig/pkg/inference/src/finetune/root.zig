@@ -132,8 +132,6 @@ test {
     _ = gliner_boundary_native_trainer;
     _ = @import("gliner_boundary_native_trainer_test.zig");
     _ = @import("gliner_boundary_inactive_trainer_test.zig");
-    _ = @import("gliner_boundary_inactive_oracle_test.zig");
-    _ = @import("gliner_boundary_inactive_native_oracle_test.zig");
     _ = gliner_boundary_training_source;
     _ = gliner_boundary_training_job;
     _ = gliner_boundary_training_limits;

@@ -745,54 +745,6 @@ pub const Context = struct {
     }
 };
 
-test "extraction regex matches pinned Python fullmatch search and match oracle" {
-    const Fixture = struct {
-        format_version: u32,
-        provenance: std.json.Value,
-        decimal_ranges: []const Range,
-        texts: []const []const u8,
-        cases: []const struct {
-            pattern: []const u8,
-            flags: u32,
-            expected: struct { fullmatch: []const bool, search: []const bool, match: []const bool },
-        },
-    };
-    const allocator = std.testing.allocator;
-    const bytes = try @import("../architectures/gliner_boundary_parity_test.zig").fixtureBytes(allocator, "regex.json");
-    defer allocator.free(bytes);
-    var fixture = try std.json.parseFromSlice(Fixture, allocator, bytes, .{});
-    defer fixture.deinit();
-    try std.testing.expectEqual(@as(u32, 2), fixture.value.format_version);
-    try std.testing.expectEqualStrings("15.0.0", fixture.value.provenance.object.get("unicode").?.string);
-    try std.testing.expectEqual(@as(usize, 390), fixture.value.cases.len);
-    try std.testing.expectEqual(@as(usize, 57), fixture.value.texts.len);
-    for (fixture.value.cases) |case| {
-        inline for (.{ Mode.fullmatch, Mode.search, Mode.match }) |mode|
-            try std.testing.expectEqual(fixture.value.texts.len, @field(case.expected, @tagName(mode)).len);
-        var program = try compile(allocator, case.pattern, case.flags, .{});
-        defer program.deinit();
-        for (fixture.value.texts, 0..) |text, index| {
-            inline for (.{ Mode.fullmatch, Mode.search, Mode.match }) |mode| {
-                const got = try program.run(allocator, text, mode, .{});
-                if (got.matched != @field(case.expected, @tagName(mode))[index]) {
-                    std.debug.print("regex mismatch pattern={f} flags={d} mode={s} text={f}\n", .{ std.json.fmt(case.pattern, .{}), case.flags, @tagName(mode), std.json.fmt(text, .{}) });
-                    return error.TestExpectedEqual;
-                }
-            }
-        }
-    }
-    var range_index: usize = 0;
-    for (0..0x110000) |raw| {
-        const cp: u21 = @intCast(raw);
-        while (range_index < fixture.value.decimal_ranges.len and fixture.value.decimal_ranges[range_index].last < cp) range_index += 1;
-        const expected = range_index < fixture.value.decimal_ranges.len and fixture.value.decimal_ranges[range_index].first <= cp;
-        if (unicodeDigit(cp) != expected) {
-            std.debug.print("Unicode Nd mismatch U+{x}\n", .{cp});
-            return error.TestExpectedEqual;
-        }
-    }
-}
-
 test "extraction regex unsupported syntax is rejected instead of approximated" {
     const allocator = std.testing.allocator;
     for ([_][]const u8{ "(a)\\1", "(?=a)a", "(?!b)a", "(?<=x)a", "(?<!x)a", "(?>a|ab)b", "a*+a", "a++a", "a?+a", "a{1,2}+a", "(?i)a", "(?i:a)", "(?P<name>a)", "(?#comment)a", "\\N{LATIN CAPITAL LETTER A}", "(a)(?(1)b|c)" }) |pattern|

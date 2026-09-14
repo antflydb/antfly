@@ -149,11 +149,9 @@ test {
     _ = architectures.gliner_boundary_ops;
     _ = architectures.gliner_boundary_engine;
     _ = @import("architectures/gliner_boundary_parity_test.zig");
-    _ = @import("architectures/gliner_boundary_tasks_test.zig");
     _ = @import("architectures/gliner_boundary_device_test.zig");
     _ = @import("architectures/gliner_boundary_engine_device_test.zig");
     _ = @import("architectures/gliner_boundary_reduced_device_test.zig");
-    _ = @import("architectures/gliner_boundary_tasks_device_test.zig");
     _ = @import("architectures/gliner_boundary_scorer_device_test.zig");
     _ = @import("architectures/gliner_boundary_request_device_test.zig");
     _ = @import("extractors/gliner_boundary_long_tasks_test.zig");

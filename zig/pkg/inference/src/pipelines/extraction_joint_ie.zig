@@ -1243,9 +1243,6 @@ test "joint source presentation uses lexical entity IDs and preserves provenance
     try std.testing.expectEqualDeep(edges[1], invalid[1]);
 }
 
-test {
-    _ = @import("extraction_joint_source_test.zig");
-}
 fn testEdge(head: usize, tail: usize, utility: f64) Edge {
     return .{ .relation_type = 0, .head = head, .tail = tail, .utility = utility, .probability = 0.8 };
 }

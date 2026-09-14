@@ -26,21 +26,16 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next();
     var directory: ?[]const u8 = null;
     var fixture_path: ?[]const u8 = null;
-    var evaluation_fixture: ?[]const u8 = null;
     var backend: enum { native, metal } = .native;
     var backend_seen = false;
     while (args.next()) |arg| {
         const value = args.next() orelse return error.MissingArgument;
-        if (std.mem.eql(u8, arg, "--model-dir") and directory == null) directory = value else if (std.mem.eql(u8, arg, "--fixture") and fixture_path == null) fixture_path = value else if (std.mem.eql(u8, arg, "--evaluation-fixture") and evaluation_fixture == null) evaluation_fixture = value else if (std.mem.eql(u8, arg, "--backend") and !backend_seen) {
+        if (std.mem.eql(u8, arg, "--model-dir") and directory == null) directory = value else if (std.mem.eql(u8, arg, "--fixture") and fixture_path == null) fixture_path = value else if (std.mem.eql(u8, arg, "--backend") and !backend_seen) {
             backend = std.meta.stringToEnum(@TypeOf(backend), value) orelse return error.InvalidArgument;
             backend_seen = true;
         } else return error.InvalidArgument;
     }
     const path = directory orelse return error.MissingArgument;
-    if (evaluation_fixture) |evaluation_path| {
-        if (fixture_path != null) return error.InvalidArgument;
-        return @import("gliner25_evaluation_worker.zig").run(a, init.io, path, evaluation_path, backend == .metal);
-    }
     const fixture_bytes = try inference.util.c_file.readFileMax(a, fixture_path orelse return error.MissingArgument, 2 * 1024 * 1024);
     defer a.free(fixture_bytes);
     // Deliberately do not deserialize expected results into the execution

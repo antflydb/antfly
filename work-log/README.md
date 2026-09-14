@@ -17,7 +17,6 @@ Go-era design documents whose content now lives in the Zig design docs were remo
 
 | Feature | Document | Summary |
 |---------|----------|---------|
-| GLiNER2.5 | [gliner2.5.md](completed/gliner2.5.md) | Native CPU/Metal extraction, training, artifact compatibility, and qualification boundaries |
 
 ## Planned Features
 
