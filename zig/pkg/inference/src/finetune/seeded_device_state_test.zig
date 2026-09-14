@@ -31,6 +31,7 @@ const Fake = struct {
         result.vtable.residentTrainingPrimitive = primitive;
         result.vtable.residentTrainingInstruction = instruction;
         result.vtable.glinerBoundaryDownload = download;
+        result.vtable.glinerBoundaryScope = null;
         return result;
     }
     fn cb(self: *Fake) ops.ComputeBackend {

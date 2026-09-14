@@ -196,7 +196,7 @@ const WasmBuf = struct {
         buf.* = .{
             .data = empty,
             .len = data.len,
-            .owned = false,
+            .owned = true,
             .allocator = allocator,
             .i32_data = data,
         };
@@ -1912,7 +1912,10 @@ pub const WasmCompute = struct {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const slot = self.decoder_runtime_linear_slots.get(request.slot) orelse return null;
         if (slot.in_dim != request.in_dim or slot.out_dim != request.out_dim) return error.UnexpectedOutputShape;
-        return try linearOp(ctx, request.input, fromBuf(slot.weight), fromBuf(slot.bias), 1, request.in_dim, request.out_dim);
+        const input = toBuf(request.input);
+        if (request.in_dim == 0 or input.len == 0 or input.len % request.in_dim != 0) return error.UnexpectedOutputShape;
+        const rows = input.len / request.in_dim;
+        return try linearOp(ctx, request.input, fromBuf(slot.weight), fromBuf(slot.bias), rows, request.in_dim, request.out_dim);
     }
 
     fn decoderRuntimeApplyLinearArgmaxOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearArgmaxRequest) anyerror!?usize {
@@ -5394,7 +5397,7 @@ test "wasm compute webgpu elementwise shape guards" {
     try std.testing.expect(!isWhereSelectGpuCompatible(8, 8, 4));
 
     try std.testing.expect(isGpuReduceLastDimCompatible(&.{1}, &.{ 2, 4 }));
-    try std.testing.expect(isGpuReduceLastDimCompatible(&.{ 0, 1 }, &.{ 2, 4 }));
+    try std.testing.expect(!isGpuReduceLastDimCompatible(&.{ 0, 1 }, &.{ 2, 4 }));
     try std.testing.expect(!isGpuReduceLastDimCompatible(&.{0}, &.{ 2, 4 }));
 
     try std.testing.expect(isGpuBroadcastInDimCompatible(&.{ 2, 3, 4 }, &.{ 0, 1, 2 }, &.{ 1, 1, 4 }));

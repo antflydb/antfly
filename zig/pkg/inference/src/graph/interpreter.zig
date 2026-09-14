@@ -1593,7 +1593,10 @@ fn executeScatterAdd(
     axis: u8,
 ) !CT {
     if (axis != 0) return error.UnsupportedPrimitiveOp;
-    const index_dtype = try cb.tensorDType(indices);
+    const index_dtype = cb.tensorDType(indices) catch |err| switch (err) {
+        error.UnsupportedTensorType => .f32,
+        else => return err,
+    };
     if (index_dtype == .i32 or index_dtype == .i64) {
         // The compatibility host path below represents legacy indices as f32.
         // Typed training indices must reach the backend without that cast.

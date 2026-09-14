@@ -652,7 +652,7 @@ function validateExtractionV2Response(
       throw new Error(`Invalid extraction v2 response: item ${index} must be an object`);
     }
     const item = row as Record<string, unknown>;
-    const hasId = Object.hasOwn(item, "id");
+    const hasId = Object.getOwnPropertyDescriptor(item, "id") !== undefined;
     if ((hasId && typeof item.id !== "string") || item.id !== expectedIds[index]) {
       throw new Error(`Invalid extraction v2 response: item ${index} id mismatch`);
     }
