@@ -354,7 +354,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .reconcile_table_group_local = reconcileTableGroupLocal,
                 .reconcile_table_group_local_transient = reconcileTableGroupLocalTransient,
                 .retire_table_group_local = retireTableGroupLocal,
-                .reconcile_table_group_local_transient_observed = reconcileTableGroupLocalTransientObserved,
+                .reconcile_table_group_local_observed = reconcileTableGroupLocalObserved,
                 .local_runtime_status_group_local = localRuntimeStatusGroupLocal,
             },
         };
@@ -1197,13 +1197,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         return localStructuralReconcileResult(result);
     }
 
-    fn reconcileTableGroupLocalTransientObserved(
+    fn reconcileTableGroupLocalObserved(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
         target_index_name: ?[]const u8,
         advance_index_repair: bool,
+        retain_cold_owner: bool,
     ) !?table_write_source.LocalStructuralReconcileObservation {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
@@ -1214,7 +1215,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             descriptor.path,
             descriptor.view(),
         );
-        const retire_after = lease.created;
+        const retire_after = lease.created and !retain_cold_owner;
         var lease_active = true;
         errdefer if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
         defer if (lease_active) lease.deinit();

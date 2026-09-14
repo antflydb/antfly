@@ -10286,3 +10286,40 @@ before and 4.760 us/op after. Uncontended acquire/release was approximately
 section contention sample was scheduling-sensitive and is not a throughput
 result. These measurements check abstraction overhead, not public query QPS;
 no new 50K/1M readiness, latency, RSS, disk or recall qualification is claimed.
+
+
+#### Post-merge ownership comparison: structural observation repair
+
+The fresh comparison in `.benchmark-results/vector-store-promotion-20260913/`
+passed four 50K timed and reclamation arms after automatic source maintenance
+was restored in the compiled owner. Vector-store peak QPS was 5.4% below LSM
+in AB order and 6.5% above in BA order; this is no consistent small-table win.
+The first 1M LSM control then logged batch and query HTTP 500s. The runner
+rejected it even though the client exited zero, and no 1M vector-store arm
+started. These failed timings cannot support an ownership comparison.
+
+Two connected defects are being qualified in
+`.benchmark-results/vector-store-boundary-repair-20260913/`. StorageBusy had
+no stable callback error detail and therefore became RuntimeBoundaryFailure.
+The compiled structural reconciliation path also returned completion without
+adding an owner observation. Targeted publication rejected the empty proof with
+EmptyTargetedIndexObservation, repeatedly scheduling reconciliation that requested
+exclusive owner access. The repair captures status before releasing the same
+owner generation, carries it through targeted publication, and leaves a group
+pending when no status proof is available. Existing table epoch, physical root
+and target incarnation fences remain enforced. Transient startup inspection
+still retires idle cold owners; ongoing structural work retains its owner.
+
+StorageBusy now retains its retryable identity through callbacks and maps to
+HTTP 503 in batch/query handlers. Ambiguous write outcomes remain conflicts;
+the implementation does not retry commits automatically. The comparison still
+rejects request errors and retries, so changing the HTTP status alone cannot
+qualify an arm. Focused regressions, saved restart/maintenance gates and fresh
+same-binary timings must pass before reconsidering the default.
+
+The focused validation passes 18 callback/error-transport checks, three HTTP
+and compiled write-callback checks, and the compiled-control structural
+publication regression, with no leaks. The latter binds catalog authority,
+verifies that an empty observation is still rejected, and publishes the captured
+owner proof through the targeted path. Saved recovery and fresh timings remain
+pending for this revision.

@@ -25,6 +25,7 @@ pub fn add(
     artifacts: [std.meta.fields(runtime.RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
 ) Result {
     const owner_filter = b.option([]const u8, "storage-owner-test-filter", "Compile and run one matching storage owner test subset");
+    const source_filter = b.option([]const u8, "storage-owner-source-test-filter", "Compile and run matching provisioned storage owner tests");
     const test_metadata = @import("../../../lib/build_info/build_support.zig").create(b, .{
         .root = b.path("lib/build_info"),
         .target = target,
@@ -53,6 +54,13 @@ pub fn add(
                 .root_module = module,
                 .filters = if (index == 0 and owner_filter != null)
                     &.{owner_filter.?}
+                else if (index == 1 and source_filter != null)
+                    &.{source_filter.?}
+                else if (index == 1)
+                    &.{
+                        b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])}),
+                        "compiled structural reconciliation publishes",
+                    }
                 else
                     &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
                 .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
@@ -61,6 +69,8 @@ pub fn add(
             runs[index] = tests.run(b);
             if (index == 0)
                 b.step("antfly-storage-owner-test", "Run tests through the compiled storage owner boundary").dependOn(&runs[index].step);
+            if (index == 1)
+                b.step("antfly-storage-owner-source-test", "Run provisioned storage owner boundary tests").dependOn(&runs[index].step);
             if (index == 2) {
                 tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
             } else {
