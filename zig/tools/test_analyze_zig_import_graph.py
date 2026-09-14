@@ -343,7 +343,7 @@ class ImportGraphTest(unittest.TestCase):
     def test_codegen_boundary_accepts_control_wal_runtime_selector(self):
         self.write_codegen_boundaries()
         self.write(
-            "storage/ha/replication_log.zig",
+            "storage/hot_standby/replication_log.zig",
             'const wal = @import("../wal_runtime.zig");\n',
         )
         self.write(
@@ -357,7 +357,7 @@ class ImportGraphTest(unittest.TestCase):
     def test_codegen_boundary_rejects_direct_native_wal_import(self):
         self.write_codegen_boundaries()
         self.write(
-            "storage/ha/replication_log.zig",
+            "storage/hot_standby/replication_log.zig",
             'const wal = @import("../wal.zig");\n',
         )
         graph = analyzer.ImportGraph(self.root)
@@ -366,7 +366,7 @@ class ImportGraphTest(unittest.TestCase):
         with redirect_stderr(diagnostics):
             self.assertFalse(analyzer.check_codegen_boundary(graph))
         self.assertIn(
-            "storage/ha/replication_log.zig directly imports storage/wal.zig",
+            "storage/hot_standby/replication_log.zig directly imports storage/wal.zig",
             diagnostics.getvalue(),
         )
 
