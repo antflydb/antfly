@@ -221,12 +221,12 @@ test "distributed txn activation worker adapts pages and atomically publishes na
                 try std.testing.expectEqual(read_gate.ReadConsistency.read_index, consistency);
                 try std.testing.expect(opts.execution_deadline_ns != null);
                 if (opts.relational_activation_json.len != 0) {
-                    var request = try std.json.parseFromSlice(struct { mode: []const u8, max_rows: u32 = 128 }, allocator, opts.relational_activation_json, .{});
+                    var request = try std.json.parseFromSlice(struct { mode: []const u8, max_rows: u32 = 128 }, allocator, opts.relational_activation_json, .{ .ignore_unknown_fields = true });
                     defer request.deinit();
                     if (request.value.max_rows == 1) self.reduced = true;
                 }
                 const result = (try self.db.lookup(allocator, key, opts)) orelse return null;
-                return .{ .json = result.json, .version = 0 };
+                return .{ .json = result.json, .version = result.version orelse try self.db.getTimestamp(allocator, key), .expected_content_digest = result.expected_content_digest };
             }
             fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: read_gate.ReadConsistency) !?reads.ScanResponse {
                 return error.UnexpectedCall;
@@ -242,18 +242,23 @@ test "distributed txn activation worker adapts pages and atomically publishes na
                 try cancellation.check();
                 try std.testing.expectEqual(@as(usize, 1), requests.len);
                 const request = requests[0];
-                try std.testing.expect(request.relational_activation != null);
-                try std.testing.expectEqual(@as(usize, 0), request.writes.len);
-                try std.testing.expectEqual(@as(usize, 0), request.deletes.len);
+                if (!request.relational_repair) {
+                    try std.testing.expect(request.relational_activation != null);
+                    try std.testing.expectEqual(@as(usize, 0), request.writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), request.deletes.len);
+                }
                 // Exercise the coordinator's real retry boundary without
                 // weakening native receiver validation or checkpoint CAS.
-                if (request.integrity_commands.len > 1 or (singleton_too_large and request.integrity_commands.len != 0)) return error.TransactionTooLarge;
+                if (!request.relational_repair and (request.integrity_commands.len > 1 or (singleton_too_large and request.integrity_commands.len != 0))) return error.TransactionTooLarge;
                 self.attempts += 1;
                 const timestamp = @as(u64, self.attempts) * 1000;
                 const txn = try self.db.beginTransactionWithId(@splat(self.attempts), timestamp);
                 self.db.writeTransaction(txn, .{
                     .relational_schema_version = request.relational_schema_version,
                     .relational_integrity_generation_set = request.relational_integrity_generation_set,
+                    .relational_repair = request.relational_repair,
+                    .writes = request.writes,
+                    .deletes = request.deletes,
                     .predicates = request.predicates,
                     .integrity_commands = request.integrity_commands,
                     .relational_activation = request.relational_activation,
@@ -298,6 +303,36 @@ test "distributed txn activation worker adapts pages and atomically publishes na
         const raw_claim = (try db.core.getStoreValue(alloc, &address.claimKey())).?;
         defer alloc.free(raw_claim);
         try std.testing.expectEqualStrings("a", (try integrity.Claim.decode(&address.claimKey(), raw_claim)).parent_key);
+        if (duplicate) {
+            const control: RequestContext = .{ .deadline_ns = std.math.maxInt(u64) };
+            // Replacing a duplicate with itself is not a constraint bypass.
+            var invalid_repair = try planner.prepareRepair(alloc, reader, &tables, &owners, .{
+                .table_name = "rows",
+                .relational_schema_version = 2,
+                .writes = &.{.{ .key = "b", .value = "{\"id\":1}" }},
+            }, control);
+            defer invalid_repair.deinit();
+            try std.testing.expectError(error.UniqueConstraintViolation, writer.commitBatchWithCancellation(alloc, invalid_repair.tables, .write, .none));
+            var repaired = try planner.prepareRepair(alloc, reader, &tables, &owners, .{
+                .table_name = "rows",
+                .relational_schema_version = 2,
+                .writes = &.{.{ .key = "b", .value = "{\"id\":2}" }},
+            }, control);
+            defer repaired.deinit();
+            _ = (try writer.commitBatchWithCancellation(alloc, repaired.tables, .write, .none)).?;
+            const still_owned = (try db.core.getStoreValue(alloc, &address.claimKey())).?;
+            defer alloc.free(still_owned);
+            try std.testing.expectEqualStrings("a", (try integrity.Claim.decode(&address.claimKey(), still_owned)).parent_key);
+            try @import("relational_constraint_recovery.zig").retry(alloc, reader, writer, &tables, &owners, .{ .table_name = "rows", .relational_schema_version = 2 }, control);
+            // Retrying again does not reset a healthy in-progress cursor.
+            try @import("relational_constraint_recovery.zig").retry(alloc, reader, writer, &tables, &owners, .{ .table_name = "rows", .relational_schema_version = 2 }, control);
+            for (0..8) |_| {
+                if (!try runPage(alloc, reader, writer, &tables, &owners, owners[0])) break;
+            } else return error.ActivationDidNotConverge;
+            const final_progress = (try db.core.getStoreValue(alloc, activation.key)).?;
+            defer alloc.free(final_progress);
+            try std.testing.expectEqual(activation.State.enforced, (try activation.Progress.decode(final_progress)).state);
+        }
     }
 }
 

@@ -882,6 +882,10 @@ pub const AntflyApiHandler = struct {
         if (!policy.failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
         const mutation = classifyHaMutation(ctx.request.method, path) orelse return null;
+        // Backup and table restore are adapters over the same durable cohort
+        // and staging authority; handlers reject uncertified historical cuts.
+        if ((mutation.surface == .cluster_restore or mutation.surface == .restore_job or mutation.surface == .table_restore or mutation.surface == .backup) and
+            self.api_server.haCoordinatedRestoreAvailable()) return null;
         if (mutation.disposition != .reject and
             (mutation.disposition != .remote_apply or policy.remote_apply_mutations_enabled))
         {
@@ -1081,6 +1085,7 @@ pub const AntflyApiHandler = struct {
         try server.post(group_prefix ++ routes.shard_ops_execute_suffix, httpx.Handler.bind(self, internalExecuteTransition));
         try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
         try server.post(table_prefix ++ routes.backup_shard_suffix, httpx.Handler.bind(self, internalGroupBackupShard));
+        try server.post(table_prefix ++ routes.restore_owner_suffix, httpx.Handler.bind(self, internalGroupRestoreOwner));
         try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
         try server.post(table_prefix ++ routes.query_suffix, httpx.Handler.bind(self, internalGroupQuery));
         try server.post(table_prefix ++ routes.query_preflight_suffix, httpx.Handler.bind(self, internalGroupQueryPreflight));
@@ -1936,6 +1941,8 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGroupErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error) !httpx.Response {
+        if (err == error.RestoreStagingInProgress) return textResponse(ctx, 503, "RestoreStagingInProgress");
+        if (@import("relational_integrity_errors.zig").classify(err)) |reason| return textResponse(ctx, 409, @errorName(reason));
         if (sharedInternalHttpErrorSpec(err)) |spec|
             return textResponse(ctx, spec.status, spec.message);
         return switch (err) {
@@ -1991,12 +1998,47 @@ pub const AntflyApiHandler = struct {
         return ctx.json(progress);
     }
 
+    fn internalGroupRestoreOwner(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "restore owner request required");
+        if (body.len > 16 * 1024) return textResponse(ctx, 413, "restore owner request too large");
+        var parsed = std.json.parseFromSlice(@import("restore_owner.zig").Request, ctx.allocator, body, .{ .allocate = .alloc_always }) catch return textResponse(ctx, 400, "invalid restore owner request");
+        defer parsed.deinit();
+        const port = self.api_server.cfg.restore_owner orelse return textResponse(ctx, 503, "restore owner unavailable");
+        const result = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| {
+            if (@import("restore_source_errors.zig").permanent(err)) return textResponse(ctx, 422, "restore source integrity validation failed");
+            return switch (err) {
+                error.InvalidRestoreStagingCommand, error.RestoreSourceProofMissing, error.InvalidBackupArtifactPath => textResponse(ctx, 400, "invalid restore source proof"),
+                error.RestoreStagingScopeChanged, error.BackupArtifactIntegrityMismatch, error.BackupSealMismatch => textResponse(ctx, 409, "restore owner or artifact changed"),
+                error.Canceled, error.Cancelled => textResponse(ctx, 408, "restore operation canceled"),
+                else => textResponse(ctx, 503, "restore owner operation must be retried"),
+            };
+        };
+        return ctx.json(result);
+    }
+
     fn internalGroupBackupShard(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse
             return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse
             return textResponse(ctx, 400, "invalid backup shard request");
+        if (ctx.header(@import("backup_contract.zig").backup_pin_control_header)) |version| {
+            if (!std.mem.eql(u8, version, "v1") or body.len > 4096) return textResponse(ctx, 400, "invalid backup pin control");
+            var parsed = std.json.parseFromSlice(@import("../storage/db/native_backup_seal.zig").Request, ctx.allocator, body, .{}) catch
+                return textResponse(ctx, 400, "invalid backup pin control");
+            defer parsed.deinit();
+            const source = self.api_server.table_writes orelse return textResponse(ctx, 503, "backup owner unavailable");
+            const request = self.api_server.boundedBackupRequest(operationContext(ctx, null));
+            const response = source.backupPinControl(ctx.allocator, params.table_name, params.group_id, parsed.value, .{ .deadline_ns = request.deadline_ns.?, .cancellation = request.cancellation, .owner_local_only = true }) catch |err| return switch (err) {
+                error.InvalidBackupFence => textResponse(ctx, 400, "invalid backup pin owner"),
+                error.IntegrityTopologyChanged, error.IntegrityTopologyMissing, error.IntegrityCatalogChanged, error.CatalogChanged => textResponse(ctx, 409, "backup pin authority changed"),
+                else => textResponse(ctx, 503, "backup pin operation must be retried"),
+            };
+            defer if (response) |value| ctx.allocator.free(value);
+            return if (response) |value| jsonResponse(ctx, 200, value) else textResponse(ctx, 404, "backup owner not found");
+        }
         const expected_fence = backups_api.parseTableBackupFenceHeaderValuesWithDeadline(
             ctx.header(backups_api.backup_fence_metadata_group_id_header),
             ctx.header(backups_api.backup_fence_metadata_incarnation_header),
@@ -2024,7 +2066,16 @@ pub const AntflyApiHandler = struct {
         }) catch return textResponse(ctx, 400, "invalid backup location");
         defer location.deinit(ctx.allocator);
 
-        const shards = self.api_server.executeInternalTableBackupShard(
+        const cohort = @import("backup_contract.zig").parseBackupCohortFenceHeader(ctx.header(@import("backup_contract.zig").backup_cohort_fence_header)) catch
+            return textResponse(ctx, 400, "invalid backup cohort fence");
+        const sealed_raw = ctx.header(@import("backup_contract.zig").backup_sealed_handle_header);
+        if (sealed_raw != null and (cohort != null or sealed_raw.?.len > 4096)) return textResponse(ctx, 400, "invalid sealed backup authority");
+        var sealed: ?std.json.Parsed(@import("backup_contract.zig").SealedHandle) = if (sealed_raw) |value|
+            std.json.parseFromSlice(@import("backup_contract.zig").SealedHandle, ctx.allocator, value, .{}) catch return textResponse(ctx, 400, "invalid sealed backup authority")
+        else
+            null;
+        defer if (sealed) |*value| value.deinit();
+        const shards = self.api_server.executeInternalTableBackupShardCohort(
             params.group_id,
             params.table_name,
             parsed.value.backup_id,
@@ -2032,9 +2083,13 @@ pub const AntflyApiHandler = struct {
             fence,
             &location,
             operationContext(ctx, null),
+            cohort,
+            if (sealed) |value| &.{value.value} else &.{},
         ) catch |err| return switch (err) {
             error.TableNotFound, error.NotFound => textResponse(ctx, 404, "not found"),
             error.CatalogChanged => textResponse(ctx, 409, "table catalog changed"),
+            error.IntegrityTopologyChanged, error.IntegrityTopologyFenceMissing, error.IntegrityCatalogChanged => textResponse(ctx, 409, "backup cohort changed"),
+            error.TransactionTopologyBusy => textResponse(ctx, 503, "backup cohort is draining"),
             error.BackupAttemptLeaseLost, error.InvalidBackupFence => textResponse(ctx, 409, "backup writer lease lost"),
             error.UnsupportedBackupFormat => textResponse(ctx, 400, "unsupported backup format"),
             error.BackupOutcomeAmbiguous => textResponse(ctx, 500, "backup outcome ambiguous"),
@@ -2069,7 +2124,7 @@ pub const AntflyApiHandler = struct {
             ctx.request.uri.query orelse "",
         ) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
-        const control_lookup = lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0;
+        const control_lookup = lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
         const logical_key = if (control_lookup and std.mem.eql(u8, key, "\x00relational_control")) "" else key;
         const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch
             return textResponse(ctx, 400, "invalid read consistency");
@@ -2088,6 +2143,10 @@ pub const AntflyApiHandler = struct {
         var version_buf: [20]u8 = undefined;
         const version = try std.fmt.bufPrint(&version_buf, "{d}", .{result.version});
         try ctx.setHeader("X-Antfly-Version", version);
+        if (result.expected_content_digest) |digest| {
+            const hex = std.fmt.bytesToHex(digest, .lower);
+            try ctx.setHeader("X-Antfly-Primary-Digest", &hex);
+        }
         return jsonResponse(ctx, 200, result.json);
     }
 
@@ -5465,6 +5524,22 @@ pub const AntflyApiHandler = struct {
     }
 
     pub fn mutateRelationalRows(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.relationalMutationImpl(ctx, table_name, .none);
+    }
+
+    pub fn repairRelationalConstraints(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.relationalMutationImpl(ctx, table_name, .repair);
+    }
+
+    pub fn retryRelationalConstraints(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.relationalMutationImpl(ctx, table_name, .retry);
+    }
+
+    pub fn retireRelationalConstraints(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.relationalMutationImpl(ctx, table_name, .retire);
+    }
+
+    fn relationalMutationImpl(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, comptime recovery: @FieldType(@import("operation.zig").RequestContext, "relational_recovery")) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -5474,9 +5549,22 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse {
             return jsonErrorResponse(ctx, 400, "missing body");
         };
-        if (try self.acquirePublicOperation(ctx, "mutateRelationalRows")) |response| return response;
-        defer self.releasePublicOperation("mutateRelationalRows");
-        return handleTableBatchOffEventLoop(ctx, self.api_server.cfg.backend_runtime, decoded_table_name, body, self.api_server.tableApi(tableMutationContext(ctx, &authenticated_identity)), public_table_http.handleRelationalRowsMutation);
+        const operation_id = switch (recovery) {
+            .none => "mutateRelationalRows",
+            .repair => "repairRelationalConstraints",
+            .retry => "retryRelationalConstraints",
+            .retire => "retireRelationalConstraints",
+        };
+        if (try self.acquirePublicOperation(ctx, operation_id)) |response| return response;
+        defer self.releasePublicOperation(operation_id);
+        var request = tableMutationContext(ctx, &authenticated_identity);
+        request.relational_recovery = recovery;
+        const handler = switch (recovery) {
+            .retry => public_table_http.handleRelationalConstraintRetry,
+            .retire => public_table_http.handleRelationalConstraintRetirement,
+            else => public_table_http.handleRelationalRowsMutation,
+        };
+        return handleTableBatchOffEventLoop(ctx, self.api_server.cfg.backend_runtime, decoded_table_name, body, self.api_server.tableApi(request), handler);
     }
 
     pub fn linearMerge(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -5993,6 +6081,7 @@ pub const AntflyApiHandler = struct {
             error.LsmRootWriterAlreadyOpen,
             error.ResidentDbRetryRequired,
             error.StorageReadTemporarilyUnavailable,
+            error.RestoreStagingInProgress,
             => {
                 var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                 return respondOwnedApiResponse(ctx, &response);

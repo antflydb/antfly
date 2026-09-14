@@ -143,6 +143,7 @@ pub const OwnedIntentMutation = struct {
 pub const VersionPredicate = struct {
     key: []const u8,
     expected_version: u64 = 0, // 0 = key must not exist
+    expected_content_digest: ?[32]u8 = null,
     /// Internal integrity records are raw metadata, not timestamped primary
     /// rows. Their CAS compares complete bytes and retains the same shared
     /// dependency guard as a document predicate. NULL means absent, not empty.
@@ -153,12 +154,22 @@ pub const VersionPredicate = struct {
 };
 
 fn validReadMember(bytes: []const u8) bool {
-    return bytes.len == 8 or (bytes.len == 33 and (bytes[0] == 2 or bytes[0] == 3));
+    return bytes.len == 8 or (bytes.len == 33 and (bytes[0] == 2 or bytes[0] == 3 or bytes[0] == 4));
 }
 
 fn readPredicateIdentity(predicate: VersionPredicate, out: *[33]u8) []const u8 {
     switch (predicate.comparison) {
         .document_version => {
+            if (predicate.expected_content_digest) |digest| {
+                var version: [8]u8 = undefined;
+                std.mem.writeInt(u64, &version, predicate.expected_version, .little);
+                var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                hash.update(&version);
+                hash.update(&digest);
+                out[0] = 4;
+                hash.final(out[1..33]);
+                return out;
+            }
             std.mem.writeInt(u64, out[0..8], predicate.expected_version, .little);
             return out[0..8];
         },
@@ -1599,6 +1610,7 @@ pub const TxnManager = struct {
         predicates: []const VersionPredicate,
         exclude_txn: ?TxnId,
     ) !void {
+        var relational_primary: ?bool = null;
         for (predicates) |pred| {
             switch (pred.comparison) {
                 .document_version => {
@@ -1609,9 +1621,42 @@ pub const TxnManager = struct {
                         const ts = current_ts orelse return TxnError.VersionConflict;
                         if (ts != pred.expected_version) return TxnError.VersionConflict;
                     }
+                    if (pred.expected_content_digest) |expected| {
+                        if (pred.expected_version == 0) return error.InvalidArgument;
+                        if (relational_primary == null) {
+                            const table_catalog = @import("db/table_catalog.zig");
+                            const catalog_bytes = self.getAlloc(self.alloc, table_catalog.key) catch |err| switch (err) {
+                                error.NotFound => null,
+                                else => return err,
+                            };
+                            defer if (catalog_bytes) |bytes| self.alloc.free(bytes);
+                            if (catalog_bytes) |bytes| {
+                                const catalog = try table_catalog.Catalog.decode(bytes);
+                                relational_primary = catalog.mode_initialized and catalog.storage_mode == .relational;
+                            } else {
+                                // Legacy document stores predate the fixed catalog.
+                                const schema = try @import("schema.zig").loadSchema(self.store, self.alloc);
+                                defer if (schema) |value| @import("schema.zig").freeSchema(self.alloc, value);
+                                relational_primary = schema != null and schema.?.storage_mode == .relational;
+                            }
+                        }
+                        const primary_key = if (relational_primary.?)
+                            try internal_keys.relationalRowKeyAlloc(self.alloc, pred.key)
+                        else
+                            try internal_keys.documentKeyAlloc(self.alloc, pred.key);
+                        defer self.alloc.free(primary_key);
+                        const current = self.getAlloc(self.alloc, primary_key) catch |err| switch (err) {
+                            error.NotFound => return TxnError.VersionConflict,
+                            else => return err,
+                        };
+                        defer self.alloc.free(current);
+                        var digest: [32]u8 = undefined;
+                        std.crypto.hash.sha2.Sha256.hash(current, &digest, .{});
+                        if (!std.mem.eql(u8, &digest, &expected)) return TxnError.VersionConflict;
+                    }
                 },
                 .exact_value => {
-                    if (!std.mem.startsWith(u8, pred.key, "\x00\x00__metadata__:relational_integrity:") and !std.mem.eql(u8, pred.key, "\x00\x00__metadata__:relational_integrity_activation")) return error.InvalidArgument;
+                    if (!std.mem.startsWith(u8, pred.key, "\x00\x00__metadata__:relational_integrity:") and !std.mem.eql(u8, pred.key, "\x00\x00__metadata__:relational_integrity_activation") and !std.mem.eql(u8, pred.key, "\x00\x00__metadata__:relational_integrity_retirement") and !std.mem.eql(u8, pred.key, "\x00\x00__metadata__:restore_staging_owner")) return error.InvalidArgument;
                     const current = self.getAlloc(self.alloc, pred.key) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,

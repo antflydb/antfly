@@ -25,6 +25,8 @@ const validation = @import("validation.zig");
 
 pub const topology_format_version: u16 = 3;
 pub const topology_name = "TOPOLOGY.json";
+pub const private_provisioning_name = "restore-provisioning.json";
+pub const standalone_metadata_name = "standalone-metadata.bin";
 pub const materialized_receipt_name = ".antfly-ha-materialized.json";
 pub const max_topology_bytes: usize = 64 * 1024 * 1024;
 pub const max_materialized_receipt_bytes: usize = 64 * 1024 * 1024;
@@ -91,6 +93,18 @@ pub const Topology = struct {
     extension_artifacts: []const ExtensionArtifact = &.{},
     auth_enabled: bool = false,
     auth_artifact: ?AuthArtifact = null,
+    /// Never serialized into the public local catalog. These immutable job
+    /// proofs authorize only the hidden replica roots carried by this seed.
+    private_provisioning: ?@import("../../metadata/restore_staging.zig").ProvisioningProjection = null,
+    /// HA-authenticated owners created after the previous seed, with no public
+    /// or metadata provisioning placement on this standby.
+    native_restore_tables: []const @import("restore_owner_registry.zig").OwnerTable = &.{},
+    native_restore_owners: []const @import("restore_owner_registry.zig").OwnerRef = &.{},
+    /// Streamed fixed-size cancellation proofs; never charged to active owners.
+    restore_terminals: ?AuthArtifact = null,
+    /// Complete indexed local metadata authority, including private lifecycle
+    /// journals and restore jobs. Distributed metadata has its own Raft seed.
+    standalone_metadata: ?AuthArtifact = null,
 };
 
 pub const MaterializeRequest = struct {
@@ -196,6 +210,40 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
     const local_catalog_json = try std.json.Stringify.valueAlloc(alloc, parsed.value.catalog, .{ .emit_null_optional_fields = false });
     defer alloc.free(local_catalog_json);
     try writeNewFileDurably(io, local_catalog_path, local_catalog_json);
+    if (parsed.value.standalone_metadata) |artifact| {
+        const source_path = try std.fs.path.join(alloc, &.{ request.raw_generation_root, artifact.path });
+        defer alloc.free(source_path);
+        const metadata_store_root = try std.fs.path.join(alloc, &.{ metadata_root, "local-state" });
+        defer alloc.free(metadata_store_root);
+        var metadata_store = try @import("../../metadata/storage/raft_apply_store.zig").RaftApplyStore.init(alloc, .{ .root_dir = metadata_store_root });
+        defer metadata_store.deinit();
+        try metadata_store.importHACheckpoint(io, source_path, artifact.size_bytes);
+        try verifyStandaloneMetadataTopology(alloc, &metadata_store, parsed.value);
+    }
+    if (parsed.value.private_provisioning) |projection| {
+        const private_path = try std.fs.path.join(alloc, &.{ metadata_root, private_provisioning_name });
+        defer alloc.free(private_path);
+        const private_json = try std.json.Stringify.valueAlloc(alloc, projection, .{});
+        defer alloc.free(private_json);
+        try writeNewFileDurably(io, private_path, private_json);
+    }
+    const native_owners = try @import("restore_owner_registry.zig").expand(alloc, parsed.value.native_restore_tables, parsed.value.native_restore_owners);
+    defer alloc.free(native_owners);
+    for (native_owners) |owner| try @import("restore_owner_registry.zig").record(alloc, io, metadata_root, owner);
+    if (parsed.value.restore_terminals) |artifact| {
+        const terminal_path = try std.fs.path.join(alloc, &.{ request.raw_generation_root, artifact.path });
+        defer alloc.free(terminal_path);
+        var ledger = try @import("restore_terminal_ledger.zig").Ledger.open(alloc, io, metadata_root);
+        defer ledger.deinit();
+        try ledger.importFile(io, terminal_path, artifact.size_bytes);
+        var terminals = try ledger.snapshot();
+        defer terminals.deinit();
+        for (native_owners) |owner| if (try terminals.get(owner.scope.target_namespace.shard_id) != null) return error.NonCanonicalSeedTopology;
+        for (parsed.value.catalog.ranges) |range| if (try terminals.get(range.group_id) != null) return error.NonCanonicalSeedTopology;
+        if (parsed.value.private_provisioning) |projection| for (projection.ranges) |range| {
+            if (try terminals.get(range.group_id) != null) return error.NonCanonicalSeedTopology;
+        };
+    }
 
     const replica_catalog_path = try std.fs.path.join(alloc, &.{ data_root, "catalog.txt" });
     defer alloc.free(replica_catalog_path);
@@ -227,7 +275,27 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
             .shard_id = replica.identity_shard_id,
             .range_id = replica.identity_range_id,
         });
+        var native_ha_owner = false;
+        for (native_owners) |owner| {
+            if (owner.scope.target_namespace.shard_id != replica.group_id) continue;
+            native_ha_owner = true;
+            var verified = try db_mod.DB.open(alloc, staged.path(), .{ .open_mode = .query_readonly, .primary_only_readonly = true, .identity_namespace = owner.scope.target_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+            defer verified.close();
+            var bootstrap = (try verified.readRestoreStagingBootstrap(alloc)) orelse return error.SeedReplicaIdentityMismatch;
+            defer bootstrap.deinit();
+            const actual = try bootstrap.value.encode(alloc);
+            defer alloc.free(actual);
+            const expected = try owner.encode(alloc);
+            defer alloc.free(expected);
+            if (!std.mem.eql(u8, actual, expected)) return error.SeedReplicaIdentityMismatch;
+            var progress = (try verified.restoreStagingStatus(alloc)) orelse return error.SeedReplicaIdentityMismatch;
+            defer progress.deinit();
+            if (!std.mem.eql(u8, &progress.value.scope.digest(), &owner.scope.digest())) return error.SeedReplicaIdentityMismatch;
+        }
         if (try staged.publish() != .durable) return error.LiveDBPublicationConflict;
+        // Stream authority reconstructs an owner, not Raft membership. The
+        // independent registry keeps it discoverable for replay and reseeding.
+        if (native_ha_owner) continue;
         try catalog.catalog().upsertReplica(.{
             .group_id = replica.group_id,
             .replica_id = request.target_replica_id,
@@ -411,6 +479,52 @@ pub fn validateRuntimeIdentity(
     }
 }
 
+fn verifyStandaloneMetadataTopology(alloc: Allocator, store: *@import("../../metadata/storage/raft_apply_store.zig").RaftApplyStore, topology: Topology) !void {
+    const manager = @import("../../metadata/table_manager.zig");
+    const group_id = @import("../../common/group_ids.zig").main_metadata_group_id;
+    if (try store.standaloneRevision() != topology.catalog.epoch) return error.SeedMetadataTopologyMismatch;
+    var projection = try store.captureProvisioningCatalog(alloc, group_id);
+    defer projection.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const expected_tables = if (topology.private_provisioning) |private| try std.mem.concat(scratch, topology_records.TableRecord, &.{ topology.catalog.tables, private.tables }) else topology.catalog.tables;
+    const expected_ranges = if (topology.private_provisioning) |private| try std.mem.concat(scratch, topology_records.RangeRecord, &.{ topology.catalog.ranges, private.ranges }) else topology.catalog.ranges;
+    if (projection.tables.len != expected_tables.len or projection.ranges.len != expected_ranges.len) return error.SeedMetadataTopologyMismatch;
+    var table_indices: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    var range_indices: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    for (expected_tables, 0..) |table, index| {
+        const entry = try table_indices.getOrPut(scratch, table.table_id);
+        if (entry.found_existing) return error.SeedMetadataTopologyMismatch;
+        entry.value_ptr.* = index;
+    }
+    for (projection.tables) |table| {
+        const index = table_indices.get(table.table_id) orelse return error.SeedMetadataTopologyMismatch;
+        if (!manager.tableDefinitionsEqual(table, expected_tables[index])) return error.SeedMetadataTopologyMismatch;
+    }
+    for (expected_ranges, 0..) |range, index| {
+        const entry = try range_indices.getOrPut(scratch, range.group_id);
+        if (entry.found_existing) return error.SeedMetadataTopologyMismatch;
+        entry.value_ptr.* = index;
+    }
+    for (projection.ranges) |range| {
+        const index = range_indices.get(range.group_id) orelse return error.SeedMetadataTopologyMismatch;
+        var actual = range;
+        var expected = expected_ranges[index];
+        // Seed descriptors make the released implicit identity explicit.
+        actual.doc_identity_shard_id = manager.rangeDocIdentityShardId(actual);
+        actual.doc_identity_range_id = manager.rangeDocIdentityRangeId(actual);
+        expected.doc_identity_shard_id = manager.rangeDocIdentityShardId(expected);
+        expected.doc_identity_range_id = manager.rangeDocIdentityRangeId(expected);
+        if (!manager.rangeRecordsEqual(actual, expected)) return error.SeedMetadataTopologyMismatch;
+    }
+    const expected_jobs = if (topology.private_provisioning) |private| private.jobs_json else &.{};
+    if (projection.jobs_json.len != expected_jobs.len) return error.SeedMetadataTopologyMismatch;
+    var jobs: std.StringHashMapUnmanaged(void) = .empty;
+    for (expected_jobs) |job| try jobs.put(scratch, job, {});
+    for (projection.jobs_json) |job| if (!jobs.remove(job)) return error.SeedMetadataTopologyMismatch;
+}
+
 pub fn validateTopology(
     alloc: Allocator,
     io: std.Io,
@@ -418,11 +532,42 @@ pub fn validateTopology(
     expected_generation: []const u8,
     topology: Topology,
 ) !void {
+    var proof_arena = std.heap.ArenaAllocator.init(alloc);
+    defer proof_arena.deinit();
+    const proof_alloc = proof_arena.allocator();
+    const private = topology.private_provisioning;
+    if (private) |projection| _ = try @import("../../data/private_provisioning.zig").validate(proof_alloc, topology.catalog.tables, topology.catalog.ranges, projection);
+    const placed_tables = if (private) |projection| try std.mem.concat(proof_alloc, topology_records.TableRecord, &.{ topology.catalog.tables, projection.tables }) else topology.catalog.tables;
+    const placed_ranges = if (private) |projection| try std.mem.concat(proof_alloc, topology_records.RangeRecord, &.{ topology.catalog.ranges, projection.ranges }) else topology.catalog.ranges;
+    const native_owners = try @import("restore_owner_registry.zig").expand(proof_alloc, topology.native_restore_tables, topology.native_restore_owners);
+    const native_projection = try @import("restore_owner_registry.zig").project(proof_alloc, native_owners, topology.catalog.tables, placed_tables, placed_ranges);
+    if (native_projection.owners.len != topology.native_restore_owners.len) return error.NonCanonicalSeedTopology;
+    for (topology.native_restore_owners, 0..) |owner, index| if (index != 0 and topology.native_restore_owners[index - 1].scope.target_namespace.shard_id >= owner.scope.target_namespace.shard_id) return error.NonCanonicalSeedTopology;
+    const all_tables = try std.mem.concat(proof_alloc, topology_records.TableRecord, &.{ placed_tables, native_projection.tables });
+    const all_ranges = try std.mem.concat(proof_alloc, topology_records.RangeRecord, &.{ placed_ranges, native_projection.ranges });
+    if (topology.restore_terminals) |artifact| {
+        if (!std.mem.eql(u8, artifact.path, @import("restore_terminal_ledger.zig").artifact_name) or artifact.size_bytes < 8 or artifact.size_bytes > max_file_bytes or !isCanonicalSha256(artifact.sha256)) return error.InvalidRestoreTerminal;
+        const path = try std.fs.path.join(proof_alloc, &.{ raw_root, artifact.path });
+        const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        if (stat.kind != .file or stat.size != artifact.size_bytes) return error.InvalidRestoreTerminal;
+        try expectFileSha256(io, alloc, path, artifact.sha256);
+    }
+    if (topology.standalone_metadata) |artifact| {
+        if (!std.mem.eql(u8, artifact.path, standalone_metadata_name) or artifact.size_bytes < 8 or artifact.size_bytes > max_file_bytes or !isCanonicalSha256(artifact.sha256)) return error.InvalidStandaloneMetadataCheckpoint;
+        const path = try std.fs.path.join(proof_alloc, &.{ raw_root, artifact.path });
+        const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        if (stat.kind != .file or stat.size != artifact.size_bytes) return error.InvalidStandaloneMetadataCheckpoint;
+        try expectFileSha256(io, alloc, path, artifact.sha256);
+    }
+    // Empty public placement is a complete state when the authenticated full
+    // standalone checkpoint owns it (including a first, still-hidden restore).
+    // Older catalog-only seed contracts still require populated placement.
+    const empty_standalone_catalog = topology.standalone_metadata != null and topology.catalog.tables.len == 0 and topology.catalog.ranges.len == 0;
     if (topology.format_version != topology_format_version or
         !std.mem.eql(u8, topology.generation, expected_generation) or
-        topology.catalog.epoch == 0 or topology.catalog.tables.len == 0 or
-        topology.catalog.ranges.len == 0 or
-        topology.replicas.len != topology.catalog.ranges.len) return error.InvalidSeedTopology;
+        topology.catalog.epoch == 0 or
+        (!empty_standalone_catalog and (topology.catalog.tables.len == 0 or topology.catalog.ranges.len == 0)) or
+        topology.replicas.len != all_ranges.len) return error.InvalidSeedTopology;
 
     for (topology.catalog.tables, 0..) |table, index| {
         if (table.table_id == 0 or !validation.isIdentifier(table.name)) return error.InvalidSeedTopology;
@@ -468,16 +613,16 @@ pub fn validateTopology(
 
     for (topology.replicas, 0..) |replica, index| {
         if (index > 0 and topology.replicas[index - 1].group_id >= replica.group_id) return error.NonCanonicalSeedTopology;
-        const range = findRange(topology.catalog.ranges, replica.group_id) orelse return error.SeedReplicaRangeMissing;
-        const table = findTable(topology.catalog.tables, replica.table_id) orelse return error.SeedReplicaTableMissing;
+        const range = findRange(all_ranges, replica.group_id) orelse return error.SeedReplicaRangeMissing;
+        const table = findTable(all_tables, replica.table_id) orelse return error.SeedReplicaTableMissing;
         const expected_path = try std.fmt.allocPrint(alloc, "replicas/group-{d}", .{replica.group_id});
         defer alloc.free(expected_path);
         if (replica.group_id != range.group_id or replica.table_id != range.table_id or
             !std.mem.eql(u8, replica.table_name, table.name) or
             !std.mem.eql(u8, replica.snapshot_path, expected_path) or
             replica.identity_table_id != table.table_id or
-            replica.identity_shard_id != range.doc_identity_shard_id or
-            replica.identity_range_id != range.doc_identity_range_id or
+            replica.identity_shard_id != @import("../../metadata/table_manager.zig").rangeDocIdentityShardId(range) or
+            replica.identity_range_id != @import("../../metadata/table_manager.zig").rangeDocIdentityRangeId(range) or
             !isCanonicalSha256(replica.logical_sha256)) return error.SeedReplicaIdentityMismatch;
         const store_path = try std.fs.path.join(alloc, &.{ raw_root, replica.snapshot_path, "store.bin" });
         defer alloc.free(store_path);

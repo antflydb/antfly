@@ -47,6 +47,7 @@ pub const AppendMetadataMutationOptions = struct {
 };
 
 pub const BatchMutationPayload = struct {
+    restore_staging_bootstrap: ?@import("../db/restore_staging.zig").OwnerBootstrap = null,
     schema_version: u32 = 1,
     request: db_types.BatchRequest,
 };
@@ -92,6 +93,12 @@ pub fn encodeBatchMutationRequestAlloc(
     return try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
         .request = request,
     }, .{});
+}
+
+pub fn encodeBatchMutationWithRestoreBootstrapAlloc(alloc: Allocator, request: db_types.BatchRequest, bootstrap: @import("../db/restore_staging.zig").OwnerBootstrap) ![]u8 {
+    if (request.restore_staging == null or request.restore_staging.? != .begin or !std.mem.eql(u8, &request.restore_staging.?.begin.digest(), &bootstrap.scope.digest())) return error.InvalidRestoreStagingCommand;
+    try bootstrap.validate();
+    return std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{ .request = request, .restore_staging_bootstrap = bootstrap }, .{});
 }
 
 pub fn appendBatchMutationRequest(

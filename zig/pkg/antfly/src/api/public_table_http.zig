@@ -1393,6 +1393,47 @@ pub fn handleRelationalRowsMutation(alloc: std.mem.Allocator, table_name: []cons
     return response;
 }
 
+pub fn handleRelationalConstraintRetry(alloc: std.mem.Allocator, table_name: []const u8, body: []const u8, api: TableApi) !OwnedResponse {
+    var parsed = std.json.parseFromSlice(struct { schema_version: u32 }, alloc, body, .{}) catch
+        return .{ .status = 400, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"schema_version is required\"}") };
+    defer parsed.deinit();
+    if (parsed.value.schema_version == 0) return .{ .status = 400, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"invalid schema_version\"}") };
+    return executeRelationalLifecycle(alloc, table_name, parsed.value.schema_version, api);
+}
+
+pub fn handleRelationalConstraintRetirement(alloc: std.mem.Allocator, table_name: []const u8, body: []const u8, api: TableApi) !OwnedResponse {
+    // The generated public contract owns these fields. Preserve target_schema
+    // as exact JSON here: generated optional/default normalization must not
+    // turn an omitted property into a new property in subtract-only DDL.
+    var parsed = std.json.parseFromSlice(struct { schema_version: u32, target_schema: ?std.json.Value = null, drop: bool = false }, alloc, body, .{ .allocate = .alloc_always }) catch
+        return .{ .status = 400, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"invalid retirement request\"}") };
+    defer parsed.deinit();
+    if (parsed.value.schema_version == 0 or (parsed.value.drop == (parsed.value.target_schema != null))) return .{ .status = 400, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"provide target_schema or drop=true, and schema_version\"}") };
+    const target = if (parsed.value.target_schema) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null;
+    defer if (target) |bytes| alloc.free(bytes);
+    var operation_api = api;
+    operation_api.request.relational_retirement_target = target;
+    operation_api.request.relational_retirement_drop = parsed.value.drop;
+    return executeRelationalLifecycle(alloc, table_name, parsed.value.schema_version, operation_api);
+}
+
+fn executeRelationalLifecycle(alloc: std.mem.Allocator, table_name: []const u8, schema_version: u32, api: TableApi) !OwnedResponse {
+    // Retry is idempotent per owner. A failure after partial progress can be
+    // safely retried; ordinary row writes never gain repair authority.
+    api.executeTableBatch(alloc, table_name, .{ .relational_schema_version = schema_version }) catch |err| {
+        const status: u16 = switch (err) {
+            error.NotFound => 404,
+            error.Forbidden => 403,
+            error.InvalidBatchRequest => 400,
+            error.Conflict => 409,
+            error.Canceled, error.DeadlineExceeded => return err,
+            else => 503,
+        };
+        return .{ .status = status, .json = true, .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err) }, .{}) };
+    };
+    return .{ .status = 202, .json = true, .body = try alloc.dupe(u8, "{\"status\":\"accepted\"}") };
+}
+
 fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batch_req: batch_api.OwnedBatchRequest, api: TableApi) !OwnedResponse {
     api.executeTableBatch(alloc, table_name, batch_req.req) catch |err| switch (err) {
         error.Forbidden => return .{ .status = 403, .body = try alloc.dupe(u8, "write permission required for every table affected by this mutation") },

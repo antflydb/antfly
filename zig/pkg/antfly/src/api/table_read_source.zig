@@ -32,6 +32,7 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 pub const LookupResponse = struct {
     json: []u8,
     version: u64,
+    expected_content_digest: ?[32]u8 = null,
 
     pub fn deinit(self: *LookupResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.json);
@@ -50,6 +51,7 @@ test "relational row query integrity controls preserve the empty first range rou
                 0 => try std.testing.expect(opts.relational_integrity_catalog),
                 1 => try std.testing.expectEqualStrings("{}", opts.relational_integrity_jobs_json),
                 2 => try std.testing.expectEqualStrings("{\"mode\":\"status\"}", opts.relational_activation_json),
+                3 => try std.testing.expectEqualStrings("{\"mode\":\"identity\"}", opts.relational_topology_json),
                 else => return error.TestUnexpectedResult,
             }
             self.calls += 1;
@@ -61,7 +63,8 @@ test "relational row query integrity controls preserve the empty first range rou
     _ = try source.integrityCatalog(std.testing.allocator, "rows");
     _ = try source.integrityJobs(std.testing.allocator, "rows", "", "{}");
     _ = try source.integrityActivation(std.testing.allocator, "rows", "", "{\"mode\":\"status\"}");
-    try std.testing.expectEqual(@as(usize, 3), recorder.calls);
+    _ = try source.topologyStatus(std.testing.allocator, "rows", "", "{\"mode\":\"identity\"}");
+    try std.testing.expectEqual(@as(usize, 4), recorder.calls);
 }
 
 test "table read source distinguishes unavailable physical capability observation" {
@@ -216,6 +219,10 @@ pub const TableReadSource = struct {
     pub fn integrityActivation(self: TableReadSource, alloc: std.mem.Allocator, table_name: []const u8, range_key: []const u8, request_json: []const u8) !?LookupResponse {
         if (request_json.len == 0 or request_json.len > 4096) return error.InvalidArgument;
         return self.lookup(alloc, table_name, range_key, .{ .relational_activation_json = request_json }, .read_index);
+    }
+
+    pub fn topologyStatus(self: TableReadSource, alloc: std.mem.Allocator, table_name: []const u8, range_key: []const u8, request_json: []const u8) !?LookupResponse {
+        return self.lookup(alloc, table_name, range_key, .{ .relational_topology_json = request_json }, .read_index);
     }
 
     ptr: *anyopaque,

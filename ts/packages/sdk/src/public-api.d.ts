@@ -929,6 +929,86 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/constraints/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair version-conditional rows after failed constraint activation
+         * @description Requires table administrator permission. Each affected target range must
+         *     have failed UNIQUE/FK activation. Replacement values still satisfy all
+         *     constraints, and referential actions require write permission on every
+         *     affected table. Existing dependencies remain protected. Repairs do not
+         *     mark historical coverage valid; invoke constraint retry after repairs.
+         */
+        post: operations["repairRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/constraints/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restart failed UNIQUE/FK validation after administrative repair
+         * @description Requires table administrator permission. Resets each failed owner using
+         *     an exact checkpoint precondition. Owners already validating or enforced
+         *     are unchanged. Retrying after partial progress is safe. Inspect the
+         *     constraint status endpoint for coverage and diagnostics.
+         *     When a retirement job is active, clears its paused diagnostic and
+         *     resumes that job instead of restarting activation. Retirement remains
+         *     fenced and retains all prior drain progress.
+         */
+        post: operations["retryRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/constraints/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retire unique and foreign-key definitions safely
+         * @description Requires table administrator permission. Starts a durable, bounded
+         *     all-owner drain. Poll constraints/status for progress. A target schema
+         *     is published automatically after the drain. With drop=true the table
+         *     remains fenced at ready_to_drop until an administrator explicitly
+         *     deletes it with the existing table deletion endpoint.
+         */
+        post: operations["retireRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/rows/query": {
         parameters: {
             query?: never;
@@ -6067,6 +6147,45 @@ export interface components {
             owner: string;
             failure?: string;
         };
+        RelationalConstraintRetryRequest: {
+            schema_version: number;
+        };
+        RelationalConstraintRetryResponse: {
+            /** @enum {string} */
+            status: "accepted";
+        };
+        /**
+         * @description Supply exactly one of target_schema or drop=true. A target schema may
+         *     only remove UNIQUE/FK definitions; all other schema properties must
+         *     remain unchanged. Its version is assigned by the server. Retirement
+         *     fences primary mutations while existing reference and claim records
+         *     are drained. External foreign keys referencing removed definitions
+         *     must be retired first.
+         */
+        RelationalConstraintRetirementRequest: {
+            schema_version: number;
+            target_schema?: components["schemas"]["TableSchema"];
+            /**
+             * @description Prepare for explicit table deletion; this operation does not delete the table.
+             * @default false
+             */
+            drop?: boolean;
+        };
+        RelationalConstraintRetirementStatus: {
+            /** @description Opaque retirement job identity. */
+            id: string;
+            /** @enum {string} */
+            phase: "fencing" | "foreign_keys" | "unique" | "publishing" | "published" | "ready_to_drop";
+            drop: boolean;
+            /** Format: uint32 */
+            target_schema_version: number;
+            /**
+             * @description Durable diagnostic that pauses the job. Retry resumes the exact
+             *     checkpoint after the cause is addressed; it does not undo a partial
+             *     drain or permit primary mutations while retirement is active.
+             */
+            failure?: string;
+        };
         RelationalConstraintStatus: {
             /** Format: uint32 */
             schema_version: number;
@@ -6077,6 +6196,7 @@ export interface components {
             coverage_kind: "unique_and_foreign_key";
             state: components["schemas"]["RelationalConstraintValidationState"];
             ranges: components["schemas"]["RelationalConstraintRangeStatus"][];
+            retirement?: components["schemas"]["RelationalConstraintRetirementStatus"];
         };
         /** @description Structured details for an aborted transaction attempt. */
         TransactionConflict: {
@@ -6289,6 +6409,14 @@ export interface components {
              */
             connection: string;
         };
+        /**
+         * @description Native cluster backups pin a common transaction cut across a dependency-complete
+         *     table set. Restart-stable LSM seals are journaled before releasing write fences;
+         *     artifact upload uses those immutable seals without holding the write pause.
+         *     Native cohorts support at most 4096 tables and 4096 ranges and require the
+         *     filesystem-managed LSM backend. Portable backups do not support coordinated
+         *     UNIQUE/FK constraints or promise a common cross-table transaction cut.
+         */
         ClusterBackupRequest: {
             /**
              * @description Unique identifier for this backup. Used to reference the backup for restore operations.
@@ -6379,6 +6507,17 @@ export interface components {
             /** @description Opaque artifact generation retained by an ambiguous cluster attempt. */
             artifact_backup_id?: string;
         };
+        /**
+         * @description Native cohort restores use the existing asynchronous restore job to provision
+         *     hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+         *     and publish the dependency-complete target set atomically. Document, relational,
+         *     and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+         *     Skipping a live parent cannot substitute it for a parent generation required by
+         *     a restored child. Overwrite retains the old generation until validation and
+         *     cutover; cancellation after publication completes publication rather than rollback.
+         *     Reserved destination authorization is immutable: changing principal requires
+         *     canceling the old job and creating a new restore.
+         */
         ClusterRestoreRequest: {
             /**
              * @description Unique identifier of the backup to restore from.
@@ -17405,6 +17544,162 @@ export interface operations {
                 content?: never;
             };
             /** @description One or more current owners could not report authoritative coverage. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    repairRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Repair transaction committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Commit is durable; visibility or participant recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator or affected-table write permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Activation, schema, row version, or constraint changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retryRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Failed owner checkpoints reset; background validation is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema or activation state changed; refresh and retry. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Some owners could not be reset; repeating the request is safe. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retireRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetirementRequest"];
+            };
+        };
+        responses: {
+            /** @description Retirement accepted; no data or schema publication is implied yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema, retirement state, topology, or incoming foreign-key dependency changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Retirement coordination is temporarily unavailable. */
             503: {
                 headers: {
                     [name: string]: unknown;

@@ -37,6 +37,7 @@ pub const Mutation = struct {
     key: []const u8,
     before: ?codec.OrdinalRowView = null,
     after: ?codec.OrdinalRowView = null,
+    repair: bool = false,
 };
 
 pub const RoutedCommand = struct { table_name: []const u8, command: storage.Command };
@@ -129,21 +130,21 @@ pub const Plan = struct {
             for (self.uniques) |unique| {
                 const before = try encode(owned, unique.tuple, mutation.before, !unique.definition.nulls_not_distinct, false);
                 const after = try encode(owned, unique.tuple, mutation.after, !unique.definition.nulls_not_distinct, false);
-                if (sameTuple(before, after)) {
+                if (sameTuple(before, after) and !mutation.repair) {
                     if (after) |tuple| try commands.append(owned, .{ .table_name = table_name, .command = .{
                         .address = try storage.Address.init(unique.generation, tuple),
                         .operation = .{ .check_owner = .{ .parent_table = table_name, .parent_key = key } },
                     } });
                     continue;
                 }
-                if (before) |tuple| try parents.append(owned, .{ .table_name = table_name, .parent_key = key, .address = try storage.Address.init(unique.generation, tuple), .target_tuple = after });
+                if (!sameTuple(before, after)) if (before) |tuple| try parents.append(owned, .{ .table_name = table_name, .parent_key = key, .address = try storage.Address.init(unique.generation, tuple), .target_tuple = after });
                 if (after) |tuple| try commands.append(owned, .{ .table_name = table_name, .command = .{
                     .address = try storage.Address.init(unique.generation, tuple),
                     .operation = .{ .establish = .{ .tuple = tuple, .parent_table = table_name, .parent_key = key, .schema_version = self.view.version() } },
                 } });
             }
             for (self.foreign) |foreign| {
-                const before = try encode(owned, foreign.tuple, mutation.before, true, foreign.definition.match == .full);
+                const before = try encode(owned, foreign.tuple, mutation.before, true, foreign.definition.match == .full and !mutation.repair);
                 const after = try encode(owned, foreign.tuple, mutation.after, true, foreign.definition.match == .full);
                 const reference: storage.Reference = .{
                     .child_table = table_name,
@@ -152,7 +153,7 @@ pub const Plan = struct {
                     .constraint_generation = foreign.generation,
                 };
                 const parent_table = try owned.dupe(u8, foreign.definition.parent_table);
-                if (!sameTuple(before, after)) if (before) |tuple| try commands.append(owned, .{ .table_name = parent_table, .command = .{ .address = try storage.Address.init(foreign.parent_generation, tuple), .operation = .{ .detach = reference } } });
+                if (!sameTuple(before, after)) if (before) |tuple| try commands.append(owned, .{ .table_name = parent_table, .command = .{ .address = try storage.Address.init(foreign.parent_generation, tuple), .operation = if (mutation.repair) .{ .repair_detach = reference } else .{ .detach = reference } } });
                 if (after) |tuple| try commands.append(owned, .{ .table_name = parent_table, .command = .{ .address = try storage.Address.init(foreign.parent_generation, tuple), .operation = .{ .attach = reference } } });
             }
             if (commands.items.len + parents.items.len > storage.max_commands) return error.TransactionTooLarge;

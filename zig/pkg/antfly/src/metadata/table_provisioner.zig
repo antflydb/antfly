@@ -285,6 +285,9 @@ pub fn reconcileDbIndexes(
 }
 
 pub const ReconcileDbIndexOptions = struct {
+    /// Hidden restore owners admit physical projections while empty. External
+    /// enrichment/resolution producers remain disabled until publication.
+    restore_build_only: bool = false,
     drain_resolver_backfill: bool = true,
     embedding_options: managed_embedder.InitOptions = .{},
     source_table: []const u8 = "",
@@ -301,6 +304,13 @@ pub fn reconcileDbIndexesWithOptions(
     indexes_json: []const u8,
     options: ReconcileDbIndexOptions,
 ) !ProvisionSummary {
+    if (options.restore_build_only) {
+        if (!dbIndexReconciliationCanMutate(db)) return error.ReadOnly;
+        const removed = try removeMissingIndexes(alloc, db, indexes_json);
+        const indexes = try ensureIndexes(alloc, db, indexes_json);
+        try db.syncIndexes(true);
+        return .{ .indexes_added = indexes.added, .indexes_removed = removed + indexes.removed, .indexes_pending = indexes.pending };
+    }
     var desired_enrichments = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
     defer {
         for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);

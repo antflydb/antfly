@@ -253,6 +253,23 @@ pub const MetadataHttpClient = struct {
         return try self.getJsonWithBudget(metadata_api.AdminSnapshot, base_uri, routes.Routes.admin_snapshot, budget);
     }
 
+    pub fn fetchProvisioningSnapshot(self: *MetadataHttpClient, base_uri: []const u8, node_id: u64, budget: ?RequestBudget) !std.json.Parsed(@import("restore_staging.zig").ProvisioningSnapshot) {
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_provisioning_snapshot);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, @import("restore_staging.zig").ProvisioningRequest{ .node_id = node_id }, .{});
+        defer self.alloc.free(body);
+        var resp = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = linearizable_snapshot_request_timeout_ms }, budget);
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405 or resp.status == 501) return error.UnsupportedOperation;
+        try mapStatus(resp.status, null, null, null);
+        if (resp.body.len > 64 * 1024 * 1024) return error.InvalidRestoreStaging;
+        var result = try parseJson(@import("restore_staging.zig").ProvisioningSnapshot, self.alloc, resp.body);
+        errdefer result.deinit();
+        if (result.value.node_id != node_id) return error.InvalidRestoreStaging;
+        try ensureRequestBudget(budget);
+        return result;
+    }
+
     pub fn fetchRoutingSnapshotWithBudget(
         self: *MetadataHttpClient,
         base_uri: []const u8,

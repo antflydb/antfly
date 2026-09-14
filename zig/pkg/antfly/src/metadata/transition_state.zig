@@ -59,7 +59,10 @@ pub const TransitionTableContract = struct {
     table_id: u64 = 0,
     table_name: []const u8 = "",
     schema_json: []const u8 = "",
+    read_schema_json: []const u8 = "",
     indexes_json: []const u8 = "",
+    /// Set only by capability-checked distributed metadata admission.
+    integrity_protocol: enum(u8) { none, distributed_quiescent_v1 } = .none,
     source_identity: TransitionIdentity = .{},
     target_identity: TransitionIdentity = .{},
 
@@ -98,6 +101,8 @@ pub const TransitionTableContract = struct {
             self.target_identity.eql(other.target_identity) and
             std.mem.eql(u8, self.table_name, other.table_name) and
             std.mem.eql(u8, self.schema_json, other.schema_json) and
+            std.mem.eql(u8, self.read_schema_json, other.read_schema_json) and
+            self.integrity_protocol == other.integrity_protocol and
             std.mem.eql(u8, self.indexes_json, other.indexes_json);
     }
 
@@ -107,10 +112,14 @@ pub const TransitionTableContract = struct {
         const schema_json = try alloc.dupe(u8, self.schema_json);
         errdefer alloc.free(schema_json);
         const indexes_json = try alloc.dupe(u8, self.indexes_json);
+        errdefer alloc.free(indexes_json);
+        const read_schema_json = try alloc.dupe(u8, self.read_schema_json);
         return .{
             .table_id = self.table_id,
             .table_name = table_name,
             .schema_json = schema_json,
+            .read_schema_json = read_schema_json,
+            .integrity_protocol = self.integrity_protocol,
             .indexes_json = indexes_json,
             .source_identity = self.source_identity,
             .target_identity = self.target_identity,
@@ -120,6 +129,7 @@ pub const TransitionTableContract = struct {
     pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         alloc.free(self.schema_json);
+        alloc.free(self.read_schema_json);
         alloc.free(self.indexes_json);
         self.* = undefined;
     }

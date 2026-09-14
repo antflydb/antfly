@@ -28,6 +28,7 @@ const table_writes = @import("table_writes.zig");
 const contract = @import("distributed_txn_contract.zig");
 const integrity_wire = @import("relational_integrity_wire.zig");
 const integrity_activation = @import("../storage/db/relational_integrity_activation.zig");
+const integrity_retirement = @import("../storage/db/relational_integrity_retirement.zig");
 
 pub const table_participant_prefix = "table:";
 const table_participant_v2_prefix = "table2:";
@@ -39,6 +40,7 @@ pub const TxnBeginRequest = struct {
     topology_epoch: u64 = 0,
     retain_terminal: bool = false,
     participants: []const []const u8,
+    restore_staging_scope: ?[32]u8 = null,
 };
 
 pub const TxnPrepareRequest = struct {
@@ -48,6 +50,7 @@ pub const TxnPrepareRequest = struct {
     /// Internal parser ownership only; never serialized as a request field.
     integrity_commands_owner: ?std.json.Parsed([]const integrity_wire.Command) = null,
     relational_activation_owner: ?std.json.Parsed(integrity_activation.Command) = null,
+    relational_retirement_owner: ?std.json.Parsed(integrity_retirement.Command) = null,
 };
 
 pub const TxnResolveRequest = struct {
@@ -315,10 +318,11 @@ pub const HostedParticipantWorker = struct {
         };
         switch (route) {
             .local => {
-                const context = self.localPreDecisionContext(deadline_ns) catch |err| {
+                var context = self.localPreDecisionContext(deadline_ns) catch |err| {
                     if (err == error.Timeout) return error.PreDecisionNotProposed;
                     return err;
                 };
+                context.restore_staging_scope = req.restore_staging_scope;
                 const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
                     if (!isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_begin_group_local_with_pre_decision_context != null)) return err;
                     return try self.beginGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
@@ -459,10 +463,11 @@ pub const HostedParticipantWorker = struct {
         };
         if (node_id == self.router.localNodeId()) {
             if (self.router.localStatus(group_id) != .active) return false;
-            const context = self.localPreDecisionContext(deadline_ns) catch |err| {
+            var context = self.localPreDecisionContext(deadline_ns) catch |err| {
                 if (err == error.Timeout) return false;
                 return err;
             };
+            context.restore_staging_scope = req.restore_staging_scope;
             const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
                 if (isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_begin_group_local_with_pre_decision_context != null)) return false;
                 return err;
@@ -882,7 +887,7 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants)) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, .{ .restore_staging_scope = req.restore_staging_scope })) orelse return error.UnknownGroup;
     }
 
     fn prepareGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
@@ -1754,8 +1759,11 @@ pub fn executeCrossGroup(
         .integrity = req.integrity,
         .integrity_commands = req.integrity_commands,
         .relational_activation = req.relational_activation,
+        .relational_retirement = req.relational_retirement,
         .relational_schema_version = req.relational_schema_version,
         .relational_integrity_generation_set = req.relational_integrity_generation_set,
+        .restore_staging_scope = req.restore_staging_scope,
+        .relational_repair = req.relational_repair,
     }};
     const outcome = try executeMultiTableCommit(
         alloc,
@@ -1873,6 +1881,12 @@ fn executeMultiTableCommitOnce(
             if (participant.relational_activation != null) return error.InvalidTxnRequest;
             participant.relational_activation = command;
         }
+        if (table.relational_retirement) |command| {
+            const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            if (participant.relational_retirement != null) return error.InvalidTxnRequest;
+            participant.relational_retirement = command;
+        }
         for (participants.items) |*participant| {
             if (!std.mem.eql(u8, participant.table_name, table.table_name)) continue;
             if (participant.relational_schema_version) |existing| {
@@ -1884,6 +1898,12 @@ fn executeMultiTableCommitOnce(
                 const requested = table.relational_integrity_generation_set orelse return error.PreparedGenerationChanged;
                 if (!std.mem.eql(u8, &existing, &requested)) return error.PreparedGenerationChanged;
             } else participant.relational_integrity_generation_set = table.relational_integrity_generation_set;
+            participant.relational_repair = table.relational_repair;
+            const routed_restore_scope = (try catalog.restoreScopeForGroup(participant.table_name, participant.group_id)) orelse table.restore_staging_scope;
+            if (participant.restore_staging_scope) |existing| {
+                const requested = routed_restore_scope orelse return error.RestoreStagingChanged;
+                if (!std.mem.eql(u8, &existing, &requested)) return error.RestoreStagingChanged;
+            } else participant.restore_staging_scope = routed_restore_scope;
         }
     }
 
@@ -1934,6 +1954,7 @@ fn executeMultiTableCommitOnce(
             .topology_epoch = participant.topology_epoch,
             .retain_terminal = options.retain_terminal,
             .participants = participant_ids,
+            .restore_staging_scope = participant.restore_staging_scope,
         }) catch |err| switch (err) {
             error.UnknownGroup, error.PreDecisionNotProposed => {
                 abort_on_error = false;
@@ -2404,6 +2425,8 @@ const ParticipantTxn = struct {
     topology_epoch: u64,
     relational_schema_version: ?u32 = null,
     relational_integrity_generation_set: ?[32]u8 = null,
+    restore_staging_scope: ?[32]u8 = null,
+    relational_repair: bool = false,
     writes: std.ArrayListUnmanaged(db_mod.types.TransactionWrite) = .empty,
     deletes: std.ArrayListUnmanaged([]const u8) = .empty,
     transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
@@ -2411,6 +2434,7 @@ const ParticipantTxn = struct {
     integrity: std.ArrayListUnmanaged(db_mod.types.TransactionIntegrityOperation) = .empty,
     integrity_commands: std.ArrayListUnmanaged(integrity_wire.Command) = .empty,
     relational_activation: ?integrity_activation.Command = null,
+    relational_retirement: ?integrity_retirement.Command = null,
 
     fn deinit(self: *ParticipantTxn, alloc: std.mem.Allocator) void {
         self.writes.deinit(alloc);
@@ -2441,6 +2465,7 @@ const BeginFanoutTask = struct {
             .topology_epoch = participant.topology_epoch,
             .retain_terminal = retain_terminal,
             .participants = participant_ids,
+            .restore_staging_scope = participant.restore_staging_scope,
         }) catch |err| {
             slot.err = err;
             slot.may_have_transaction_state = !beginDefinitelyCreatedNoState(err);
@@ -2523,8 +2548,11 @@ const PrepareFanoutTask = struct {
                 .integrity = participant.integrity.items,
                 .integrity_commands = participant.integrity_commands.items,
                 .relational_activation = participant.relational_activation,
+                .relational_retirement = participant.relational_retirement,
                 .relational_schema_version = participant.relational_schema_version,
                 .relational_integrity_generation_set = participant.relational_integrity_generation_set,
+                .restore_staging_scope = participant.restore_staging_scope,
+                .relational_repair = participant.relational_repair,
             },
         }) catch |err| {
             slot.err = err;
@@ -3078,7 +3106,14 @@ pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
-    try out.appendSlice(alloc, "]}");
+    try out.appendSlice(alloc, "]");
+    if (req.restore_staging_scope) |scope| {
+        try out.appendSlice(alloc, ",\"restore_staging_scope\":");
+        const encoded = try integrity_wire.encodeGenerationSet(alloc, scope);
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    try out.appendSlice(alloc, "}");
     return try out.toOwnedSlice(alloc);
 }
 
@@ -3140,11 +3175,13 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
     try out.appendSlice(alloc, "],\"predicates\":[");
     for (req.req.predicates, 0..) |predicate, i| {
         if (i > 0) try out.append(alloc, ',');
-        const encoded = try std.fmt.allocPrint(
-            alloc,
-            "{{\"key\":{f},\"expected_version\":{d}}}",
-            .{ std.json.fmt(predicate.key, .{}), predicate.expected_version },
-        );
+        var digest_hex: [64]u8 = undefined;
+        if (predicate.expected_content_digest) |digest| digest_hex = std.fmt.bytesToHex(digest, .lower);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{
+            .key = predicate.key,
+            .expected_version = predicate.expected_version,
+            .expected_content_digest = if (predicate.expected_content_digest != null) @as(?[]const u8, &digest_hex) else null,
+        }, .{ .emit_null_optional_fields = false });
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
@@ -3158,10 +3195,23 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         try out.appendSlice(alloc, ",\"relational_activation\":");
         try out.appendSlice(alloc, encoded);
     }
+    if (req.req.relational_retirement) |retirement| {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, retirement, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, ",\"relational_retirement\":");
+        try out.appendSlice(alloc, encoded);
+    }
     if (req.req.relational_schema_version) |version| {
         const field = try std.fmt.allocPrint(alloc, ",\"relational_schema_version\":{d}", .{version});
         defer alloc.free(field);
         try out.appendSlice(alloc, field);
+    }
+    if (req.req.relational_repair) try out.appendSlice(alloc, ",\"relational_repair\":true");
+    if (req.req.restore_staging_scope) |scope| {
+        try out.appendSlice(alloc, ",\"restore_staging_scope\":");
+        const encoded = try integrity_wire.encodeGenerationSet(alloc, scope);
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
     }
     if (req.req.relational_integrity_generation_set) |generation_set| {
         try out.appendSlice(alloc, ",\"relational_integrity_generation_set\":");
@@ -3240,6 +3290,7 @@ pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBegi
     return .{
         .txn_id = txn_id,
         .begin_timestamp = begin_timestamp,
+        .restore_staging_scope = if (obj.get("restore_staging_scope")) |value| try integrity_wire.parseGenerationSet(value) else null,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .retain_terminal = if (obj.get("retain_terminal")) |value| switch (value) {
             .bool => |flag| flag,
@@ -3277,12 +3328,19 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     errdefer if (integrity_commands_owner) |*owner| owner.deinit();
     var relational_activation_owner = if (obj.get("relational_activation")) |value| try std.json.parseFromValue(integrity_activation.Command, alloc, value, .{ .allocate = .alloc_always }) else null;
     errdefer if (relational_activation_owner) |*owner| owner.deinit();
+    var relational_retirement_owner = if (obj.get("relational_retirement")) |value| try std.json.parseFromValue(integrity_retirement.Command, alloc, value, .{ .allocate = .alloc_always }) else null;
+    errdefer if (relational_retirement_owner) |*owner| owner.deinit();
     const relational_schema_version: ?u32 = if (obj.get("relational_schema_version")) |_| blk: {
         const version = try optionalU64(obj, "relational_schema_version");
         if (version == 0 or version > std.math.maxInt(u32)) return error.InvalidTxnRequest;
         break :blk @intCast(version);
     } else null;
     const generation_set: ?[32]u8 = if (obj.get("relational_integrity_generation_set")) |value| try integrity_wire.parseGenerationSet(value) else null;
+    const restore_staging_scope: ?[32]u8 = if (obj.get("restore_staging_scope")) |value| try integrity_wire.parseGenerationSet(value) else null;
+    const relational_repair = if (obj.get("relational_repair")) |value| switch (value) {
+        .bool => |flag| flag,
+        else => return error.InvalidTxnRequest,
+    } else false;
     return .{
         .txn_id = txn_id,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
@@ -3294,11 +3352,15 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
             .integrity = integrity,
             .integrity_commands = if (integrity_commands_owner) |owner| owner.value else &.{},
             .relational_activation = if (relational_activation_owner) |owner| owner.value else null,
+            .relational_retirement = if (relational_retirement_owner) |owner| owner.value else null,
             .relational_schema_version = relational_schema_version,
             .relational_integrity_generation_set = generation_set,
+            .restore_staging_scope = restore_staging_scope,
+            .relational_repair = relational_repair,
         },
         .integrity_commands_owner = integrity_commands_owner,
         .relational_activation_owner = relational_activation_owner,
+        .relational_retirement_owner = relational_retirement_owner,
     };
 }
 
@@ -3310,6 +3372,7 @@ pub fn freeTxnPrepareRequest(alloc: std.mem.Allocator, req: *TxnPrepareRequest) 
     integrity_wire.free(alloc, req.req.integrity);
     if (req.integrity_commands_owner) |*owner| owner.deinit();
     if (req.relational_activation_owner) |*owner| owner.deinit();
+    if (req.relational_retirement_owner) |*owner| owner.deinit();
     req.* = undefined;
 }
 
@@ -3321,7 +3384,9 @@ test "distributed txn prepare roundtrips activation checkpoint and schema fence"
         .req = .{
             .relational_schema_version = 7,
             .relational_integrity_generation_set = [_]u8{9} ** 32,
+            .relational_repair = true,
             .relational_activation = .{ .routing_key = "\xff\x00", .expected = "\xfe\x00", .next = "\xfd\x00", .retry = true },
+            .relational_retirement = .{ .routing_key = "\xff\x00", .expected = "\xfe\x00", .next = "\xfd\x00" },
         },
     };
     const bytes = try encodeTxnPrepareRequest(alloc, request);
@@ -3330,7 +3395,9 @@ test "distributed txn prepare roundtrips activation checkpoint and schema fence"
     defer freeTxnPrepareRequest(alloc, &parsed);
     try std.testing.expectEqual(request.req.relational_schema_version, parsed.req.relational_schema_version);
     try std.testing.expectEqual(request.req.relational_integrity_generation_set, parsed.req.relational_integrity_generation_set);
+    try std.testing.expect(parsed.req.relational_repair);
     try std.testing.expectEqualDeep(request.req.relational_activation, parsed.req.relational_activation);
+    try std.testing.expectEqualDeep(request.req.relational_retirement, parsed.req.relational_retirement);
 }
 
 pub fn parseTxnResolveRequest(alloc: std.mem.Allocator, body: []const u8) !TxnResolveRequest {
@@ -3573,9 +3640,17 @@ fn parseTxnPredicates(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
             else => return error.InvalidTxnRequest,
         };
         const expected_version = try requireU64(obj, "expected_version");
+        var content_digest: ?[32]u8 = null;
+        if (obj.get("expected_content_digest")) |encoded| {
+            if (encoded != .string or encoded.string.len != 64 or expected_version == 0) return error.InvalidTxnRequest;
+            var digest: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&digest, encoded.string) catch return error.InvalidTxnRequest;
+            content_digest = digest;
+        }
         out[i] = .{
             .key = try alloc.dupe(u8, requireString(obj, "key")),
             .expected_version = expected_version,
+            .expected_content_digest = content_digest,
         };
         initialized += 1;
     }
@@ -3762,6 +3837,24 @@ test "transaction request parsers reject invalid unsigned integers and accept le
     );
     try std.testing.expectEqual(std.math.maxInt(u64), max_resolve.commit_version);
     try std.testing.expectEqual(std.math.maxInt(u64), max_resolve.topology_epoch);
+}
+
+test "distributed txn prepare preserves exact content observations" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeTxnPrepareRequest(alloc, .{
+        .txn_id = @splat(1),
+        .req = .{ .predicates = &.{.{ .key = "row", .expected_version = std.math.maxInt(u64), .expected_content_digest = @splat(11) }} },
+    });
+    defer alloc.free(encoded);
+    var decoded = try parseTxnPrepareRequest(alloc, encoded);
+    defer freeTxnPrepareRequest(alloc, &decoded);
+    try std.testing.expectEqual(std.math.maxInt(u64), decoded.req.predicates[0].expected_version);
+    try std.testing.expectEqual([_]u8{11} ** 32, decoded.req.predicates[0].expected_content_digest.?);
+    for ([_][]const u8{ "null", "[]", "[256]", "\"not-a-digest\"" }) |digest| {
+        const malformed = try std.fmt.allocPrint(alloc, "{{\"txn_id\":\"01010101010101010101010101010101\",\"writes\":[],\"deletes\":[],\"transforms\":[],\"predicates\":[{{\"key\":\"row\",\"expected_version\":1,\"expected_content_digest\":{s}}}]}}", .{digest});
+        defer alloc.free(malformed);
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc, malformed));
+    }
 }
 
 fn parseU64(value: std.json.Value) !u64 {
@@ -4042,7 +4135,7 @@ fn participantConflict(participant: ParticipantTxn, cause: anyerror) CommitConfl
         error.ForeignKeyReferenced => .foreign_key_referenced,
         else => null,
     };
-    if (reason != null or participant.integrity.items.len != 0 or participant.integrity_commands.items.len != 0 or participant.relational_activation != null) return .{
+    if (reason != null or participant.integrity.items.len != 0 or participant.integrity_commands.items.len != 0 or participant.relational_activation != null or participant.relational_retirement != null) return .{
         .table_name = participant.table_name,
         .key = "",
         .message = if (reason) |value| switch (value) {

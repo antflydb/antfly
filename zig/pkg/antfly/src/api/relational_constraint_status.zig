@@ -38,6 +38,23 @@ pub fn collect(alloc: std.mem.Allocator, source: anytype, reader: reads.TableRea
     const temporary = arena.allocator();
     const has_constraints = (if (parsed.unique_constraints) |list| list.value.len else 0) != 0 or (if (parsed.foreign_keys) |list| list.value.len else 0) != 0;
     var result = wire.RelationalConstraintStatus{ .schema_version = parsed.version, .coverage_kind = "unique_and_foreign_key", .state = .enforced, .ranges = &.{} };
+    if (table.relational_retirement_json.len != 0) {
+        var job = try @import("../metadata/relational_retirement.zig").parse(temporary, table.relational_retirement_json);
+        defer job.deinit();
+        result.retirement = .{
+            .id = try temporary.dupe(u8, &std.fmt.bytesToHex(job.value.id, .lower)),
+            .phase = switch (job.value.phase) {
+                .fencing => "fencing",
+                .foreign_keys => "foreign_keys",
+                .unique => "unique",
+                .ready => if (job.value.drop) "ready_to_drop" else "publishing",
+                .published => "published",
+            },
+            .drop = job.value.drop,
+            .target_schema_version = try tables.schemaVersion(job.value.target_schema_json),
+            .failure = if (job.value.failure.len > 0) try temporary.dupe(u8, job.value.failure) else null,
+        };
+    }
     if (!has_constraints) return std.json.Stringify.valueAlloc(alloc, result, .{});
     var opts: types.LookupOptions = .{ .relational_integrity_catalog = true, .execution_deadline_ns = request.deadline_ns, .execution_io = request.deadline_io, .cancellation = request.cancellation };
     var envelope = (try reader.lookup(temporary, name, "", opts, .read_index)) orelse return error.ConstraintActivationPending;
@@ -116,7 +133,7 @@ pub fn collect(alloc: std.mem.Allocator, source: anytype, reader: reads.TableRea
     for (current.ranges) |owner| if (owner.table_id == table.table_id) {
         found += 1;
         const matches = for (owners.items) |prior| {
-            if (prior.group_id == owner.group_id and std.mem.eql(u8, prior.start_key, owner.start_key) and std.mem.eql(u8, prior.end_key orelse "", owner.end_key orelse "")) break true;
+            if (metadata.rangeRecordsEqual(prior.*, owner)) break true;
         } else false;
         if (!matches) return error.TopologyChanged;
     };
@@ -131,14 +148,20 @@ test "relational declarations status requires complete matching owner coverage" 
         update: *catalog_mod.Update,
         stale: bool = false,
         calls: usize = 0,
+        changed_identity: bool = false,
+        snapshots: usize = 0,
         const schema_json =
             \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
         ;
-        pub fn adminSnapshot(_: *@This()) !?@import("../metadata/api.zig").AdminSnapshot {
+        pub fn adminSnapshot(self: *@This()) !?@import("../metadata/api.zig").AdminSnapshot {
+            self.snapshots += 1;
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast(&[_]metadata.TableRecord{.{ .table_id = 7, .name = "rows", .schema_json = schema_json }}),
-                .ranges = @constCast(&[_]metadata.RangeRecord{
+                .ranges = if (self.changed_identity and self.snapshots > 1) @constCast(&[_]metadata.RangeRecord{
+                    .{ .table_id = 7, .group_id = 11, .range_id = 999, .start_key = "", .end_key = "\x00" },
+                    .{ .table_id = 7, .group_id = 12, .start_key = "\x00", .end_key = null },
+                }) else @constCast(&[_]metadata.RangeRecord{
                     .{ .table_id = 7, .group_id = 11, .start_key = "", .end_key = "\x00" },
                     .{ .table_id = 7, .group_id = 12, .start_key = "\x00", .end_key = null },
                 }),
@@ -190,4 +213,8 @@ test "relational declarations status requires complete matching owner coverage" 
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     fixture.stale = true;
     try std.testing.expectError(error.PreparedGenerationChanged, collect(alloc, &fixture, reader, "rows", .{}));
+    fixture.stale = false;
+    fixture.changed_identity = true;
+    fixture.snapshots = 0;
+    try std.testing.expectError(error.TopologyChanged, collect(alloc, &fixture, reader, "rows", .{}));
 }

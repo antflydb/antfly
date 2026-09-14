@@ -62,6 +62,10 @@ pub const AdmissionReservation = struct {
 };
 
 pub const RequestContext = struct {
+    /// Set only by the administrator-authorized relational recovery routes.
+    relational_recovery: enum { none, repair, retry, retire } = .none,
+    relational_retirement_target: ?[]const u8 = null,
+    relational_retirement_drop: bool = false,
     cancellation: CancellationToken = .none,
     /// Absolute monotonic deadline. This deliberately does not use a wall
     /// clock or a transport timeout duration.

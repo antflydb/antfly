@@ -65,7 +65,7 @@ fn parseReverseKey(key: []const u8) !ReverseKey {
 }
 
 fn checksum(key: []const u8, body: []const u8) u32 {
-    var crc = std.hash.crc.Crc32Iscsi.init();
+    var crc = @import("antfly_hash").Crc32c.init();
     crc.update(key);
     crc.update(body);
     return crc.final();

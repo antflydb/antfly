@@ -251,6 +251,7 @@ pub const MetadataServer = struct {
             owned_public_write_source = public_write_source;
 
             var api_server_cfg = cfg.api_server_cfg;
+            api_server_cfg.restore_validation = .{ .status = public_api_http_server.StatusSource.fromMetadataHttpService(svc), .reader = public_read_source, .writer = public_write_source };
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
             api_server_cfg.raft_quarantine_admin = .{

@@ -1505,11 +1505,13 @@ fn nextPrimaryRawKeyAlloc(
                 return null;
             }
         }
-        if (!internal_keys.isPrimaryDocumentKey(kv.key)) {
+        if (!internal_keys.isPrimaryDocumentKey(kv.key) and
+            !(group_id == null and internal_keys.isRelationalRowKey(kv.key)))
+        {
             entry.* = try cursor.next();
             continue;
         }
-        const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse {
+        const logical_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, kv.key)) orelse {
             entry.* = try cursor.next();
             continue;
         };
@@ -1828,6 +1830,16 @@ pub fn reconcileAuthoritativeGroupDocumentsPaged(
 
     var source_txn = try source.beginReadTxn();
     defer source_txn.abort();
+    // The Raft projection stores API values, never schema-bound AROW bytes.
+    // Cache one immutable layout for this streaming snapshot; this is bounded
+    // by one schema rather than the number of rows or historical epochs.
+    var layout_arena = std.heap.ArenaAllocator.init(alloc);
+    defer layout_arena.deinit();
+    const storage_schema = @import("../../storage/schema.zig");
+    const row_codec = @import("../../storage/db/algebraic/relational_row_codec.zig");
+    const relational_store = @import("../../storage/db/relational_store.zig");
+    var schema: ?storage_schema.TableSchema = null;
+    var layout: ?row_codec.PhysicalLayout = null;
     var source_cursor = try source_txn.openCursor();
     defer source_cursor.close();
     source_cursor.setUpperBound(source_upper);
@@ -1842,24 +1854,44 @@ pub fn reconcileAuthoritativeGroupDocumentsPaged(
                 entry = null;
                 break;
             };
-            if (!internal_keys.isPrimaryDocumentKey(kv.key)) {
+            if (!internal_keys.isPrimaryDocumentKey(kv.key) and !internal_keys.isRelationalRowKey(kv.key)) {
                 entry = try source_cursor.next();
                 continue;
             }
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse {
+            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, kv.key)) orelse {
                 entry = try source_cursor.next();
                 continue;
             };
             defer alloc.free(raw_key);
             const projected_key = try groupDocumentStoreKeyAlloc(alloc, group_id, raw_key);
             defer alloc.free(projected_key);
-            const entry_bytes = std.math.add(usize, projected_key.len, kv.value.len) catch return error.OutOfMemory;
+            const logical_value = if (internal_keys.isRelationalRowKey(kv.key)) logical: {
+                const version = try relational_store.rowSchemaVersion(kv.value);
+                if (schema == null or schema.?.version != version) {
+                    schema = null;
+                    layout = null;
+                    _ = layout_arena.reset(.retain_capacity);
+                    const owned = layout_arena.allocator();
+                    const schema_key = try storage_schema.schemaVersionKeyAlloc(owned, version);
+                    const encoded = source_txn.get(schema_key) catch |err| switch (err) {
+                        error.NotFound => return error.UnknownSchemaVersion,
+                        else => return err,
+                    };
+                    schema = try storage_schema.deserializeSchema(owned, encoded);
+                    if (schema.?.version != version) return error.InvalidSchema;
+                    layout = try row_codec.PhysicalLayout.init(owned, schema.?);
+                }
+                break :logical try relational_store.decodeValueForSchemaAndLayoutAlloc(alloc, kv.value, schema.?, &layout.?);
+            } else null;
+            defer if (logical_value) |value| alloc.free(value);
+            const value = logical_value orelse kv.value;
+            const entry_bytes = std.math.add(usize, projected_key.len, value.len) catch return error.OutOfMemory;
             if (page_entries > 0 and
                 (page_entries >= max_page_entries or entry_bytes > max_page_bytes -| page_bytes))
             {
                 break;
             }
-            try write_txn.put(projected_key, kv.value);
+            try write_txn.put(projected_key, value);
             page_entries += 1;
             page_bytes +|= entry_bytes;
             entry = try source_cursor.next();

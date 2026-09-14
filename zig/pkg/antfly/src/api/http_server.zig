@@ -27,6 +27,7 @@ const common_secrets = @import("../common/secrets.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const api_operation = @import("operation.zig");
+const backup_cohort_driver = @import("backup_cohort_driver.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
 const backups_api = @import("backups.zig");
 const restore_jobs = @import("restore_jobs.zig");
@@ -1092,6 +1093,7 @@ pub const InferenceRequestAdmissionSource = struct {
 };
 
 pub const ApiHttpServerConfig = struct {
+    restore_validation: ?@import("restore_catalog.zig").ValidationPort = null,
     auth_enabled: bool = false,
     experimental: bool = false,
     /// Maximum serialized MCP tools/call result size. Zero disables the guard.
@@ -1157,6 +1159,7 @@ pub const ApiHttpServerConfig = struct {
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     routed_raft_batch_writer: ?internal_group_operations.RoutedRaftBatchWriter = null,
+    restore_owner: ?@import("restore_owner.zig").Port = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_key: ?[]const u8 = null,
@@ -1360,6 +1363,7 @@ pub const AuthenticatedIdentity = struct {
 pub const StatusSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    standalone_ha: ?@import("standalone_ha.zig").Port = null,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
     /// Routing is carried as one complete capability. Admin-only sources leave
     /// it null; production constructors never assemble it from independent
@@ -1378,6 +1382,13 @@ pub const StatusSource = struct {
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         replace_table_definition_stamped: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!?metadata_api.CatalogMutationStamp = null,
+        get_backup_cohort: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, job_id: u64, request: api_operation.RequestContext) anyerror!?[]u8 = null,
+        list_backup_cohorts: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: api_operation.RequestContext) anyerror![]@import("../storage/docstore.zig").OwnedKVPair = null,
+        compare_and_set_backup_cohort: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, write: @import("../metadata/storage/raft_apply_store.zig").BackupCohortWrite, request: api_operation.RequestContext) anyerror!void = null,
+        get_restore_staging: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, request: api_operation.RequestContext) anyerror!?[]u8 = null,
+        get_restore_staging_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, request: api_operation.RequestContext) anyerror!?@import("../metadata/restore_staging.zig").Progress = null,
+        get_restore_staging_receipt: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, state: @import("../metadata/restore_staging.zig").State, owner_group: u64, request: api_operation.RequestContext) anyerror!?[]u8 = null,
+        apply_restore_staging: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, command_json: []const u8, request: api_operation.RequestContext) anyerror![]u8 = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1485,6 +1496,43 @@ pub const StatusSource = struct {
     pub fn replaceTableDefinition(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const fn_ptr = self.vtable.replace_table_definition orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("replace_table_definition", self.boundary_dispatch, fn_ptr, .{ self.ptr, expected, replacement });
+    }
+
+    pub fn getBackupCohort(self: StatusSource, alloc: std.mem.Allocator, job_id: u64, request: api_operation.RequestContext) !?[]u8 {
+        const callback = self.vtable.get_backup_cohort orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("get_backup_cohort", self.boundary_dispatch, callback, .{ self.ptr, alloc, job_id, request });
+    }
+
+    pub fn listBackupCohorts(self: StatusSource, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: api_operation.RequestContext) ![]@import("../storage/docstore.zig").OwnedKVPair {
+        const callback = self.vtable.list_backup_cohorts orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("list_backup_cohorts", self.boundary_dispatch, callback, .{ self.ptr, alloc, after, limit, request });
+    }
+
+    pub fn compareAndSetBackupCohort(self: StatusSource, alloc: std.mem.Allocator, write: @import("../metadata/storage/raft_apply_store.zig").BackupCohortWrite, request: api_operation.RequestContext) !void {
+        const callback = self.vtable.compare_and_set_backup_cohort orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("compare_and_set_backup_cohort", self.boundary_dispatch, callback, .{ self.ptr, alloc, write, request });
+    }
+
+    pub fn getRestoreStaging(self: StatusSource, alloc: std.mem.Allocator, id: [16]u8, request: api_operation.RequestContext) !?[]u8 {
+        const callback = self.vtable.get_restore_staging orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("get_restore_staging", self.boundary_dispatch, callback, .{ self.ptr, alloc, id, request });
+    }
+
+    pub fn getRestoreStagingProgress(self: StatusSource, alloc: std.mem.Allocator, id: [16]u8, request: api_operation.RequestContext) !?@import("../metadata/restore_staging.zig").Progress {
+        const callback = self.vtable.get_restore_staging_progress orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("get_restore_staging_progress", self.boundary_dispatch, callback, .{ self.ptr, alloc, id, request });
+    }
+
+    pub fn getRestoreStagingReceipt(self: StatusSource, alloc: std.mem.Allocator, id: [16]u8, state: @import("../metadata/restore_staging.zig").State, owner_group: u64, request: api_operation.RequestContext) !?[]u8 {
+        const callback = self.vtable.get_restore_staging_receipt orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("get_restore_staging_receipt", self.boundary_dispatch, callback, .{ self.ptr, alloc, id, state, owner_group, request });
+    }
+
+    /// Returns the authoritative resulting job; callers must verify their
+    /// exact state/owner receipt instead of treating Raft admission as success.
+    pub fn applyRestoreStaging(self: StatusSource, alloc: std.mem.Allocator, command_json: []const u8, request: api_operation.RequestContext) ![]u8 {
+        const callback = self.vtable.apply_restore_staging orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("apply_restore_staging", self.boundary_dispatch, callback, .{ self.ptr, alloc, command_json, request });
     }
 
     pub fn replaceTableDefinitionStamped(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
@@ -1733,6 +1781,95 @@ pub const StatusSource = struct {
                 return try replaceTableDefinitionOnServiceStamped(cast(ptr), expected, replacement);
             }
 
+            fn getBackupCohort(ptr: *anyopaque, alloc: std.mem.Allocator, job_id: u64, request: api_operation.RequestContext) !?[]u8 {
+                const svc = cast(ptr);
+                try svc.ensureLinearizableReadWithContext(request);
+                const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+                return store.getBackupCohort(alloc, svc.metadata_group_id, job_id);
+            }
+
+            fn listBackupCohorts(ptr: *anyopaque, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: api_operation.RequestContext) ![]@import("../storage/docstore.zig").OwnedKVPair {
+                const svc = cast(ptr);
+                try svc.ensureLinearizableReadWithContext(request);
+                const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+                return store.listBackupCohorts(alloc, svc.metadata_group_id, after, limit);
+            }
+
+            fn compareAndSetBackupCohort(ptr: *anyopaque, alloc: std.mem.Allocator, write: @import("../metadata/storage/raft_apply_store.zig").BackupCohortWrite, request: api_operation.RequestContext) !void {
+                const svc = cast(ptr);
+                try request.ensureActive();
+                const cohort = @import("../metadata/backup_cohort.zig");
+                if (write.job_id == 0 or write.value.len == 0 or write.value.len >
+                    @as(usize, if (write.expected_revision == 0) cohort.Job.max_encoded_bytes else 4096)) return error.InvalidBackupCohort;
+                // Canonicalize before proposal: semantically valid input with
+                // whitespace must not commit and then report a false CAS miss
+                // when the getter merges immutable plan and progress records.
+                const canonical = if (write.expected_revision == 0) blk: {
+                    var parsed = try std.json.parseFromSlice(cohort.Job, alloc, write.value, .{});
+                    defer parsed.deinit();
+                    if (parsed.value.id != write.job_id) return error.InvalidBackupCohort;
+                    try cohort.validateReplacement(alloc, null, parsed.value);
+                    break :blk try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+                } else blk: {
+                    var parsed = try std.json.parseFromSlice(cohort.Progress, alloc, write.value, .{});
+                    defer parsed.deinit();
+                    break :blk try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+                };
+                defer alloc.free(canonical);
+                var canonical_write = write;
+                canonical_write.value = canonical;
+                try metadata_service.ensureCoordinatedDecoderWithContext(svc, .{ .compare_and_set_backup_cohort = canonical_write }, request);
+                const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .compare_and_set_backup_cohort = canonical_write });
+                try svc.waitForTransitionAppliedWithContext(receipt, request);
+                try svc.ensureLinearizableReadWithContext(request);
+                const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+                const actual = (if (write.expected_revision == 0)
+                    try @This().getBackupCohort(ptr, alloc, write.job_id, request)
+                else
+                    try store.getBackupCohortProgress(alloc, svc.metadata_group_id, write.job_id)) orelse return error.BackupCohortChanged;
+                defer alloc.free(actual);
+                if (!std.mem.eql(u8, actual, canonical)) return error.BackupCohortChanged;
+            }
+
+            fn getRestoreStaging(ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, request: api_operation.RequestContext) !?[]u8 {
+                const svc = cast(ptr);
+                try svc.ensureLinearizableReadWithContext(request);
+                const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+                var loaded = (try store.loadRestoreStaging(alloc, svc.metadata_group_id, id)) orelse return null;
+                defer loaded.deinit();
+                return try std.json.Stringify.valueAlloc(alloc, loaded.value, .{});
+            }
+
+            fn getRestoreStagingProgress(ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, request: api_operation.RequestContext) !?@import("../metadata/restore_staging.zig").Progress {
+                const svc = cast(ptr);
+                try svc.ensureLinearizableReadWithContext(request);
+                const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+                return store.loadRestoreStagingProgress(alloc, svc.metadata_group_id, id);
+            }
+
+            fn getRestoreStagingReceipt(ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, state: @import("../metadata/restore_staging.zig").State, owner_group: u64, request: api_operation.RequestContext) !?[]u8 {
+                const svc = cast(ptr);
+                try svc.ensureLinearizableReadWithContext(request);
+                const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+                return store.loadRestoreStagingReceipt(alloc, svc.metadata_group_id, id, state, owner_group);
+            }
+
+            fn applyRestoreStaging(ptr: *anyopaque, alloc: std.mem.Allocator, command_json: []const u8, request: api_operation.RequestContext) ![]u8 {
+                try request.ensureActive();
+                var command = try @import("../metadata/restore_staging.zig").parseCommand(alloc, command_json);
+                defer command.deinit();
+                const svc = cast(ptr);
+                try metadata_service.ensureCoordinatedDecoderWithContext(svc, .{ .apply_restore_staging = command_json }, request);
+                const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_restore_staging = command_json });
+                try svc.waitForTransitionAppliedWithContext(receipt, request);
+                if (try @This().getRestoreStaging(ptr, alloc, command.value.id, request)) |job| return job;
+                if (command.value.action == .cancel_reservation) {
+                    const progress = (try @This().getRestoreStagingProgress(ptr, alloc, command.value.id, request)) orelse return error.RestoreStagingChanged;
+                    return std.json.Stringify.valueAlloc(alloc, progress, .{});
+                }
+                return error.RestoreStagingChanged;
+            }
+
             fn restoreTable(
                 ptr: *anyopaque,
                 alloc: std.mem.Allocator,
@@ -1871,6 +2008,13 @@ pub const StatusSource = struct {
             .create_table = Gen.createTable,
             .replace_table_definition = Gen.replaceTableDefinition,
             .replace_table_definition_stamped = Gen.replaceTableDefinitionStamped,
+            .get_backup_cohort = Gen.getBackupCohort,
+            .list_backup_cohorts = Gen.listBackupCohorts,
+            .compare_and_set_backup_cohort = Gen.compareAndSetBackupCohort,
+            .get_restore_staging = Gen.getRestoreStaging,
+            .get_restore_staging_progress = Gen.getRestoreStagingProgress,
+            .get_restore_staging_receipt = Gen.getRestoreStagingReceipt,
+            .apply_restore_staging = Gen.applyRestoreStaging,
             .restore_table = Gen.restoreTable,
             .drop_table = Gen.dropTable,
             .drop_table_exact = Gen.dropTableExact,
@@ -2392,6 +2536,7 @@ fn validateTableDefinitionReplacementOnService(
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
 ) !void {
+    try metadata_service.ensureCoordinatedDecoderWithContext(svc, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = replacement } }, .{});
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const current = tables_api.findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
@@ -2982,6 +3127,8 @@ pub const ApiHttpServer = struct {
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
     backup_maintenance_mutex: std.atomic.Mutex = .unlocked,
     backup_maintenance_queue: BackupRepositoryMaintenanceQueue = .{},
+    backup_cohort_recovery_cursor: [192]u8 = undefined,
+    backup_cohort_recovery_cursor_len: usize = 0,
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -4017,6 +4164,10 @@ pub const ApiHttpServer = struct {
         // primary-local. Their mutating routes are rejected in continuous HA,
         // and their cleanup/resume loop must remain frozen for the same reason.
         if (!self.mutationBackgroundExecutionPermitted()) return;
+        self.recoverBackupCohortSlice() catch |err| switch (err) {
+            error.UnsupportedOperation, error.Canceled, error.DeadlineExceeded => {},
+            else => std.log.warn("backup cohort recovery deferred err={s}", .{@errorName(err)}),
+        };
         self.advanceRelationalActivationOnce() catch |err| switch (err) {
             error.ConstraintActivationChanged,
             error.ConstraintActivationNotReady,
@@ -4028,6 +4179,7 @@ pub const ApiHttpServer = struct {
             error.KeyOutOfRange,
             error.RelationalTableRequired,
             error.IntegrityCatalogUnavailable,
+            error.RestoreStagingInProgress,
             error.IntegrityCatalogChanged,
             error.TopologyChanged,
             error.Canceled,
@@ -4072,6 +4224,23 @@ pub const ApiHttpServer = struct {
         defer self.source.freeAdminSnapshot(&snapshot);
         if (snapshot.ranges.len == 0) return;
         const next = self.relational_activation_range_cursor.fetchAdd(1, .monotonic) % snapshot.ranges.len;
+        const owner = snapshot.ranges[next];
+        for (snapshot.tables) |table| if (table.table_id == owner.table_id and table.relational_retirement_json.len != 0) {
+            var job = try @import("../metadata/relational_retirement.zig").parse(self.alloc, table.relational_retirement_json);
+            defer job.deinit();
+            if ((job.value.phase == .ready or (job.value.phase == .published and table.read_schema_json.len == 0)) and job.value.failure.len == 0 and !job.value.drop) {
+                var finalized = try @import("relational_retirement_worker.zig").finalize(self.alloc, table);
+                defer finalized.deinit();
+                try self.source.replaceTableDefinition(table, finalized.table);
+                return;
+            }
+            if (try @import("relational_retirement_worker.zig").runPage(self.alloc, reader, writer, snapshot.tables, table, owner.start_key)) |result| {
+                var replacement = result;
+                defer replacement.deinit();
+                try self.source.replaceTableDefinition(table, replacement.table);
+            }
+            return;
+        };
         _ = try @import("relational_activation_worker.zig").runPage(self.alloc, reader, writer, snapshot.tables, snapshot.ranges, snapshot.ranges[next]);
     }
 
@@ -4612,14 +4781,17 @@ pub const ApiHttpServer = struct {
                         table.backup_id,
                     ),
                 },
-                .cluster => |cluster_attempt| backups_api.cleanupClusterBackupAttemptByIdAtLocation(
-                    self.server.owner_alloc,
-                    repository_io,
-                    &location,
-                    cluster_attempt.attempt_id,
-                ) catch |err| switch (err) {
-                    error.FileNotFound => {},
-                    else => return err,
+                .cluster => |cluster_attempt| {
+                    backups_api.cleanupClusterBackupAttemptByIdAtLocation(
+                        self.server.owner_alloc,
+                        repository_io,
+                        &location,
+                        cluster_attempt.attempt_id,
+                    ) catch |err| switch (err) {
+                        error.FileNotFound => {},
+                        else => return err,
+                    };
+                    try self.server.reconcileBackupCohortAttempt(repository_io, &location, cluster_attempt.attempt_id);
                 },
             }
         }
@@ -8671,7 +8843,8 @@ pub const ApiHttpServer = struct {
         manifest: *const backups_api.TableBackupManifest,
     ) !bool {
         if (!std.mem.eql(u8, table.description, manifest.description)) return false;
-        if (table.read_schema_json.len != 0 or manifest.read_schema_json.len != 0) return false;
+        if ((table.read_schema_json.len == 0) != (manifest.read_schema_json.len == 0)) return false;
+        if (table.read_schema_json.len != 0 and !try jsonDocumentsEqual(alloc, table.read_schema_json, manifest.read_schema_json)) return false;
         if (!try jsonDocumentsEqual(alloc, tables_api.effectiveSchemaJson(table.schema_json), tables_api.effectiveSchemaJson(manifest.schema_json))) return false;
         if (!try jsonDocumentsEqual(alloc, table.indexes_json, manifest.indexes_json)) return false;
         if (!try jsonDocumentsEqual(alloc, table.replication_sources_json, manifest.replication_sources_json)) return false;
@@ -8835,8 +9008,33 @@ pub const ApiHttpServer = struct {
         writer_lease_role: TableBackupWriterLeaseRole,
         request: api_operation.RequestContext,
     ) !void {
+        return self.backupOwnedTableWithArtifactIdAndSeals(io, table, fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, receipt, writer_lease_role, request, &.{});
+    }
+
+    fn backupOwnedTableWithArtifactIdAndSeals(
+        self: *ApiHttpServer,
+        io: std.Io,
+        table: *const metadata_table_manager.TableRecord,
+        fence: backups_api.TableBackupFence,
+        table_name: []const u8,
+        backup_location: *backups_api.BackupLocation,
+        location_uri: []const u8,
+        backup_id: []const u8,
+        artifact_backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        connection: []const u8,
+        receipt: ?*public_table_http.TableApi.BackupExecutionReceipt,
+        writer_lease_role: TableBackupWriterLeaseRole,
+        request: api_operation.RequestContext,
+        sealed_handles: []const @import("backup_contract.zig").SealedHandle,
+    ) !void {
         if (!std.mem.eql(u8, table.name, table_name)) return error.TableNotFound;
-        if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
+        if (table.read_schema_json.len > 0) {
+            // Only a coherent sealed cut may capture both schema generations.
+            // Legacy independent snapshots still lack that authority.
+            if (sealed_handles.len == 0) return error.UnsupportedBackupMigrationState;
+            try @import("../schema/restore_migration.zig").validate(self.alloc, table.schema_json, table.read_schema_json);
+        }
         const admission_now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
         var writer_fence = fence;
         const initial_writer_lease_expiration = switch (writer_lease_role) {
@@ -8860,6 +9058,7 @@ pub const ApiHttpServer = struct {
         var execution_fence = writer_fence;
         execution_fence.writer_not_after_unix_ns = initial_writer_lease_expiration;
         var operation_control = try backupOperationControl(io, execution_fence, request);
+        operation_control.sealed_handles = sealed_handles;
         try operation_control.ensureActive();
         if (backups_api.manifestExistsAtLocationWithIoAndCancellation(
             self.alloc,
@@ -9196,7 +9395,7 @@ pub const ApiHttpServer = struct {
         }
     }
 
-    fn boundedBackupRequest(
+    pub fn boundedBackupRequest(
         self: *const ApiHttpServer,
         request: api_operation.RequestContext,
     ) api_operation.RequestContext {
@@ -9327,6 +9526,7 @@ pub const ApiHttpServer = struct {
                 .format = format,
                 .io = staging_io,
                 .fence = fence,
+                .sealed_handles = operation_control.sealed_handles,
                 .cancellation = operation_control.token(),
                 .deadline_ns = operation_control.deadline_ns,
             }) catch |err| switch (err) {
@@ -9440,6 +9640,23 @@ pub const ApiHttpServer = struct {
         backup_location: *backups_api.BackupLocation,
         request: api_operation.RequestContext,
     ) ![]backups_api.ShardSnapshot {
+        return self.executeInternalTableBackupShardCohort(group_id, table_name, artifact_backup_id, format, fence, backup_location, request, null, &.{});
+    }
+
+    pub fn executeInternalTableBackupShardCohort(
+        self: *ApiHttpServer,
+        group_id: u64,
+        table_name: []const u8,
+        artifact_backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        fence: backups_api.TableBackupFence,
+        backup_location: *backups_api.BackupLocation,
+        request: api_operation.RequestContext,
+        cohort: ?@import("../storage/db/relational_integrity_topology.zig").Fence,
+        sealed_handles: []const @import("backup_contract.zig").SealedHandle,
+    ) ![]backups_api.ShardSnapshot {
+        if (cohort) |value| if (format != .native or value.owner_group_id != group_id or value.namespace.table_id != fence.table_id or value.role != .backup_snapshot)
+            return error.InvalidBackupFence;
         const io = self.backupLocationIo(backup_location) orelse
             return error.BackupStorageUnavailable;
         const staging_io = self.backupStagingIo(io);
@@ -9495,6 +9712,8 @@ pub const ApiHttpServer = struct {
             .io = staging_io,
             .fence = fence,
             .target_group_id = group_id,
+            .relational_cohort_fence = cohort,
+            .sealed_handles = sealed_handles,
             .cancellation = operation_control.token(),
             .deadline_ns = operation_control.deadline_ns,
         });
@@ -9544,12 +9763,95 @@ pub const ApiHttpServer = struct {
         location: *backups_api.BackupLocation,
         marker: *const backups_api.ClusterBackupAttemptMarker,
     ) !void {
-        return try backups_api.cleanupClusterBackupAttemptAtLocation(
+        try backups_api.cleanupClusterBackupAttemptAtLocation(
             self.alloc,
             io,
             location,
             marker,
         );
+        try self.reconcileBackupCohortAttempt(io, location, marker.attempt_id);
+    }
+
+    const BackupCohortSession = backup_cohort_driver.Session(StatusSource);
+
+    const BackupAuthorityControl = struct {
+        server: *ApiHttpServer,
+        upstream: ?api_operation.CancellationToken,
+        term: u64,
+        fn canceled(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            if (self.upstream) |token| if (token.isCancelled()) return true;
+            if (!self.server.haMutationPolicy().failover_safe_mutations_only) return false;
+            const guard = self.server.cfg.restore_execution_guard orelse return true;
+            return !self.server.restoreExecutionPermitted() or !guard.is_current(guard.ptr, self.term);
+        }
+        fn bind(self: *const @This(), request: api_operation.RequestContext) api_operation.RequestContext {
+            var bound = request;
+            bound.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+            return bound;
+        }
+    };
+
+    fn backupCohortContext(self: *ApiHttpServer) api_operation.RequestContext {
+        return self.boundedBackupRequest(.{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s });
+    }
+
+    /// Reuses session maintenance, so restart discovery does not depend on
+    /// process-local repository registrations or create another job queue.
+    fn recoverBackupCohortSlice(self: *ApiHttpServer) !void {
+        if (self.haMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted()) return;
+        if (self.source.vtable.list_backup_cohorts == null) return;
+        const records = try self.source.listBackupCohorts(self.alloc, if (self.backup_cohort_recovery_cursor_len == 0) null else self.backup_cohort_recovery_cursor[0..self.backup_cohort_recovery_cursor_len], 1, self.backupCohortContext());
+        defer {
+            for (records) |entry| {
+                self.alloc.free(entry.key);
+                self.alloc.free(entry.value);
+            }
+            self.alloc.free(records);
+        }
+        if (records.len == 0) {
+            self.backup_cohort_recovery_cursor_len = 0;
+            return;
+        }
+        const record = records[0];
+        if (record.key.len > self.backup_cohort_recovery_cursor.len) return error.InvalidBackupCohort;
+        @memcpy(self.backup_cohort_recovery_cursor[0..record.key.len], record.key);
+        self.backup_cohort_recovery_cursor_len = record.key.len;
+        const parsed = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Job, self.alloc, record.value, .{});
+        defer parsed.deinit();
+        if (parsed.value.terminal() or parsed.value.attempt_id.len == 0) return;
+        var location = try backups_api.openBackupLocationWithOptions(self.alloc, parsed.value.location, .{ .secret_store = self.cfg.secret_store, .node_config = self.cfg.node_config, .connection = parsed.value.connection, .required_capability = "backup.write", .network_io = self.sharedApiNetworkIo(), .filesystem_io = self.sharedApiFilesystemIo() });
+        defer location.deinit(self.alloc);
+        try self.reconcileBackupCohortAttempt(self.backupLocationIo(&location) orelse return error.BackgroundRuntimeUnavailable, &location, parsed.value.attempt_id);
+    }
+
+    fn reconcileBackupCohortAttempt(self: *ApiHttpServer, io: std.Io, location: *backups_api.BackupLocation, attempt_id: []const u8) !void {
+        if (self.source.vtable.get_backup_cohort == null) return;
+        var authority: BackupAuthorityControl = .{ .server = self, .upstream = null, .term = self.restore_leadership_term.load(.acquire) };
+        const context = authority.bind(self.backupCohortContext());
+        try context.ensureActive();
+        var session = (try BackupCohortSession.load(self.alloc, self.source, self.table_reads orelse return error.UnsupportedOperation, self.table_writes orelse return error.UnsupportedOperation, context, backup_cohort_driver.idForAttempt(attempt_id))) orelse return;
+        defer session.deinit();
+        if (session.parsed.value.terminal()) return;
+        if (!std.mem.eql(u8, session.parsed.value.attempt_id, attempt_id)) return error.BackupCohortChanged;
+        var manifest = backups_api.readClusterManifestFromLocation(self.alloc, location, session.parsed.value.backup_id) catch |err| switch (err) {
+            error.FileNotFound => {
+                const now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+                if (try backups_api.fenceUnpublishedCohortAttempt(self.alloc, io, location, session.parsed.value.backup_id, attempt_id, now)) try session.canceledAfterPublicationFence();
+                return;
+            },
+            else => return err,
+        };
+        defer manifest.deinit(self.alloc);
+        if (manifest.cohort_json.len == 0) return error.BackupCohortChanged;
+        const proof = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Job, self.alloc, manifest.cohort_json, .{});
+        defer proof.deinit();
+        if (proof.value.id != session.parsed.value.id or !std.mem.eql(u8, &(try proof.value.planDigest(self.alloc)), &(try session.parsed.value.planDigest(self.alloc)))) return error.BackupCohortChanged;
+        const encoded = try std.json.Stringify.valueAlloc(self.alloc, manifest, .{});
+        defer self.alloc.free(encoded);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+        try session.committed(digest);
     }
 
     /// Serialize repository mutations performed by cluster backup writers.
@@ -10948,10 +11250,50 @@ pub const ApiHttpServer = struct {
         };
         defer self.source.freeAdminSnapshot(&snapshot);
         const coordinated = try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables);
+        if (request.relational_recovery != .none and (!coordinated or tables.len != 1)) return error.InvalidBatchRequest;
         if (!coordinated) return source.commitBatchWithCancellation(alloc, tables, sync_level, request.cancellation);
         try ensureTableOperationActive(request);
         const reader = self.table_reads orelse return error.IntegrityCatalogUnavailable;
-        var prepared = try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, request);
+        if (request.relational_recovery == .retire) {
+            const table = for (snapshot.tables) |table| {
+                if (std.mem.eql(u8, table.name, tables[0].table_name)) break table;
+            } else return error.TableNotFound;
+            var owned_target: ?[]u8 = null;
+            defer if (owned_target) |bytes| alloc.free(bytes);
+            const target = request.relational_retirement_target orelse target: {
+                if (!request.relational_retirement_drop) return error.InvalidBatchRequest;
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, table.schema_json, .{ .allocate = .alloc_always });
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidBatchRequest;
+                _ = parsed.value.object.swapRemove("unique_constraints");
+                _ = parsed.value.object.swapRemove("foreign_keys");
+                const version = tables[0].relational_schema_version orelse return error.InvalidBatchRequest;
+                if (version == std.math.maxInt(u32)) return error.InvalidBatchRequest;
+                try parsed.value.object.put(alloc, "version", .{ .integer = @as(i64, version) + 1 });
+                owned_target = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+                break :target owned_target.?;
+            };
+            const normalized = try tables_api.applySchemaUpdateRecord(alloc, &table, target);
+            defer metadata_table_manager.freeTable(alloc, normalized);
+            var replacement = try @import("relational_retirement_worker.zig").begin(alloc, reader, snapshot.tables, snapshot.ranges, table.name, normalized.schema_json, request.relational_retirement_drop);
+            defer replacement.deinit();
+            try self.source.replaceTableDefinition(table, replacement.table);
+            return .{ .committed = .{ .participant_count = 0 } };
+        }
+        if (request.relational_recovery == .retry) {
+            for (snapshot.tables) |table| if (std.mem.eql(u8, table.name, tables[0].table_name) and table.relational_retirement_json.len != 0) {
+                var replacement = try @import("relational_retirement_worker.zig").retry(alloc, table);
+                defer replacement.deinit();
+                try self.source.replaceTableDefinition(table, replacement.table);
+                return .{ .committed = .{ .participant_count = 0 } };
+            };
+            try @import("relational_constraint_recovery.zig").retry(alloc, reader, source, snapshot.tables, snapshot.ranges, tables[0], request);
+            return .{ .committed = .{ .participant_count = 0 } };
+        }
+        var prepared = if (request.relational_recovery == .repair)
+            try integrity.prepareRepair(alloc, reader, snapshot.tables, snapshot.ranges, tables[0], request)
+        else
+            try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, request);
         defer prepared.deinit();
         try ensureTableOperationActive(request);
         try integrity.authorizePrimaryMutations(request, self.cfg.auth_enabled, prepared.tables);
@@ -11005,6 +11347,9 @@ pub const ApiHttpServer = struct {
             => return error.InvalidBatchRequest,
             error.TableNotFound, error.UnknownGroup => return error.NotFound,
             error.TopologyChanged,
+            error.TableTransitionActive,
+            error.TableGenerationChanged,
+            error.SchemaVersionExhausted,
             error.DecisionConflict,
             error.TxnNotFound,
             error.InvalidTxnRecord,
@@ -11017,6 +11362,11 @@ pub const ApiHttpServer = struct {
             error.ForeignKeyTargetNotUnique,
             error.ForeignKeyTypeMismatch,
             error.ConstraintActivationFailed,
+            error.InvalidConstraintActivation,
+            error.ConstraintRetirementInProgress,
+            error.ConstraintRetirementChanged,
+            error.InvalidConstraintRetirement,
+            error.ConstraintNotFound,
             error.VersionConflict,
             error.PreparedGenerationChanged,
             error.PreparedSchemaChanged,
@@ -11039,12 +11389,14 @@ pub const ApiHttpServer = struct {
             error.CatalogRoutingUnavailable,
             error.CatalogProjectionRefreshRequired,
             error.IntegrityCatalogUnavailable,
+            error.TableTopologyProtocolUpgradeRequired,
             error.ConstraintActivationPending,
             error.ConstraintActivationInProgress,
             error.ConstraintActivationChanged,
             error.ConstraintActivationOwnerChanged,
             error.ForeignKeyCoordinationRequired,
             error.IntegrityCatalogChanged,
+            error.RestoreStagingInProgress,
             => return error.WriteUnavailable,
             error.CommitDecisionUnknown => return error.OutcomeUnknown,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -11144,6 +11496,7 @@ pub const ApiHttpServer = struct {
             error.PortableImportRecoveryRequired,
             error.PortableRuntimeActivationPending,
             error.StorageReadTemporarilyUnavailable,
+            error.RestoreStagingInProgress,
             => return error.StorageReadTemporarilyUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -12342,6 +12695,29 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const operation_request = self.boundedBackupRequest(request);
         try ensureTableOperationActive(operation_request);
+        if (expected_fence == null and self.source.vtable.compare_and_set_backup_cohort != null) {
+            receipt.recordArtifactBackupId(backup_id);
+            const response = executePublicClusterBackup(self, self.alloc, .{
+                .backup_id = backup_id,
+                .location = location_uri,
+                .connection = connection,
+                .format = format,
+                .table_names = &.{table_name},
+                .single_table_manifest_id = backup_id,
+            }, location, operation_request) catch |err| return switch (err) {
+                error.Canceled, error.DeadlineExceeded, error.NotLeader, error.MetadataCapabilityUnavailable, error.BackupAlreadyExists, error.BackupOutcomeAmbiguous, error.BackupManifestTooLarge, error.MethodNotAllowed, error.InternalFailure => @errorCast(err),
+                error.BackupRepositoryBusy => error.BackupOutcomeAmbiguous,
+                error.InvalidRequest => error.UnsupportedBackupFormat,
+                error.NoTables => error.NotFound,
+            };
+            defer self.alloc.free(response);
+            const Status = struct { status: []const u8 };
+            var status = std.json.parseFromSlice(Status, self.alloc, response, .{ .ignore_unknown_fields = true }) catch return error.InternalFailure;
+            defer status.deinit();
+            if (!std.mem.eql(u8, status.value.status, "completed")) return error.BackupOutcomeAmbiguous;
+            return;
+        }
+        if (self.haMutationPolicy().failover_safe_mutations_only and expected_fence == null) return error.MethodNotAllowed;
         var admitted_fence: backups_api.TableBackupFence = undefined;
         var table = table: {
             var authoritative_snapshot = (self.source.linearizableSnapshot(operation_request) catch |err| {
@@ -13680,7 +14056,9 @@ pub const ApiHttpServer = struct {
         request: api_operation.RequestContext,
     ) cluster_api_http.ClusterApi.ExecuteBackupError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        const operation_request = self.boundedBackupRequest(request);
+        if (self.haMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted()) return error.NotLeader;
+        var authority: BackupAuthorityControl = .{ .server = self, .upstream = request.cancellation, .term = self.restore_leadership_term.load(.acquire) };
+        const operation_request = authority.bind(self.boundedBackupRequest(request));
         operation_request.ensureActive() catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
@@ -13723,6 +14101,10 @@ pub const ApiHttpServer = struct {
         trace.enter(.manifest_probe);
         if (backups_api.clusterManifestExistsAtLocationWithIo(alloc, backup_io, location, req.backup_id) catch |err| return trace.internal(err))
             return error.BackupAlreadyExists;
+        if (req.single_table_manifest_id) |table_manifest_id| {
+            if (req.table_names == null or req.table_names.?.len != 1 or !std.mem.eql(u8, table_manifest_id, req.backup_id)) return error.InvalidRequest;
+            if (backups_api.manifestExistsAtLocationWithIo(alloc, backup_io, location, table_manifest_id) catch |err| return trace.internal(err)) return error.BackupAlreadyExists;
+        }
         const connection = req.connection orelse return error.InvalidRequest;
 
         trace.enter(.table_selection);
@@ -13771,7 +14153,7 @@ pub const ApiHttpServer = struct {
             op_alloc.free(attempt_tables);
         }
         for (table_names, 0..) |table_name, i| {
-            const table_backup_id = std.fmt.allocPrint(op_alloc, "{s}-t-{d}", .{
+            const table_backup_id = if (req.single_table_manifest_id) |id| op_alloc.dupe(u8, id) catch |err| return trace.internal(err) else std.fmt.allocPrint(op_alloc, "{s}-t-{d}", .{
                 attempt_id,
                 i,
             }) catch |err| return trace.internal(err);
@@ -13970,6 +14352,27 @@ pub const ApiHttpServer = struct {
         };
         const extension_snapshot: ?*const metadata_api.AdminSnapshot = &authoritative_snapshot;
 
+        // Coordinated backups use the same artifact publisher, but first
+        // establish a common cut for the selection. Mutation fences cover
+        // only drain + durable immutable pin sealing, never object uploads.
+        var cohort_session: ?BackupCohortSession = null;
+        defer if (cohort_session) |*session| session.deinit();
+        if (req.format == .native or self.source.vtable.compare_and_set_backup_cohort != null) {
+            var fallback_router = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
+            const router = self.cfg.session_router orelse fallback_router.router();
+            cohort_session = BackupCohortSession.admit(op_alloc, self.source, self.table_reads orelse return error.MetadataCapabilityUnavailable, self.table_writes orelse return error.MetadataCapabilityUnavailable, operation_request, router, self.catalogSource(), &authoritative_snapshot, attempt_marker, req.location, connection) catch |err| switch (err) {
+                error.TableTopologyProtocolUpgradeRequired => return error.MetadataCapabilityUnavailable,
+                else => return trace.internal(err),
+            };
+            while (true) {
+                switch (cohort_session.?.prepareSlice() catch |err| return trace.internal(err)) {
+                    .ready => break,
+                    .advanced => {},
+                    .waiting => backup_io.sleep(.fromMilliseconds(10), .awake) catch |err| return trace.internal(err),
+                }
+            }
+        }
+
         trace.enter(.table_snapshots);
         for (table_names, attempt_tables, 0..) |table_name, attempt_table, i| {
             operation_control.ensureActive() catch |err| switch (err) {
@@ -13988,7 +14391,7 @@ pub const ApiHttpServer = struct {
                 continue;
             };
 
-            self.backupOwnedTableWithArtifactId(
+            self.backupOwnedTableWithArtifactIdAndSeals(
                 backup_io,
                 table,
                 backups_api.tableBackupFence(&authoritative_snapshot, table),
@@ -14002,6 +14405,7 @@ pub const ApiHttpServer = struct {
                 null,
                 .logical_create,
                 operation_request,
+                if (cohort_session) |session| session.parsed.value.seals else &.{},
             ) catch |err| {
                 if (err == error.BackupOutcomeAmbiguous) {
                     // The forwarded owner may still be completing work after a
@@ -14091,6 +14495,10 @@ pub const ApiHttpServer = struct {
                 extension_dependencies,
             ) catch |err| return trace.internal(err);
             defer manifest.deinit(op_alloc);
+            if (cohort_session) |*session| {
+                session.exported() catch |err| return trace.internal(err);
+                manifest.cohort_json = std.json.Stringify.valueAlloc(op_alloc, session.parsed.value, .{}) catch |err| return trace.internal(err);
+            }
             operation_control.ensureActive() catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.Timeout => return error.DeadlineExceeded,
@@ -14158,6 +14566,17 @@ pub const ApiHttpServer = struct {
                 std.log.warn("cluster backup committed with lease already fenced", .{});
             }
             cluster_committed = true;
+            if (cohort_session) |*session| {
+                const encoded = std.json.Stringify.valueAlloc(op_alloc, manifest, .{}) catch |err| return trace.internal(err);
+                defer op_alloc.free(encoded);
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+                session.committed(digest) catch |err| {
+                    // The immutable aggregate already committed. Existing
+                    // periodic maintenance resumes exact pin reclamation.
+                    std.log.warn("committed backup pin reclamation deferred err={s}", .{@errorName(err)});
+                };
+            }
         } else if (table_outcome_ambiguous) {
             trace.enter(.partial_cleanup);
             lease_heartbeat.stop_event.set(backup_io);
@@ -14208,6 +14627,402 @@ pub const ApiHttpServer = struct {
     }
 
     const RestoreCancellation = struct { job_id: u64, attempt_id: u64 };
+
+    const StagedRestoreControl = struct {
+        server: *ApiHttpServer,
+        restore: RestoreCancellation,
+        fn canceled(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            if (!self.server.restoreExecutionPermitted()) return true;
+            return (self.server.restore_job_store.attemptState(self.server.alloc, self.restore.job_id, self.restore.attempt_id) catch return true) == .fenced;
+        }
+        fn context(self: *const @This()) api_operation.RequestContext {
+            return .{ .deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s, .cancellation = .{ .ptr = self, .is_cancelled_fn = canceled } };
+        }
+    };
+
+    fn stagingCommand(self: *ApiHttpServer, job: *@import("std").json.Parsed(@import("../metadata/restore_staging.zig").Job), action: @FieldType(@import("../metadata/restore_staging.zig").Command, "action"), receipt: ?@import("../metadata/restore_staging.zig").OwnerReceipt, context: api_operation.RequestContext) !void {
+        const command: @import("../metadata/restore_staging.zig").Command = .{ .id = job.value.plan.id, .expected_revision = job.value.revision, .action = action, .receipt = receipt };
+        const encoded = try std.json.Stringify.valueAlloc(self.alloc, command, .{});
+        defer self.alloc.free(encoded);
+        const replacement = try self.source.applyRestoreStaging(self.alloc, encoded, context);
+        defer self.alloc.free(replacement);
+        const parsed = try std.json.parseFromSlice(@import("../metadata/restore_staging.zig").Job, self.alloc, replacement, .{ .allocate = .alloc_always });
+        job.deinit();
+        job.* = parsed;
+    }
+
+    /// One scheduling slice of the EXISTING restore job. Native row pages,
+    /// global constraint activation, publication, and cancellation all retain
+    /// the same durable staging incarnation across execution retries.
+    fn driveStagedRestore(self: *ApiHttpServer, restore: RestoreCancellation, staging_attempt: u64, initial: []const u8, table_names: []const []const u8) anyerror![]u8 {
+        if (self.cfg.deployment_mode == .standalone) _ = try self.source.runRound();
+        const stages = @import("../metadata/restore_staging.zig");
+        const owners = @import("restore_owner.zig");
+        var job = try std.json.parseFromSlice(stages.Job, self.alloc, initial, .{ .allocate = .alloc_always });
+        defer job.deinit();
+        errdefer |err| if (permanentStagingFailure(err) and job.value.state != .published) {
+            if (self.restore_job_store.recordStagingFailure(self.alloc, restore.job_id, restore.attempt_id, @errorName(err))) |recorded| {
+                self.alloc.free(recorded);
+            } else |_| {}
+        };
+        const worker_json = (try self.restore_job_store.load(self.alloc, restore.job_id)) orelse return error.RestoreJobFenced;
+        defer self.alloc.free(worker_json);
+        const worker_state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, worker_json, .{});
+        defer worker_state.deinit();
+        const failed = worker_state.value.staging_failure.len != 0;
+        if (!failed and !worker_state.value.cancel_requested and job.value.state != .published and job.value.state != .canceled) {
+            const authorizer: stored_destination_authorization.Authorizer = .{ .manager = self.cfg.user_manager, .auth_enabled = self.cfg.auth_enabled };
+            for (job.value.plan.targets) |target| {
+                try stored_destination_authorization.authorizeReplicationSourcesJson(self.alloc, target.table.replication_sources_json, target.table.name, authorizer);
+                try stored_destination_authorization.authorizeIndexesJson(self.alloc, target.table.indexes_json, target.table.name, authorizer);
+            }
+        }
+        const expected_id = try stages.idForAttempt(restore.job_id, staging_attempt);
+        if (!std.mem.eql(u8, &expected_id, &job.value.plan.id)) return error.RestoreJobFenced;
+        var control = StagedRestoreControl{ .server = self, .restore = restore };
+        const context = control.context();
+        var phase = job.value.state;
+        var owner_cursor: usize = if (worker_state.value.staging_owner_phase == @intFromEnum(phase)) worker_state.value.staging_owner_cursor else 0;
+        var saved_owner_cursor = owner_cursor;
+        var saved_owner_phase = phase;
+        var begun_group: ?u64 = null;
+        var validation_session: ?*@import("restore_catalog.zig").ValidationSession = null;
+        defer if (validation_session) |session| session.deinit();
+        var slices: usize = 0;
+        while (slices < 64) : (slices += 1) {
+            // Persist only verified prefix progress. The phase is that of the
+            // receipt, even if its final acknowledgement advanced metadata.
+            if (owner_cursor != saved_owner_cursor or phase != saved_owner_phase) {
+                const checkpoint = try self.restore_job_store.recordStagingOwner(self.alloc, restore.job_id, restore.attempt_id, @intFromEnum(phase), @intCast(owner_cursor));
+                self.alloc.free(checkpoint);
+                saved_owner_cursor = owner_cursor;
+                saved_owner_phase = phase;
+            }
+            try context.ensureActive();
+            const attempt_state = try self.restore_job_store.attemptState(self.alloc, restore.job_id, restore.attempt_id);
+            if (attempt_state == .fenced) return error.RestoreJobFenced;
+            if ((attempt_state == .cancelled or failed) and job.value.state != .published and job.value.state != .canceling and job.value.state != .canceled) {
+                try self.stagingCommand(&job, .begin_cancel, null, context);
+            }
+            if (job.value.state != phase) {
+                phase = job.value.state;
+                owner_cursor = 0;
+            }
+            if (phase == .canceled) {
+                const resolved = try self.restore_job_store.recordStagingResolution(self.alloc, restore.job_id, restore.attempt_id, staging_attempt, .canceled);
+                self.alloc.free(resolved);
+                return if (failed) error.RestoreStagingFailed else error.Cancelled;
+            }
+            if (phase == .validating) {
+                const encoded_state = (try self.restore_job_store.load(self.alloc, restore.job_id)) orelse return error.RestoreJobFenced;
+                defer self.alloc.free(encoded_state);
+                const parsed_state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded_state, .{});
+                defer parsed_state.deinit();
+                var cursor: @import("restore_catalog.zig").ValidationCursor = .{ .phase = @enumFromInt(parsed_state.value.staging_validation_phase), .owner_index = parsed_state.value.staging_validation_owner };
+                if (validation_session == null) validation_session = try (self.cfg.restore_validation orelse return error.RestoreValidationPending).prepare(self.alloc, job.value, context);
+                const complete = try validation_session.?.step(self.alloc, &cursor, context);
+                if (@intFromEnum(cursor.phase) != parsed_state.value.staging_validation_phase or cursor.owner_index != parsed_state.value.staging_validation_owner) {
+                    const checkpoint = try self.restore_job_store.recordStagingValidation(self.alloc, restore.job_id, restore.attempt_id, @intFromEnum(cursor.phase), cursor.owner_index);
+                    self.alloc.free(checkpoint);
+                }
+                if (!complete) continue;
+            }
+            var target_index: usize = 0;
+            var range_index = owner_cursor;
+            while (target_index < job.value.plan.targets.len and range_index >= job.value.plan.targets[target_index].ranges.len) : (target_index += 1) range_index -= job.value.plan.targets[target_index].ranges.len;
+            if (target_index == job.value.plan.targets.len) {
+                if (phase == .cutover or phase == .canceling) {
+                    var old_index = range_index;
+                    const selected: ?struct { table: metadata_table_manager.TableRecord, range: metadata_table_manager.RangeRecord, fence: @import("../storage/db/relational_integrity_topology.zig").Fence } = for (job.value.plan.targets) |target| {
+                        if (target.replace) |old| {
+                            if (old.fences.len != old.ranges.len) return error.RestoreSourceProofMissing;
+                            if (old_index < old.ranges.len) {
+                                const range = old.ranges[old_index];
+                                const fence = for (old.fences) |item| {
+                                    if (item.owner_group_id == range.group_id) break item;
+                                } else return error.RestoreSourceProofMissing;
+                                break .{ .table = old.table, .range = range, .fence = fence };
+                            }
+                            old_index -= old.ranges.len;
+                        }
+                    } else null;
+                    if (selected) |old| {
+                        if (try self.source.getRestoreStagingReceipt(self.alloc, job.value.plan.id, phase, old.range.group_id, context)) |receipt| {
+                            self.alloc.free(receipt);
+                            owner_cursor += 1;
+                            continue;
+                        }
+                        _ = (try (self.table_writes orelse return error.UnsupportedOperation).batch(self.alloc, old.table.name, .{ .relational_topology = .{ .fence = old.fence, .action = if (phase == .cutover) .begin else .cancel } })) orelse return error.RestoreValidationPending;
+                        if (phase == .cutover) {
+                            var response = (try (self.table_reads orelse return error.UnsupportedOperation).topologyStatus(self.alloc, old.table.name, old.range.start_key, "{\"mode\":\"status\"}")) orelse return error.RestoreValidationPending;
+                            defer response.deinit(self.alloc);
+                            const status = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Observation, self.alloc, response.json, .{});
+                            defer status.deinit();
+                            if (status.value.fence == null or !status.value.fence.?.eql(old.fence)) return error.RestoreStagingScopeChanged;
+                            if (!status.value.drained) return error.RestoreValidationPending;
+                        }
+                        var digest: [32]u8 = undefined;
+                        var hash = std.crypto.hash.Blake3.init(.{});
+                        hash.update(if (phase == .cutover) "restore old owner frozen v1" else "restore old owner canceled v1");
+                        hash.update(&try old.fence.encode());
+                        hash.final(&digest);
+                        try self.stagingCommand(&job, if (phase == .cutover) .old_fenced else .canceled, .{ .group_id = old.range.group_id, .range_id = if (old.range.range_id == 0) old.range.group_id else old.range.range_id, .plan_digest = job.value.plan_digest, .completion_digest = digest }, context);
+                        owner_cursor += 1;
+                        continue;
+                    }
+                }
+                switch (phase) {
+                    .importing => return error.RestoreValidationPending,
+                    .validating => {
+                        const has_old = for (job.value.plan.targets) |target| {
+                            if (target.replace != null) break true;
+                        } else false;
+                        try self.stagingCommand(&job, if (has_old) .begin_cutover else .publish, null, context);
+                    },
+                    .cutover => try self.stagingCommand(&job, .publish, null, context),
+                    .canceling => {
+                        // Old-generation tombstones are required even when a
+                        // cutover begin reply was never observed.
+                        try self.stagingCommand(&job, .finish_cancel, null, context);
+                    },
+                    .published => {
+                        const resolved = try self.restore_job_store.recordStagingResolution(self.alloc, restore.job_id, restore.attempt_id, staging_attempt, .published);
+                        self.alloc.free(resolved);
+                        const statuses = try self.alloc.alloc(backups_api.ClusterTableRestoreStatus, table_names.len);
+                        defer self.alloc.free(statuses);
+                        for (table_names, statuses) |name, *status| {
+                            const present = for (job.value.plan.targets) |target| {
+                                if (std.mem.eql(u8, target.table.name, name)) break true;
+                            } else false;
+                            status.* = .{ .name = name, .status = if (present) "committed" else "skipped", .@"error" = null };
+                        }
+                        return backups_api.encodeClusterRestoreResponse(self.alloc, statuses);
+                    },
+                    .canceled => unreachable,
+                }
+                continue;
+            }
+            const target = job.value.plan.targets[target_index];
+            const range = target.ranges[range_index];
+            if (phase == .cutover) {
+                owner_cursor += 1;
+                continue;
+            }
+            if (phase != .published) {
+                if (try self.source.getRestoreStagingReceipt(self.alloc, job.value.plan.id, phase, range.group_id, context)) |receipt| {
+                    self.alloc.free(receipt);
+                    owner_cursor += 1;
+                    continue;
+                }
+            }
+            const scope = try stages.ownerScope(self.alloc, job.value.plan, job.value.plan_digest, target, range);
+            const artifact = for (target.source_artifacts) |item| {
+                if (item.target_group_id == range.group_id) break item;
+            } else return error.RestoreSourceProofMissing;
+            var request: owners.Request = .{ .scope = scope, .action = switch (phase) {
+                .importing => .import_page,
+                .validating => .validate,
+                .published => .publish,
+                .canceling => .cancel,
+                else => unreachable,
+            } };
+            if (phase == .importing) {
+                if (begun_group != range.group_id) {
+                    _ = try self.executeRestoreOwner(self.alloc, target.table.name, range.group_id, .{ .scope = scope, .action = .begin }, context);
+                    begun_group = range.group_id;
+                }
+                request.source = .{ .location = job.value.plan.source_location, .connection = job.value.plan.source_connection, .artifact = artifact };
+            }
+            const result = self.executeRestoreOwner(self.alloc, target.table.name, range.group_id, request, context) catch |err| {
+                if (@import("restore_source_errors.zig").permanent(err)) return error.BackupIntegrityFailure;
+                return @as(anyerror![]u8, err);
+            };
+            if (phase == .importing and result.phase == .importing) continue;
+            // Index readiness is a bounded owner job, not a single-call
+            // transition. Keep the imported generation hidden while it builds.
+            if (phase == .validating and result.phase == .imported) continue;
+            const expected_phase: @import("../storage/db/restore_staging.zig").Phase = switch (phase) {
+                .importing => .imported,
+                .validating => .validated,
+                .published => .published,
+                .canceling => .canceled,
+                else => unreachable,
+            };
+            if (result.phase != expected_phase) return error.RestoreStagingScopeChanged;
+            if (phase != .published) {
+                try self.stagingCommand(&job, switch (phase) {
+                    .importing => .imported,
+                    .validating => .validated,
+                    .canceling => .canceled,
+                    else => unreachable,
+                }, .{ .group_id = range.group_id, .range_id = if (range.range_id == 0) range.group_id else range.range_id, .plan_digest = job.value.plan_digest, .completion_digest = result.receipt }, context);
+            }
+            owner_cursor += 1;
+        }
+        if (owner_cursor != saved_owner_cursor or phase != saved_owner_phase) {
+            const checkpoint = try self.restore_job_store.recordStagingOwner(self.alloc, restore.job_id, restore.attempt_id, @intFromEnum(phase), @intCast(owner_cursor));
+            self.alloc.free(checkpoint);
+        }
+        return error.RestoreStagingYield;
+    }
+
+    fn executeRestoreOwner(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("restore_owner.zig").Request, context: api_operation.RequestContext) !@import("restore_owner.zig").Response {
+        try context.ensureActive();
+        // Standalone has no replicated placement catalog. The local owner
+        // receiver independently verifies the durable plan and exact scope.
+        if (self.cfg.deployment_mode == .standalone) return (self.cfg.restore_owner orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context);
+        var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
+        const router = self.cfg.session_router orelse fallback.router();
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.RestoreValidationPending;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => return (self.cfg.restore_owner orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context),
+            .remote => |remote| {
+                var client = @import("http_client.zig").ApiHttpClient.init(alloc, self.cfg.session_executor orelse return error.HttpExecutorUnavailable);
+                _ = client.withInternalServiceAuth(self.cfg.internal_service_secret, self.cfg.internal_service_issuer);
+                return client.fetchRestoreOwner(remote.base_uri, group_id, table_name, request, context);
+            },
+        }
+    }
+
+    fn admitStagedClusterRestore(self: *ApiHttpServer, req: backups_api.ClusterRestoreRequest, location: *backups_api.BackupLocation, manifest: *const backups_api.ClusterBackupManifest, names: []const []const u8, restore: RestoreCancellation, principal: []const u8) ![]u8 {
+        const driver = @import("restore_staging_driver.zig");
+        const stages = @import("../metadata/restore_staging.zig");
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const proof = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Job, a, manifest.cohort_json, .{ .allocate = .alloc_always });
+        if (!std.mem.eql(u8, proof.value.backup_id, req.backup_id)) return error.BackupIntegrityFailure;
+        const state_json = (try self.restore_job_store.load(self.alloc, restore.job_id)) orelse return error.RestoreJobFenced;
+        defer self.alloc.free(state_json);
+        const state = try std.json.parseFromSlice(restore_jobs.JobState, a, state_json, .{});
+        if (state.value.attempt_id != restore.attempt_id or state.value.phase != .running) return error.RestoreJobFenced;
+        const staging_attempt = if (state.value.staging_attempt_id == 0) restore.attempt_id else state.value.staging_attempt_id;
+        const id = try stages.idForAttempt(restore.job_id, staging_attempt);
+        var control = StagedRestoreControl{ .server = self, .restore = restore };
+        const context = control.context();
+        if (try self.source.getRestoreStaging(self.alloc, id, context)) |existing| {
+            defer self.alloc.free(existing);
+            return self.driveStagedRestore(restore, staging_attempt, existing, names);
+        }
+        const sources = try a.alloc(driver.SourceTable, names.len);
+        for (names, sources) |name, *source| {
+            const entry = backups_api.findClusterTable(manifest, name) orelse return error.InvalidRequest;
+            try self.authorizeClusterRestoreManifestDestinations(self.alloc, location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id, principal);
+            const table = try a.create(backups_api.TableBackupManifest);
+            table.* = try backups_api.readManifestFromLocationWithArtifactBackupId(a, location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id);
+            if (!std.mem.eql(u8, table.table_name, name)) return error.BackupIntegrityFailure;
+            try self.admitArtifactSources(.{}, try indexes_api.indexesConfigUsesArtifactSources(a, table.indexes_json));
+            source.* = try driver.cohortSource(a, proof.value, table);
+        }
+        var snapshot = (try self.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const manifest_json = try std.json.Stringify.valueAlloc(a, manifest.*, .{});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(manifest_json, &digest, .{});
+        const selection = try driver.buildPlan(a, id, digest, sources, snapshot.tables, snapshot.ranges, req.restore_mode orelse "fail_if_exists");
+        var plan = selection.plan orelse {
+            // No reservation or owner side effect exists. A skipped no-op is
+            // durably resolved before terminalizing the existing job.
+            if (state.value.staging_attempt_id != 0) return error.RestoreValidationPending;
+            const statuses = try a.alloc(backups_api.ClusterTableRestoreStatus, names.len);
+            for (names, statuses) |name, *status| status.* = .{ .name = name, .status = "skipped", .@"error" = null };
+            return backups_api.encodeClusterRestoreResponse(self.alloc, statuses);
+        };
+        plan.source_location = req.location;
+        plan.source_connection = req.connection orelse return error.InvalidRequest;
+        const authorizer: stored_destination_authorization.Authorizer = .{ .manager = self.cfg.user_manager, .auth_enabled = self.cfg.auth_enabled };
+        for (@constCast(plan.targets)) |*target| {
+            const fingerprint = try stored_destination_authorization.destinationConfigFingerprintAlloc(a, target.table.replication_sources_json, target.table.indexes_json);
+            const effective = try restoreDestinationPrincipal(a, target.table.replication_sources_json, target.table.indexes_json, if (principal.len != 0) fingerprint else "", principal);
+            target.table.replication_sources_json = try stored_destination_authorization.sealReplicationSourcesJsonForPrincipalAlloc(a, target.table.replication_sources_json, target.table.name, effective, authorizer);
+            target.table.indexes_json = try stored_destination_authorization.sealIndexesJsonForPrincipalAlloc(a, target.table.indexes_json, target.table.name, effective, authorizer);
+        }
+        for (@constCast(plan.targets)) |*target| if (target.replace) |*old| {
+            const fences = try a.alloc(@import("../storage/db/relational_integrity_topology.zig").Fence, old.ranges.len);
+            for (old.ranges, fences) |range, *fence| {
+                var response = (try (self.table_reads orelse return error.UnsupportedOperation).topologyStatus(self.alloc, old.table.name, range.start_key, "{\"mode\":\"identity\"}")) orelse return error.TableNotFound;
+                defer response.deinit(self.alloc);
+                const Identity = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+                const native = try std.json.parseFromSlice(Identity, a, response.json, .{ .ignore_unknown_fields = true });
+                fence.* = .{ .transition_id = backup_cohort_driver.idForAttempt(&id), .attempt = staging_attempt, .admission_epoch = native.value.next_epoch, .owner_group_id = range.group_id, .peer_group_id = range.group_id, .role = .backup_snapshot, .namespace = native.value.namespace, .catalog_digest = native.value.catalog_digest };
+            }
+            old.fences = fences;
+        };
+        try plan.validate(a);
+        const pinned_attempt = try self.restore_job_store.ensureStagingAttempt(self.alloc, restore.job_id, restore.attempt_id);
+        self.alloc.free(pinned_attempt);
+        const encoded = try std.json.Stringify.valueAlloc(a, stages.Command{ .id = id, .action = .reserve, .plan = plan }, .{});
+        const reserved = try self.source.applyRestoreStaging(self.alloc, encoded, context);
+        defer self.alloc.free(reserved);
+        return self.driveStagedRestore(restore, staging_attempt, reserved, names);
+    }
+
+    fn stagedRestoreError(err: anyerror) cluster_api_http.ClusterApi.ExecuteRestoreError {
+        return switch (err) {
+            error.RestoreStagingYield => error.RestoreStagingYield,
+            error.Cancelled => error.Cancelled,
+            error.RestoreJobFenced, error.NotLeader => error.NotLeader,
+            error.TableAlreadyExists => error.TableAlreadyExists,
+            error.RestoreDependencyMissing, error.InvalidRestoreMode, error.InvalidRestoreStaging, error.InvalidRestoreMigrationState, error.InvalidRequest => error.InvalidRequest,
+            error.BackupIntegrityFailure, error.BackupArtifactIntegrityMismatch, error.RestoreStagingScopeChanged, error.RestoreStagingFailed => error.BackupIntegrityFailure,
+            error.RestoreDestinationReauthorizationRequired, error.StoredDestinationAuthorizationRevoked => error.RestoreDestinationReauthorizationRequired,
+            else => error.RestoreValidationPending,
+        };
+    }
+
+    fn permanentStagingFailure(err: anyerror) bool {
+        return switch (err) {
+            error.BackupIntegrityFailure,
+            error.BackupArtifactIntegrityMismatch,
+            error.BackupSealMismatch,
+            error.RestoreStagingScopeChanged,
+            error.ForeignKeyParentMissing,
+            error.ForeignKeyReferenced,
+            error.UniqueConstraintViolation,
+            error.ForeignKeyMatchFullViolation,
+            error.ConstraintValidationFailed,
+            error.ConstraintActivationFailed,
+            => true,
+            else => false,
+        };
+    }
+
+    fn resolveStagedRestoreWithoutSource(self: *ApiHttpServer, state: restore_jobs.JobState) ![]u8 {
+        const stages = @import("../metadata/restore_staging.zig");
+        const restore: RestoreCancellation = .{ .job_id = state.job_id, .attempt_id = state.attempt_id };
+        var control = StagedRestoreControl{ .server = self, .restore = restore };
+        const context = control.context();
+        const id = try stages.idForAttempt(state.job_id, state.staging_attempt_id);
+        if (try self.source.getRestoreStaging(self.alloc, id, context)) |existing| {
+            defer self.alloc.free(existing);
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const parsed = try std.json.parseFromSlice(stages.Job, arena.allocator(), existing, .{});
+            const names = state.table_names orelse names: {
+                const values = try arena.allocator().alloc([]const u8, parsed.value.plan.targets.len + parsed.value.plan.skipped_tables.len);
+                for (parsed.value.plan.targets, values[0..parsed.value.plan.targets.len]) |target, *name| name.* = target.table.name;
+                @memcpy(values[parsed.value.plan.targets.len..], parsed.value.plan.skipped_tables);
+                break :names values;
+            };
+            return self.driveStagedRestore(restore, state.staging_attempt_id, existing, names);
+        }
+        if (!state.cancel_requested and state.staging_failure.len == 0) return error.RestoreValidationPending;
+        const command = try std.json.Stringify.valueAlloc(self.alloc, stages.Command{ .id = id, .action = .cancel_reservation }, .{});
+        defer self.alloc.free(command);
+        const result = try self.source.applyRestoreStaging(self.alloc, command, context);
+        self.alloc.free(result);
+        if (try self.source.getRestoreStaging(self.alloc, id, context)) |raced| {
+            self.alloc.free(raced);
+            return error.RestoreValidationPending;
+        }
+        const progress = (try self.source.getRestoreStagingProgress(self.alloc, id, context)) orelse return error.RestoreValidationPending;
+        if (progress.state != .canceled) return error.RestoreValidationPending;
+        const resolved = try self.restore_job_store.recordStagingResolution(self.alloc, state.job_id, state.attempt_id, state.staging_attempt_id, .canceled);
+        self.alloc.free(resolved);
+        return if (state.staging_failure.len == 0) error.Cancelled else error.RestoreStagingFailed;
+    }
 
     const RestoreRepairCancellation = struct {
         server: *ApiHttpServer,
@@ -14272,6 +15087,47 @@ pub const ApiHttpServer = struct {
         if (restore_connection.len == 0 or restore_connection.len > 256) return error.InvalidRequest;
         const restore_io = self.backupLocationIo(location) orelse return error.InternalFailure;
 
+        if (cancellation) |restore| {
+            const current = (self.restore_job_store.load(self.alloc, restore.job_id) catch return error.InternalFailure) orelse return error.NotLeader;
+            defer self.alloc.free(current);
+            const state = std.json.parseFromSlice(restore_jobs.JobState, self.alloc, current, .{}) catch return error.InternalFailure;
+            defer state.deinit();
+            if (state.value.staging_attempt_id != 0) {
+                const id = @import("../metadata/restore_staging.zig").idForAttempt(restore.job_id, state.value.staging_attempt_id) catch return error.InternalFailure;
+                var staged_control = StagedRestoreControl{ .server = self, .restore = restore };
+                if (self.source.getRestoreStaging(self.alloc, id, staged_control.context()) catch |err| return stagedRestoreError(err)) |existing| {
+                    defer self.alloc.free(existing);
+                    var arena = std.heap.ArenaAllocator.init(self.alloc);
+                    defer arena.deinit();
+                    const parsed = std.json.parseFromSlice(@import("../metadata/restore_staging.zig").Job, arena.allocator(), existing, .{}) catch return error.InternalFailure;
+                    const names = req.table_names orelse names: {
+                        const values = arena.allocator().alloc([]const u8, parsed.value.plan.targets.len + parsed.value.plan.skipped_tables.len) catch return error.InternalFailure;
+                        for (parsed.value.plan.targets, values[0..parsed.value.plan.targets.len]) |target, *name| name.* = target.table.name;
+                        @memcpy(values[parsed.value.plan.targets.len..], parsed.value.plan.skipped_tables);
+                        break :names values;
+                    };
+                    return self.driveStagedRestore(restore, state.value.staging_attempt_id, existing, names) catch |err| return stagedRestoreError(err);
+                }
+                // Fence absent reservations durably. A delayed reserve must
+                // not recreate targets after cancellation has terminalized.
+                if (state.value.cancel_requested or state.value.staging_failure.len != 0) {
+                    const command = std.json.Stringify.valueAlloc(self.alloc, @import("../metadata/restore_staging.zig").Command{ .id = id, .action = .cancel_reservation }, .{}) catch return error.InternalFailure;
+                    defer self.alloc.free(command);
+                    const result = self.source.applyRestoreStaging(self.alloc, command, staged_control.context()) catch |err| return stagedRestoreError(err);
+                    self.alloc.free(result);
+                    if (self.source.getRestoreStaging(self.alloc, id, staged_control.context()) catch |err| return stagedRestoreError(err)) |raced| {
+                        self.alloc.free(raced);
+                        return error.RestoreValidationPending;
+                    }
+                    const progress = (self.source.getRestoreStagingProgress(self.alloc, id, staged_control.context()) catch |err| return stagedRestoreError(err)) orelse return error.RestoreValidationPending;
+                    if (progress.state != .canceled) return error.RestoreValidationPending;
+                    const resolved = self.restore_job_store.recordStagingResolution(self.alloc, restore.job_id, restore.attempt_id, state.value.staging_attempt_id, .canceled) catch |err| return stagedRestoreError(err);
+                    self.alloc.free(resolved);
+                    return if (state.value.staging_failure.len == 0) error.Cancelled else error.BackupIntegrityFailure;
+                }
+            }
+        }
+
         try self.ensureRestoreActive(cancellation);
 
         // Restore treats the backup repository as immutable input. Every
@@ -14318,6 +15174,14 @@ pub const ApiHttpServer = struct {
             break :blk names;
         };
         if (table_names.len > restore_jobs.max_cluster_tables_per_job) return error.InvalidRequest;
+
+        if (manifest.cohort_json.len != 0) {
+            const restore = cancellation orelse return error.MethodNotAllowed;
+            return self.admitStagedClusterRestore(req, location, &manifest, table_names, restore, destination_authorization_principal) catch |err| return stagedRestoreError(err);
+        }
+        // Migrated legacy jobs must not fall through to in-place/predrop
+        // activation after HA promotion. Only scoped native staging is mirrored.
+        if (self.haMutationPolicy().failover_safe_mutations_only) return error.MethodNotAllowed;
 
         if (std.mem.eql(u8, restore_mode, "fail_if_exists")) {
             for (table_names, 0..) |table_name, table_index| {
@@ -14748,8 +15612,12 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    pub fn haCoordinatedRestoreAvailable(self: *const ApiHttpServer) bool {
+        return self.source.standalone_ha != null and self.cfg.restore_execution_guard != null and self.restore_job_store.replicated != null;
+    }
+
     fn restoreExecutionPermitted(self: *ApiHttpServer) bool {
-        if (self.haMutationPolicy().failover_safe_mutations_only) return false;
+        if (self.haMutationPolicy().failover_safe_mutations_only and !self.haCoordinatedRestoreAvailable()) return false;
         if (self.restore_dispatch_paused.load(.acquire)) return false;
         const guard = self.cfg.restore_execution_guard orelse return true;
         const term = self.restore_leadership_term.load(.acquire);
@@ -16326,6 +17194,8 @@ pub const ApiHttpServer = struct {
         idempotency_key: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
+        if (self.haMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted())
+            return try contextualJsonErrorResponse(self.alloc, 503, "HA restore authority is not ready");
         const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer parsed.deinit();
         backups_api.validateBackupId(parsed.value.backup_id) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup id");
@@ -16340,13 +17210,49 @@ pub const ApiHttpServer = struct {
         }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         defer location.deinit(self.alloc);
         self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
-        var manifest = backups_api.readManifestFromLocationWithArtifactBackupId(
-            self.alloc,
-            &location,
-            parsed.value.backup_id,
-            parsed.value.backup_id,
-        ) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup manifest");
+        var source_kind: restore_jobs.SourceKind = .table_snapshot;
+        var manifest = manifest: {
+            var independent = backups_api.readManifestFromLocationWithArtifactBackupId(self.alloc, &location, parsed.value.backup_id, parsed.value.backup_id) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup manifest"),
+            };
+            var independent_owned = independent != null;
+            defer if (independent_owned) independent.?.deinit(self.alloc);
+            var aggregate_source = backups_api.readClusterManifestFromLocation(self.alloc, &location, parsed.value.backup_id) catch |err| switch (err) {
+                error.FileNotFound => {
+                    independent_owned = false;
+                    break :manifest independent orelse return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup manifest");
+                },
+                else => return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup cohort manifest"),
+            };
+            defer aggregate_source.deinit(self.alloc);
+            if (independent) |value| {
+                // Table and cluster backup IDs historically occupy separate
+                // namespaces. An unrelated aggregate must not shadow an
+                // existing independent table snapshot. Only the explicit
+                // one-table adapter's matching entry upgrades its source kind.
+                if (backups_api.findClusterTable(&aggregate_source, table_name)) |selected| {
+                    if (aggregate_source.cohort_json.len != 0 and std.mem.eql(u8, selected.table_backup_id, parsed.value.backup_id) and std.mem.eql(u8, value.table_name, table_name)) source_kind = .cluster_cohort;
+                }
+                independent_owned = false;
+                break :manifest value;
+            }
+            if (aggregate_source.cohort_json.len == 0) return try contextualJsonErrorResponse(self.alloc, 409, "table restore requires a certified common-cut cohort");
+            const selected = backups_api.findClusterTable(&aggregate_source, table_name) orelse return try contextualJsonErrorResponse(self.alloc, 404, "backup does not contain the requested table");
+            const selected_manifest = backups_api.readManifestFromLocationWithArtifactBackupId(self.alloc, &location, selected.table_backup_id, selected.artifact_backup_id orelse selected.table_backup_id) catch
+                return try contextualJsonErrorResponse(self.alloc, 400, "invalid table artifact manifest");
+            source_kind = .cluster_cohort;
+            break :manifest selected_manifest;
+        };
         defer manifest.deinit(self.alloc);
+        if (self.haMutationPolicy().failover_safe_mutations_only and source_kind != .cluster_cohort)
+            return try contextualJsonErrorResponse(self.alloc, 409, "historical independent snapshots are not certified for HA restore; select a dependency-complete cohort");
+        if (source_kind == .cluster_cohort) {
+            @import("restore_staging_driver.zig").validateSelection(self.alloc, &.{.{ .source_table_id = manifest.table_id, .manifest = &manifest }}) catch |err| return try contextualJsonErrorResponse(self.alloc, 409, if (err == error.RestoreDependencyMissing)
+                "this table has foreign-key dependencies; use cluster restore with the complete dependency set from the same backup"
+            else
+                "invalid relational backup declarations");
+        }
         const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
             self.alloc,
             manifest.indexes_json,
@@ -16391,6 +17297,8 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(idempotency_namespace);
         const admission = self.restore_job_store.startRecoverable(self.alloc, .{
             .scope = .table,
+            .source_kind = source_kind,
+            .restore_mode = if (source_kind == .cluster_cohort) "overwrite" else "fail_if_exists",
             .table_name = table_name,
             .backup_id = parsed.value.backup_id,
             .location = parsed.value.location,
@@ -16421,6 +17329,8 @@ pub const ApiHttpServer = struct {
         idempotency_key: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
+        if (self.haMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted())
+            return try contextualJsonErrorResponse(self.alloc, 503, "HA restore metadata authority is not ready");
         var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer backups_api.freeClusterRestoreRequest(self.alloc, &req);
         const connection = req.connection orelse return try contextualJsonErrorResponse(self.alloc, 400, "restore requires a named external_io connection");
@@ -16434,6 +17344,18 @@ pub const ApiHttpServer = struct {
             .filesystem_io = self.sharedApiFilesystemIo(),
         }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         defer location.deinit(self.alloc);
+
+        if (self.haMutationPolicy().failover_safe_mutations_only) {
+            const restore_io = self.backupLocationIo(&location) orelse
+                return try contextualJsonErrorResponse(self.alloc, 503, "restore service unavailable");
+            var verification_cache: backups_api.ArtifactVerificationCache = .{};
+            defer verification_cache.deinit(self.alloc);
+            var manifest = backups_api.readClusterManifestForRestoreAdmissionWithCache(self.alloc, restore_io, &location, req.backup_id, &verification_cache) catch
+                return try contextualJsonErrorResponse(self.alloc, 400, "invalid cluster backup manifest");
+            defer manifest.deinit(self.alloc);
+            if (manifest.cohort_json.len == 0)
+                return try contextualJsonErrorResponse(self.alloc, 422, "HA restore requires a dependency-complete native cluster cohort");
+        }
 
         if (authenticated_identity) |identity| {
             const credential_supported = std.mem.startsWith(u8, identity.credential_principal, "basic:") or
@@ -16521,7 +17443,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn resumeRestoreJobsOnce(self: *ApiHttpServer) !void {
-        if (self.haMutationPolicy().failover_safe_mutations_only) return;
+        if (self.haMutationPolicy().failover_safe_mutations_only and !self.haCoordinatedRestoreAvailable()) return;
         if (self.restore_jobs_resumed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         self.schedulePendingRestoreJobs() catch |err| {
             self.restore_jobs_resumed.store(false, .release);
@@ -16775,6 +17697,32 @@ pub const ApiHttpServer = struct {
         const state = parsed.value;
         if (state.phase != .running or state.attempt_id != begin.attempt_id)
             return error.CorruptRestoreJobStore;
+        if (self.haMutationPolicy().failover_safe_mutations_only and state.scope != .cluster and state.source_kind != .cluster_cohort) {
+            const failed = try self.restore_job_store.fail(self.alloc, state, "HA restore requires a dependency-complete native cluster cohort");
+            self.alloc.free(failed);
+            return;
+        }
+        if (state.staging_attempt_id != 0 and (state.cancel_requested or state.staging_failure.len != 0 or state.staging_resolution == .published)) {
+            // Owner cleanup/publication never requires source repository
+            // credentials or availability after a staging attempt exists.
+            const result = self.resolveStagedRestoreWithoutSource(state) catch |err| {
+                if (err == error.Cancelled or err == error.RestoreStagingFailed) {
+                    const failed = try self.restore_job_store.fail(self.alloc, state, if (state.staging_failure.len != 0) state.staging_failure else @errorName(err));
+                    self.alloc.free(failed);
+                    return;
+                }
+                if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
+                const retry = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), if (err == error.RestoreStagingYield) 10 * std.time.ns_per_ms else restoreRepositoryRetryDelayNs(state.job_id, state.attempt_id));
+                self.alloc.free(retry);
+                self.signalRestoreRetryWakeup();
+                try self.ensureRestoreRetryWakeup();
+                return;
+            };
+            defer self.alloc.free(result);
+            const finished = try self.restore_job_store.finish(self.alloc, state, result);
+            self.alloc.free(finished);
+            return;
+        }
         var repair_cancellation = RestoreRepairCancellation{
             .server = self,
             .restore = .{ .job_id = state.job_id, .attempt_id = state.attempt_id },
@@ -16797,6 +17745,36 @@ pub const ApiHttpServer = struct {
             .table => blk: {
                 if (!self.restoreExecutionPermitted()) return error.RestoreJobFenced;
                 const table_name = state.table_name orelse return error.CorruptRestoreJobStore;
+                if (state.source_kind == .cluster_cohort) {
+                    const response = executePublicClusterRestoreWithCancellation(self, self.alloc, .{
+                        .backup_id = state.backup_id,
+                        .location = state.location,
+                        .connection = state.connection,
+                        .table_names = &.{table_name},
+                        .restore_mode = state.restore_mode,
+                    }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
+                        if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
+                        if (restoreJobErrorIsRetryable(err)) {
+                            const encoded = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), if (err == error.RestoreStagingYield) 10 * std.time.ns_per_ms else restoreRepositoryRetryDelayNs(state.job_id, state.attempt_id));
+                            self.alloc.free(encoded);
+                            self.signalRestoreRetryWakeup();
+                            try self.ensureRestoreRetryWakeup();
+                            return;
+                        }
+                        const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+                        self.alloc.free(failed);
+                        return;
+                    };
+                    defer self.alloc.free(response);
+                    var summary = try restore_jobs.summarizeClusterResultAlloc(self.alloc, response);
+                    defer summary.deinit(self.alloc);
+                    if (!summary.succeeded) {
+                        const failed = try self.restore_job_store.failWithResult(self.alloc, state, summary.encoded, "TableRestoreFailed");
+                        self.alloc.free(failed);
+                        return;
+                    }
+                    break :blk try backups_api.encodeRestoreTriggered(self.alloc);
+                }
                 var restored_via_metadata = false;
                 if (!restore_jobs.containsTableIndex(state.published_table_ranges orelse &.{}, 0)) {
                     if (!restore_jobs.tableAttempted(state, 0)) {
@@ -16909,7 +17887,7 @@ pub const ApiHttpServer = struct {
                 .restore_mode = state.restore_mode,
             }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                 if (restoreJobErrorIsRetryable(err)) {
-                    const retry_delay_ns = restoreRepositoryRetryDelayNs(
+                    const retry_delay_ns = if (err == error.RestoreStagingYield) 10 * std.time.ns_per_ms else restoreRepositoryRetryDelayNs(
                         state.job_id,
                         state.attempt_id,
                     );
@@ -17401,11 +18379,12 @@ fn restoreJobErrorIsFenced(err: anyerror) bool {
 
 fn restoreJobErrorIsRetryable(err: anyerror) bool {
     return err == error.BackupRepositoryBusy or
+        err == error.RestoreStagingYield or
         err == error.RestoreValidationPending;
 }
 
 fn restoreJobFailureRequiresRecovery(begin_established: bool, err: anyerror) bool {
-    return !begin_established or restoreJobErrorIsFenced(err);
+    return !begin_established or restoreJobErrorIsFenced(err) or err == error.RestoreStagingResolutionPending;
 }
 
 test "restore job ownership failures remain retryable" {
@@ -17416,6 +18395,173 @@ test "restore job ownership failures remain retryable" {
     try std.testing.expect(!restoreJobErrorIsFenced(error.InvalidArguments));
     try std.testing.expect(restoreJobFailureRequiresRecovery(false, error.OutOfMemory));
     try std.testing.expect(!restoreJobFailureRequiresRecovery(true, error.OutOfMemory));
+}
+
+pub const RestoreWorkerTestDriver = if (builtin.is_test) struct {
+    pub fn request(server: *ApiHttpServer, value: http_common.HttpRequest) !http_common.HttpResponse {
+        return executeHttpxTestRequest(server, value);
+    }
+    pub fn wait(alloc: std.mem.Allocator, server: *ApiHttpServer, admitted: []const u8) ![]u8 {
+        return waitForTerminalRestoreJobAlloc(alloc, server, admitted);
+    }
+    pub fn nodeConfig(alloc: std.mem.Allocator) !common_config.Config {
+        return testBackupNodeConfig(alloc);
+    }
+    pub fn work(server: *ApiHttpServer, job_id: u64) !void {
+        var attempt: u64 = 0;
+        var established = false;
+        server.runRestoreJob(job_id, &attempt, &established) catch |err| {
+            if (err == error.AsyncRestoreUnavailable) {
+                // This deterministic fixture drives the same durable FIFO
+                // itself instead of starting a production scheduler lane.
+                const bytes = (try server.restore_job_store.load(server.alloc, job_id)).?;
+                defer server.alloc.free(bytes);
+                var state = try std.json.parseFromSlice(restore_jobs.JobState, server.alloc, bytes, .{});
+                defer state.deinit();
+                try std.testing.expectEqual(restore_jobs.Phase.queued, state.value.phase);
+                return;
+            }
+            if (!restoreJobFailureRequiresRecovery(established, err)) return err;
+            _ = try server.restore_job_store.recoverDispatchedAttempt(server.alloc, job_id, attempt, @errorName(err));
+        };
+    }
+} else struct {};
+
+test "staged restore worker publishes a dependency complete mixed native cohort" {
+    try @import("restore_worker_fixture.zig").run(RestoreWorkerTestDriver, false);
+    try @import("restore_worker_fixture.zig").run(RestoreWorkerTestDriver, true);
+}
+
+test "staged restore worker rebuilds a dependency complete mixed portable cohort" {
+    try @import("restore_worker_fixture.zig").runWithPolicy(RestoreWorkerTestDriver, false, null, null, .{ .portable = true });
+    try @import("restore_worker_fixture.zig").runWithPolicy(RestoreWorkerTestDriver, true, null, null, .{ .portable = true });
+}
+
+test "staged table restore worker uses shared dependency complete cohort" {
+    for ([_]bool{ false, true }) |portable| {
+        try @import("restore_worker_fixture.zig").runWithPolicy(RestoreWorkerTestDriver, false, null, null, .{ .portable = portable, .table_restore = true });
+    }
+}
+
+test "staged restore worker preserves migration mappings and indexes after restart" {
+    for ([_]bool{ false, true }) |portable| {
+        try @import("restore_worker_fixture.zig").runWithPolicy(RestoreWorkerTestDriver, false, null, null, .{ .portable = portable, .migration = true, .restart_after_commit = true });
+    }
+}
+
+test "staged restore worker measures bounded LSM native and portable work" {
+    for ([_]bool{ false, true }) |portable| {
+        try @import("restore_worker_fixture.zig").runWithPolicy(RestoreWorkerTestDriver, false, null, null, .{ .portable = portable, .benchmark_rows = 256 });
+    }
+}
+
+test "staged restore worker recovers lost acknowledgements across owner restart matrix" {
+    for ([_]bool{ false, true }) |portable| for ([_]bool{ false, true }) |invalid_child| {
+        try @import("restore_worker_fixture.zig").runWithPolicy(RestoreWorkerTestDriver, invalid_child, null, null, .{ .portable = portable, .restart_after_commit = true });
+    };
+}
+
+test "staged restore published metadata wins cancellation only after every owner opens" {
+    const alloc = std.testing.allocator;
+    const stages = @import("../metadata/restore_staging.zig");
+    const owner_api = @import("restore_owner.zig");
+    const Fixture = struct {
+        calls: [129]usize = @splat(0),
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn localNode(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .active;
+        }
+        fn leader(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+        fn uri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, group: u64, request: owner_api.Request, context: api_operation.RequestContext) !owner_api.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            try std.testing.expectEqual(.publish, request.action);
+            const index = group - 701;
+            self.calls[index] += 1;
+            if (index == 128 and self.calls[index] == 1) return error.Timeout;
+            return .{ .phase = .published, .rows = 1, .receipt = @splat(9) };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const job_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-jobs", .{tmp.sub_path});
+    defer alloc.free(job_path);
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(alloc, .{
+        .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.execute },
+        .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.localNode, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_base_uri = Fixture.uri } },
+    }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
+    defer server.deinit();
+    server.restore_job_store.deinit();
+    server.restore_job_store = restore_jobs.Store.initWithIo(alloc, std.testing.io);
+    const job_store = try alloc.create(restore_jobs.OpenedStore);
+    job_store.* = try restore_jobs.OpenedStore.open(alloc, job_path);
+    try server.restore_job_store.attach(job_store);
+    const queued = try server.restore_job_store.start(alloc, .{ .scope = .cluster, .backup_id = "daily", .location = "s3://archive/daily", .connection = "archive", .idempotency_namespace = "principal:admin:cluster" });
+    defer alloc.free(queued);
+    const admitted = try std.json.parseFromSlice(restore_jobs.JobState, alloc, queued, .{});
+    defer admitted.deinit();
+    const running = (try server.restore_job_store.begin(alloc, admitted.value.job_id)).?;
+    defer alloc.free(running);
+    const worker = try std.json.parseFromSlice(restore_jobs.JobState, alloc, running, .{});
+    defer worker.deinit();
+    const pinned = try server.restore_job_store.ensureStagingAttempt(alloc, worker.value.job_id, worker.value.attempt_id);
+    alloc.free(pinned);
+    const canceled = (try server.restore_job_store.cancel(alloc, worker.value.job_id)).?;
+    alloc.free(canceled);
+    const id = try stages.idForAttempt(worker.value.job_id, worker.value.attempt_id);
+    var target: stages.Target = .{
+        .source_table_id = 9,
+        .table = .{ .table_id = 19, .name = "docs", .schema_json = "{}" },
+        .ranges = &.{ .{ .table_id = 19, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "", .end_key = "m" }, .{ .table_id = 19, .group_id = 702, .range_id = 702, .doc_identity_shard_id = 702, .doc_identity_range_id = 702, .start_key = "m" } },
+        .source_artifacts = &.{ .{ .target_group_id = 701, .source_namespace = .{ .table_id = 9, .shard_id = 101, .range_id = 101 }, .format = .native, .snapshot_path = "daily/101", .artifact_size_bytes = 1, .artifact_sha256 = @splat(3) }, .{ .target_group_id = 702, .source_namespace = .{ .table_id = 9, .shard_id = 102, .range_id = 102 }, .format = .native, .snapshot_path = "daily/102", .artifact_size_bytes = 1, .artifact_sha256 = @splat(4) } },
+    };
+    // More owners than a worker slice: durable prefix progress must prevent
+    // every retry from repeatedly consuming its budget on the first owners.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const ranges = try arena.allocator().alloc(metadata_table_manager.RangeRecord, 129);
+    const artifacts = try arena.allocator().alloc(stages.SourceArtifact, 129);
+    for (ranges, artifacts, 0..) |*range, *artifact, index| {
+        const group = 701 + @as(u64, @intCast(index));
+        range.* = .{ .table_id = 19, .group_id = group, .range_id = group, .doc_identity_shard_id = group, .doc_identity_range_id = group, .start_key = if (index == 0) "" else try std.fmt.allocPrint(arena.allocator(), "{d:0>4}", .{index}), .end_key = if (index == 128) null else try std.fmt.allocPrint(arena.allocator(), "{d:0>4}", .{index + 1}) };
+        artifact.* = .{ .target_group_id = group, .source_namespace = .{ .table_id = 9, .shard_id = group, .range_id = group }, .format = .native, .snapshot_path = "daily/owner", .artifact_size_bytes = 1, .artifact_sha256 = @splat(3) };
+    }
+    target.ranges = ranges;
+    target.source_artifacts = artifacts;
+    const job: stages.Job = .{ .plan = .{ .id = id, .cohort_digest = @splat(1), .targets = &.{target} }, .plan_digest = @splat(2), .state = .published };
+    const encoded = try std.json.Stringify.valueAlloc(alloc, job, .{});
+    defer alloc.free(encoded);
+    const restore: ApiHttpServer.RestoreCancellation = .{ .job_id = worker.value.job_id, .attempt_id = worker.value.attempt_id };
+    try std.testing.expectError(error.RestoreStagingYield, server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}));
+    try std.testing.expectError(error.RestoreStagingYield, server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}));
+    try std.testing.expectError(error.Timeout, server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}));
+    const incomplete = (try server.restore_job_store.load(alloc, worker.value.job_id)).?;
+    defer alloc.free(incomplete);
+    const progress = try std.json.parseFromSlice(restore_jobs.JobState, alloc, incomplete, .{});
+    defer progress.deinit();
+    try std.testing.expectEqual(.active, progress.value.staging_resolution);
+    const result = try server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"});
+    defer alloc.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "committed") != null);
+    const finished = try server.restore_job_store.finish(alloc, worker.value, result);
+    defer alloc.free(finished);
+    const final = try std.json.parseFromSlice(restore_jobs.JobState, alloc, finished, .{});
+    defer final.deinit();
+    try std.testing.expectEqual(.succeeded, final.value.phase);
+    try std.testing.expectEqual(.published, final.value.staging_resolution);
+    for (fixture.calls[0..128]) |count| try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls[128]);
 }
 
 test "restore admission unknown response preserves recovery without claiming acceptance" {
@@ -17509,6 +18655,7 @@ fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !contex
     return switch (err) {
         error.InvalidIdempotencyKey => try contextualJsonErrorResponse(alloc, 400, "invalid idempotency key"),
         error.IdempotencyConflict => try contextualJsonErrorResponse(alloc, 409, "idempotency key reused for a different restore"),
+        error.RestoreStagingPrincipalImmutable => try contextualJsonErrorResponse(alloc, 409, "restore targets are reserved under a different principal; cancel this restore and start a new restore to change its authorization identity"),
         error.AsyncRestoreUnavailable => try contextualJsonErrorResponse(alloc, 503, "asynchronous restore worker unavailable"),
         error.RestoreJobPersistenceUnavailable => try contextualJsonErrorResponse(alloc, 503, "durable restore store unavailable"),
         error.RestoreJobCapacityExceeded => try contextualJsonErrorResponse(alloc, 503, "restore job history is at capacity"),
@@ -19922,6 +21069,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchRelationalRowsQuery(path)) |rows| return try tablePermission(alloc, rows.table_name, .read);
     if (routes.Routes.matchRelationalRowsMutation(path)) |rows| return try tablePermission(alloc, rows.table_name, .write);
     if (routes.Routes.matchRelationalConstraintStatus(path)) |status| return try tablePermission(alloc, status.table_name, .admin);
+    if (routes.Routes.matchRelationalConstraintRecovery(path)) |recovery| return try tablePermission(alloc, recovery.table_name, .admin);
     if (routes.Routes.matchTableDocumentArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
         .GET => .read,
         .POST, .PUT, .DELETE => return null,
@@ -40466,6 +41614,17 @@ test "api http server serves table metadata routes against real metadata service
             .cancellation = CancellationToken.fromAtomic(&canceled_linearizable_read),
         }),
     );
+    // Private lifecycle readers and CAS must retain the same request boundary;
+    // none may outlive cancellation merely because they bypass public routing.
+    const canceled_context: api_operation.RequestContext = .{
+        .cancellation = CancellationToken.fromAtomic(&canceled_linearizable_read),
+    };
+    const canceled_source = StatusSource.fromMetadataService(&svc);
+    try std.testing.expectError(error.Canceled, canceled_source.getBackupCohort(std.testing.allocator, 1, canceled_context));
+    try std.testing.expectError(error.Canceled, canceled_source.listBackupCohorts(std.testing.allocator, null, 1, canceled_context));
+    try std.testing.expectError(error.Canceled, canceled_source.compareAndSetBackupCohort(std.testing.allocator, .{ .job_id = 1, .expected_revision = 0, .value = "{}" }, canceled_context));
+    try std.testing.expectError(error.Canceled, canceled_source.getRestoreStaging(std.testing.allocator, @splat(1), canceled_context));
+    try std.testing.expectError(error.Canceled, canceled_source.getRestoreStagingReceipt(std.testing.allocator, @splat(1), .importing, 301, canceled_context));
 
     _ = try svc.ensureMetadataReplica(.{
         .group_id = 1988,

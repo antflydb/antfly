@@ -335,14 +335,18 @@ pub const Reference = struct {
     }
 };
 
+pub const ClaimOwner = struct { parent_table: []const u8, parent_key: []const u8 };
+
 pub const Command = struct {
     address: Address,
     operation: union(enum) {
         establish: Claim,
-        check_owner: struct { parent_table: []const u8, parent_key: []const u8 },
+        check_owner: ClaimOwner,
         attach: Reference,
         detach: Reference,
-        release: struct { parent_table: []const u8, parent_key: []const u8 },
+        repair_detach: Reference,
+        release: ClaimOwner,
+        repair_release: ClaimOwner,
         start_action: struct { parent_table: []const u8, parent_key: []const u8, action: Action, action_id: Generation, target_tuple: ?[]const u8 = null, parent_version: u64, parent_schema_version: u32, parent_value: ?[]const u8 = null },
         finish_action: Generation,
         advance_validation: struct { action_id: Generation, expected_cursor: []const u8, expected_rows: u64, cursor: []const u8, rows: u64, complete: bool, failure: ?[]const u8 = null },
@@ -364,13 +368,13 @@ pub fn commandAdmissionBytes(command: Command) !usize {
         .establish => |claim| for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| {
             bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
         },
-        .attach, .detach => |reference| for ([_][]const u8{ reference.child_table, reference.child_key, reference.constraint_name }) |field| {
+        .attach, .detach, .repair_detach => |reference| for ([_][]const u8{ reference.child_table, reference.child_key, reference.constraint_name }) |field| {
             bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
         },
         .check_owner => |owner| {
             bytes = std.math.add(usize, owner.parent_table.len, owner.parent_key.len) catch return error.TransactionTooLarge;
         },
-        .release => |owner| {
+        .release, .repair_release => |owner| {
             bytes = std.math.add(usize, owner.parent_table.len, owner.parent_key.len) catch return error.TransactionTooLarge;
         },
         .start_action => |action| for ([_][]const u8{ action.parent_table, action.parent_key, action.target_tuple orelse "", action.parent_value orelse "" }) |field| {
@@ -532,12 +536,14 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
     var builder: Builder = .{ .alloc = owned, .retained_bytes = admission_bytes };
     // Detaches first make RESTRICT independent of caller row ordering. They
     // may not create a nonexistent parent; creation/attachment remain ordered.
-    for (commands) |command| if (command.operation == .detach) {
+    for (commands) |command| if (command.operation == .detach or command.operation == .repair_detach) {
         const claim_key = command.address.claimKey();
-        const raw = try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing;
-        _ = try Claim.decode(&claim_key, raw);
+        const raw = try builder.current(txn, &claim_key);
+        if (raw) |bytes| {
+            _ = try Claim.decode(&claim_key, bytes);
+        } else if (command.operation == .detach) return error.ForeignKeyParentMissing;
         try builder.add(txn, command.address, &claim_key, .guard, null);
-        const reference = command.operation.detach;
+        const reference = if (command.operation == .detach) command.operation.detach else command.operation.repair_detach;
         const reference_key = try reference.key(command.address);
         if (try builder.current(txn, &reference_key)) |old| _ = try Reference.decode(&reference_key, old);
         try builder.add(txn, command.address, &reference_key, .delete, null);
@@ -548,9 +554,9 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
     for (0..5) |phase| {
         for (commands) |command| {
             const command_phase: usize = switch (command.operation) {
-                .detach => continue,
+                .detach, .repair_detach => continue,
                 .check_owner => 0,
-                .release => 1,
+                .release, .repair_release => 1,
                 .establish => 2,
                 .attach => 3,
                 else => 4,
@@ -559,7 +565,7 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
             const address = command.address;
             const claim_key = address.claimKey();
             switch (command.operation) {
-                .detach => {},
+                .detach, .repair_detach => {},
                 .check_owner => |owner| {
                     const claim = try Claim.decode(&claim_key, try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing);
                     try requireOwner(claim, owner.parent_table, owner.parent_key);
@@ -595,9 +601,21 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
                     }
                     try builder.add(txn, address, &reference_key, .put, encoded_reference);
                 },
-                .release => |owner| {
-                    const raw = try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing;
+                .release, .repair_release => |owner| {
+                    const raw = try builder.current(txn, &claim_key) orelse {
+                        if (command.operation != .repair_release) return error.ForeignKeyParentMissing;
+                        try builder.add(txn, address, &claim_key, .guard, null);
+                        continue;
+                    };
                     const claim = try Claim.decode(&claim_key, raw);
+                    if (command.operation == .repair_release and
+                        (!std.mem.eql(u8, claim.parent_table, owner.parent_table) or !std.mem.eql(u8, claim.parent_key, owner.parent_key)))
+                    {
+                        // Partial activation may have assigned this duplicate's
+                        // tuple to another row. Repair must preserve that owner.
+                        try builder.add(txn, address, &claim_key, .guard, null);
+                        continue;
+                    }
                     try requireOwner(claim, owner.parent_table, owner.parent_key);
                     if (claim.state != .live) return error.ForeignKeyActionInProgress;
                     try builder.requireEmpty(txn, address);

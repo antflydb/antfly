@@ -246,6 +246,36 @@ pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Repair version-conditional rows after failed constraint activation
+pub const RepairRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for repairRelationalConstraints.
+pub fn parseRepairRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retire unique and foreign-key definitions safely
+pub const RetireRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retireRelationalConstraints.
+pub fn parseRetireRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetirementRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetirementRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Restart failed UNIQUE/FK validation after administrative repair
+pub const RetryRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retryRelationalConstraints.
+pub fn parseRetryRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetryRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Read distributed unique and foreign-key validation coverage
 pub const GetRelationalConstraintStatusPathParams = struct {
     table_name: []const u8,
@@ -617,6 +647,9 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/repair", .operation_id = "repairRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/retire", .operation_id = "retireRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/retry", .operation_id = "retryRelationalConstraints", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/constraints/status", .operation_id = "getRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/destination-authorization", .operation_id = "reauthorizeTableDestinations", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys", .request_body = .buffered, .streaming_response = true },
@@ -699,6 +732,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "cancelDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'cancelDocumentArtifactReprocessJob'");
         if (!@hasDecl(Impl, "backupTable")) @compileError("ServerRouter: Impl missing required method 'backupTable'");
         if (!@hasDecl(Impl, "batchWrite")) @compileError("ServerRouter: Impl missing required method 'batchWrite'");
+        if (!@hasDecl(Impl, "repairRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'repairRelationalConstraints'");
+        if (!@hasDecl(Impl, "retireRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'retireRelationalConstraints'");
+        if (!@hasDecl(Impl, "retryRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'retryRelationalConstraints'");
         if (!@hasDecl(Impl, "getRelationalConstraintStatus")) @compileError("ServerRouter: Impl missing required method 'getRelationalConstraintStatus'");
         if (!@hasDecl(Impl, "reauthorizeTableDestinations")) @compileError("ServerRouter: Impl missing required method 'reauthorizeTableDestinations'");
         if (!@hasDecl(Impl, "scanKeys")) @compileError("ServerRouter: Impl missing required method 'scanKeys'");
@@ -779,6 +815,9 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId/cancel", httpx.Handler.bind(self.impl, cancelDocumentArtifactReprocessJob));
             try server.post("/tables/:tableName/backup", httpx.Handler.bind(self.impl, backupTable));
             try server.post("/tables/:tableName/batch", httpx.Handler.bind(self.impl, batchWrite));
+            try server.post("/tables/:tableName/constraints/repair", httpx.Handler.bind(self.impl, repairRelationalConstraints));
+            try server.post("/tables/:tableName/constraints/retire", httpx.Handler.bind(self.impl, retireRelationalConstraints));
+            try server.post("/tables/:tableName/constraints/retry", httpx.Handler.bind(self.impl, retryRelationalConstraints));
             try server.get("/tables/:tableName/constraints/status", httpx.Handler.bind(self.impl, getRelationalConstraintStatus));
             try server.post("/tables/:tableName/destination-authorization", httpx.Handler.bind(self.impl, reauthorizeTableDestinations));
             try server.post("/tables/:tableName/documents", httpx.Handler.bind(self.impl, scanKeys));
@@ -1058,6 +1097,27 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn batchWrite(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.batchWrite(ctx, table_name);
+        }
+
+        /// Repair version-conditional rows after failed constraint activation
+        /// POST /tables/{tableName}/constraints/repair
+        fn repairRelationalConstraints(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.repairRelationalConstraints(ctx, table_name);
+        }
+
+        /// Retire unique and foreign-key definitions safely
+        /// POST /tables/{tableName}/constraints/retire
+        fn retireRelationalConstraints(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.retireRelationalConstraints(ctx, table_name);
+        }
+
+        /// Restart failed UNIQUE/FK validation after administrative repair
+        /// POST /tables/{tableName}/constraints/retry
+        fn retryRelationalConstraints(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.retryRelationalConstraints(ctx, table_name);
         }
 
         /// Read distributed unique and foreign-key validation coverage
@@ -1377,6 +1437,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn cancelDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn repairRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn retireRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn retryRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reauthorizeTableDestinations(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

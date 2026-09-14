@@ -112,3 +112,25 @@ def test_generated_row_query_returns_ndjson_text_without_number_coercion() -> No
         _parse_response(client=Client(base_url="http://example.invalid"), response=httpx.Response(200, text=page))
         == page
     )
+
+
+def test_generated_constraint_recovery_routes_and_acceptance() -> None:
+    from antfly.client_generated.api.data_operations.retire_relational_constraints import _get_kwargs, _parse_response
+    from antfly.client_generated.api.data_operations.retry_relational_constraints import _get_kwargs as retry_kwargs
+    from antfly.client_generated.client import Client
+    from antfly.client_generated.models.relational_constraint_retirement_request import (
+        RelationalConstraintRetirementRequest,
+    )
+    from antfly.client_generated.models.relational_constraint_retry_request import RelationalConstraintRetryRequest
+
+    request = RelationalConstraintRetirementRequest(schema_version=7, drop=True)
+    encoded = _get_kwargs("parent table", body=request)
+    assert encoded["url"] == "/db/v1/tables/parent%20table/constraints/retire"
+    assert encoded["json"] == {"schema_version": 7, "drop": True}
+    assert retry_kwargs("parents", body=RelationalConstraintRetryRequest(schema_version=7))["json"] == {
+        "schema_version": 7
+    }
+    accepted = _parse_response(
+        client=Client(base_url="http://example.invalid"), response=httpx.Response(202, json={"status": "accepted"})
+    )
+    assert accepted.to_dict() == {"status": "accepted"}

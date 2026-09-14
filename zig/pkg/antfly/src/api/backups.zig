@@ -49,6 +49,8 @@ pub const ClusterBackupRequest = struct {
     connection: ?[]const u8 = null,
     format: BackupFormat = .portable,
     table_names: ?[]const []const u8 = null,
+    /// Internal table endpoint adapter; never accepted by public JSON parsing.
+    single_table_manifest_id: ?[]const u8 = null,
 };
 pub const ClusterRestoreRequest = struct {
     backup_id: []const u8,
@@ -3575,6 +3577,9 @@ pub const ClusterBackupManifest = struct {
     expected_table_count: usize = 0,
     completed_table_count: usize = 0,
     tables: []const ClusterTableBackupEntry,
+    /// Canonical metadata-issued common-cut proof. Empty identifies an older
+    /// independent-table backup and cannot authorize coordinated restoration.
+    cohort_json: []const u8 = "",
     installed_extensions: []extension_domain.InstalledExtension = &.{},
     extension_members: []extension_domain.ExtensionMember = &.{},
     extension_dependencies: []extension_domain.ExtensionDependency = &.{},
@@ -3584,6 +3589,7 @@ pub const ClusterBackupManifest = struct {
         alloc.free(@constCast(self.timestamp));
         alloc.free(@constCast(self.location));
         alloc.free(@constCast(self.antfly_version));
+        if (self.cohort_json.len != 0) alloc.free(@constCast(self.cohort_json));
         for (self.tables) |table| {
             var owned = table;
             owned.deinit(alloc);
@@ -3996,6 +4002,7 @@ pub fn createManifest(
         .format = format,
         .backup_id = owned_backup_id,
         .table_name = owned_table_name,
+        .table_id = table.table_id,
         .description = owned_description,
         .schema_json = owned_schema_json,
         .read_schema_json = owned_read_schema_json,
@@ -7665,6 +7672,21 @@ pub fn commitClusterBackupAttemptHeadIfOwned(
     );
 }
 
+test "cluster backup format one-table adapter keeps artifact IDs isolated" {
+    const alloc = std.testing.allocator;
+    const marker: ClusterBackupAttemptMarker = .{ .attempt_id = "attempt", .cluster_backup_id = "daily", .created_at_unix_ns = 1, .format = .native, .tables = &.{.{ .name = "docs", .table_backup_id = "daily", .artifact_backup_id = "artifact" }} };
+    try validateClusterBackupAttemptMarker(alloc, &marker, "attempt");
+    var manifest: ClusterBackupManifest = .{ .backup_id = "daily", .timestamp = "now", .location = "file:///archive", .antfly_version = "test", .expected_table_count = 1, .completed_table_count = 1, .tables = &.{.{ .name = "docs", .table_backup_id = "daily", .artifact_backup_id = "artifact" }}, .cohort_json = "{}" };
+    try validateClusterManifest(alloc, &manifest, "daily");
+    manifest.cohort_json = "";
+    try std.testing.expectError(error.InvalidBackupRequest, validateClusterManifest(alloc, &manifest, "daily"));
+    var collision = marker;
+    collision.tables = &.{.{ .name = "docs", .table_backup_id = "daily", .artifact_backup_id = "attempt" }};
+    try std.testing.expectError(error.InvalidBackupRequest, validateClusterBackupAttemptMarker(alloc, &collision, "attempt"));
+    collision.tables = &.{ .{ .name = "docs", .table_backup_id = "daily", .artifact_backup_id = "artifact" }, .{ .name = "other", .table_backup_id = "other", .artifact_backup_id = "another-artifact" } };
+    try std.testing.expectError(error.InvalidBackupRequest, validateClusterBackupAttemptMarker(alloc, &collision, "attempt"));
+}
+
 fn validateClusterBackupAttemptMarker(
     alloc: std.mem.Allocator,
     marker: *const ClusterBackupAttemptMarker,
@@ -7701,7 +7723,7 @@ fn validateClusterBackupAttemptMarker(
         try validateBackupId(table.artifact_backup_id);
         if (std.mem.eql(u8, table.table_backup_id, table.artifact_backup_id) or
             table_names.contains(table.name) or
-            ids.contains(table.table_backup_id) or
+            (ids.contains(table.table_backup_id) and !(marker.tables.len == 1 and std.mem.eql(u8, table.table_backup_id, marker.cluster_backup_id))) or
             ids.contains(table.artifact_backup_id))
         {
             return error.InvalidBackupRequest;
@@ -10439,6 +10461,27 @@ pub fn cleanupClusterBackupAttemptByIdAtLocation(
     );
 }
 
+/// Common-cut native pin recovery shares the existing repository writer fence.
+/// True proves this attempt cannot subsequently publish, including a delayed
+/// writer. A missing manifest alone is never such a proof.
+pub fn fenceUnpublishedCohortAttempt(alloc: std.mem.Allocator, io: std.Io, location: *BackupLocation, backup_id: []const u8, attempt_id: []const u8, now_unix_ns: u64) !bool {
+    if (try clusterManifestExistsAtLocationWithIo(alloc, io, location, backup_id)) return false;
+    var marker = readClusterBackupAttemptMarker(alloc, io, location, attempt_id) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return err,
+    };
+    defer marker.deinit();
+    if (!std.mem.eql(u8, marker.value.cluster_backup_id, backup_id)) return error.InvalidBackupAttemptMarker;
+    var budget: usize = backup_attempt_cleanup_object_budget;
+    _ = try reclaimClusterBackupAttemptMarker(alloc, io, location, &marker.value, now_unix_ns, null, &budget);
+    var remaining = readClusterBackupAttemptMarker(alloc, io, location, attempt_id) catch |err| switch (err) {
+        error.FileNotFound => return !try clusterManifestExistsAtLocationWithIo(alloc, io, location, backup_id),
+        else => return err,
+    };
+    remaining.deinit();
+    return false;
+}
+
 fn cleanupClusterBackupAttemptIncrementally(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -12360,7 +12403,7 @@ fn validateClusterManifest(
         try validateBackupId(table.table_backup_id);
         if (table.artifact_backup_id) |artifact_backup_id|
             try validateBackupId(artifact_backup_id);
-        if (std.mem.eql(u8, table.table_backup_id, manifest.backup_id) or
+        if ((std.mem.eql(u8, table.table_backup_id, manifest.backup_id) and !(manifest.tables.len == 1 and manifest.cohort_json.len != 0)) or
             table_names.contains(table.name) or
             table_backup_ids.contains(table.table_backup_id))
         {
@@ -14044,6 +14087,49 @@ pub fn readFileFromLocationUsingIoLimited(
 /// Copies exactly one manifest-declared artifact directly into an unpublished
 /// generation. Size and digest are checked against the bytes written, and a
 /// remote object's immutable identity is pinned across bounded range reads.
+/// A bounded transfer primitive shared by restartable materializers. The
+/// caller owns the returned bytes and pins the final file digest from the
+/// authenticated manifest; provider ETags additionally fence each range read.
+pub fn readFileRangeFromLocationUsingIo(alloc: std.mem.Allocator, io: std.Io, location: *BackupLocation, relative_path: []const u8, expected_size: u64, offset: u64, maximum: usize, cancellation: CancellationToken) ![]u8 {
+    try cancellation.check();
+    try validateArtifactRelativePath(relative_path);
+    if (offset > expected_size or maximum == 0 or maximum > 8 * 1024 * 1024) return error.InvalidBackupRange;
+    const wanted: usize = @intCast(@min(expected_size - offset, maximum));
+    if (wanted == 0) return alloc.alloc(u8, 0);
+    switch (location.*) {
+        .file => |root| {
+            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, relative_path });
+            defer alloc.free(path);
+            const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+            defer file.close(io);
+            if ((try file.stat(io)).size != expected_size) return error.SourceFileChanged;
+            const result = try alloc.alloc(u8, wanted);
+            errdefer alloc.free(result);
+            if (try file.readPositionalAll(io, result, offset) != wanted) return error.SourceFileChanged;
+            try cancellation.check();
+            return result;
+        },
+        .remote => |*store| {
+            const key = try store.keyAlloc(alloc, relative_path);
+            defer alloc.free(key);
+            var metadata = try store.client.statObject(store.bucket, key);
+            defer metadata.deinit(alloc);
+            if (metadata.content_length != expected_size) return error.SourceFileChanged;
+            const etag = metadata.etag orelse return error.RestoreArtifactIdentityMissing;
+            var result = try store.client.getObject(store.bucket, key, .{
+                .range = .{ .offset = offset, .length = wanted },
+                .if_match_etag = etag,
+                .skip_metadata_probe = true,
+                .max_response_bytes = wanted,
+                .cancellation = object_storage.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+            });
+            defer result.deinit(alloc);
+            if (result.body.len != wanted) return error.SourceFileChanged;
+            return alloc.dupe(u8, result.body);
+        },
+    }
+}
+
 pub fn copyFileFromLocationVerifiedUsingIo(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -14730,6 +14816,7 @@ fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupManif
         .artifact_integrity_mode = manifest.artifact_integrity_mode,
         .backup_id = try alloc.dupe(u8, manifest.backup_id),
         .table_name = try alloc.dupe(u8, manifest.table_name),
+        .table_id = manifest.table_id,
         .description = try alloc.dupe(u8, manifest.description),
         .schema_json = try alloc.dupe(u8, manifest.schema_json),
         .read_schema_json = try alloc.dupe(u8, manifest.read_schema_json),
@@ -14795,6 +14882,7 @@ fn cloneClusterBackupManifest(alloc: std.mem.Allocator, manifest: ClusterBackupM
         .timestamp = try alloc.dupe(u8, manifest.timestamp),
         .location = try alloc.dupe(u8, manifest.location),
         .antfly_version = try alloc.dupe(u8, manifest.antfly_version),
+        .cohort_json = if (manifest.cohort_json.len != 0) try alloc.dupe(u8, manifest.cohort_json) else "",
         .expected_table_count = manifest.expected_table_count,
         .completed_table_count = manifest.completed_table_count,
         .tables = tables,

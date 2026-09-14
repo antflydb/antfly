@@ -442,6 +442,7 @@ pub const DocStore = struct {
     });
 
     pub const Txn = struct {
+        mutation_capture: ?*@import("txn_mutation_capture.zig").Capture = null,
         payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
         raw: ?LmdbTransaction = null,
@@ -635,6 +636,7 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
+            if (self.mutation_capture) |capture| try capture.touch(key);
             try self.markColumnarDirty(key, value);
             try self.invalidateColumns(key);
             if (supports_lmdb) {
@@ -649,6 +651,7 @@ pub const DocStore = struct {
         }
 
         pub fn delete(self: *Txn, key: []const u8) !void {
+            if (self.mutation_capture) |capture| try capture.touch(key);
             try self.markColumnarDirty(key, null);
             try self.invalidateColumns(key);
             if (supports_lmdb) {

@@ -21,6 +21,7 @@
 pub const cluster = @import("cluster.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
+pub const restore_owner = @import("restore_owner.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");

@@ -661,11 +661,26 @@ func (c *AntflyClient) QueryRelationalRows(ctx context.Context, tableName string
 // MutateRelationalRows atomically replaces/deletes rows with exact row-version
 // and schema-epoch preconditions. It never retries an ambiguous commit.
 func (c *AntflyClient) MutateRelationalRows(ctx context.Context, tableName string, request RelationalRowMutationRequest) (*BatchResult, error) {
+	return c.mutateRelationalRows(ctx, tableName, request, false)
+}
+
+// RepairRelationalConstraints repairs failed activation rows without bypassing
+// new-value integrity checks. It requires administrator permission.
+func (c *AntflyClient) RepairRelationalConstraints(ctx context.Context, tableName string, request RelationalRowMutationRequest) (*BatchResult, error) {
+	return c.mutateRelationalRows(ctx, tableName, request, true)
+}
+
+func (c *AntflyClient) mutateRelationalRows(ctx context.Context, tableName string, request RelationalRowMutationRequest, repair bool) (*BatchResult, error) {
 	body, err := boundedJSONBody(request, DefaultWriteMaxRequestBytes)
 	if err != nil {
 		return nil, fmt.Errorf("encoding relational mutations: %w", err)
 	}
-	resp, err := c.client.MutateRelationalRowsWithBody(ctx, tableName, "application/json", body)
+	var resp *http.Response
+	if repair {
+		resp, err = c.client.RepairRelationalConstraintsWithBody(ctx, tableName, "application/json", body)
+	} else {
+		resp, err = c.client.MutateRelationalRowsWithBody(ctx, tableName, "application/json", body)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("mutating relational rows: %w", err)
 	}
@@ -690,6 +705,50 @@ func (c *AntflyClient) MutateRelationalRows(ctx context.Context, tableName strin
 		} else {
 			result.Status = "committed"
 		}
+	}
+	return &result, nil
+}
+
+// RetryRelationalConstraints idempotently restarts failed owner validation.
+// Acceptance is not completion; inspect the constraint status endpoint afterward.
+func (c *AntflyClient) RetryRelationalConstraints(ctx context.Context, tableName string, request RelationalConstraintRetryRequest) (*RelationalConstraintRetryResponse, error) {
+	return c.relationalConstraintLifecycle(ctx, tableName, request, false)
+}
+
+// RetireRelationalConstraints starts a durable constraint drain. With Drop,
+// the table remains intact until explicitly deleted after ready_to_drop.
+func (c *AntflyClient) RetireRelationalConstraints(ctx context.Context, tableName string, request RelationalConstraintRetirementRequest) (*RelationalConstraintRetryResponse, error) {
+	return c.relationalConstraintLifecycle(ctx, tableName, request, true)
+}
+
+func (c *AntflyClient) relationalConstraintLifecycle(ctx context.Context, tableName string, request any, retire bool) (*RelationalConstraintRetryResponse, error) {
+	body, err := boundedJSONBody(request, DefaultWriteMaxRequestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("encoding constraint retry: %w", err)
+	}
+	var resp *http.Response
+	if retire {
+		resp, err = c.client.RetireRelationalConstraintsWithBody(ctx, tableName, "application/json", body)
+	} else {
+		resp, err = c.client.RetryRelationalConstraintsWithBody(ctx, tableName, "application/json", body)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("retrying constraints: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		return nil, fmt.Errorf("retrying constraints: %w", readErrorResponse(resp))
+	}
+	encoded, truncated, err := readLimitedBody(resp.Body, DefaultWriteMaxResponseBytes)
+	if err != nil || truncated {
+		return nil, fmt.Errorf("reading constraint retry response (truncated=%t): %v", truncated, err)
+	}
+	var result RelationalConstraintRetryResponse
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		return nil, fmt.Errorf("decoding constraint retry: %w", err)
+	}
+	if result.Status != "accepted" {
+		return nil, fmt.Errorf("unexpected constraint retry status %q", result.Status)
 	}
 	return &result, nil
 }

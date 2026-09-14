@@ -167,6 +167,14 @@ export type RelationalRowQueryRequest = components["schemas"]["RelationalRowQuer
 export type RelationalRowMutation = components["schemas"]["RelationalRowMutation"];
 export type RelationalRowMutationRequest = components["schemas"]["RelationalRowMutationRequest"];
 export type RelationalConstraintStatus = components["schemas"]["RelationalConstraintStatus"];
+export type RelationalConstraintRetryRequest =
+  components["schemas"]["RelationalConstraintRetryRequest"];
+export type RelationalConstraintRetirementRequest =
+  components["schemas"]["RelationalConstraintRetirementRequest"];
+export type RelationalConstraintRetirementStatus =
+  components["schemas"]["RelationalConstraintRetirementStatus"];
+export type RelationalConstraintRetryResponse =
+  components["schemas"]["RelationalConstraintRetryResponse"];
 export type RelationalConstraintRangeStatus =
   components["schemas"]["RelationalConstraintRangeStatus"];
 export type RelationalConstraintConflictReason =

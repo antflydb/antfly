@@ -119,11 +119,13 @@ pub const OwnedLookupOptions = struct {
     fields: [][]const u8 = &.{},
     relational_integrity_jobs_json: []const u8 = "",
     relational_activation_json: []const u8 = "",
+    relational_topology_json: []const u8 = "",
     opts: @import("../storage/db/types.zig").LookupOptions = .{},
 
     pub fn deinit(self: *OwnedLookupOptions, alloc: std.mem.Allocator) void {
         if (self.relational_integrity_jobs_json.len != 0) alloc.free(self.relational_integrity_jobs_json);
         if (self.relational_activation_json.len != 0) alloc.free(self.relational_activation_json);
+        if (self.relational_topology_json.len != 0) alloc.free(self.relational_topology_json);
         for (self.fields) |field| alloc.free(field);
         if (self.fields.len > 0) alloc.free(self.fields);
         self.* = undefined;
@@ -194,6 +196,9 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
             if (seen or !std.mem.eql(u8, part, "_relational_integrity_catalog=true")) return error.InvalidQueryRequest;
             seen = true;
             result.opts.relational_integrity_catalog = true;
+        } else if (std.mem.startsWith(u8, part, "_primary_digest=")) {
+            if (result.opts.include_primary_digest or !std.mem.eql(u8, part, "_primary_digest=true")) return error.InvalidQueryRequest;
+            result.opts.include_primary_digest = true;
         } else if (std.mem.startsWith(u8, part, "_relational_integrity_action=")) {
             if (seen or !std.mem.eql(u8, part, "_relational_integrity_action=true")) return error.InvalidQueryRequest;
             seen = true;
@@ -210,6 +215,19 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
             result.relational_activation_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_relational_activation=".len..]);
             if (result.relational_activation_json.len == 0 or result.relational_activation_json.len > 4096) return error.InvalidQueryRequest;
             result.opts.relational_activation_json = result.relational_activation_json;
+        } else if (std.mem.startsWith(u8, part, "_relational_topology=")) {
+            if (seen) return error.InvalidQueryRequest;
+            seen = true;
+            result.relational_topology_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_relational_topology=".len..]);
+            if (result.relational_topology_json.len == 0 or result.relational_topology_json.len > 4096) return error.InvalidQueryRequest;
+            result.opts.relational_topology_json = result.relational_topology_json;
+        } else if (std.mem.startsWith(u8, part, "_restore_staging_scope=")) {
+            if (result.opts.restore_staging_scope != null) return error.InvalidQueryRequest;
+            const hex = part["_restore_staging_scope=".len..];
+            if (hex.len != 64) return error.InvalidQueryRequest;
+            var scope: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&scope, hex) catch return error.InvalidQueryRequest;
+            result.opts.restore_staging_scope = scope;
         }
     }
     return result;
@@ -217,6 +235,13 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
 
 test "relational row query control modes require authenticated internal parsing" {
     const alloc = std.testing.allocator;
+    var primary = try parseInternalLookupOptions(alloc, "_primary_digest=true");
+    defer primary.deinit(alloc);
+    try std.testing.expect(primary.opts.include_primary_digest);
+    var public_primary = try parseLookupOptions(alloc, "_primary_digest=true");
+    defer public_primary.deinit(alloc);
+    try std.testing.expect(!public_primary.opts.include_primary_digest);
+    try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, "_primary_digest=true&_primary_digest=true"));
     const query = "_relational_activation=%7B%22mode%22%3A%22status%22%7D";
     var internal = try parseInternalLookupOptions(alloc, query);
     defer internal.deinit(alloc);
@@ -225,6 +250,14 @@ test "relational row query control modes require authenticated internal parsing"
     defer public.deinit(alloc);
     try std.testing.expectEqualStrings("", public.opts.relational_activation_json);
     try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, "_relational_integrity_catalog=true&_relational_integrity_action=true"));
+    const topology_query = "_relational_topology=%7B%22mode%22%3A%22identity%22%7D";
+    var topology_internal = try parseInternalLookupOptions(alloc, topology_query);
+    defer topology_internal.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"mode\":\"identity\"}", topology_internal.opts.relational_topology_json);
+    var topology_public = try parseLookupOptions(alloc, topology_query);
+    defer topology_public.deinit(alloc);
+    try std.testing.expectEqualStrings("", topology_public.opts.relational_topology_json);
+    try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, topology_query ++ "&_relational_integrity_catalog=true"));
 }
 
 test "relational mutation endpoints are not aliased to serverless ingestion" {

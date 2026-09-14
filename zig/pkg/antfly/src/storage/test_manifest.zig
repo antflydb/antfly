@@ -32,6 +32,9 @@ comptime {
     _ = @import("db/relational_integrity_integration_test.zig");
     _ = @import("db/relational_integrity_range.zig");
     _ = @import("db/relational_integrity_activation.zig");
+    _ = @import("db/relational_integrity_retirement.zig");
+    _ = @import("db/relational_integrity_topology.zig");
+    _ = @import("db/restore_staging.zig");
     _ = @import("db/relational_index_gc.zig");
     _ = @import("db/relational_predicate.zig");
     _ = @import("admission_waiter.zig");
@@ -180,6 +183,7 @@ comptime {
     _ = @import("ha/kubernetes_lease_watchdog.zig");
     _ = @import("ha/lifecycle_receipt_inventory_test.zig");
     _ = @import("ha/local_generation_gc.zig");
+    _ = @import("ha/metadata_effect_chunks.zig");
     _ = @import("ha/metrics.zig");
     _ = @import("ha/mod.zig");
     _ = @import("ha/mutation_barrier.zig");

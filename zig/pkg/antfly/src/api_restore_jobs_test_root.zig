@@ -6,7 +6,10 @@
 
 const std = @import("std");
 const restore_jobs = @import("api/restore_jobs.zig");
+const restore_staging_driver = @import("api/restore_staging_driver.zig");
 
 test {
     std.testing.refAllDecls(restore_jobs);
+    std.testing.refAllDecls(restore_staging_driver);
+    std.testing.refAllDecls(@import("api/restore_owner.zig"));
 }

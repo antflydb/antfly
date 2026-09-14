@@ -67,3 +67,33 @@ func TestRelationalMutationPreservesPendingOutcomeWithoutRetry(t *testing.T) {
 		t.Fatalf("outcome=%#v calls=%d", result, calls)
 	}
 }
+
+func TestRelationalRecoveryRoutesAndOutcomes(t *testing.T) {
+	calls := 0
+	client, err := NewAntflyClientWithOptions("http://example.invalid", oapi.WithHTTPClient(relationalHTTPDoer(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if req.URL.Path == "/db/v1/tables/rows/constraints/repair" {
+			return &http.Response{StatusCode: 202, Body: io.NopCloser(strings.NewReader(`{"status":"committed_pending","inserted":1,"deleted":0}`))}, nil
+		}
+		if req.URL.Path != "/db/v1/tables/rows/constraints/retry" && req.URL.Path != "/db/v1/tables/rows/constraints/retire" {
+			t.Fatalf("unexpected recovery route %s", req.URL.Path)
+		}
+		return &http.Response{StatusCode: 202, Body: io.NopCloser(strings.NewReader(`{"status":"accepted"}`))}, nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repair, err := client.RepairRelationalConstraints(context.Background(), "rows", RelationalRowMutationRequest{SchemaVersion: 2, Mutations: []RelationalRowMutation{{Key: "b", ExpectedVersion: "18446744073709551615"}}})
+	if err != nil || repair.Status != "committed_pending" {
+		t.Fatalf("repair=%#v err=%v", repair, err)
+	}
+	retry, err := client.RetryRelationalConstraints(context.Background(), "rows", RelationalConstraintRetryRequest{SchemaVersion: 2})
+	if err != nil || retry.Status != "accepted" || calls != 2 {
+		t.Fatalf("retry=%#v err=%v calls=%d", retry, err, calls)
+	}
+	drop := true
+	retirement, err := client.RetireRelationalConstraints(context.Background(), "rows", RelationalConstraintRetirementRequest{SchemaVersion: 2, Drop: drop})
+	if err != nil || retirement.Status != "accepted" || calls != 3 {
+		t.Fatalf("retirement=%#v err=%v calls=%d", retirement, err, calls)
+	}
+}

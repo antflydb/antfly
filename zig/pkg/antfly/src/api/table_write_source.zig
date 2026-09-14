@@ -81,6 +81,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             contract: metadata_topology_protocol.DropCleanupContract,
         ) anyerror!?void = null,
+        backup_pin_control: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backup_contract.BackupOperationControl) anyerror!?[]u8 = null,
         backup_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -552,6 +553,12 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.drop_table orelse return null;
         return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, contract });
+    }
+
+    pub fn backupPinControl(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backup_contract.BackupOperationControl) !?[]u8 {
+        try control.ensureActive();
+        const callback = self.vtable.backup_pin_control orelse return error.UnsupportedOperation;
+        return callback(self.ptr, alloc, table_name, group_id, request, control);
     }
 
     pub fn backupTable(

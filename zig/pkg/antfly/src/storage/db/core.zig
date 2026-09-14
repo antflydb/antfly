@@ -1377,7 +1377,12 @@ pub const DBCore = struct {
                     const next = prepared.integrity_catalog.?.catalog.findGeneration(binding.generation) orelse return error.IntegrityCatalogChanged;
                     // Retaining a descriptor is necessary for recovery, but
                     // is not proof that cross-table dependents have retired.
-                    if (next.retired) return error.ConstraintRetirementRequired;
+                    if (next.retired) {
+                        const proof = (try self.getStoreValue(self.alloc, @import("relational_integrity_retirement.zig").key)) orelse return error.ConstraintRetirementRequired;
+                        defer self.alloc.free(proof);
+                        const retirement = try @import("relational_integrity_retirement.zig").Progress.decode(proof);
+                        if (retirement.phase != .ready or !retirement.includes(binding.generation) or !std.mem.eql(u8, &retirement.target_schema_digest, &digest)) return error.ConstraintRetirementRequired;
+                    }
                 }
             }
         }
@@ -1452,8 +1457,20 @@ pub const DBCore = struct {
             namespace: doc_identity.Namespace,
 
             pub fn stage(participants: @This(), txn: anytype) !void {
+                try @import("relational_integrity_topology.zig").requireUnfenced(txn);
                 if (participants.prepared.relational_indexes) |*indexes| _ = try indexes.metadata.stage(txn);
                 if (participants.prepared.integrity_catalog) |*catalog| {
+                    const retirement_mod = @import("relational_integrity_retirement.zig");
+                    if (try retirement_mod.current(txn)) |retirement| {
+                        if (retirement.phase != .ready or !std.mem.eql(u8, &retirement.target_schema_digest, &catalog.catalog.schema_digest)) return error.ConstraintRetirementInProgress;
+                        for (retirement.generations) |generation| {
+                            const binding = catalog.catalog.findGeneration(generation) orelse return error.IntegrityCatalogChanged;
+                            if (!binding.retired) return error.ConstraintRetirementRequired;
+                        }
+                        // Consume only inside the atomic schema/catalog/outbox
+                        // transaction. Failed publication leaves admission shut.
+                        try txn.delete(retirement_mod.key);
+                    }
                     if (try doc_identity.loadNamespaceTxn(txn)) |stored| {
                         if (!stored.eql(participants.namespace)) return error.IdentityNamespaceMismatch;
                     } else {

@@ -31,6 +31,7 @@ pub const status_server_response_reserve_ms: u32 = 50;
 /// Process-local execution context established by the receiving node. This is
 /// never serialized directly across the wire.
 pub const PreDecisionContext = struct {
+    restore_staging_scope: ?[32]u8 = null,
     deadline_ns: ?u64 = null,
     deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
     cancellation: db_types.CancellationToken = .none,
@@ -40,6 +41,8 @@ pub const TableCommitRequest = struct {
     table_name: []const u8,
     relational_schema_version: ?u32 = null,
     relational_integrity_generation_set: ?[32]u8 = null,
+    restore_staging_scope: ?[32]u8 = null,
+    relational_repair: bool = false,
     writes: []const db_types.TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const db_types.DocumentTransform = &.{},
@@ -47,6 +50,7 @@ pub const TableCommitRequest = struct {
     integrity: []const db_types.TransactionIntegrityOperation = &.{},
     integrity_commands: []const @import("../storage/db/relational_integrity.zig").Command = &.{},
     relational_activation: ?@import("../storage/db/relational_integrity_activation.zig").Command = null,
+    relational_retirement: ?@import("../storage/db/relational_integrity_retirement.zig").Command = null,
 };
 
 pub const CommitConflict = struct {

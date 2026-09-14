@@ -194,6 +194,14 @@ pub fn requireReady(txn: anytype, catalog: catalog_mod.Catalog) !void {
     }
 }
 
+/// Repairs retain an exact-value read guard on failed activation. A concurrent
+/// retry cannot scan around repaired rows or publish coverage from an old cut.
+pub fn repairPredicate(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catalog) !transactions.VersionPredicate {
+    if (!hasActive(catalog) or (try status(txn, catalog)).state != .invalid) return error.InvalidConstraintActivation;
+    const current = (try optional(txn, key)) orelse return error.ConstraintActivationChanged;
+    return .{ .key = key, .comparison = .exact_value, .expected_value = try alloc.dupe(u8, current) };
+}
+
 pub const Command = struct {
     routing_key: []const u8,
     expected: ?[]const u8,
@@ -216,17 +224,19 @@ pub fn prepareCommand(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catal
     defer arena.deinit();
     if (!std.mem.eql(u8, command.routing_key, try routingKey(arena.allocator(), txn))) return error.ConstraintActivationOwnerChanged;
     const before = try status(txn, catalog);
-    const after = try Progress.decode(command.next);
+    // Malformed proposed bytes are a terminal command rejection; malformed
+    // stored progress from status() above remains a storage failure.
+    const after = Progress.decode(command.next) catch return error.InvalidConstraintActivationCommand;
     if (!after.matches(catalog, before.owner) or after.schema_version != catalog.schema_version) return error.ConstraintActivationChanged;
     if (command.retry) {
         const initial_phase: Phase = if (hasKind(catalog, .unique)) .unique else .foreign_key;
-        if (before.state != .invalid or after.state != .validating or after.phase != initial_phase or after.cursor.len != 0 or after.rows_scanned != 0) return error.InvalidConstraintActivation;
+        if (before.state != .invalid or after.state != .validating or after.phase != initial_phase or after.cursor.len != 0 or after.rows_scanned != 0) return error.InvalidConstraintActivationCommand;
     } else {
-        if (before.state != .validating or after.rows_scanned < before.rows_scanned) return error.InvalidConstraintActivation;
+        if (before.state != .validating or after.rows_scanned < before.rows_scanned) return error.InvalidConstraintActivationCommand;
         if (after.phase != before.phase) {
-            if (before.phase != .unique or after.phase != .foreign_key or after.state != .validating or after.cursor.len != 0 or !hasKind(catalog, .foreign_key)) return error.InvalidConstraintActivation;
-        } else if (after.state == .validating and std.mem.order(u8, after.cursor, before.cursor) != .gt) return error.InvalidConstraintActivation;
-        if (after.state == .enforced and before.phase == .unique and hasKind(catalog, .foreign_key)) return error.InvalidConstraintActivation;
+            if (before.phase != .unique or after.phase != .foreign_key or after.state != .validating or after.cursor.len != 0 or !hasKind(catalog, .foreign_key)) return error.InvalidConstraintActivationCommand;
+        } else if (after.state == .validating and std.mem.order(u8, after.cursor, before.cursor) != .gt) return error.InvalidConstraintActivationCommand;
+        if (after.state == .enforced and before.phase == .unique and hasKind(catalog, .foreign_key)) return error.InvalidConstraintActivationCommand;
     }
     return .{ .intent = .{ .key = key, .value = command.next }, .predicate = .{ .key = key, .comparison = .exact_value, .expected_value = command.expected } };
 }
@@ -265,7 +275,7 @@ pub const Page = struct {
             defer view.release();
             // Validate all physically retained rows, including TTL candidates;
             // only coordinated expiration may retire constrained parents.
-            break :blk try rows.Reader.open(alloc, core.store, view, null, .{ .fields = fields }, 0);
+            break :blk try rows.Reader.open(alloc, core.store, view, null, .{ .fields = fields, .include_primary_digest = true }, 0);
         };
         defer reader.deinit();
         const catalog_raw = try optional(&reader.read, catalog_mod.key) orelse return error.ConstraintNotFound;

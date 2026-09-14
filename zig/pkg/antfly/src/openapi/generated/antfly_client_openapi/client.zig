@@ -1115,6 +1115,45 @@ pub const Client = struct {
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Repair version-conditional rows after failed constraint activation
+    /// POST /db/v1/tables/{tableName}/constraints/repair
+    pub fn repairRelationalConstraints(self: *@This(), table_name: []const u8, body: types.RelationalRowMutationRequest) !ApiResponse(types.BatchResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/constraints/repair", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Retire unique and foreign-key definitions safely
+    /// POST /db/v1/tables/{tableName}/constraints/retire
+    pub fn retireRelationalConstraints(self: *@This(), table_name: []const u8, body: types.RelationalConstraintRetirementRequest) !ApiResponse(types.RelationalConstraintRetryResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/constraints/retire", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalConstraintRetryResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Restart failed UNIQUE/FK validation after administrative repair
+    /// POST /db/v1/tables/{tableName}/constraints/retry
+    pub fn retryRelationalConstraints(self: *@This(), table_name: []const u8, body: types.RelationalConstraintRetryRequest) !ApiResponse(types.RelationalConstraintRetryResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/constraints/retry", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalConstraintRetryResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Read distributed unique and foreign-key validation coverage
     /// GET /db/v1/tables/{tableName}/constraints/status
     pub fn getRelationalConstraintStatus(self: *@This(), table_name: []const u8) !ApiResponse(types.RelationalConstraintStatus) {

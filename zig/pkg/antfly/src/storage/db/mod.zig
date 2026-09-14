@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+pub const coordinated_ttl = @import("../coordinated_ttl.zig");
 const query_search = @import("query/search_exec.zig");
 const distributed_stats = @import("../../search/distributed_stats.zig");
 const planning_adapter = @import("planning_adapter.zig");

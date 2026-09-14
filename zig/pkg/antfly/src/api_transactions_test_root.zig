@@ -15,6 +15,7 @@
 const distributed_txn = @import("api/distributed_txn.zig");
 const distributed_entity_sink = @import("api/distributed_entity_sink.zig");
 const internal_group_operations = @import("api/internal_group_operations.zig");
+const restore_catalog = @import("api/restore_catalog.zig");
 const transactions = @import("api/transactions.zig");
 
 test {
@@ -23,9 +24,13 @@ test {
     _ = @import("api/relational_integrity_wire.zig");
     _ = @import("api/relational_integrity_errors.zig");
     _ = @import("api/relational_integrity_commit.zig");
+    _ = @import("api/relational_ttl.zig");
     _ = @import("api/relational_activation_worker.zig");
+    _ = @import("api/relational_retirement_worker.zig");
+    _ = @import("metadata/storage/raft_apply_store.zig");
     _ = @import("api/batch.zig");
     _ = distributed_entity_sink;
     _ = internal_group_operations;
+    _ = restore_catalog;
     _ = transactions;
 }

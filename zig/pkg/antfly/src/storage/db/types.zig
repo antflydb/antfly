@@ -287,9 +287,16 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    /// Private replicated hidden-owner lifecycle; public JSON cannot set it.
+    restore_staging: ?@import("restore_staging.zig").Control = null,
+    restore_staging_scope: ?[32]u8 = null,
+    /// Authenticated owner lifecycle control; never populated by public JSON.
+    relational_topology: ?@import("relational_integrity_topology.zig").Command = null,
     relational_schema_version: ?u32 = null,
     /// Internal coordinator evidence; never populated from public request JSON.
     relational_integrity_generation_set: ?[32]u8 = null,
+    /// Authenticated administrative repair, still subject to integrity checks.
+    relational_repair: bool = false,
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
@@ -300,6 +307,7 @@ pub const BatchRequest = struct {
     integrity: []const TransactionIntegrityOperation = &.{},
     integrity_commands: []const @import("relational_integrity.zig").Command = &.{},
     relational_activation: ?@import("relational_integrity_activation.zig").Command = null,
+    relational_retirement: ?@import("relational_integrity_retirement.zig").Command = null,
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
@@ -331,12 +339,33 @@ pub const BatchRequest = struct {
         try jw.beginObject();
         inline for (std.meta.fields(@This())) |field| {
             try jw.objectField(field.name);
-            if (comptime std.mem.eql(u8, field.name, "relational_integrity_generation_set")) {
-                if (self.relational_integrity_generation_set) |digest| {
+            if (comptime std.mem.eql(u8, field.name, "relational_integrity_generation_set") or std.mem.eql(u8, field.name, "restore_staging_scope")) {
+                if (@field(self, field.name)) |digest| {
                     try jw.beginArray();
                     for (digest) |byte| try jw.write(byte);
                     try jw.endArray();
                 } else try jw.write(null);
+            } else if (comptime std.mem.eql(u8, field.name, "split_checkpoint") or
+                std.mem.eql(u8, field.name, "split_transition") or
+                std.mem.eql(u8, field.name, "merge_checkpoint") or
+                std.mem.eql(u8, field.name, "merge_artifacts"))
+            {
+                // Lifecycle ranges and physical artifacts are opaque bytes,
+                // including when replayed through the native HA envelope.
+                try @import("relational_integrity_json.zig").write(@field(self, field.name), jw);
+            } else if (comptime std.mem.eql(u8, field.name, "writes") or std.mem.eql(u8, field.name, "deletes")) {
+                // Final transaction effects can contain binary private keys
+                // and values in live HA as well as staged restore. Preserve
+                // those bytes without expanding ordinary JSON primary rows.
+                try jw.beginArray();
+                for (@field(self, field.name)) |item| {
+                    const key = if (comptime std.mem.eql(u8, field.name, "writes")) item.key else item;
+                    if (std.mem.startsWith(u8, key, "\x00\x00__metadata__:"))
+                        try @import("relational_integrity_json.zig").write(item, jw)
+                    else
+                        try jw.write(item);
+                }
+                try jw.endArray();
             } else try jw.write(@field(self, field.name));
         }
         try jw.endObject();
@@ -1226,11 +1255,16 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Private optimistic observation: captures version and SHA256 of the
+    /// exact primary bytes from one snapshot, regardless of JSON projection.
+    include_primary_digest: bool = false,
+    restore_staging_scope: ?[32]u8 = null,
     /// Authenticated group-local control read; never accepted by public lookup parsing.
     relational_integrity_catalog: bool = false,
     relational_integrity_action: bool = false,
     relational_integrity_jobs_json: []const u8 = "",
     relational_activation_json: []const u8 = "",
+    relational_topology_json: []const u8 = "",
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     /// Internal, absolute monotonic deadline used by routed lookups. It is not
@@ -1250,6 +1284,8 @@ pub const LookupOptions = struct {
 
 pub const LookupResult = struct {
     json: []u8,
+    version: ?u64 = null,
+    expected_content_digest: ?[32]u8 = null,
 
     pub fn deinit(self: *LookupResult, alloc: Allocator) void {
         alloc.free(self.json);
@@ -1457,6 +1493,9 @@ pub const TransactionWrite = struct {
 pub const TransactionVersionPredicate = struct {
     key: []const u8,
     expected_version: u64,
+    /// Internal observation guard. TTL timestamps need not change on updates.
+    /// SHA-256 binds the exact primary row read before planning FK actions.
+    expected_content_digest: ?[32]u8 = null,
 };
 
 /// Server-compiled integrity effects. The logical routing key is separate from
@@ -1497,9 +1536,12 @@ pub const TransactionIntegrityOperation = struct {
 };
 
 pub const TransactionIntentRequest = struct {
+    restore_staging_scope: ?[32]u8 = null,
     relational_activation: ?@import("relational_integrity_activation.zig").Command = null,
+    relational_retirement: ?@import("relational_integrity_retirement.zig").Command = null,
     relational_schema_version: ?u32 = null,
     relational_integrity_generation_set: ?[32]u8 = null,
+    relational_repair: bool = false,
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},

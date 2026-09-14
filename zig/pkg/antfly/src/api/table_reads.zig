@@ -325,12 +325,13 @@ fn controlledLookupResponseAlloc(
     json: []const u8,
     version: u64,
     opts: db_mod.types.LookupOptions,
+    expected_content_digest: ?[32]u8,
 ) !LookupResponse {
     try checkLookupOptionsActive(opts);
     const cloned = try alloc.dupe(u8, json);
     errdefer alloc.free(cloned);
     try checkLookupOptionsActive(opts);
-    return .{ .json = cloned, .version = version };
+    return .{ .json = cloned, .version = version, .expected_content_digest = expected_content_digest };
 }
 
 fn nsToUsFloat(ns: u64) f64 {
@@ -1543,6 +1544,7 @@ const RoutePinnedCatalog = struct {
     }
 
     const vtable: table_catalog.CatalogSource.VTable = .{
+        .restore_scope_for_group = restoreScopeForGroup,
         .admin_snapshot = adminSnapshot,
         .free_admin_snapshot = freeAdminSnapshot,
         .routing_snapshot = routingSnapshot,
@@ -1559,6 +1561,10 @@ const RoutePinnedCatalog = struct {
 
     fn cast(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
+    }
+
+    fn restoreScopeForGroup(ptr: *anyopaque, table_name: []const u8, group_id: u64) !?[32]u8 {
+        return cast(ptr).base.restoreScopeForGroup(table_name, group_id);
     }
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -2614,7 +2620,7 @@ pub const BoundTableReadSource = struct {
         var result = (try self.reads.lookupWithConsistency(alloc, self.db, key, opts, consistency)) orelse return null;
         defer result.deinit(alloc);
 
-        return try controlledLookupResponseAlloc(alloc, result.json, if (integrityLookupMode(opts)) 0 else try self.db.getTimestamp(alloc, key), opts);
+        return try controlledLookupResponseAlloc(alloc, result.json, if (integrityLookupMode(opts)) 0 else result.version orelse try self.db.getTimestamp(alloc, key), opts, result.expected_content_digest);
     }
 
     fn scan(
@@ -3828,6 +3834,16 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try checkLookupOptionsActive(opts);
         try self.ensureHAReadAllowed(consistency);
+        if (self.catalog.vtable.restore_scope_for_group != null) {
+            // The standalone restore validator pins the same unpublished
+            // catalog as the distributed adapter. Admit only its exact owner
+            // scope, never an ordinary named-table open.
+            const routed = try table_catalog.routedGroupSnapshotUntil(alloc, self.catalog, table_name, key, lookupRoutingDeadline(self.catalog, opts));
+            const fence = routed.fence() orelse return null;
+            var scoped = opts;
+            scoped.restore_staging_scope = (try self.catalog.restoreScopeForGroup(table_name, fence.route.group_id)) orelse return error.RestoreStagingScopeChanged;
+            return self.lookupRestoreStaging(alloc, fence.route.group_id, table_name, key, scoped, fence);
+        }
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.lookup(&hosted, alloc, table_name, key, opts, consistency);
@@ -4259,6 +4275,7 @@ pub const ProvisionedTableReadSource = struct {
 
     fn lookupGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (opts.restore_staging_scope != null) return self.lookupRestoreStaging(alloc, group_id, table_name, key, opts, fence);
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned: RoutePinnedCatalog = undefined;
         var routed: ProvisionedTableReadSource = undefined;
@@ -4374,6 +4391,30 @@ pub const ProvisionedTableReadSource = struct {
         return try graphEdgesGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
     }
 
+    fn lookupRestoreStaging(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, fence: ?metadata_api.CatalogRouteFence) !?LookupResponse {
+        try self.ensureHAReadAllowed(.read_index);
+        try checkLookupOptionsActive(opts);
+        const resident = self.resident_db orelse return error.UnknownGroup;
+        var lease = (try resident.leaseGroup(alloc, table_name, group_id, self.visibleRootGeneration(group_id), .{})) orelse return error.UnknownGroup;
+        defer lease.release(alloc);
+        try lease.db.validateRestoreStagingScope(alloc, opts.restore_staging_scope orelse return error.RestoreStagingScopeChanged);
+        const identity = lease.db.core.identity_namespace;
+        if (identity.shard_id != group_id) return error.RestoreStagingScopeChanged;
+        if (fence) |expected| {
+            try expected.validate();
+            try expected.admission_cancellation.check();
+            if (expected.table_id != identity.table_id or expected.route.group_id != group_id or expected.route.range_id != identity.range_id or expected.route.identity_namespace.table_id != identity.table_id or expected.route.identity_namespace.shard_id != identity.shard_id or expected.route.identity_namespace.range_id != identity.range_id) return error.RestoreStagingScopeChanged;
+        }
+        // Never downgrade a hidden validation read: its result becomes a
+        // durable UNIQUE/FK coverage proof consumed by atomic publication.
+        const reader = raft_mod.FeatureDBReads.init(group_id, self.read_safety_barrier);
+        var result = (try reader.lookupWithConsistency(alloc, lease.db, key, opts, .read_index)) orelse return null;
+        defer result.deinit(alloc);
+        const version = if (integrityLookupMode(opts)) 0 else result.version orelse try lease.db.getTimestamp(alloc, key);
+        try checkLookupOptionsActive(opts);
+        return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest);
+    }
+
     fn lookupGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -4384,6 +4425,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (opts.restore_staging_scope != null) return self.lookupRestoreStaging(alloc, group_id, table_name, key, opts, null);
         try self.ensureHAReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
@@ -5595,6 +5637,12 @@ pub const HostedProvisionedTableReadSource = struct {
 
     fn lookupGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (opts.restore_staging_scope != null) {
+            const local = self.local_source orelse return error.UnknownGroup;
+            var routed_local = local;
+            routed_local.route_fence = fence;
+            return routed_local.lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency);
+        }
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned: RoutePinnedCatalog = undefined;
         var routed: HostedProvisionedTableReadSource = undefined;
@@ -5834,8 +5882,10 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
         try checkLookupOptionsActive(opts);
 
-        if (try lookupViaRoute(self, alloc, route, group_id, table_name, key, opts, consistency)) |result| return result;
-        return try lookupAcrossActivePlacements(self, alloc, group_id, table_name, key, opts, consistency, route);
+        var scoped_opts = opts;
+        if (try self.catalog.restoreScopeForGroup(table_name, group_id)) |scope| scoped_opts.restore_staging_scope = scope;
+        if (try lookupViaRoute(self, alloc, route, group_id, table_name, key, scoped_opts, consistency)) |result| return result;
+        return try lookupAcrossActivePlacements(self, alloc, group_id, table_name, key, scoped_opts, consistency, route);
     }
 
     fn documentArtifactManifest(
@@ -9370,6 +9420,7 @@ fn replaceLookupResponseWithProjectedFullPayload(
     response.* = .{
         .json = projected.json,
         .version = full.version,
+        .expected_content_digest = full.expected_content_digest,
     };
 }
 
@@ -10992,9 +11043,9 @@ fn lookupLocal(
     var result = (try reads.lookupWithConsistency(alloc, &db, key, opts, consistency)) orelse return null;
     defer result.deinit(alloc);
     try checkLookupOptionsActive(opts);
-    const version = if (integrityLookupMode(opts)) 0 else try db.getTimestamp(alloc, key);
+    const version = if (integrityLookupMode(opts)) 0 else result.version orelse try db.getTimestamp(alloc, key);
     try checkLookupOptionsActive(opts);
-    return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
+    return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest);
 }
 
 fn lookupProvisionedLocal(
@@ -11035,9 +11086,9 @@ fn lookupProvisionedLocal(
             var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
             var result = (try reads.lookupWithConsistency(alloc, lease.db, key, opts, consistency)) orelse return null;
             defer result.deinit(alloc);
-            const version = if (integrityLookupMode(opts)) 0 else try lease.db.getTimestamp(alloc, key);
+            const version = if (integrityLookupMode(opts)) 0 else result.version orelse try lease.db.getTimestamp(alloc, key);
             try checkLookupOptionsActive(opts);
-            return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
+            return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest);
         }
     }
 
@@ -11053,9 +11104,9 @@ fn lookupProvisionedLocal(
         var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
         var result = (try reads.lookupWithConsistency(alloc, lease.db, key, opts, consistency)) orelse return null;
         defer result.deinit(alloc);
-        const version = if (integrityLookupMode(opts)) 0 else try lease.db.getTimestamp(alloc, key);
+        const version = if (integrityLookupMode(opts)) 0 else result.version orelse try lease.db.getTimestamp(alloc, key);
         try checkLookupOptionsActive(opts);
-        return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
+        return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest);
     }
 
     var db = try openProvisionedLookupDbForTable(
@@ -11073,9 +11124,9 @@ fn lookupProvisionedLocal(
     const reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     var result = (try reads.lookupWithConsistency(alloc, &db, key, opts, consistency)) orelse return null;
     defer result.deinit(alloc);
-    const version = if (integrityLookupMode(opts)) 0 else try db.getTimestamp(alloc, key);
+    const version = if (integrityLookupMode(opts)) 0 else result.version orelse try db.getTimestamp(alloc, key);
     try checkLookupOptionsActive(opts);
-    return try controlledLookupResponseAlloc(alloc, result.json, version, opts);
+    return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest);
 }
 
 fn lookupHostedLocal(
@@ -19009,6 +19060,9 @@ fn lookupRemote(
         opts.relational_integrity_action,
         opts.relational_integrity_jobs_json,
         opts.relational_activation_json,
+        opts.relational_topology_json,
+        opts.restore_staging_scope,
+        opts.include_primary_digest,
     );
     defer result.deinit(alloc);
     try checkLookupOptionsActive(opts);
@@ -19017,11 +19071,41 @@ fn lookupRemote(
         result.body,
         if (result.version) |version| try std.fmt.parseUnsigned(u64, version, 10) else 0,
         opts,
+        result.expected_content_digest,
     );
 }
 
+test "relational row query primary digest transport preserves snapshot proof and rejects missing or invalid headers" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        mode: enum { good, missing, invalid } = .good,
+        fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.indexOf(u8, req.uri, "_primary_digest=true") != null);
+            const digest = std.fmt.bytesToHex([_]u8{0xab} ** 32, .lower);
+            const headers = try allocator.alloc(http_common.Header, if (self.mode == .missing) 1 else 2);
+            headers[0] = .{ .name = try allocator.dupe(u8, "X-Antfly-Version"), .value = try allocator.dupe(u8, "77") };
+            if (headers.len == 2) headers[1] = .{
+                .name = try allocator.dupe(u8, "X-Antfly-Primary-Digest"),
+                .value = try allocator.dupe(u8, if (self.mode == .invalid) "invalid" else &digest),
+            };
+            return .{ .status = 200, .headers = headers, .body = try allocator.dupe(u8, "{\"id\":1}") };
+        }
+    };
+    var capture: Capture = .{};
+    const executor: http_common.RequestExecutor = .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } };
+    var response = (try lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true }, .read_index)).?;
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 77), response.version);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xab} ** 32), &response.expected_content_digest.?);
+    capture.mode = .missing;
+    try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true }, .read_index));
+    capture.mode = .invalid;
+    try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true }, .read_index));
+}
+
 fn integrityLookupMode(opts: db_mod.types.LookupOptions) bool {
-    return opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_activation_json.len != 0;
+    return opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
 }
 
 const RemoteDocumentArtifactManifest = struct {

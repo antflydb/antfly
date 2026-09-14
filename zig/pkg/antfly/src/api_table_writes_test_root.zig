@@ -26,4 +26,5 @@ test {
     _ = provisioned_storage;
     _ = table_write_source;
     _ = table_writes;
+    _ = @import("api/backup_cohort.zig");
 }

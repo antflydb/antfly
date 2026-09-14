@@ -49,6 +49,9 @@ import type {
   QueryResponses,
   QueryResult,
   RelationalConstraintStatus,
+  RelationalConstraintRetryRequest,
+  RelationalConstraintRetirementRequest,
+  RelationalConstraintRetryResponse,
   RelationalRowMutationRequest,
   RelationalRowQueryRequest,
   ResourceType,
@@ -1312,6 +1315,58 @@ export class AntflyClient {
     },
 
     constraints: {
+      /** Start a durable constraint drain; acceptance is not publication. */
+      retire: async (
+        tableName: string,
+        request: RelationalConstraintRetirementRequest,
+        options?: WriteOptions
+      ): Promise<RelationalConstraintRetryResponse> => {
+        const { data: result } = await this.postBoundedJSON<RelationalConstraintRetryResponse>(
+          `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/retire`,
+          request,
+          options,
+          "Constraint retirement failed",
+          "marshalling constraint retirement",
+          true
+        );
+        if (!result || result.status !== "accepted")
+          throw new Error("Constraint retirement returned no acceptance outcome");
+        return result;
+      },
+      /** Admin repair preserves FK/UNIQUE checks; activation must be failed. */
+      repair: async (
+        tableName: string,
+        request: RelationalRowMutationRequest,
+        options?: WriteOptions
+      ): Promise<BatchResult> => {
+        const { data: result } = await this.postBoundedJSON<BatchResult>(
+          `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/repair`,
+          request,
+          options,
+          "Constraint repair failed",
+          "marshalling constraint repair",
+          true
+        );
+        if (!result) throw new Error("Constraint repair returned no commit outcome");
+        return result;
+      },
+      /** Idempotently restart failed owners; inspect status for completion. */
+      retry: async (
+        tableName: string,
+        request: RelationalConstraintRetryRequest,
+        options?: WriteOptions
+      ): Promise<RelationalConstraintRetryResponse> => {
+        const { data: result } = await this.postBoundedJSON<RelationalConstraintRetryResponse>(
+          `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/retry`,
+          request,
+          options,
+          "Constraint retry failed",
+          "marshalling constraint retry",
+          true
+        );
+        if (!result) throw new Error("Constraint retry returned no acceptance outcome");
+        return result;
+      },
       /** Distributed UNIQUE/FK coverage; local CHECK validation is separate. */
       status: async (tableName: string): Promise<RelationalConstraintStatus> => {
         const { data, error } = await this.client.GET(

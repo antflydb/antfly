@@ -43,6 +43,7 @@ pub fn applyObservation(
         updated.status_generation = observation.status_generation;
         updated.artifact_sources_protocol_version = observation.artifact_sources_protocol_version;
         updated.dense_native_storage_protocol_version = observation.dense_native_storage_protocol_version;
+        updated.relational_topology_protocol_version = observation.relational_topology_protocol_version;
     }
     updated.live = observation.live;
     updated.health_class = observation.health_class;
@@ -100,6 +101,7 @@ pub fn applyObservationsOwnedWithRepairStatus(
             records[index].status_generation = observation.status_generation;
             records[index].artifact_sources_protocol_version = observation.artifact_sources_protocol_version;
             records[index].dense_native_storage_protocol_version = observation.dense_native_storage_protocol_version;
+            records[index].relational_topology_protocol_version = observation.relational_topology_protocol_version;
         }
         records[index].live = observation.live;
         records[index].capacity_bytes = observation.capacity_bytes;
@@ -233,6 +235,7 @@ pub fn observationChangesRecordWithRepairStatus(
             existing.status_generation != observation.status_generation) or
         existing.artifact_sources_protocol_version != observation.artifact_sources_protocol_version or
         existing.dense_native_storage_protocol_version != observation.dense_native_storage_protocol_version or
+        existing.relational_topology_protocol_version != observation.relational_topology_protocol_version or
         existing.capacity_bytes != observation.capacity_bytes or
         existing.available_bytes != observation.available_bytes or
         existing.lease_pressure != observation.lease_pressure or

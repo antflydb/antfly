@@ -39,6 +39,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const lib_metadata_runtime_filters = selectTestFilters(b, &.{"metadata."});
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
+    const backup_cohort_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "backup cohort", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-backup-cohort-test", "Run durable backup cohort admission and recovery contracts").dependOn(&addFilteredTestRunArtifact(b, backup_cohort_tests).step);
+    const restore_staging_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "relational integrity restore staging", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-restore-staging-test", "Run atomic hidden restore target publication contracts").dependOn(&addFilteredTestRunArtifact(b, restore_staging_tests).step);
+    const relational_topology_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "relational integrity metadata topology", "relational topology admission", "metadata raft apply store transition codec", "initializes one durable snapshotted cluster incarnation", "metadata incarnation rejects unsupported", "fences transition identity and active removal", "metadata reconciler publishes table contracts", "atomically fences table replacement during a range transition", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-relational-topology-test", "Run distributed integrity topology capability and admission contracts").dependOn(&addFilteredTestRunArtifact(b, relational_topology_tests).step);
 
     const lib_metadata_table_workflow_tests = b.addTest(.{
         .root_module = antfly_test_mod,

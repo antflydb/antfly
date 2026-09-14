@@ -74,6 +74,7 @@ fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8
 pub const LookupResponse = struct {
     status: u16 = 200,
     version: ?[]u8 = null,
+    expected_content_digest: ?[32]u8 = null,
     body: []u8,
 
     pub fn deinit(self: *LookupResponse, alloc: std.mem.Allocator) void {
@@ -498,7 +499,7 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !LookupResponse {
-        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "");
+        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", null, false);
     }
 
     pub fn fetchGroupLookupWithMode(
@@ -515,6 +516,9 @@ pub const ApiHttpClient = struct {
         relational_integrity_action: bool,
         relational_integrity_jobs_json: []const u8,
         relational_activation_json: []const u8,
+        relational_topology_json: []const u8,
+        restore_staging_scope: ?[32]u8,
+        include_primary_digest: bool,
     ) !LookupResponse {
         // Group lookups are also used for routed derived-artifact hydration.
         // Those storage keys are binary and contain namespace bytes and NUL
@@ -524,7 +528,7 @@ pub const ApiHttpClient = struct {
         // value even when they contain URI delimiters.
         const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(encoded_table_name);
-        const special = relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0;
+        const special = relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0;
         // Routing uses the actual logical key, including empty first-range
         // boundaries. Only the already-routed HTTP path needs a placeholder.
         const encoded_key = try percentEncodePathComponent(self.alloc, if (special and key.len == 0) "\x00relational_control" else key);
@@ -558,13 +562,20 @@ pub const ApiHttpClient = struct {
         defer if (jobs.len != 0) self.alloc.free(jobs);
         const activation = if (relational_activation_json.len != 0) try percentEncodePathComponent(self.alloc, relational_activation_json) else "";
         defer if (activation.len != 0) self.alloc.free(activation);
-        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}{s}{s}{s}{s}", .{
+        const topology = if (relational_topology_json.len != 0) try percentEncodePathComponent(self.alloc, relational_topology_json) else "";
+        defer if (topology.len != 0) self.alloc.free(topology);
+        const scope_hex = if (restore_staging_scope) |scope| std.fmt.bytesToHex(scope, .lower) else null;
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}", .{
             routes.Routes.internal_groups_prefix,                                            group_id,                                                                      suffix,
             if (relational_integrity_catalog) "&_relational_integrity_catalog=true" else "", if (relational_integrity_action) "&_relational_integrity_action=true" else "", if (jobs.len != 0) "&_relational_integrity_jobs=" else "",
             jobs,                                                                            if (activation.len != 0) "&_relational_activation=" else "",                   activation,
+            if (topology.len != 0) "&_relational_topology=" else "",                         topology,                                                                      if (scope_hex != null) "&_restore_staging_scope=" else "",
+            if (scope_hex) |*value| value else "",
         });
         defer self.alloc.free(path);
-        const uri = try self.joinRoute(base_uri, path);
+        const observation_path = if (include_primary_digest) try std.fmt.allocPrint(self.alloc, "{s}&_primary_digest=true", .{path}) else null;
+        defer if (observation_path) |value| self.alloc.free(value);
+        const uri = try self.joinRoute(base_uri, observation_path orelse path);
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
@@ -584,7 +595,16 @@ pub const ApiHttpClient = struct {
         const version = for (resp.headers) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Version")) break try self.alloc.dupe(u8, header.value);
         } else null;
-        return .{ .version = version, .body = try self.alloc.dupe(u8, resp.body) };
+        errdefer if (version) |value| self.alloc.free(value);
+        var digest: ?[32]u8 = null;
+        for (resp.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Primary-Digest")) {
+            if (digest != null or header.value.len != 64) return error.InvalidResponse;
+            var parsed: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&parsed, header.value) catch return error.InvalidResponse;
+            digest = parsed;
+        };
+        if (include_primary_digest and digest == null) return error.InvalidResponse;
+        return .{ .version = version, .body = try self.alloc.dupe(u8, resp.body), .expected_content_digest = digest };
     }
 
     pub fn fetchScan(
@@ -669,6 +689,76 @@ pub const ApiHttpClient = struct {
         fence: backup_contract.TableBackupFence,
         control: backup_contract.BackupOperationControl,
     ) !TablesResponse {
+        return self.fetchBackupShardCohort(base_uri, group_id, table_name, body, fence, control, null);
+    }
+
+    pub fn fetchBackupPinControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8, control: backup_contract.BackupOperationControl) !TablesResponse {
+        try control.ensureActive();
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, routes.Routes.backup_shard_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const timeout_ms = try control.remainingTimeoutMs();
+        var budget_buffer: [20]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&budget_buffer, "{d}", .{@min(timeout_ms, backup_contract.max_backup_server_budget_ms)});
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = backup_contract.backup_pin_control_header, .value = "v1" },
+            .{ .name = backup_contract.backup_remaining_ms_header, .value = budget },
+        };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = control.cancellation.ptr, .borrowed_is_cancelled = control.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .headers = &headers, .content_type = "application/json", .body = body, .timeout_ms = timeout_ms, .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        return switch (response.status) {
+            200 => .{ .body = try self.alloc.dupe(u8, response.body) },
+            404 => error.NotFound,
+            409 => error.CatalogChanged,
+            408, 504 => error.Timeout,
+            503 => error.BackupRepositoryBusy,
+            else => error.UnexpectedHttpStatus,
+        };
+    }
+
+    pub fn fetchRestoreOwner(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_owner.zig").Request, context: @import("operation.zig").RequestContext) !@import("restore_owner.zig").Response {
+        try context.ensureActive();
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, routes.Routes.restore_owner_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400, 409 => return error.RestoreStagingScopeChanged,
+            422 => return error.BackupIntegrityFailure,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.RestoreValidationPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const parsed = try std.json.parseFromSlice(@import("restore_owner.zig").Response, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    pub fn fetchBackupShardCohort(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        fence: backup_contract.TableBackupFence,
+        control: backup_contract.BackupOperationControl,
+        cohort: ?@import("../storage/db/relational_integrity_topology.zig").Fence,
+    ) !TablesResponse {
+        if (cohort) |value| if (value.owner_group_id != group_id or value.namespace.table_id != fence.table_id or value.role != .backup_snapshot)
+            return error.InvalidBackupFence;
         try control.ensureActive();
         const client_timeout_ms = try control.remainingTimeoutMs();
         if (client_timeout_ms <= backup_contract.backup_server_response_reserve_ms)
@@ -693,6 +783,11 @@ pub const ApiHttpClient = struct {
         );
         var remaining_ms_buffer: [10]u8 = undefined;
         const remaining_ms = try std.fmt.bufPrint(&remaining_ms_buffer, "{d}", .{server_budget_ms});
+        const cohort_hex = if (cohort) |value| std.fmt.bytesToHex(try value.encode(), .lower) else null;
+        const sealed_handle = try backup_contract.sealedHandleForGroup(control.sealed_handles, group_id);
+        if (sealed_handle != null and cohort != null) return error.InvalidBackupFence;
+        const sealed_json = if (sealed_handle) |value| try std.json.Stringify.valueAlloc(self.alloc, value, .{}) else null;
+        defer if (sealed_json) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = backup_contract.backup_fence_metadata_group_id_header, .value = metadata_group_id },
             .{ .name = backup_contract.backup_fence_metadata_incarnation_header, .value = &fence.metadata_incarnation },
@@ -702,6 +797,7 @@ pub const ApiHttpClient = struct {
             .{ .name = backup_contract.backup_fence_topology_header, .value = &topology_digest },
             .{ .name = backup_contract.backup_writer_not_after_header, .value = writer_not_after },
             .{ .name = backup_contract.backup_remaining_ms_header, .value = remaining_ms },
+            .{ .name = if (sealed_json != null) backup_contract.backup_sealed_handle_header else backup_contract.backup_cohort_fence_header, .value = sealed_json orelse if (cohort_hex) |*value| value else "" },
         };
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -726,7 +822,7 @@ pub const ApiHttpClient = struct {
         var resp = self.executeRequest(.{
             .method = .POST,
             .uri = uri,
-            .headers = &headers,
+            .headers = if (sealed_json != null or cohort != null) &headers else headers[0 .. headers.len - 1],
             .content_type = "application/json",
             .body = body,
             .delivery_tracker = &delivery_tracker,
@@ -4071,6 +4167,49 @@ test "api http client preserves transaction size admission failures" {
     try std.testing.expectError(error.TransactionTooLarge, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "docs", "{}"));
 }
 
+test "relational backup cohort remote capture carries exact binary owner authority" {
+    const topology = @import("../storage/db/relational_integrity_topology.zig");
+    const expected: topology.Fence = .{
+        .transition_id = std.math.maxInt(u64),
+        .attempt = 7,
+        .admission_epoch = 19,
+        .owner_group_id = 301,
+        .peer_group_id = 301,
+        .role = .backup_snapshot,
+        .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 },
+        .catalog_digest = @splat(255),
+    };
+    const Executor = struct {
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            var found = false;
+            for (req.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, backup_contract.backup_cohort_fence_header)) {
+                const actual = (try backup_contract.parseBackupCohortFenceHeader(header.value)).?;
+                try std.testing.expect(expected.eql(actual));
+                found = true;
+            };
+            try std.testing.expect(found);
+            return .{ .status = 200, .content_type = try alloc.dupe(u8, "application/json"), .body = try alloc.dupe(u8, "{\"shards\":[]}") };
+        }
+    };
+    var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = undefined, .vtable = &.{ .execute = Executor.execute } });
+    const fence: backup_contract.TableBackupFence = .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = 9,
+        .definition_digest = @splat(1),
+        .topology_range_count = 1,
+        .topology_digest = @splat(2),
+        .writer_not_after_unix_ns = 123,
+    };
+    const control: backup_contract.BackupOperationControl = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s };
+    var response = try client.fetchBackupShardCohort("http://127.0.0.1:7777", 301, "rows", "{}", fence, control, expected);
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidBackupFence, client.fetchBackupShardCohort("http://127.0.0.1:7777", 302, "rows", "{}", fence, control, expected));
+    var encoded = std.fmt.bytesToHex(try expected.encode(), .lower);
+    encoded[encoded.len - 1] = if (encoded[encoded.len - 1] == '0') '1' else '0';
+    try std.testing.expectError(error.InvalidBackupFence, backup_contract.parseBackupCohortFenceHeader(&encoded));
+}
+
 test "api http client preserves retryable group transaction unavailability" {
     const UnavailableExecutor = struct {
         marked_not_proposed: bool = true,
@@ -4652,6 +4791,30 @@ test "api http client authenticates only the internal API namespace" {
     deceptive_host.deinit(std.testing.allocator);
     var deceptive_query = try client.executeRequest(.{ .method = .GET, .uri = "http://node:8080/status?next=/internal/v1/groups" });
     deceptive_query.deinit(std.testing.allocator);
+}
+
+test "api http client distinguishes invalid restore sources from retryable owners" {
+    const Executor = struct {
+        status: u16 = 422,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.restore_owner_suffix));
+            return .{ .status = self.status };
+        }
+    };
+    var executor: Executor = .{};
+    var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    const request: @import("restore_owner.zig").Request = .{
+        .action = .status,
+        .scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 11, .range_id = 11 }, .target_namespace = .{ .table_id = 2, .shard_id = 22, .range_id = 22 }, .target_schema_digest = @splat(4) },
+    };
+    try std.testing.expectError(error.BackupIntegrityFailure, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
+    executor.status = 503;
+    try std.testing.expectError(error.RestoreValidationPending, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
+    executor.status = 408;
+    try std.testing.expectError(error.Timeout, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
+    executor.status = 409;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
 }
 
 test "api http client preserves committed visibility outcomes for forwarded raft batches" {

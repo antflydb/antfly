@@ -356,6 +356,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     test_imports.configure(b, api_restore_jobs_test_mod, true, true);
+    const restore_owner_tests = b.addTest(.{
+        .root_module = api_restore_jobs_test_mod,
+        .filters = &.{"restore owner verified decoder"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-restore-owner-test", "Run authenticated source cache and replicated owner control integration").dependOn(&addFilteredTestRunArtifact(b, restore_owner_tests).step);
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
@@ -368,6 +374,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "restore expiry preserves durable ownership",
             "restore idempotency keys are scoped by principal and resource",
             "successful restore completion wins a racing cancellation",
+            "restore staging incarnation survives retries and cancellation waits for owner cleanup",
+            "restore staging driver shares stable identities and existing destination modes",
+            "restore staging cohort proof binds every source identity and durable seal",
+            "restore staging partial selection is dependency closed across both schema generations",
             "retryable restore contention durably requeues progress and honors cancellation",
             "restore ownership loss requeues only the exact running attempt",
             "replicated restore mutations are rejected after leadership term changes",
@@ -384,6 +394,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "restore progress ranges bound maximally fragmented cluster state",
             "cluster restore summaries are truthful and bounded",
             "restore job store rejects oversized request state",
+            "restore staging driver retains migration pair without source coverage",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -412,6 +423,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "import preflights full portable envelope before mutating destination",
             "export and import documents preserve timestamps",
             "portable backup round trips relational rows and schema metadata",
+            "portable backup refuses retained retirement and topology authority without a catalog",
             "portable restore validates historical rows with their public schema epoch",
             "portable archive accepts long history with a bounded decoded working set",
             "ordinal rows bind layout support projection checksum and canonical bytes",
@@ -1398,6 +1410,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "inference connection invocation requires inference write permission",
         "httpx inference connection preserves upstream retry guidance",
         "api http client preserves exact-group join unavailability and absence",
+        "api http client distinguishes invalid restore sources from retryable owners",
         "distributed join translates native and borrowed deadline boundaries",
         "distributed join context forwards one absolute deadline to every query callback",
         "distributed graph translates native worker and catalog deadline boundaries",
@@ -3814,6 +3827,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
+            "standalone shared catalog resumes private restore and publishes atomically",
             "standalone metadata advertises a linearizable owned snapshot",
             "standalone schema mutation supports atomic merge patch and version CAS",
             "standalone routing watch does not report absence after one probe",
@@ -3845,6 +3859,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
+    // Keep the complete API worker fixture out of the inference-heavy runtime
+    // object. Compile this narrow integration slice independently so adding
+    // restore coverage does not inflate every standalone runtime test build.
+    const standalone_restore_tests = b.addTest(.{
+        .root_module = standalone_runtime_test_mod,
+        .filters = &.{"standalone shared"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 11 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_standalone_restore_tests = b.addRunArtifact(standalone_restore_tests);
+    run_standalone_restore_tests.addArgs(&.{ "--test-filter", "standalone shared" });
+    b.step("antfly-standalone-staged-restore-test", "Run shared standalone restore authority and mixed import regressions").dependOn(&run_standalone_restore_tests.step);
 
     const raft_test_step = b.step("antfly-raft-test", "Run raft integration unit tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
@@ -4249,6 +4275,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    db_test_mod.addImport("antfly_schema_openapi", antfly_imports.schema_openapi);
     const transcribing_db_test_stub_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
         .target = target,
@@ -4594,6 +4621,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.relational_integrity_integration_test.",
             "storage.db.relational_integrity_range.",
             "storage.db.relational_integrity_activation.",
+            "storage.db.relational_integrity_retirement.",
+            "storage.db.restore_staging.",
+            "storage.db.relational_integrity_topology.",
             "storage.db.relational_index_gc.",
             "storage.db.relational_predicate.",
             "storage.db.relational_store.",
@@ -4991,6 +5021,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "metadata.table_manager.",
             "metadata.table_workflow.",
             "metadata.transition_state.",
+            "metadata.relational_topology_admission.",
             "metadata.transition_actions.",
             "metadata.transition_controller.",
             "metadata.transition_driver.",

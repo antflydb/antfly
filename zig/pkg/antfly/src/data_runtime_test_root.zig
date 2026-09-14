@@ -18,6 +18,8 @@ const runtime_status = @import("api/runtime_status.zig");
 const indexes = @import("api/indexes.zig");
 const table_writes = @import("api/table_writes.zig");
 const enrichment_runtime = @import("storage/db/enrichment/enrichment_runtime.zig");
+const restore_terminal_ledger = @import("storage/ha/restore_terminal_ledger.zig");
+const private_provisioning = @import("data/private_provisioning.zig");
 
 // The auth storage adapter deliberately receives storage through an injected
 // module to avoid a production import cycle. Focused runtime tests expose the
@@ -32,4 +34,6 @@ test {
     _ = indexes;
     _ = table_writes;
     _ = enrichment_runtime;
+    _ = restore_terminal_ledger;
+    _ = private_provisioning;
 }

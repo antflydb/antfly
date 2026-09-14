@@ -17,6 +17,318 @@ const integrity = @import("relational_integrity.zig");
 const catalog = @import("relational_integrity_catalog.zig");
 const tuples = @import("relational_index_keys.zig");
 
+fn applyRestoreReplica(db: *db_mod.DB, request: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
+    if (!ha) return db.batchRaftReplicatedApply(request, .{ .term = 1, .index = index });
+    const alloc = std.testing.allocator;
+    const payload = try @import("../ha/effects.zig").encodeBatchMutationRequestAlloc(alloc, request);
+    defer alloc.free(payload);
+    try db.applyHAReplicationRecord(.{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index, .previous_lsn = index - 1, .payload = payload });
+}
+
+test "relational integrity restore follower repairs projection and CHECK debt before validated receipt" {
+    const alloc = std.testing.allocator;
+    const restore = @import("restore_staging.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"text":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const source_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/lag-source", .{tmp.sub_path});
+    var source_options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .start_optional_runtimes = false, .start_index_workers = false };
+    {
+        var source = try db_mod.DB.open(alloc, source_path, source_options);
+        defer source.close();
+        try source.setSchemaJson(alloc, schema);
+        var rows: [600]@import("types.zig").BatchWrite = undefined;
+        for (&rows, 0..) |*row, n| row.* = .{ .key = try std.fmt.allocPrint(owned, "row-{d:0>4}", .{n}), .value = "{\"id\":1,\"text\":\"keyword\"}" };
+        try source.batch(.{ .writes = &rows });
+    }
+    source_options.open_mode = .query_readonly;
+    var source = try db_mod.DB.open(alloc, source_path, source_options);
+    defer source.close();
+    for ([_]bool{ false, true }, 0..) |ha, attempt| {
+        var gate: @import("../ha/public_gate_state.zig").State = .{};
+        gate.role.store(@intFromEnum(@import("../ha/public_gate_state.zig").Role.standby), .release);
+        const path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/lag-{d}", .{ tmp.sub_path, attempt });
+        const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .open_mode = .writer_no_replay, .start_optional_runtimes = false, .start_index_workers = false };
+        var target = try db_mod.DB.open(alloc, path, options);
+        var open = true;
+        defer if (open) target.close();
+        try target.setSchemaJson(alloc, schema);
+        try target.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        const encoded = try @import("../schema.zig").serializeSchema(owned, target.core.schema.?);
+        const scope: restore.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = options.identity_namespace.?, .target_schema_digest = restore.digest(encoded) };
+        try target.reserveRestoreStagingScoped(alloc, scope);
+        if (ha) target.ha_write_gate = .{ .shared = .{ .state = &gate } };
+        try applyRestoreReplica(&target, .{ .restore_staging = .{ .begin = scope } }, 1, ha);
+        var index: u64 = 2;
+        var crashed = false;
+        while (true) : (index += 1) {
+            var page = try target.prepareRestoreStagingPage(alloc, scope, &source, 128, .none);
+            defer page.deinit();
+            if (page.batch) |batch| {
+                {
+                    db_mod.DB.failNextRestoreProjectionApplyForTest();
+                    try std.testing.expectError(error.InjectedRestoreProjectionApplyFailure, applyRestoreReplica(&target, batch, index, ha));
+                    target.close();
+                    open = false;
+                    target = try db_mod.DB.open(alloc, path, options);
+                    open = true;
+                    if (ha) target.ha_write_gate = .{ .shared = .{ .state = &gate } };
+                    try applyRestoreReplica(&target, batch, index, ha);
+                    // Model the last physical projection watermark being
+                    // lost at the crash cut while the primary Raft/HA receipt
+                    // remains durable. Replay must restore this local proof.
+                    try @import("derived/apply_state.zig").clearAppliedSequenceWithCheckpoint(alloc, std.testing.io, target.core.store, target.core.applied_sequence_checkpoint_path, "text");
+                    // Import replay is intentionally idempotent; its durable
+                    // receipt cannot falsely imply projections caught up.
+                    const debt = try target.listDerivedReplayDebt(alloc);
+                    defer {
+                        for (debt) |*entry| entry.deinit(alloc);
+                        alloc.free(debt);
+                    }
+                    try std.testing.expect(debt.len != 0);
+                    var pending = false;
+                    for (debt) |entry| pending = pending or entry.catch_up_required;
+                    try std.testing.expect(pending);
+                    crashed = true;
+                }
+            }
+            if (page.phase == .imported) break;
+        }
+        try std.testing.expect(crashed);
+        // CHECK coverage is disposable replica-local proof. Losing it must
+        // make bounded progress on replay, never a semantic Raft rejection.
+        try target.core.store.putBatch(&.{}, &.{@import("relational_constraint_jobs.zig").progress_key});
+        const validate_index = index + 1;
+        const validate: @import("types.zig").BatchRequest = .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .validated } } };
+        try std.testing.expectError(error.RestoreProjectionCatchUpPending, applyRestoreReplica(&target, validate, validate_index, ha));
+        if (ha) try std.testing.expectEqual(index, try target.haAppliedReplicationLsn()) else try std.testing.expectEqual(index, (try target.raftAppliedEntry()).?.index);
+        try std.testing.expectError(error.RestoreStagingInProgress, target.lookup(alloc, "row-0000", .{}));
+        var validated = false;
+        for (0..32) |_| {
+            applyRestoreReplica(&target, validate, validate_index, ha) catch |err| switch (err) {
+                error.RestoreProjectionCatchUpPending => continue,
+                else => return err,
+            };
+            validated = true;
+            break;
+        }
+        try std.testing.expect(validated);
+        try applyRestoreReplica(&target, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } }, validate_index + 1, ha);
+        var result = try target.search(alloc, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "text", .text = "keyword" } }, .limit = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 600), result.total_hits);
+    }
+}
+
+test "relational integrity topology durable backup metadata scaling benchmark" {
+    const alloc = std.testing.allocator;
+    const lsm = @import("../lsm_backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Case = struct { runs: usize, bytes: usize };
+    for ([_]Case{ .{ .runs = 8, .bytes = 64 * 1024 }, .{ .runs = 8, .bytes = 1024 * 1024 }, .{ .runs = 64, .bytes = 64 * 1024 } }, 0..) |case, case_id| {
+        const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bench-{d}", .{ tmp.sub_path, case_id });
+        defer alloc.free(source);
+        const target = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pin-{d}", .{ tmp.sub_path, case_id });
+        defer alloc.free(target);
+        var backend = try lsm.Backend.open(alloc, source, .{ .flush_threshold = 1, .compact_threshold_runs = 10000, .l0_soft_limit_runs = 10000, .l0_hard_limit_runs = 10000 });
+        defer backend.close();
+        const value = try alloc.alloc(u8, case.bytes);
+        defer alloc.free(value);
+        var random = std.Random.DefaultPrng.init(42);
+        random.random().bytes(value);
+        for (0..case.runs) |row| {
+            var key_buf: [32]u8 = undefined;
+            var txn = try backend.beginWrite();
+            errdefer txn.abort();
+            try txn.put(.{}, try std.fmt.bufPrint(&key_buf, "row-{d:0>6}", .{row}), value);
+            try txn.commit();
+        }
+        const started = std.Io.Clock.awake.now(std.testing.io);
+        var checkpoint = try backend.pinNativeCheckpoint();
+        defer checkpoint.deinit();
+        const bytes = try checkpoint.seal(std.testing.io, target, .none);
+        const elapsed = started.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds();
+        // File identity proves the measured path does not accidentally copy
+        // corpus bytes; timings are diagnostic rather than flaky assertions.
+        const linked = try std.fmt.allocPrint(alloc, "{s}/runs/{d}.tbl", .{ target, checkpoint.run_ids[0] });
+        defer alloc.free(linked);
+        const before = try @import("native_backup.zig").statRegularFile(std.testing.io, checkpoint.run_paths[0]);
+        const after = try @import("native_backup.zig").statRegularFile(std.testing.io, linked);
+        try std.testing.expectEqual(before.inode, after.inode);
+        std.debug.print("\nbackup durable seal benchmark runs={} corpus_bytes={} metadata_ns={}\n", .{ checkpoint.run_ids.len, bytes, elapsed });
+    }
+}
+
+test "relational integrity topology durable backup seal survives restart and later writes" {
+    const alloc = std.testing.allocator;
+    const seal = @import("native_backup_seal.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/seal-source", .{tmp.sub_path});
+    defer alloc.free(path);
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 700, .shard_id = 701 }, .primary_backend = .{ .lsm = .{} } };
+    var handle: seal.Handle = undefined;
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "before", .value = "{\"v\":1}" }} });
+        const identity = try db.relationalTopologyIdentity();
+        const fence: @import("relational_integrity_topology.zig").Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 701, .owner_group_id = 701, .admission_epoch = identity.next_epoch, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest };
+        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
+        const seal_start = std.Io.Clock.awake.now(std.testing.io);
+        handle = try db.sealBackupCohort("attempt", fence, .none);
+        std.debug.print("\nbackup seal DB fence-hold ns={}\n", .{seal_start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds()});
+        const repeated = try db.sealBackupCohort("attempt-retry", fence, .none);
+        try std.testing.expectEqualSlices(u8, &handle.digest, &repeated.digest);
+        try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null);
+        try db.batch(.{ .writes = &.{.{ .key = "after", .value = "{\"v\":2}" }} });
+        try db.sync(true);
+    }
+    {
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "restart", .value = "{\"v\":3}" }} });
+        const Hook = struct {
+            fn run(ptr: *anyopaque) !void {
+                const source: *db_mod.DB = @ptrCast(@alignCast(ptr));
+                // Runs inside reopened export; acquiring the normal write
+                // path here would deadlock if capture admission remained held.
+                try source.batch(.{ .writes = &.{.{ .key = "during-export", .value = "{\"v\":4}" }} });
+            }
+        };
+        seal.test_export_hook = .{ .ptr = &db, .run = Hook.run };
+        defer seal.test_export_hook = null;
+        try std.testing.expect(try db.exportBackupCohort(handle, "export", .none) > 0);
+        try std.testing.expect(try db.exportBackupCohort(handle, "export", .none) > 0);
+        seal.test_export_hook = null;
+        const exported_primary = try std.fmt.allocPrint(alloc, "{s}.snapshots/export/primary-lsm", .{path});
+        defer alloc.free(exported_primary);
+        const lsm = @import("../lsm_backend.zig");
+        var image = try lsm.Backend.open(alloc, exported_primary, .{});
+        defer image.close();
+        var image_read = try image.beginRead();
+        defer image_read.abort();
+        const keys = @import("../internal_keys.zig");
+        const before_key = try keys.documentKeyAlloc(alloc, "before");
+        defer alloc.free(before_key);
+        try std.testing.expectEqualStrings("{\"v\":1}", try image_read.get(.{ .name = "docs" }, before_key));
+        for ([_][]const u8{ "after", "restart", "during-export" }) |key| {
+            const physical = try keys.documentKeyAlloc(alloc, key);
+            defer alloc.free(physical);
+            try std.testing.expectError(error.NotFound, image_read.get(.{ .name = "docs" }, physical));
+        }
+        const pin = try seal.pathAlloc(alloc, path, handle.fence);
+        defer alloc.free(pin);
+        var opened = try seal.open(alloc, std.testing.io, pin, handle);
+        defer opened.deinit();
+        try std.testing.expect(opened.parsed.value.files.len > 0);
+        var wrong = handle;
+        wrong.digest[0] ^= 1;
+        try std.testing.expectError(error.BackupSealMismatch, db.exportBackupCohort(wrong, "wrong", .none));
+        // Portable and native exports must observe the same sealed cut after
+        // writes resumed and the source process restarted.
+        const portable = @import("../portable_backup.zig");
+        var bytes = std.Io.Writer.Allocating.init(alloc);
+        defer bytes.deinit();
+        try db.exportBackupCohortPortable(handle, &bytes.writer, .{}, .none);
+        try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, portable.validatePortable(alloc, bytes.written()));
+        const decoded_path = try std.fmt.allocPrint(alloc, "{s}-portable", .{path});
+        defer alloc.free(decoded_path);
+        var decoded = try db_mod.DB.open(alloc, decoded_path, options);
+        defer decoded.close();
+        try portable.importPortableWithOptions(alloc, decoded.core.store, bytes.written(), .{
+            .unpublished_staging = true,
+            .cohort = .{ .seal = handle, .namespace = handle.fence.namespace },
+            .identity_namespace = handle.fence.namespace,
+        });
+        try portable.validateCompleteDatabaseImageWithCohort(alloc, decoded.core.store, .{ .seal = handle, .namespace = handle.fence.namespace });
+        const before = try decoded.core.store.get(alloc, before_key);
+        defer alloc.free(before);
+        try std.testing.expectEqualStrings("{\"v\":1}", before);
+        const after_key = try keys.documentKeyAlloc(alloc, "after");
+        defer alloc.free(after_key);
+        try std.testing.expectError(error.NotFound, decoded.core.store.get(alloc, after_key));
+        try std.testing.expectError(error.BackupIntegrityFailure, portable.validateCompleteDatabaseImageWithCohort(alloc, decoded.core.store, .{ .seal = wrong, .namespace = handle.fence.namespace }));
+        try std.testing.expectError(error.BackupIntegrityFailure, portable.importPortableWithOptions(alloc, decoded.core.store, bytes.written(), .{ .unpublished_staging = true, .cohort = .{ .seal = wrong, .namespace = handle.fence.namespace } }));
+        const corrupted = try alloc.dupe(u8, bytes.written());
+        defer alloc.free(corrupted);
+        corrupted[@import("../backup_codec.zig").header_size + 6] ^= 1;
+        try std.testing.expectError(error.BlockCrcMismatch, portable.importPortableWithOptions(alloc, decoded.core.store, corrupted, .{ .unpublished_staging = true, .cohort = .{ .seal = handle, .namespace = handle.fence.namespace } }));
+        try std.testing.expectError(error.InvalidBackupRequest, portable.importPortableWithOptions(alloc, decoded.core.store, bytes.written(), .{ .cohort = .{ .seal = handle, .namespace = handle.fence.namespace } }));
+        try db.releaseBackupCohort(handle);
+        try db.releaseBackupCohort(handle);
+        try std.testing.expectError(error.BackupSealReleased, db.exportBackupCohort(handle, "released", .none));
+        try std.testing.expectError(error.BackupSealReleased, db.sealBackupCohort("delayed", handle.fence, .none));
+        var canceled = handle.fence;
+        canceled.transition_id += 1;
+        canceled.admission_epoch += 1;
+        try db.cancelBackupCohort(canceled);
+        try db.cancelBackupCohort(canceled);
+        try std.testing.expectError(error.BackupSealReleased, db.sealBackupCohort("never-delivered", canceled, .none));
+    }
+}
+
+test "relational integrity portable decoder resumes bounded row pages across LSM reopen" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
+    const decoded_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/decoded", .{tmp.sub_path});
+    const file_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source.afb", .{tmp.sub_path});
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 600, .shard_id = 601, .range_id = 601 };
+    var source = try db_mod.DB.open(alloc, source_path, .{ .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+    defer source.close();
+    var rows: [300]@import("types.zig").BatchWrite = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{ .key = try std.fmt.allocPrint(a, "row-{d:0>4}", .{i}), .value = "{\"id\":1}" };
+    try source.batch(.{ .writes = &rows, .timestamp_ns = 900 });
+    const identity = try source.relationalTopologyIdentity();
+    const fence: @import("relational_integrity_topology.zig").Fence = .{ .role = .backup_snapshot, .transition_id = 55, .attempt = 1, .owner_group_id = 601, .peer_group_id = 601, .namespace = namespace, .catalog_digest = identity.catalog_digest, .admission_epoch = identity.next_epoch };
+    try source.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
+    const handle = try source.sealBackupCohort("portable-page", fence, .none);
+    try source.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null);
+    const portable = @import("../portable_backup.zig");
+    const proof: portable.CohortProof = .{ .seal = handle, .namespace = namespace };
+    var file = try std.Io.Dir.cwd().createFile(std.testing.io, file_path, .{ .read = true });
+    defer file.close(std.testing.io);
+    var buffer: [65536]u8 = undefined;
+    var writer = file.writer(std.testing.io, &buffer);
+    try source.exportBackupCohortPortable(handle, &writer.interface, .{}, .none);
+    try writer.end();
+    try file.sync(std.testing.io);
+    const size = (try file.stat(std.testing.io)).size;
+    var calls: usize = 0;
+    while (calls < 200) : (calls += 1) {
+        var backend = try @import("../lsm_backend.zig").Backend.open(alloc, decoded_path, .{ .read_runtime = @import("../lsm_backend/storage_io.zig").ReadRuntime.init(std.testing.io) });
+        defer backend.close();
+        var store = try @import("../docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
+        defer store.close();
+        const done = try portable.importCohortFilePage(alloc, &store, std.testing.io, file, size, proof, @splat(7), 17, .none);
+        try std.testing.expectError(error.RestoreStagingScopeChanged, portable.importCohortFilePage(alloc, &store, std.testing.io, file, size, proof, @splat(8), 17, .none));
+        if (done) {
+            try std.testing.expect(try portable.importCohortFilePage(alloc, &store, std.testing.io, file, size, proof, @splat(7), 17, .none));
+            try @import("doc_identity.zig").validatePrimaryDocumentCoverageAlloc(alloc, &store);
+            const stats = try @import("doc_identity.zig").fullStatsFromStore(&store);
+            try std.testing.expectEqual(@as(u64, 300), stats.live_ordinals);
+            for (rows) |row| {
+                const key = try @import("../internal_keys.zig").documentKeyAlloc(a, row.key);
+                const value = try store.get(a, key);
+                try std.testing.expectEqualStrings(row.value, value);
+            }
+            break;
+        }
+    } else return error.RestoreWorkerDidNotConverge;
+    try std.testing.expect(calls > 300 / 17);
+}
+
 fn binding(db: *db_mod.DB, kind: catalog.Kind, name: []const u8) !integrity.Generation {
     const alloc = std.testing.allocator;
     const raw = try db.core.getStoreValue(alloc, catalog.key) orelse return error.MissingIntegrityCatalog;
@@ -33,6 +345,187 @@ fn generationSet(db: *db_mod.DB) ![32]u8 {
     var loaded = try catalog.decode(alloc, raw);
     defer loaded.deinit();
     return @import("relational_integrity_activation.zig").generationSet(loaded);
+}
+
+test "relational integrity scoped two phase resolution mirrors binary claims through HA" {
+    const alloc = std.testing.allocator;
+    const restore = @import("restore_staging.zig");
+    const primary_mod = @import("../ha/primary.zig");
+    const effects = @import("../ha/effects.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const source_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/ha-2pc-source", .{tmp.sub_path});
+    const target_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/ha-2pc-target", .{tmp.sub_path});
+    const replica_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/ha-2pc-replica", .{tmp.sub_path});
+    const source_options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    {
+        var source = try db_mod.DB.open(alloc, source_path, source_options);
+        defer source.close();
+        try source.setSchemaJson(alloc, schema);
+    }
+    var read_options = source_options;
+    read_options.open_mode = .query_readonly;
+    var source = try db_mod.DB.open(alloc, source_path, read_options);
+    defer source.close();
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    var target = try db_mod.DB.open(alloc, target_path, options);
+    defer target.close();
+    var replica = try db_mod.DB.open(alloc, replica_path, options);
+    defer replica.close();
+    try target.setSchemaJson(alloc, schema);
+    try replica.setSchemaJson(alloc, schema);
+    const encoded = try @import("../schema.zig").serializeSchema(owned, target.core.schema.?);
+    const scope: restore.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = options.identity_namespace.?, .target_schema_digest = restore.digest(encoded) };
+    for ([_]*db_mod.DB{ &target, &replica }) |db| {
+        try db.reserveRestoreStagingScoped(alloc, scope);
+        try db.beginRestoreStaging(alloc, scope);
+        var page = try db.prepareRestoreStagingPage(alloc, scope, &source, 1, .none);
+        defer page.deinit();
+        try db.batch(page.batch orelse return error.TestUnexpectedResult);
+        var status = (try db.restoreStagingStatus(alloc)).?;
+        defer status.deinit();
+        try std.testing.expectEqual(.imported, status.value.phase);
+    }
+    const log_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-2pc-log", .{tmp.sub_path}, 0);
+    const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-2pc-slots", .{tmp.sub_path}, 0);
+    var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 10, .shard_id = 11 }, .{});
+    defer primary.close();
+    target.ha_async_batch_mirror = .{ .primary = &primary, .sync_policy = .{ .mode = .async } };
+    defer target.ha_async_batch_mirror = null;
+    var view = target.core.acquireSchemaView().?;
+    defer view.release();
+    var tuple_plan = try tuples.TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+    defer tuple_plan.deinit();
+    var tuple: std.ArrayList(u8) = .empty;
+    defer tuple.deinit(alloc);
+    _ = try tuple_plan.appendValues(alloc, &tuple, &.{.{ .integer = 9001 }});
+    const address = try integrity.Address.init(try binding(&target, .unique, "pk"), tuple.items);
+    const transaction = try target.beginTransactionScoped(@splat(18), 100, 100, &.{}, false, false, scope.digest());
+    try target.writeTransaction(transaction, .{ .restore_staging_scope = scope.digest(), .relational_schema_version = 1, .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "p", .schema_version = 1 } } }} });
+    try target.resolveReplicatedTransactionAtRaftEntry(transaction, .committed, 200, .full_index, .none, .{ .term = 1, .index = 1 }, null);
+    try target.resolveReplicatedTransactionAtRaftEntry(transaction, .committed, 200, .full_index, .none, .{ .term = 1, .index = 1 }, null);
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    var entry = (try primary.log.entryAt(alloc, 1)).?;
+    defer entry.deinit(alloc);
+    var decoded = try effects.decodeBatchMutationRequest(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqualSlices(u8, &scope.digest(), &decoded.value.request.restore_staging_scope.?);
+    try std.testing.expect(decoded.value.request.restore_staging == null);
+    try replica.applyHAReplicationRecord(entry.record);
+    const claim_key = address.claimKey();
+    const expected = (try target.core.getStoreValue(alloc, &claim_key)).?;
+    defer alloc.free(expected);
+    const actual = (try replica.core.getStoreValue(alloc, &claim_key)).?;
+    defer alloc.free(actual);
+    try std.testing.expectEqualSlices(u8, expected, actual);
+}
+
+test "relational integrity live two phase HA replay preserves rows and binary claim reference effects" {
+    const alloc = std.testing.allocator;
+    const primary_mod = @import("../ha/primary.zig");
+    const effects = @import("../ha/effects.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const primary_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/live-primary", .{tmp.sub_path});
+    const replica_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/live-replica", .{tmp.sub_path});
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    var db = try db_mod.DB.open(alloc, primary_path, options);
+    defer db.close();
+    var replica = try db_mod.DB.open(alloc, replica_path, options);
+    defer replica.close();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, schema);
+    try replica.setSchemaJson(alloc, schema);
+    const log_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/live-log", .{tmp.sub_path}, 0);
+    const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/live-slots", .{tmp.sub_path}, 0);
+    var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 10, .shard_id = 11 }, .{});
+    defer primary.close();
+    db.ha_async_batch_mirror = .{ .primary = &primary, .sync_policy = .{ .mode = .async } };
+    defer db.ha_async_batch_mirror = null;
+    var view = db.core.acquireSchemaView().?;
+    defer view.release();
+    var plan = try tuples.TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+    defer plan.deinit();
+    var tuple: std.ArrayList(u8) = .empty;
+    defer tuple.deinit(alloc);
+    _ = try plan.appendValues(alloc, &tuple, &.{.{ .integer = 9001 }});
+    const address = try integrity.Address.init(try binding(&db, .unique, "pk"), tuple.items);
+    const claim: integrity.Claim = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "p", .schema_version = 1 };
+    const reference: integrity.Reference = .{ .child_table = "children", .child_key = "c", .constraint_name = "fk", .constraint_generation = @splat(250) };
+    const txn = try db.beginTransactionWithId(@splat(31), 100);
+    try db.writeTransaction(txn, .{ .relational_schema_version = 1, .relational_integrity_generation_set = try generationSet(&db), .writes = &.{.{ .key = "p", .value = "{\"id\":9001}" }}, .integrity_commands = &.{ .{ .address = address, .operation = .{ .establish = claim } }, .{ .address = address, .operation = .{ .attach = reference } } } });
+    try db.commitTransaction(txn, 200);
+    try std.testing.expect(primary.lastLsn() > 0);
+    // A replicated quiescence fence must still admit authoritative effects
+    // from participants prepared before that fence, just like local resolve.
+    const owner = try replica.relationalTopologyIdentity();
+    const fence: @import("relational_integrity_topology.zig").Fence = .{
+        .transition_id = 701,
+        .attempt = 1,
+        .owner_group_id = 11,
+        .peer_group_id = 11,
+        .role = .backup_snapshot,
+        .namespace = owner.namespace,
+        .catalog_digest = owner.catalog_digest,
+    };
+    try replica.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
+    var lsn: u64 = 1;
+    while (lsn <= primary.lastLsn()) : (lsn += 1) {
+        var entry = (try primary.log.entryAt(alloc, lsn)).?;
+        defer entry.deinit(alloc);
+        var decoded = try effects.decodeBatchMutationRequest(alloc, entry.record);
+        defer decoded.deinit();
+        try std.testing.expect(decoded.value.request.restore_staging_scope == null);
+        // The same bytes remain forbidden to the unauthenticated raw batch API.
+        try std.testing.expectError(error.InvalidIntegrityOperation, replica.batch(decoded.value.request));
+        try replica.applyHAReplicationRecord(entry.record);
+        try replica.applyHAReplicationRecord(entry.record);
+    }
+    try replica.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null);
+    var row = (try replica.lookup(alloc, "p", .{})).?;
+    defer row.deinit(alloc);
+    const claim_key = address.claimKey();
+    const reference_key = try reference.key(address);
+    for ([_][]const u8{ &claim_key, &reference_key }) |key| {
+        const expected = (try db.core.getStoreValue(alloc, key)).?;
+        defer alloc.free(expected);
+        const actual = (try replica.core.getStoreValue(alloc, key)).?;
+        defer alloc.free(actual);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+    }
+    const remove = try db.beginTransactionWithId(@splat(32), 300);
+    try db.writeTransaction(remove, .{ .relational_schema_version = 1, .relational_integrity_generation_set = try generationSet(&db), .deletes = &.{"p"}, .integrity_commands = &.{ .{ .address = address, .operation = .{ .detach = reference } }, .{ .address = address, .operation = .{ .release = .{ .parent_table = "parents", .parent_key = "p" } } } } });
+    try db.commitTransaction(remove, 400);
+    while (lsn <= primary.lastLsn()) : (lsn += 1) {
+        var entry = (try primary.log.entryAt(alloc, lsn)).?;
+        defer entry.deinit(alloc);
+        try replica.applyHAReplicationRecord(entry.record);
+    }
+    try std.testing.expect((try replica.lookup(alloc, "p", .{})) == null);
+    for ([_][]const u8{ &claim_key, &reference_key }) |key| try std.testing.expect((try replica.core.getStoreValue(alloc, key)) == null);
+    const before_invalid = try replica.haAppliedReplicationLsn();
+    const invalid_address = try integrity.Address.init(@splat(199), tuple.items);
+    const invalid_key = invalid_address.claimKey();
+    const invalid_value = try claim.encode(alloc, invalid_address);
+    defer alloc.free(invalid_value);
+    const invalid_lsn = try effects.appendBatchMutationRequest(alloc, &primary, .{
+        .writes = &.{.{ .key = &invalid_key, .value = invalid_value }},
+    }, .{});
+    var invalid_entry = (try primary.log.entryAt(alloc, invalid_lsn)).?;
+    defer invalid_entry.deinit(alloc);
+    try std.testing.expectError(error.IntegrityCatalogChanged, replica.applyHAReplicationRecord(invalid_entry.record));
+    try std.testing.expectEqual(before_invalid, try replica.haAppliedReplicationLsn());
 }
 
 test "relational integrity DB transactions atomically preserve cross-table parent dependencies" {
@@ -155,6 +648,401 @@ fn activateOnePage(db: *db_mod.DB, txn_byte: u8) !bool {
     try db.writeTransaction(transaction, .{ .relational_schema_version = view.version(), .integrity_commands = commands, .predicates = predicates, .relational_activation = page.command });
     try db.commitTransaction(transaction, 600);
     return page.progress.state == .enforced;
+}
+
+test "relational integrity topology quiesces new work while old decisions drain and resumes after release" {
+    const alloc = std.testing.allocator;
+    const topology = @import("relational_integrity_topology.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fenced", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{
+        .identity_namespace = .{ .table_id = 500, .shard_id = 501, .range_id = 502 },
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+        .primary_backend = .{ .lsm = .{} },
+    });
+    defer db.close();
+    const old = try db.beginTransactionWithId(@splat(71), 100);
+    try db.writeTransaction(old, .{ .writes = &.{.{ .key = "a", .value = "{\"v\":1}" }} });
+    const owner = try db.relationalTopologyIdentity();
+    const fence: topology.Fence = .{
+        .transition_id = 700,
+        .attempt = 1,
+        .owner_group_id = 501,
+        .peer_group_id = 501,
+        .role = .backup_snapshot,
+        .namespace = owner.namespace,
+        .catalog_digest = owner.catalog_digest,
+    };
+    try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
+    try std.testing.expect(!(try db.relationalTopologyStatus()).drained);
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.batch(.{ .writes = &.{.{ .key = "b", .value = "{}" }} }));
+    const fresh = try db.beginTransactionWithId(@splat(72), 200);
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.writeTransaction(fresh, .{ .writes = &.{.{ .key = "b", .value = "{}" }} }));
+    try db.abortTransaction(fresh, 210);
+    try db.writeTransaction(old, .{ .writes = &.{.{ .key = "a", .value = "{\"v\":1}" }} });
+    try db.commitTransaction(old, 220);
+    try std.testing.expect((try db.relationalTopologyStatus()).drained);
+    try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null);
+    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{}" }} });
+    try std.testing.expectError(error.IntegrityTopologyCompleted, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null));
+    var cancelled = fence;
+    cancelled.transition_id += 1;
+    cancelled.admission_epoch = (try db.relationalTopologyIdentity()).next_epoch;
+    try db.batchReplicatedApply(.{ .relational_topology = .{ .fence = cancelled, .action = .cancel } });
+    try std.testing.expectError(error.IntegrityTopologyCompleted, db.batchReplicatedApply(.{ .relational_topology = .{ .fence = cancelled, .action = .begin } }));
+    var newer = cancelled;
+    newer.transition_id += 1;
+    newer.admission_epoch = (try db.relationalTopologyIdentity()).next_epoch;
+    try db.batch(.{ .relational_topology = .{ .fence = newer, .action = .begin } });
+    try db.batch(.{ .relational_topology = .{ .fence = newer, .action = .release } });
+    try std.testing.expectError(error.IntegrityTopologyCompleted, db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null));
+    try std.testing.expectError(error.IntegrityTopologyCompleted, db.applyRelationalTopologyControl(.{ .fence = cancelled, .action = .begin }, null));
+    var aborted = newer;
+    aborted.transition_id += 10;
+    aborted.role = .split_source;
+    aborted.admission_epoch = (try db.relationalTopologyIdentity()).next_epoch;
+    try db.applyRelationalTopologyControl(.{ .fence = aborted, .action = .abort_transition }, null);
+    // A rollback need not know the epoch assigned to an ambiguously delivered
+    // begin. The transition tombstone rejects it even with a newer epoch.
+    aborted.admission_epoch += 100;
+    try std.testing.expectError(error.IntegrityTopologyCompleted, db.applyRelationalTopologyControl(.{ .fence = aborted, .action = .begin }, null));
+}
+
+test "relational integrity topology handoff transfers routed companions with restartable page CAS" {
+    const alloc = std.testing.allocator;
+    const topology = @import("relational_integrity_topology.zig");
+    const handoff = @import("relational_integrity_handoff.zig");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
+    const destination_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/destination", .{tmp.sub_path});
+    var source = try db_mod.DB.open(alloc, source_path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 600, .shard_id = 601 }, .primary_backend = .{ .lsm = .{} } });
+    defer source.close();
+    var destination = try db_mod.DB.open(alloc, destination_path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 600, .shard_id = 602 }, .primary_backend = .{ .lsm = .{} } });
+    defer destination.close();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    try source.setSchemaJson(alloc, schema);
+    try destination.setSchemaJson(alloc, schema);
+    const generation = try binding(&source, .unique, "pk");
+    {
+        var view = source.core.acquireSchemaView().?;
+        defer view.release();
+        var plan = try tuples.TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+        defer plan.deinit();
+        var tuple: std.ArrayList(u8) = .empty;
+        defer tuple.deinit(alloc);
+        _ = try plan.appendValues(alloc, &tuple, &.{.{ .integer = 999 }});
+        const address = try integrity.Address.init(generation, tuple.items);
+        const create = try source.beginTransactionWithId(@splat(75), 100);
+        try source.writeTransaction(create, .{ .relational_schema_version = 1, .relational_integrity_generation_set = try generationSet(&source), .writes = &.{.{ .key = "z", .value = "{\"id\":999}" }}, .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "z", .schema_version = 1 } } }} });
+        try source.commitTransaction(create, 200);
+    }
+    // Populate more than one bounded page. The second physical namespace
+    // contains child references whose matching claims were sent first.
+    var kept_address: ?integrity.Address = null;
+    for (0..300) |i| {
+        const tuple = try std.fmt.allocPrint(owned, "tuple-{d}", .{i});
+        const address = try integrity.Address.init(generation, tuple);
+        if (std.mem.order(u8, &address.routing, "m") != .lt) kept_address = address;
+        const claim: integrity.Claim = .{ .tuple = tuple, .parent_table = "parents", .parent_key = tuple, .schema_version = 1 };
+        const reference: integrity.Reference = .{ .child_table = "children", .child_key = tuple, .constraint_name = "fk", .constraint_generation = @splat(9) };
+        try source.core.store.put(&address.claimKey(), try claim.encode(owned, address));
+        try source.core.store.put(&(try reference.key(address)), try reference.encode(owned, address));
+    }
+    const source_owner = try source.relationalTopologyIdentity();
+    const destination_owner = try destination.relationalTopologyIdentity();
+    const source_fence: topology.Fence = .{ .transition_id = 800, .attempt = 1, .owner_group_id = 601, .peer_group_id = 602, .role = .split_source, .namespace = source_owner.namespace, .catalog_digest = source_owner.catalog_digest };
+    const destination_fence: topology.Fence = .{ .transition_id = 800, .attempt = 1, .owner_group_id = 602, .peer_group_id = 601, .role = .split_destination, .namespace = destination_owner.namespace, .catalog_digest = destination_owner.catalog_digest };
+    try source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null);
+    try destination.applyRelationalTopologyControl(.{ .action = .begin, .fence = destination_fence }, null);
+    const manifest = try source.relationalHandoffManifest(owned, source_fence, destination_fence, "m", "", 10);
+    try destination.applyRelationalTopologyControl(.{ .action = .transfer, .fence = destination_fence, .transfer = .{ .begin = manifest } }, null);
+    var page_count: usize = 0;
+    while (true) {
+        var read = try destination.core.store.beginProbeTxn();
+        const progress = try handoff.loadProgress(owned, &read);
+        read.abort();
+        if (progress.value.exhausted) break;
+        const page = try source.relationalHandoffPage(owned, manifest, progress.value);
+        try destination.applyRelationalTopologyControl(.{ .action = .transfer, .fence = destination_fence, .transfer = .{ .page = page } }, null);
+        try destination.applyRelationalTopologyControl(.{ .action = .transfer, .fence = destination_fence, .transfer = .{ .page = page } }, null);
+        page_count += 1;
+    }
+    try std.testing.expect(page_count >= 2);
+    while (true) {
+        var read = try destination.core.store.beginProbeTxn();
+        const progress = try handoff.loadProgress(owned, &read);
+        read.abort();
+        if (progress.value.ready) break;
+        try destination.applyRelationalTopologyControl(.{ .action = .transfer, .fence = destination_fence, .transfer = .{ .finish = .{ .sequence = progress.value.sequence, .digest = progress.value.digest } } }, null);
+    }
+    var read = try destination.core.store.beginProbeTxn();
+    defer read.abort();
+    const address = kept_address orelse return error.TestUnexpectedResult;
+    try integrity.validateTransferredCompanions(&read, &address.claimKey(), try read.get(&address.claimKey()));
+    // Metadata completion alone never releases the destination write fence.
+    try std.testing.expect((try destination.relationalTopologyStatus()).fence != null);
+    const replication: @import("types.zig").SplitReplicationContext = .{ .transition_id = 800, .attempt_epoch = 1, .source_group_id = 601, .destination_group_id = 602, .identity_namespace = destination_owner.namespace, .bootstrap_sequence = 10, .operation = .checkpoint, .sequence = 10 };
+    const checkpoint: @import("types.zig").SplitReplicationCheckpoint = .{ .kind = .destination_begin, .transition_id = 800, .attempt_epoch = 1, .source_group_id = 601, .destination_group_id = 602, .range_start = "m", .range_end = "", .delta_sequence = 10 };
+    try destination.batchRaftReplicatedApply(.{ .split_replication = replication, .split_checkpoint = checkpoint }, .{ .term = 1, .index = 10 });
+    var row_replication = replication;
+    row_replication.operation = .bootstrap_chunk;
+    try destination.batchRaftReplicatedApply(.{ .split_replication = row_replication, .writes = &.{.{ .key = "z", .value = "{\"id\":999}" }} }, .{ .term = 1, .index = 11 });
+    var complete = checkpoint;
+    complete.kind = .destination_complete;
+    try destination.batchRaftReplicatedApply(.{ .split_replication = replication, .split_checkpoint = complete }, .{ .term = 1, .index = 12 });
+    try source.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 800, .attempt_epoch = 1, .destination_group_id = 602, .split_key = "m" } }, .{ .term = 1, .index = 12 });
+    try std.testing.expect((try source.relationalTopologyStatus()).fence == null);
+    try destination.applyRelationalTopologyControl(.{ .action = .release, .fence = destination_fence }, null);
+    try std.testing.expect((try destination.relationalTopologyStatus()).fence == null);
+    try std.testing.expectEqualStrings("m", source.getRange().end);
+    try std.testing.expectEqualStrings("m", destination.getRange().start);
+    const row = (try destination.get(alloc, "z")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"id\":999}", row);
+    while (true) {
+        try source.applyRelationalTopologyControl(.{ .action = .prune, .fence = source_fence }, null);
+        var source_read = try source.core.store.beginProbeTxn();
+        defer source_read.abort();
+        var progress = try std.json.parseFromSlice(handoff.PruneProgress, owned, try source_read.get(handoff.prune_key), .{});
+        defer progress.deinit();
+        if (progress.value.complete) {
+            try std.testing.expectError(error.NotFound, source_read.get(&address.claimKey()));
+            break;
+        }
+    }
+    var retry_destination = destination_fence;
+    retry_destination.transition_id += 1;
+    retry_destination.admission_epoch = (try destination.relationalTopologyIdentity()).next_epoch;
+    try std.testing.expectError(error.IntegrityHandoffDestinationResetRequired, destination.applyRelationalTopologyControl(.{ .action = .begin, .fence = retry_destination }, null));
+}
+
+test "relational integrity resolves private keys on non-first logical owner" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/owner", .{tmp.sub_path});
+    var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 970, .shard_id = 971 }, .primary_backend = .{ .lsm = .{} } });
+    defer db.close();
+    try db.updateRange(.{ .start = "m", .end = "" });
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    const generation = try binding(&db, .unique, "pk");
+    var view = db.core.acquireSchemaView().?;
+    defer view.release();
+    var plan = try tuples.TuplePlan.init(owned, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+    defer plan.deinit();
+    var tuple: std.ArrayList(u8) = .empty;
+    var address: integrity.Address = undefined;
+    var value: i64 = 0;
+    while (value < 1000) : (value += 1) {
+        tuple.clearRetainingCapacity();
+        _ = try plan.appendValues(owned, &tuple, &.{.{ .integer = value }});
+        address = try integrity.Address.init(generation, tuple.items);
+        if (db.getRange().contains(&address.routing)) break;
+    } else return error.TestUnexpectedResult;
+    const json = try std.fmt.allocPrint(owned, "{{\"id\":{d}}}", .{value});
+    const txn = try db.beginTransactionWithId(@splat(121), 100);
+    try db.writeTransaction(txn, .{ .relational_schema_version = 1, .relational_integrity_generation_set = try generationSet(&db), .writes = &.{.{ .key = "z", .value = json }}, .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "z", .schema_version = 1 } } }} });
+    try db.commitTransaction(txn, 200);
+    const row = (try db.get(owned, "z")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(json, row);
+    var read = try db.core.store.beginProbeTxn();
+    defer read.abort();
+    _ = try read.get(&address.claimKey());
+}
+
+test "relational integrity topology merge rollback prunes imported claims before unfreezing" {
+    try testMergeIntegrityHandoff(true, false, false);
+}
+
+test "relational integrity topology merge finalize keeps both ownership slices after reopen" {
+    try testMergeIntegrityHandoff(false, false, false);
+}
+
+test "relational integrity topology merge rollback before transfer releases both fences" {
+    try testMergeIntegrityHandoff(true, true, false);
+}
+
+test "relational integrity topology merge HA replay preserves imported ownership through finalize" {
+    try testMergeIntegrityHandoff(false, false, true);
+}
+
+test "relational integrity topology merge HA replay preserves rollback prune and abort" {
+    try testMergeIntegrityHandoff(true, false, true);
+}
+
+fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comptime ha: bool) !void {
+    const alloc = std.testing.allocator;
+    const topology = @import("relational_integrity_topology.zig");
+    const handoff = @import("relational_integrity_handoff.zig");
+    const types = @import("types.zig");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
+    const destination_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/destination", .{tmp.sub_path});
+    var primary: @import("../ha/primary.zig").Primary = if (ha) try @import("../ha/primary.zig").Primary.open(alloc, try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-log", .{tmp.sub_path}, 0), try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-slots", .{tmp.sub_path}, 0), .{ .cluster_id = 901, .timeline_id = 1, .epoch = 1 }, .{}) else undefined;
+    defer if (ha) primary.close();
+    const source_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 901 }, .primary_backend = .{ .lsm = .{} } };
+    const destination_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 902 }, .primary_backend = .{ .lsm = .{} }, .ha_async_batch_mirror = if (ha) .{ .primary = &primary } else null, .ha_write_gate = if (ha) .{ .primary = &primary } else null };
+    var source = try db_mod.DB.open(alloc, source_path, source_options);
+    defer source.close();
+    var destination = try db_mod.DB.open(alloc, destination_path, destination_options);
+    defer destination.close();
+    try source.updateRange(.{ .start = "m", .end = "" });
+    try destination.updateRange(.{ .start = "", .end = "m" });
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    try source.setSchemaJson(alloc, schema);
+    try destination.setSchemaJson(alloc, schema);
+    var standby_options = destination_options;
+    standby_options.ha_async_batch_mirror = null;
+    standby_options.ha_write_gate = null;
+    var standby: db_mod.DB = if (ha) try db_mod.DB.open(alloc, try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/standby", .{tmp.sub_path}), standby_options) else undefined;
+    defer if (ha) standby.close();
+    if (ha) {
+        try standby.updateRange(.{ .start = "", .end = "m" });
+        try standby.setSchemaJson(alloc, schema);
+    }
+    const generation = try binding(&source, .unique, "pk");
+    var imported: ?integrity.Address = null;
+    var retained: ?integrity.Address = null;
+    for (0..800) |i| {
+        const tuple = try std.fmt.allocPrint(owned, "merge-{d}", .{i});
+        const address = try integrity.Address.init(generation, tuple);
+        const claim: integrity.Claim = .{ .tuple = tuple, .parent_table = "parents", .parent_key = tuple, .schema_version = 1 };
+        if (std.mem.order(u8, &address.routing, "m") != .lt) {
+            try source.core.store.put(&address.claimKey(), try claim.encode(owned, address));
+            imported = address;
+        } else {
+            try destination.core.store.put(&address.claimKey(), try claim.encode(owned, address));
+            if (ha) try standby.core.store.put(&address.claimKey(), try claim.encode(owned, address));
+            retained = address;
+        }
+    }
+    const replay_start = if (ha) primary.nextLsn() else 0;
+    const source_owner = try source.relationalTopologyIdentity();
+    const destination_owner = try destination.relationalTopologyIdentity();
+    const source_fence: topology.Fence = .{ .transition_id = 980, .attempt = 1, .owner_group_id = 901, .peer_group_id = 902, .role = .merge_source, .namespace = source_owner.namespace, .catalog_digest = source_owner.catalog_digest };
+    const destination_fence: topology.Fence = .{ .transition_id = 980, .attempt = 1, .owner_group_id = 902, .peer_group_id = 901, .role = .merge_destination, .namespace = destination_owner.namespace, .catalog_digest = destination_owner.catalog_digest };
+    try source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null);
+    try destination.batch(.{ .relational_topology = .{ .action = .begin, .fence = destination_fence } });
+    var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 980, .donor_group_id = 901, .receiver_group_id = 902, .receiver_base_start = "", .receiver_base_end = "m", .merged_start = "", .merged_end = "" };
+    try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+    if (empty) {
+        checkpoint.kind = .rollback;
+        try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+        try destination.applyRelationalTopologyControl(.{ .action = .abort_transition, .fence = destination_fence }, null);
+        try source.applyRelationalTopologyControl(.{ .action = .abort_transition, .fence = source_fence }, null);
+        try std.testing.expect((try destination.relationalTopologyStatus()).fence == null);
+        try std.testing.expect((try source.relationalTopologyStatus()).fence == null);
+        try std.testing.expectEqualStrings("m", destination.getRange().end);
+        return;
+    }
+    var manifest = try source.relationalHandoffManifest(owned, source_fence, destination_fence, "m", "", 10);
+    manifest.merge_copy_attempt = .{ .donor_term = 1, .sequence = 1 };
+    try destination.batch(.{ .relational_topology = .{ .action = .transfer, .fence = destination_fence, .transfer = .{ .begin = manifest } } });
+    while (true) {
+        var read = try destination.core.store.beginProbeTxn();
+        const progress = try handoff.loadProgress(owned, &read);
+        read.abort();
+        if (progress.value.exhausted) break;
+        const page = try source.relationalHandoffPage(owned, manifest, progress.value);
+        try destination.batch(.{ .relational_topology = .{ .action = .transfer, .fence = destination_fence, .transfer = .{ .page = page } } });
+    }
+    checkpoint.kind = .begin_copy;
+    checkpoint.copy_attempt = manifest.merge_copy_attempt;
+    try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+    var stale = checkpoint;
+    stale.copy_attempt.sequence = 0;
+    try std.testing.expectError(error.IntegrityHandoffSequenceChanged, destination.batchRaftReplicatedApply(.{ .merge_checkpoint = stale }, .{ .term = 1, .index = 3 }));
+    try std.testing.expectError(error.IntegrityHandoffIncomplete, destination.applyRelationalTopologyControl(.{ .action = .prune, .fence = destination_fence }, null));
+    if (!rollback) {
+        while (true) {
+            var read = try destination.core.store.beginProbeTxn();
+            const progress = try handoff.loadProgress(owned, &read);
+            read.abort();
+            if (progress.value.ready) break;
+            try destination.batch(.{ .relational_topology = .{ .action = .transfer, .fence = destination_fence, .transfer = .{ .finish = .{ .sequence = progress.value.sequence, .digest = progress.value.digest } } } });
+        }
+        checkpoint.kind = .bootstrap_complete;
+        checkpoint.bootstrap_applied_index = 10;
+        try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 4 });
+        try std.testing.expectError(error.MergeTransitionNotReady, destination.applyRelationalTopologyControl(.{ .action = .release, .fence = destination_fence }, null));
+        checkpoint.kind = .finalize;
+        checkpoint.bootstrap_applied_index = 11;
+        try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 5 });
+        destination.close();
+        destination = try db_mod.DB.open(alloc, destination_path, destination_options);
+        try destination.batch(.{ .relational_topology = .{ .action = .release, .fence = destination_fence } });
+        try destination.batch(.{ .relational_topology = .{ .action = .release, .fence = destination_fence } });
+        try std.testing.expect((try destination.relationalTopologyStatus()).fence == null);
+        var read = try destination.core.store.beginProbeTxn();
+        defer read.abort();
+        _ = try read.get(&imported.?.claimKey());
+        _ = try read.get(&retained.?.claimKey());
+        try std.testing.expectError(error.NotFound, read.get(handoff.manifest_key));
+        if (ha) try verifyMergeHAReplay(&primary, replay_start, &standby, imported.?, retained.?, false);
+        return;
+    }
+    checkpoint.kind = .rollback;
+    try destination.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 4 });
+    try std.testing.expectError(error.IntegrityTopologyChanged, destination.applyRelationalTopologyControl(.{ .action = .transfer, .fence = destination_fence, .transfer = .{ .begin = manifest } }, null));
+    destination.close();
+    destination = try db_mod.DB.open(alloc, destination_path, destination_options);
+    var pages: usize = 0;
+    while (true) {
+        try destination.batch(.{ .relational_topology = .{ .action = .prune, .fence = destination_fence } });
+        var read = try destination.core.store.beginProbeTxn();
+        defer read.abort();
+        const progress = (try std.json.parseFromSlice(handoff.PruneProgress, owned, try read.get(handoff.prune_key), .{})).value;
+        pages += 1;
+        if (progress.complete) break;
+        try std.testing.expectError(error.IntegrityHandoffIncomplete, destination.applyRelationalTopologyControl(.{ .action = .abort_transition, .fence = destination_fence }, null));
+    }
+    try std.testing.expect(pages > 1);
+    try destination.batch(.{ .relational_topology = .{ .action = .abort_transition, .fence = destination_fence } });
+    try destination.batch(.{ .relational_topology = .{ .action = .abort_transition, .fence = destination_fence } });
+    try std.testing.expect((try destination.relationalTopologyStatus()).fence == null);
+    var read = try destination.core.store.beginProbeTxn();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(&imported.?.claimKey()));
+    _ = try read.get(&retained.?.claimKey());
+    try std.testing.expectError(error.NotFound, read.get(handoff.manifest_key));
+    if (ha) try verifyMergeHAReplay(&primary, replay_start, &standby, imported.?, retained.?, true);
+}
+
+fn verifyMergeHAReplay(primary: *@import("../ha/primary.zig").Primary, start_lsn: u64, standby: *db_mod.DB, imported: integrity.Address, retained: integrity.Address, rollback: bool) !void {
+    var lsn = start_lsn;
+    while (lsn <= primary.lastLsn()) : (lsn += 1) {
+        var entry = (try primary.log.entryAt(std.testing.allocator, lsn)) orelse return error.TestUnexpectedResult;
+        defer entry.deinit(std.testing.allocator);
+        try standby.applyHAReplicationRecord(entry.record);
+        try standby.applyHAReplicationRecord(entry.record);
+    }
+    try std.testing.expect((try standby.relationalTopologyStatus()).fence == null);
+    try std.testing.expectEqualStrings(if (rollback) "m" else "", standby.getRange().end);
+    var read = try standby.core.store.beginProbeTxn();
+    defer read.abort();
+    _ = try read.get(&retained.claimKey());
+    if (rollback) try std.testing.expectError(error.NotFound, read.get(&imported.claimKey())) else _ = try read.get(&imported.claimKey());
+    try std.testing.expectError(error.NotFound, read.get(@import("relational_integrity_handoff.zig").manifest_key));
 }
 
 test "relational integrity historical restore stays fenced while coherent HA seed preserves namespace" {

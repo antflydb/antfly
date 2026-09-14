@@ -18,6 +18,7 @@ pub const artifact_sources_protocol_version: u16 = 1;
 /// The store understands native HBC authority markers, WAL recovery, and the
 /// fail-closed placement contract used during rolling upgrades.
 pub const dense_native_storage_protocol_version: u16 = 1;
+pub const relational_topology_protocol_version: u16 = 1;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
@@ -50,6 +51,7 @@ pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
         std.mem.eql(u8, lhs.description, rhs.description) and
         std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
         std.mem.eql(u8, lhs.read_schema_json, rhs.read_schema_json) and
+        std.mem.eql(u8, lhs.relational_retirement_json, rhs.relational_retirement_json) and
         std.mem.eql(u8, lhs.indexes_json, rhs.indexes_json) and
         std.mem.eql(u8, lhs.replication_sources_json, rhs.replication_sources_json) and
         std.mem.eql(u8, lhs.placement_role, rhs.placement_role) and
@@ -81,6 +83,7 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
     hashTableDefinitionPart(&hasher, table.description);
     hashTableDefinitionPart(&hasher, table.schema_json);
     hashTableDefinitionPart(&hasher, table.read_schema_json);
+    if (table.relational_retirement_json.len != 0) hashTableDefinitionPart(&hasher, table.relational_retirement_json);
     hashTableDefinitionPart(&hasher, table.indexes_json);
     hashTableDefinitionPart(&hasher, table.replication_sources_json);
     hashTableDefinitionPart(&hasher, table.placement_role);
@@ -451,6 +454,7 @@ pub const StoreRecord = struct {
     artifact_sources_protocol_version: u16 = 0,
     native_generation_restore_version: u16 = 0,
     dense_native_storage_protocol_version: u16 = 0,
+    relational_topology_protocol_version: u16 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -795,6 +799,7 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
 }
 
 pub const StoreStatusReport = struct {
+    relational_topology_protocol_version: u16 = 0,
     store_id: u64,
     /// Version of the volatile owner-activity projection carried by this
     /// heartbeat. Zero means absent/legacy; version 2 is the current schema.
@@ -1903,6 +1908,7 @@ pub const TableManager = struct {
             return error.TransitionTableContractViolated;
         if (!std.mem.eql(u8, table.name, contract.table_name) or
             !std.mem.eql(u8, table.schema_json, contract.schema_json) or
+            !std.mem.eql(u8, table.read_schema_json, contract.read_schema_json) or
             !std.mem.eql(u8, table.indexes_json, contract.indexes_json))
         {
             return error.TransitionTableContractViolated;
@@ -2022,6 +2028,7 @@ fn transitionTableContract(
         .table_id = table.table_id,
         .table_name = table.name,
         .schema_json = table.schema_json,
+        .read_schema_json = table.read_schema_json,
         .indexes_json = table.indexes_json,
         .source_identity = .{
             .shard_id = rangeDocIdentityShardId(source),
@@ -2090,6 +2097,8 @@ fn freeOwnedOptional(alloc: std.mem.Allocator, value: ?[]const u8) void {
 }
 
 pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
+    const relational_retirement_json = try alloc.dupe(u8, record.relational_retirement_json);
+    errdefer alloc.free(relational_retirement_json);
     const name = try alloc.dupe(u8, record.name);
     errdefer alloc.free(name);
     const description = try alloc.dupe(u8, record.description);
@@ -2110,6 +2119,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     errdefer alloc.free(restore_location);
     return .{
         .storage = record.storage,
+        .relational_retirement_json = relational_retirement_json,
         .table_id = record.table_id,
         .name = name,
         .description = description,
@@ -2165,6 +2175,7 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
 }
 
 pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
+    alloc.free(record.relational_retirement_json);
     alloc.free(record.name);
     alloc.free(record.description);
     alloc.free(record.schema_json);
@@ -2479,6 +2490,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .artifact_sources_protocol_version = record.artifact_sources_protocol_version,
         .native_generation_restore_version = record.native_generation_restore_version,
         .dense_native_storage_protocol_version = record.dense_native_storage_protocol_version,
+        .relational_topology_protocol_version = record.relational_topology_protocol_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,

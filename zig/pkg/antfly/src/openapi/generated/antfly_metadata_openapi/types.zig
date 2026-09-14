@@ -1712,6 +1712,7 @@ pub const CdcConnection = struct {
     }
 };
 
+/// Native cluster backups pin a common transaction cut across a dependency-complete table set. Restart-stable LSM seals are journaled before releasing write fences; artifact upload uses those immutable seals without holding the write pause. Native cohorts support at most 4096 tables and 4096 ranges and require the filesystem-managed LSM backend. Portable backups do not support coordinated UNIQUE/FK constraints or promise a common cross-table transaction cut.
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
@@ -2237,6 +2238,7 @@ pub const ClusterHealth = enum {
     }
 };
 
+/// Native cohort restores use the existing asynchronous restore job to provision hidden fresh generations, import rows, rebuild indexes and coordinated constraints, and publish the dependency-complete target set atomically. Document, relational, and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges). Skipping a live parent cannot substitute it for a parent generation required by a restored child. Overwrite retains the old generation until validation and cutover; cancellation after publication completes publication rather than rollback. Reserved destination authorization is immutable: changing principal requires canceling the old job and creating a new restore.
 pub const ClusterRestoreRequest = struct {
     /// Unique identifier of the backup to restore from.
     backup_id: []const u8,
@@ -7916,12 +7918,106 @@ pub const RelationalConstraintRangeStatus = struct {
     }
 };
 
+/// Supply exactly one of target_schema or drop=true. A target schema may only remove UNIQUE/FK definitions; all other schema properties must remain unchanged. Its version is assigned by the server. Retirement fences primary mutations while existing reference and claim records are drained. External foreign keys referencing removed definitions must be retired first.
+pub const RelationalConstraintRetirementRequest = struct {
+    schema_version: i64,
+    target_schema: ?antfly_schema_openapi.TableSchema = null,
+    /// Prepare for explicit table deletion; this operation does not delete the table.
+    drop: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "target_schema", "target_schema", false },
+        .{ "drop", "drop", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        if (self.target_schema) |value| {
+            try jw.objectField("target_schema");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("target_schema");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.drop) |value| {
+            try jw.objectField("drop");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalConstraintRetirementStatus = struct {
+    /// Opaque retirement job identity.
+    id: []const u8,
+    phase: []const u8,
+    drop: bool,
+    target_schema_version: i64,
+    /// Durable diagnostic that pauses the job. Retry resumes the exact checkpoint after the cause is addressed; it does not undo a partial drain or permit primary mutations while retirement is active.
+    failure: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "phase", "phase", false },
+        .{ "drop", "drop", false },
+        .{ "target_schema_version", "target_schema_version", false },
+        .{ "failure", "failure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("drop");
+        try jw.write(self.drop);
+        try jw.objectField("target_schema_version");
+        try jw.write(self.target_schema_version);
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalConstraintRetryRequest = struct {
+    schema_version: i64,
+};
+
+pub const RelationalConstraintRetryResponse = struct {
+    status: []const u8,
+};
+
 pub const RelationalConstraintStatus = struct {
     schema_version: i64,
     /// This endpoint reports distributed unique/FK coverage, not local scalar CHECK validation.
     coverage_kind: []const u8,
     state: antfly_schema_openapi.RelationalConstraintValidationState,
     ranges: []const RelationalConstraintRangeStatus,
+    retirement: ?RelationalConstraintRetirementStatus = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -7929,6 +8025,7 @@ pub const RelationalConstraintStatus = struct {
         .{ "coverage_kind", "coverage_kind", false },
         .{ "state", "state", false },
         .{ "ranges", "ranges", false },
+        .{ "retirement", "retirement", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -7949,6 +8046,10 @@ pub const RelationalConstraintStatus = struct {
         try jw.write(self.state);
         try jw.objectField("ranges");
         try jw.write(self.ranges);
+        if (self.retirement) |value| {
+            try jw.objectField("retirement");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

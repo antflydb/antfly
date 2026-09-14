@@ -88,6 +88,7 @@ pub const Routes = struct {
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const backup_shard_suffix = "/backup-shard";
+    pub const restore_owner_suffix = "/restore-owner";
     pub const restore_suffix = "/restore";
     pub const destination_authorization_suffix = "/destination-authorization";
     pub const query_suffix = "/query";
@@ -493,6 +494,10 @@ pub const Routes = struct {
 
     pub fn matchRelationalConstraintStatus(path: []const u8) ?TableScan {
         return matchRelationalRowsPath(path, "/constraints/status");
+    }
+
+    pub fn matchRelationalConstraintRecovery(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/constraints/repair") orelse matchRelationalRowsPath(path, "/constraints/retry") orelse matchRelationalRowsPath(path, "/constraints/retire");
     }
 
     fn matchRelationalRowsPath(path: []const u8, suffix: []const u8) ?TableScan {

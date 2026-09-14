@@ -432,6 +432,36 @@ pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Repair version-conditional rows after failed constraint activation
+pub const RepairRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for repairRelationalConstraints.
+pub fn parseRepairRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retire unique and foreign-key definitions safely
+pub const RetireRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retireRelationalConstraints.
+pub fn parseRetireRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetirementRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetirementRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Restart failed UNIQUE/FK validation after administrative repair
+pub const RetryRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retryRelationalConstraints.
+pub fn parseRetryRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetryRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Read distributed unique and foreign-key validation coverage
 pub const GetRelationalConstraintStatusPathParams = struct {
     table_name: []const u8,
@@ -827,6 +857,9 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/repair", .operation_id = "repairRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/retire", .operation_id = "retireRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/retry", .operation_id = "retryRelationalConstraints", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/constraints/status", .operation_id = "getRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/destination-authorization", .operation_id = "reauthorizeTableDestinations", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys", .request_body = .buffered, .streaming_response = true },
@@ -924,6 +957,9 @@ pub const routes = [_]Route{
 //   fn cancelDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn repairRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn retireRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn retryRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reauthorizeTableDestinations(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

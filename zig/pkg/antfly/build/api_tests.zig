@@ -507,6 +507,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "cluster backup APIs require named connections",
             "cluster backup vtable preserves request context and canceled ingress stops before parsing",
             "cluster backup format defaults portable and preserves explicit native",
+            "cluster backup format one-table adapter keeps artifact IDs isolated",
             "cluster backup and restore reject duplicate table selectors",
             "backup API requests reject unknown operational fields",
             "backup manifest round trips through metadata path",
@@ -907,6 +908,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "internal batch parser rejects mixed split transition commands",
             "internal batch parser requires source acknowledgements to be metadata-only",
             "internal batch codec preserves timestamps and rejects public injection",
+            "internal batch topology control preserves binary fences and refuses public injection",
             "internal batch split identity round trips the full u64 id space",
             "internal batch codec round trips replicated transaction phases",
             "txn resolve codec preserves sync level and accepts legacy requests",
@@ -1438,7 +1440,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_api_transactions_docid_tests = addFilteredTestRunArtifact(b, api_transactions_docid_tests);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
-        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry" },
+        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
@@ -1451,11 +1453,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-rows-test", "Run generated relational row and schema boundary contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_row_contract_tests).step);
+    const api_relational_topology_contract_tests = b.addTest(.{
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{ "internal batch topology control", "relational backup cohort" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-relational-topology-test", "Run private lifecycle control and backup cohort contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_topology_contract_tests).step);
     const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
     const api_table_writes_production_regression_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
         .filters = &.{
+            "restore staging private provisioning",
             "provisioned table write source drop table",
             "provisioned table drop cache drain",
             "provisioned writer cache starts DB workers after stable entry installation",
@@ -1682,6 +1691,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
+    const restore_provisioning_tests = b.addTest(.{
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{"restore staging private provisioning"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-restore-provisioning-test", "Run private hidden owner reservation and writer-cache admission").dependOn(&addFilteredTestRunArtifact(b, restore_provisioning_tests).step);
     const run_api_table_writes_production_regression_unit_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
     // These stateful suites each open several DB/index runtimes. Keep their
     // aggregate-gate runs on one lane so bounded CI hosts do not convert
@@ -1824,6 +1839,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db incomplete deferred restore import recovers before runtime repair",
             "db restore state uses strict structured content identity markers",
             "restore job ownership failures remain retryable",
+            "staged restore published metadata wins cancellation only after every owner opens",
+            "staged restore worker publishes a dependency complete mixed native cohort",
+            "staged restore worker rebuilds a dependency complete mixed portable cohort",
             "restore admission unknown response preserves recovery",
             "restore worker authority is fenced across leadership reacquisition",
             "restore ownership backoff is interruptible without polling",
@@ -1834,6 +1852,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_lib_api_standalone_backup_restore_tests = addFilteredTestRunArtifact(b, lib_api_standalone_backup_restore_tests);
+    const staged_restore_driver_tests = b.addTest(.{
+        .root_module = api_backup_restore_test_mod,
+        .filters = &.{ "staged restore published metadata wins cancellation only after every owner opens", "staged restore worker publishes a dependency complete mixed native cohort", "staged restore worker rebuilds a dependency complete mixed portable cohort", "staged restore worker recovers lost acknowledgements across owner restart matrix", "staged table restore worker uses shared dependency complete cohort", "staged restore worker preserves migration mappings and indexes after restart", "staged restore worker measures bounded LSM native and portable work" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-staged-restore-driver-test", "Run bounded staged restore publication and cancellation driver regressions").dependOn(&addFilteredTestRunArtifact(b, staged_restore_driver_tests).step);
     const lib_api_standalone_backup_restore_test_step = b.step("antfly-api-standalone-backup-restore-test", "Run the focused standalone-like backup/restore e2e test");
     lib_api_standalone_backup_restore_test_step.dependOn(&run_lib_api_standalone_backup_restore_tests.step);
 

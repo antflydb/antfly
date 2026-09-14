@@ -4,6 +4,60 @@ import { AntflyClient } from "../src/client.js";
 afterEach(() => vi.restoreAllMocks());
 
 describe("typed relational rows", () => {
+  it("reports retirement acceptance without implying table deletion", async () => {
+    const fetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response('{"status":"accepted"}', { status: 202 }));
+    const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+    expect(await client.tables.constraints.retire("t", { schema_version: 2, drop: true })).toEqual({
+      status: "accepted",
+    });
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0]?.[0]).toBe(
+      "http://localhost:8080/db/v1/tables/t/constraints/retire"
+    );
+    expect(JSON.parse(fetch.mock.calls[0]?.[1]?.body as string)).toEqual({
+      schema_version: 2,
+      drop: true,
+    });
+  });
+  it("keeps administrative repair precision and pending outcomes", async () => {
+    const fetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response('{"status":"committed_pending","inserted":1,"deleted":0}', { status: 202 })
+      );
+    const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+    const outcome = await client.tables.constraints.repair("table name", {
+      schema_version: 2,
+      mutations: [{ key: "b", expected_version: "18446744073709551615", row: { id: 2 } }],
+    });
+    expect(outcome.status).toBe("committed_pending");
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0]?.[0]).toBe(
+      "http://localhost:8080/db/v1/tables/table%20name/constraints/repair"
+    );
+    await expect(
+      client.tables.constraints.repair("t", {
+        schema_version: 2,
+        mutations: [{ key: "b", expected_version: "1", row: { id: 9007199254740992 } }],
+      })
+    ).rejects.toThrow("safe JavaScript integers");
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it("reports constraint retry acceptance separately from completion", async () => {
+    const fetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response('{"status":"accepted"}', { status: 202 }));
+    const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+    expect(await client.tables.constraints.retry("t", { schema_version: 2 })).toEqual({
+      status: "accepted",
+    });
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0]?.[0]).toBe("http://localhost:8080/db/v1/tables/t/constraints/retry");
+  });
+
   it("rejects unsafe integer operands and row values before sending", async () => {
     const fetch = vi.spyOn(globalThis, "fetch");
     const client = new AntflyClient({ baseUrl: "http://localhost:8080" });

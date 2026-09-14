@@ -49,8 +49,10 @@ fn restoreRetryDelayMs(job_id: u64, attempt_id: u64) u64 {
 }
 
 pub const Scope = enum { table, cluster };
+pub const SourceKind = enum { table_snapshot, cluster_cohort };
 pub const Phase = enum { queued, running, succeeded, failed, cancelled };
 pub const AttemptState = enum { active, cancelled, fenced };
+pub const StagingResolution = enum { active, published, canceled };
 pub const TableIndexRange = [2]u16;
 
 pub const ClusterResultSummary = struct {
@@ -74,7 +76,18 @@ pub const JobState = struct {
     /// Realtime eligibility survives restart and leadership handoff.
     not_before_ms: u64 = 0,
     attempt_id: u64 = 0,
+    /// Immutable target incarnation, allocated by the first staging worker.
+    /// Execution attempts advance after retry; target identities must not.
+    staging_attempt_id: u64 = 0,
+    staging_resolution: StagingResolution = .active,
+    staging_validation_phase: u8 = 0,
+    staging_validation_owner: u32 = 0,
+    /// Durable prefix within a metadata phase; 255 means no checkpoint yet.
+    staging_owner_phase: u8 = 255,
+    staging_owner_cursor: u32 = 0,
+    staging_failure: []const u8 = "",
     scope: Scope,
+    source_kind: SourceKind = .table_snapshot,
     table_name: ?[]const u8 = null,
     backup_id: []const u8,
     location: []const u8,
@@ -104,6 +117,7 @@ pub const JobState = struct {
 
 pub const StartRequest = struct {
     scope: Scope,
+    source_kind: SourceKind = .table_snapshot,
     table_name: ?[]const u8 = null,
     backup_id: []const u8,
     location: []const u8,
@@ -547,6 +561,13 @@ pub const Store = struct {
                         .dispatch_sequence = parsed.value.dispatch_sequence,
                         .not_before_ms = 0,
                         .attempt_id = parsed.value.attempt_id,
+                        .staging_attempt_id = parsed.value.staging_attempt_id,
+                        .staging_resolution = parsed.value.staging_resolution,
+                        .staging_validation_phase = parsed.value.staging_validation_phase,
+                        .staging_validation_owner = parsed.value.staging_validation_owner,
+                        .staging_owner_phase = parsed.value.staging_owner_phase,
+                        .staging_owner_cursor = parsed.value.staging_owner_cursor,
+                        .staging_failure = parsed.value.staging_failure,
                         .scope = parsed.value.scope,
                         .table_name = parsed.value.table_name,
                         .backup_id = parsed.value.backup_id,
@@ -761,7 +782,7 @@ pub const Store = struct {
             const current = self.jobs.get(job_id) orelse continue;
             var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            if (parsed.value.cancel_requested) {
+            if (parsed.value.cancel_requested and !stagingNeedsExecution(parsed.value)) {
                 const encoded = try self.updateLocked(alloc, parsed.value, .{
                     .phase = .cancelled,
                     .last_error = "cancel_requested",
@@ -836,6 +857,13 @@ pub const Store = struct {
                 .dispatch_sequence = parsed.value.dispatch_sequence,
                 .not_before_ms = 0,
                 .attempt_id = parsed.value.attempt_id,
+                .staging_attempt_id = parsed.value.staging_attempt_id,
+                .staging_resolution = parsed.value.staging_resolution,
+                .staging_validation_phase = parsed.value.staging_validation_phase,
+                .staging_validation_owner = parsed.value.staging_validation_owner,
+                .staging_owner_phase = parsed.value.staging_owner_phase,
+                .staging_owner_cursor = parsed.value.staging_owner_cursor,
+                .staging_failure = parsed.value.staging_failure,
                 .scope = parsed.value.scope,
                 .table_name = parsed.value.table_name,
                 .backup_id = parsed.value.backup_id,
@@ -951,6 +979,7 @@ pub const Store = struct {
                 const reauthorize = destinationReauthorizationMatches(parsed.value, req);
                 if (!same_request and !reauthorize) return error.IdempotencyConflict;
                 if (reauthorize) {
+                    if (parsed.value.staging_attempt_id != 0 and !std.mem.eql(u8, parsed.value.destination_authorization_principal, req.destination_authorization_principal)) return error.RestoreStagingPrincipalImmutable;
                     // A destination authorization failure is guaranteed to
                     // occur before the next publication boundary. Re-admission
                     // with the same explicit key is an authorization refresh,
@@ -968,6 +997,13 @@ pub const Store = struct {
                         .dispatch_sequence = dispatch_sequence,
                         .not_before_ms = now,
                         .attempt_id = parsed.value.attempt_id,
+                        .staging_attempt_id = parsed.value.staging_attempt_id,
+                        .staging_resolution = parsed.value.staging_resolution,
+                        .staging_validation_phase = parsed.value.staging_validation_phase,
+                        .staging_validation_owner = parsed.value.staging_validation_owner,
+                        .staging_owner_phase = parsed.value.staging_owner_phase,
+                        .staging_owner_cursor = parsed.value.staging_owner_cursor,
+                        .staging_failure = parsed.value.staging_failure,
                         .scope = parsed.value.scope,
                         .table_name = parsed.value.table_name,
                         .backup_id = parsed.value.backup_id,
@@ -1024,6 +1060,7 @@ pub const Store = struct {
             .dispatch_sequence = dispatch_sequence,
             .not_before_ms = now,
             .scope = req.scope,
+            .source_kind = req.source_kind,
             .table_name = req.table_name,
             .backup_id = req.backup_id,
             .location = req.location,
@@ -1142,6 +1179,80 @@ pub const Store = struct {
         if (tableAttempted(parsed.value, table_index)) return try alloc.dupe(u8, current);
         if (parsed.value.active_table_index != null) return error.RestoreJobCheckpointOrder;
         return try self.updateLocked(alloc, parsed.value, .{ .phase = .running, .active_table_index = table_index });
+    }
+
+    /// Persist the stable target incarnation before reserving names or sending
+    /// any owner work. Retried workers reuse it instead of creating fresh hidden
+    /// targets; their execution ownership remains the current attempt token.
+    pub fn ensureStagingAttempt(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64) ![]u8 {
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return error.NotFound;
+        var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (attempt_id == 0 or parsed.value.phase != .running or parsed.value.attempt_id != attempt_id) return error.RestoreJobFenced;
+        if (parsed.value.staging_attempt_id != 0) return alloc.dupe(u8, current);
+        if (parsed.value.cancel_requested) return error.Cancelled;
+        return self.updateLocked(alloc, parsed.value, .{ .phase = .running, .staging_attempt_id = attempt_id });
+    }
+
+    /// Only call after reading the authoritative metadata publication or full
+    /// cancellation receipt. Worker-local success is not a durable resolution.
+    pub fn recordStagingResolution(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, staging_attempt_id: u64, resolution: StagingResolution) ![]u8 {
+        if (resolution == .active) return error.InvalidRestoreProgress;
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return error.NotFound;
+        var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (attempt_id == 0 or parsed.value.phase != .running or parsed.value.attempt_id != attempt_id or
+            staging_attempt_id == 0 or parsed.value.staging_attempt_id != staging_attempt_id) return error.RestoreJobFenced;
+        if (parsed.value.staging_resolution != .active) {
+            if (parsed.value.staging_resolution != resolution) return error.RestoreJobFenced;
+            return alloc.dupe(u8, current);
+        }
+        return self.updateLocked(alloc, parsed.value, .{ .phase = .running, .staging_resolution = resolution });
+    }
+
+    pub fn recordStagingValidation(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, phase: u8, owner: u32) ![]u8 {
+        if (phase > 2 or owner > 4096) return error.InvalidRestoreProgress;
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return error.NotFound;
+        var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id or parsed.value.staging_attempt_id == 0 or parsed.value.staging_resolution != .active) return error.RestoreJobFenced;
+        if (phase < parsed.value.staging_validation_phase or (phase == parsed.value.staging_validation_phase and owner < parsed.value.staging_validation_owner)) return error.RestoreJobCheckpointOrder;
+        return self.updateLocked(alloc, parsed.value, .{ .phase = .running, .staging_validation_phase = phase, .staging_validation_owner = owner });
+    }
+
+    /// Call only after authoritative owner receipt (or native publication)
+    /// succeeds. A stale checkpoint may replay work, but can never skip work.
+    pub fn recordStagingOwner(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, phase: u8, owner: u32) ![]u8 {
+        if (phase > 5 or owner > 8192) return error.InvalidRestoreProgress;
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return error.NotFound;
+        var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id or parsed.value.staging_attempt_id == 0 or parsed.value.staging_resolution != .active) return error.RestoreJobFenced;
+        if (parsed.value.staging_owner_phase == phase and owner < parsed.value.staging_owner_cursor) return error.RestoreJobCheckpointOrder;
+        return self.updateLocked(alloc, parsed.value, .{ .phase = .running, .staging_owner_phase = phase, .staging_owner_cursor = owner });
+    }
+
+    /// Preserve the first definitive failure while cleanup remains runnable.
+    /// User cancellation remains a separate signal; successful cleanup of an
+    /// invalid artifact should report failed, not pretend the user canceled.
+    pub fn recordStagingFailure(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, failure: []const u8) ![]u8 {
+        if (failure.len == 0 or failure.len > 128) return error.InvalidRestoreProgress;
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return error.NotFound;
+        var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id or parsed.value.staging_attempt_id == 0 or parsed.value.staging_resolution != .active) return error.RestoreJobFenced;
+        if (parsed.value.staging_failure.len != 0) return alloc.dupe(u8, current);
+        return self.updateLocked(alloc, parsed.value, .{ .phase = .running, .staging_failure = failure, .last_error = failure });
     }
 
     pub fn recordTableDurabilityPending(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, table_index: u16) ![]u8 {
@@ -1492,7 +1603,7 @@ pub const Store = struct {
             .attempt_id = 0,
         };
         if (parsed.value.phase == .running) return null;
-        const next_phase: Phase = if (parsed.value.cancel_requested) .cancelled else .running;
+        const next_phase: Phase = if (parsed.value.cancel_requested and !stagingNeedsExecution(parsed.value)) .cancelled else .running;
         const attempt_id = parsed.value.attempt_id +| 1;
         if (next_phase == .running) attempt_id_out.* = attempt_id;
         return .{
@@ -1558,7 +1669,7 @@ pub const Store = struct {
         {
             return .stale;
         }
-        if (parsed.value.cancel_requested) {
+        if (parsed.value.cancel_requested and !stagingNeedsExecution(parsed.value)) {
             const cancelled = try self.updateLocked(alloc, parsed.value, .{
                 .phase = .cancelled,
                 .last_error = "cancel_requested",
@@ -1642,7 +1753,7 @@ pub const Store = struct {
         {
             return try alloc.dupe(u8, current);
         }
-        if (parsed.value.cancel_requested) {
+        if (parsed.value.cancel_requested and !stagingNeedsExecution(parsed.value)) {
             return try self.updateLocked(alloc, parsed.value, .{
                 .phase = .cancelled,
                 .last_error = "cancel_requested",
@@ -1700,7 +1811,7 @@ pub const Store = struct {
         defer parsed.deinit();
         if (isTerminal(parsed.value.phase)) return try alloc.dupe(u8, current);
         return try self.updateLocked(alloc, parsed.value, .{
-            .phase = if (parsed.value.phase == .running) .running else .cancelled,
+            .phase = if (parsed.value.phase == .running or stagingNeedsExecution(parsed.value)) parsed.value.phase else .cancelled,
             .cancel_requested = true,
             .last_error = "cancel_requested",
         });
@@ -1719,6 +1830,13 @@ pub const Store = struct {
     const Update = struct {
         phase: Phase,
         attempt_id: ?u64 = null,
+        staging_attempt_id: ?u64 = null,
+        staging_resolution: ?StagingResolution = null,
+        staging_validation_phase: ?u8 = null,
+        staging_validation_owner: ?u32 = null,
+        staging_owner_phase: ?u8 = null,
+        staging_owner_cursor: ?u32 = null,
+        staging_failure: ?[]const u8 = null,
         dispatch_sequence: ?u64 = null,
         not_before_ms: ?u64 = null,
         cancel_requested: ?bool = null,
@@ -1732,6 +1850,12 @@ pub const Store = struct {
     };
 
     fn updateLocked(self: *Store, alloc: std.mem.Allocator, current: JobState, update: Update) ![]u8 {
+        if (isTerminal(update.phase) and stagingNeedsResolution(current) and
+            (update.staging_resolution orelse current.staging_resolution) == .active)
+            return error.RestoreStagingResolutionPending;
+        if ((update.phase == .failed or update.phase == .cancelled) and current.staging_attempt_id != 0 and
+            (update.staging_resolution orelse current.staging_resolution) == .published)
+            return error.RestoreStagingResolutionPending;
         const next: JobState = .{
             .format_version = restore_job_format_version,
             .job_id = current.job_id,
@@ -1740,7 +1864,15 @@ pub const Store = struct {
             .not_before_ms = update.not_before_ms orelse
                 if (update.phase == .queued) current.not_before_ms else 0,
             .attempt_id = update.attempt_id orelse current.attempt_id,
+            .staging_attempt_id = update.staging_attempt_id orelse current.staging_attempt_id,
+            .staging_resolution = update.staging_resolution orelse current.staging_resolution,
+            .staging_validation_phase = update.staging_validation_phase orelse current.staging_validation_phase,
+            .staging_validation_owner = update.staging_validation_owner orelse current.staging_validation_owner,
+            .staging_owner_phase = update.staging_owner_phase orelse current.staging_owner_phase,
+            .staging_owner_cursor = update.staging_owner_cursor orelse current.staging_owner_cursor,
+            .staging_failure = update.staging_failure orelse current.staging_failure,
             .scope = current.scope,
+            .source_kind = current.source_kind,
             .table_name = current.table_name,
             .backup_id = current.backup_id,
             .location = current.location,
@@ -2237,8 +2369,78 @@ fn rangesContainRange(ranges: []const TableIndexRange, candidate: TableIndexRang
     return false;
 }
 
+pub fn stagingNeedsResolution(state: JobState) bool {
+    return state.staging_attempt_id != 0 and state.staging_resolution == .active;
+}
+
+test "restore staging incarnation survives retries and cancellation waits for owner cleanup" {
+    const alloc = std.testing.allocator;
+    for ([_]StagingResolution{ .canceled, .published }) |resolution| {
+        var persistence = TestReplicatedPersistence.init(alloc);
+        defer persistence.deinit();
+        var store = Store.initWithIo(alloc, std.testing.io);
+        defer store.deinit();
+        try store.attachReplicated(persistence.persistence());
+        const initial = try store.start(alloc, .{ .scope = .cluster, .backup_id = "daily", .location = "s3://archive/daily", .connection = "archive-reader", .idempotency_namespace = "principal:admin:cluster" });
+        defer alloc.free(initial);
+        var admitted = try std.json.parseFromSlice(JobState, alloc, initial, .{});
+        defer admitted.deinit();
+        const job_id = admitted.value.job_id;
+        const running = (try store.begin(alloc, job_id)).?;
+        defer alloc.free(running);
+        var worker = try std.json.parseFromSlice(JobState, alloc, running, .{});
+        defer worker.deinit();
+        const staging = try store.ensureStagingAttempt(alloc, job_id, worker.value.attempt_id);
+        defer alloc.free(staging);
+        var staged = try std.json.parseFromSlice(JobState, alloc, staging, .{});
+        defer staged.deinit();
+        try std.testing.expectEqual(worker.value.attempt_id, staged.value.staging_attempt_id);
+        const owner_checkpoint = try store.recordStagingOwner(alloc, job_id, worker.value.attempt_id, 0, 128);
+        defer alloc.free(owner_checkpoint);
+        const validation_checkpoint = try store.recordStagingValidation(alloc, job_id, worker.value.attempt_id, 1, 3);
+        defer alloc.free(validation_checkpoint);
+        const retried = try store.retryRunning(alloc, staged.value, "RestoreValidationPending", 0);
+        defer alloc.free(retried);
+        const canceling = (try store.cancel(alloc, job_id)).?;
+        defer alloc.free(canceling);
+        var canceled = try std.json.parseFromSlice(JobState, alloc, canceling, .{});
+        defer canceled.deinit();
+        try std.testing.expectEqual(Phase.queued, canceled.value.phase);
+        const resumed = (try store.begin(alloc, job_id)).?;
+        defer alloc.free(resumed);
+        var replacement = try std.json.parseFromSlice(JobState, alloc, resumed, .{});
+        defer replacement.deinit();
+        try std.testing.expectEqual(Phase.running, replacement.value.phase);
+        try std.testing.expect(replacement.value.attempt_id > staged.value.attempt_id);
+        try std.testing.expectEqual(staged.value.staging_attempt_id, replacement.value.staging_attempt_id);
+        try std.testing.expectEqual(@as(u32, 128), replacement.value.staging_owner_cursor);
+        try std.testing.expectEqual(@as(u8, 0), replacement.value.staging_owner_phase);
+        try std.testing.expectEqual(@as(u8, 1), replacement.value.staging_validation_phase);
+        try std.testing.expectEqual(@as(u32, 3), replacement.value.staging_validation_owner);
+        try std.testing.expectError(error.RestoreStagingResolutionPending, store.fail(alloc, replacement.value, "CancelRequested"));
+        try std.testing.expectError(error.RestoreJobFenced, store.recordStagingResolution(alloc, job_id, staged.value.attempt_id, staged.value.staging_attempt_id, resolution));
+        const resolved = try store.recordStagingResolution(alloc, job_id, replacement.value.attempt_id, replacement.value.staging_attempt_id, resolution);
+        defer alloc.free(resolved);
+        const terminal = if (resolution == .published)
+            try store.finish(alloc, replacement.value, "{}")
+        else
+            try store.fail(alloc, replacement.value, "CancelRequested");
+        defer alloc.free(terminal);
+        var finished = try std.json.parseFromSlice(JobState, alloc, terminal, .{});
+        defer finished.deinit();
+        try std.testing.expectEqual(if (resolution == .published) Phase.succeeded else Phase.cancelled, finished.value.phase);
+    }
+}
+
+fn stagingNeedsExecution(state: JobState) bool {
+    return state.staging_attempt_id != 0 and state.staging_resolution != .canceled;
+}
+
 fn validateProgressState(state: JobState) !void {
     if (state.format_version != restore_job_format_version) return error.UnsupportedRestoreJobFormat;
+    if ((state.staging_owner_phase != 255 and state.staging_owner_phase > 5) or state.staging_owner_cursor > 8192 or state.staging_failure.len > 128 or state.staging_validation_phase > 2 or state.staging_validation_owner > 4096 or state.staging_attempt_id > state.attempt_id or
+        (state.staging_attempt_id == 0 and state.staging_resolution != .active) or
+        (isTerminal(state.phase) and stagingNeedsResolution(state))) return error.CorruptRestoreJobStore;
     if (state.enqueue_sequence == 0 or
         state.dispatch_sequence == 0 or
         state.idempotency_namespace.len == 0 or
@@ -2400,7 +2602,12 @@ fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
     }, .{});
     defer alloc.free(canonical);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(canonical, &digest, .{});
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    // Preserve existing independent-snapshot idempotency keys while separating
+    // the new shared-cohort admission from an otherwise identical request.
+    if (req.source_kind == .cluster_cohort) hash.update("antfly:restore:cluster-cohort:v1\x00");
+    hash.update(canonical);
+    hash.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
     return try alloc.dupe(u8, &hex);
 }
@@ -3142,6 +3349,21 @@ test "delayed replicated restore refresh cannot regress a running job" {
     var finished_parsed = try std.json.parseFromSlice(JobState, std.testing.allocator, finished, .{});
     defer finished_parsed.deinit();
     try std.testing.expectEqual(Phase.succeeded, finished_parsed.value.phase);
+}
+
+test "restore request fingerprints distinguish coordinated table sources" {
+    const alloc = std.testing.allocator;
+    var request: StartRequest = .{ .scope = .table, .table_name = "docs", .backup_id = "daily", .location = "file:///archive", .connection = "archive-reader" };
+    const original = try requestFingerprintAlloc(alloc, request);
+    defer alloc.free(original);
+    request.source_kind = .cluster_cohort;
+    const coordinated = try requestFingerprintAlloc(alloc, request);
+    defer alloc.free(coordinated);
+    try std.testing.expect(!std.mem.eql(u8, original, coordinated));
+    request.source_kind = .table_snapshot;
+    const repeated = try requestFingerprintAlloc(alloc, request);
+    defer alloc.free(repeated);
+    try std.testing.expectEqualStrings(original, repeated);
 }
 
 test "restore job store is idempotent and fenced" {

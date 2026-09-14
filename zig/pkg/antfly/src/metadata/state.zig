@@ -153,10 +153,18 @@ pub const MetadataState = struct {
     }
 
     pub fn syncProjected(self: *MetadataState, service: anytype) !void {
-        const projected_tables = try service.listProjectedTables(self.alloc);
-        defer service.freeProjectedTables(self.alloc, projected_tables);
-        const projected_ranges = try service.listProjectedRanges(self.alloc);
-        defer service.freeProjectedRanges(self.alloc, projected_ranges);
+        const Service = switch (@typeInfo(@TypeOf(service))) {
+            .pointer => |ptr| ptr.child,
+            else => @TypeOf(service),
+        };
+        // Hidden restore generations participate in placement, never public
+        // routing. Both namespaces come from one authoritative read revision.
+        var provisioning: ?@import("restore_staging.zig").ProvisioningProjection = if (comptime @hasDecl(Service, "captureProvisioningCatalog")) try service.captureProvisioningCatalog(self.alloc) else null;
+        defer if (provisioning) |*projection| projection.deinit(self.alloc);
+        const projected_tables = if (provisioning) |projection| projection.tables else try service.listProjectedTables(self.alloc);
+        defer if (provisioning == null) service.freeProjectedTables(self.alloc, projected_tables);
+        const projected_ranges = if (provisioning) |projection| projection.ranges else try service.listProjectedRanges(self.alloc);
+        defer if (provisioning == null) service.freeProjectedRanges(self.alloc, projected_ranges);
         const projected_nodes = try listProjectedNodes(self, service);
         defer freeProjectedNodes(self, service, projected_nodes);
         const projected_stores = try listProjectedStores(self, service);

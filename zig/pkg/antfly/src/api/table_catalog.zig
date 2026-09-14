@@ -125,6 +125,7 @@ pub const CatalogSource = struct {
     }
 
     pub const VTable = struct {
+        restore_scope_for_group: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64) anyerror!?[32]u8 = null,
         /// Snapshot slices and all transitively referenced bytes must remain
         /// valid until the matching `free_admin_snapshot` call returns.
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
@@ -171,6 +172,10 @@ pub const CatalogSource = struct {
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
         return try self.vtable.admin_snapshot(self.ptr);
+    }
+
+    pub fn restoreScopeForGroup(self: CatalogSource, table_name: []const u8, group_id: u64) !?[32]u8 {
+        return if (self.vtable.restore_scope_for_group) |callback| try callback(self.ptr, table_name, group_id) else null;
     }
 
     pub fn freeAdminSnapshot(self: CatalogSource, snapshot: *metadata_api.AdminSnapshot) void {
@@ -522,6 +527,7 @@ pub const RoutingSession = struct {
     }
 
     const vtable: CatalogSource.VTable = .{
+        .restore_scope_for_group = restoreScopeForGroup,
         .admin_snapshot = adminSnapshot,
         .free_admin_snapshot = freeAdminSnapshot,
         .routing_snapshot = routingSnapshot,
@@ -539,6 +545,10 @@ pub const RoutingSession = struct {
 
     fn cast(ptr: *anyopaque) *RoutingSession {
         return @ptrCast(@alignCast(ptr));
+    }
+
+    fn restoreScopeForGroup(ptr: *anyopaque, table_name: []const u8, group_id: u64) !?[32]u8 {
+        return cast(ptr).base.restoreScopeForGroup(table_name, group_id);
     }
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {

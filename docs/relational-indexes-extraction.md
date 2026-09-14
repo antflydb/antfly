@@ -294,26 +294,75 @@ a durable restore-incarnation proof.
 
 Explicit boundaries still matter:
 
-- Constraint retirement and coordinated table DROP are rejected until a
-  distributed reference-retirement proof exists. Retaining old descriptors is
-  necessary for recovery, but does not itself constitute that proof.
-- Constrained TTL is rejected; local expiration cannot bypass FK actions.
-- Split/merge transitions for UNIQUE/FK tables are rejected until ownership
-  transfer can atomically hand off routed integrity records and retained locks.
-- Portable export and independent historical table restore are rejected for
-  coordinated constraints. A cluster-consistent restore/activation barrier is
-  needed before those operations can preserve cross-table references.
+- Administrative constraint retirement uses a durable all-owner fence and
+  phase-separated reference/claim drain. A subtract-only target schema is
+  published after the proof completes. `drop=true` prepares an explicit table
+  deletion; it never silently deletes the table from a background name-only job.
+- Constrained TTL uses the normal FK-aware distributed delete planner and 2PC.
+  Expired rows remain visible until that transaction commits; RESTRICT-blocked
+  parents stay visible and retry on later sweeps. Maintenance observes at most
+  128 candidates per page, bounds physical keys/bytes visited, and resumes with
+  a short inter-page yield rather than sleeping a full interval for each page.
+  Native workers only enqueue owned observations into the server's bounded
+  background lane (one page per group); they never synchronously reenter the
+  managed DB cache. Queue pressure retains the scan cursor for retry. Server
+  jobs drain before cached DB workers close, avoiding cache-close/self-join
+  deadlocks, and actual committed expirations are counted by the coordinator.
+  Accepted pages retain an explicit candidate offset across bounded 16-root,
+  five-second coordinator slices. Timeout/oversized roots remain visible and
+  retry on a later sweep; they cannot starve the remaining page. Successors
+  retain the same admission slot, including during scheduler resource pressure.
+  Every observed primary row carries a snapshot-bound physical SHA256 guard in
+  addition to its timestamp, including cascade descendants and activation
+  backfill. Custom TTL timestamps therefore cannot hide a concurrent row change
+  from the integrity transaction. A missing coordinator or strong read proof
+  defers expiration instead of falling back to local deletion.
+  Strong proofs are required for every observed coordinated row and backfill,
+  including non-TTL tables; there is no pre-release version-only peer fallback.
+  The public timestamp-based `version` field is unchanged: the private digest
+  guard strengthens internal observation/commit checks, but is not a new
+  monotonic public row revision or a changed version-only CAS contract.
+- UNIQUE/FK split/merge requires distributed quiescent integrity protocol v1.
+  Metadata voters and learners first negotiate decoder capability v7 using the
+  existing exact-membership probe; the older framed status codec alone is not
+  sufficient evidence. Probes happen outside the catalog lock, and emission
+  reuses a term/incarnation/membership-bound readiness token.
+  Before first admission every registered table-serving store must advertise
+  v1; metadata-only roles are exempt. Admission atomically records a durable
+  cluster protocol floor, and subsequent registration/status downgrades below
+  that floor are refused. Upgrade the data fleet before scheduling constrained
+  transitions. Unsupported queued transitions do not block other reconciliation.
+  Standalone topology and constrained active/read-schema migrations remain
+  unsupported; the immutable transition contract pins both schema mappings.
+- Native and portable dependency-complete cohorts use the shared hidden-target
+  restore and global activation barrier. The independent table endpoints adapt
+  to that same engine only when a certified cohort proves the complete selected
+  dependency set; unrelated historical snapshots remain rejected.
 - Coherent HA seed replica materialization has a distinct internal entry point
   after topology validation and requires exact durable namespace identity.
   It does not enable independently restoring historical table backups.
-- Online split/merge admission is blocked for coordinated constraints until
-  the distributed delta protocol carries logically routed claims/references,
-  not just document mutations. Local range-copy helpers are not proof that
-  the distributed handoff protocol is complete.
+- Distributed topology verification must check the real routed claim/reference
+  handoff after failover and cutover; local range-copy helpers alone are not
+  evidence of the distributed protocol's correctness.
 - Deferred constraints, MATCH PARTIAL, and constrained raw transforms are not
   exposed as supported operations.
-- Failed-activation repair needs an explicit administrative recovery contract;
-  retrying coverage must not authorize ordinary writes to bypass constraints.
+- Failed-activation repair is administrator-only and row/schema conditional.
+  Replacement values still satisfy UNIQUE/FK constraints. Separate retry
+  restarts failed coverage; it does not grant ordinary writes repair authority.
+
+The continuation adds public `/constraints/repair`, `/constraints/retry`, and
+`/constraints/retire` operations with generated SDK contracts. Retirement status
+includes durable phase/failure diagnostics. A paused retirement retry preserves
+the exact job and prior drain progress instead of re-enabling ordinary writes.
+
+The [restore architecture](relational-restore-architecture.md) uses a consistent
+cohort and isolated new targets with atomic publication. The existing native
+cluster backup/restore jobs now drive disk-backed pins, hidden placement,
+replicated logical row import, distributed claim reconstruction, and publication.
+Independent historical table restoration remains closed because unrelated
+snapshots do not prove a consistent cross-table cut. The architecture document
+distinguishes component regression coverage from the remaining distributed
+release-verification matrix.
 
 ## Verification
 
@@ -396,3 +445,33 @@ against full-row materialization plus JSON parsing: 200 iterations over a 64 KiB
 payload allocate zero additional key-buffer bytes versus 71,594,400 cumulative
 control bytes. This is neither a peak-memory measurement nor an end-to-end
 write-throughput result.
+
+### Cohort portable and selected-table restores
+
+Portable cohort artifacts now derive from the same durable native seal as
+native artifacts, after the common-cut write fence is released. LSM export
+reads the sealed primary directly; logical-backend seals use a disposable,
+disk-backed decoder. The portable manifest includes the exact seal and source
+namespace, but excludes routed claims, references, and constraint generations.
+Only an unpublished logical-source import with the authenticated aggregate's
+matching proof can decode this representation. Ordinary table-local portable
+publication remains unable to bypass distributed constraint validation.
+
+Selected tables must include all outgoing FK dependencies from both active and
+read schemas. Missing parents are never bound to unrelated live data, and
+selection is never silently expanded beyond the caller's authorization scope.
+All selected targets receive fresh identities, normal prepared-row imports,
+and global UNIQUE/FK rebuilding before atomic publication. Skipping an existing
+parent cannot make a restored child's dependency valid.
+
+Coverage includes mixed document/parent/child portable restores, invalid-child
+rollback without publication, exact-seal exports after restart and later writes,
+proof mismatch/corruption rejection, and dependency-closed partial selections.
+Portable materialization persists a ranged-download SHA prefix, then indexes the
+authenticated object directory once into its unpublished LSM decoder. Each
+object is verified once and document objects become small reusable row pages;
+row writes, rebuilt source identities, and the decode cursor commit atomically.
+Historical-layout validation also advances with a durable bounded cursor.
+Cancellation and restarts resume both phases without downloading the prefix or
+decoding earlier objects again. Decoder admission is bounded by the existing
+archive object/manifest limits, with at most 128 logical rows per import slice.

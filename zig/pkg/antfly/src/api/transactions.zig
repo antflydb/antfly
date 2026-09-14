@@ -3306,6 +3306,7 @@ fn clonePredicatesInto(
         out.appendAssumeCapacity(.{
             .key = try alloc.dupe(u8, predicate.key),
             .expected_version = predicate.expected_version,
+            .expected_content_digest = predicate.expected_content_digest,
         });
     }
 }
@@ -3682,6 +3683,7 @@ fn appendPredicates(
         predicates.appendAssumeCapacity(.{
             .key = try alloc.dupe(u8, predicate.key),
             .expected_version = predicate.expected_version,
+            .expected_content_digest = predicate.expected_content_digest,
         });
     }
 }

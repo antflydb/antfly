@@ -45,6 +45,7 @@ pub const RowFilter = struct {
     matches: *const fn (*anyopaque, Allocator, []const u8, codec.OrdinalRowView) anyerror!bool,
 };
 pub const Request = struct {
+    include_primary_digest: bool = false,
     /// Null selects primary-key order. Named indexes must have a durable
     /// ready proof for this exact generation and owned range.
     index: ?[]const u8 = null,
@@ -79,6 +80,7 @@ pub const Row = struct {
     version: u64,
     schema_version: u32,
     semantic_hash: [32]u8,
+    expected_content_digest: ?[32]u8 = null,
 };
 
 pub const Page = struct {
@@ -108,6 +110,7 @@ pub const Reader = struct {
     fields: []const []const u8,
     now_ns: u64,
     authenticated: bool,
+    include_primary_digest: bool,
     row_filter: ?RowFilter,
     source: ?registry.SchemaView = null,
     selected: ?codec.OrdinalProjectionPlan = null,
@@ -197,6 +200,7 @@ pub const Reader = struct {
             .fields = fields,
             .now_ns = now_ns,
             .authenticated = store.valuesAreAuthenticated(),
+            .include_primary_digest = request.include_primary_digest,
             .row_filter = request.row_filter,
             .conditions = conditions,
             .done = std.mem.order(u8, lower, upper) != .lt,
@@ -326,8 +330,8 @@ pub const Reader = struct {
                     else => return err,
                 } else kv.value;
                 const row = try self.rowView(raw);
-                const expired = self.active.tableSchema().ttl_duration_ns != 0 and row.writeTimestampNs() != 0 and
-                    ttl.isExpired(row.writeTimestampNs(), self.active.tableSchema().ttl_duration_ns, self.now_ns);
+                const expired = self.active.visibilityTtlDurationNs() != 0 and row.writeTimestampNs() != 0 and
+                    ttl.isExpired(row.writeTimestampNs(), self.active.visibilityTtlDurationNs(), self.now_ns);
                 var decoded_key: ?[]const u8 = null;
                 const matches = check: {
                     if (expired) break :check false;
@@ -356,6 +360,11 @@ pub const Reader = struct {
                         .version = row.writeTimestampNs(),
                         .schema_version = row.table_schema.version,
                         .semantic_hash = row.semanticHash(),
+                        .expected_content_digest = if (self.include_primary_digest) blk: {
+                            var digest: [32]u8 = undefined;
+                            std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+                            break :blk digest;
+                        } else null,
                     });
                     result.output_bytes += size;
                 }

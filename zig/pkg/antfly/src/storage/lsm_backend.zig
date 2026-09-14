@@ -2100,6 +2100,33 @@ pub const Backend = struct {
         run_ids: []u64,
         run_paths: [][]u8,
 
+        /// Persist the retained generation using immutable file links. Unlike
+        /// process-local run refs, this tree survives owner restart and GC.
+        pub fn seal(self: *const NativeCheckpoint, io: std.Io, destination_root: []const u8, cancellation: CancellationToken) !u64 {
+            if (!self.storage.supportsHostPathGenerationPublication()) return error.NativeBackupStorageBackendUnsupported;
+            try fs_paths.createDirPathPortable(io, destination_root);
+            const manifest = try std.fmt.allocPrint(self.allocator, "{s}/manifest.bin", .{destination_root});
+            defer self.allocator.free(manifest);
+            var total = try writeCheckpointBytes(io, manifest, self.manifest_bytes, null);
+            const runs = try std.fmt.allocPrint(self.allocator, "{s}/runs", .{destination_root});
+            defer self.allocator.free(runs);
+            try fs_paths.createDirPathPortable(io, runs);
+            for (self.run_paths, self.run_ids) |source, id| {
+                try cancellation.check();
+                const target = try std.fmt.allocPrint(self.allocator, "{s}/{d}.tbl", .{ runs, id });
+                defer self.allocator.free(target);
+                try std.Io.Dir.hardLink(.cwd(), source, .cwd(), target, io, .{});
+                var file = try std.Io.Dir.cwd().openFile(io, target, .{});
+                defer file.close(io);
+                const stat = try file.stat(io);
+                if (stat.kind != .file) return error.UnsupportedFileType;
+                total = std.math.add(u64, total, stat.size) catch return error.FileTooBig;
+            }
+            try fs_paths.syncDirPortable(io, runs);
+            try fs_paths.syncDirPortable(io, destination_root);
+            return total;
+        }
+
         pub fn deinit(self: *NativeCheckpoint) void {
             for (self.run_paths) |path| {
                 run_snapshot_refs.release(path);

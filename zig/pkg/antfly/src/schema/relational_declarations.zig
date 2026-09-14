@@ -26,9 +26,9 @@ pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSche
     const arena = scratch.allocator();
     const uniques = try public.relationalUniqueDefinitions(arena);
     const foreign_keys = try public.relationalForeignKeyDefinitions(arena);
-    // Logical expiry must participate in the same parent/reference protocol;
-    // merely fencing the later physical TTL delete is not sufficient.
-    if ((uniques.len != 0 or foreign_keys.len != 0) and public.ttl_duration_ns != 0) return error.InvalidSchemaUpdateRequest;
+    // Constrained TTL is enforced by conditional, FK-aware transactions.
+    // Until those commit, rows remain visible; a native-only owner without
+    // the coordinator capability safely defers expiration.
     const definitions = try alloc.alloc(catalog.Definition, uniques.len + foreign_keys.len);
     errdefer alloc.free(definitions);
     var initialized: usize = 0;
@@ -118,5 +118,7 @@ test "relational declarations own arrays and fingerprint logical identity" {
     try std.testing.expectEqualSlices(u8, &first[0].fingerprint, &second[0].fingerprint);
     try std.testing.expectEqualSlices(u8, &first[1].fingerprint, &second[1].fingerprint);
     parsed.ttl_duration_ns = 1;
-    try std.testing.expectError(error.InvalidSchemaUpdateRequest, definitionFingerprints(alloc, parsed, runtime));
+    const ttl_definitions = try definitionFingerprints(alloc, parsed, runtime);
+    defer freeDefinitions(alloc, ttl_definitions);
+    try std.testing.expectEqualSlices(u8, &first[0].fingerprint, &ttl_definitions[0].fingerprint);
 }

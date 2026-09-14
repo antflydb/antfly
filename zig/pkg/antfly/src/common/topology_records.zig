@@ -11,6 +11,8 @@
 const std = @import("std");
 
 pub const TableRecord = struct {
+    /// Internal metadata lifecycle intent; never accepted as public schema.
+    relational_retirement_json: []const u8 = "",
     storage: @import("table_storage.zig").Settings = .{},
     table_id: u64,
     name: []const u8,

@@ -119,10 +119,17 @@ const Builder = struct {
     queue: std.ArrayList(*Work) = .empty,
     prepared_bytes: usize = 0,
     control: RequestContext = .{},
+    repair_table: ?[]const u8 = null,
+
+    fn repairing(self: *const Builder, name: []const u8) bool {
+        return if (self.repair_table) |target| std.mem.eql(u8, target, name) else false;
+    }
 
     fn lookup(self: *Builder, table: []const u8, key: []const u8, options: types.LookupOptions) !?reads.LookupResponse {
         try self.control.ensureActive();
         var opts = options;
+        opts.include_primary_digest = !options.relational_integrity_catalog and !options.relational_integrity_action and
+            options.relational_integrity_jobs_json.len == 0 and options.relational_activation_json.len == 0 and options.relational_topology_json.len == 0;
         opts.execution_deadline_ns = self.control.deadline_ns;
         opts.execution_io = self.control.deadline_io;
         opts.cancellation = self.control.cancellation;
@@ -143,6 +150,8 @@ const Builder = struct {
         if (self.by_row.get(identity)) |existing| return existing;
         if (self.work.items.len >= 4096) return error.TransactionTooLarge;
         const old = try self.lookup(table.name, key, .{});
+        if (old) |row| if (row.expected_content_digest == null)
+            return error.MissingPrimaryObservation;
         try self.charge(key.len + if (old) |row| row.json.len else @as(usize, 0));
         const item = try self.alloc.create(Work);
         item.* = .{ .table = table, .key = try self.alloc.dupe(u8, key), .before = old, .after = if (old) |row| row.json else null };
@@ -167,7 +176,7 @@ const Builder = struct {
         defer if (before) |*row| row.deinit(self.alloc);
         var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.init(self.alloc, item.key, json, view.validator(), view.tableSchema().*, view.physicalLayout()) else null;
         defer if (after) |*row| row.deinit(self.alloc);
-        return plan.expand(self.alloc, &.{.{ .key = item.key, .before = if (before) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .after = if (after) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null }});
+        return plan.expand(self.alloc, &.{.{ .key = item.key, .before = if (before) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .after = if (after) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .repair = self.repairing(item.table.name) }});
     }
 
     fn childStillReferences(self: *Builder, item: *Work, definition: native.ForeignKey, address: planner.storage.Address) !bool {
@@ -243,14 +252,21 @@ const Builder = struct {
             pages += 1;
             if (pages > 4096) return error.TransactionTooLarge;
             const request = try std.json.Stringify.valueAlloc(self.alloc, .{ .kind = "references", .address = transition.address, .after = continuation, .limit = @as(u32, 128) }, .{});
-            var response = (try self.lookup(item.table.name, &transition.address.routing, .{ .relational_integrity_jobs_json = request })) orelse return error.ForeignKeyParentMissing;
+            var response = (try self.lookup(item.table.name, &transition.address.routing, .{ .relational_integrity_jobs_json = request })) orelse {
+                if (self.repairing(item.table.name)) return;
+                return error.ForeignKeyParentMissing;
+            };
             defer response.deinit(self.alloc);
             try self.charge(response.json.len);
             var page = try std.json.parseFromSlice(struct { address: planner.storage.Address, claim: planner.storage.Claim, references: []const planner.storage.Reference, next: ?[]const u8 = null }, self.alloc, response.json, .{ .allocate = .alloc_always });
             // References copied into work own their selected bytes; continuation
             // is copied below before releasing this independently bounded page.
             defer page.deinit();
-            if (!std.meta.eql(page.value.address, transition.address) or !std.mem.eql(u8, page.value.claim.parent_table, item.table.name) or !std.mem.eql(u8, page.value.claim.parent_key, item.key)) return error.InvalidIntegrityRecord;
+            if (!std.meta.eql(page.value.address, transition.address)) return error.InvalidIntegrityRecord;
+            if (!std.mem.eql(u8, page.value.claim.parent_table, item.table.name) or !std.mem.eql(u8, page.value.claim.parent_key, item.key)) {
+                if (self.repairing(item.table.name)) return;
+                return error.InvalidIntegrityRecord;
+            }
             for (page.value.references) |reference| try self.applyReference(item, transition, reference);
             const next = page.value.next orelse break;
             if (continuation) |previous| if (std.mem.eql(u8, previous, next)) return error.InvalidIntegrityContinuation;
@@ -326,12 +342,22 @@ const Builder = struct {
     }
 
     fn bindingPlanSelected(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool) !planner.Plan {
+        return self.bindingPlanFiltered(table, with_unique, with_foreign, null);
+    }
+
+    fn bindingPlanFiltered(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool, retirement: ?@import("../storage/db/relational_integrity_retirement.zig").Progress) !planner.Plan {
         const unique_defs = if (with_unique) table.uniques else &.{};
         const foreign_defs = if (with_foreign) table.foreign else &.{};
-        const uniques = try self.alloc.alloc(planner.UniqueBinding, unique_defs.len);
-        for (unique_defs, uniques) |definition, *binding| binding.* = .{ .generation = (table.catalog.find(.unique, definition.name) orelse return error.PreparedGenerationChanged).generation, .definition = definition };
-        const foreign = try self.alloc.alloc(planner.ForeignBinding, foreign_defs.len);
-        for (foreign_defs, foreign) |definition, *binding| {
+        var uniques = std.ArrayList(planner.UniqueBinding).empty;
+        for (unique_defs) |definition| {
+            const generation = (table.catalog.find(.unique, definition.name) orelse return error.PreparedGenerationChanged).generation;
+            if (retirement) |selection| if (!selection.includes(generation)) continue;
+            try uniques.append(self.alloc, .{ .generation = generation, .definition = definition });
+        }
+        var foreign = std.ArrayList(planner.ForeignBinding).empty;
+        for (foreign_defs) |definition| {
+            const generation = (table.catalog.find(.foreign_key, definition.name) orelse return error.PreparedGenerationChanged).generation;
+            if (retirement) |selection| if (!selection.includes(generation)) continue;
             const parent = try self.load(definition.parent_table);
             const target = target: {
                 for (parent.uniques) |unique| {
@@ -345,15 +371,15 @@ const Builder = struct {
                 }
                 return error.ForeignKeyTargetNotUnique;
             };
-            binding.* = .{
-                .generation = (table.catalog.find(.foreign_key, definition.name) orelse return error.PreparedGenerationChanged).generation,
+            try foreign.append(self.alloc, .{
+                .generation = generation,
                 .parent_generation = (parent.catalog.find(.unique, target.name) orelse return error.PreparedGenerationChanged).generation,
                 .definition = definition,
                 .parent = parent.view,
                 .parent_unique = target,
-            };
+            });
         }
-        return planner.Plan.init(self.alloc, table.name, table.view, uniques, foreign);
+        return planner.Plan.init(self.alloc, table.name, table.view, uniques.items, foreign.items);
     }
 
     fn outputIndex(self: *Builder, table_name: []const u8, version: u32) !usize {
@@ -377,13 +403,16 @@ const Builder = struct {
         try self.command_lists.items[i].append(self.alloc, command);
     }
 
-    fn appendPredicate(self: *Builder, table_index: usize, key: []const u8, version: u64) !void {
+    fn appendPredicate(self: *Builder, table_index: usize, key: []const u8, version: u64, digest: ?[32]u8) !void {
         const predicates = &self.predicate_lists.items[table_index];
-        for (predicates.items) |old| if (std.mem.eql(u8, old.key, key)) {
+        for (predicates.items) |*old| if (std.mem.eql(u8, old.key, key)) {
             if (old.expected_version != version) return error.VersionConflict;
+            if (old.expected_content_digest) |expected| {
+                if (digest) |observed| if (!std.mem.eql(u8, &expected, &observed)) return error.VersionConflict;
+            } else old.expected_content_digest = digest;
             return;
         };
-        try predicates.append(self.alloc, .{ .key = key, .expected_version = version });
+        try predicates.append(self.alloc, .{ .key = key, .expected_version = version, .expected_content_digest = digest });
     }
 };
 
@@ -395,9 +424,13 @@ pub fn prepare(alloc: Allocator, source: reads.TableReadSource, metadata: []cons
 }
 
 pub fn prepareControlled(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext) !Prepared {
+    return prepareMode(alloc, source, metadata, requests, request_control, null);
+}
+
+fn prepareMode(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_table: ?[]const u8) !Prepared {
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .control = try boundedControl(request_control) };
+    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .control = try boundedControl(request_control), .repair_table = repair_table };
     defer builder.deinit();
     try builder.output.appendSlice(builder.alloc, requests);
     for (requests) |request| {
@@ -409,7 +442,7 @@ pub fn prepareControlled(alloc: Allocator, source: reads.TableReadSource, metada
     var requested_tables = std.StringHashMapUnmanaged(void).empty;
     for (requests) |request| {
         if ((try requested_tables.getOrPut(builder.alloc, request.table_name)).found_existing) return error.InvalidBatchRequest;
-        if (request.integrity.len != 0 or request.integrity_commands.len != 0 or request.relational_activation != null or request.relational_integrity_generation_set != null) return error.InvalidBatchRequest;
+        if (request.integrity.len != 0 or request.integrity_commands.len != 0 or request.relational_activation != null or request.relational_integrity_generation_set != null or request.relational_repair) return error.InvalidBatchRequest;
         const record = try builder.metadataTable(request.table_name);
         if (record.schema_json.len == 0) continue;
         var declaration = try schema_api.parseValidatedTableSchema(builder.alloc, record.schema_json);
@@ -465,12 +498,15 @@ pub fn prepareControlled(alloc: Allocator, source: reads.TableReadSource, metada
     for (builder.work.items) |item| {
         if (!item.dirty) continue;
         const i = try builder.outputIndex(item.table.name, item.table.view.version());
-        try builder.appendPredicate(i, item.key, if (item.before) |row| row.version else 0);
+        try builder.appendPredicate(i, item.key, if (item.before) |row| row.version else 0, if (item.before) |row| row.expected_content_digest else null);
         if (item.after) |json| try final_writes[i].append(builder.alloc, .{ .key = item.key, .value = json }) else try final_deletes[i].append(builder.alloc, item.key);
         // This arena is owned transitively by the returned request arena.
         const expansion = try builder.expandWork(item);
         for (expansion.commands) |command| try builder.appendCommand(command.table_name, command.command);
-        for (expansion.parents) |transition| try builder.appendCommand(transition.table_name, .{ .address = transition.address, .operation = .{ .release = .{ .parent_table = transition.table_name, .parent_key = transition.parent_key } } });
+        for (expansion.parents) |transition| {
+            const owner: planner.storage.ClaimOwner = .{ .parent_table = transition.table_name, .parent_key = transition.parent_key };
+            try builder.appendCommand(transition.table_name, .{ .address = transition.address, .operation = if (builder.repairing(transition.table_name)) .{ .repair_release = owner } else .{ .release = owner } });
+        }
     }
     for (final_writes, final_deletes, 0..) |writes, deletes, i| {
         if (writes.items.len != 0 or deletes.items.len != 0) {
@@ -482,11 +518,12 @@ pub fn prepareControlled(alloc: Allocator, source: reads.TableReadSource, metada
         _ = try planner.storage.validateCommandAdmission(commands.items);
         table.integrity_commands = commands.items;
         table.predicates = predicates.items;
+        table.relational_repair = builder.repairing(table.table_name);
     }
     return .{ .arena = arena, .tables = try builder.output.toOwnedSlice(builder.alloc) };
 }
 
-pub const BackfillRow = struct { key: []const u8, json: []const u8, version: u64 };
+pub const BackfillRow = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 = null };
 pub const BackfillPhase = enum { unique, foreign_key };
 
 /// A positive local proof does not imply global uniqueness: another owner's
@@ -563,9 +600,62 @@ pub fn prepareWithCoverageControlled(alloc: Allocator, source: reads.TableReadSo
     return prepared;
 }
 
+/// Administrative recovery may edit invalid rows, not bypass new-value checks.
+/// Only the target table's incomplete historical coverage is exempted; every
+/// external parent still needs global UNIQUE coverage. Native prepares require
+/// failed activation and lock its exact checkpoint through the repair decision.
+pub fn prepareRepair(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, request: contract.TableCommitRequest, control: RequestContext) !Prepared {
+    _ = try metadataRequiresCoordination(alloc, metadata, &.{request});
+    if (!try requiresCoordination(alloc, (for (metadata) |table| {
+        if (std.mem.eql(u8, table.name, request.table_name)) break table.schema_json;
+    } else return error.TableNotFound))) return error.InvalidConstraintActivation;
+    var prepared = try prepareMode(alloc, source, metadata, &.{request}, control, request.table_name);
+    errdefer prepared.deinit();
+    var parents: std.ArrayList([]const u8) = .empty;
+    defer parents.deinit(alloc);
+    for (prepared.tables) |table| if (!std.mem.eql(u8, table.table_name, request.table_name)) try parents.append(alloc, table.table_name);
+    try ensureUniqueCoverageControlled(alloc, source, metadata, ranges, parents.items, control);
+    return prepared;
+}
+
 /// Backfill writes only globally routed derived claims/references, never the
 /// primary rows. Source versions remain real read-only 2PC participants. The
 /// caller enlists its owner-bound activation checkpoint in this SAME decision.
+pub fn prepareRetirementPage(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, progress: @import("../storage/db/relational_integrity_retirement.zig").Progress, request: RequestContext) !Prepared {
+    if (rows.len > 128 or (progress.phase != .foreign_keys and progress.phase != .unique)) return error.InvalidConstraintRetirement;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .control = try boundedControl(request) };
+    defer builder.deinit();
+    const table = try builder.load(table_name);
+    if (table.view.version() != progress.schema_version or !std.mem.eql(u8, &@import("../storage/db/relational_integrity_activation.zig").generationSet(table.catalog), &progress.generation_set)) return error.ConstraintRetirementChanged;
+    const row_table_index = try builder.outputIndex(table_name, table.view.version());
+    var plan = try builder.bindingPlanFiltered(table, progress.phase == .unique, progress.phase == .foreign_keys, progress);
+    defer plan.deinit();
+    for (rows) |row| {
+        try builder.charge(row.key.len + row.json.len);
+        if (row.expected_content_digest == null) return error.MissingPrimaryObservation;
+        try builder.appendPredicate(row_table_index, row.key, row.version, row.expected_content_digest);
+        var prepared = try mapper.PreparedRelationalWrite.init(builder.alloc, row.key, row.json, null, table.view.tableSchema().*, table.view.physicalLayout());
+        defer prepared.deinit(builder.alloc);
+        const expansion = try plan.expand(builder.alloc, &.{.{ .key = row.key, .before = try prepared.typedView(table.view.tableSchema().*, table.view.physicalLayout()), .repair = true }});
+        for (expansion.commands) |command| switch (command.command.operation) {
+            .repair_detach => |reference| if (progress.includes(reference.constraint_generation)) try builder.appendCommand(command.table_name, command.command),
+            else => {},
+        };
+        for (expansion.parents) |parent| if (progress.includes(parent.address.generation)) try builder.appendCommand(parent.table_name, .{
+            .address = parent.address,
+            .operation = .{ .repair_release = .{ .parent_table = parent.table_name, .parent_key = parent.parent_key } },
+        });
+    }
+    for (builder.output.items, builder.command_lists.items, builder.predicate_lists.items) |*table_request, commands, predicates| {
+        _ = try planner.storage.validateCommandAdmission(commands.items);
+        table_request.integrity_commands = commands.items;
+        table_request.predicates = predicates.items;
+    }
+    return .{ .arena = arena, .tables = try builder.output.toOwnedSlice(builder.alloc) };
+}
+
 pub fn prepareBackfill(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, phase: BackfillPhase) !Prepared {
     return prepareBackfillControlled(alloc, source, metadata, table_name, rows, phase, .{});
 }
@@ -582,7 +672,8 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
     defer plan.deinit();
     for (rows) |row| {
         try builder.charge(row.key.len + row.json.len);
-        try builder.appendPredicate(row_table_index, row.key, row.version);
+        if (row.expected_content_digest == null) return error.MissingPrimaryObservation;
+        try builder.appendPredicate(row_table_index, row.key, row.version, row.expected_content_digest);
         var prepared = try mapper.PreparedRelationalWrite.init(builder.alloc, row.key, row.json, null, table.view.tableSchema().*, table.view.physicalLayout());
         defer prepared.deinit(builder.alloc);
         const expansion = try plan.expand(builder.alloc, &.{.{ .key = row.key, .after = try prepared.typedView(table.view.tableSchema().*, table.view.physicalLayout()) }});
@@ -784,7 +875,7 @@ test "distributed txn public integrity adapter enlists generated parent commands
     try std.testing.expectEqualStrings("child-1", prepared.tables[1].integrity_commands[0].operation.attach.child_key);
     // Unique coverage is independent of target FK availability. This is also
     // required for cyclic table activation to make progress phase by phase.
-    var unique_backfill = try prepareBackfill(alloc, source, metadata[1..], "children", &.{.{ .key = "child-1", .json = request[0].writes[0].value, .version = 7 }}, .unique);
+    var unique_backfill = try prepareBackfill(alloc, source, metadata[1..], "children", &.{.{ .key = "child-1", .json = request[0].writes[0].value, .version = 7, .expected_content_digest = @splat(7) }}, .unique);
     defer unique_backfill.deinit();
     try std.testing.expectEqual(@as(usize, 1), unique_backfill.tables.len);
     try std.testing.expectEqual(@as(usize, 0), unique_backfill.tables[0].integrity_commands.len);
@@ -814,6 +905,7 @@ test "distributed txn atomic cascade closure handles delete cycles update cycles
             references: [2]planner.storage.Reference = undefined,
             addresses: [2]planner.storage.Address = undefined,
             reference_reads: usize = 0,
+            omit_primary_proof: bool = false,
             fn lookup(ptr: *anyopaque, allocator: Allocator, table: []const u8, _: []const u8, opts: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 const i: usize = if (std.mem.eql(u8, table, "a")) 0 else 1;
@@ -831,7 +923,7 @@ test "distributed txn atomic cascade closure handles delete cycles update cycles
                     };
                     return .{ .json = try std.json.Stringify.valueAlloc(allocator, Response{ .address = self.addresses[i], .claim = self.claims[i], .references = self.references[i..][0..1] }, .{}), .version = 0 };
                 }
-                return .{ .json = try allocator.dupe(u8, "{\"id\":1}"), .version = 7 };
+                return .{ .json = try allocator.dupe(u8, "{\"id\":1}"), .version = 7, .expected_content_digest = if (self.omit_primary_proof) null else @as([32]u8, @splat(7)) };
             }
             fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
                 return error.UnexpectedCall;
@@ -843,13 +935,19 @@ test "distributed txn atomic cascade closure handles delete cycles update cycles
         var fake: Fake = .{ .a = envelope_a, .b = envelope_b };
         const source: reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
         const metadata = [_]TableRecord{ .{ .table_id = 10, .name = "a", .placement_role = "data", .schema_json = schema_a }, .{ .table_id = 20, .name = "b", .placement_role = "data", .schema_json = schema_b } };
-        var a_unique = try prepareBackfill(alloc, source, &metadata, "a", &.{.{ .key = "a", .json = "{\"id\":1}", .version = 7 }}, .unique);
+        // No pre-release peer compatibility fallback: even non-TTL rows must
+        // supply an exact physical observation, not merely a timestamp.
+        fake.omit_primary_proof = true;
+        try std.testing.expectError(error.MissingPrimaryObservation, prepare(alloc, source, &metadata, &.{.{ .table_name = "a", .deletes = &.{"a"} }}));
+        fake.omit_primary_proof = false;
+        try std.testing.expectError(error.MissingPrimaryObservation, prepareBackfill(alloc, source, &metadata, "a", &.{.{ .key = "a", .json = "{\"id\":1}", .version = 7 }}, .unique));
+        var a_unique = try prepareBackfill(alloc, source, &metadata, "a", &.{.{ .key = "a", .json = "{\"id\":1}", .version = 7, .expected_content_digest = @splat(7) }}, .unique);
         defer a_unique.deinit();
-        var b_unique = try prepareBackfill(alloc, source, &metadata, "b", &.{.{ .key = "b", .json = "{\"id\":1}", .version = 7 }}, .unique);
+        var b_unique = try prepareBackfill(alloc, source, &metadata, "b", &.{.{ .key = "b", .json = "{\"id\":1}", .version = 7, .expected_content_digest = @splat(7) }}, .unique);
         defer b_unique.deinit();
-        var a_foreign = try prepareBackfill(alloc, source, &metadata, "a", &.{.{ .key = "a", .json = "{\"id\":1}", .version = 7 }}, .foreign_key);
+        var a_foreign = try prepareBackfill(alloc, source, &metadata, "a", &.{.{ .key = "a", .json = "{\"id\":1}", .version = 7, .expected_content_digest = @splat(7) }}, .foreign_key);
         defer a_foreign.deinit();
-        var b_foreign = try prepareBackfill(alloc, source, &metadata, "b", &.{.{ .key = "b", .json = "{\"id\":1}", .version = 7 }}, .foreign_key);
+        var b_foreign = try prepareBackfill(alloc, source, &metadata, "b", &.{.{ .key = "b", .json = "{\"id\":1}", .version = 7, .expected_content_digest = @splat(7) }}, .foreign_key);
         defer b_foreign.deinit();
         fake.claims = .{ a_unique.tables[0].integrity_commands[0].operation.establish, b_unique.tables[0].integrity_commands[0].operation.establish };
         fake.addresses = .{ a_unique.tables[0].integrity_commands[0].address, b_unique.tables[0].integrity_commands[0].address };
@@ -895,7 +993,7 @@ test "distributed txn atomic cascade adapter composes real native reference page
             if (options.relational_integrity_jobs_json.len != 0) self.reference_pages += 1;
             const result = (try self.db.lookup(allocator, key, options)) orelse return null;
             const internal = options.relational_integrity_catalog or options.relational_integrity_jobs_json.len != 0 or options.relational_activation_json.len != 0;
-            return .{ .json = result.json, .version = if (internal) 0 else try self.db.getTimestamp(allocator, key) };
+            return .{ .json = result.json, .version = if (internal) 0 else result.version orelse try self.db.getTimestamp(allocator, key), .expected_content_digest = result.expected_content_digest };
         }
         fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: gate.ReadConsistency) !?reads.ScanResponse {
             return error.UnexpectedCall;

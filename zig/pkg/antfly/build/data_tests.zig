@@ -182,6 +182,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo",
         "production DataServer replicated merge actions run on VoprIo",
         "three production DataServers compose replicated merge and split across public writes failover and restart on VoprIo",
+        "three production DataServers preserve UNIQUE FK ownership across quiesced merge split restart on VoprIo",
         "inline replicated split action failure releases its transition lane exactly once",
         "data raft forwarding distinguishes safe retries from ambiguous outcomes",
         "data raft forwarding progresses while the control executor is saturated",
