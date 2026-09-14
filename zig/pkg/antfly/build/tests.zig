@@ -205,7 +205,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[0],
         .filters = &.{ "system catalog migration finalization", "schema migration" },
     });
-    b.step("antfly-system-catalog-finalization-test", "Run migration finalization and opt-in readiness workload").dependOn(&b.addRunArtifact(schema_finalization_tests).step);
+    const run_schema_finalization = b.addRunArtifact(schema_finalization_tests);
+    // Opt-in measurements must observe this invocation's environment and
+    // execute fresh samples, even after the same tests ran without timing.
+    run_schema_finalization.has_side_effects = true;
+    b.step("antfly-system-catalog-finalization-test", "Run migration finalization and opt-in readiness workload").dependOn(&run_schema_finalization.step);
     const schema_progress_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[6],
         .filters = &.{ "system catalog schema progress", "runtime schema progress", "schema progress runtime coverage" },
@@ -221,6 +225,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_report_bench = b.addRunArtifact(report_bench_tests);
     const run_admission_bench = b.addRunArtifact(admission_bench_tests);
+    run_report_bench.has_side_effects = true;
+    run_admission_bench.has_side_effects = true;
     // Compile both before either timed workload, and serialize measurements.
     run_report_bench.step.dependOn(&admission_bench_tests.step);
     run_admission_bench.step.dependOn(&run_report_bench.step);
