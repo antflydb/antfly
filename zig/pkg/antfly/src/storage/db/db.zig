@@ -109280,9 +109280,17 @@ test "db last dense catch-up lease finalizes every covered rebuilding generation
     // exact-vector file is shared by the table. Preserve the independently
     // certified sibling instead of projecting the owner's short fence onto
     // every dense index.
-    // This fixture disables index workers. Stage acceleration explicitly;
-    // the finalization assertions below exercise certification only.
-    _ = try db.publishVectorBlockBasesOnline(.{});
+    // This fixture disables index workers. Finish acceleration staging at
+    // its idle boundary before testing certification: an online pass only
+    // schedules checkpoint builders and may return while either is pending.
+    _ = try db.publishVectorBlockBasesAtStableTip();
+    for (configs) |config| {
+        try std.testing.expect(db.core.index_manager.vectorBlockReadyForDenseIndexAtSequence(
+            config.name,
+            try db.core.loadAppliedSequence(alloc, config.name),
+            1,
+        ));
+    }
     {
         const owner = db.core.index_manager.denseIndex(configs[0].name) orelse
             return error.TestUnexpectedResult;
