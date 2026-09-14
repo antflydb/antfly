@@ -173,6 +173,7 @@ comptime {
     _ = @import("hot_standby/http_operation.zig");
     _ = @import("hot_standby/http_replication_client.zig");
     _ = @import("hot_standby/kubernetes_lease_watchdog.zig");
+    _ = @import("hot_standby/layout.zig");
     _ = @import("hot_standby/lifecycle_receipt_inventory_test.zig");
     _ = @import("hot_standby/local_generation_gc.zig");
     _ = @import("hot_standby/metrics.zig");
