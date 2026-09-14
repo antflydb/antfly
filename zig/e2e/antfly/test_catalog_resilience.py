@@ -6,6 +6,7 @@ import copy
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ from catalog_baseline import (
     post_baseline,
 )
 from conftest import DEFAULT_ANTFLY_BIN, internal_service_headers
-from test_scaling import MultiNodeScalingCluster
+from test_scaling import MultiNodeScalingCluster, _insert_docs
 
 
 @pytest.fixture
@@ -426,3 +427,78 @@ def test_schema_progress_batches_validate_apply_and_replay(catalog_cluster):
     snapshot, _ = read_pages(c, leader, control=True, retry_admission=True)
     observed = [r for r in snapshot["schema_progresses"] if r["node_id"] == 1000]
     assert sorted(observed, key=lambda r: r["table_id"]) == records
+
+
+def test_concurrent_tenant_schema_migrations_preserve_documents(catalog_cluster):
+    c = catalog_cluster
+    api = c.data_api_urls[0]
+    tables = [f"migration_tenant_{i}" for i in range(3)]
+    docs = {
+        f"doc-{i:03d}": {"title": f"Migration document {i}", "tenant_value": i}
+        for i in range(30)
+    }
+    for table in tables:
+        c.create_table(table, num_shards=2)
+        _insert_docs(c, table, docs, min_group_count=2)
+
+    schema = {
+        "document_schemas": {
+            "default": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "x-antfly-types": ["text"]}
+                    },
+                }
+            }
+        }
+    }
+
+    def migrate(table):
+        response = requests.put(f"{api}/tables/{table}/schema", json=schema, timeout=30)
+        response.raise_for_status()
+        assert response.json()["schema"]["version"] == 1
+
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=len(tables)) as pool:
+        list(pool.map(migrate, tables))
+    pending = set(tables)
+    deadline = started + 180
+    statuses = {}
+    while pending:
+        for table in list(pending):
+            response = requests.get(f"{api}/tables/{table}", timeout=15)
+            response.raise_for_status()
+            statuses[table] = response.json()
+            if (
+                statuses[table].get("migration") is None
+                and statuses[table].get("schema", {}).get("version") == 1
+            ):
+                pending.remove(table)
+        assert time.monotonic() < deadline, (
+            json.dumps(statuses, indent=2)
+            + "\n"
+            + c.metadata_snapshot_diagnostic()
+            + "\n"
+            + c.debug_logs()
+        )
+        if pending:
+            time.sleep(0.2)
+    for table in tables:
+        for key in ("doc-000", "doc-015", "doc-029"):
+            response = requests.get(f"{api}/tables/{table}/documents/{key}", timeout=15)
+            response.raise_for_status()
+            assert response.json() == docs[key]
+    if os.environ.get("ANTFLY_E2E_PHASE_TIMINGS") == "1":
+        print(
+            json.dumps(
+                {
+                    "scenario": "concurrent_tenant_schema_migrations",
+                    "tables": len(tables),
+                    "shards_per_table": 2,
+                    "replicas_per_shard": 3,
+                    "documents_per_table": len(docs),
+                    "migration_and_validation_ms": (time.monotonic() - started) * 1000,
+                }
+            )
+        )

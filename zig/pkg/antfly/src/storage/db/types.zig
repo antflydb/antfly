@@ -3508,6 +3508,9 @@ pub const RepairCapacityCheck = struct {
 };
 
 pub const ArtifactRepairRunOptions = struct {
+    /// Restrict a local schema-migration quantum to its exact index. Unrelated
+    /// durable repairs retain their existing scheduler and ownership policy.
+    target_index_name: ?[]const u8 = null,
     cancel_check: ?RepairCancelCheck = null,
     /// Internal BackendRuntime scheduling policy. This is deliberately not an
     /// API/index setting and is observed only after a bounded candidate batch

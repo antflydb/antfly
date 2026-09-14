@@ -3319,6 +3319,8 @@ const CachedSplitKey = union(enum) {
 
 const StoreStatusHeartbeatCache = struct {
     valid: bool = false,
+    ownership_generation: u64 = 0,
+    runtime_snapshot: ?store_report_update.Publisher.RuntimeSnapshot = null,
     embedding_activity_protocol_version: u16 = 0,
     embedding_activity_sequence: u64 = 0,
     reporter_incarnation: u64 = 0,
@@ -3340,7 +3342,7 @@ const StoreStatusHeartbeatCache = struct {
 
     fn clear(self: *StoreStatusHeartbeatCache, alloc: std.mem.Allocator) void {
         if (self.group_statuses.len > 0) antfly.metadata.table_manager.freeGroupStatuses(alloc, self.group_statuses);
-        if (self.runtime_statuses.len > 0) antfly.metadata.table_manager.freeRuntimeGroupStatusReports(alloc, self.runtime_statuses);
+        if (self.runtime_snapshot) |*snapshot| snapshot.deinit(alloc) else if (self.runtime_statuses.len > 0) antfly.metadata.table_manager.freeRuntimeGroupStatusReports(alloc, self.runtime_statuses);
         if (self.owns_health_class) alloc.free(self.health_class);
         self.* = .{};
     }
@@ -4377,8 +4379,8 @@ fn chooseStoreStatusReportKind(
     if (last_report_at_ms == 0 or dirty) return .full;
     const tick_due = ticks >= store_status_report_interval_ticks;
     if (!tick_due) return .none;
-    if (due_full_refresh or due_data_raft_refresh) return .full;
-    if (due_heartbeat) return .heartbeat;
+    if (due_full_refresh) return .full;
+    if (due_heartbeat or due_data_raft_refresh) return .heartbeat;
     return .none;
 }
 
@@ -7454,29 +7456,7 @@ pub const DataServer = struct {
                     );
                     if (report_kind != .none) {
                         self.store_status_ticks.store(0, .release);
-                        const result = switch (report_kind) {
-                            .full => self.reportStoreStatus(),
-                            .heartbeat => self.reportStoreStatusHeartbeat(),
-                            .none => unreachable,
-                        };
-                        result catch |err| switch (err) {
-                            error.StoreReportBaselinePending => {},
-                            // Split runtime can briefly observe placement before the
-                            // local replica root is fully provisioned on disk.
-                            error.LsmRootWriterAlreadyOpen,
-                            error.PersistentDescriptorAdmissionExhausted,
-                            error.FileNotFound,
-                            error.UnknownGroup,
-                            error.LmdbUnexpected,
-                            error.Corrupted,
-                            error.StaleLocalGroupStatusGeneration,
-                            => {},
-                            error.UnknownStore => {
-                                self.store_registration_confirmed = false;
-                                self.registerNodeIfConfigured() catch |register_err| try self.recordMetadataBootstrapError(register_err, now_ms);
-                            },
-                            else => |retry_err| try self.recordMetadataBootstrapError(retry_err, now_ms),
-                        };
+                        try self.reportStoreStatusForControl(report_kind, now_ms);
                     }
                 }
 
@@ -14653,6 +14633,32 @@ pub const DataServer = struct {
         };
     }
 
+    fn reportStoreStatusForControl(self: *DataServer, report_kind: StoreStatusReportKind, now_ms: u64) !void {
+        const result = switch (report_kind) {
+            .full => self.reportStoreStatus(),
+            .heartbeat => self.reportStoreStatusHeartbeat(),
+            .none => unreachable,
+        };
+        result catch |err| switch (err) {
+            error.StoreReportBaselinePending, error.StoreReportRepairRequired => {},
+            // Split runtime can briefly observe placement before the
+            // local replica root is fully provisioned on disk.
+            error.LsmRootWriterAlreadyOpen,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.FileNotFound,
+            error.UnknownGroup,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            error.StaleLocalGroupStatusGeneration,
+            => {},
+            error.UnknownStore => {
+                self.store_registration_confirmed = false;
+                self.registerNodeIfConfigured() catch |register_err| try self.recordMetadataBootstrapError(register_err, now_ms);
+            },
+            else => |retry_err| try self.recordMetadataBootstrapError(retry_err, now_ms),
+        };
+    }
+
     fn reportStoreStatus(self: *DataServer) !void {
         const failure = self.store_report_failure.swap(0, .acq_rel);
         if (failure != 0) return @errorFromInt(failure);
@@ -14841,7 +14847,7 @@ pub const DataServer = struct {
             return error.StaleLocalGroupStatusGeneration;
         }
         if (!try self.publishStoreReportUpdateWithBudget(report, false, budget)) try remote_metadata.reportNodeStatusWithBudget(report, budget);
-        try self.storeStatusHeartbeatCacheReplace(report);
+        try self.storeStatusHeartbeatCacheReplaceAtGeneration(report, report_generation);
         self.last_store_status_report_at_ms.store(self.backgroundMonotonicMs(), .release);
         if (claimed_activity) self.last_embedding_activity_report_at_ms.store(self.last_store_status_report_at_ms.load(.acquire), .release);
         self.clearMetadataBootstrapRetry();
@@ -15691,7 +15697,7 @@ pub const DataServer = struct {
         self.store_report_update_retry_at_ms = if (err == error.StoreReportBaselinePending) 0 else self.backgroundMonotonicMs() + (if (permanent) @as(u64, 30000) else 1000);
         const cancelled = err == error.Canceled or err == error.Cancelled;
         if (self.store_report_baseline == null and err != error.StoreReportBaselinePending and !cancelled)
-            self.store_report_failure.store(@intFromError(if (permanent) error.StoreReportInventoryRejected else err), .release);
+            self.store_report_failure.store(@intFromError(if (permanent) error.StoreReportInventoryRejected else if (err == error.StoreReportBaseMismatch) error.StoreReportRepairRequired else err), .release);
         self.markStoreStatusDirtyImmediate();
         if (err != error.StoreReportBaselinePending and !cancelled)
             std.log.warn("store report worker deferred err={s}", .{@errorName(err)});
@@ -15845,12 +15851,17 @@ pub const DataServer = struct {
             .cancellation = &self.store_report_cancellation,
             .io = remote_metadata.io,
         };
+        const ownership_generation = self.local_group_status_generation.load(.acquire);
         const reference = remote_metadata.supports_runtime_reference.load(.acquire);
         var report = (try self.cloneHeartbeatStoreStatusReport(registration.store_id, reference)) orelse return error.StoreReportBaseMismatch;
         defer freeStoreStatusReportOwned(self.alloc, &report);
         for (report.group_statuses) |*group_status| {
             overlayLiveRaftGroupStatus(group_status, self.group_leadership_source, self.group_membership_source);
+            // Retirement and relocation wait for live apply progress even
+            // when no index inventory changed.
+            group_status.raft_applied_index = self.localDataRaftAppliedIndex(group_status.group_id) orelse 0;
         }
+        if (self.local_group_status_generation.load(.acquire) != ownership_generation) return error.StoreReportBaseMismatch;
         if (try self.publishStoreReportUpdateWithBudget(report, reference, budget)) {
             self.last_store_status_report_at_ms.store(self.backgroundMonotonicMs(), .release);
             self.clearMetadataBootstrapRetry();
@@ -15874,7 +15885,7 @@ pub const DataServer = struct {
         lockAtomic(&self.store_status_cache_mutex);
         defer self.store_status_cache_mutex.unlock();
         const cache = &self.store_status_heartbeat_cache;
-        if (!cache.valid) return null;
+        if (!cache.valid or cache.ownership_generation != self.local_group_status_generation.load(.acquire)) return null;
         const runtime_statuses = if (reference) try self.alloc.alloc(antfly.metadata.table_manager.RuntimeGroupStatusReport, 0) else try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, cache.runtime_statuses);
         errdefer if (runtime_statuses.len > 0)
             antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
@@ -15916,16 +15927,27 @@ pub const DataServer = struct {
         self: *DataServer,
         report: antfly.metadata.table_manager.StoreStatusReport,
     ) !void {
+        return self.storeStatusHeartbeatCacheReplaceAtGeneration(report, self.local_group_status_generation.load(.acquire));
+    }
+
+    fn storeStatusHeartbeatCacheReplaceAtGeneration(self: *DataServer, report: antfly.metadata.table_manager.StoreStatusReport, ownership_generation: u64) !void {
         const health_class = try self.alloc.dupe(u8, report.health_class);
         errdefer self.alloc.free(health_class);
         const group_statuses = try antfly.metadata.table_manager.cloneGroupStatuses(self.alloc, report.group_statuses);
         errdefer if (group_statuses.len > 0)
             antfly.metadata.table_manager.freeGroupStatuses(self.alloc, group_statuses);
-        const runtime_statuses = try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, report.runtime_statuses);
-        errdefer if (runtime_statuses.len > 0)
+        var runtime_snapshot: ?store_report_update.Publisher.RuntimeSnapshot = if (self.store_report_publisher.cursor != null)
+            try self.store_report_publisher.retainRuntimeSnapshot(self.alloc, report)
+        else
+            null;
+        errdefer if (runtime_snapshot) |*snapshot| snapshot.deinit(self.alloc);
+        const runtime_statuses = if (runtime_snapshot) |snapshot| snapshot.items else try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, report.runtime_statuses);
+        errdefer if (runtime_snapshot == null and runtime_statuses.len > 0)
             antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
         var next: StoreStatusHeartbeatCache = .{
             .valid = true,
+            .ownership_generation = ownership_generation,
+            .runtime_snapshot = runtime_snapshot,
             .embedding_activity_protocol_version = report.embedding_activity_protocol_version,
             .embedding_activity_sequence = report.embedding_activity_sequence,
             .reporter_incarnation = report.reporter_incarnation,
@@ -15955,9 +15977,10 @@ pub const DataServer = struct {
             next.clear(self.alloc);
             return;
         }
-        self.store_status_heartbeat_cache.clear(self.alloc);
+        var previous = self.store_status_heartbeat_cache;
         self.store_status_heartbeat_cache = next;
         self.store_status_cache_mutex.unlock();
+        previous.clear(self.alloc);
     }
 
     fn collectStoreRuntimeStatusReports(
@@ -16918,11 +16941,32 @@ pub const DataServer = struct {
         // Walk ranges once with logarithmic membership checks instead of the
         // former table/group Cartesian product plus repeated range scans.
         // Exact retries perform disk work only for their keyed targets.
+        var schema_repair_attempted = false;
         for (snapshot.ranges) |range| {
             const group_id = range.group_id;
             if (!containsSortedU64(local_group_ids, group_id)) continue;
             if (!full_scan and !containsSortedDeferredStartupCatchUpGroup(deferred_groups, group_id)) continue;
             const table = findTableById(snapshot.tables, range.table_id) orelse continue;
+            // Schema cutover requires a local index proof from every replica.
+            // Give that exact full-text index one repair quantum on this owner;
+            // unrelated steady-state repair keeps its leader-only admission.
+            var schema_index_name_buf: [64]u8 = undefined;
+            const schema_index_name: ?[]const u8 = if (table.read_schema_json.len != 0) name: {
+                const version = @import("../api/tables.zig").schemaVersion(table.schema_json) catch |err| {
+                    std.log.warn("schema repair target unavailable table={s} err={s}", .{ table.name, @errorName(err) });
+                    stats.debt_remaining = true;
+                    stats.unparked_debt_remaining = true;
+                    stats.full_scan_retry_required = true;
+                    continue;
+                };
+                break :name std.fmt.bufPrint(&schema_index_name_buf, "full_text_index_v{d}", .{version}) catch unreachable;
+            } else null;
+            if (schema_index_name != null and schema_repair_attempted) {
+                stats.debt_remaining = true;
+                stats.unparked_debt_remaining = true;
+                stats.full_scan_retry_required = true;
+                continue;
+            }
             // Restore imports a distinct physical generation into every
             // placement, and metadata does not complete the range intent
             // until every placement reports its local runtime repair
@@ -16931,7 +16975,7 @@ pub const DataServer = struct {
             // Keeping the exception scoped to a live restore identity
             // preserves single-leader admission for all steady-state debt.
             const restore_repair_pending = range.restore_backup_id.len != 0 and range.restore_location.len != 0;
-            if (!restore_repair_pending) {
+            if (!restore_repair_pending and schema_index_name == null) {
                 switch (startupCatchUpGroupDisposition(
                     snapshot.stores,
                     snapshot.placement_intents,
@@ -16992,6 +17036,9 @@ pub const DataServer = struct {
                 break :result_blk self.liveRuntimeWriteSource().catchUpTableGroupBestEffortWithMetadata(self.alloc, group_id, table.name, .{
                     .indexes_json = table.indexes_json,
                     .schema_json = table.schema_json,
+                    .target_index_name = schema_index_name,
+                    .advance_index_repairs = schema_index_name != null,
+                    .index_repair_options = .{ .target_index_name = schema_index_name },
                     .identity_namespace = .{
                         .table_id = table.table_id,
                         .shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
@@ -17007,6 +17054,17 @@ pub const DataServer = struct {
                 };
             };
             stats.group_count += 1;
+            if (schema_index_name != null) {
+                schema_repair_attempted = schema_repair_attempted or result.index_repair_attempted;
+                if (result.had_debt) stats.groups_with_debt += 1;
+                if (result.made_progress or result.cleared_debt) stats.groups_cleared += 1;
+                if (result.busy or result.index_repair_pending) {
+                    stats.debt_remaining = true;
+                    stats.full_scan_retry_required = true;
+                    stats.unparked_debt_remaining = true;
+                }
+                continue;
+            }
             if (result.index_repair_pending) {
                 // Startup catch-up is a periodic level observation, not a
                 // causal progress edge. It may recover a lost queue entry,
@@ -27547,6 +27605,40 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "system catalog runtime observation isolates busy and nonlocal groups" {
+            if (comptime !control_only_storage_sources) return error.SkipZigTest;
+            const Fake = struct {
+                failure: ?anyerror = null,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: antfly.db.types.BatchRequest) !?void {
+                    return error.UnexpectedBatch;
+                }
+                fn group(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8) !?runtime_status.LocalTableRuntimeStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("tenant", table_name);
+                    try std.testing.expectEqual(@as(u64, 102), group_id);
+                    if (self.failure) |err| return err;
+                    return .{ .group_id = group_id, .stats = .{ .doc_count = 42 } };
+                }
+                fn table(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+                    // Another shard is remote or busy. A group observation
+                    // must never depend on a whole-table observation.
+                    return error.UnexpectedTableWideObservation;
+                }
+            };
+            var fake: Fake = .{};
+            var source = antfly.public_api.ProvisionedTableWriteSource.init("", antfly.public_api.table_catalog.emptyCatalogSource());
+            source.local_write_source = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .local_runtime_statuses = Fake.table, .local_runtime_status_group_local = Fake.group } };
+            var status = (try source.snapshotManagedWriterGroupStatusBestEffort(std.testing.allocator, "tenant", 102)).?;
+            defer status.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u64, 42), status.stats.doc_count);
+            for ([_]anyerror{ error.StorageBusy, error.StorageReadTemporarilyUnavailable }) |err| {
+                fake.failure = err;
+                try std.testing.expect((try source.snapshotManagedWriterGroupStatusBestEffort(std.testing.allocator, "tenant", 102)) == null);
+            }
+            fake.failure = error.OutOfMemory;
+            try std.testing.expectError(error.OutOfMemory, source.snapshotManagedWriterGroupStatusBestEffort(std.testing.allocator, "tenant", 102));
+        }
+
         test "system catalog initial report collection is isolated fenced and cancellable" {
             if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
             const a = std.testing.allocator;
@@ -27555,9 +27647,12 @@ fn consumerTests() type {
                 entered: std.atomic.Value(bool) = .init(false),
                 release: std.atomic.Value(bool) = .init(false),
                 writes: std.atomic.Value(usize) = .init(0),
+                observations: std.atomic.Value(usize) = .init(0),
+                reject_next: std.atomic.Value(bool) = .init(false),
                 cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation = null,
                 fn observe(ptr: *anyopaque) !resource_manager_mod.CapacityObservation {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = self.observations.fetchAdd(1, .monotonic);
                     self.entered.store(true, .release);
                     const until = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
                     while (!self.release.load(.acquire) and !self.cancellation.?.isCancelled()) {
@@ -27570,6 +27665,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (request.method == .GET) return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataHead{ .metadata_group_id = 9, .metadata_incarnation = [_]u8{'1'} ** 32 }, .{}) };
                     _ = self.writes.fetchAdd(1, .monotonic);
+                    if (self.reject_next.swap(false, .acq_rel)) return error.StoreReportBaseMismatch;
                     var update = try std.json.parseFromSlice(store_report_update.Update, alloc, request.body, .{});
                     defer update.deinit();
                     var digest: [32]u8 = undefined;
@@ -27639,6 +27735,38 @@ fn consumerTests() type {
             try server.runStoreStatusRoundOnly();
             try std.testing.expectEqual(@as(usize, 1), fake.writes.load(.acquire));
             try std.testing.expect(!server.store_status_dirty.load(.acquire));
+            // Normal clustered scheduling dispatches a cached Raft refresh
+            // without entering the collector/capacity source again.
+            const observations = fake.observations.load(.acquire);
+            const kind = chooseStoreStatusReportKind(store_status_report_interval_ticks, false, 42, false, false, true);
+            try std.testing.expectEqual(StoreStatusReportKind.heartbeat, kind);
+            try server.reportStoreStatusForControl(kind, 0);
+            server.store_report_worker_future.?.await(server.store_report_worker_lease.?.io());
+            try std.testing.expectEqual(observations, fake.observations.load(.acquire));
+            try std.testing.expectEqual(@as(u16, 0), server.store_report_failure.load(.acquire));
+            // A rejected retained base is handled by the worker and consumed
+            // by the exact dispatch/error path used by the control loop.
+            fake.reject_next.store(true, .release);
+            try server.reportStoreStatusForControl(.heartbeat, 0);
+            server.store_report_worker_future.?.await(server.store_report_worker_lease.?.io());
+            try std.testing.expect(server.store_report_publisher.cursor == null);
+            try std.testing.expectEqual(@intFromError(error.StoreReportRepairRequired), server.store_report_failure.load(.acquire));
+            try server.reportStoreStatusForControl(.full, 0);
+            try std.testing.expectEqual(@as(u16, 0), server.store_report_failure.load(.acquire));
+            try std.testing.expect(server.store_status_dirty.load(.acquire));
+            server.store_report_update_retry_at_ms = 0;
+            try server.runStoreStatusRoundOnly();
+            try std.testing.expect(server.store_report_publisher.cursor != null);
+            try std.testing.expect(fake.observations.load(.acquire) > observations);
+            // Ownership invalidation before a queued heartbeat requires repair,
+            // never publication of the cached generation or a fatal control error.
+            server.invalidateLocalGroupStatusCache();
+            try server.reportStoreStatusForControl(.heartbeat, 0);
+            server.store_report_worker_future.?.await(server.store_report_worker_lease.?.io());
+            try server.reportStoreStatusForControl(.full, 0);
+            server.store_report_update_retry_at_ms = 0;
+            try server.runStoreStatusRoundOnly();
+            const writes_before_cancel = fake.writes.load(.acquire);
             // Cancellation also joins a first collection, before a baseline exists.
             fake.entered.store(false, .release);
             fake.release.store(false, .release);
@@ -27648,7 +27776,7 @@ fn consumerTests() type {
             server.stopStoreReportWorker();
             try std.testing.expect(server.store_report_collection == null);
             try std.testing.expect(server.store_report_worker_lease == null);
-            try std.testing.expectEqual(@as(usize, 1), fake.writes.load(.acquire));
+            try std.testing.expectEqual(writes_before_cancel, fake.writes.load(.acquire));
         }
 
         test "system catalog permanent baseline rejection releases inventory for a fresh report" {
@@ -28970,7 +29098,7 @@ fn consumerTests() type {
                 chooseStoreStatusReportKind(store_status_report_interval_ticks, false, 42, false, true, false),
             );
             try std.testing.expectEqual(
-                StoreStatusReportKind.full,
+                StoreStatusReportKind.heartbeat,
                 chooseStoreStatusReportKind(store_status_report_interval_ticks, false, 42, false, false, true),
             );
         }
@@ -28980,6 +29108,8 @@ fn consumerTests() type {
             server.alloc = std.testing.allocator;
             server.store_status_cache_mutex = .unlocked;
             server.store_status_heartbeat_cache = .{};
+            server.store_report_publisher = .{};
+            server.local_group_status_generation = .init(0);
             defer server.store_status_heartbeat_cache.clear(std.testing.allocator);
 
             try server.storeStatusHeartbeatCacheReplace(.{

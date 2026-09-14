@@ -1529,6 +1529,19 @@ const IndexRepairSchedulerDirectory = struct {
             .wake = self.wake(),
         };
     }
+
+    fn summaryForIndex(self: *@This(), target_index_name: ?[]const u8) DB.IndexRepairIntentSummary {
+        const name = target_index_name orelse return self.summary();
+        const index = self.by_name.get(name) orelse return .{};
+        const record = self.records.items[index];
+        return .{
+            .runnable = @intFromBool(record.class == .runnable),
+            .paused = @intFromBool(record.class == .paused),
+            .terminal = @intFromBool(record.class == .terminal),
+            .earliest_retry_at_ms = if (record.class == .runnable) record.next_retry_at_ms else 0,
+            .wake = if (record.class != .runnable) .empty else if (record.next_retry_at_ms == 0) .immediate else .{ .at_realtime_ms = record.next_retry_at_ms },
+        };
+    }
 };
 
 const AsyncDenseCatchUpSession = struct {
@@ -14929,11 +14942,15 @@ pub const DB = struct {
     }
 
     pub fn indexRepairIntentSummary(self: *DB, alloc: Allocator) !IndexRepairIntentSummary {
+        return self.indexRepairIntentSummaryForIndex(alloc, null);
+    }
+
+    pub fn indexRepairIntentSummaryForIndex(self: *DB, alloc: Allocator, target_index_name: ?[]const u8) !IndexRepairIntentSummary {
         if (self.managedAdmissionMaterializationPending()) try self.drainManagedIndexAdmissions(alloc);
         try self.ensureIndexRepairSchedulerDirectory(alloc);
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         defer self.async_context.index_repair_scheduler_mutex.unlock();
-        return self.async_context.index_repair_scheduler.summary();
+        return self.async_context.index_repair_scheduler.summaryForIndex(target_index_name);
     }
 
     pub fn loadIndexRepairState(self: *const DB, alloc: Allocator) !index_repair_state.State {
@@ -18956,17 +18973,24 @@ pub const DB = struct {
         alloc: Allocator,
         execution_limit: usize,
     ) !IndexRepairSchedulerSelection {
+        return self.selectIndexRepairSchedulerQuantumForIndex(alloc, execution_limit, null);
+    }
+
+    fn selectIndexRepairSchedulerQuantumForIndex(self: *DB, alloc: Allocator, execution_limit: usize, target_index_name: ?[]const u8) !IndexRepairSchedulerSelection {
         try self.ensureIndexRepairSchedulerDirectory(alloc);
         var selection: IndexRepairSchedulerSelection = .{};
         errdefer selection.deinit(alloc);
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         defer self.async_context.index_repair_scheduler_mutex.unlock();
         const directory = &self.async_context.index_repair_scheduler;
-        selection.terminal = directory.terminal;
-        selection.deferred = directory.paused;
-        selection.remaining = directory.records.items.len;
-        selection.next_retry_at_ms = directory.earliestRetryDeadline();
-        const inspection = indexRepairInspectionWindow(
+        const summary = directory.summaryForIndex(target_index_name);
+        selection.terminal = summary.terminal;
+        selection.deferred = summary.paused;
+        selection.remaining = summary.runnable + summary.paused + summary.terminal;
+        selection.next_retry_at_ms = summary.earliest_retry_at_ms;
+        const target_index = if (target_index_name) |name| directory.by_name.get(name) else null;
+        if (target_index_name != null and target_index == null) return selection;
+        const inspection = if (target_index) |index| IndexRepairInspectionWindow{ .start = index, .budget = @min(execution_limit, 1) } else indexRepairInspectionWindow(
             directory.records.items.len,
             execution_limit,
             @intCast(directory.cursor),
@@ -18976,7 +19000,7 @@ pub const DB = struct {
         while (selection.inspected < inspection.budget) : (selection.inspected += 1) {
             const record_index = (inspection.start + selection.inspected) % directory.records.items.len;
             const record = directory.records.items[record_index];
-            directory.cursor = (record_index + 1) % directory.records.items.len;
+            if (target_index_name == null) directory.cursor = (record_index + 1) % directory.records.items.len;
             if (record.class != .runnable) continue;
             if (record.next_retry_at_ms > now_ms) {
                 selection.deferred += 1;
@@ -19023,9 +19047,9 @@ pub const DB = struct {
         // Existing terminal intents are counted from the durable state below.
         // Discovery contributes only terminal load failures for which no intent
         // exists, avoiding double-counting checkpointed failures.
-        result.terminal = discovery.terminal - discovery.existing_terminal;
+        result.terminal = if (options.target_index_name == null) discovery.terminal - discovery.existing_terminal else 0;
 
-        var selection = try self.selectIndexRepairSchedulerQuantum(alloc, limit);
+        var selection = try self.selectIndexRepairSchedulerQuantumForIndex(alloc, limit, options.target_index_name);
         defer selection.deinit(alloc);
         result.terminal += selection.terminal;
         result.deferred += selection.deferred;
@@ -19065,8 +19089,9 @@ pub const DB = struct {
         try self.ensureIndexRepairSchedulerDirectory(alloc);
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         const directory = &self.async_context.index_repair_scheduler;
-        result.remaining = directory.records.items.len;
-        result.wake = directory.wake();
+        const summary = directory.summaryForIndex(options.target_index_name);
+        result.remaining = summary.runnable + summary.paused + summary.terminal;
+        result.wake = summary.wake;
         result.next_retry_at_ms = result.wake.retryAtMs();
         self.async_context.index_repair_scheduler_mutex.unlock();
         return result;
@@ -104260,6 +104285,31 @@ test "resident index repair scheduler skips deferred prefixes with bounded fair 
             intent.deinit(alloc);
         }
     }
+
+    // Exact migration repair bypasses unrelated paused prefixes without
+    // consuming the ordinary scheduler's fairness cursor.
+    const cursor_before = db.async_context.index_repair_scheduler.cursor;
+    var targeted = try db.selectIndexRepairSchedulerQuantumForIndex(alloc, 1, "repair-17");
+    defer targeted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), targeted.inspected);
+    try std.testing.expectEqual(@as(usize, 1), targeted.repairs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), targeted.remaining);
+    try std.testing.expectEqual(@as(usize, 0), targeted.deferred);
+    try std.testing.expectEqual(@as(u128, 18), targeted.repairs.items[0].repair_id);
+    try std.testing.expectEqual(cursor_before, db.async_context.index_repair_scheduler.cursor);
+    var paused_target = try db.selectIndexRepairSchedulerQuantumForIndex(alloc, 1, "repair-0");
+    defer paused_target.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), paused_target.repairs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), paused_target.deferred);
+    var absent_target = try db.selectIndexRepairSchedulerQuantumForIndex(alloc, 1, "absent");
+    defer absent_target.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), absent_target.inspected);
+    try std.testing.expectEqual(@as(usize, 0), absent_target.remaining);
+    const target_summary = try db.indexRepairIntentSummaryForIndex(alloc, "repair-17");
+    try std.testing.expectEqual(@as(usize, 1), target_summary.runnable);
+    try std.testing.expectEqual(@as(usize, 0), target_summary.paused);
+    try std.testing.expectEqual(@as(usize, 1), (try db.indexRepairIntentSummaryForIndex(alloc, "repair-0")).paused);
+    try std.testing.expectEqual(@as(usize, 0), (try db.indexRepairIntentSummaryForIndex(alloc, "absent")).runnable);
 
     var first = try db.selectIndexRepairSchedulerQuantum(alloc, 1);
     defer first.deinit(alloc);

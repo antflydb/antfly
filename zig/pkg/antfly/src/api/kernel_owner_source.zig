@@ -3490,7 +3490,10 @@ pub const ProvisionedKernelOwnerSource = struct {
                 return null;
             };
             defer lease.deinit();
-            var response = try lease.owner().runtimeStatusJson(table_name);
+            var response = lease.owner().runtimeStatusJson(table_name) catch |err| switch (err) {
+                error.StorageBusy => return error.StorageReadTemporarilyUnavailable,
+                else => return err,
+            };
             defer response.deinit();
             var parsed = try std.json.parseFromSlice(
                 runtime_status.LocalTableRuntimeStatus,
@@ -3516,7 +3519,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var lease = (try self.acquireIfPresent(group_id, table_name)) orelse return null;
         defer lease.deinit();
-        var response = try lease.owner().runtimeStatusJson(table_name);
+        var response = lease.owner().runtimeStatusJson(table_name) catch |err| switch (err) {
+            error.StorageBusy => return error.StorageReadTemporarilyUnavailable,
+            else => return err,
+        };
         defer response.deinit();
         var parsed = try std.json.parseFromSlice(
             runtime_status.LocalTableRuntimeStatus,

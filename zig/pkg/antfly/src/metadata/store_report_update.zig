@@ -153,21 +153,59 @@ pub fn asReport(record: metadata.StoreRecord) metadata.StoreStatusReport {
 /// Serialized by the reporter owner. Only acknowledged replacements become
 /// the next diff baseline; unchanged clocks retain their last transmitted age.
 pub const Publisher = struct {
-    // Only the serialized publisher owner changes references. A prepared
+    // The publisher serializes mutations; independently owned snapshots may
+    // release references on the control owner. A prepared
     // heartbeat can share the acknowledged immutable index inventory safely
     // across commit, abandonment, and replacement of the structural group row.
     const Runtime = struct {
         arena: std.heap.ArenaAllocator,
-        refs: usize = 1,
+        refs: std.atomic.Value(usize) = .init(1),
         items: []metadata.RuntimeGroupStatusReport,
         fn release(self: *Runtime, alloc: std.mem.Allocator) void {
-            self.refs -= 1;
-            if (self.refs == 0) {
+            if (self.refs.fetchSub(1, .acq_rel) == 1) {
                 self.arena.deinit();
                 alloc.destroy(self);
             }
         }
     };
+    pub const RuntimeSnapshot = struct {
+        items: []metadata.RuntimeGroupStatusReport,
+        leases: []*Runtime,
+        pub fn deinit(self: *RuntimeSnapshot, alloc: std.mem.Allocator) void {
+            for (self.leases) |runtime| runtime.release(alloc);
+            alloc.free(self.leases);
+            alloc.free(self.items);
+            self.* = undefined;
+        }
+    };
+
+    /// Preserve caller order (including duplicate runtime rows) while sharing
+    /// the acknowledged immutable index arrays. No index inventory is walked.
+    pub fn retainRuntimeSnapshot(self: *const Publisher, alloc: std.mem.Allocator, report: metadata.StoreStatusReport) !RuntimeSnapshot {
+        const cursor = self.cursor orelse return error.StoreReportBaseMismatch;
+        if (cursor.reporter_incarnation != report.reporter_incarnation) return error.StoreReportBaseMismatch;
+        const items = try alloc.alloc(metadata.RuntimeGroupStatusReport, report.runtime_statuses.len);
+        errdefer alloc.free(items);
+        const leases = try alloc.alloc(*Runtime, items.len);
+        errdefer alloc.free(leases);
+        var initialized: usize = 0;
+        errdefer for (leases[0..initialized]) |runtime| runtime.release(alloc);
+        var positions: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+        defer positions.deinit(alloc);
+        for (report.runtime_statuses, items, leases) |record, *item, *lease| {
+            const group = self.groups.get(record.group_id) orelse return error.StoreReportBaseMismatch;
+            const position = try positions.getOrPut(alloc, record.group_id);
+            if (!position.found_existing) position.value_ptr.* = 0;
+            if (position.value_ptr.* >= group.runtimes.len) return error.StoreReportBaseMismatch;
+            item.* = group.runtimes[position.value_ptr.*];
+            position.value_ptr.* += 1;
+            _ = group.runtime.refs.fetchAdd(1, .monotonic);
+            lease.* = group.runtime;
+            initialized += 1;
+        }
+        return .{ .items = items, .leases = leases };
+    }
+
     const Group = struct {
         arena: std.heap.ArenaAllocator,
         groups: []metadata.GroupStatusReport,
@@ -240,7 +278,7 @@ pub const Publisher = struct {
             const groups = try metadata.cloneGroupStatuses(la, selected_groups);
             const runtime = if (retain_runtime) blk: {
                 const prior = self.groups.get(entry.key_ptr.*) orelse return error.StoreReportBaseMismatch;
-                prior.runtime.refs += 1;
+                _ = prior.runtime.refs.fetchAdd(1, .monotonic);
                 break :blk prior.runtime;
             } else blk: {
                 const value = try alloc.create(Runtime);
@@ -638,15 +676,15 @@ test "system catalog retained heartbeat shares immutable inventory through aband
                 var abandoned = try publisher.prepare(a, report, false, true);
                 defer abandoned.deinit(a);
                 try std.testing.expectEqual(runtime, abandoned.replacements[0].group.runtime);
-                try std.testing.expectEqual(@as(usize, 2), runtime.refs);
+                try std.testing.expectEqual(@as(usize, 2), runtime.refs.load(.acquire));
             }
-            try std.testing.expectEqual(@as(usize, 1), runtime.refs);
+            try std.testing.expectEqual(@as(usize, 1), runtime.refs.load(.acquire));
             var changed = try publisher.prepare(a, report, false, true);
             defer changed.deinit(a);
             try std.testing.expectEqualDeep(runtimes[0], changed.update.report.runtime_statuses[0]);
             publisher.commit(a, &changed, testCursor(changed.update));
             try std.testing.expectEqual(runtime, publisher.groups.get(101).?.runtime);
-            try std.testing.expectEqual(@as(usize, 1), runtime.refs);
+            try std.testing.expectEqual(@as(usize, 1), runtime.refs.load(.acquire));
             try std.testing.expect(publisher.groups.contains(102));
             report.group_statuses = &.{};
             try std.testing.expectError(error.StoreReportBaseMismatch, publisher.prepare(a, report, false, true));
@@ -711,6 +749,71 @@ test "store report workload benchmark retained heartbeat" {
                 std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
                 std.debug.print("RETAINED_HEARTBEAT_BENCH groups={d} indexes_per_group=32 changed={} retained={} prepare_p50_ns={d} samples_ns={any}\n", .{ count, changed, retain, samples[4], samples });
             }
+        }
+    }
+}
+
+test "system catalog runtime snapshot retains duplicate ordered leaves across replacement and publisher teardown" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var publisher: Publisher = .{};
+            defer publisher.deinit(a);
+            var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .name = "search", .kind = "full_text", .doc_count = 1 }};
+            var runtimes = [_]metadata.RuntimeGroupStatusReport{
+                .{ .group_id = 102, .indexes = &indexes },
+                .{ .group_id = 101, .indexes = &indexes },
+                .{ .group_id = 102, .indexes = &indexes },
+            };
+            const report: metadata.StoreStatusReport = .{ .store_id = 20, .reporter_incarnation = 77, .runtime_statuses = &runtimes };
+            var initial = try publisher.prepare(a, report, false, false);
+            defer initial.deinit(a);
+            publisher.commit(a, &initial, testCursor(initial.update));
+            var snapshot = try publisher.retainRuntimeSnapshot(a, report);
+            defer snapshot.deinit(a);
+            try std.testing.expectEqualDeep(&runtimes, snapshot.items);
+            try std.testing.expectEqual(publisher.groups.get(102).?.runtimes[0].indexes.ptr, snapshot.items[0].indexes.ptr);
+            indexes[0].doc_count = 2;
+            var changed = try publisher.prepare(a, report, false, false);
+            defer changed.deinit(a);
+            publisher.commit(a, &changed, testCursor(changed.update));
+            try std.testing.expectEqual(@as(u64, 1), snapshot.items[0].indexes[0].doc_count);
+            publisher.deinit(a);
+            try std.testing.expectEqual(@as(u64, 1), snapshot.items[2].indexes[0].doc_count);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "store report workload benchmark acknowledged runtime cache leases" {
+    if (std.c.getenv("ANTFLY_CATALOG_REPORT_BENCH") == null) return;
+    const a = std.heap.c_allocator;
+    for ([_]usize{ 1000, 10000 }) |count| {
+        const runtimes = try a.alloc(metadata.RuntimeGroupStatusReport, count);
+        defer a.free(runtimes);
+        var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .name = "tenant_search", .kind = "full_text" }} ** 32;
+        for (runtimes, 0..) |*runtime, i| runtime.* = .{ .group_id = i + 100, .indexes = &indexes };
+        const report: metadata.StoreStatusReport = .{ .store_id = 20, .reporter_incarnation = 77, .runtime_statuses = runtimes };
+        var publisher: Publisher = .{};
+        defer publisher.deinit(a);
+        var initial = try publisher.prepare(a, report, false, false);
+        defer initial.deinit(a);
+        publisher.commit(a, &initial, testCursor(initial.update));
+        for ([_]bool{ false, true }) |shared| {
+            var samples: [9]u64 = undefined;
+            for (0..10) |sample| {
+                const start = @import("antfly_platform").time.monotonicNs();
+                if (shared) {
+                    var snapshot = try publisher.retainRuntimeSnapshot(a, report);
+                    snapshot.deinit(a);
+                } else {
+                    const copy = try metadata.cloneRuntimeGroupStatusReports(a, runtimes);
+                    metadata.freeRuntimeGroupStatusReports(a, copy);
+                }
+                const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+                if (sample != 0) samples[sample - 1] = elapsed;
+            }
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            std.debug.print("RUNTIME_CACHE_BENCH groups={d} indexes_per_group=32 shared={} p50_ns={d} samples_ns={any}\n", .{ count, shared, samples[4], samples });
         }
     }
 }

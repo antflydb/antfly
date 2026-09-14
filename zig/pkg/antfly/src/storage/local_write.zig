@@ -1848,12 +1848,12 @@ pub fn reconcileStorageKernelOwnerDb(
         }
     }
 
-    var repair_summary = db.indexRepairIntentSummary(alloc) catch |err| switch (err) {
+    var repair_summary = db.indexRepairIntentSummaryForIndex(alloc, target_index_name) catch |err| switch (err) {
         error.DurableIndexRepairStateUnavailable => db_mod.DB.IndexRepairIntentSummary{},
         else => return err,
     };
     if (advance_index_repair and repair_summary.runnable != 0) {
-        const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, .{});
+        const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, .{ .target_index_name = target_index_name });
         result.repair_discovered = repair.discovered;
         result.repair_attempted = repair.attempted;
         result.repair_repaired = repair.repaired;
@@ -1862,7 +1862,10 @@ pub fn reconcileStorageKernelOwnerDb(
         result.repair_busy = repair.busy;
         result.repair_disk_waits = repair.disk_waits;
         result.next_retry_at_ms = repair.next_retry_at_ms;
-        repair_summary = try db.indexRepairIntentSummary(alloc);
+        repair_summary = try db.indexRepairIntentSummaryForIndex(alloc, target_index_name);
+        result.repair_remaining = repair_summary.runnable + repair_summary.paused + repair_summary.terminal;
+        result.repair_terminal = repair_summary.terminal;
+        result.next_retry_at_ms = repair_summary.earliest_retry_at_ms;
     } else {
         result.repair_remaining = repair_summary.runnable + repair_summary.paused + repair_summary.terminal;
         result.repair_terminal = repair_summary.terminal;

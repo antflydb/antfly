@@ -791,3 +791,45 @@ edge provenance only when paths are requested, sharing ancestry while queued.
 Native restore checks catalog compatibility after primary transfer and validates
 physical projection checkpoints after their artifacts are installed, before the
 restored generation is published.
+
+
+### Report scheduling and migration readiness
+
+A data node with Raft refreshes cached live Raft facts at the existing reporting
+cadence. Raft presence alone does not force runtime inventory collection. Dirty
+observations and expired local group snapshots still select a full collection;
+leadership, membership, and ownership changes still invalidate the caches. Cached
+heartbeats carry the local ownership generation and check it before publication.
+A rejected base is a `StoreReportRepairRequired` control outcome: the worker clears
+the cursor, marks inventory dirty, and backs off, while the control loop remains
+available to schedule a fresh report. Unknown-store recovery still re-registers.
+
+The heartbeat cache retains the publisher's acknowledged immutable runtime leaves.
+A small ordered snapshot preserves duplicate runtime rows without copying index
+arrays. Leaf references are atomic because cache invalidation and publisher
+replacement can release them on different owners. Cache replacement swaps ownership
+under its mutex and destroys the old snapshot after unlocking. The fallback for
+peers without sparse reporting retains the existing independently owned report.
+
+Migration finalization builds one readiness index for the reconciliation snapshot:
+range-to-table ownership, distinct hosting nodes, and exact table/node/schema-version
+acknowledgements. It deduplicates hosting nodes across shards and keeps tables with
+no hosts or missing acknowledgements unready. Only migrating tables need schema
+version parsing. The same index serves every table in the round, removing repeated
+placement/range scans from the metadata leader's cutover path.
+
+Runtime observations address the exact local physical group through the storage
+boundary. A remote sibling shard cannot suppress a local observation, and a busy
+owner yields an unavailable observation so the existing cached/synthetic fallback
+can serve the control loop. Allocation failures remain errors. Live Raft apply
+indexes refresh with heartbeats so drain and relocation fences observe catch-up
+without requiring an index-inventory rebuild.
+
+An in-progress schema migration admits local full-text reconstruction on every
+hosting replica. Startup maintenance targets the exact schema-version index and
+admits at most one repair attempt per pass. The storage owner's existing descriptor
+and exclusive lease fence the physical generation. Exact repair selection uses the
+resident name index, leaves the general repair cursor unchanged, honors paused and
+future-dated intents, and excludes unrelated repair debt from the target's readiness.
+Ordinary repairs retain their existing leader admission. Busy runtime observations
+cross the compiled boundary as the existing retryable storage-unavailable identity.

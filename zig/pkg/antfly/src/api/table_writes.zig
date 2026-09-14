@@ -16352,20 +16352,15 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatus {
         if (comptime control_only_storage_sources) {
             const local_source = self.local_write_source orelse return null;
-            var statuses = (local_source.localRuntimeStatuses(alloc, table_name) catch |err| switch (err) {
+            return local_source.localRuntimeStatusGroupLocal(alloc, group_id, table_name) catch |err| switch (err) {
                 // This probe is used by observational control loops such as
                 // schema-migration finalization. A resident owner can be
                 // momentarily retiring or publishing its generation; absence
                 // is the truthful best-effort result and must not terminate
                 // the node's control loop.
-                error.StorageReadTemporarilyUnavailable => return null,
+                error.StorageReadTemporarilyUnavailable, error.StorageBusy => null,
                 else => return err,
-            }) orelse return null;
-            defer statuses.deinit(alloc);
-            for (statuses.items) |status| {
-                if (status.group_id == group_id) return try status.clone(alloc);
-            }
-            return null;
+            };
         }
         return switch (self.probeManagedWriterGroupBestEffort(table_name, group_id)) {
             .absent, .unknown => null,

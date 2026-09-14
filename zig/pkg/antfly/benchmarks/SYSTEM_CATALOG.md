@@ -5,6 +5,36 @@ they are not CI latency thresholds or production capacity claims.
 See [recorded measurements](SYSTEM_CATALOG_RESULTS.md) for a reproducible local
 before/after comparison and representative request latencies.
 
+## Reporting cadence and concurrent migrations
+
+```sh
+ANTFLY_CATALOG_REPORT_BENCH=1 python3 tools/run_bounded_zig_build.py build antfly-system-catalog-report-bench
+ANTFLY_CATALOG_REPORT_BENCH=1 python3 tools/run_bounded_zig_build.py build antfly-system-catalog-finalization-test
+ANTFLY_BIN=./zig-out/bin/antfly ANTFLY_E2E_PHASE_TIMINGS=1 uv run --project e2e/antfly pytest -q -s \
+  e2e/antfly/test_catalog_resilience.py::test_concurrent_tenant_schema_migrations_preserve_documents
+```
+
+The runtime-cache component models a node with 1,000 or 10,000 groups and 32
+indexes per group. It compares copying/freeing the former cache with retaining/
+releasing acknowledged runtime leaves, including the ordered lease map. Both use
+`c_allocator`, one warmup, and nine samples. It excludes report collection and
+transport. Structural changes still require fresh inventory; clean Raft reporting
+ticks now refresh live Raft facts without collecting index inventory.
+
+The finalization component models 100 concurrent tenant migrations, 1,000 groups,
+and 3,000 placements plus one unhosted table. It checks every result against the
+former scan with one warmup and five paired samples. The new interval includes
+schema parsing and readiness-index construction; the reference interval excludes
+schema parsing. Index destruction is excluded. Neither includes document rebuilds,
+HTTP, or Raft. These are Debug comparisons unless an optimization mode is supplied.
+
+The cluster scenario complements those component measurements with three tables,
+two shards per table, three replicas per shard, and existing documents. It updates schemas concurrently,
+waits for all cutovers, and verifies reads. Its optional phase timing includes
+migration and validation, excludes provisioning, and has no performance threshold.
+Use repeated independent runs for latency comparisons. Node-drain E2Es separately
+verify that live Raft apply progress still satisfies retirement fences.
+
 ## Catalog scale in process
 
 ```sh
