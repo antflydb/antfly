@@ -1602,3 +1602,60 @@ allocation-failure, and production DataServer simulation regressions also passed
 OpenAPI generation, generated-file consistency, test-ownership audit, lint,
 formatting, and diff checks passed. This is local validation; hosted CI is
 reported independently on the PR.
+
+## Batched recovery and initial collection isolation — 2026-09-14
+
+[Raw measurements](system_catalog_batched_workloads_2026_09_14.json) record source
+`d5af4ffd4`, including main `3554f8210` (standby rename, PR #721). All three live
+scenarios used the same Debug binary on macOS arm64, three metadata nodes, and
+three real data nodes, with no task-owned builds or tests running concurrently.
+Each recovery ran once; steady scenarios used one warmup and five measurements.
+An earlier interrupted run is retained separately and excluded from comparisons.
+
+| 10,000-group recovery (46.1 MB) | Sequential chunks | Batched chunks |
+| --- | ---: | ---: |
+| Delivery time | 67.77 s | 40.99 s |
+| Logical requests | 159 | 34 |
+| HTTP attempts, including discovery | 318 | 68 |
+| Maximum request bytes | 296,029 | 1,480,895 |
+| Activation request | 45.59 ms | 468.76 ms |
+| Contended control median | 50.92 ms | 51.43 ms |
+| Successful control probes | 25/25 | 25/25 |
+| Successful diagnostic probes | 2/20 | 2/20 |
+
+Batching reduced recovery time by 39.5% (1.65×) and logical request count by
+78.6%. Both uploads contained 157 logical chunks. Activation was slower in the
+batched run; a single recovery per configuration cannot establish its distribution.
+Python planning took 2.24/2.29 seconds, separately from delivery. Diagnostic
+capacity rejected 18/20 competing captures in each run; this is not a diagnostic
+throughput improvement. Durable burst publication medians for 32/33/128 changed
+groups were 96.6/117.5/727.1 ms sequential and 88.6/199.4/596.8 ms batched. These
+bursts use the same sparse path, so their mixed movements are not a batching win.
+
+An index-heavy recovery with eight groups and 1,200 indexes each transported
+9.76 MB through 24 durable fragments and 26 requests. It completed in 7.67 seconds
+with a 699,999-byte maximum request; planning took 3.47 seconds. All real data
+nodes survived, and every control probe succeeded. Subsequent eight-group
+publication took 996 ms median. Fragment completion still materializes a whole
+group once at admission and once at apply; its memory/CPU cost scales with group
+size, bounded by the generation limit and serialized admission.
+
+The placement component benchmark compares the old nested scan with production
+indexed annotation for 10,000 groups and 20,001 intents. One warmup and five samples
+gave medians of 1,695.53 ms and 5.681 ms (298.5×). The indexed measurement includes
+building and freeing the map; both implementations must produce identical output.
+This Debug CPU comparison excludes collection I/O, HTTP, and hosted Raft work.
+
+The production worker now owns initial group/index collection, capacity observation,
+preparation, and publication. Registration and placement reconciliation stay on the
+control owner. Native regressions stall both collection and upload while 2,000
+scheduling attempts remain responsive, reject a raced ownership generation, and
+verify cancellation/join. The HTTP harness drives ingestion directly without the
+production worker quantum or backoff. Synthetic groups are outside actual placement;
+these measurements do not establish hosted-shard capacity or production SLOs.
+
+Merged validation: 54 catalog/resolution/standby E2Es passed in 176.88 seconds;
+423 standby storage tests, the standby command suite, 79 CLI tests, 127 standalone
+tests, and both production DataServer simulations passed. The simulations cover
+public writes, failover, restart, split, and merge. Worker regressions and generated
+file checks passed. Hosted CI status is reported separately on the PR.
