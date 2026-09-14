@@ -120,6 +120,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_storage: ?@import("../common/table_storage.zig").Settings = null,
         owner: client.Owner,
         active_users: usize = 0,
+        /// Once another operation adopts a newly opened owner, a transient
+        /// warmup no longer owns its lifetime, even after that lease drains.
+        adopted: bool = false,
         /// Writer preference for structural reconciliation. Once an exclusive
         /// caller observes live readers, new observational/foreground readers
         /// must stop entering so the existing leases can drain.
@@ -145,6 +148,14 @@ pub const ProvisionedKernelOwnerSource = struct {
             lock(&self.source.mutex);
             self.entry.retired = true;
             self.source.mutex.unlock();
+        }
+
+        fn retireIfUnadopted(self: *Lease) void {
+            if (!self.created) return;
+            lock(&self.source.mutex);
+            defer self.source.mutex.unlock();
+            if (!self.entry.adopted and !self.entry.exclusive_pending and self.entry.active_users == 1)
+                self.entry.retired = true;
         }
 
         fn deinit(self: *Lease) void {
@@ -1060,12 +1071,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
     ) !void {
         var lease = try self.acquire(group_id, table_name);
-        lease.deinit();
-        // Preserve the existing warmup contract: validate that the physical
-        // root can be opened, but do not pin a writer before startup catch-up
-        // and structural reconciliation have run. The first actual read or
-        // write will install the long-lived owner.
-        try retireGroupForPublication(self, group_id, table_name);
+        defer lease.deinit();
+        // Warmup can overlap startup catch-up or foreground admission. Retire
+        // only the exact owner created here, while the lease still pins it,
+        // and only if nobody has adopted it. Never retire by group after
+        // releasing the lease: that can close another operation's owner.
+        lease.retireIfUnadopted();
     }
 
     /// Apply the latest catalog schema/index contract to the already-resident
@@ -1113,7 +1124,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             descriptor.path,
             descriptor.view(),
         );
-        const retire_after = lease.created and !retain_cold_owner;
+        defer lease.deinit();
         const result = lease.owner().reconcile(
             table_name,
             descriptor.schema_json,
@@ -1122,15 +1133,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             advance_index_repair,
         ) catch |err| {
             lease.retireAfterConfigurationFailure();
-            lease.deinit();
-            if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
             return err;
         };
-        lease.deinit();
-        // A concurrent foreground operation may have adopted this newly
-        // opened owner after reconciliation. In that case it is legitimately
-        // resident and retirement reports StorageBusy.
-        if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
+        if (!retain_cold_owner) lease.retireIfUnadopted();
         return result;
     }
 
@@ -1214,10 +1219,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             descriptor.path,
             descriptor.view(),
         );
-        const retire_after = lease.created;
-        var lease_active = true;
-        errdefer if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
-        defer if (lease_active) lease.deinit();
+        defer lease.deinit();
+        errdefer lease.retireIfUnadopted();
 
         const result = lease.owner().reconcile(
             table_name,
@@ -1266,15 +1269,13 @@ pub const ProvisionedKernelOwnerSource = struct {
             // publish the exact generation proof once the writer guard drains.
             true;
 
-        lease.deinit();
-        lease_active = false;
         // A transient startup inspection normally gives the cold owner back
         // immediately. Managed enrichment and index catch-up are different:
         // their retry scheduler lives inside that owner, so retiring it here
         // strands durable work until an unrelated foreground request happens
         // to reopen the group. Keep only owners with observed background debt;
         // idle groups preserve the bounded transient-open contract.
-        if (retire_after and !retain_for_background_work) retireGroupForPublication(self, group_id, table_name) catch {};
+        if (!retain_for_background_work) lease.retireIfUnadopted();
         return .{
             .result = localStructuralReconcileResult(result),
             .runtime_status = observed,
@@ -1944,6 +1945,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             }
             if (!tryReserveEntryLeaseLocked(entry, false))
                 return error.StorageReadTemporarilyUnavailable;
+            entry.adopted = true;
             _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
             return .{ .source = self, .entry = entry, .created = false, .exclusive = false };
         }
@@ -2081,6 +2083,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 break;
             }
             if (!tryReserveEntryLeaseLocked(entry, exclusive)) return error.StorageKernelOwnerTransitionRequired;
+            entry.adopted = true;
             _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
             return .{ .source = self, .entry = entry, .created = false, .exclusive = exclusive };
         }
@@ -3472,37 +3475,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
 
-        const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, group_ids.len);
-        var initialized: usize = 0;
+        var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
         errdefer {
-            for (items[0..initialized]) |*item| item.deinit(alloc);
-            alloc.free(items);
+            for (items.items) |*item| item.deinit(alloc);
+            items.deinit(alloc);
         }
         for (group_ids) |group_id| {
-            // Runtime status is observational. The control plane owns the
-            // durable published status cache; never map a cold physical owner
-            // merely to synthesize a fresh-looking zero-value placeholder.
-            var lease = (try self.acquireIfPresent(group_id, table_name)) orelse {
-                for (items[0..initialized]) |*item| item.deinit(alloc);
-                alloc.free(items);
-                return null;
-            };
-            defer lease.deinit();
-            var response = try lease.owner().runtimeStatusJson(table_name);
-            defer response.deinit();
-            var parsed = try std.json.parseFromSlice(
-                runtime_status.LocalTableRuntimeStatus,
-                alloc,
-                response.bytes(),
-                .{},
-            );
-            defer parsed.deinit();
-            items[initialized] = try parsed.value.clone(alloc);
-            items[initialized].group_id = group_id;
-            items[initialized].metadata.lsm_root_generation = lease.entry.generation;
-            initialized += 1;
+            // Each group is an independent best-effort observation. One cold
+            // or busy owner must not discard facts sampled from its siblings.
+            var status = (localRuntimeStatusGroupLocal(self, alloc, group_id, table_name) catch |err| switch (err) {
+                error.StorageBusy, error.StorageReadTemporarilyUnavailable => continue,
+                else => return err,
+            }) orelse continue;
+            errdefer status.deinit(alloc);
+            try items.append(alloc, status);
         }
-        return .{ .items = items };
+        if (items.items.len == 0) {
+            items.deinit(alloc);
+            return null;
+        }
+        return .{ .items = try items.toOwnedSlice(alloc) };
     }
 
     fn localRuntimeStatusGroupLocal(

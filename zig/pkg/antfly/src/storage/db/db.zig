@@ -54872,7 +54872,7 @@ fn applyDerivedBatchToIndexContextProfiled(
             const plan_base = write_start;
             var publication_plan = try ctx.index_manager.planTextMapperDocsPublication(
                 index_ref.name,
-                publication_context,
+                &publication_context,
                 collected.docs.items[plan_base..],
                 reservation_limit,
             );

@@ -4,6 +4,110 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-13: overlapping storage owner E2E failures (#626, #722)
+
+[PR #626's Antfly E2E job](https://github.com/antflydb/antfly/actions/runs/34781521711/job/103794277696)
+ran merge revision `62181d9cbae16aa1599c7e4c9202fcabf9aa0dbc` and reported
+**two failures, 444 passes, five skips** on Linux with Python 3.12.3:
+
+- `test_artifact_coverage_terminal_outcomes_by_policy_after_restart` lost the
+  partial-policy index's runtime observation after restart: zero reported
+  groups, one missing group, `runtime_unavailable`, and `missing_group`. This
+  matches the signature in both #722 CI attempts and the retained native
+  reproduction described in [the E2E investigation](e2e/FLAKES.md).
+- `test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query`
+  failed its batch request with HTTP 500 `RuntimeBoundaryFailure`. The server
+  first logged `IndexNotFound` in the `full_text_index_v0` derived worker at
+  journal sequence 1, then an untransportable `StorageKernelFailure` from
+  `commit_batch_with_cancellation`. This is an additional failure, distinct
+  from #722's query callback returning an untransportable `StorageBusy`.
+
+The #626 log is retained at `/tmp/pr626-job103794277696.log`. Repeated
+`EmptyTargetedIndexObservation` messages precede the batch failure. They are
+evidence to investigate, not proof that reconciliation caused it. The restart
+signature's recurrence on another branch does not by itself establish its
+introducing commit. The deterministic follow-up investigation is recorded
+below on `codex/maintenance-e2e-fixes`.
+
+The additional batch case belongs in the existing regression loop alongside
+the three #722 cases; preserve the failing process roots and test the containing
+`test_index_lifecycle.py` module as well, because CI shares that process between
+tests. Do not retry committed writes or relax coverage/deadline assertions to
+hide these failures.
+
+The unchanged merged executable passed **100/100** isolated repetitions of the
+additional packed-ingest case (four workers, 25 repetitions). Evidence is
+`/tmp/pr626-local-packed-100.log`; this does not reproduce the shared-module
+history or prove the worker is race-free.
+
+The follow-up has established these defects with deterministic negative controls:
+
+1. Warmup retired a resident owner installed by another operation. The linked
+   owner regression expected one owner after delayed warmup and found zero.
+   Transient cleanup now retires only the exact, still-leased owner it created,
+   and preserves owners adopted by another operation. The same rule closes
+   the release-then-retire race in transient reconciliation.
+2. Compiled structural reconciliation returned its mutation result without
+   appending an observation to the control-plane publication batch. An unchanged
+   empty dense index reproduced eight `EmptyTargetedIndexObservation` retries
+   and failed the existing five-second bound. Reconciliation now samples status
+   under its exclusive owner lease and passes it through the existing root,
+   catalog, and targeted-activation fences. A busy observation retains the group
+   for another bounded quantum; it cannot acknowledge completion without facts.
+3. Text publication planning reported an ordinary same-instance projection
+   revision change as `IndexNotFound`. The regression changes an empty index's
+   schema between capture and planning and failed at that exact check. Both
+   JSON and parsed-document planning now refresh the context while holding the
+   analysis lease used to construct the plan. Admission still revalidates it;
+   delete/recreate replacement remains rejected. This explains a path from a
+   legitimate schema refresh to a terminal derived-worker failure without
+   treating every `IndexNotFound` as retryable.
+
+`git blame` traces the warmup and compiled-reconciliation defects to
+`332817c668f` ([#536](https://github.com/antflydb/antfly/pull/536)), and the
+projection revision check to `aefe3bad405`
+([#502](https://github.com/antflydb/antfly/pull/502)). Both are ancestors of
+`c1a39a3aeb65e62d9e4494c5b785a028e4520c5d`, #722's unchanged base, so these
+demonstrated defects predate #722 even though its base soak did not expose them.
+
+Status collection also preserves independent sibling observations when another
+group is cold or busy, probes only the requested group's owner, and retains
+refresh debt when that probe is busy. `StorageBusy` and `StorageKernelFailure`
+retain their semantic identities across the callback ABI; public query
+contention is HTTP 503 rather than HTTP 500. Mutation retry semantics are
+unchanged.
+
+Negative-control logs: `/tmp/maintenance-owner-before.log`,
+`/tmp/maintenance-owner-activation-before.log`, and
+`/tmp/maintenance-text-before.log`. The warmup and activation fixes passed the
+linked owner suite with no leaks. A fresh batch containing those two fixes
+passed **100/100 per scenario, 400/400 total**, with the four unchanged E2E
+tests and no retries or skips. Its executable SHA-256 is
+`988f3c8414a168f76a1ffc9a75b79d94c8fd091e1555b9d209e657718dfaa010`;
+output is `/tmp/maintenance-followup-e2e-100.log`. That executable predates the
+text-planning and observation/error-transport changes; final validation of the
+complete change set is recorded below. These deterministic defects and passing
+soaks do not establish the precise interleaving of every original CI failure.
+
+Final native Debug focused checks passed: the linked-owner suite (two tests),
+text publication (two substantive tests plus two import checks), public query
+availability (one table-driven test plus six import checks), the compiled
+busy-owner refresh-debt regression, and all 12 stable runtime error ABI tests.
+No leaks were reported. Temporary focused build steps used for the negative
+controls were removed; the regressions remain in their existing owner suites.
+The final binary SHA-256 is
+`de2c5f7e99bb3074ed3238ed7e64f9b230387e949af6b0559b551ce1d6503519`.
+All **54/54** tests in the three affected E2E modules passed using four pytest
+workers and two process slots, preserving CI's shared-module fixture history.
+Evidence: `/tmp/maintenance-complete-build-tests-final.log`,
+`/tmp/maintenance-data-observation-tests.log`,
+`/tmp/maintenance-error-abi-tests.log`, and `/tmp/maintenance-final-modules.log`.
+The fresh final-binary batch passed **100/100 per scenario, 400/400 total**,
+with four workers and no retries, failures, or skips. The log is
+`/tmp/maintenance-final-e2e-100.log`; per-scenario counts and the executable
+hash are recorded in `/tmp/maintenance-followup-validation.json`. These are
+native macOS arm64 Debug results; Linux CI validation remains pending.
+
 ## 2026-09-12: combined unit build/test budget terminates progressing DB-core (#716)
 
 [The Linux unit job](https://github.com/antflydb/antfly/actions/runs/34714680318/job/103609868433)
