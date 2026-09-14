@@ -37688,6 +37688,9 @@ pub const DB = struct {
         defer if (apply_held) self.core.unlockApplyShared();
         if (!self.beginPublishedDenseSearch()) return declineDenseSnapshot("catalog");
         defer self.endPublishedDenseSearch();
+        // Publication can close admission while this query waits for apply.
+        // Recheck under the same fence as the ordinary dense search path.
+        try self.enforcePortableRuntimeGate();
         if (ttlDurationNs(self) != 0) return declineDenseSnapshot("ttl");
         const entry = (try denseIndexCallback(self, req.index_name)) orelse return error.IndexNotFound;
         if (entry.chunk_name != null or entry.embedding_names.len != 0) return declineDenseSnapshot("result_shape");

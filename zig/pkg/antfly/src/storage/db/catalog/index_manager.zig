@@ -15167,9 +15167,9 @@ pub const IndexManager = struct {
     }
 
     fn denseVectorBlockPreferredEncoding() vector_block_store_mod.Encoding {
-        // Float16 is the compact candidate plane. Exact public reranking must
-        // complete against authoritative float32 values before publication.
-        const raw_z = getenv("ANTFLY_HBC_VECTOR_BLOCK_ENCODING") orelse return .float16;
+        // Match the qualified float32 source and exact-mapped serving path.
+        // Float16 remains an explicit experiment with exact residual reads.
+        const raw_z = getenv("ANTFLY_HBC_VECTOR_BLOCK_ENCODING") orelse return .float32;
         const raw = std.mem.span(raw_z);
         return if (std.ascii.eqlIgnoreCase(raw, "float16") or std.ascii.eqlIgnoreCase(raw, "f16"))
             .float16
@@ -44414,6 +44414,7 @@ test "DB query snapshot activates for public single-dense request envelopes" {
 }
 
 fn testPublicDenseSnapshot(native_only: bool) !void {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     if (IndexManager.denseVectorBlockPreferredEncoding() != .float32) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -44496,6 +44497,62 @@ fn testPublicDenseSnapshot(native_only: bool) !void {
         try std.testing.expect(bundle.source.read_txn == null);
         try std.testing.expectError(error.DenseSnapshotNeedsPrimary, bundle.source.getTxn(primary));
         try std.testing.expectError(error.DenseSnapshotNeedsPrimary, bundle.lookupDocKey(1));
+    }
+    // All public adapters checked admission before waiting for apply. A
+    // portable publication can close that gate during the wait, even though
+    // the previously published snapshot still appears complete and searchable.
+    const PendingQuery = struct {
+        db: *DB,
+        req: types.SearchRequest,
+        dense: types.DenseKnnQuery,
+        adapter: enum { profile, captured, dense_profile },
+        failure: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(ctx: *@This()) void {
+            defer ctx.done.store(true, .release);
+            ctx.search() catch |err| {
+                ctx.failure = err;
+            };
+        }
+
+        fn search(ctx: *@This()) !void {
+            switch (ctx.adapter) {
+                .profile => {
+                    var result = try ctx.db.searchWithDenseProfile(std.testing.allocator, ctx.req);
+                    defer result.result.deinit();
+                },
+                .captured => {
+                    var result = try ctx.db.searchWithCapturedRequest(std.testing.allocator, ctx.req);
+                    defer result.result.deinit();
+                },
+                .dense_profile => {
+                    var result = try ctx.db.searchDenseProfiledWithCapturedRequest(std.testing.allocator, .{ .index_name = "dense_idx", .include_stored = false, .limit = 1 }, ctx.dense);
+                    defer result.profiled.result.deinit();
+                },
+            }
+        }
+    };
+    inline for (.{ .profile, .captured, .dense_profile }) |adapter| {
+        var query: PendingQuery = .{ .db = &db, .req = req, .dense = dense, .adapter = adapter };
+        db.core.lockApply();
+        const thread = std.Thread.spawn(.{}, PendingQuery.run, .{&query}) catch |err| {
+            db.core.unlockApply();
+            return err;
+        };
+        const deadline = platform_time.monotonicNs() +| 10 * std.time.ns_per_s;
+        while (db.core.apply_mutex.shared_waiters.load(.acquire) == 0 and
+            !query.done.load(.acquire) and platform_time.monotonicNs() < deadline)
+        {
+            std.atomic.spinLoopHint();
+        }
+        const waited = db.core.apply_mutex.shared_waiters.load(.acquire) != 0;
+        db.async_context.portable_runtime_activation_pending.store(true, .release);
+        defer db.async_context.portable_runtime_activation_pending.store(false, .release);
+        db.core.unlockApply();
+        thread.join();
+        try std.testing.expect(waited);
+        try std.testing.expectEqual(@as(?anyerror, error.PortableRuntimeActivationPending), query.failure);
     }
     if (native_only) {
         // An incomplete native source must abandon the whole captured query

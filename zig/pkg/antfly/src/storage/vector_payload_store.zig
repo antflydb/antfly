@@ -1296,7 +1296,9 @@ pub const Store = struct {
 
     fn preferredEncoding() vector_block.Encoding {
         const raw = if (@import("builtin").link_libc) std.c.getenv("ANTFLY_HBC_VECTOR_BLOCK_ENCODING") else null;
-        const value = if (raw) |z| std.mem.span(z) else return .float16;
+        // Fresh stores use the qualified exact-mapped float32 path. Open
+        // continues to honor the encoding in an existing manifest.
+        const value = if (raw) |z| std.mem.span(z) else return .float32;
         return if (std.ascii.eqlIgnoreCase(value, "float16") or std.ascii.eqlIgnoreCase(value, "f16")) .float16 else .float32;
     }
 
@@ -3449,6 +3451,43 @@ test "source vector payloads recover both outcomes of an ambiguous primary commi
         defer alloc.free(retried);
         try std.testing.expectEqualSlices(u8, artifact, retried);
     }
+}
+
+test "source vector payloads fresh managed encoding preserves persisted float16 on reopen" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    {
+        var fresh = try Store.openManaged(alloc, null, memory.storage(), "/fresh-source", false);
+        defer fresh.deinit();
+        try std.testing.expectEqual(Store.preferredEncoding(), fresh.opened.payloadEncoding());
+        if (!@import("builtin").link_libc or std.c.getenv("ANTFLY_HBC_VECTOR_BLOCK_ENCODING") == null)
+            try std.testing.expectEqual(.float32, fresh.opened.payloadEncoding());
+    }
+    const key = try @import("internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, "doc:existing", "model");
+    defer alloc.free(key);
+    const vector = [_]f32{ 1.234567, -9.876543 };
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 17, &vector);
+    defer alloc.free(artifact);
+    var reference: payload.Reference = undefined;
+    {
+        var existing = try Store.openWithEncoding(alloc, memory.storage(), "/existing-source", false, .float16);
+        defer existing.deinit();
+        const session = try payload.Session.create(alloc, existing.interface());
+        defer session.release();
+        reference = try payload.Reference.decode(try session.put(key, artifact));
+        try session.prepareCommit();
+        session.committed = true;
+        try existing.checkpoint();
+    }
+    var reopened = try Store.openWithEncoding(alloc, memory.storage(), "/existing-source", false, .float32);
+    defer reopened.deinit();
+    try std.testing.expectEqual(.float16, reopened.opened.payloadEncoding());
+    const session = try payload.Session.create(alloc, reopened.interface());
+    defer session.release();
+    const resolved = try session.getAlloc(alloc, key, &reference.encode());
+    defer alloc.free(resolved);
+    try std.testing.expectEqualSlices(u8, artifact, resolved);
 }
 
 test "source vector payloads ANN references share bytes across WAL checkpoint and immutable leases" {

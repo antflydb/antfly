@@ -48,7 +48,7 @@ usage() {
   echo "  VDBBENCH_MIXED_SECONDS Concurrent query/update qualification duration (default: 0)" >&2
   echo "  VDBBENCH_PROFILE_DATASET Dataset directory for detailed profiling (default: inferred from case)" >&2
   echo "  VDBBENCH_VECTOR_BLOCKS Build/use the shared mmap exact-vector projection (default: 0)" >&2
-  echo "  VDBBENCH_VECTOR_BLOCK_ENCODING Exact projection encoding (default: float16)" >&2
+  echo "  VDBBENCH_VECTOR_BLOCK_ENCODING Exact projection encoding (default: float32)" >&2
   echo "  VDBBENCH_RESUME_AFTER_LIVE Restart/query an existing run root (default: 0)" >&2
   echo "  VDBBENCH_RESUME_CONCURRENT Run concurrent search after a warm resume (default: 0)" >&2
   echo "  VDBBENCH_LABEL_SUFFIX Required unique suffix for a resume run (for example: -budget-1024)" >&2
@@ -92,7 +92,7 @@ label_suffix=${VDBBENCH_LABEL_SUFFIX:-}
 dense_embeddings=${ANTFLY_VDBBENCH_DENSE_EMBEDDINGS:-}
 native_hbc=0
 vector_blocks=${VDBBENCH_VECTOR_BLOCKS:-0}
-vector_block_encoding=${VDBBENCH_VECTOR_BLOCK_ENCODING:-float16}
+vector_block_encoding=${VDBBENCH_VECTOR_BLOCK_ENCODING:-float32}
 diagnostic_profile_only=0
 load_only=0
 centroid_directory_mode=${VDBBENCH_HBC_CENTROID_DIRECTORY_MODE:-}

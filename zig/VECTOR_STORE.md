@@ -32,6 +32,7 @@ qualified implementation without benchmark environment setup:
 
 | Default behavior | Retained qualification override |
 | --- | --- |
+| Float32 source and ANN payload encoding for fresh stores | `ANTFLY_HBC_VECTOR_BLOCK_ENCODING=float16` selects the residual-backed experiment |
 | Direct ANN member bindings | `ANTFLY_SOURCE_VECTOR_MEMBER_BINDINGS=0` disables |
 | Exact mapped reads | `ANTFLY_EXPERIMENT_EXACT_MAPPED=0` disables |
 | Reduction-based query packing | `ANTFLY_EXPERIMENT_QUERY_PACKING=lanes` restores the prior path |
@@ -39,6 +40,12 @@ qualified implementation without benchmark environment setup:
 | Batched source reads and positional batches | `ANTFLY_SOURCE_VECTOR_BATCH_READS=0`, `ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS=0` disable |
 | Shared immutable source catalogs | `ANTFLY_SOURCE_VECTOR_SHARED_CATALOG=0` disables |
 | Replay-aware matrix loads | `ANTFLY_SOURCE_VECTOR_REPLAY_READS=0` disables |
+
+Existing source stores retain their persisted encoding, including float16;
+opening a source store does not migrate its encoding. Derived ANN serving
+projections retain the existing preferred-encoding rebuild policy. The
+qualification runner also defaults to float32, matching the completed ABBA arms
+and ordinary fresh-table launches.
 
 These read settings apply wherever their existing capability checks permit,
 including applicable LSM-serving paths; the ownership comparisons used the same
@@ -63,6 +70,18 @@ full-text preservation and explicit-LSM backup/restore. Supported restore reques
 explicitly retain primary ownership rather than applying fresh-table policy.
 OpenAPI/generated-doc checks pass. These are correctness checks for promotion;
 the performance evidence remains the completed ABBA comparison above.
+
+The PR-review follow-up aligns fresh-store encoding with that float32
+qualification and closes an admission race in the optional query-snapshot path.
+A query now rechecks portable runtime activation after acquiring apply-shared
+and the catalog lease, so publication cannot leave a queued query searching a
+runtime whose activation is pending. The regression closes admission while each
+of three public query adapters waits for apply, in both snapshot modes.
+[Review-fix validation](../.benchmark-results/vector-store-pr-review-fixes-20260914/README.md)
+passed that regression, 68 source tests, 43 native tests (two skipped), seven
+owner tests, 13 benchmark-tool tests, and 11 API checks with vector/HBC overrides
+cleared. A separate float16 override/reopen check also passed. No new throughput
+measurement is claimed.
 
 ## Existing-table migration plan (not yet implemented)
 
