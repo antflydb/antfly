@@ -70157,6 +70157,10 @@ test "relational columnar maintenance survives unrelated artifact corruption and
 
 test "relational columnar maintenance advances past hot ranges across restart" {
     const alloc = std.testing.allocator;
+    // Durable deferred-range ages must use one clock across setup, restart,
+    // and admission; switching from realtime after setup can strand timers.
+    relational_columns.test_now_ns = 100 * std.time.ns_per_s;
+    defer relational_columns.test_now_ns = null;
     // Assert scheduler fairness against fixed 256-row ranges, independently
     // of debug-build speed and the production wall-clock quantum.
     relational_columns.test_disable_deadline = true;
@@ -70204,8 +70208,6 @@ test "relational columnar maintenance advances past hot ranges across restart" {
     try std.testing.expectEqual(@as(u64, 2), stats.blocks_read);
     // Remove the hot writer. Adaptive maintenance waits for the durable age cap.
     relational_columns.test_before_publish = null;
-    relational_columns.test_now_ns = 100 * std.time.ns_per_s;
-    defer relational_columns.test_now_ns = null;
     try std.testing.expect(try db.runRelationalColumnMaintenancePass() > 0);
     relational_columns.test_now_ns = 111 * std.time.ns_per_s;
     _ = try db.runRelationalColumnMaintenancePass();
