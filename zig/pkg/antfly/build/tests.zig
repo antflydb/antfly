@@ -201,6 +201,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_store_step = b.step("antfly-system-catalog-store-test", "Run catalog report persistence, snapshot, drain, and migration regressions");
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
+    const schema_progress_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[6],
+        .filters = &.{ "system catalog schema progress", "runtime schema progress", "schema progress runtime coverage" },
+    });
+    b.step("antfly-system-catalog-progress-test", "Run schema migration readiness, acknowledged deltas, and opt-in collector workload").dependOn(&b.addRunArtifact(schema_progress_tests).step);
     const report_bench_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{"store report workload benchmark"},

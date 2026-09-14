@@ -1217,6 +1217,15 @@ pub const RuntimeIndexSourceReplayStatusReport = struct {
     failed: bool = false,
 };
 
+pub const max_schema_progress_batch = 64;
+pub fn validateSchemaProgressBatch(records: []const SchemaProgressRecord) !void {
+    if (records.len == 0 or records.len > max_schema_progress_batch) return error.InvalidSchemaProgressRequest;
+    for (records, 0..) |record, i| {
+        if (record.table_id == 0 or record.node_id == 0 or record.node_id != records[0].node_id) return error.InvalidSchemaProgressRequest;
+        for (records[0..i]) |prior| if (prior.table_id == record.table_id) return error.InvalidSchemaProgressRequest;
+    }
+}
+
 pub const SchemaProgressRecord = struct {
     table_id: u64,
     node_id: u64,

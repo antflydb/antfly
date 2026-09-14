@@ -169,6 +169,7 @@ pub const AdminSource = struct {
 
         report_store_update: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, bytes: []const u8) anyerror!store_report_update.Cursor = null,
         report_store_status: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) anyerror!void = null,
+        upsert_schema_progress_batch: ?*const fn (ptr: *anyopaque, context: operation.RequestContext, records: []const metadata_table_manager.SchemaProgressRecord) anyerror!void = null,
         upsert_schema_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) anyerror!void = null,
         upsert_restore_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.RestoreProgressRecord) anyerror!void = null,
         remove_restore_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, identity: metadata_table_manager.RestoreProgressIdentity) anyerror!void = null,
@@ -559,6 +560,7 @@ pub const AdminSource = struct {
                 .upsert_store = metadataServiceUpsertStore,
                 .report_store_status = metadataServiceReportStoreStatus,
                 .upsert_schema_progress = metadataServiceUpsertSchemaProgress,
+                .upsert_schema_progress_batch = metadataServiceUpsertSchemaProgressBatch,
                 .upsert_restore_progress = metadataServiceUpsertRestoreProgress,
                 .remove_restore_progress = metadataServiceRemoveRestoreProgress,
                 .sync_restore_progress = metadataServiceSyncRestoreProgress,
@@ -627,6 +629,7 @@ pub const AdminSource = struct {
 
                 .report_store_update = metadataHttpServiceReportStoreUpdate,
                 .upsert_schema_progress = metadataHttpServiceUpsertSchemaProgress,
+                .upsert_schema_progress_batch = metadataHttpServiceUpsertSchemaProgressBatch,
                 .upsert_restore_progress = metadataHttpServiceUpsertRestoreProgress,
                 .remove_restore_progress = metadataHttpServiceRemoveRestoreProgress,
                 .sync_restore_progress = metadataHttpServiceSyncRestoreProgress,
@@ -1013,6 +1016,11 @@ pub const AdminSource = struct {
         defer freeStoreStatusReport(alloc, report);
         try svc.reportStoreStatus(report);
         try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceUpsertSchemaProgressBatch(ptr: *anyopaque, context: operation.RequestContext, records: []const metadata_table_manager.SchemaProgressRecord) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.upsertSchemaProgressBatch(context, records);
     }
 
     fn metadataServiceUpsertSchemaProgress(ptr: *anyopaque, _: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) !void {
@@ -1473,6 +1481,11 @@ pub const AdminSource = struct {
         try flushMetadataHttpServiceMutation(svc);
     }
 
+    fn metadataHttpServiceUpsertSchemaProgressBatch(ptr: *anyopaque, context: operation.RequestContext, records: []const metadata_table_manager.SchemaProgressRecord) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.upsertSchemaProgressBatch(context, records);
+    }
+
     fn metadataHttpServiceUpsertSchemaProgress(ptr: *anyopaque, _: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         try svc.upsertSchemaProgress(record);
@@ -1738,6 +1751,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_catalog_group_retirement_check, httpx.Handler.bind(self, metadataCatalogGroupRetirementCheck));
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
+        try server.postWithBodyLimit(routes.Routes.internal_schema_progress_batch, 16384, httpx.Handler.bind(self, metadataUpsertSchemaProgressBatch));
         try server.post(routes.Routes.internal_schema_progress, httpx.Handler.bind(self, metadataUpsertSchemaProgress));
         try server.post(routes.Routes.internal_restore_progress, httpx.Handler.bind(self, metadataUpsertRestoreProgress));
         try server.postWithBodyLimit(
@@ -2516,6 +2530,18 @@ pub const MetadataHttpServer = struct {
         self.mutationOperations().triggerReallocate(requestContext(ctx)) catch |err|
             return metadataMutationError(ctx, err);
         return ctx.status(202).text("accepted");
+    }
+
+    fn metadataUpsertSchemaProgressBatch(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse "";
+        if (body.len > 16384) return ctx.status(413).text("schema progress batch too large");
+        var parsed = std.json.parseFromSlice([]const metadata_table_manager.SchemaProgressRecord, ctx.allocator, body, .{}) catch
+            return ctx.status(400).text("invalid schema progress batch");
+        defer parsed.deinit();
+        metadata_table_manager.validateSchemaProgressBatch(parsed.value) catch return ctx.status(400).text("invalid schema progress batch");
+        const apply = self.source.vtable.upsert_schema_progress_batch orelse return ctx.status(405).text("unsupported");
+        apply(self.source.ptr, requestContext(ctx), parsed.value) catch |err| return metadataMutationError(ctx, err);
+        return ctx.status(200).text("applied");
     }
 
     fn metadataUpsertSchemaProgress(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {

@@ -5436,6 +5436,14 @@ pub const MetadataService = struct {
         return error.MetadataMutationApplyTimeout;
     }
 
+    pub fn upsertSchemaProgressBatch(self: *MetadataService, context: api_operation.RequestContext, records: []const metadata_table_manager.SchemaProgressRecord) !void {
+        try metadata_table_manager.validateSchemaProgressBatch(records);
+        const readiness = try self.ensureTableTopologyProtocolReadyWithContext(context, metadata_topology_protocol.schema_progress_batch_version);
+        try self.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+        const receipt = try self.proposeTransitionCommandWithReceipt(.{ .upsert_schema_progress_batch = records });
+        try self.waitForTransitionAppliedWithContext(receipt, context);
+    }
+
     pub fn upsertSchemaProgress(self: *MetadataService, record: metadata_table_manager.SchemaProgressRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_schema_progress = record });
     }
@@ -8360,6 +8368,14 @@ pub const MetadataHttpService = struct {
         return error.MetadataMutationApplyTimeout;
     }
 
+    pub fn upsertSchemaProgressBatch(self: *MetadataHttpService, context: api_operation.RequestContext, records: []const metadata_table_manager.SchemaProgressRecord) !void {
+        try metadata_table_manager.validateSchemaProgressBatch(records);
+        const readiness = try self.ensureTableTopologyProtocolReadyWithContext(context, metadata_topology_protocol.schema_progress_batch_version);
+        try self.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+        const receipt = try self.proposeTransitionCommandWithReceipt(.{ .upsert_schema_progress_batch = records });
+        try self.waitForTransitionAppliedWithContext(receipt, context);
+    }
+
     pub fn upsertSchemaProgress(self: *MetadataHttpService, record: metadata_table_manager.SchemaProgressRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_schema_progress = record });
     }
@@ -9857,6 +9873,7 @@ pub const MetadataHttpService = struct {
             snapshot.nodes = try store.listNodes(self.alloc, self.metadata_group_id);
             snapshot.placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, core.placement_intents);
             snapshot.shuffle_join_leases = try cloneProjectedShuffleJoinLeasesOwned(self.alloc, core.shuffle_join_leases);
+            snapshot.schema_progresses = try self.alloc.dupe(metadata_table_manager.SchemaProgressRecord, core.schema_progresses);
             snapshot.restore_progresses = try cloneProjectedRestoreProgressesOwned(self.alloc, core.restore_progresses);
             snapshot.replication_source_statuses = try cloneProjectedReplicationSourceStatusesOwned(self.alloc, core.replication_source_statuses);
             snapshot.split_transitions = try cloneProjectedSplitTransitionsOwned(self.alloc, core.split_transitions);

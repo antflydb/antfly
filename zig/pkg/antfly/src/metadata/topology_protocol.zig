@@ -27,6 +27,7 @@ const std = @import("std");
 /// Version 7 adds system catalog records and atomic catalog/table publication.
 /// Version 8 adds acknowledged sparse store reports.
 /// Version 9 adds durable membership-bound protocol activation.
+/// Version 10 adds resumable store inventories and atomic schema-progress batches.
 pub const current_version: u16 = 10;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
@@ -189,3 +190,6 @@ pub const Activation = struct {
 
 /// Resumable report generations and bounded retired-page collection.
 pub const store_report_baseline_version: u16 = 10;
+
+/// Atomic, bounded acknowledgements for local schema migration readiness.
+pub const schema_progress_batch_version: u16 = 10;

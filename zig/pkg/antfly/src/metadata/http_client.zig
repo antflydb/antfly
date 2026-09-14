@@ -719,11 +719,19 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn reportNodeHeartbeat(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !void {
+        return self.reportNodeHeartbeatWithBudget(base_uri, body, null);
+    }
+
+    pub fn reportNodeHeartbeatWithBudget(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8, budget: ?RequestBudget) !void {
         const route = try nodeStatusRouteForBody(self.alloc, body);
         defer self.alloc.free(route);
         const path = try std.fmt.allocPrint(self.alloc, "{s}/heartbeat", .{route});
         defer self.alloc.free(path);
-        try self.requestWithBody(base_uri, .POST, path, body, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch);
+        try self.requestWithBodyBudget(base_uri, .POST, path, body, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch, budget);
+    }
+
+    pub fn upsertSchemaProgressBatch(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8, budget: ?RequestBudget) !void {
+        try self.requestWithBodyBudget(base_uri, .POST, routes.Routes.internal_schema_progress_batch, body, error.InvalidSchemaProgressRequest, error.UnsupportedOperation, null, budget);
     }
 
     pub fn upsertSchemaProgress(

@@ -390,3 +390,39 @@ def test_report_baseline_fragments_large_group_and_batches_neighbors(catalog_clu
     assert len(visible["group_statuses"]) == 260
     assert len(visible["runtime_statuses"][0]["indexes"]) == 1200
     assert all(proc.poll() is None for proc in c.data_procs)
+
+
+def test_schema_progress_batches_validate_apply_and_replay(catalog_cluster):
+    c = catalog_cluster
+    path = "/internal/v1/schema-progress/batch"
+    records = [
+        {"table_id": 900000 + i, "node_id": 1000, "schema_version": 3}
+        for i in range(64)
+    ]
+    leader, response = post_report(c, path, records)
+    assert response.status_code == 200, response.text
+    for invalid in (
+        [],
+        records + [records[0]],
+        [records[0], records[0]],
+        [records[0], {**records[1], "node_id": 1001}],
+    ):
+        response = requests.post(
+            c.metadata_urls[leader] + path,
+            json=invalid,
+            headers=internal_service_headers(),
+            timeout=15,
+        )
+        assert response.status_code == 400, response.text
+    oversized = requests.post(
+        c.metadata_urls[leader] + path,
+        data=" " * 17000,
+        headers=internal_service_headers(),
+        timeout=15,
+    )
+    assert oversized.status_code == 413, oversized.text
+    _, replay = post_report(c, path, records)
+    assert replay.status_code == 200, replay.text
+    snapshot, _ = read_pages(c, leader, control=True, retry_admission=True)
+    observed = [r for r in snapshot["schema_progresses"] if r["node_id"] == 1000]
+    assert sorted(observed, key=lambda r: r["table_id"]) == records

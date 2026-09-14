@@ -189,6 +189,7 @@ pub const TransitionCommand = union(enum) {
     },
     apply_table_topology: TableTopologyMutation,
     upsert_schema_progress: metadata.SchemaProgressRecord,
+    upsert_schema_progress_batch: []const metadata.SchemaProgressRecord,
     remove_schema_progress: struct {
         table_id: u64,
         node_id: u64,
@@ -268,6 +269,7 @@ pub const TransitionCommand = union(enum) {
 
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
+            .upsert_schema_progress_batch => |records| alloc.free(records),
             .activate_topology_protocol, .apply_system_catalog, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
@@ -5932,7 +5934,7 @@ pub const RaftApplyStore = struct {
             .apply_table_topology => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.catalog_revision),
-            .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
+            .upsert_schema_progress_batch, .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
             .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
             .upsert_replication_source_status, .claim_replication_source_cutover, .complete_replication_source_retirement => metadataSnapshotProjectionBit(.replication_source_status),
             .complete_restore_range => metadataSnapshotProjectionBit(.range) |
@@ -6588,6 +6590,10 @@ pub const RaftApplyStore = struct {
             .apply_table_topology => |mutation| {
                 try self.applyTableTopologyMutationTxn(txn, group_id, mutation);
             },
+            .upsert_schema_progress_batch => |records| {
+                try metadata_table_manager.validateSchemaProgressBatch(records);
+                for (records) |record| try self.applyTransitionCommandTxn(txn, group_id, .{ .upsert_schema_progress = record });
+            },
             .upsert_schema_progress => |record| {
                 const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
                 defer if (table_name) |name| self.alloc.free(name);
@@ -6595,6 +6601,11 @@ pub const RaftApplyStore = struct {
                 const key = try schemaProgressKeyForGroup(&key_buf, group_id, record.table_id, record.node_id);
                 const value = try encodeSchemaProgressRecord(self.alloc, record);
                 defer self.alloc.free(value);
+                const previous = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (previous) |old| if (std.mem.eql(u8, old, value)) return;
                 try txn.put(key, value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
@@ -9130,6 +9141,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    upsert_schema_progress_batch = 59,
     activate_topology_protocol = 57,
     apply_system_catalog = 54,
     upsert_store_heartbeat = 55,
@@ -9341,6 +9353,12 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
                     }
                 },
             }
+        },
+        .upsert_schema_progress_batch => |records| {
+            try metadata_table_manager.validateSchemaProgressBatch(records);
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_schema_progress_batch));
+            try appendInt(alloc, &out, u16, @intCast(records.len));
+            for (records) |record| try appendSchemaProgressRecord(alloc, &out, record);
         },
         .upsert_schema_progress => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_schema_progress));
@@ -9721,6 +9739,15 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 } } };
             }
             return error.InvalidMetadataTransitionEncoding;
+        },
+        .upsert_schema_progress_batch => blk: {
+            const count = try readInt(encoded, &pos, u16);
+            if (count == 0 or count > metadata_table_manager.max_schema_progress_batch) return error.InvalidMetadataTransitionEncoding;
+            const records = try alloc.alloc(metadata.SchemaProgressRecord, count);
+            errdefer alloc.free(records);
+            for (records) |*record| record.* = try readSchemaProgressRecord(encoded, &pos);
+            try metadata_table_manager.validateSchemaProgressBatch(records);
+            break :blk .{ .upsert_schema_progress_batch = records };
         },
         .upsert_schema_progress => .{
             .upsert_schema_progress = try readSchemaProgressRecord(encoded, &pos),
@@ -20056,4 +20083,48 @@ test "system catalog baseline frames oversized groups across snapshot and batche
     const key = try address.key(a, 21, "fragment", 0);
     defer a.free(key);
     try std.testing.expectError(error.NotFound, txn.get(key));
+}
+
+test "system catalog schema progress batch is bounded atomic replayable and durable" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/schema-progress-batch", .{tmp.sub_path});
+    defer a.free(root);
+    const records = [_]metadata.SchemaProgressRecord{
+        .{ .table_id = 41, .node_id = 7, .schema_version = 3 },
+        .{ .table_id = 42, .node_id = 7, .schema_version = 2 },
+    };
+    try std.testing.expectError(error.InvalidSchemaProgressRequest, encodeTransitionCommand(a, .{ .upsert_schema_progress_batch = &.{} }));
+    try std.testing.expectError(error.InvalidSchemaProgressRequest, encodeTransitionCommand(a, .{ .upsert_schema_progress_batch = &.{ records[0], records[0] } }));
+    try std.testing.expectError(error.InvalidSchemaProgressRequest, encodeTransitionCommand(a, .{ .upsert_schema_progress_batch = &.{ records[0], .{ .table_id = 42, .node_id = 8 } } }));
+    const cmd = try encodeTransitionCommand(a, .{ .upsert_schema_progress_batch = &records });
+    defer a.free(cmd);
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        const Capture = struct {
+            signals: usize = 0,
+            fn onProjection(ptr: *anyopaque, signal: ProjectionSignal) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (signal.kind == .schema_progress) self.signals += 1;
+            }
+        };
+        var capture: Capture = .{};
+        try store.addProjectionListener(.{ .ptr = &capture, .vtable = &.{ .on_projection_signal = Capture.onProjection } });
+        for (1..3) |index| {
+            const entries = try raft_state_machine.encodeCommittedEntries(a, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = cmd }});
+            defer a.free(entries);
+            try store.snapshotBuilder().applyBatch(.{ .group_id = 41, .commit_index = index, .entries_bytes = entries });
+            const progress = try store.listSchemaProgress(a, 41);
+            defer store.freeSchemaProgress(a, progress);
+            try std.testing.expectEqualDeep(&records, progress);
+            try std.testing.expectEqual(@as(usize, 2), capture.signals);
+        }
+    }
+    var reopened = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer reopened.deinit();
+    const progress = try reopened.listSchemaProgress(a, 41);
+    defer reopened.freeSchemaProgress(a, progress);
+    try std.testing.expectEqualDeep(&records, progress);
 }

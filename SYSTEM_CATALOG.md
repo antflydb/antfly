@@ -703,14 +703,40 @@ indexes local intents once rather than scanning every intent for every group.
 Control rounds skip collection while work is pending, leaving maintenance
 scheduling available during slow collection and uploads. A baseline worker quantum has a shared
 two-second transport deadline across discovery, requests, and retries, plus a
-32-request ceiling. Ordinary report and schema-progress requests retain their
-per-request deadlines and also observe worker cancellation. Shutdown cancels
+32-request ceiling. Cached heartbeats use the same reserved worker and a shared
+two-second deadline; the control thread only fills the bounded work slot. Ordinary
+report requests retain their per-request deadlines and observe worker cancellation.
+Schema-progress batches share a two-second transport budget per collection; the
+next acknowledged snapshot resumes the remaining records. Shutdown cancels
 transport and joins the worker before stopping its Raft/storage providers or
 releasing its owner. Ordinary payloads remain borrowed from the pinned generation; exceptional
 large groups retain immutable frame bytes. Transport failures resume from replicated
 progress, including after leader changes or lost responses. A rejected header/cursor
 fence discards the generation and schedules fresh collection. Unsupported requests
-retain the plan and retry after a bounded pause.
+retain the plan and retry after a bounded pause. Permanent size or validation
+rejections release the pinned plan and prepared inventory, clear the diff cursor,
+and back off for 30 seconds before a fresh collection. The control owner sees a
+retryable `StoreReportInventoryRejected` signal; the worker logs the original
+cause. A subsequently reduced inventory can recover without restarting the node.
+
+Retained-runtime heartbeats compare only structural group rows. Each acknowledged
+runtime leaf owns an immutable arena shared by reference between the acknowledged
+and prepared structural rows. Abandonment releases the prepared reference; commit
+releases the old structural row. Runtime-only groups remain retained. A heartbeat
+that adds or removes structural groups fails its base fence and requires fresh
+collection. Ordinary full observations still compare and replace runtime leaves.
+
+Schema migration readiness builds table, range, and local-runtime indexes once per
+observation, then evaluates every hosted range. Missing or non-authoritative
+runtime observations still withhold readiness. Ready records are compared against
+the captured replicated schema-progress records: equal versions generate no
+request, and missing acknowledgements after failed delivery or restore are resent.
+`POST /internal/v1/schema-progress/batch` accepts 1–64 distinct table records for
+one node, with a 16 KiB body limit. Protocol 10 command 59 applies the batch in one
+storage transaction and the endpoint acknowledges only after apply. Exact record
+replay skips writes and projection notifications. The existing single-record
+command remains decodable; new reporters use the bounded batch endpoint.
+
 
 HTTP admission computes each chunk's canonical digest once and reuses it for replay
 checks, the binary command, and the application receipt. Command 58 carries admitted
