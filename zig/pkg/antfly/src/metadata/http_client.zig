@@ -669,11 +669,15 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn reportNodeStatusWithReferenceSupport(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !bool {
+        return self.reportNodeStatusWithReferenceSupportAndBudget(base_uri, body, null);
+    }
+
+    pub fn reportNodeStatusWithReferenceSupportAndBudget(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8, budget: ?RequestBudget) !bool {
         const route = try nodeStatusRouteForBody(self.alloc, body);
         defer self.alloc.free(route);
         const uri = try join(self.alloc, base_uri, route);
         defer self.alloc.free(uri);
-        var resp = try self.executeWithRetry(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms });
+        var resp = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms }, budget);
         defer resp.deinit(self.alloc);
         try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnknownStore, null);
         return responseHasHeaderValueAnyStatus(resp, metadata_table_manager.store_runtime_reference_header, "1");
@@ -697,11 +701,15 @@ pub const MetadataHttpClient = struct {
         return parsed.value;
     }
     pub fn reportNodeUpdate(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8) !store_report_update.Cursor {
+        return self.reportNodeUpdateWithBudget(base_uri, store_id, body, null);
+    }
+
+    pub fn reportNodeUpdateWithBudget(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8, budget: ?RequestBudget) !store_report_update.Cursor {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/nodes/{d}/status/update", .{store_id});
         defer self.alloc.free(path);
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
-        var resp = try self.executeWithRetry(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms });
+        var resp = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms }, budget);
         defer resp.deinit(self.alloc);
         if (resp.status == 405) return error.UnsupportedOperation;
         try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch);
@@ -724,6 +732,10 @@ pub const MetadataHttpClient = struct {
         body: []const u8,
     ) !void {
         try self.requestWithBody(base_uri, .POST, routes.Routes.internal_schema_progress, body, error.InvalidSchemaProgressRequest, null, null);
+    }
+
+    pub fn upsertSchemaProgressWithBudget(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8, budget: ?RequestBudget) !void {
+        try self.requestWithBodyBudget(base_uri, .POST, routes.Routes.internal_schema_progress, body, error.InvalidSchemaProgressRequest, null, null, budget);
     }
 
     pub fn upsertRestoreProgress(
@@ -1541,16 +1553,30 @@ pub const MetadataHttpClient = struct {
         not_found_err: ?anyerror,
         conflict_err: ?anyerror,
     ) !void {
+        return self.requestWithBodyBudget(base_uri, method, path, body, bad_request_err, not_found_err, conflict_err, null);
+    }
+
+    fn requestWithBodyBudget(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        method: http_common.Method,
+        path: []const u8,
+        body: []const u8,
+        bad_request_err: ?anyerror,
+        not_found_err: ?anyerror,
+        conflict_err: ?anyerror,
+        budget: ?RequestBudget,
+    ) !void {
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executeWithRetry(.{
+        var resp = try self.executeWithRetryBudget(.{
             .method = method,
             .uri = uri,
             .body = body,
             .content_type = "application/json",
             .timeout_ms = default_request_timeout_ms,
-        });
+        }, budget);
         defer resp.deinit(self.alloc);
         try mapResponseStatus(resp, bad_request_err, not_found_err, conflict_err);
     }

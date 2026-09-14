@@ -434,6 +434,9 @@ logical chunks, fragment counts, actual HTTP requests and rejected discovery att
 The default is batched. For index-heavy tenants, use `--groups 8
 --indexes-per-group 1200`; each group then needs multiple durable frames. This measures
 large-group transport and activation independently of actual shard placement.
+The harness drives the protocol directly; it does not impose the production
+worker's two-second quantum or retry backoff. Delivery comparisons therefore
+measure metadata ingestion, not end-to-end production worker recovery time.
 
 The production sender has a separate regression scenario, `system catalog baseline
 worker keeps control scheduling live and cancels transport on shutdown` in the data
@@ -441,3 +444,23 @@ runtime test target. It stalls the real worker's HTTP executor, runs 2,000 full/
 scheduling attempts without recollection or another HTTP request, verifies an unrelated
 maintenance job completes, and checks transport cancellation and worker release. This
 is a controlled scheduling regression, not a claim about hosted-group throughput.
+
+`system catalog initial report collection is isolated fenced and cancellable`
+also stalls the capacity collector before any update exists. It checks 2,000
+scheduling calls, rejection after a concurrent ownership change, a subsequent
+successful publication, and cancellation during a new first collection.
+
+The placement-annotation regression has an opt-in component benchmark. Compile
+once, wait for competing builds to finish, then run the cached target:
+
+```sh
+zig build antfly-data-runtime-test -- 'system catalog placement annotation'
+env ANTFLY_CATALOG_REPORT_BENCH=1 zig build antfly-data-runtime-test -- 'system catalog placement annotation'
+```
+
+It compares the former nested scan with production indexed annotation using
+10,000 groups and 20,001 intents, including unrelated stores and duplicate local
+intents. Both implementations must produce identical results. The timed indexed
+path includes building and freeing its map; setup and equality checks are outside
+the interval. One warmup precedes five samples. This isolates annotation CPU cost
+and excludes collection I/O, network, and hosted Raft processing.

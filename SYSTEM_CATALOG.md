@@ -692,12 +692,21 @@ Admission stays inside the storage owner, including compiled storage, returning 
 the required runtime-status protocol version. The final fragment command contains
 only that fragment; it does not retransmit the assembled group.
 
-The publisher pins the prepared generation in an independently reserved reporting
-worker. Control rounds skip inventory collection while it is pending, leaving
-maintenance scheduling available during slow uploads. A worker quantum has a shared
+The control owner performs registration and Raft placement reconciliation, then
+transfers an owned metadata snapshot and a local ownership-generation fence to an
+independently reserved reporting worker. The worker collects group/index facts,
+observes capacity, prepares the update, and publishes it. A changed ownership
+generation rejects the observation before publication. The idle/capturing/ready
+handoff permits one collection or pinned generation at a time; concurrent dirty
+notifications survive collection for a subsequent report. Placement annotation
+indexes local intents once rather than scanning every intent for every group.
+Control rounds skip collection while work is pending, leaving maintenance
+scheduling available during slow collection and uploads. A baseline worker quantum has a shared
 two-second transport deadline across discovery, requests, and retries, plus a
-32-request ceiling. Shutdown cancels transport and joins the worker before releasing
-its owner. Ordinary payloads remain borrowed from the pinned generation; exceptional
+32-request ceiling. Ordinary report and schema-progress requests retain their
+per-request deadlines and also observe worker cancellation. Shutdown cancels
+transport and joins the worker before stopping its Raft/storage providers or
+releasing its owner. Ordinary payloads remain borrowed from the pinned generation; exceptional
 large groups retain immutable frame bytes. Transport failures resume from replicated
 progress, including after leader changes or lost responses. A rejected header/cursor
 fence discards the generation and schedules fresh collection. Unsupported requests
