@@ -65,8 +65,12 @@ Default runtime paths live under `/antflydb/standby/` (`primary.wal`, `slots`,
 `standby-generations/`). Clusters created before 0.3 have the same files under
 `/antflydb/ha/` with `standby.wal` and `standby-progress.wal`. The operator
 records which layout it renders in `status.haStatus.dataLayout` (`ha` or
-`standby`) and never moves it back. New clusters start on `standby`. An
-existing cluster stays on `ha` until the operator's admin client has
+`standby`) and never moves it back; the pod template's
+`antfly.io/hot-standby-data-layout` annotation carries the same value and is
+what the operator trusts if a status write was lost. New clusters start on
+`standby`; a cluster counts as new only when it has neither a StatefulSet nor
+a surviving volume claim. An existing cluster, or a surviving volume, stays on
+`ha` until the operator's admin client has
 negotiated the 0.3 `/admin/v1/standby` paths with one of its nodes, which
 proves the nodes run a server that can migrate; the operator then flips the
 status, emits a `HotStandbyLayoutStandby` event, and the next pod rollout

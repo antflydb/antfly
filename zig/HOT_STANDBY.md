@@ -941,13 +941,22 @@ only reads.
 
 The Kubernetes operator drives the switch. It records the layout it renders
 into pod arguments in `status.haStatus.dataLayout` (`ha` or `standby`) and
-never moves it back. A brand-new cluster (no hot-standby StatefulSet yet) gets
-`standby` immediately: there is nothing to migrate, and a 0.2 server simply
-creates the new tree. An existing cluster stays on `ha` until the operator's
-admin client has negotiated the canonical `/admin/v1/standby` path style with
-one of its nodes, which proves the nodes run a server that has the migration;
-it then flips the status, emits an event, and the next pod rollout carries the
-new paths, at which point each node migrates its own volume on start. Explicit
+never moves it back. Because a status write can fail after the StatefulSet was
+already updated, the rendered StatefulSet is the source of truth: the pod
+template carries the annotation `antfly.io/hot-standby-data-layout`, written
+in the same update as the arguments, and an undecided status is recovered
+from that annotation (or from `/antflydb/standby/` in the rendered arguments)
+before the operator would ever fall back to `ha`. A brand-new cluster gets
+`standby` immediately, where brand-new means no StatefulSet AND no surviving
+volume claim (a PVC named `<claim template>-<StatefulSet>-<ordinal>` carrying
+the cluster's `app.kubernetes.io/instance` label): a StatefulSet can be deleted
+and recreated while its volume, and the `ha/` tree on it, survive. An existing
+cluster, or a surviving volume, stays on `ha` until the operator's admin
+client has negotiated the canonical `/admin/v1/standby` path style with one of
+its nodes, which proves the nodes run a server that has the migration; it then
+flips the status, emits a `HotStandbyLayoutStandby` event, and the next pod
+rollout carries the new paths, at which point each node migrates its own
+volume on start. Explicit
 `spec.highAvailability.runtime.*Path` overrides are rendered as given and are
 never migrated by the operator. Server flags stay on the `--ha-*` spellings in
 generated arguments until the operator's minimum server is 0.3, because every

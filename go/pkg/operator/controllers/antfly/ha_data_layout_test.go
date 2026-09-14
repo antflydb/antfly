@@ -199,6 +199,117 @@ func TestDecideHADataLayoutExistingClusterUndecidedRendersLegacy(t *testing.T) {
 	g.Expect(args).To(ContainSubstring(`--ha-primary-log '/antflydb/ha/primary.wal'`))
 }
 
+// TestDecideHADataLayoutRecoversFromRenderedStatefulSetAfterLostStatusUpdate
+// covers the flip-flop gap: reconcileStandaloneStatefulSet renders and
+// applies the StatefulSet with the decided layout before updateStatus
+// persists status.haStatus.dataLayout. If that status update is lost to a
+// routine conflict, the next reconcile must not re-derive "ha" from an empty
+// status while a StatefulSet already exists — it must recover "standby" from
+// the StatefulSet it already rendered (via the haDataLayoutAnnotation pod
+// template annotation, or the rendered args as a fallback).
+func TestDecideHADataLayoutRecoversFromRenderedStatefulSetAfterLostStatusUpdate(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := newHADataLayoutTestCluster()
+	testClient := newHAControllerTestClient(t, s, cluster)
+	reconciler := &AntflyClusterReconciler{Client: testClient, Scheme: s}
+
+	// First reconcile: brand-new cluster (no StatefulSet, no PVC). Decides and
+	// renders standby.
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.DataLayout).To(Equal(antflyv1.HADataLayoutStandby))
+
+	sts := &appsv1.StatefulSet{}
+	g.Expect(testClient.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(haDataLayoutAnnotation, string(antflyv1.HADataLayoutStandby)))
+
+	// Simulate the status update meant to persist this decision being lost to
+	// a conflict: the in-memory object reverts to having no recorded layout,
+	// exactly like re-fetching the cluster on the next reconcile would.
+	cluster.Status.HAStatus = nil
+
+	layout, err := reconciler.decideHADataLayout(context.Background(), cluster, sts, true)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(layout).To(Equal(antflyv1.HADataLayoutStandby),
+		"the already-rendered StatefulSet must prove standby even though status was lost")
+	g.Expect(cluster.Status.HAStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.DataLayout).To(Equal(antflyv1.HADataLayoutStandby))
+}
+
+// TestDecideHADataLayoutSurvivingPVCWithoutStatefulSetStaysLegacy covers the
+// "no StatefulSet is not no data" gap: a StatefulSet can be deleted and
+// recreated while its PVC survives (default retention, restore, GitOps
+// drift), so the operator must not treat StatefulSet absence alone as proof
+// of a brand-new cluster when a PVC from its volumeClaimTemplate still
+// exists.
+func TestDecideHADataLayoutSurvivingPVCWithoutStatefulSetStaysLegacy(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := newHADataLayoutTestCluster()
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			// The StatefulSet-generated claim name pattern:
+			// "<volumeClaimTemplateName>-<statefulSetName>-<ordinal>".
+			Name:      standaloneStorageVolumeName(cluster) + "-" + standaloneStatefulSetName(cluster) + "-0",
+			Namespace: "default",
+			Labels:    map[string]string{"app.kubernetes.io/instance": cluster.Name},
+		},
+	}
+	recorder := events.NewFakeRecorder(4)
+	testClient := newHAControllerTestClient(t, s, cluster, pvc)
+	reconciler := &AntflyClusterReconciler{Client: testClient, Scheme: s, Recorder: recorder}
+
+	layout, err := reconciler.decideHADataLayout(context.Background(), cluster, nil, false)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(layout).To(Equal(antflyv1.HADataLayoutLegacy),
+		"a surviving PVC without a StatefulSet must be treated like an existing, undecided cluster")
+	if cluster.Status.HAStatus != nil {
+		g.Expect(cluster.Status.HAStatus.DataLayout).To(BeEmpty())
+	}
+	select {
+	case msg := <-recorder.Events:
+		t.Fatalf("unexpected event deciding legacy for surviving storage: %s", msg)
+	default:
+	}
+}
+
+// TestDecideHADataLayoutNoStatefulSetNoPVCDecidesStandby is the genuinely
+// brand-new case: neither the StatefulSet nor any of its PVCs exist, so
+// there is nothing to migrate and the operator may jump straight to standby.
+func TestDecideHADataLayoutNoStatefulSetNoPVCDecidesStandby(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := newHADataLayoutTestCluster()
+	recorder := events.NewFakeRecorder(4)
+	testClient := newHAControllerTestClient(t, s, cluster)
+	reconciler := &AntflyClusterReconciler{Client: testClient, Scheme: s, Recorder: recorder}
+
+	layout, err := reconciler.decideHADataLayout(context.Background(), cluster, nil, false)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(layout).To(Equal(antflyv1.HADataLayoutStandby))
+	g.Expect(cluster.Status.HAStatus).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.DataLayout).To(Equal(antflyv1.HADataLayoutStandby))
+
+	select {
+	case msg := <-recorder.Events:
+		g.Expect(msg).To(ContainSubstring(haDataLayoutStandbyEventReason))
+	default:
+		t.Fatal("expected a HotStandbyLayoutStandby event for the brand-new cluster decision")
+	}
+}
+
 func TestRecordHADataLayoutObservationFlipsOnceCanonicalPathStylePinned(t *testing.T) {
 	g := NewWithT(t)
 	t.Setenv(haAdminTokenDefaultEnvVar, "operator-token")

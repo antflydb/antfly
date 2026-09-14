@@ -15632,6 +15632,11 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 			}
 		}
 	}`, digest, strings.Repeat("b", 64), strings.Repeat("c", 64), strings.Repeat("d", 64), strings.Repeat("e", 64), strings.Repeat("f", 64))), observedStatus)).To(Succeed())
+	// This scenario models an existing cluster being promoted onto an
+	// already-provisioned target PVC, not a brand-new one, so pin the layout
+	// explicitly rather than relying on the first reconcile's brand-new-cluster
+	// inference (which observedStatus below otherwise discards).
+	observedStatus.DataLayout = antflyv1.HADataLayoutLegacy
 	cluster.Status.HAStatus = observedStatus
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
