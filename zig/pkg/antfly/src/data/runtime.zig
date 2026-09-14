@@ -3985,9 +3985,7 @@ pub const HAStandbyReplicationConfig = struct {
     executor: ?antfly.common.http.RequestExecutor = null,
 };
 
-/// A previously-live upstream/slot pair retired by `setHAStandbyUpstream`.
-/// Owned by `DataServer` and freed only at `deinit`; see
-/// `ha_standby_upstream_retired`.
+/// A server-owned upstream/slot pair retained until replication quiesces.
 const HAStandbyUpstreamRetired = struct {
     upstream_url: []u8,
     slot_name: []u8,
@@ -5070,11 +5068,10 @@ pub const DataServer = struct {
     ha_standby_replication_last_attempt_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_next_attempt_ns: std.atomic.Value(u64) = .init(0),
-    /// True once `setHAStandbyUpstream` has swapped `ha_cfg.standby_replication`
-    /// at least once. Distinguishes the initial caller-owned upstream/slot
-    /// strings (not ours to free) from later swaps' self-allocated
-    /// replacements (retired below and freed at `deinit`).
-    ha_standby_upstream_swapped: bool = false,
+    /// Owned independently of the active config: promotion clears that
+    /// config while a replication round can still be reading these strings.
+    /// The initial caller-owned pair is never stored here or freed by us.
+    ha_standby_upstream_owned: ?HAStandbyUpstreamRetired = null,
     /// Strings replaced by `setHAStandbyUpstream`. A replication round may
     /// still be holding an unlocked copy of the old config mid-fetch (see
     /// `runHAStandbyReplicationRound`), so a swap must never free the
@@ -6015,7 +6012,7 @@ pub const DataServer = struct {
 
     /// Repoints this standby's continuous-replication puller at a new
     /// upstream primary and slot, without a restart. This is the runtime
-    /// side of `antfly ha follow` / `POST /admin/v1/ha/standby/upstream`.
+    /// side of `antfly standby follow` / `POST /admin/v1/standby/upstream`.
     ///
     /// Must be called with `ha_state_mutex` already held by the caller
     /// (the HTTP admin dispatch loop holds it for the whole request; see
@@ -6023,7 +6020,6 @@ pub const DataServer = struct {
     /// reentrant, so this method must never try to lock it itself.
     pub fn setHAStandbyUpstream(
         self: *DataServer,
-        alloc: std.mem.Allocator,
         upstream_url: []const u8,
         slot_name: []const u8,
         expected: antfly.hot_standby.standby.Identity,
@@ -6052,10 +6048,10 @@ pub const DataServer = struct {
             return .{ .identity = current_identity, .previous = previous, .changed = false };
         }
 
-        const owned_upstream = try alloc.dupe(u8, upstream_url);
-        errdefer alloc.free(owned_upstream);
-        const owned_slot = try alloc.dupe(u8, slot_name);
-        errdefer alloc.free(owned_slot);
+        const owned_upstream = try self.alloc.dupe(u8, upstream_url);
+        errdefer self.alloc.free(owned_upstream);
+        const owned_slot = try self.alloc.dupe(u8, slot_name);
+        errdefer self.alloc.free(owned_slot);
 
         // The strings this swap replaces may still be in use by a
         // replication round that copied `cfg` before this swap took the
@@ -6064,13 +6060,13 @@ pub const DataServer = struct {
         // previously allocated ourselves; the very first pair belongs to
         // whoever configured continuous replication (standalone runtime
         // config, CLI flags, etc.) and is never ours to free.
-        if (self.ha_standby_upstream_swapped) {
-            try self.ha_standby_upstream_retired.append(self.alloc, .{
-                .upstream_url = @constCast(cfg.upstream_base_uri),
-                .slot_name = @constCast(cfg.slot_name),
-            });
+        if (self.ha_standby_upstream_owned) |owned| {
+            try self.ha_standby_upstream_retired.append(self.alloc, owned);
         }
-        self.ha_standby_upstream_swapped = true;
+        self.ha_standby_upstream_owned = .{
+            .upstream_url = owned_upstream,
+            .slot_name = owned_slot,
+        };
 
         self.ha_cfg.standby_replication.?.upstream_base_uri = owned_upstream;
         self.ha_cfg.standby_replication.?.slot_name = owned_slot;
@@ -6086,13 +6082,13 @@ pub const DataServer = struct {
 
     fn setHAStandbyUpstreamCallback(
         ptr: *anyopaque,
-        alloc: std.mem.Allocator,
+        _: std.mem.Allocator,
         upstream_url: []const u8,
         slot_name: []const u8,
         expected: antfly.hot_standby.standby.Identity,
     ) anyerror!antfly.hot_standby.http_admin.Server.StandbyUpstreamResult {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        return self.setHAStandbyUpstream(alloc, upstream_url, slot_name, expected);
+        return self.setHAStandbyUpstream(upstream_url, slot_name, expected);
     }
 
     fn openPromotedPrimaryFromStandbyIfReady(self: *DataServer, cfg: HAStandbyReplicationConfig) !bool {
@@ -6143,18 +6139,8 @@ pub const DataServer = struct {
         self.ha_promoted_primary = promoted_primary;
         const promoted_primary_handle = &self.ha_promoted_primary.?;
         self.ha_cfg.internal_primary = promoted_primary_handle;
-        // If `setHAStandbyUpstream` ever swapped this standby's upstream,
-        // the currently active pair is our own allocation (see
-        // `ha_standby_upstream_swapped`) and must be retired rather than
-        // dropped, since a replication round may still be reading it.
-        if (self.ha_cfg.standby_replication) |active_cfg| {
-            if (self.ha_standby_upstream_swapped) {
-                self.ha_standby_upstream_retired.append(self.alloc, .{
-                    .upstream_url = @constCast(active_cfg.upstream_base_uri),
-                    .slot_name = @constCast(active_cfg.slot_name),
-                }) catch {};
-            }
-        }
+        // Keep the owned pair independently of this config. Promotion cannot
+        // allocate or drop strings still borrowed by a replication round.
         self.ha_cfg.standby_replication = null;
         const promoted_node_id = self.ha_cfg.admin_context.?.standby_node_id;
         self.ha_cfg.admin_context.?.primary = promoted_primary_handle;
@@ -7593,11 +7579,9 @@ pub const DataServer = struct {
         // Safe only now: every replication round has been quiesced above, so
         // no in-flight round can still hold an unlocked copy of a retired
         // upstream/slot pair. See `ha_standby_upstream_retired`.
-        if (self.ha_cfg.standby_replication) |cfg| {
-            if (self.ha_standby_upstream_swapped) {
-                self.alloc.free(@constCast(cfg.upstream_base_uri));
-                self.alloc.free(@constCast(cfg.slot_name));
-            }
+        if (self.ha_standby_upstream_owned) |owned| {
+            self.alloc.free(owned.upstream_url);
+            self.alloc.free(owned.slot_name);
         }
         for (self.ha_standby_upstream_retired.items) |retired| {
             self.alloc.free(retired.upstream_url);
@@ -34546,7 +34530,7 @@ fn consumerTests() type {
                 defer unconfigured.deinit();
                 try std.testing.expectError(
                     error.HAStandbyNotConfigured,
-                    unconfigured.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-a", identity),
+                    unconfigured.setHAStandbyUpstream("http://primary-b.internal.test", "standby-a", identity),
                 );
             }
 
@@ -34565,7 +34549,7 @@ fn consumerTests() type {
                 defer promoted.deinit();
                 try std.testing.expectError(
                     error.HAStandbyAlreadyPromoted,
-                    promoted.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-a", identity),
+                    promoted.setHAStandbyUpstream("http://primary-b.internal.test", "standby-a", identity),
                 );
             }
 
@@ -34575,18 +34559,20 @@ fn consumerTests() type {
             wrong_identity.shard_id = identity.shard_id + 1;
             try std.testing.expectError(
                 error.WrongShard,
-                server.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-a", wrong_identity),
+                server.setHAStandbyUpstream("http://primary-b.internal.test", "standby-a", wrong_identity),
             );
 
             // Idempotent retry: requesting the already-effective upstream and
             // slot reports changed=false without mutating anything.
-            const unchanged = try server.setHAStandbyUpstream(alloc, "http://primary-a.internal.test", "standby-a", identity);
+            const unchanged = try server.setHAStandbyUpstream("http://primary-a.internal.test", "standby-a", identity);
             try std.testing.expect(!unchanged.changed);
             try std.testing.expectEqualStrings("http://primary-a.internal.test", server.ha_cfg.standby_replication.?.upstream_base_uri);
 
             // A real swap changes the URL/slot the next replication round
             // will use and reports the previous pair.
-            const swapped = try server.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-b", identity);
+            // The HTTP allocator may differ from the server owner and must
+            // never own strings retained beyond this callback.
+            const swapped = try DataServer.setHAStandbyUpstreamCallback(&server, std.testing.failing_allocator, "http://primary-b.internal.test", "standby-b", identity);
             try std.testing.expect(swapped.changed);
             try std.testing.expectEqualStrings("http://primary-a.internal.test", swapped.previous.?.upstream_url);
             try std.testing.expectEqualStrings("standby-a", swapped.previous.?.slot_name);
@@ -34596,10 +34582,17 @@ fn consumerTests() type {
             // A second swap must retire (not free) the first swap's owned
             // strings, since a round may still be reading them; see
             // `ha_standby_upstream_retired`.
-            const swapped_again = try server.setHAStandbyUpstream(alloc, "http://primary-c.internal.test", "standby-c", identity);
+            const swapped_again = try server.setHAStandbyUpstream("http://primary-c.internal.test", "standby-c", identity);
             try std.testing.expect(swapped_again.changed);
             try std.testing.expectEqualStrings("http://primary-b.internal.test", swapped_again.previous.?.upstream_url);
             try std.testing.expectEqual(@as(usize, 1), server.ha_standby_upstream_retired.items.len);
+
+            // Promotion clears the active replication config. Both current
+            // and retired strings must remain live until server teardown;
+            // the testing allocator also checks that teardown frees them.
+            server.ha_cfg.standby_replication = null;
+            try std.testing.expectEqualStrings("http://primary-c.internal.test", server.ha_standby_upstream_owned.?.upstream_url);
+            try std.testing.expectEqualStrings("http://primary-b.internal.test", swapped_again.previous.?.upstream_url);
         }
 
         test "data server resumes HA standby replication from durable progress after restart" {
