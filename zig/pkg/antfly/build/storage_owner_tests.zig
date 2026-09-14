@@ -50,7 +50,7 @@ pub fn add(
             const tests = @import("linked_tests.zig").add(b, .{
                 .name = if (index == 0) "storage-owner-tests" else if (index == 1) "storage-owner-source-tests" else "storage-owner-enrichment-tests",
                 .root_module = module,
-                .filters = &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
+                .filters = if (index == 1) &.{ "storage.kernel_owner_provisioned_source_test.", "api.kernel_owner_source." } else &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
                 .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
             });
             tests.executable.root_module.addObject(test_metadata.object);
