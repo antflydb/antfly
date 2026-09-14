@@ -21,6 +21,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
         return listArtifactsWithFirstArg(allocator, io, client, null, args);
     };
 
+    if (std.mem.eql(u8, subcommand, "maintenance")) return @import("maintenance.zig").run(allocator, io, client, .artifact, args);
     if (std.mem.eql(u8, subcommand, "list")) return listArtifactsWithFirstArg(allocator, io, client, null, args);
     if (std.mem.eql(u8, subcommand, "get")) return getArtifact(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "put")) return putArtifactEnrichment(allocator, io, client, args);

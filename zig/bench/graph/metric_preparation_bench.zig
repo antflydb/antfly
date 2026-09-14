@@ -372,12 +372,9 @@ fn benchmarkPageBootstrap(io: std.Io, output: anytype) !void {
     }
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     var output_buf: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buf);
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, std.heap.smp_allocator);
-    defer args.deinit();
-    _ = args.next();
     var staged_only = false;
     var topology_only = false;
     var score_join_only = false;
@@ -891,19 +888,22 @@ fn benchmarkPresence(out: anytype) !void {
                 stats.peak_bytes = baseline;
                 const before = backend.snapshotReadStats();
                 const started = antfly.platform_time.monotonicNs();
-                var batch = try runtime.beginBatch();
-                errdefer batch.abort();
-                if (reference) {
-                    for (keys) |key| if ((try batch.get(key)).len != value.len) return error.InvalidBenchmarkResult;
-                } else {
-                    var present: [1024]bool = undefined;
-                    try batch.containsManySorted(keys, &present);
-                    for (present) |exists| if (!exists) return error.InvalidBenchmarkResult;
+                {
+                    var batch = try runtime.beginBatch();
+                    defer batch.abort();
+                    if (reference) {
+                        for (keys) |key| if ((try batch.get(key)).len != value.len) return error.InvalidBenchmarkResult;
+                    } else {
+                        var present: [1024]bool = undefined;
+                        try batch.containsManySorted(keys, &present);
+                        for (present) |exists| if (!exists) return error.InvalidBenchmarkResult;
+                    }
                 }
-                batch.abort();
                 const elapsed = antfly.platform_time.monotonicNs() - started;
                 copies = backend.snapshotReadStats().point_value_copies - before.point_value_copies;
-                if (copies != (if (reference) @as(u64, keys.len) else 0)) return error.InvalidBenchmarkResult;
+                // Scalar reads may borrow cached values; measure their copies instead
+                // of requiring an allocation that the backend can avoid.
+                if (!reference and copies != 0) return error.InvalidBenchmarkResult;
                 if (sample != 0) {
                     samples[sample - 1] = elapsed;
                     peaks[sample - 1] = stats.peak_bytes -| baseline;

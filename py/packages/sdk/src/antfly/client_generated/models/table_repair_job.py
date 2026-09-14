@@ -8,6 +8,7 @@ from attrs import field as _attrs_field
 
 from ..models.artifact_repair_kind import ArtifactRepairKind
 from ..models.repair_target import RepairTarget
+from ..models.table_repair_job_control import TableRepairJobControl
 from ..models.table_repair_job_phase import TableRepairJobPhase
 from ..models.table_repair_job_repair_status import TableRepairJobRepairStatus
 from ..types import UNSET, Unset
@@ -34,15 +35,22 @@ class TableRepairJob:
         limit (int): Effective per-pass repair limit.
         force (bool): Whether the next bounded pass still needs to dispatch the job's one forced named-index generation.
         result (TableRepairRunResult): Result of one bounded table repair pass.
-        cancel_requested (bool): Whether cancellation is pending. For a named-index job, cancellation durably pauses the
-            matching repair in every group and becomes terminal only after that bounded traversal completes.
+        cancel_requested (bool): Whether cancellation is pending. For a named-index repair/rebuild job, cancellation
+            durably pauses the matching repair in every group. Cancelling a control job stops remaining passes without
+            undoing controls already applied.
         created_at_millis (int): Unix epoch milliseconds when the job was created.
         last_updated_at_millis (int): Unix epoch milliseconds when the job state was last updated.
         expires_at_millis (int): Unix epoch milliseconds when the job is eligible for cleanup.
         kind (ArtifactRepairKind | Unset): Kind of stored artifact tracked by the repair queue.
         index (str | Unset): Index name when the job is restricted to one index.
+        control (TableRepairJobControl | Unset): Durable named-index control applied in bounded server-owned passes
+            across every table group.
+        repair_id (str | Unset): Decimal repair attempt fence, preserved across every pass. A stale fence fails the
+            control job.
         cursor (None | str | Unset): Opaque continuation cursor for the next bounded repair pass.
         last_error (None | str | Unset): Last stable job-level error code.
+        next_retry_at_millis (int | Unset): Unix epoch milliseconds when a deferred pass may next run; zero means
+            immediately eligible.
     """
 
     job_id: int
@@ -60,8 +68,11 @@ class TableRepairJob:
     expires_at_millis: int
     kind: ArtifactRepairKind | Unset = UNSET
     index: str | Unset = UNSET
+    control: TableRepairJobControl | Unset = UNSET
+    repair_id: str | Unset = UNSET
     cursor: None | str | Unset = UNSET
     last_error: None | str | Unset = UNSET
+    next_retry_at_millis: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -97,6 +108,12 @@ class TableRepairJob:
 
         index = self.index
 
+        control: str | Unset = UNSET
+        if not isinstance(self.control, Unset):
+            control = self.control.value
+
+        repair_id = self.repair_id
+
         cursor: None | str | Unset
         if isinstance(self.cursor, Unset):
             cursor = UNSET
@@ -108,6 +125,8 @@ class TableRepairJob:
             last_error = UNSET
         else:
             last_error = self.last_error
+
+        next_retry_at_millis = self.next_retry_at_millis
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -132,10 +151,16 @@ class TableRepairJob:
             field_dict["kind"] = kind
         if index is not UNSET:
             field_dict["index"] = index
+        if control is not UNSET:
+            field_dict["control"] = control
+        if repair_id is not UNSET:
+            field_dict["repair_id"] = repair_id
         if cursor is not UNSET:
             field_dict["cursor"] = cursor
         if last_error is not UNSET:
             field_dict["last_error"] = last_error
+        if next_retry_at_millis is not UNSET:
+            field_dict["next_retry_at_millis"] = next_retry_at_millis
 
         return field_dict
 
@@ -179,6 +204,15 @@ class TableRepairJob:
 
         index = d.pop("index", UNSET)
 
+        _control = d.pop("control", UNSET)
+        control: TableRepairJobControl | Unset
+        if isinstance(_control, Unset):
+            control = UNSET
+        else:
+            control = TableRepairJobControl(_control)
+
+        repair_id = d.pop("repair_id", UNSET)
+
         def _parse_cursor(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -197,6 +231,8 @@ class TableRepairJob:
 
         last_error = _parse_last_error(d.pop("last_error", UNSET))
 
+        next_retry_at_millis = d.pop("next_retry_at_millis", UNSET)
+
         table_repair_job = cls(
             job_id=job_id,
             attempt_id=attempt_id,
@@ -213,8 +249,11 @@ class TableRepairJob:
             expires_at_millis=expires_at_millis,
             kind=kind,
             index=index,
+            control=control,
+            repair_id=repair_id,
             cursor=cursor,
             last_error=last_error,
+            next_retry_at_millis=next_retry_at_millis,
         )
 
         table_repair_job.additional_properties = d

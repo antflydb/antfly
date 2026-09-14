@@ -964,6 +964,17 @@ pub fn parseQueryTableBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.StatefulQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Start a durable index control job
+pub const StartTableRepairControlJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for startTableRepairControlJob.
+pub fn parseStartTableRepairControlJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TableRepairControlJobStartRequest) {
+    return std.json.parseFromSlice(types.TableRepairControlJobStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// List table repair issues
 pub const ListTableRepairIssuesPathParams = struct {
     /// Name of the table
@@ -1283,6 +1294,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/control-jobs", .operation_id = "startTableRepairControlJob", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/issues", .operation_id = "listTableRepairIssues", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs", .operation_id = "startTableRepairJob", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/repair/jobs/{jobId}", .operation_id = "getTableRepairJob", .request_body = .none, .streaming_response = false },
@@ -1413,6 +1425,7 @@ pub const routes = [_]Route{
 //   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn startTableRepairControlJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listTableRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response

@@ -16,6 +16,7 @@ const std = @import("std");
 const antfly = @import("../../cli_root.zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
+const maintenance = @import("maintenance.zig");
 const index_readiness = @import("index_readiness.zig");
 const platform_time = antfly.platform_time;
 
@@ -36,6 +37,9 @@ const wait_progress_report_interval_ns: u64 = 10 * std.time.ns_per_s;
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var command_args = args.*;
     const route = parseRoute(args.*);
+    if (route.subcommand) |command| {
+        if (std.mem.eql(u8, command, "maintenance")) return maintenance.run(allocator, io, client, .index, args);
+    }
     if (route.missing_value_arg) |arg| cli.fatal("{s} requires a value", .{arg});
     if (route.duplicate_arg) |arg| cli.fatal("{s} may only be provided once", .{arg});
     if (route.unknown_arg) |arg| cli.fatal("unknown index option or subcommand: {s}", .{arg});
@@ -113,6 +117,9 @@ fn parseRoute(iterator: std.process.Args.Iterator) Route {
         {
             if (wait_only_arg == null) wait_only_arg = arg;
             _ = nextRouteValue(&args, arg, &route.missing_value_arg);
+        } else if (std.mem.eql(u8, arg, "maintenance")) {
+            route.subcommand = "maintenance";
+            return route;
         } else if (std.mem.eql(u8, arg, "create") or std.mem.eql(u8, arg, "drop") or
             std.mem.eql(u8, arg, "list") or std.mem.eql(u8, arg, "get") or std.mem.eql(u8, arg, "wait"))
         {

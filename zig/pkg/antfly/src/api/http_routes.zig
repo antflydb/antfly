@@ -555,6 +555,10 @@ pub const Routes = struct {
         return matchTableArtifactRepairWithSuffix(path, artifact_repair_run_suffix);
     }
 
+    pub fn matchTableRepairControlJobs(path: []const u8) ?TableArtifactRepair {
+        return matchTableArtifactRepairWithSuffix(path, "/repair/control-jobs");
+    }
+
     pub fn matchTableRepairJobs(path: []const u8) ?TableArtifactRepair {
         return matchTableArtifactRepairWithSuffix(path, repair_jobs_suffix);
     }

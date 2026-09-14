@@ -180,33 +180,14 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const backend_bench_step = b.step("backend-bench", "Build and install backend_bench");
     backend_bench_step.dependOn(&b.addInstallArtifact(backend_bench, .{}).step);
 
-    const graph_metric_prepare_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/graph/metric_preparation_bench.zig"),
+    const graph_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/graph/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    graph_metric_prepare_bench_mod.addImport("antfly_zig", antfly_mod);
-    const graph_metric_prepare_bench = b.addExecutable(.{
-        .name = "graph_metric_preparation_bench",
-        .root_module = graph_metric_prepare_bench_mod,
-    });
-    const run_graph_metric_prepare_bench = b.addRunArtifact(graph_metric_prepare_bench);
-    if (b.args) |args| run_graph_metric_prepare_bench.addArgs(args);
-    b.step("graph-metric-preparation-bench", "Compare unpack/hash and packed ordinal graph-metric preparation").dependOn(&run_graph_metric_prepare_bench.step);
-
-    const graph_pattern_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/graph/pattern_query_bench.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    graph_pattern_bench_mod.addImport("antfly_zig", antfly_mod);
-    const graph_pattern_bench = b.addExecutable(.{
-        .name = "graph_pattern_query_bench",
-        .root_module = graph_pattern_bench_mod,
-    });
-
-    const graph_pattern_bench_step = b.step("graph-pattern-bench", "Build and install graph_pattern_query_bench");
-    graph_pattern_bench_step.dependOn(&b.addInstallArtifact(graph_pattern_bench, .{}).step);
+    graph_bench_mod.addImport("antfly_zig", antfly_mod);
+    const graph_bench = b.addExecutable(.{ .name = "antfly-graph-bench", .root_module = graph_bench_mod });
+    b.step("antfly-graph-bench", "Build and install graph preparation and query benchmarks").dependOn(&b.addInstallArtifact(graph_bench, .{}).step);
 
     const lsm_backend_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/lsm_backend_bench.zig"),
