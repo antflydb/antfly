@@ -52,10 +52,12 @@ type PoolActivator interface {
 
 // Resolution is the result of routing a request to a specific endpoint.
 type Resolution struct {
-	Route       *Route
-	Destination *Destination
-	Endpoint    *Endpoint
-	Pool        string
+	// ColdStartFallback identifies a CPU/redirect choice made while waking the primary.
+	ColdStartFallback bool
+	Route             *Route
+	Destination       *Destination
+	Endpoint          *Endpoint
+	Pool              string
 }
 
 // ResolutionLease reserves a resolved endpoint for forwarding and must be completed.
@@ -318,6 +320,9 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 		}
 		if dest == nil {
 			dest = p.selectActivationDestination(matchedRoute, routeReq)
+		}
+		if dest != nil && p.useColdStartFallback(matchedRoute, dest, routeReq) {
+			return p.resolveColdStartFallback(ctx, matchedRoute, dest, routeReq, workloadType, reserve)
 		}
 		if dest != nil {
 			endpoint, resolveErr := p.resolvePoolTarget(ctx, routeNamespace(matchedRoute), dest.Pool, routeReq, workloadType, reserve, dest)

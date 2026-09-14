@@ -984,12 +984,15 @@ func (r *ConsistentHashRing) GetN(key string, endpoints []*Endpoint, n int) []*E
 
 // Proxy is the main proxy server
 type Proxy struct {
-	registry     *ModelRegistry
-	router       *Router
-	routeWatcher *RouteWatcher
-	activator    PoolActivator
-	server       *http.Server
-	logger       *zap.Logger
+	registry           *ModelRegistry
+	router             *Router
+	routeWatcher       *RouteWatcher
+	activator          PoolActivator
+	coldFallbackRoutes map[string]bool
+	activationMu       sync.Mutex
+	activations        map[string]bool
+	server             *http.Server
+	logger             *zap.Logger
 
 	defaultPool string
 	listenAddr  string
@@ -1002,14 +1005,18 @@ func (p *Proxy) SetPoolActivator(activator PoolActivator) {
 
 // Config holds proxy configuration
 type Config struct {
-	ListenAddr            string
-	DefaultPool           string
-	RefreshInterval       time.Duration
-	EnableRouteWatching   bool        // Enable watching InferenceProxy CRs
-	RouteWatchNamespace   string      // Namespace to watch for routes (empty for all)
-	RouteWatchKubeconfig  string      // Optional kubeconfig path for route watching
-	UpstreamAuthorization string      // Optional Authorization header value for upstream refreshes and requests
-	Logger                *zap.Logger // Optional logger (defaults to production logger)
+	// ColdStartFallbackRoutes opts exact namespace/name routes into asynchronous
+	// activation and immediate redirect fallback. Other routes keep wake-and-wait.
+	// Only redirect routes with a scale-to-zero primary are eligible.
+	ColdStartFallbackRoutes []string
+	ListenAddr              string
+	DefaultPool             string
+	RefreshInterval         time.Duration
+	EnableRouteWatching     bool        // Enable watching InferenceProxy CRs
+	RouteWatchNamespace     string      // Namespace to watch for routes (empty for all)
+	RouteWatchKubeconfig    string      // Optional kubeconfig path for route watching
+	UpstreamAuthorization   string      // Optional Authorization header value for upstream refreshes and requests
+	Logger                  *zap.Logger // Optional logger (defaults to production logger)
 }
 
 // NewProxy creates a new Proxy
@@ -1029,6 +1036,12 @@ func NewProxy(cfg Config) *Proxy {
 		defaultPool: cfg.DefaultPool,
 		listenAddr:  cfg.ListenAddr,
 		logger:      logger,
+	}
+
+	p.coldFallbackRoutes = make(map[string]bool, len(cfg.ColdStartFallbackRoutes))
+	p.activations = make(map[string]bool)
+	for _, name := range cfg.ColdStartFallbackRoutes {
+		p.coldFallbackRoutes[name] = true
 	}
 
 	// Initialize RouteWatcher if enabled
