@@ -1,0 +1,128 @@
+{
+  "schema": "antfly.qwen3vl.ocr_endpoint_golden.v1",
+  "fixture_sha256": "b35198f40181829477026eaaf9eada2a6ad7e9d5e72dff87666154b6a8fae386",
+  "artifacts": {
+    "Qwen3VL-2B-Instruct-Q4_K_M.gguf": "089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae",
+    "antfly_inference_bundle.json": "e49580b4a08a5ee33489a88725415becef256b0cd65493497d18b3117f5e2d32",
+    "chat_template.json": "6f8a6a55027e3da5160105556cda5dd69f6423f1c32645f6730d32de7773d0c4",
+    "config.json": "bec4b3d446efa05807365c9e1cec03ac590836879d02f3a6da879971154bdd3b",
+    "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf": "f9a68fabba69c3b81e153367b2c7521030b0fa8bb0de400c9599c8e6725f9c82",
+    "model_manifest.json": "fbf7d68d29fdad967c090af72674f3d06fdd63a48d613ad77d5a885297917167",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "tokenizer.json": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+    "tokenizer_config.json": "c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399",
+    "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+  },
+  "baseline": {
+    "pid": 18369,
+    "command": "<workdir>/baseline-server run --host 127.0.0.1 --port 18191 --models-dir ~/.antfly/inference/models --max-loaded-models 1 --max-concurrent-requests 32 --kernel-jit-mode off --process-memory-budget-mb 8192 --host-budget-mb 4096 --backend-budget-mb 6144 --combined-budget-mb 8192 --kv-budget-mb 512 --scratch-budget-mb 1024",
+    "executable": "<workdir>/baseline-server",
+    "executable_sha256": "9f645aca65d0e27071d22d2cd80043ba41a702fc397e48815179316e3eba7ca2",
+    "argv": [
+      "run",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18191",
+      "--models-dir",
+      "~/.antfly/inference/models",
+      "--max-loaded-models",
+      "1",
+      "--max-concurrent-requests",
+      "32",
+      "--kernel-jit-mode",
+      "off",
+      "--process-memory-budget-mb",
+      "8192",
+      "--host-budget-mb",
+      "4096",
+      "--backend-budget-mb",
+      "6144",
+      "--combined-budget-mb",
+      "8192",
+      "--kv-budget-mb",
+      "512",
+      "--scratch-budget-mb",
+      "1024"
+    ],
+    "build_id": "trimmed-baseline-ReleaseSafe",
+    "artifacts": {
+      "Qwen3VL-2B-Instruct-Q4_K_M.gguf": "089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae",
+      "antfly_inference_bundle.json": "e49580b4a08a5ee33489a88725415becef256b0cd65493497d18b3117f5e2d32",
+      "chat_template.json": "6f8a6a55027e3da5160105556cda5dd69f6423f1c32645f6730d32de7773d0c4",
+      "config.json": "bec4b3d446efa05807365c9e1cec03ac590836879d02f3a6da879971154bdd3b",
+      "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf": "f9a68fabba69c3b81e153367b2c7521030b0fa8bb0de400c9599c8e6725f9c82",
+      "model_manifest.json": "fbf7d68d29fdad967c090af72674f3d06fdd63a48d613ad77d5a885297917167",
+      "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+      "tokenizer.json": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+      "tokenizer_config.json": "c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399",
+      "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+    }
+  },
+  "outputs": {
+    "sparse": {
+      "texts": [
+        "ANTFLY\nOrder 1042\n3 notebooks\nTotal: 18.00"
+      ],
+      "usage": {
+        "prompt_tokens": 132,
+        "completion_tokens": 22,
+        "total_tokens": 154
+      }
+    },
+    "portrait": {
+      "texts": [
+        "WAREHOUSE RECEIPT\nDate: September 7, 2026\nReference: AF-2026-1042\n\nItems received\n12 blue notebooks\n8 black pens\n4 document folders\n\nDelivery instructions\nUse the north entrance.\nPlace cartons on shelf B-12.\nCheck the packing list.\nReport missing items today.\n\nReceived by: Taylor Reed\nStatus: Complete\n"
+      ],
+      "usage": {
+        "prompt_tokens": 576,
+        "completion_tokens": 86,
+        "total_tokens": 662
+      }
+    },
+    "landscape_table": {
+      "texts": [
+        "INVENTORY REPORT\nLocation: North warehouse\n\nItem           Units    Shelf\nNotebooks      12      B-12\nPens           8       A-04\nFolders        4       C-07\nLabels         30      A-02\n\nTotal units: 54\nChecked: September 7, 2026"
+      ],
+      "usage": {
+        "prompt_tokens": 587,
+        "completion_tokens": 77,
+        "total_tokens": 664
+      }
+    },
+    "screenshot": {
+      "texts": [
+        "Search settings\nCollection: product_manuals\nEmbedding model: Qwen3\nDocuments indexed: 1,024\nPending updates: 0\nStatus: Ready"
+      ],
+      "usage": {
+        "prompt_tokens": 276,
+        "completion_tokens": 36,
+        "total_tokens": 312
+      }
+    },
+    "serial_2_pages": {
+      "texts": [
+        "ANTFLY\nOrder 1042\n3 notebooks\nTotal: 18.00",
+        "WAREHOUSE RECEIPT\nDate: September 7, 2026\nReference: AF-2026-1042\n\nItems received\n12 blue notebooks\n8 black pens\n4 document folders\n\nDelivery instructions\nUse the north entrance.\nPlace cartons on shelf B-12.\nCheck the packing list.\nReport missing items today.\n\nReceived by: Taylor Reed\nStatus: Complete\n"
+      ],
+      "usage": {
+        "prompt_tokens": 708,
+        "completion_tokens": 108,
+        "total_tokens": 816
+      }
+    },
+    "serial_4_pages": {
+      "texts": [
+        "ANTFLY\nOrder 1042\n3 notebooks\nTotal: 18.00",
+        "WAREHOUSE RECEIPT\nDate: September 7, 2026\nReference: AF-2026-1042\n\nItems received\n12 blue notebooks\n8 black pens\n4 document folders\n\nDelivery instructions\nUse the north entrance.\nPlace cartons on shelf B-12.\nCheck the packing list.\nReport missing items today.\n\nReceived by: Taylor Reed\nStatus: Complete\n",
+        "INVENTORY REPORT\nLocation: North warehouse\n\nItem           Units    Shelf\nNotebooks      12      B-12\nPens           8       A-04\nFolders        4       C-07\nLabels         30      A-02\n\nTotal units: 54\nChecked: September 7, 2026",
+        "Search settings\nCollection: product_manuals\nEmbedding model: Qwen3\nDocuments indexed: 1,024\nPending updates: 0\nStatus: Ready"
+      ],
+      "usage": {
+        "prompt_tokens": 1571,
+        "completion_tokens": 221,
+        "total_tokens": 1792
+      }
+    }
+  }
+}

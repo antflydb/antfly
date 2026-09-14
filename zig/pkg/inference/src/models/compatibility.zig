@@ -213,6 +213,16 @@ fn assessWithRuntimeFacts(
         return makeIncompatible(architecture, .unsupported_backend, "the Qwen3-VL artifact route does not implement the declared serving role");
     }
 
+    if (man.isQwen3TextReranker() and
+        man.nativeWeightArtifactKind() != null and
+        std.mem.eql(u8, architecture, "qwen3"))
+    {
+        return makeCompatible(
+            architecture,
+            "Qwen3 generative yes/no reranker runtime is enabled",
+        );
+    }
+
     if (man.model_type == .generator)
         return assessGenerator(architecture, expert_count, qualified_gemma4_a4b);
 
@@ -288,11 +298,7 @@ fn assessWithRuntimeFacts(
                 );
             }
         },
-        .reranker => {
-            if (std.mem.eql(u8, architecture, "qwen3") and man.usesGgufWeights()) {
-                return makeCompatible(architecture, "Qwen3 GGUF final-token yes/no reranking runtime");
-            }
-        },
+        .reranker => {},
         .chunker, .recognizer, .transcriber => {},
         .generator => unreachable,
     }
@@ -584,7 +590,7 @@ test "Qwen3 text reranker uses selected GGUF without enabling unqualified VL bun
     man.config_model_arch = "qwen3";
     man.inference_bundle_family = "";
     man.gguf_path = null;
-    try std.testing.expect(!man.isQwen3TextReranker());
+    try std.testing.expect(man.isQwen3TextReranker());
     try std.testing.expect(assessWithFacts(&man, "qwen3", 0).level != .compatible);
 }
 
@@ -752,6 +758,18 @@ test "release encoder contracts cover DeBERTa reranking and GLiNER2" {
     gliner.model_type = .recognizer;
     gliner.gliner_model_type = "gliner2";
     try std.testing.expectEqual(Level.compatible, assess(&gliner, "extractor").level);
+}
+
+test "Qwen3 reranker role enables only the Qwen3 generative scoring runtime" {
+    var reranker = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    reranker.model_type = .reranker;
+    reranker.config_model_arch = "qwen3";
+    reranker.gguf_path = "qwen3-reranker-q8_0.gguf";
+    try std.testing.expectEqual(Level.compatible, assess(&reranker, "qwen3").level);
+
+    const spoofed = assess(&reranker, "bart");
+    try std.testing.expectEqual(Level.incompatible, spoofed.level);
+    try std.testing.expect(!spoofed.allowed(true));
 }
 
 test "known Qwen hybrid variants and NomicBERT stay classified" {

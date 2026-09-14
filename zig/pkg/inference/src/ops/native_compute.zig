@@ -3744,6 +3744,21 @@ fn shouldBorrowEmbeddingTensor(name: []const u8) bool {
         std.mem.eql(u8, name, "wte.weight");
 }
 
+fn shouldBorrowTypedWeightTensor(self: *const NativeCompute, name: []const u8, tensor: *const tensor_mod.Tensor) bool {
+    if (shouldBorrowEmbeddingTensor(name)) return true;
+    if (!self.borrow_bf16_linear_weights) return false;
+    if (tensor.dtype != .bf16 or tensor.shape.len != 2) return false;
+    if (std.mem.eql(u8, name, "lm_head.weight") or std.mem.eql(u8, name, "cls.output.weight")) return true;
+    if (!std.mem.startsWith(u8, name, "model.layers.")) return false;
+    return std.mem.endsWith(u8, name, ".self_attn.q_proj.weight") or
+        std.mem.endsWith(u8, name, ".self_attn.k_proj.weight") or
+        std.mem.endsWith(u8, name, ".self_attn.v_proj.weight") or
+        std.mem.endsWith(u8, name, ".self_attn.o_proj.weight") or
+        std.mem.endsWith(u8, name, ".mlp.gate_proj.weight") or
+        std.mem.endsWith(u8, name, ".mlp.up_proj.weight") or
+        std.mem.endsWith(u8, name, ".mlp.down_proj.weight");
+}
+
 const WeightF32View = struct {
     data: []const f32,
     owned: ?[]f32 = null,
@@ -3796,6 +3811,12 @@ fn linearNoBiasSourceTensorChunked(
     if (tensor.dtype != .f32 and tensor.dtype != .f16 and tensor.dtype != .bf16) {
         return error.UnsupportedTensorType;
     }
+    if (rows == 0 or out_dim == 0) return;
+    const weight_elements = std.math.mul(usize, in_dim, out_dim) catch return error.ShapeMismatch;
+    const weight_bytes = std.math.mul(usize, weight_elements, tensor.dtype.byteSize()) catch return error.ShapeMismatch;
+    const input_elements = std.math.mul(usize, rows, in_dim) catch return error.ShapeMismatch;
+    const output_elements = std.math.mul(usize, rows, out_dim) catch return error.ShapeMismatch;
+    if (tensor.data.len != weight_bytes or input.len != input_elements or output.len != output_elements) return error.ShapeMismatch;
 
     // Fast path: f16 weights, naturally aligned, can be consumed directly by
     // sgemmTransBF16Weights without materializing an f32 copy.  This halves
@@ -3817,16 +3838,45 @@ fn linearNoBiasSourceTensorChunked(
     }
 
     const target_weight_bytes: usize = 8 * 1024 * 1024;
-    const block_rows = @max(@as(usize, 1), @min(out_dim, target_weight_bytes / (@max(@as(usize, 1), in_dim) * @sizeOf(f32))));
+    const scratch_row_elements = std.math.add(usize, in_dim, if (build_options.enable_system_blas) 0 else rows) catch return error.ShapeMismatch;
+    const scratch_row_bytes = std.math.mul(usize, scratch_row_elements, @sizeOf(f32)) catch return error.ShapeMismatch;
+    const block_rows = @max(@as(usize, 1), @min(out_dim, target_weight_bytes / @max(@as(usize, 1), scratch_row_bytes)));
+    const scratch_bytes = std.math.mul(usize, block_rows, scratch_row_bytes) catch return error.ShapeMismatch;
+    const scratch_estimate = run_memory.Estimate{
+        .prompt_tokens = 0,
+        .retained_tokens = 0,
+        .kv_bytes = 0,
+        .kv_tier = .host,
+        .scratch_bytes = scratch_bytes,
+        .scratch_tier = .host,
+    };
+    if (self.run_budget) |budget| try budget.reserveEstimate(scratch_estimate);
+    defer if (self.run_budget) |budget| budget.releaseEstimate(scratch_estimate);
     const weight_block = try self.allocator.alloc(f32, block_rows * in_dim);
     defer self.allocator.free(weight_block);
-    const output_block = try self.allocator.alloc(f32, rows * block_rows);
+    const output_block = try self.allocator.alloc(f32, if (build_options.enable_system_blas) 0 else rows * block_rows);
     defer self.allocator.free(output_block);
 
     var row_start: usize = 0;
     while (row_start < out_dim) : (row_start += block_rows) {
+        if (self.io) |io| try io.checkCancel();
         const row_count = @min(block_rows, out_dim - row_start);
         try convertTensorRowsToF32(tensor, row_start, row_count, in_dim, weight_block[0 .. row_count * in_dim]);
+        if (build_options.enable_system_blas) {
+            try native.sgemmTransBStrided(
+                self.io,
+                rows,
+                row_count,
+                in_dim,
+                1.0,
+                input,
+                weight_block[0 .. row_count * in_dim],
+                0.0,
+                output[row_start..],
+                out_dim,
+            );
+            continue;
+        }
         @memset(output_block[0 .. rows * row_count], 0.0);
         try self.dispatchSgemmTransB(
             rows,
@@ -3940,6 +3990,9 @@ pub const NativeCompute = struct {
     data: *WeightStore,
     run_budget: ?*run_memory.RunBudget = null,
     weight_reservations: std.StringHashMapUnmanaged(ReservationState) = .empty,
+    /// Opt in only for qualified model families whose projection consumers
+    /// accept typed weights. Other native/PJRT callers keep their load policy.
+    borrow_bf16_linear_weights: bool = false,
     weight_handles: std.StringHashMapUnmanaged(CT) = .empty,
     /// Optional Io for parallel GEMM dispatch.  When non-null, sgemm calls
     /// route through linalg's Io-aware variants and parallel work is
@@ -4733,10 +4786,10 @@ fn checkedF32Bytes(len: usize) usize {
         std.math.maxInt(usize);
 }
 
-fn loadedWeightHandleBytes(loaded: *const LoadedWeight, name: []const u8, cached_bytes: usize) usize {
+fn loadedWeightHandleBytes(self: *const NativeCompute, loaded: *const LoadedWeight, name: []const u8, cached_bytes: usize) usize {
     if (loaded.quantized_storage != null or
         loaded.tensor.dtype == .f32 or
-        shouldBorrowEmbeddingTensor(name))
+        shouldBorrowTypedWeightTensor(self, name, &loaded.tensor))
     {
         return cached_bytes;
     }
@@ -4836,14 +4889,15 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
             else
                 WeightF32View{ .data = empty_f32[0..] };
             const tensor = try makeBufFromWeightView(self, view, name, null, storage);
-            return finishWeight(self, tensor, name, quantizedStorageBudgetBytes(storage), w.tensor.shape);
+            const shape = if (w.tensor.shape.len == 0) storage.shape else w.tensor.shape;
+            return finishWeight(self, tensor, name, quantizedStorageBudgetBytes(storage), shape);
         }
         if (w.tensor.dtype == .f32) {
             const view = try tensorF32View(self, &w.tensor);
             const tensor = try makeBufFromWeightView(self, view, name, null, null);
             return finishWeight(self, tensor, name, checkedF32Bytes(view.data.len), w.tensor.shape);
         }
-        if (shouldBorrowEmbeddingTensor(name)) {
+        if (shouldBorrowTypedWeightTensor(self, name, &w.tensor)) {
             const tensor = try self.makeBufWithEntry(empty_f32[0..], false, name, null, null, &w.tensor);
             return finishWeight(self, tensor, name, w.tensor.data.len, w.tensor.shape);
         }
@@ -4877,7 +4931,7 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
         const reservation = try acquireWeightReservation(
             self,
             name,
-            loadedWeightHandleBytes(loaded, name, entry.loaded_bytes),
+            loadedWeightHandleBytes(self, loaded, name, entry.loaded_bytes),
         );
         errdefer if (reservation != null) releaseWeightReservation(self, name);
         entry.pin_count += 1;
@@ -4889,14 +4943,15 @@ fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
             else
                 WeightF32View{ .data = empty_f32[0..] };
             const tensor = try makeBufFromWeightView(self, view, name, entry, storage);
-            return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
+            const shape = if (loaded.tensor.shape.len == 0) storage.shape else loaded.tensor.shape;
+            return finishLazyWeightLocked(self, tensor, reservation, shape);
         }
         if (loaded.tensor.dtype == .f32) {
             const view = try tensorF32View(self, &loaded.tensor);
             const tensor = try makeBufFromWeightView(self, view, name, entry, null);
             return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
-        if (shouldBorrowEmbeddingTensor(name)) {
+        if (shouldBorrowTypedWeightTensor(self, name, &loaded.tensor)) {
             const tensor = try self.makeBufWithEntry(empty_f32[0..], false, name, entry, null, &loaded.tensor);
             return finishLazyWeightLocked(self, tensor, reservation, loaded.tensor.shape);
         }
@@ -5837,9 +5892,15 @@ fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_di
 
     if (weight_buf.source_tensor) |tensor| {
         try linearNoBiasSourceTensorChunked(self, getData(input), tensor, output, rows, in_dim, out_dim);
+        for (0..rows) |row| {
+            for (0..out_dim) |col| output[row * out_dim + col] += bias_data[col];
+        }
     } else if (weight_buf.lazy_entry) |entry| {
         if (weight_buf.data.len == 0 and canFallbackDenseBudgetPressure(weight_buf.name, entry)) {
             try linearNoBiasLazyEntryChunked(self, getData(input), entry, output, rows, in_dim, out_dim);
+            for (0..rows) |row| {
+                for (0..out_dim) |col| output[row * out_dim + col] += bias_data[col];
+            }
         } else {
             const weight_view = try denseWeightView(self, weight);
             defer if (weight_view.owned) |owned| self.allocator.free(owned);
@@ -6111,27 +6172,21 @@ fn linearLoRAOp(
     out_dim: usize,
 ) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    defer maybeDiscardMappedWeightAfterUse(self, base_weight);
     defer maybeDiscardMappedWeightAfterUse(self, lora_a);
     defer maybeDiscardMappedWeightAfterUse(self, lora_b);
     _ = rank;
 
     const input_data = getData(input);
-    const base_w_data = getData(base_weight);
-    const bias_data = getData(bias);
     const lora_a_data = getData(lora_a);
     const lora_b_data = getData(lora_b);
 
     const lora_rank: usize = if (in_dim == 0) 0 else lora_a_data.len / in_dim;
 
-    // Base linear: Y = input @ W^T + bias.  Same path as `linearOp` (just
-    // inlined here so we can add the LoRA residual into the same buffer).
-    const output = try self.allocator.alloc(f32, rows * out_dim);
-    errdefer self.allocator.free(output);
-    for (0..rows) |r| {
-        @memcpy(output[r * out_dim .. (r + 1) * out_dim], bias_data[0..out_dim]);
-    }
-    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input_data, base_w_data, 1.0, output);
+    // Reuse the base route so typed and quantized-only weights remain valid
+    // when an adapter adds its residual to the same output buffer.
+    const result = try linearOp(ctx, input, base_weight, bias, rows, in_dim, out_dim);
+    errdefer freeTensor(self, result);
+    const output = getData(result);
 
     // LoRA residual: Y += alpha * (input @ A^T) @ B^T, where A is
     // [lora_rank, in_dim] and B is [out_dim, lora_rank].  The previous
@@ -6151,8 +6206,7 @@ fn linearLoRAOp(
         try self.dispatchSgemmTransB(rows, out_dim, lora_rank, alpha, intermediate, lora_b_data, 1.0, output);
     }
 
-    const result = try self.makeBuf(output, true);
-    return self.withLogicalShape(result, &.{ @intCast(rows), @intCast(out_dim) });
+    return result;
 }
 
 fn layerNormOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!CT {
@@ -46035,6 +46089,276 @@ test "linearNoBias source tensor chunked matches dense f16 weight" {
     for (got, want) |actual, expected| {
         try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
     }
+}
+
+test "native typed BF16 weights borrow source reserve bytes and preserve linear bias" {
+    const allocator = std.testing.allocator;
+    const name = "model.layers.0.self_attn.q_proj.weight";
+    // Include values outside f16 range and an unaligned source. Widening BF16
+    // must preserve these exactly; an intermediate f16 cast would overflow.
+    var source = [_]u8{0} ** 13;
+    const weight_bits = [_]u16{ 0x4980, 0x3f80, 0xbf80, 0xc980, 0x3f00, 0x4000 };
+    for (weight_bits, 0..) |bits, index| std.mem.writeInt(u16, source[1 + index * 2 ..][0..2], bits, .little);
+    const shape = [_]i64{ 2, 3 };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.resident_weights.deinit(allocator);
+    try store.resident_weights.put(allocator, name, .{ .tensor = .{
+        .data = source[1..],
+        .shape = &shape,
+        .dtype = .bf16,
+        .name = name,
+        .allocator = allocator,
+        .owns_data = false,
+        .owns_shape = false,
+    } });
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 1024, .scratch_limit_bytes = 128 });
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    compute.borrow_bf16_linear_weights = true;
+    defer compute.deinit();
+    const weight = try getWeight(&compute, name);
+    defer freeTensor(&compute, weight);
+    const second = try getWeight(&compute, name);
+    defer freeTensor(&compute, second);
+    try std.testing.expectEqual(@as(usize, 0), toBuf(weight).data.len);
+    try std.testing.expect(toBuf(weight).source_tensor == &store.resident_weights.getPtr(name).?.tensor);
+    try std.testing.expectEqual(@as(usize, 12), budget.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 12), loadedWeightHandleBytes(&compute, store.resident_weights.getPtr(name).?, name, 12));
+    try std.testing.expect(!shouldBorrowTypedWeightTensor(&compute, "model.layers.0.input_layernorm.weight", toBuf(weight).source_tensor.?));
+    var input_values = [_]f32{ 0x1p-20, 2, 3, -0x1p-20, -2, 0.5 };
+    var bias_values = [_]f32{ 0.25, -0.75 };
+    const input = try compute.makeBuf(&input_values, false);
+    defer freeTensor(&compute, input);
+    const bias = try compute.makeBuf(&bias_values, false);
+    defer freeTensor(&compute, bias);
+    const result = try linearOp(&compute, input, weight, bias, 2, 3, 2);
+    defer freeTensor(&compute, result);
+    for (0..2) |row| {
+        for (0..2) |column| {
+            var expected: f64 = bias_values[column];
+            for (0..3) |inner| {
+                const value: f32 = @bitCast(@as(u32, weight_bits[column * 3 + inner]) << 16);
+                expected += @as(f64, input_values[row * 3 + inner]) * value;
+            }
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), getData(result)[row * 2 + column], 1e-6);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+    const CanceledIo = struct {
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    var canceled_vtable = std.Io.failing.vtable.*;
+    canceled_vtable.checkCancel = CanceledIo.check;
+    compute.io = .{ .vtable = &canceled_vtable, .userdata = null };
+    try std.testing.expectError(error.Canceled, linearNoBiasOp(&compute, input, weight, 2, 3, 2));
+    compute.io = null;
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+    // The same operation remains usable after a scratch-admission failure.
+    budget.limits.scratch_limit_bytes = 1;
+    try std.testing.expectError(error.MemoryBudgetExceeded, linearNoBiasOp(&compute, input, weight, 2, 3, 2));
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+    budget.limits.scratch_limit_bytes = 128;
+    const recovered = try linearNoBiasOp(&compute, input, weight, 2, 3, 2);
+    defer freeTensor(&compute, recovered);
+    for (getData(recovered), getData(result), 0..) |actual, biased, index| {
+        try std.testing.expectApproxEqAbs(biased - bias_values[index % 2], actual, 1e-6);
+    }
+    var adapter_a = [_]f32{ 1, 0.5, -0.25 };
+    var adapter_b = [_]f32{ 0.5, -2 };
+    const lora_a = try compute.makeBuf(&adapter_a, false);
+    defer freeTensor(&compute, lora_a);
+    const lora_b = try compute.makeBuf(&adapter_b, false);
+    defer freeTensor(&compute, lora_b);
+    const adapted = try linearLoRAOp(&compute, input, weight, bias, lora_a, lora_b, 0.25, 1, 2, 3, 2);
+    defer freeTensor(&compute, adapted);
+    for (0..2) |row| {
+        var projected: f32 = 0;
+        for (0..3) |inner| projected += input_values[row * 3 + inner] * adapter_a[inner];
+        for (0..2) |column| {
+            const expected = getData(result)[row * 2 + column] + 0.25 * projected * adapter_b[column];
+            try std.testing.expectApproxEqAbs(expected, getData(adapted)[row * 2 + column], 1e-6);
+        }
+    }
+    const pair = try linearNoBiasPairOp(&compute, input, weight, weight, 2, 3, 2);
+    defer freeTensor(&compute, pair.first);
+    defer freeTensor(&compute, pair.second);
+    try std.testing.expectEqualSlices(f32, getData(recovered), getData(pair.first));
+    try std.testing.expectEqualSlices(f32, getData(recovered), getData(pair.second));
+    const triple = try linearTripleOp(&compute, input, weight, bias, weight, bias, weight, bias, 2, 3, 2);
+    defer freeTensor(&compute, triple.first);
+    defer freeTensor(&compute, triple.second);
+    defer freeTensor(&compute, triple.third);
+    try std.testing.expectEqualSlices(f32, getData(result), getData(triple.first));
+    try std.testing.expectEqualSlices(f32, getData(result), getData(triple.second));
+    try std.testing.expectEqualSlices(f32, getData(result), getData(triple.third));
+    compute.borrow_bf16_linear_weights = false;
+    try std.testing.expect(!shouldBorrowTypedWeightTensor(&compute, name, toBuf(weight).source_tensor.?));
+}
+
+test "native Qwen3 quantized-only weight handle preserves shape and lookup without dense storage" {
+    const allocator = std.testing.allocator;
+    const name = "cls.output.weight";
+    var dense = [_]f32{0} ** 64;
+    for (&dense, 0..) |*value, index| value.* = @floatFromInt(index);
+    const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
+    defer allocator.free(raw);
+    const shape = [_]i64{ 2, 32 };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.resident_weights.deinit(allocator);
+    try store.resident_weights.put(allocator, name, .{
+        .tensor = .{
+            .data = &.{},
+            .shape = &.{},
+            .dtype = .f32,
+            .name = name,
+            .allocator = allocator,
+            .owns_data = false,
+            .owns_shape = false,
+        },
+        .quantized = true,
+        .quantized_storage = .{
+            .tensor_type = .{ .known = .Q8_0 },
+            .raw_bytes = raw,
+            .shape = &shape,
+            .raw_owned = false,
+            .allocator = allocator,
+        },
+    });
+    const prepared_bytes = 2 * prepared_q8_0_block_bytes;
+    const weight_bytes = raw.len + prepared_bytes;
+    const output_bytes = 2 * 32 * @sizeOf(f32);
+    // The caller's output envelope is separate from the compressed weight
+    // reservation, which includes the two prepared Q8 row blocks.
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = weight_bytes + output_bytes });
+    const output_estimate = run_memory.Estimate{
+        .prompt_tokens = 0,
+        .retained_tokens = 0,
+        .kv_bytes = 0,
+        .kv_tier = .host,
+        .scratch_bytes = output_bytes,
+        .scratch_tier = .host,
+    };
+    try budget.reserveEstimate(output_estimate);
+    defer budget.releaseEstimate(output_estimate);
+    defer store.resident_weights.getPtr(name).?.quantized_storage.?.prepared.deinit(allocator);
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    defer compute.deinit();
+    const weight = try getWeight(&compute, name);
+    defer freeTensor(&compute, weight);
+    try std.testing.expectEqual(@as(usize, 0), toBuf(weight).data.len);
+    try std.testing.expectEqualSlices(i64, &shape, toBuf(weight).logical_shape.?);
+    try std.testing.expectEqual(prepared_bytes, toBuf(weight).quantized_storage.?.prepared.ownedBytes());
+    try std.testing.expectEqual(weight_bytes, budget.host_weight_bytes);
+    try std.testing.expectEqual(output_bytes, budget.host_scratch_bytes);
+    const result = try embeddingLookup(&compute, weight, &.{ 1, 0 }, 2, 32);
+    defer freeTensor(&compute, result);
+    var expected = [_]f32{0} ** 32;
+    for ([_]usize{ 1, 0 }, 0..) |source_row, output_row| {
+        try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, source_row, &expected);
+        try std.testing.expectEqualSlices(f32, &expected, getData(result)[output_row * 32 ..][0..32]);
+    }
+}
+
+test "native typed BF16 lazy weight stays pinned until all handles are freed" {
+    const allocator = std.testing.allocator;
+    const name = "model.layers.0.mlp.up_proj.weight";
+    var bits = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080 };
+    const shape = [_]i64{ 2, 2 };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer {
+        deinitPrefetchQueue(&store);
+        store.lazy_weights.deinit(allocator);
+    }
+    try store.lazy_weights.put(allocator, name, .{
+        .tensor_ref = .{ .name = name, .byte_len = 8 },
+        .loaded = .{ .tensor = .{
+            .data = std.mem.sliceAsBytes(&bits),
+            .shape = &shape,
+            .dtype = .bf16,
+            .name = name,
+            .allocator = allocator,
+            .owns_data = false,
+            .owns_shape = false,
+        } },
+        .loaded_bytes = 8,
+        .active_tier = .host,
+    });
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 8 });
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    compute.borrow_bf16_linear_weights = true;
+    defer compute.deinit();
+    var first: ?CT = try getWeight(&compute, name);
+    defer if (first) |weight| freeTensor(&compute, weight);
+    var shared: ?CT = try getWeight(&compute, name);
+    defer if (shared) |weight| freeTensor(&compute, weight);
+    var second: ?CT = try acquireWeight(&compute, name);
+    defer if (second) |weight| freeTensor(&compute, weight);
+    try std.testing.expectEqual(first.?, shared.?);
+    try std.testing.expect(first.? != second.?);
+    const entry = store.lazy_weights.getPtr(name).?;
+    try std.testing.expectEqual(@as(usize, 2), entry.pin_count);
+    try std.testing.expectEqual(@as(usize, 8), budget.host_weight_bytes);
+    try std.testing.expect(toBuf(first.?).source_tensor == &entry.loaded.?.tensor);
+    freeTensor(&compute, first.?);
+    first = null;
+    try std.testing.expectEqual(@as(usize, 2), entry.pin_count);
+    try std.testing.expectEqual(@as(usize, 8), budget.host_weight_bytes);
+    try std.testing.expect(toBuf(shared.?).source_tensor == &entry.loaded.?.tensor);
+    freeTensor(&compute, shared.?);
+    shared = null;
+    try std.testing.expectEqual(@as(usize, 1), entry.pin_count);
+    try std.testing.expectEqual(@as(usize, 8), budget.host_weight_bytes);
+    freeTensor(&compute, second.?);
+    second = null;
+    try std.testing.expectEqual(@as(usize, 0), entry.pin_count);
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+    try std.testing.expect(entry.loaded != null);
+}
+
+test "native typed BF16 linear panels preserve output tails" {
+    const allocator = std.testing.allocator;
+    const rows = 2;
+    const in_dim = 16385;
+    const out_dim = 129;
+    const bits = try allocator.alloc(u16, in_dim * out_dim);
+    defer allocator.free(bits);
+    @memset(bits, 0x3f80);
+    for (0..out_dim) |column| bits[column * in_dim] = if (column % 2 == 0) 0x4000 else 0xbf80;
+    const input = try allocator.alloc(f32, rows * in_dim);
+    defer allocator.free(input);
+    @memset(input, 0);
+    input[0] = 1;
+    input[in_dim - 1] = 0.5;
+    input[in_dim] = -2;
+    input[2 * in_dim - 1] = 0.25;
+    var output = [_]f32{99} ** (rows * out_dim + 2);
+    const shape = [_]i64{ out_dim, in_dim };
+    const tensor = tensor_mod.Tensor{
+        .data = std.mem.sliceAsBytes(bits),
+        .shape = &shape,
+        .dtype = .bf16,
+        .name = "model.layers.0.self_attn.o_proj.weight",
+        .allocator = allocator,
+        .owns_data = false,
+        .owns_shape = false,
+    };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var budget = run_memory.RunBudget.init(.{ .scratch_limit_bytes = 8 * 1024 * 1024 });
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    defer compute.deinit();
+    try linearNoBiasSourceTensorChunked(&compute, input, &tensor, output[1 .. output.len - 1], rows, in_dim, out_dim);
+    try std.testing.expectEqual(@as(f32, 99), output[0]);
+    try std.testing.expectEqual(@as(f32, 99), output[output.len - 1]);
+    for (0..rows) |row| {
+        for (0..out_dim) |column| {
+            const value: f32 = if (column % 2 == 0) 2 else -1;
+            const expected = value * input[row * in_dim] + input[(row + 1) * in_dim - 1];
+            try std.testing.expectApproxEqAbs(expected, output[1 + row * out_dim + column], 1e-6);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+    try std.testing.expect(budget.peak_host_total_bytes <= 8 * 1024 * 1024);
 }
 
 test "embeddingLookup dequantizes quantized GGUF rows" {
