@@ -5903,6 +5903,7 @@ pub const DB = struct {
             generation_read_lease = null;
             errdefer db.deinitWrapperState(executor_ready);
             db.core.index_manager.setIo(db.backend_runtime.io());
+            db.core.apply_mutex.io = db.backend_runtime.io();
             db.core.index_manager.setPrimaryLsmBackend(db.core.primary_store_owner.lsmBackend());
             db.core.setIndexOpenParallelism(opts.index_open_parallelism);
             const init_async_started_ns = monotonicTimeNs();
@@ -66238,6 +66239,95 @@ test "db close retires runtime owners for memory primary backend" {
         .run = Fns.run,
         .deinit = Fns.deinit,
     }));
+}
+
+test "db apply fences wait through their borrowed runtime" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    var runtime_io = try vopr.vopr_io.VoprIo.init(.{ .monotonic_ns = 100 * std.time.ns_per_s });
+    defer runtime_io.deinit();
+    const io = runtime_io.io();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = io },
+    });
+    defer runtime.deinit();
+    var db = try DB.open(alloc, "/apply-fence-vopr", .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    // Fail before attempting a blocking acquisition if DB.open loses ownership.
+    try std.testing.expect(db.core.apply_mutex.io != null);
+    try std.testing.expectEqual(io.userdata, db.core.apply_mutex.io.?.userdata);
+    const Work = struct {
+        fn run(database: *DB, shared: bool, completed: *bool) !void {
+            if (shared) {
+                try database.lockApplySharedForPortableRuntime();
+                database.core.unlockApplyShared();
+            } else {
+                // Exercise the maintenance entrypoint from the topology-churn hang.
+                _ = try database.runArtifactRepairMetadataMaintenanceAfterScan();
+            }
+            completed.* = true;
+        }
+    };
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    for ([_]bool{ false, true }) |shared| {
+        const mutex = db.core.apply_mutex;
+        if (shared) mutex.lockExclusive() else mutex.lockShared();
+        var held = true;
+        var completed = false;
+        var future = io.async(Work.run, .{ &db, shared, &completed });
+        defer {
+            if (held) {
+                if (shared) mutex.unlockExclusive() else mutex.unlockShared();
+            }
+            _ = runtime_io.cancelAndDrainTasksForTeardown(alloc, 64) catch @panic("apply fence test cleanup failed");
+            _ = future.cancel(io) catch {};
+        }
+        const scheduler = runtime_io.scheduler();
+        for (0..16) |_| {
+            if (runtime_io.futureTaskSnapshot(future.any_future.?).?.sleep_deadline_ns != null) break;
+            enabled.items.clearRetainingCapacity();
+            try scheduler.enumerateReady(&enabled, alloc);
+            try enabled.canonicalize();
+            try std.testing.expect(enabled.items.items.len != 0);
+            try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
+        }
+        try std.testing.expect(!completed);
+        const deadline = runtime_io.futureTaskSnapshot(future.any_future.?).?.sleep_deadline_ns orelse
+            return error.ExpectedBorrowedApplyFenceWait;
+        const expected_delay_us: i96 = 50 + @as(i96, @intCast(if (shared)
+            @as(u64, @intCast(runtime_io.monotonic_ns)) & 0x3f
+        else
+            (@as(u64, @intCast(runtime_io.monotonic_ns)) >> 6) & 0x3f));
+        try std.testing.expectEqual(runtime_io.monotonic_ns + expected_delay_us * std.time.ns_per_us, deadline);
+        if (shared) mutex.unlockExclusive() else mutex.unlockShared();
+        held = false;
+        for (0..32) |_| {
+            if (scheduler.quiescent()) break;
+            enabled.items.clearRetainingCapacity();
+            try scheduler.enumerateReady(&enabled, alloc);
+            try enabled.canonicalize();
+            try std.testing.expect(enabled.items.items.len != 0);
+            try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
+        }
+        try std.testing.expect(scheduler.quiescent());
+        try future.await(io);
+        try std.testing.expect(completed);
+        try std.testing.expectEqual(@as(u64, 0), mutex.exclusive_waiters.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), mutex.shared_waiters.load(.acquire));
+    }
+    try runtime_io.ensureNoCapabilityViolation();
 }
 
 test "db replay truncation waits for repair pins through borrowed VoprIo" {

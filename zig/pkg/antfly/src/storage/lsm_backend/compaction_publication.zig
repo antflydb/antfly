@@ -507,75 +507,64 @@ test "compaction publication stages and rebases all roots and cleans every alloc
 }
 
 test "compaction publication uses the borrowed clock for bounded preparation" {
-    const vopr = @import("vopr");
     const allocator = std.testing.allocator;
-    var vopr_io = try vopr.vopr_io.VoprIo.init(.{});
-    defer vopr_io.deinit();
-    const Work = struct {
-        fn run(alloc: std.mem.Allocator, model: *vopr.vopr_io.VoprIo) !void {
-            const Backend = @import("../lsm_backend.zig").Backend;
-            var backend = Backend.init(alloc, .{
-                .wal_enabled = false,
-                .read_runtime = @import("storage_io.zig").ReadRuntime.init(model.io()),
-            });
-            defer backend.close();
-            try std.testing.expect(backend.mu.tryLock());
-            defer backend.mu.unlock();
-            backend.retainReaderKind(.compaction);
-            defer backend.releaseReaderKind(.compaction);
-            try TestFixture.append(&backend, 1, 0, "a");
-            try TestFixture.append(&backend, 2, 0, "a");
-            const directory = try backend.planningDirectory();
-            const handles = [_]Directory.Handle{ directory.at(0), directory.at(1) };
-            const plan = Plan{
-                .source_level = 0,
-                .source_start = 0,
-                .source_len = 2,
-                .target_start = 2,
-                .target_len = 0,
-                .output_level = 1,
-                .input_handles = &handles,
-                .complete_coverage = true,
-            };
-            var outputs: std.ArrayListUnmanaged(Run) = .empty;
-            var job = try Job.init(&backend, plan, 0);
-            backend.active_compaction_publications = &job;
-            defer {
-                job.finishLocked(&backend, &outputs);
-                backend.active_compaction_publications = null;
-            }
-            // One credit advances exactly one input while the owning clock is
-            // before the deadline, regardless of the host clock's epoch.
-            backend.mu.unlock();
-            const first = job.step(&backend, &.{}, 1, 10);
-            try std.testing.expect(backend.mu.tryLock());
-            try first;
-            try std.testing.expectEqual(@as(usize, 1), job.prepared_inputs);
-            try model.advance(10);
-            backend.mu.unlock();
-            const expired = job.step(&backend, &.{}, 1, 10);
-            try std.testing.expect(backend.mu.tryLock());
-            try expired;
-            try std.testing.expectEqual(@as(usize, 1), job.prepared_inputs);
+    const Clock = struct {
+        var now_ns: i96 = 0;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = now_ns };
         }
     };
-    var future = vopr_io.io().async(Work.run, .{ allocator, &vopr_io });
-    var enabled: vopr.transition.List = .{};
-    defer enabled.deinit(allocator);
-    var events: vopr.event.Sink = .{};
-    defer events.deinit(allocator);
-    const scheduler = vopr_io.scheduler();
-    for (0..128) |_| {
-        if (scheduler.quiescent()) break;
-        enabled.items.clearRetainingCapacity();
-        try scheduler.enumerateReady(&enabled, allocator);
-        try enabled.canonicalize();
-        try std.testing.expect(enabled.items.items.len != 0);
-        try scheduler.executeReady(enabled.items.items[0].id, &events, allocator);
+    // This leaf storage test also runs in lean sparse-index roots. Override
+    // only the clock, retaining the native I/O context for synchronization.
+    // Composed VOPR tests separately cover scheduling and cancellation.
+    Clock.now_ns = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const Backend = @import("../lsm_backend.zig").Backend;
+    var backend = Backend.init(allocator, .{
+        .wal_enabled = false,
+        .read_runtime = @import("storage_io.zig").ReadRuntime.init(io),
+    });
+    defer backend.close();
+    try std.testing.expect(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    backend.retainReaderKind(.compaction);
+    defer backend.releaseReaderKind(.compaction);
+    try TestFixture.append(&backend, 1, 0, "a");
+    try TestFixture.append(&backend, 2, 0, "a");
+    const directory = try backend.planningDirectory();
+    const handles = [_]Directory.Handle{ directory.at(0), directory.at(1) };
+    const plan = Plan{
+        .source_level = 0,
+        .source_start = 0,
+        .source_len = 2,
+        .target_start = 2,
+        .target_len = 0,
+        .output_level = 1,
+        .input_handles = &handles,
+        .complete_coverage = true,
+    };
+    var outputs: std.ArrayListUnmanaged(Run) = .empty;
+    var job = try Job.init(&backend, plan, 0);
+    backend.active_compaction_publications = &job;
+    defer {
+        job.finishLocked(&backend, &outputs);
+        backend.active_compaction_publications = null;
     }
-    try std.testing.expect(scheduler.quiescent());
-    try future.await(vopr_io.io());
-    try vopr_io.ensureNoCapabilityViolation();
+    // One credit advances exactly one input while the owning clock is
+    // before the deadline, regardless of the host clock's epoch.
+    backend.mu.unlock();
+    const first = job.step(&backend, &.{}, 1, 10);
+    try std.testing.expect(backend.mu.tryLock());
+    try first;
+    try std.testing.expectEqual(@as(usize, 1), job.prepared_inputs);
+    Clock.now_ns = 10;
+    backend.mu.unlock();
+    const expired = job.step(&backend, &.{}, 1, 10);
+    try std.testing.expect(backend.mu.tryLock());
+    try expired;
+    try std.testing.expectEqual(@as(usize, 1), job.prepared_inputs);
 }
 
 test "compaction publication atomic fence scaling benchmark" {
