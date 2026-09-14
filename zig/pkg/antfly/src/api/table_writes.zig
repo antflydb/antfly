@@ -14593,6 +14593,16 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
+            const busy_result = StartupCatchUpResult{
+                .had_debt = true,
+                .busy = true,
+                .index_repair_pending = metadata.advance_index_repairs,
+            };
+            self.invalidateRepairHandoffOwnerAuditBestEffort(table_name, group_id);
+            if (!self.tryBeginStartupCatchUpGroupOperation(table_name, group_id, metadata.advance_index_repairs)) {
+                return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
+            }
+            defer self.endGroupOperation(table_name, group_id);
             const publication_token = if (self.runtime_status_cache) |snapshot_cache|
                 try snapshot_cache.capturePublicationToken(table_name)
             else
@@ -14606,6 +14616,13 @@ pub const ProvisionedTableWriteSource = struct {
                 false,
             )) orelse return error.StorageKernelOwnerUnavailable;
             defer observation.deinit(alloc);
+            if (observation.result.state == .busy) {
+                // The compiled owner has a separate admission fence. Keep the
+                // exact retry key when it yields, just as for group contention.
+                // Admission above clears the prior key so a stale scheduler
+                // snapshot cannot retire a newly deferred attempt.
+                return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
+            }
             if (publication_token) |token| {
                 if (observation.runtime_status) |status| {
                     _ = publishRuntimeStatusGroupAfterObservation(
@@ -33060,6 +33077,49 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "compiled startup catch-up retains exact retries across owner contention" {
+            if (comptime !control_only_storage_sources) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            const Fake = struct {
+                busy: bool = true,
+                calls: usize = 0,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return error.UnexpectedBatch;
+                }
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: ?[]const u8, advance: bool, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(!advance and !retain);
+                    self.calls += 1;
+                    return .{ .result = .{ .state = if (self.busy) .busy else .complete } };
+                }
+            };
+            var fake = Fake{};
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-owner-catch-up", table_catalog.emptyCatalogSource());
+            defer source.deinit();
+            source.local_write_source = .{ .ptr = &fake, .vtable = &.{
+                .batch = Fake.batch,
+                .reconcile_table_group_local_observed = Fake.observe,
+            } };
+            const first = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{});
+            try std.testing.expect(first.busy and first.had_debt);
+            const old = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(old);
+            try std.testing.expectEqual(@as(usize, 1), old.len);
+            try std.testing.expect((try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{})).busy);
+            source.clearDeferredStartupCatchUpGroupIfUnchanged(old[0]);
+            const next = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(next);
+            try std.testing.expectEqual(@as(usize, 1), next.len);
+            try std.testing.expect(next[0].generation != old[0].generation);
+            fake.busy = false;
+            const complete = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{});
+            try std.testing.expect(!complete.busy and !complete.had_debt);
+            const cleared = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(cleared);
+            try std.testing.expectEqual(@as(usize, 0), cleared.len);
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+        }
+
         test "compiled structural reconciliation publishes its owner observation and defers absent proof" {
             if (comptime !control_only_storage_sources) return error.SkipZigTest;
             const alloc = std.testing.allocator;

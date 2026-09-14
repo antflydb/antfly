@@ -10323,3 +10323,40 @@ publication regression, with no leaks. The latter binds catalog authority,
 verifies that an empty observation is still rejected, and publishes the captured
 owner proof through the targeted path. Saved recovery and fresh timings remain
 pending for this revision.
+
+
+#### Post-merge comparison: periodic owner admission
+
+The committed observation repair (`8337942cb1`) passed three saved vector-store
+restart/automatic-GC checks and two saved LSM restart/concurrent-query checks.
+All four fresh 50K arms passed their workloads and reclamation gates. In AB/BA
+order, vector-store readiness improved 4.6%/7.8%, and total allocated disk after
+restart fell 45.5%/43.0%. Peak QPS changed -12.4%/+11.6%; mixed-workload QPS
+changed -8.8%/-3.8%. These controls share explicit ANN settings; ownership is
+the table-level treatment.
+
+The first fresh 1M LSM arm reached readiness in 318.5 seconds and completed the
+read-only query windows, but a query returned HTTP 503 during mixed updates.
+No 1M vector-store arm started. The empty targeted-observation loop and error
+identity collapse were absent. A separate unsampled restart reproduction also
+failed with query 503s. Evidence is preserved in
+`.benchmark-results/vector-store-boundary-repair-20260913/` and
+`.benchmark-results/vector-store-owner-admission-20260914/`.
+
+Periodic startup inspection used the same waiting exclusive owner admission as
+structural changes. Waiting behind an existing lease installed an exclusive
+pending flag, which blocked new foreground leases; a long derived-index apply
+could then exhaust their five-second admission deadline. A diagnostic sample
+captured catch-up waiting for owner admission and maintenance waiting for the DB
+apply lock. Sampling was intrusive and supplies stack evidence only; the fresh
+failure and separate unsampled reproduction establish the request failure.
+
+Periodic inspection now attempts exclusive admission only when idle, yielding
+without installing a pending writer gate. Structural changes and explicit repair
+retain their waiting admission. The compiled catch-up path also uses the existing
+group admission/deferred-key protocol: a busy owner preserves an exact retry,
+and a new attempt changes its generation so stale scheduler cleanup cannot
+remove new debt. Owner/root/catalog identity checks and observation publication
+fences remain enforced. Focused tests cover foreground admission, structural
+writer preference, deferred retry retention and eventual completion. All six owner-source suite checks pass with no leaks. Saved-workload recovery
+and fresh same-binary comparison qualification are pending; this change does not promote vector-store ownership to the default.

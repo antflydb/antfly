@@ -60,6 +60,8 @@ pub fn add(
                     &.{
                         b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])}),
                         "compiled structural reconciliation publishes",
+                        "storage owner lease",
+                        "compiled startup catch-up retains exact retries",
                     }
                 else
                     &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
