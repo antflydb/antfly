@@ -56,9 +56,9 @@ const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const portable_backup = @import("../storage/portable_backup.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
-const ha_primary_mod = @import("../storage/ha/primary.zig");
-const ha_mutation_barrier_mod = @import("../storage/ha/mutation_barrier.zig");
-const ha_public_gate_state_mod = @import("../storage/ha/public_gate_state.zig");
+const ha_primary_mod = @import("../storage/hot_standby/primary.zig");
+const ha_mutation_barrier_mod = @import("../storage/hot_standby/mutation_barrier.zig");
+const ha_public_gate_state_mod = @import("../storage/hot_standby/public_gate_state.zig");
 const storage_schema = @import("../storage/schema.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
@@ -53315,7 +53315,7 @@ fn implementationTests() type {
             });
             _ = try source.withHAWriteGate(.{ .shared = .{ .state = &gate_state } });
 
-            const ha_effects = @import("../storage/ha/effects.zig");
+            const ha_effects = @import("../storage/hot_standby/effects.zig");
             const payload = try ha_effects.encodeBatchMutationRequestAlloc(alloc, .{
                 .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
             });

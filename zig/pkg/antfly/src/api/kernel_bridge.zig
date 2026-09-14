@@ -27,7 +27,7 @@ const table_writes = @import("table_write_source.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
-const ha_http_operation = @import("../storage/ha/http_operation.zig");
+const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
 const internal_routes = @import("../internal/routes.zig");
 
@@ -431,8 +431,10 @@ const OpaqueHttpxHandler = struct {
 fn requiresHostInternalServicePrincipal(path: []const u8) bool {
     const in_internal_namespace = std.mem.eql(u8, path, internal_routes.base) or
         std.mem.startsWith(u8, path, internal_routes.base ++ "/");
-    const ha_exempt = std.mem.eql(u8, path, internal_routes.ha) or
-        std.mem.startsWith(u8, path, internal_routes.ha ++ "/");
+    const ha_exempt = std.mem.eql(u8, path, internal_routes.standby) or
+        std.mem.startsWith(u8, path, internal_routes.standby ++ "/") or
+        std.mem.eql(u8, path, internal_routes.legacy_standby) or
+        std.mem.startsWith(u8, path, internal_routes.legacy_standby ++ "/");
     return in_internal_namespace and !ha_exempt;
 }
 

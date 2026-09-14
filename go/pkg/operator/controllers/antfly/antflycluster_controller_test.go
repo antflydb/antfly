@@ -15069,12 +15069,15 @@ func TestReconcileStandaloneStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	sts := &appsv1.StatefulSet{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
 	primaryArgs := sts.Spec.Template.Spec.Containers[0].Args[0]
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-log '/antflydb/ha/primary.wal'`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-slots '/antflydb/ha/slots'`))
+	// This is a brand-new cluster (no StatefulSet existed before the first
+	// reconcile), so the operator decides the 0.3 standby/ layout immediately.
+	g.Expect(cluster.Status.HAStatus.DataLayout).To(Equal(antflyv1.HADataLayoutStandby))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-log '/antflydb/standby/primary.wal'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-slots '/antflydb/standby/slots'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-node-id 'primary-a'`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-seed-capture-root '/antflydb/ha/seed-captures'`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-fence-wal '/antflydb/ha/fence.wal'`))
-	g.Expect(primaryArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/ha/primary.wal'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-seed-capture-root '/antflydb/standby/seed-captures'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-fence-wal '/antflydb/standby/fence.wal'`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/standby/primary.wal'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--admin-token-env 'ANTFLY_HA_ADMIN_TOKEN'`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-retention-max-lag-lsn 50`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-retention-max-retained-bytes 4096`))
@@ -15129,7 +15132,8 @@ func TestReconcileStandaloneStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-log '/antflydb/custom/standby.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-progress '/antflydb/custom/progress.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-node-id 'standby-a'`))
-	g.Expect(standbyArgs).To(ContainSubstring(`--ha-seed-capture-root '/antflydb/ha/seed-captures'`))
+	// The data layout was already decided as standby above and never reverts.
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-seed-capture-root '/antflydb/standby/seed-captures'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-fence-wal '/antflydb/custom/fence.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-former-primary-log '/antflydb/custom/former-primary.wal'`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--admin-token-env 'CUSTOM_HA_ADMIN_TOKEN'`))
@@ -15628,6 +15632,11 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 			}
 		}
 	}`, digest, strings.Repeat("b", 64), strings.Repeat("c", 64), strings.Repeat("d", 64), strings.Repeat("e", 64), strings.Repeat("f", 64))), observedStatus)).To(Succeed())
+	// This scenario models an existing cluster being promoted onto an
+	// already-provisioned target PVC, not a brand-new one, so pin the layout
+	// explicitly rather than relying on the first reconcile's brand-new-cluster
+	// inference (which observedStatus below otherwise discards).
+	observedStatus.DataLayout = antflyv1.HADataLayoutLegacy
 	cluster.Status.HAStatus = observedStatus
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
@@ -16006,7 +16015,7 @@ func TestStandaloneHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {
 			Selection:    antflyv1.HAStandbySelectionAll,
 			StandbyNames: []string{"standby-a", "standby-b"},
 		},
-	}, "")
+	}, "", antflyv1.HADataLayoutLegacy)
 
 	g.Expect(args).To(ContainSubstring(`--ha-sync-mode 'remote-apply'`))
 	g.Expect(args).To(ContainSubstring(`--ha-sync-selection 'all'`))
@@ -16028,13 +16037,13 @@ func TestStandaloneHAArgsScopesDefaultStandbyProgressToActivatedGeneration(t *te
 		},
 	}
 
-	args := standaloneHAArgs(ha, "reseed-standby-a-topology-2")
+	args := standaloneHAArgs(ha, "reseed-standby-a-topology-2", antflyv1.HADataLayoutLegacy)
 	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/ha/standby-generations/reseed-standby-a-topology-2/receive.wal'`))
 	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/ha/standby-generations/reseed-standby-a-topology-2/progress.wal'`))
 
 	ha.Runtime.Standby.LogPath = "/antflydb/custom/receive.wal"
 	ha.Runtime.Standby.ProgressPath = "/antflydb/custom/progress.wal"
-	args = standaloneHAArgs(ha, "reseed-standby-a-topology-2")
+	args = standaloneHAArgs(ha, "reseed-standby-a-topology-2", antflyv1.HADataLayoutLegacy)
 	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/custom/receive.wal'`))
 	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/custom/progress.wal'`))
 }
@@ -16059,7 +16068,7 @@ func TestStandaloneHAArgsShellQuotesRuntimeValues(t *testing.T) {
 			Mode:         antflyv1.HADurabilityModeRemoteWrite,
 			StandbyNames: []string{"standby-$(touch /tmp/pwned)"},
 		},
-	}, "")
+	}, "", antflyv1.HADataLayoutLegacy)
 
 	g.Expect(args).To(ContainSubstring(`--ha-primary-node-id 'primary-$(touch /tmp/pwned)` + "`" + `x` + "`" + `'`))
 	g.Expect(args).To(ContainSubstring(`--ha-former-primary-log '/antflydb/ha/'\''former.wal'`))

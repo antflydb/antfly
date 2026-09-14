@@ -100,22 +100,25 @@ func TestHAAdminTokenSecretInjectionManifestsAreAligned(t *testing.T) {
 		t.Fatalf("deployment namespace = %q, want %q", deployment.Namespace, OperatorNamespace)
 	}
 
-	tokenEnv, ok := findContainerEnv(deployment.Spec.Template.Spec.Containers, "antfly-operator-manager", "ANTFLY_HA_ADMIN_TOKEN")
+	// The operator reads ANTFLY_STANDBY_ADMIN_TOKEN first and falls back to
+	// ANTFLY_HA_ADMIN_TOKEN; the shipped deployment injects the preferred name.
+	const operatorTokenEnv = "ANTFLY_STANDBY_ADMIN_TOKEN"
+	tokenEnv, ok := findContainerEnv(deployment.Spec.Template.Spec.Containers, "antfly-operator-manager", operatorTokenEnv)
 	if !ok {
-		t.Fatal("deployment must inject ANTFLY_HA_ADMIN_TOKEN into antfly-operator-manager")
+		t.Fatalf("deployment must inject %s into antfly-operator-manager", operatorTokenEnv)
 	}
 	if tokenEnv.ValueFrom == nil || tokenEnv.ValueFrom.SecretKeyRef == nil {
-		t.Fatalf("ANTFLY_HA_ADMIN_TOKEN must come from a Secret key ref: %#v", tokenEnv)
+		t.Fatalf("%s must come from a Secret key ref: %#v", operatorTokenEnv, tokenEnv)
 	}
 	secretRef := tokenEnv.ValueFrom.SecretKeyRef
 	if secretRef.Name != "antfly-ha-admin-token" {
-		t.Fatalf("ANTFLY_HA_ADMIN_TOKEN Secret name = %q, want antfly-ha-admin-token", secretRef.Name)
+		t.Fatalf("%s Secret name = %q, want antfly-ha-admin-token", operatorTokenEnv, secretRef.Name)
 	}
 	if secretRef.Key != "token" {
-		t.Fatalf("ANTFLY_HA_ADMIN_TOKEN Secret key = %q, want token", secretRef.Key)
+		t.Fatalf("%s Secret key = %q, want token", operatorTokenEnv, secretRef.Key)
 	}
 	if secretRef.Optional == nil || !*secretRef.Optional {
-		t.Fatal("ANTFLY_HA_ADMIN_TOKEN Secret key ref must be optional for deployments without HA admin automation")
+		t.Fatalf("%s Secret key ref must be optional for deployments without HA admin automation", operatorTokenEnv)
 	}
 
 	rawExample, err := os.ReadFile("../examples/ha-hot-standby-standalone.yaml")

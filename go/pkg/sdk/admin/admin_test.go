@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -106,7 +107,7 @@ func TestInternalClientRemoveMetadataPeerSendsToken(t *testing.T) {
 	}
 }
 
-func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
+func TestStandbyClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -158,9 +159,9 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	resp, err := client.WithToken("test-token").CreateReplicationSlot(context.Background(), ReplicationSlotCreateRequest{
 		SlotName:   "standby-a",
@@ -177,7 +178,7 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 	}
 }
 
-func TestHAClientRejectsInvalidHAInputsLocally(t *testing.T) {
+func TestStandbyClientRejectsInvalidStandbyInputsLocally(t *testing.T) {
 	t.Parallel()
 
 	var requests atomic.Int32
@@ -187,11 +188,11 @@ func TestHAClientRejectsInvalidHAInputsLocally(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
-	identity := HAIdentity{
+	identity := StandbyIdentity{
 		ClusterId:  1,
 		ShardId:    0,
 		TableId:    0,
@@ -215,14 +216,20 @@ func TestHAClientRejectsInvalidHAInputsLocally(t *testing.T) {
 		LastLsn:                         9,
 		RetainedFromLsn:                 1,
 		AllowRewindAfterForcedPromotion: false,
-		Receipt:                         HAFenceReceipt{},
+		Receipt:                         StandbyFenceReceipt{},
 	}
-	validSyncPolicy := HASyncPolicy{
-		Mode:          HASyncPolicyModeRemoteWrite,
-		Selection:     HASyncPolicySelectionAny,
+	validSyncPolicy := StandbySyncPolicy{
+		Mode:          StandbySyncPolicyModeRemoteWrite,
+		Selection:     StandbySyncPolicySelectionAny,
 		Required:      1,
-		FailurePolicy: HASyncPolicyFailureFailClosed,
+		FailurePolicy: StandbySyncPolicyFailureFailClosed,
 		StandbyNames:  []string{"standby-a"},
+	}
+	validStandbyUpstream := StandbyUpstreamRequest{
+		Identity:    identity,
+		UpstreamUrl: "https://primary-b.example:5433",
+		SlotName:    "standby-a",
+		Reason:      "switchover",
 	}
 
 	tests := []struct {
@@ -263,7 +270,7 @@ func TestHAClientRejectsInvalidHAInputsLocally(t *testing.T) {
 		{
 			name: "primary status sync standby padded",
 			call: func() error {
-				_, err := client.PrimaryStatus(context.Background(), &HAPrimaryStatusParams{
+				_, err := client.PrimaryStatus(context.Background(), &StandbyPrimaryStatusParams{
 					SyncStandby: []string{"standby-a "},
 				})
 				return err
@@ -352,6 +359,51 @@ func TestHAClientRejectsInvalidHAInputsLocally(t *testing.T) {
 			},
 		},
 		{
+			name: "set standby upstream incomplete identity",
+			call: func() error {
+				body := validStandbyUpstream
+				body.Identity = StandbyIdentity{}
+				_, err := client.SetStandbyUpstream(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "set standby upstream missing scheme",
+			call: func() error {
+				body := validStandbyUpstream
+				body.UpstreamUrl = "primary-b.example:5433"
+				_, err := client.SetStandbyUpstream(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "set standby upstream unsupported scheme",
+			call: func() error {
+				body := validStandbyUpstream
+				body.UpstreamUrl = "ftp://primary-b.example:5433"
+				_, err := client.SetStandbyUpstream(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "set standby upstream padded url",
+			call: func() error {
+				body := validStandbyUpstream
+				body.UpstreamUrl = " https://primary-b.example:5433"
+				_, err := client.SetStandbyUpstream(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "set standby upstream invalid slot name",
+			call: func() error {
+				body := validStandbyUpstream
+				body.SlotName = "standby/a"
+				_, err := client.SetStandbyUpstream(context.Background(), body)
+				return err
+			},
+		},
+		{
 			name: "promote padded promoted node id",
 			call: func() error {
 				body := validFence
@@ -373,7 +425,7 @@ func TestHAClientRejectsInvalidHAInputsLocally(t *testing.T) {
 			name: "rewind rejoin invalid receipt old primary id",
 			call: func() error {
 				body := validRejoin
-				body.Receipt = HAFenceReceipt{
+				body.Receipt = StandbyFenceReceipt{
 					Identity:         identity,
 					OldPrimaryId:     "primary a",
 					PromotedNodeId:   "standby-a",
@@ -396,7 +448,7 @@ func TestHAClientRejectsInvalidHAInputsLocally(t *testing.T) {
 			name: "reseed rejoin invalid receipt promoted node id",
 			call: func() error {
 				body := validRejoin
-				body.Receipt = HAFenceReceipt{
+				body.Receipt = StandbyFenceReceipt{
 					Identity:         identity,
 					OldPrimaryId:     "primary-a",
 					PromotedNodeId:   strings.Repeat("a", 129),
@@ -428,7 +480,7 @@ func TestHAClientRejectsInvalidHAInputsLocally(t *testing.T) {
 	}
 }
 
-func TestHAClientSeedWorkflowUsesAdminAPI(t *testing.T) {
+func TestStandbyClientSeedWorkflowUsesAdminAPI(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -457,29 +509,29 @@ func TestHAClientSeedWorkflowUsesAdminAPI(t *testing.T) {
 				!strings.Contains(got, `"manifest_id":"manifest-a"`) {
 				t.Fatalf("base backup begin body = %s, want slot and manifest", got)
 			}
-			_, _ = fmt.Fprint(w, haBaseBackupBeginResponseJSON())
+			_, _ = fmt.Fprint(w, standbyBaseBackupBeginResponseJSON())
 		case HABaseBackupsFinishPath:
 			got := string(body)
 			if !strings.Contains(got, `"manifest_path":"/backup/manifest-a.json"`) {
 				t.Fatalf("base backup finish body = %s, want manifest path", got)
 			}
-			_, _ = fmt.Fprint(w, haBaseBackupFinishResponseJSON())
+			_, _ = fmt.Fprint(w, standbyBaseBackupFinishResponseJSON())
 		case HAStandbyBootstrapPath:
 			got := string(body)
 			if !strings.Contains(got, `"manifest_path":"/backup/manifest-a.json"`) ||
 				!strings.Contains(got, `"content_root":"/backup/files"`) {
 				t.Fatalf("standby bootstrap body = %s, want manifest path and content root", got)
 			}
-			_, _ = fmt.Fprint(w, haStandbyBootstrapResponseJSON())
+			_, _ = fmt.Fprint(w, standbyBootstrapResponseJSON())
 		default:
 			t.Fatalf("path = %s, want HA seed workflow endpoint", r.URL.Path)
 		}
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	client.WithToken("test-token")
 
@@ -490,7 +542,7 @@ func TestHAClientSeedWorkflowUsesAdminAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginBaseBackup returned error: %v", err)
 	}
-	if begin.Action.ActionKind != HAActionKindBaseBackupBegin ||
+	if begin.Action.ActionKind != StandbyActionKindBaseBackupBegin ||
 		begin.Action.NodeId != "primary-a" ||
 		begin.BackupLsn != 7 ||
 		begin.StartRecordLsn != 8 {
@@ -503,7 +555,7 @@ func TestHAClientSeedWorkflowUsesAdminAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FinishBaseBackup returned error: %v", err)
 	}
-	if finish.Action.ActionKind != HAActionKindBaseBackupFinish ||
+	if finish.Action.ActionKind != StandbyActionKindBaseBackupFinish ||
 		finish.Action.NodeId != "primary-a" ||
 		finish.BackupLsn != 7 ||
 		finish.EndRecordLsn != 9 {
@@ -517,7 +569,7 @@ func TestHAClientSeedWorkflowUsesAdminAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BootstrapStandby returned error: %v", err)
 	}
-	if bootstrap.Action.ActionKind != HAActionKindStandbyBootstrap ||
+	if bootstrap.Action.ActionKind != StandbyActionKindStandbyBootstrap ||
 		bootstrap.Action.NodeId != "standby-a" ||
 		bootstrap.BackupLsn != 7 ||
 		bootstrap.CheckpointLsn != 10 {
@@ -525,7 +577,65 @@ func TestHAClientSeedWorkflowUsesAdminAPI(t *testing.T) {
 	}
 }
 
-func TestHAClientAcquireFenceUsesAdminAPI(t *testing.T) {
+func TestStandbyClientSetStandbyUpstreamUsesAdminAPI(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodPost)
+		}
+		if r.URL.Path != HAStandbyUpstreamPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAStandbyUpstreamPath)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll returned error: %v", err)
+		}
+		got := string(body)
+		if !strings.Contains(got, `"upstream_url":"https://primary-b.example:5433"`) ||
+			!strings.Contains(got, `"slot_name":"standby-a"`) ||
+			!strings.Contains(got, `"reason":"switchover"`) {
+			t.Fatalf("set standby upstream body = %s, want upstream url, slot, and reason", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyUpstreamResponseJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	resp, err := client.WithToken("test-token").SetStandbyUpstream(context.Background(), StandbyUpstreamRequest{
+		Identity: StandbyIdentity{
+			ClusterId:  100,
+			ShardId:    10,
+			TableId:    20,
+			TimelineId: 4,
+			Epoch:      6,
+		},
+		UpstreamUrl: "https://primary-b.example:5433",
+		SlotName:    "standby-a",
+		Reason:      "switchover",
+	})
+	if err != nil {
+		t.Fatalf("SetStandbyUpstream returned error: %v", err)
+	}
+	if resp.Action.ActionKind != StandbyActionKindStandbyUpstream || resp.Action.NodeId != "standby-a" {
+		t.Fatalf("standby upstream action = %#v, want standby upstream receipt", resp.Action)
+	}
+	if !resp.Changed || resp.Upstream.UpstreamUrl != "https://primary-b.example:5433" || resp.Upstream.SlotName != "standby-a" {
+		t.Fatalf("standby upstream response = %#v, want changed upstream evidence", resp)
+	}
+	if resp.Previous.UpstreamUrl != "https://primary-a.example:5433" || resp.Previous.SlotName != "standby-a" {
+		t.Fatalf("standby upstream previous = %#v, want prior upstream evidence", resp.Previous)
+	}
+}
+
+func TestStandbyClientAcquireFenceUsesAdminAPI(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -558,16 +668,16 @@ func TestHAClientAcquireFenceUsesAdminAPI(t *testing.T) {
 			t.Fatalf("fence acquire body = %s, want primary, standby, LSN, timeline, and reason", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, haFenceAcquireResponseJSON())
+		_, _ = fmt.Fprint(w, standbyFenceAcquireResponseJSON())
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	resp, err := client.WithToken("test-token").AcquireFence(context.Background(), FenceAcquireRequest{
-		Identity: HAIdentity{
+		Identity: StandbyIdentity{
 			ClusterId:  100,
 			ShardId:    10,
 			TableId:    20,
@@ -586,7 +696,7 @@ func TestHAClientAcquireFenceUsesAdminAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcquireFence returned error: %v", err)
 	}
-	if resp.Action.ActionKind != HAActionKindFenceAcquire || resp.Action.NodeId != "standby-a" {
+	if resp.Action.ActionKind != StandbyActionKindFenceAcquire || resp.Action.NodeId != "standby-a" {
 		t.Fatalf("fence action = %#v, want standby fence acquisition receipt", resp.Action)
 	}
 	if resp.Receipt.Generation != 3 ||
@@ -598,7 +708,50 @@ func TestHAClientAcquireFenceUsesAdminAPI(t *testing.T) {
 	}
 }
 
-func TestHAClientPromoteWithCurrentFenceUsesAdminAPI(t *testing.T) {
+func TestStandbyClientAcquireFenceAllowsOmittedGeneration(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll returned error: %v", err)
+		}
+		got := string(body)
+		if strings.Contains(got, `"generation"`) {
+			t.Fatalf("fence acquire body = %s, want generation omitted when unset", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyFenceAcquireResponseJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	// Generation is intentionally left at its zero value: the server
+	// allocates the next generation when it is omitted from the request.
+	_, err = client.AcquireFence(context.Background(), FenceAcquireRequest{
+		Identity: StandbyIdentity{
+			ClusterId:  100,
+			ShardId:    10,
+			TableId:    20,
+			TimelineId: 4,
+			Epoch:      6,
+		},
+		OldPrimaryId:   "primary-a",
+		PromotedNodeId: "standby-a",
+		NewTimelineId:  5,
+		NewEpoch:       7,
+		RequiredLsn:    12,
+		ObservedLsn:    12,
+	})
+	if err != nil {
+		t.Fatalf("AcquireFence with omitted generation returned error: %v", err)
+	}
+}
+
+func TestStandbyClientPromoteWithCurrentFenceUsesAdminAPI(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -615,19 +768,19 @@ func TestHAClientPromoteWithCurrentFenceUsesAdminAPI(t *testing.T) {
 			t.Fatalf("Accept = %q, want application/json", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, haPromotionResponseJSON())
+		_, _ = fmt.Fprint(w, standbyPromotionResponseJSON())
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	resp, err := client.WithToken("test-token").PromoteWithCurrentFence(context.Background())
 	if err != nil {
 		t.Fatalf("PromoteWithCurrentFence returned error: %v", err)
 	}
-	if resp.Action.ActionKind != HAActionKindPromotion || resp.Action.NodeId != "standby-a" {
+	if resp.Action.ActionKind != StandbyActionKindPromotion || resp.Action.NodeId != "standby-a" {
 		t.Fatalf("promotion action = %#v, want standby promotion receipt", resp.Action)
 	}
 	if resp.Promotion.NewIdentity.TimelineId != 5 || resp.Promotion.SwitchLsn != 13 {
@@ -638,7 +791,7 @@ func TestHAClientPromoteWithCurrentFenceUsesAdminAPI(t *testing.T) {
 	}
 }
 
-func TestHAClientAssessPromotionUsesAdminAPI(t *testing.T) {
+func TestStandbyClientAssessPromotionUsesAdminAPI(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -669,13 +822,13 @@ func TestHAClientAssessPromotionUsesAdminAPI(t *testing.T) {
 			t.Fatalf("promotion assess body = %s, want required LSN and fence mode fields", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, haPromotionAssessResponseJSON())
+		_, _ = fmt.Fprint(w, standbyPromotionAssessResponseJSON())
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	resp, err := client.WithToken("test-token").AssessPromotion(context.Background(), PromotionAssessRequest{
 		RequiredLsn:      12,
@@ -686,10 +839,10 @@ func TestHAClientAssessPromotionUsesAdminAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AssessPromotion returned error: %v", err)
 	}
-	if resp.Action.ActionKind != HAActionKindPromotionAssess || resp.Action.State != HAActionStateAssessed {
+	if resp.Action.ActionKind != StandbyActionKindPromotionAssess || resp.Action.State != StandbyActionStateAssessed {
 		t.Fatalf("promotion assess action = %#v, want assessed promotion receipt", resp.Action)
 	}
-	if !resp.Assessment.CanPromote || !resp.Assessment.Safe || resp.Assessment.Mode != HAPromotionModeSafe {
+	if !resp.Assessment.CanPromote || !resp.Assessment.Safe || resp.Assessment.Mode != StandbyPromotionModeSafe {
 		t.Fatalf("promotion assessment = %#v, want safe promotable assessment", resp.Assessment)
 	}
 	if resp.Assessment.RequiredLsn != 12 || resp.Assessment.ReceivedLsn != 12 || resp.Assessment.AppliedLsn != 12 {
@@ -697,7 +850,7 @@ func TestHAClientAssessPromotionUsesAdminAPI(t *testing.T) {
 	}
 }
 
-func TestHAClientRewindRejoinUsesAdminAPI(t *testing.T) {
+func TestStandbyClientRewindRejoinUsesAdminAPI(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -728,19 +881,19 @@ func TestHAClientRewindRejoinUsesAdminAPI(t *testing.T) {
 			t.Fatalf("rejoin rewind body = %s, want node, LSN, retention, and force-rewind fields", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, haRejoinRewindResponseJSON())
+		_, _ = fmt.Fprint(w, standbyRejoinRewindResponseJSON())
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	resp, err := client.WithToken("test-token").RewindRejoin(context.Background(), RejoinAssessRequest{
 		NodeId:          "primary-a",
 		LastLsn:         13,
 		RetainedFromLsn: 8,
-		Identity: HAIdentity{
+		Identity: StandbyIdentity{
 			ClusterId:  100,
 			ShardId:    10,
 			TableId:    20,
@@ -752,10 +905,10 @@ func TestHAClientRewindRejoinUsesAdminAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RewindRejoin returned error: %v", err)
 	}
-	if resp.Action.ActionKind != HAActionKindRejoinRewind || resp.Action.NodeId != "primary-a" {
+	if resp.Action.ActionKind != StandbyActionKindRejoinRewind || resp.Action.NodeId != "primary-a" {
 		t.Fatalf("rejoin action = %#v, want former-primary rewind receipt", resp.Action)
 	}
-	if resp.Assessment.Action != HARejoinActionRewind || resp.Assessment.Reason != HARejoinReasonParentTimelineRetained {
+	if resp.Assessment.Action != StandbyRejoinActionRewind || resp.Assessment.Reason != StandbyRejoinReasonParentTimelineRetained {
 		t.Fatalf("rejoin assessment = %#v, want rewind on retained parent timeline", resp.Assessment)
 	}
 	if resp.Rewind.NodeId != "primary-a" ||
@@ -766,7 +919,7 @@ func TestHAClientRewindRejoinUsesAdminAPI(t *testing.T) {
 	}
 }
 
-func TestHAClientReseedRejoinUsesAdminAPI(t *testing.T) {
+func TestStandbyClientReseedRejoinUsesAdminAPI(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -796,19 +949,19 @@ func TestHAClientReseedRejoinUsesAdminAPI(t *testing.T) {
 			t.Fatalf("rejoin reseed body = %s, want former node, LSN, and expired retention boundary", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, haRejoinReseedResponseJSON())
+		_, _ = fmt.Fprint(w, standbyRejoinReseedResponseJSON())
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	resp, err := client.WithToken("test-token").ReseedRejoin(context.Background(), RejoinAssessRequest{
 		NodeId:          "primary-a",
 		LastLsn:         13,
 		RetainedFromLsn: 14,
-		Identity: HAIdentity{
+		Identity: StandbyIdentity{
 			ClusterId:  100,
 			ShardId:    10,
 			TableId:    20,
@@ -819,10 +972,10 @@ func TestHAClientReseedRejoinUsesAdminAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReseedRejoin returned error: %v", err)
 	}
-	if resp.Action.ActionKind != HAActionKindRejoinReseed || resp.Action.NodeId != "primary-current" {
+	if resp.Action.ActionKind != StandbyActionKindRejoinReseed || resp.Action.NodeId != "primary-current" {
 		t.Fatalf("rejoin action = %#v, want current-primary reseed receipt", resp.Action)
 	}
-	if resp.Assessment.Action != HARejoinActionReseed || resp.Assessment.Reason != HARejoinReasonParentTimelineWALExpired {
+	if resp.Assessment.Action != StandbyRejoinActionReseed || resp.Assessment.Reason != StandbyRejoinReasonParentTimelineWALExpired {
 		t.Fatalf("rejoin assessment = %#v, want reseed after expired parent timeline WAL", resp.Assessment)
 	}
 	if resp.Reseed.NodeId != "primary-a" ||
@@ -834,7 +987,7 @@ func TestHAClientReseedRejoinUsesAdminAPI(t *testing.T) {
 	}
 }
 
-func TestHAClientWithTokenCanChangeAndClearBearerAuth(t *testing.T) {
+func TestStandbyClientWithTokenCanChangeAndClearBearerAuth(t *testing.T) {
 	t.Parallel()
 
 	expectedAuth := make(chan string, 3)
@@ -856,9 +1009,9 @@ func TestHAClientWithTokenCanChangeAndClearBearerAuth(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 
 	expectedAuth <- "Bearer first-token"
@@ -877,7 +1030,7 @@ func TestHAClientWithTokenCanChangeAndClearBearerAuth(t *testing.T) {
 	}
 }
 
-func TestHAClientStatusWrappersExposeLagAndRetention(t *testing.T) {
+func TestStandbyClientStatusWrappersExposeLagAndRetention(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -907,33 +1060,33 @@ func TestHAClientStatusWrappersExposeLagAndRetention(t *testing.T) {
 				syncStandbys[0] != "standby-a" {
 				t.Fatalf("primary status query = %s, want retention and sync policy params", r.URL.RawQuery)
 			}
-			_, _ = fmt.Fprint(w, haPrimaryStatusResponseJSON())
+			_, _ = fmt.Fprint(w, standbyPrimaryStatusResponseJSON())
 		case HAStandbyStatusPath:
 			if got := r.URL.Query().Get("upstream_lsn"); got != "20" {
 				t.Fatalf("standby upstream_lsn = %q, want 20", got)
 			}
-			_, _ = fmt.Fprint(w, haStandbyStatusResponseJSON())
+			_, _ = fmt.Fprint(w, standbyStatusResponseJSON())
 		default:
 			t.Fatalf("path = %s, want HA status endpoint", r.URL.Path)
 		}
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	client.WithToken("test-token")
 
-	primary, err := client.PrimaryStatus(context.Background(), &HAPrimaryStatusParams{
+	primary, err := client.PrimaryStatus(context.Background(), &StandbyPrimaryStatusParams{
 		MaxLagLsn:        8,
 		MaxRetainedBytes: 1024,
 		MaxRetainedAgeNs: 5000,
-		SyncMode:         HAPrimaryStatusSyncModeRemoteWrite,
-		SyncSelection:    HAPrimaryStatusSyncSelectionAny,
+		SyncMode:         StandbyPrimaryStatusSyncModeRemoteWrite,
+		SyncSelection:    StandbyPrimaryStatusSyncSelectionAny,
 		SyncRequired:     1,
 		SyncStandby:      []string{"standby-a"},
-		SyncFailure:      HAPrimaryStatusSyncFailureFailClosed,
+		SyncFailure:      StandbyPrimaryStatusSyncFailureFailClosed,
 	})
 	if err != nil {
 		t.Fatalf("PrimaryStatus returned error: %v", err)
@@ -942,11 +1095,11 @@ func TestHAClientStatusWrappersExposeLagAndRetention(t *testing.T) {
 		primary.Snapshot.Retention.RetainedByteCount != 1024 ||
 		primary.Snapshot.Slots[0].RetentionLagLsn != 8 ||
 		primary.Snapshot.Slots[0].WriteLagLsn != 2 ||
-		primary.Snapshot.Durability.Mode != HADurabilityModeRemoteWrite {
+		primary.Snapshot.Durability.Mode != StandbyDurabilityModeRemoteWrite {
 		t.Fatalf("primary status = %#v, want retention, lag, and remote_write durability evidence", primary.Snapshot)
 	}
 
-	standby, err := client.StandbyStatus(context.Background(), &HAStandbyStatusParams{UpstreamLsn: 20})
+	standby, err := client.StandbyStatus(context.Background(), &StandbyStatusParams{UpstreamLsn: 20})
 	if err != nil {
 		t.Fatalf("StandbyStatus returned error: %v", err)
 	}
@@ -961,7 +1114,7 @@ func TestHAClientStatusWrappersExposeLagAndRetention(t *testing.T) {
 	}
 }
 
-func TestHAClientPublicAPIDoesNotExposeGeneratedClient(t *testing.T) {
+func TestStandbyClientPublicAPIDoesNotExposeGeneratedClient(t *testing.T) {
 	t.Parallel()
 
 	_, file, _, ok := runtime.Caller(0)
@@ -981,7 +1134,7 @@ func TestHAClientPublicAPIDoesNotExposeGeneratedClient(t *testing.T) {
 			continue
 		}
 		if fn.Recv != nil && fn.Name.Name == "Client" {
-			t.Fatalf("HAClient must not expose the generated oapi client through an exported Client method")
+			t.Fatalf("StandbyClient must not expose the generated oapi client through an exported Client method")
 		}
 		if fn.Type.Params != nil && containsOAPISelector(fn.Type.Params) {
 			t.Fatalf("%s exposes generated oapi types in public HA wrapper parameters", fn.Name.Name)
@@ -1012,7 +1165,7 @@ func containsOAPISelector(node ast.Node) bool {
 	return found
 }
 
-func TestHAClientCreateReplicationSlotRejectsMissingEvidence(t *testing.T) {
+func TestStandbyClientCreateReplicationSlotRejectsMissingEvidence(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1041,9 +1194,9 @@ func TestHAClientCreateReplicationSlotRejectsMissingEvidence(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	_, err = client.CreateReplicationSlot(context.Background(), ReplicationSlotCreateRequest{SlotName: "standby-a"})
 	if err == nil || !strings.Contains(err.Error(), "slot field evidence") {
@@ -1051,7 +1204,7 @@ func TestHAClientCreateReplicationSlotRejectsMissingEvidence(t *testing.T) {
 	}
 }
 
-func TestHAClientGateOperationsUseAdminAPI(t *testing.T) {
+func TestStandbyClientGateOperationsUseAdminAPI(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1080,13 +1233,13 @@ func TestHAClientGateOperationsUseAdminAPI(t *testing.T) {
 				!strings.Contains(got, `"mode":"remote_write"`) {
 				t.Fatalf("commit append body = %s, want kind, payload_codec, and sync policy", got)
 			}
-			_, _ = fmt.Fprint(w, haCommitAppendResponseJSON())
+			_, _ = fmt.Fprint(w, standbyCommitAppendResponseJSON())
 		case "/admin/v1/ha/commit/check":
 			if got := string(body); !strings.Contains(got, `"target_lsn":9`) ||
 				!strings.Contains(got, `"failure_policy":"fail_closed"`) {
 				t.Fatalf("commit check body = %s, want target_lsn and sync policy", got)
 			}
-			_, _ = fmt.Fprint(w, haCommitCheckResponseJSON())
+			_, _ = fmt.Fprint(w, standbyCommitCheckResponseJSON())
 		case "/admin/v1/ha/read/check":
 			if got := string(body); !strings.Contains(got, `"consistency":"at_least_lsn"`) {
 				t.Fatalf("read check body = %s, want consistency", got)
@@ -1107,29 +1260,29 @@ func TestHAClientGateOperationsUseAdminAPI(t *testing.T) {
 			if got := string(body); !strings.Contains(got, `"role":"standby"`) {
 				t.Fatalf("write check body = %s, want standby role", got)
 			}
-			_, _ = fmt.Fprint(w, haWriteDecisionResponseJSON())
+			_, _ = fmt.Fprint(w, standbyWriteDecisionResponseJSON())
 		case "/admin/v1/ha/owner-jobs/check":
 			if got := string(body); !strings.Contains(got, `"kind":"compaction_publish"`) ||
 				!strings.Contains(got, `"role":"primary"`) {
 				t.Fatalf("owner job check body = %s, want kind and primary role", got)
 			}
-			_, _ = fmt.Fprint(w, haOwnerJobDecisionResponseJSON())
+			_, _ = fmt.Fprint(w, standbyOwnerJobDecisionResponseJSON())
 		default:
 			t.Fatalf("path = %s, want HA gate endpoint", r.URL.Path)
 		}
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	client.WithToken("test-token")
-	syncPolicy := HASyncPolicy{
-		Mode:          HASyncPolicyModeRemoteWrite,
-		Selection:     HASyncPolicySelectionAny,
+	syncPolicy := StandbySyncPolicy{
+		Mode:          StandbySyncPolicyModeRemoteWrite,
+		Selection:     StandbySyncPolicySelectionAny,
 		Required:      1,
-		FailurePolicy: HASyncPolicyFailureFailClosed,
+		FailurePolicy: StandbySyncPolicyFailureFailClosed,
 		StandbyNames:  []string{"standby-a"},
 	}
 
@@ -1190,7 +1343,7 @@ func TestHAClientGateOperationsUseAdminAPI(t *testing.T) {
 	}
 }
 
-func TestHAClientGateOperationsRejectInvalidTypedResponses(t *testing.T) {
+func TestStandbyClientGateOperationsRejectInvalidTypedResponses(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1198,13 +1351,13 @@ func TestHAClientGateOperationsRejectInvalidTypedResponses(t *testing.T) {
 			t.Fatalf("path = %s, want /admin/v1/ha/write/check", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, strings.Replace(haWriteDecisionResponseJSON(), `"action":"reject_read_only_standby"`, `"action":"unknown"`, 1))
+		_, _ = fmt.Fprint(w, strings.Replace(standbyWriteDecisionResponseJSON(), `"action":"reject_read_only_standby"`, `"action":"unknown"`, 1))
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	_, err = client.CheckWrite(context.Background(), WriteCheckRequest{Role: WriteCheckRoleStandby})
 	if err == nil || !strings.Contains(err.Error(), "write decision fields") {
@@ -1212,7 +1365,7 @@ func TestHAClientGateOperationsRejectInvalidTypedResponses(t *testing.T) {
 	}
 }
 
-func TestHAClientAcceptsAdminRootURL(t *testing.T) {
+func TestStandbyClientAcceptsAdminRootURL(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1224,9 +1377,9 @@ func TestHAClientAcceptsAdminRootURL(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL+"/admin/v1", server.Client())
+	client, err := NewStandbyClient(server.URL+"/admin/v1", server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	resp, err := client.CurrentFence(context.Background())
 	if err != nil {
@@ -1237,7 +1390,7 @@ func TestHAClientAcceptsAdminRootURL(t *testing.T) {
 	}
 }
 
-func TestHAClientAcceptsHARootURL(t *testing.T) {
+func TestStandbyClientAcceptsStandbyRootURL(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1249,9 +1402,9 @@ func TestHAClientAcceptsHARootURL(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL+"/admin/v1/ha", server.Client())
+	client, err := NewStandbyClient(server.URL+"/admin/v1/ha", server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	resp, err := client.CurrentFence(context.Background())
 	if err != nil {
@@ -1262,7 +1415,7 @@ func TestHAClientAcceptsHARootURL(t *testing.T) {
 	}
 }
 
-func TestHAClientRejectsInvalidBaseURLs(t *testing.T) {
+func TestStandbyClientRejectsInvalidBaseURLs(t *testing.T) {
 	t.Parallel()
 
 	tests := []string{
@@ -1278,14 +1431,14 @@ func TestHAClientRejectsInvalidBaseURLs(t *testing.T) {
 	for _, baseURL := range tests {
 		t.Run(baseURL, func(t *testing.T) {
 			t.Parallel()
-			if _, err := NewHAClient(baseURL, nil); err == nil || !strings.Contains(err.Error(), "invalid HA admin base URL") {
-				t.Fatalf("NewHAClient(%q) error = %v, want invalid HA admin base URL", baseURL, err)
+			if _, err := NewStandbyClient(baseURL, nil); err == nil || !strings.Contains(err.Error(), "invalid HA admin base URL") {
+				t.Fatalf("NewStandbyClient(%q) error = %v, want invalid HA admin base URL", baseURL, err)
 			}
 		})
 	}
 }
 
-func TestHAClientCurrentFenceRejectsInvalidTypedResponse(t *testing.T) {
+func TestStandbyClientCurrentFenceRejectsInvalidTypedResponse(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1297,9 +1450,9 @@ func TestHAClientCurrentFenceRejectsInvalidTypedResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	_, err = client.CurrentFence(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "current fence receipt fields") {
@@ -1307,7 +1460,7 @@ func TestHAClientCurrentFenceRejectsInvalidTypedResponse(t *testing.T) {
 	}
 }
 
-func TestHAClientCurrentFenceAcceptsEmptyReceiptReason(t *testing.T) {
+func TestStandbyClientCurrentFenceAcceptsEmptyReceiptReason(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1319,9 +1472,9 @@ func TestHAClientCurrentFenceAcceptsEmptyReceiptReason(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	resp, err := client.CurrentFence(context.Background())
 	if err != nil {
@@ -1332,7 +1485,7 @@ func TestHAClientCurrentFenceAcceptsEmptyReceiptReason(t *testing.T) {
 	}
 }
 
-func TestHAClientGeneratedSpecIsDedicatedAdminAPI(t *testing.T) {
+func TestStandbyClientGeneratedSpecIsDedicatedAdminAPI(t *testing.T) {
 	t.Parallel()
 
 	spec, err := oapi.GetSwagger()
@@ -1357,21 +1510,21 @@ func TestHAClientGeneratedSpecIsDedicatedAdminAPI(t *testing.T) {
 		bearer.Value.Scheme != "bearer" {
 		t.Fatalf("BearerAuth security scheme = %#v, want http bearer", bearer)
 	}
-	pathItem := spec.Paths.Find("/ha/primary/status")
+	pathItem := spec.Paths.Find("/standby/primary/status")
 	if pathItem == nil || pathItem.Get == nil {
-		t.Fatalf("/ha/primary/status operation = %#v, want GET operation", pathItem)
+		t.Fatalf("/standby/primary/status operation = %#v, want GET operation", pathItem)
 	}
 	req, err := oapi.NewGetHAPrimaryStatusRequest("http://admin.test"+AdminV1Path+"/", nil)
 	if err != nil {
 		t.Fatalf("NewGetHAPrimaryStatusRequest returned error: %v", err)
 	}
-	if req.Method != http.MethodGet || req.URL.Path != HAPrimaryStatusPath {
-		t.Fatalf("generated primary status request = %s %s, want GET %s", req.Method, req.URL.Path, HAPrimaryStatusPath)
+	if req.Method != http.MethodGet || req.URL.Path != StandbyPrimaryStatusPath {
+		t.Fatalf("generated primary status request = %s %s, want GET %s", req.Method, req.URL.Path, StandbyPrimaryStatusPath)
 	}
 
 	sourceSpec := loadSourceAdminOpenAPISpec(t)
-	sourceOperations := haOpenAPIOperations(sourceSpec)
-	generatedOperations := haOpenAPIOperations(spec)
+	sourceOperations := standbyOpenAPIOperations(sourceSpec)
+	generatedOperations := standbyOpenAPIOperations(spec)
 	for key, sourceOperationID := range sourceOperations {
 		generatedOperationID, ok := generatedOperations[key]
 		if !ok {
@@ -1407,7 +1560,7 @@ func loadSourceAdminOpenAPISpec(t *testing.T) *openapi3.T {
 	return spec
 }
 
-func haOpenAPIOperations(spec *openapi3.T) map[string]string {
+func standbyOpenAPIOperations(spec *openapi3.T) map[string]string {
 	operations := map[string]string{}
 	if spec == nil || spec.Paths == nil {
 		return operations
@@ -1426,165 +1579,172 @@ func haOpenAPIOperations(spec *openapi3.T) map[string]string {
 	return operations
 }
 
-func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
+func TestStandbyOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name      string
-		got       HAOperation
-		generated func(*testing.T) HAOperation
+		got       StandbyOperation
+		generated func(*testing.T) StandbyOperation
 	}{
 		{
 			name: "primary status",
-			got:  HAPrimaryStatusOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyPrimaryStatusOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewGetHAPrimaryStatusRequest(server, nil)
 			}),
 		},
 		{
 			name: "standby status",
-			got:  HAStandbyStatusOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyStatusOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewGetHAStandbyStatusRequest(server, nil)
 			}),
 		},
 		{
 			name: "check commit",
-			got:  HACheckCommitOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyCheckCommitOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewCheckHACommitRequest(server, oapi.CheckHACommitJSONRequestBody{})
 			}),
 		},
 		{
 			name: "append commit",
-			got:  HAAppendCommitOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyAppendCommitOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewAppendHACommitRequest(server, oapi.AppendHACommitJSONRequestBody{})
 			}),
 		},
 		{
 			name: "check read",
-			got:  HACheckReadOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyCheckReadOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewCheckHAReadRequest(server, oapi.CheckHAReadJSONRequestBody{})
 			}),
 		},
 		{
 			name: "check write",
-			got:  HACheckWriteOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyCheckWriteOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewCheckHAWriteRequest(server, oapi.CheckHAWriteJSONRequestBody{})
 			}),
 		},
 		{
 			name: "check owner job",
-			got:  HACheckOwnerJobOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyCheckOwnerJobOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewCheckHAOwnerJobRequest(server, oapi.CheckHAOwnerJobJSONRequestBody{})
 			}),
 		},
 		{
 			name: "list replication slots",
-			got:  HAListReplicationSlotsOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyListReplicationSlotsOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewListHAReplicationSlotsRequest(server)
 			}),
 		},
 		{
 			name: "create replication slot",
-			got:  HACreateReplicationSlotOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyCreateReplicationSlotOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewCreateHAReplicationSlotRequest(server, oapi.CreateHAReplicationSlotJSONRequestBody{})
 			}),
 		},
 		{
 			name: "begin base backup",
-			got:  HABeginBaseBackupOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyBeginBaseBackupOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewBeginHABaseBackupRequest(server, oapi.BeginHABaseBackupJSONRequestBody{})
 			}),
 		},
 		{
 			name: "finish base backup",
-			got:  HAFinishBaseBackupOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyFinishBaseBackupOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewFinishHABaseBackupRequest(server, oapi.FinishHABaseBackupJSONRequestBody{})
 			}),
 		},
 		{
 			name: "capture seed artifact",
-			got:  HASeedCaptureOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbySeedCaptureOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewCaptureHASeedArtifactRequest(server, oapi.CaptureHASeedArtifactJSONRequestBody{})
 			}),
 		},
 		{
 			name: "activate seeded slot",
-			got:  HAActivateSeededSlotOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyActivateSeededSlotOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewActivateHASeededSlotRequest(server, oapi.ActivateHASeededSlotJSONRequestBody{})
 			}),
 		},
 		{
 			name: "bootstrap standby",
-			got:  HABootstrapStandbyOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyBootstrapStandbyOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewBootstrapHAStandbyRequest(server, oapi.BootstrapHAStandbyJSONRequestBody{})
 			}),
 		},
 		{
+			name: "set standby upstream",
+			got:  StandbySetStandbyUpstreamOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
+				return oapi.NewSetHAStandbyUpstreamRequest(server, oapi.SetHAStandbyUpstreamJSONRequestBody{})
+			}),
+		},
+		{
 			name: "acquire fence",
-			got:  HAAcquireFenceOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyAcquireFenceOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewAcquireHAFenceRequest(server, oapi.AcquireHAFenceJSONRequestBody{})
 			}),
 		},
 		{
 			name: "current fence",
-			got:  HACurrentFenceOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyCurrentFenceOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewGetHACurrentFenceRequest(server)
 			}),
 		},
 		{
 			name: "assess promotion",
-			got:  HAAssessPromotionOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyAssessPromotionOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewAssessHAPromotionRequest(server, oapi.AssessHAPromotionJSONRequestBody{})
 			}),
 		},
 		{
 			name: "promote with current fence",
-			got:  HAPromoteWithCurrentFenceOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyPromoteWithCurrentFenceOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewPromoteHAWithCurrentFenceRequest(server)
 			}),
 		},
 		{
 			name: "promote",
-			got:  HAPromoteOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyPromoteOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewPromoteHARequest(server, oapi.PromoteHAJSONRequestBody{})
 			}),
 		},
 		{
 			name: "assess rejoin",
-			got:  HAAssessRejoinOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyAssessRejoinOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewAssessHARejoinRequest(server, oapi.AssessHARejoinJSONRequestBody{})
 			}),
 		},
 		{
 			name: "rewind rejoin",
-			got:  HARewindRejoinOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyRewindRejoinOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewRewindHARejoinRequest(server, oapi.RewindHARejoinJSONRequestBody{})
 			}),
 		},
 		{
 			name: "reseed rejoin",
-			got:  HAReseedRejoinOperation(),
-			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+			got:  StandbyReseedRejoinOperation(),
+			generated: generatedStandbyOperation(func(server string) (*http.Request, error) {
 				return oapi.NewReseedHARejoinRequest(server, oapi.ReseedHARejoinJSONRequestBody{})
 			}),
 		},
@@ -1599,45 +1759,118 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 		})
 	}
 
+	// The deprecated HA*Operation wrappers must keep returning the legacy
+	// /admin/v1/ha paths verbatim, since they describe what PathStyleLegacy
+	// (the default) actually sends and existing callers depend on the exact
+	// value.
+	legacyTests := []struct {
+		name string
+		got  StandbyOperation
+		want StandbyOperation
+	}{
+		{"primary status", HAPrimaryStatusOperation(), StandbyOperation{Method: http.MethodGet, Path: HAPrimaryStatusPath}},
+		{"standby status", HAStandbyStatusOperation(), StandbyOperation{Method: http.MethodGet, Path: HAStandbyStatusPath}},
+		{"check commit", HACheckCommitOperation(), StandbyOperation{Method: http.MethodPost, Path: HACommitCheckPath}},
+		{"append commit", HAAppendCommitOperation(), StandbyOperation{Method: http.MethodPost, Path: HACommitAppendPath}},
+		{"check read", HACheckReadOperation(), StandbyOperation{Method: http.MethodPost, Path: HAReadCheckPath}},
+		{"check write", HACheckWriteOperation(), StandbyOperation{Method: http.MethodPost, Path: HAWriteCheckPath}},
+		{"check owner job", HACheckOwnerJobOperation(), StandbyOperation{Method: http.MethodPost, Path: HAOwnerJobCheckPath}},
+		{"list replication slots", HAListReplicationSlotsOperation(), StandbyOperation{Method: http.MethodGet, Path: HAReplicationSlotsPath}},
+		{"create replication slot", HACreateReplicationSlotOperation(), StandbyOperation{Method: http.MethodPost, Path: HAReplicationSlotsPath}},
+		{"begin base backup", HABeginBaseBackupOperation(), StandbyOperation{Method: http.MethodPost, Path: HABaseBackupsPath}},
+		{"finish base backup", HAFinishBaseBackupOperation(), StandbyOperation{Method: http.MethodPost, Path: HABaseBackupsFinishPath}},
+		{"capture seed artifact", HASeedCaptureOperation(), StandbyOperation{Method: http.MethodPost, Path: HABaseBackupsCapturePath}},
+		{"activate seeded slot", HAActivateSeededSlotOperation(), StandbyOperation{Method: http.MethodPost, Path: HABaseBackupsActivatePath}},
+		{"bootstrap standby", HABootstrapStandbyOperation(), StandbyOperation{Method: http.MethodPost, Path: HAStandbyBootstrapPath}},
+		{"set standby upstream", HASetStandbyUpstreamOperation(), StandbyOperation{Method: http.MethodPost, Path: HAStandbyUpstreamPath}},
+		{"acquire fence", HAAcquireFenceOperation(), StandbyOperation{Method: http.MethodPost, Path: HAFencePath}},
+		{"current fence", HACurrentFenceOperation(), StandbyOperation{Method: http.MethodGet, Path: HAFenceCurrentPath}},
+		{"assess promotion", HAAssessPromotionOperation(), StandbyOperation{Method: http.MethodPost, Path: HAPromotionAssessPath}},
+		{"promote with current fence", HAPromoteWithCurrentFenceOperation(), StandbyOperation{Method: http.MethodPost, Path: HAPromotionCurrentFencePath}},
+		{"promote", HAPromoteOperation(), StandbyOperation{Method: http.MethodPost, Path: HAPromotionPath}},
+		{"assess rejoin", HAAssessRejoinOperation(), StandbyOperation{Method: http.MethodPost, Path: HARejoinAssessPath}},
+		{"rewind rejoin", HARewindRejoinOperation(), StandbyOperation{Method: http.MethodPost, Path: HARejoinRewindPath}},
+		{"reseed rejoin", HAReseedRejoinOperation(), StandbyOperation{Method: http.MethodPost, Path: HARejoinReseedPath}},
+	}
+	for _, tt := range legacyTests {
+		t.Run("legacy alias/"+tt.name, func(t *testing.T) {
+			t.Parallel()
+			if tt.got != tt.want {
+				t.Fatalf("legacy operation = %#v, want %#v", tt.got, tt.want)
+			}
+		})
+	}
+
 	const slotName = "standby-a.1:zone_9"
 
-	slotPath, ok := HAReplicationSlotPath(slotName)
+	slotPath, ok := StandbyReplicationSlotPath(slotName)
 	if !ok {
-		t.Fatal("HAReplicationSlotPath returned ok=false for valid slot")
+		t.Fatal("StandbyReplicationSlotPath returned ok=false for valid slot")
 	}
-	if slotPath != HAReplicationSlotPathPrefix+url.PathEscape(slotName) {
+	if slotPath != StandbyReplicationSlotPathPrefix+url.PathEscape(slotName) {
 		t.Fatalf("slot path = %q, want escaped valid slot path", slotPath)
 	}
-	generatedDrop := generatedHAOperation(func(server string) (*http.Request, error) {
+	generatedDrop := generatedStandbyOperation(func(server string) (*http.Request, error) {
 		return oapi.NewDropHAReplicationSlotRequest(server, slotName)
 	})(t)
-	if dropPath := (HAOperation{Method: http.MethodDelete, Path: slotPath}); dropPath != generatedDrop {
+	if dropPath := (StandbyOperation{Method: http.MethodDelete, Path: slotPath}); dropPath != generatedDrop {
 		t.Fatalf("drop slot path operation = %#v, want generated OpenAPI operation %#v", dropPath, generatedDrop)
 	}
-	resume, ok := HAResumeReplicationSlotOperation(slotName)
+	resume, ok := StandbyResumeReplicationSlotOperation(slotName)
 	if !ok {
-		t.Fatal("HAResumeReplicationSlotOperation returned ok=false")
+		t.Fatal("StandbyResumeReplicationSlotOperation returned ok=false")
 	}
-	if want := generatedHAOperation(func(server string) (*http.Request, error) {
+	if want := generatedStandbyOperation(func(server string) (*http.Request, error) {
 		return oapi.NewResumeHAReplicationSlotRequest(server, slotName)
 	})(t); resume != want {
 		t.Fatalf("resume operation = %#v, want generated OpenAPI operation %#v", resume, want)
 	}
-	pause, ok := HAPauseReplicationSlotOperation(slotName)
+	pause, ok := StandbyPauseReplicationSlotOperation(slotName)
 	if !ok {
-		t.Fatal("HAPauseReplicationSlotOperation returned ok=false")
+		t.Fatal("StandbyPauseReplicationSlotOperation returned ok=false")
 	}
-	if want := generatedHAOperation(func(server string) (*http.Request, error) {
+	if want := generatedStandbyOperation(func(server string) (*http.Request, error) {
 		return oapi.NewPauseHAReplicationSlotRequest(server, slotName)
 	})(t); pause != want {
 		t.Fatalf("pause operation = %#v, want generated OpenAPI operation %#v", pause, want)
 	}
-	drop, ok := HADropReplicationSlotOperation(slotName)
+	drop, ok := StandbyDropReplicationSlotOperation(slotName)
 	if !ok {
-		t.Fatal("HADropReplicationSlotOperation returned ok=false")
+		t.Fatal("StandbyDropReplicationSlotOperation returned ok=false")
 	}
 	if drop != generatedDrop {
 		t.Fatalf("drop operation = %#v, want generated OpenAPI operation %#v", drop, generatedDrop)
+	}
+
+	// Legacy replication slot path/operation helpers must keep returning the
+	// legacy /admin/v1/ha/replication-slots/... paths verbatim.
+	legacySlotPath, ok := HAReplicationSlotPath(slotName)
+	if !ok {
+		t.Fatal("HAReplicationSlotPath returned ok=false for valid slot")
+	}
+	if legacySlotPath != HAReplicationSlotPathPrefix+url.PathEscape(slotName) {
+		t.Fatalf("legacy slot path = %q, want escaped legacy slot path", legacySlotPath)
+	}
+	legacyResume, ok := HAResumeReplicationSlotOperation(slotName)
+	if !ok {
+		t.Fatal("HAResumeReplicationSlotOperation returned ok=false")
+	}
+	if want := (StandbyOperation{Method: http.MethodPut, Path: legacySlotPath + HAReplicationSlotResumePathSuffix}); legacyResume != want {
+		t.Fatalf("legacy resume operation = %#v, want %#v", legacyResume, want)
+	}
+	legacyPause, ok := HAPauseReplicationSlotOperation(slotName)
+	if !ok {
+		t.Fatal("HAPauseReplicationSlotOperation returned ok=false")
+	}
+	if want := (StandbyOperation{Method: http.MethodPut, Path: legacySlotPath + HAReplicationSlotPausePathSuffix}); legacyPause != want {
+		t.Fatalf("legacy pause operation = %#v, want %#v", legacyPause, want)
+	}
+	legacyDrop, ok := HADropReplicationSlotOperation(slotName)
+	if !ok {
+		t.Fatal("HADropReplicationSlotOperation returned ok=false")
+	}
+	if want := (StandbyOperation{Method: http.MethodDelete, Path: legacySlotPath}); legacyDrop != want {
+		t.Fatalf("legacy drop operation = %#v, want %#v", legacyDrop, want)
 	}
 
 	invalidSlots := []string{
@@ -1651,6 +1884,18 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 		strings.Repeat("a", 129),
 	}
 	for _, invalid := range invalidSlots {
+		if path, ok := StandbyReplicationSlotPath(invalid); ok {
+			t.Fatalf("StandbyReplicationSlotPath(%q) = %q, true; want false", invalid, path)
+		}
+		if operation, ok := StandbyResumeReplicationSlotOperation(invalid); ok {
+			t.Fatalf("StandbyResumeReplicationSlotOperation(%q) = %#v, true; want false", invalid, operation)
+		}
+		if operation, ok := StandbyPauseReplicationSlotOperation(invalid); ok {
+			t.Fatalf("StandbyPauseReplicationSlotOperation(%q) = %#v, true; want false", invalid, operation)
+		}
+		if operation, ok := StandbyDropReplicationSlotOperation(invalid); ok {
+			t.Fatalf("StandbyDropReplicationSlotOperation(%q) = %#v, true; want false", invalid, operation)
+		}
 		if path, ok := HAReplicationSlotPath(invalid); ok {
 			t.Fatalf("HAReplicationSlotPath(%q) = %q, true; want false", invalid, path)
 		}
@@ -1666,107 +1911,113 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 	}
 }
 
-func generatedHAOperation(build func(string) (*http.Request, error)) func(*testing.T) HAOperation {
-	return func(t *testing.T) HAOperation {
+func generatedStandbyOperation(build func(string) (*http.Request, error)) func(*testing.T) StandbyOperation {
+	return func(t *testing.T) StandbyOperation {
 		t.Helper()
 		req, err := build("http://admin.test" + AdminV1Path + "/")
 		if err != nil {
 			t.Fatalf("generated OpenAPI request builder returned error: %v", err)
 		}
-		return HAOperation{Method: req.Method, Path: req.URL.EscapedPath()}
+		return StandbyOperation{Method: req.Method, Path: req.URL.EscapedPath()}
 	}
 }
 
-func TestHAReceiptExpectationsUseAdminAPIEnums(t *testing.T) {
+func TestStandbyReceiptExpectationsUseAdminAPIEnums(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name      string
-		got       HAReceiptExpectation
+		got       StandbyReceiptExpectation
 		wantKind  string
 		wantState string
 	}{
 		{
 			name:      "create replication slot",
-			got:       HAReplicationSlotCreateReceiptExpectation(),
+			got:       StandbyReplicationSlotCreateReceiptExpectation(),
 			wantKind:  "replication_slot_create",
 			wantState: "applied",
 		},
 		{
 			name:      "resume replication slot",
-			got:       HAReplicationSlotResumeReceiptExpectation(),
+			got:       StandbyReplicationSlotResumeReceiptExpectation(),
 			wantKind:  "replication_slot_resume",
 			wantState: "applied",
 		},
 		{
 			name:      "pause replication slot",
-			got:       HAReplicationSlotPauseReceiptExpectation(),
+			got:       StandbyReplicationSlotPauseReceiptExpectation(),
 			wantKind:  "replication_slot_pause",
 			wantState: "applied",
 		},
 		{
 			name:      "drop replication slot",
-			got:       HAReplicationSlotDropReceiptExpectation(),
+			got:       StandbyReplicationSlotDropReceiptExpectation(),
 			wantKind:  "replication_slot_drop",
 			wantState: "applied",
 		},
 		{
 			name:      "begin base backup",
-			got:       HABaseBackupBeginReceiptExpectation(),
+			got:       StandbyBaseBackupBeginReceiptExpectation(),
 			wantKind:  "base_backup_begin",
 			wantState: "applied",
 		},
 		{
 			name:      "finish base backup",
-			got:       HABaseBackupFinishReceiptExpectation(),
+			got:       StandbyBaseBackupFinishReceiptExpectation(),
 			wantKind:  "base_backup_finish",
 			wantState: "applied",
 		},
 		{
 			name:      "capture seed artifact",
-			got:       HASeedCaptureReceiptExpectation(),
+			got:       StandbySeedCaptureReceiptExpectation(),
 			wantKind:  "seed_capture",
 			wantState: "applied",
 		},
 		{
 			name:      "bootstrap standby",
-			got:       HAStandbyBootstrapReceiptExpectation(),
+			got:       StandbyBootstrapReceiptExpectation(),
 			wantKind:  "standby_bootstrap",
 			wantState: "applied",
 		},
 		{
+			name:      "set standby upstream",
+			got:       StandbyUpstreamReceiptExpectation(),
+			wantKind:  "standby_upstream",
+			wantState: "applied",
+		},
+		{
 			name:      "acquire fence",
-			got:       HAFenceAcquireReceiptExpectation(),
+			got:       StandbyFenceAcquireReceiptExpectation(),
 			wantKind:  "fence_acquire",
 			wantState: "applied",
 		},
 		{
 			name:      "assess promotion",
-			got:       HAPromotionAssessReceiptExpectation(),
+			got:       StandbyPromotionAssessReceiptExpectation(),
 			wantKind:  "promotion_assess",
 			wantState: "assessed",
 		},
 		{
 			name:      "promote",
-			got:       HAPromotionReceiptExpectation(),
+			got:       StandbyPromotionReceiptExpectation(),
 			wantKind:  "promotion",
 			wantState: "applied",
 		},
 		{
 			name:      "assess rejoin",
-			got:       HARejoinAssessReceiptExpectation(),
+			got:       StandbyRejoinAssessReceiptExpectation(),
 			wantKind:  "rejoin_assess",
 			wantState: "assessed",
 		},
 		{
 			name:      "rewind rejoin",
-			got:       HARejoinRewindReceiptExpectation(),
+			got:       StandbyRejoinRewindReceiptExpectation(),
 			wantKind:  "rejoin_rewind",
 			wantState: "applied",
 		},
 		{
 			name:      "reseed rejoin",
-			got:       HARejoinReseedReceiptExpectation(),
+			got:       StandbyRejoinReseedReceiptExpectation(),
 			wantKind:  "rejoin_reseed",
 			wantState: "applied",
 		},
@@ -1782,68 +2033,68 @@ func TestHAReceiptExpectationsUseAdminAPIEnums(t *testing.T) {
 	}
 }
 
-func TestHAReceiptMatchesExpectedOperationAndTarget(t *testing.T) {
+func TestStandbyReceiptMatchesExpectedOperationAndTarget(t *testing.T) {
 	t.Parallel()
 
-	expectation := HAReplicationSlotCreateReceiptExpectation()
-	receipt := HAActionReceipt{
+	expectation := StandbyReplicationSlotCreateReceiptExpectation()
+	receipt := StandbyActionReceipt{
 		ActionId:   "replication_slot_create:standby-a",
-		ActionKind: HAActionKindReplicationSlotCreate,
+		ActionKind: StandbyActionKindReplicationSlotCreate,
 		Target:     "standby-a",
-		State:      HAActionStateApplied,
+		State:      StandbyActionStateApplied,
 		NodeId:     "primary-a",
 	}
-	if !HAReceiptMatches(receipt, expectation, "standby-a") {
-		t.Fatalf("HAReceiptMatches returned false for exact matching receipt")
+	if !StandbyReceiptMatches(receipt, expectation, "standby-a") {
+		t.Fatalf("StandbyReceiptMatches returned false for exact matching receipt")
 	}
-	receipt.State = HAActionStateAlreadyApplied
-	if !HAReceiptMatches(receipt, expectation, "standby-a") {
-		t.Fatalf("HAReceiptMatches returned false for already-applied idempotent receipt")
+	receipt.State = StandbyActionStateAlreadyApplied
+	if !StandbyReceiptMatches(receipt, expectation, "standby-a") {
+		t.Fatalf("StandbyReceiptMatches returned false for already-applied idempotent receipt")
 	}
-	receipt.State = HAActionStateApplied
+	receipt.State = StandbyActionStateApplied
 	receipt.Target = "standby-b"
-	if HAReceiptMatches(receipt, expectation, "standby-a") {
-		t.Fatalf("HAReceiptMatches returned true for mismatched target")
+	if StandbyReceiptMatches(receipt, expectation, "standby-a") {
+		t.Fatalf("StandbyReceiptMatches returned true for mismatched target")
 	}
 	receipt.Target = "standby-a"
-	if HAReceiptMatches(receipt, expectation, "") {
-		t.Fatalf("HAReceiptMatches returned true with empty expected target")
+	if StandbyReceiptMatches(receipt, expectation, "") {
+		t.Fatalf("StandbyReceiptMatches returned true with empty expected target")
 	}
 }
 
-func TestHAReceiptMatchesNode(t *testing.T) {
+func TestStandbyReceiptMatchesNode(t *testing.T) {
 	t.Parallel()
 
-	expectation := HAReplicationSlotResumeReceiptExpectation()
-	receipt := HAActionReceipt{
+	expectation := StandbyReplicationSlotResumeReceiptExpectation()
+	receipt := StandbyActionReceipt{
 		ActionId:   "replication_slot_resume:standby-a",
-		ActionKind: HAActionKindReplicationSlotResume,
+		ActionKind: StandbyActionKindReplicationSlotResume,
 		Target:     "standby-a",
-		State:      HAActionStateApplied,
+		State:      StandbyActionStateApplied,
 		NodeId:     "primary-a",
 	}
-	if !HAReceiptMatchesNode(receipt, expectation, "standby-a", "primary-a", true) {
-		t.Fatalf("HAReceiptMatchesNode returned false for exact matching node")
+	if !StandbyReceiptMatchesNode(receipt, expectation, "standby-a", "primary-a", true) {
+		t.Fatalf("StandbyReceiptMatchesNode returned false for exact matching node")
 	}
-	if HAReceiptMatchesNode(receipt, expectation, "standby-a", "primary-b", true) {
-		t.Fatalf("HAReceiptMatchesNode returned true for mismatched node")
+	if StandbyReceiptMatchesNode(receipt, expectation, "standby-a", "primary-b", true) {
+		t.Fatalf("StandbyReceiptMatchesNode returned true for mismatched node")
 	}
-	if HAReceiptMatchesNode(receipt, expectation, "standby-a", "", true) {
-		t.Fatalf("HAReceiptMatchesNode returned true without required expected node")
+	if StandbyReceiptMatchesNode(receipt, expectation, "standby-a", "", true) {
+		t.Fatalf("StandbyReceiptMatchesNode returned true without required expected node")
 	}
-	if !HAReceiptMatchesNode(receipt, expectation, "standby-a", "", false) {
-		t.Fatalf("HAReceiptMatchesNode returned false for optional expected node")
+	if !StandbyReceiptMatchesNode(receipt, expectation, "standby-a", "", false) {
+		t.Fatalf("StandbyReceiptMatchesNode returned false for optional expected node")
 	}
 	receipt.NodeId = ""
-	if HAReceiptMatchesNode(receipt, expectation, "standby-a", "", false) {
-		t.Fatalf("HAReceiptMatchesNode returned true without receipt node id")
+	if StandbyReceiptMatchesNode(receipt, expectation, "standby-a", "", false) {
+		t.Fatalf("StandbyReceiptMatchesNode returned true without receipt node id")
 	}
 }
 
-func TestValidateHAReplicationSlotActionResponse(t *testing.T) {
+func TestValidateStandbyReplicationSlotActionResponse(t *testing.T) {
 	t.Parallel()
 
-	slot := HAReplicationSlot{
+	slot := StandbyReplicationSlot{
 		SlotName:       "standby-a",
 		TimelineId:     1,
 		RestartLsn:     7,
@@ -1854,102 +2105,102 @@ func TestValidateHAReplicationSlotActionResponse(t *testing.T) {
 		Active:         true,
 		ReseedRequired: false,
 	}
-	response := HAReplicationSlotActionResponse{
+	response := StandbyReplicationSlotActionResponse{
 		SchemaVersion: 1,
-		Action: HAActionReceipt{
+		Action: StandbyActionReceipt{
 			ActionId:   "replication_slot_create:standby-a",
-			ActionKind: HAActionKindReplicationSlotCreate,
+			ActionKind: StandbyActionKindReplicationSlotCreate,
 			Target:     "standby-a",
-			State:      HAActionStateApplied,
+			State:      StandbyActionStateApplied,
 			NodeId:     "primary-a",
 		},
-		SlotAction: HAReplicationSlotActionCreate,
+		SlotAction: StandbyReplicationSlotActionCreate,
 		Slot:       slot,
 	}
-	if err := ValidateHAReplicationSlotActionResponse(response); err != nil {
-		t.Fatalf("ValidateHAReplicationSlotActionResponse returned error: %v", err)
+	if err := ValidateStandbyReplicationSlotActionResponse(response); err != nil {
+		t.Fatalf("ValidateStandbyReplicationSlotActionResponse returned error: %v", err)
 	}
 	wrongSlotTarget := response
 	wrongSlotTarget.Action.Target = "standby-b"
-	if err := ValidateHAReplicationSlotActionResponse(wrongSlotTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
+	if err := ValidateStandbyReplicationSlotActionResponse(wrongSlotTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("wrong slot target error = %v, want receipt mismatch", err)
 	}
 	paddedSlotTarget := response
 	paddedSlotTarget.Action.Target = " standby-a"
-	if err := ValidateHAReplicationSlotActionResponse(paddedSlotTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
+	if err := ValidateStandbyReplicationSlotActionResponse(paddedSlotTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("padded slot target error = %v, want receipt mismatch", err)
 	}
 	paddedActionID := response
 	paddedActionID.Action.ActionId = "replication_slot_create:standby-a "
-	if err := ValidateHAReplicationSlotActionResponse(paddedActionID); err == nil || !strings.Contains(err.Error(), "receipt") {
+	if err := ValidateStandbyReplicationSlotActionResponse(paddedActionID); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("padded action id error = %v, want receipt mismatch", err)
 	}
 	wrongSlotKind := response
-	wrongSlotKind.Action.ActionKind = HAActionKindReplicationSlotPause
+	wrongSlotKind.Action.ActionKind = StandbyActionKindReplicationSlotPause
 	wrongSlotKind.Action.ActionId = "replication_slot_pause:standby-a"
-	if err := ValidateHAReplicationSlotActionResponse(wrongSlotKind); err == nil || !strings.Contains(err.Error(), "receipt") {
+	if err := ValidateStandbyReplicationSlotActionResponse(wrongSlotKind); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("wrong slot action kind error = %v, want receipt mismatch", err)
 	}
-	if err := ValidateHAReplicationSlotListResponse(HAReplicationSlotListResponse{
+	if err := ValidateStandbyReplicationSlotListResponse(StandbyReplicationSlotListResponse{
 		SchemaVersion: 1,
-		Slots:         []HAReplicationSlot{slot},
+		Slots:         []StandbyReplicationSlot{slot},
 	}); err != nil {
-		t.Fatalf("ValidateHAReplicationSlotListResponse returned error: %v", err)
+		t.Fatalf("ValidateStandbyReplicationSlotListResponse returned error: %v", err)
 	}
 	badListSlot := slot
 	badListSlot.SlotName = ""
-	if err := ValidateHAReplicationSlotListResponse(HAReplicationSlotListResponse{
+	if err := ValidateStandbyReplicationSlotListResponse(StandbyReplicationSlotListResponse{
 		SchemaVersion: 1,
-		Slots:         []HAReplicationSlot{badListSlot},
+		Slots:         []StandbyReplicationSlot{badListSlot},
 	}); err == nil || !strings.Contains(err.Error(), "slot fields") {
 		t.Fatalf("invalid slot list error = %v, want slot fields error", err)
 	}
 	badListSlot.SlotName = "standby a"
-	if err := ValidateHAReplicationSlotListResponse(HAReplicationSlotListResponse{
+	if err := ValidateStandbyReplicationSlotListResponse(StandbyReplicationSlotListResponse{
 		SchemaVersion: 1,
-		Slots:         []HAReplicationSlot{badListSlot},
+		Slots:         []StandbyReplicationSlot{badListSlot},
 	}); err == nil || !strings.Contains(err.Error(), "slot fields") {
 		t.Fatalf("invalid slot name error = %v, want slot fields error", err)
 	}
 
 	response.Action.NodeId = ""
-	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "receipt") {
+	if err := ValidateStandbyReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("missing node id error = %v, want receipt error", err)
 	}
 	response.Action.NodeId = "primary a"
-	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "receipt") {
+	if err := ValidateStandbyReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("invalid node id error = %v, want receipt error", err)
 	}
 	response.Action.NodeId = "primary-a"
 
-	response.SlotAction = HAReplicationSlotAction("invalid")
-	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "invalid replication slot action") {
+	response.SlotAction = StandbyReplicationSlotAction("invalid")
+	if err := ValidateStandbyReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "invalid replication slot action") {
 		t.Fatalf("invalid slot action error = %v, want invalid action error", err)
 	}
-	response.SlotAction = HAReplicationSlotActionCreate
+	response.SlotAction = StandbyReplicationSlotActionCreate
 
 	response.Slot.SlotName = "standby a"
-	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "slot fields") {
+	if err := ValidateStandbyReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "slot fields") {
 		t.Fatalf("invalid slot name error = %v, want slot fields error", err)
 	}
 	response.Slot.SlotName = "standby-a"
 
 	response.Slot.TimelineId = 0
-	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "slot fields") {
+	if err := ValidateStandbyReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "slot fields") {
 		t.Fatalf("missing slot fields error = %v, want slot fields error", err)
 	}
 }
 
-func TestValidateHASeedActionResponses(t *testing.T) {
+func TestValidateStandbySeedActionResponses(t *testing.T) {
 	t.Parallel()
 
-	begin := HABaseBackupBeginResponse{
+	begin := StandbyBaseBackupBeginResponse{
 		SchemaVersion: 1,
-		Action: HAActionReceipt{
+		Action: StandbyActionReceipt{
 			ActionId:   "base_backup_begin:manifest-a",
-			ActionKind: HAActionKindBaseBackupBegin,
+			ActionKind: StandbyActionKindBaseBackupBegin,
 			Target:     "manifest-a",
-			State:      HAActionStateApplied,
+			State:      StandbyActionStateApplied,
 			NodeId:     "primary-a",
 		},
 		SlotName:       "standby-a",
@@ -1957,54 +2208,54 @@ func TestValidateHASeedActionResponses(t *testing.T) {
 		BackupLsn:      7,
 		StartRecordLsn: 8,
 	}
-	if err := ValidateHABaseBackupBeginResponse(begin); err != nil {
-		t.Fatalf("ValidateHABaseBackupBeginResponse returned error: %v", err)
+	if err := ValidateStandbyBaseBackupBeginResponse(begin); err != nil {
+		t.Fatalf("ValidateStandbyBaseBackupBeginResponse returned error: %v", err)
 	}
 	wrongBeginTarget := begin
 	wrongBeginTarget.Action.Target = "manifest-b"
-	if err := ValidateHABaseBackupBeginResponse(wrongBeginTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
+	if err := ValidateStandbyBaseBackupBeginResponse(wrongBeginTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("wrong begin target error = %v, want receipt mismatch", err)
 	}
 	begin.StartRecordLsn = 0
-	if err := ValidateHABaseBackupBeginResponse(begin); err == nil || !strings.Contains(err.Error(), "start_record_lsn") {
+	if err := ValidateStandbyBaseBackupBeginResponse(begin); err == nil || !strings.Contains(err.Error(), "start_record_lsn") {
 		t.Fatalf("missing start_record_lsn error = %v, want start_record_lsn error", err)
 	}
 
-	finish := HABaseBackupFinishResponse{
+	finish := StandbyBaseBackupFinishResponse{
 		SchemaVersion: 1,
-		Action: HAActionReceipt{
+		Action: StandbyActionReceipt{
 			ActionId:   "base_backup_finish:manifest-a",
-			ActionKind: HAActionKindBaseBackupFinish,
+			ActionKind: StandbyActionKindBaseBackupFinish,
 			Target:     "manifest-a",
-			State:      HAActionStateApplied,
+			State:      StandbyActionStateApplied,
 			NodeId:     "primary-a",
 		},
 		ManifestId:   "manifest-a",
 		BackupLsn:    7,
 		EndRecordLsn: 9,
 	}
-	if err := ValidateHABaseBackupFinishResponse(finish); err != nil {
-		t.Fatalf("ValidateHABaseBackupFinishResponse returned error: %v", err)
+	if err := ValidateStandbyBaseBackupFinishResponse(finish); err != nil {
+		t.Fatalf("ValidateStandbyBaseBackupFinishResponse returned error: %v", err)
 	}
 	wrongFinishKind := finish
-	wrongFinishKind.Action.ActionKind = HAActionKindBaseBackupBegin
+	wrongFinishKind.Action.ActionKind = StandbyActionKindBaseBackupBegin
 	wrongFinishKind.Action.ActionId = "base_backup_begin:manifest-a"
-	if err := ValidateHABaseBackupFinishResponse(wrongFinishKind); err == nil || !strings.Contains(err.Error(), "receipt") {
+	if err := ValidateStandbyBaseBackupFinishResponse(wrongFinishKind); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("wrong finish kind error = %v, want receipt mismatch", err)
 	}
 	finish.EndRecordLsn = 0
-	if err := ValidateHABaseBackupFinishResponse(finish); err == nil || !strings.Contains(err.Error(), "end_record_lsn") {
+	if err := ValidateStandbyBaseBackupFinishResponse(finish); err == nil || !strings.Contains(err.Error(), "end_record_lsn") {
 		t.Fatalf("missing end_record_lsn error = %v, want end_record_lsn error", err)
 	}
 
 	digest := strings.Repeat("a", 64)
-	capture := HASeedArtifactCaptureResponse{
+	capture := StandbySeedArtifactCaptureResponse{
 		SchemaVersion: 1,
-		Action: HAActionReceipt{
+		Action: StandbyActionReceipt{
 			ActionId:   "seed_capture:seed-standby-a-7",
-			ActionKind: HAActionKindSeedCapture,
+			ActionKind: StandbyActionKindSeedCapture,
 			Target:     "seed-standby-a-7",
-			State:      HAActionStateApplied,
+			State:      StandbyActionStateApplied,
 			NodeId:     "primary-a",
 		},
 		SlotName:             "standby-a",
@@ -2030,22 +2281,22 @@ func TestValidateHASeedActionResponses(t *testing.T) {
 		ContentRoot:          "/antflydb/ha/seed-captures/generations/seed-standby-a-7/content",
 		ManifestPath:         "/antflydb/ha/seed-captures/generations/seed-standby-a-7/manifest.afha",
 	}
-	if err := ValidateHASeedArtifactCaptureResponse(capture); err != nil {
-		t.Fatalf("ValidateHASeedArtifactCaptureResponse returned error: %v", err)
+	if err := ValidateStandbySeedArtifactCaptureResponse(capture); err != nil {
+		t.Fatalf("ValidateStandbySeedArtifactCaptureResponse returned error: %v", err)
 	}
 	badCapture := capture
 	badCapture.SourcePlanSha256 = strings.ToUpper(digest)
-	if err := ValidateHASeedArtifactCaptureResponse(badCapture); err == nil || !strings.Contains(err.Error(), "digest") {
+	if err := ValidateStandbySeedArtifactCaptureResponse(badCapture); err == nil || !strings.Contains(err.Error(), "digest") {
 		t.Fatalf("invalid capture digest error = %v, want digest error", err)
 	}
 
-	activation := HASeededSlotActivateResponse{
+	activation := StandbySeededSlotActivateResponse{
 		SchemaVersion: 1,
-		Action: HAActionReceipt{
+		Action: StandbyActionReceipt{
 			ActionId:   "seeded_slot_activate:seed-standby-a-7",
-			ActionKind: HAActionKindSeededSlotActivate,
+			ActionKind: StandbyActionKindSeededSlotActivate,
 			Target:     "seed-standby-a-7",
-			State:      HAActionStateApplied,
+			State:      StandbyActionStateApplied,
 			NodeId:     "primary-a",
 		},
 		SlotName:             "standby-a",
@@ -2058,51 +2309,51 @@ func TestValidateHASeedActionResponses(t *testing.T) {
 		ManifestSha256:       digest,
 		AggregateSha256:      digest,
 	}
-	if err := ValidateHASeededSlotActivateResponse(activation); err != nil {
-		t.Fatalf("ValidateHASeededSlotActivateResponse returned error: %v", err)
+	if err := ValidateStandbySeededSlotActivateResponse(activation); err != nil {
+		t.Fatalf("ValidateStandbySeededSlotActivateResponse returned error: %v", err)
 	}
 	wrongActivationTarget := activation
 	wrongActivationTarget.Action.Target = "seed-standby-a-8"
-	if err := ValidateHASeededSlotActivateResponse(wrongActivationTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
+	if err := ValidateStandbySeededSlotActivateResponse(wrongActivationTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("wrong activation target error = %v, want receipt mismatch", err)
 	}
 	activation.SeedReceiptSha256 = strings.Repeat("A", 64)
-	if err := ValidateHASeededSlotActivateResponse(activation); err == nil || !strings.Contains(err.Error(), "digest") {
+	if err := ValidateStandbySeededSlotActivateResponse(activation); err == nil || !strings.Contains(err.Error(), "digest") {
 		t.Fatalf("invalid activation digest error = %v, want digest error", err)
 	}
 
-	bootstrap := HAStandbyBootstrapResponse{
+	bootstrap := StandbyBootstrapResponse{
 		SchemaVersion: 1,
-		Action: HAActionReceipt{
+		Action: StandbyActionReceipt{
 			ActionId:   "standby_bootstrap:manifest-a",
-			ActionKind: HAActionKindStandbyBootstrap,
+			ActionKind: StandbyActionKindStandbyBootstrap,
 			Target:     "manifest-a",
-			State:      HAActionStateApplied,
+			State:      StandbyActionStateApplied,
 			NodeId:     "standby-a",
 		},
 		ManifestId:    "manifest-a",
 		BackupLsn:     7,
 		CheckpointLsn: 10,
 	}
-	if err := ValidateHAStandbyBootstrapResponse(bootstrap); err != nil {
-		t.Fatalf("ValidateHAStandbyBootstrapResponse returned error: %v", err)
+	if err := ValidateStandbyBootstrapResponse(bootstrap); err != nil {
+		t.Fatalf("ValidateStandbyBootstrapResponse returned error: %v", err)
 	}
 	wrongBootstrapTarget := bootstrap
 	wrongBootstrapTarget.Action.Target = "manifest-b"
-	if err := ValidateHAStandbyBootstrapResponse(wrongBootstrapTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
+	if err := ValidateStandbyBootstrapResponse(wrongBootstrapTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
 		t.Fatalf("wrong bootstrap target error = %v, want receipt mismatch", err)
 	}
 	bootstrap.CheckpointLsn = 0
-	if err := ValidateHAStandbyBootstrapResponse(bootstrap); err == nil || !strings.Contains(err.Error(), "checkpoint_lsn") {
+	if err := ValidateStandbyBootstrapResponse(bootstrap); err == nil || !strings.Contains(err.Error(), "checkpoint_lsn") {
 		t.Fatalf("missing checkpoint_lsn error = %v, want checkpoint_lsn error", err)
 	}
 }
 
-func TestValidateHAFenceResponse(t *testing.T) {
+func TestValidateStandbyFenceResponse(t *testing.T) {
 	t.Parallel()
 
-	receipt := HAFenceReceipt{
-		Identity: HAIdentity{
+	receipt := StandbyFenceReceipt{
+		Identity: StandbyIdentity{
 			ClusterId:  1,
 			ShardId:    2,
 			TableId:    3,
@@ -2122,80 +2373,80 @@ func TestValidateHAFenceResponse(t *testing.T) {
 		Token:            "fence-token",
 		Reason:           "manual",
 	}
-	response := HAFenceResponse{
+	response := StandbyFenceResponse{
 		SchemaVersion: 1,
-		Action: HAActionReceipt{
+		Action: StandbyActionReceipt{
 			ActionId:   "fence_acquire:standby-a",
-			ActionKind: HAActionKindFenceAcquire,
+			ActionKind: StandbyActionKindFenceAcquire,
 			Target:     "standby-a",
-			State:      HAActionStateApplied,
+			State:      StandbyActionStateApplied,
 			NodeId:     "standby-a",
 		},
 		Receipt: receipt,
 	}
-	if err := ValidateHAFenceResponse(response); err != nil {
-		t.Fatalf("ValidateHAFenceResponse returned error: %v", err)
+	if err := ValidateStandbyFenceResponse(response); err != nil {
+		t.Fatalf("ValidateStandbyFenceResponse returned error: %v", err)
 	}
 	formerPrimaryCopy := response
 	formerPrimaryCopy.Action.NodeId = "primary-a"
-	if err := ValidateHAFenceResponse(formerPrimaryCopy); err != nil {
-		t.Fatalf("ValidateHAFenceResponse rejected former-primary receipt copy: %v", err)
+	if err := ValidateStandbyFenceResponse(formerPrimaryCopy); err != nil {
+		t.Fatalf("ValidateStandbyFenceResponse rejected former-primary receipt copy: %v", err)
 	}
 	emptyReason := response
 	emptyReason.Receipt.Reason = ""
-	if err := ValidateHAFenceResponse(emptyReason); err != nil {
-		t.Fatalf("ValidateHAFenceResponse with empty reason returned error: %v", err)
+	if err := ValidateStandbyFenceResponse(emptyReason); err != nil {
+		t.Fatalf("ValidateStandbyFenceResponse with empty reason returned error: %v", err)
 	}
 	wrongActionNode := response
 	wrongActionNode.Action.NodeId = "standby-b"
-	if err := ValidateHAFenceResponse(wrongActionNode); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
+	if err := ValidateStandbyFenceResponse(wrongActionNode); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
 		t.Fatalf("wrong fence action node error = %v, want action node mismatch", err)
 	}
 	paddedActionTarget := response
 	paddedActionTarget.Action.Target = "standby-a "
-	if err := ValidateHAFenceResponse(paddedActionTarget); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
+	if err := ValidateStandbyFenceResponse(paddedActionTarget); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
 		t.Fatalf("padded fence action target error = %v, want action node mismatch", err)
 	}
 	paddedActionID := response
 	paddedActionID.Action.ActionId = "fence_acquire:standby-a "
-	if err := ValidateHAFenceResponse(paddedActionID); err == nil || !strings.Contains(err.Error(), "action id") {
+	if err := ValidateStandbyFenceResponse(paddedActionID); err == nil || !strings.Contains(err.Error(), "action id") {
 		t.Fatalf("padded fence action id error = %v, want action id mismatch", err)
 	}
 	invalidReceiptNode := response
 	invalidReceiptNode.Receipt.PromotedNodeId = "standby a"
-	if err := ValidateHAFenceResponse(invalidReceiptNode); err == nil || !strings.Contains(err.Error(), "receipt fields") {
+	if err := ValidateStandbyFenceResponse(invalidReceiptNode); err == nil || !strings.Contains(err.Error(), "receipt fields") {
 		t.Fatalf("invalid fence receipt node error = %v, want receipt fields", err)
 	}
 	wrongIdentity := response
 	wrongIdentity.Receipt.Identity.TimelineId = 5
-	if err := ValidateHAFenceResponse(wrongIdentity); err == nil || !strings.Contains(err.Error(), "promoted timeline") {
+	if err := ValidateStandbyFenceResponse(wrongIdentity); err == nil || !strings.Contains(err.Error(), "promoted timeline") {
 		t.Fatalf("wrong fence identity error = %v, want promoted timeline mismatch", err)
 	}
 	staleObserved := response
 	staleObserved.Receipt.ObservedLsn = 7
-	if err := ValidateHAFenceResponse(staleObserved); err == nil || !strings.Contains(err.Error(), "observed_lsn") {
+	if err := ValidateStandbyFenceResponse(staleObserved); err == nil || !strings.Contains(err.Error(), "observed_lsn") {
 		t.Fatalf("stale fence observed_lsn error = %v, want observed_lsn mismatch", err)
 	}
-	if err := ValidateHACurrentFenceResponse(HACurrentFenceResponse{
+	if err := ValidateStandbyCurrentFenceResponse(StandbyCurrentFenceResponse{
 		SchemaVersion: 1,
 		Held:          false,
 	}); err != nil {
-		t.Fatalf("ValidateHACurrentFenceResponse empty returned error: %v", err)
+		t.Fatalf("ValidateStandbyCurrentFenceResponse empty returned error: %v", err)
 	}
-	if err := ValidateHACurrentFenceResponse(HACurrentFenceResponse{
+	if err := ValidateStandbyCurrentFenceResponse(StandbyCurrentFenceResponse{
 		SchemaVersion: 1,
 		Held:          true,
 		Receipt:       receipt,
 	}); err != nil {
-		t.Fatalf("ValidateHACurrentFenceResponse held returned error: %v", err)
+		t.Fatalf("ValidateStandbyCurrentFenceResponse held returned error: %v", err)
 	}
-	if err := ValidateHACurrentFenceResponse(HACurrentFenceResponse{
+	if err := ValidateStandbyCurrentFenceResponse(StandbyCurrentFenceResponse{
 		SchemaVersion: 1,
 		Held:          true,
 	}); err == nil || !strings.Contains(err.Error(), "receipt fields") {
 		t.Fatalf("missing current fence receipt error = %v, want receipt fields error", err)
 	}
-	if err := ValidateHACurrentFenceResponse(HACurrentFenceResponse{
+	if err := ValidateStandbyCurrentFenceResponse(StandbyCurrentFenceResponse{
 		SchemaVersion: 1,
 		Held:          false,
 		Receipt:       receipt,
@@ -2205,7 +2456,7 @@ func TestValidateHAFenceResponse(t *testing.T) {
 	currentWithBadReceipt := receipt
 	currentWithBadReceipt.NewEpoch = currentWithBadReceipt.ParentEpoch
 	currentWithBadReceipt.Identity.Epoch = currentWithBadReceipt.NewEpoch
-	if err := ValidateHACurrentFenceResponse(HACurrentFenceResponse{
+	if err := ValidateStandbyCurrentFenceResponse(StandbyCurrentFenceResponse{
 		SchemaVersion: 1,
 		Held:          true,
 		Receipt:       currentWithBadReceipt,
@@ -2213,20 +2464,102 @@ func TestValidateHAFenceResponse(t *testing.T) {
 		t.Fatalf("bad current fence receipt error = %v, want advance error", err)
 	}
 	response.Receipt.Token = ""
-	if err := ValidateHAFenceResponse(response); err == nil || !strings.Contains(err.Error(), "receipt fields") {
+	if err := ValidateStandbyFenceResponse(response); err == nil || !strings.Contains(err.Error(), "receipt fields") {
 		t.Fatalf("missing token error = %v, want receipt fields error", err)
 	}
 	response.Receipt.Token = "fence-token"
 	response.Action.NodeId = ""
-	if err := ValidateHAFenceResponse(response); err == nil || !strings.Contains(err.Error(), "action receipt") {
+	if err := ValidateStandbyFenceResponse(response); err == nil || !strings.Contains(err.Error(), "action receipt") {
 		t.Fatalf("missing action receipt error = %v, want action receipt error", err)
 	}
 }
 
-func TestValidateHAPromotionResponses(t *testing.T) {
+func TestValidateStandbyUpstreamResponse(t *testing.T) {
 	t.Parallel()
 
-	assessment := HAPromotionAssessment{
+	identity := StandbyIdentity{ClusterId: 100, ShardId: 10, TableId: 20, TimelineId: 4, Epoch: 6}
+	newUpstream := StandbyUpstream{UpstreamUrl: "https://primary-b.example:5433", SlotName: "standby-a"}
+	oldUpstream := StandbyUpstream{UpstreamUrl: "https://primary-a.example:5433", SlotName: "standby-a"}
+
+	changed := StandbyUpstreamResponse{
+		SchemaVersion: 1,
+		Action: StandbyActionReceipt{
+			ActionId:   "standby_upstream:standby-a",
+			ActionKind: StandbyActionKindStandbyUpstream,
+			Target:     "standby-a",
+			State:      StandbyActionStateApplied,
+			NodeId:     "standby-a",
+		},
+		Identity: identity,
+		Upstream: newUpstream,
+		Previous: oldUpstream,
+		Changed:  true,
+	}
+	if err := ValidateStandbyUpstreamResponse(changed); err != nil {
+		t.Fatalf("ValidateStandbyUpstreamResponse changed returned error: %v", err)
+	}
+
+	changedWithoutPrevious := changed
+	changedWithoutPrevious.Previous = StandbyUpstream{}
+	if err := ValidateStandbyUpstreamResponse(changedWithoutPrevious); err != nil {
+		t.Fatalf("ValidateStandbyUpstreamResponse changed without previous returned error: %v", err)
+	}
+
+	alreadyApplied := changed
+	alreadyApplied.Action.State = StandbyActionStateAlreadyApplied
+	alreadyApplied.Changed = false
+	alreadyApplied.Previous = newUpstream
+	if err := ValidateStandbyUpstreamResponse(alreadyApplied); err != nil {
+		t.Fatalf("ValidateStandbyUpstreamResponse unchanged returned error: %v", err)
+	}
+
+	unchangedWithoutPrevious := alreadyApplied
+	unchangedWithoutPrevious.Previous = StandbyUpstream{}
+	if err := ValidateStandbyUpstreamResponse(unchangedWithoutPrevious); err == nil || !strings.Contains(err.Error(), "without a previous upstream") {
+		t.Fatalf("unchanged without previous error = %v, want missing previous error", err)
+	}
+
+	unchangedWithMismatchedPrevious := alreadyApplied
+	unchangedWithMismatchedPrevious.Previous = oldUpstream
+	if err := ValidateStandbyUpstreamResponse(unchangedWithMismatchedPrevious); err == nil || !strings.Contains(err.Error(), "mismatched previous upstream") {
+		t.Fatalf("unchanged with mismatched previous error = %v, want mismatched previous error", err)
+	}
+
+	changedWithIdenticalPrevious := changed
+	changedWithIdenticalPrevious.Previous = newUpstream
+	if err := ValidateStandbyUpstreamResponse(changedWithIdenticalPrevious); err == nil || !strings.Contains(err.Error(), "unchanged previous upstream") {
+		t.Fatalf("changed with identical previous error = %v, want unchanged previous error", err)
+	}
+
+	missingIdentity := changed
+	missingIdentity.Identity = StandbyIdentity{}
+	if err := ValidateStandbyUpstreamResponse(missingIdentity); err == nil || !strings.Contains(err.Error(), "identity fields") {
+		t.Fatalf("missing identity error = %v, want identity fields error", err)
+	}
+
+	invalidUpstream := changed
+	invalidUpstream.Upstream.UpstreamUrl = ""
+	if err := ValidateStandbyUpstreamResponse(invalidUpstream); err == nil || !strings.Contains(err.Error(), "standby upstream fields") {
+		t.Fatalf("invalid upstream error = %v, want standby upstream fields error", err)
+	}
+
+	mismatchedTarget := changed
+	mismatchedTarget.Action.Target = "standby-b"
+	if err := ValidateStandbyUpstreamResponse(mismatchedTarget); err == nil || !strings.Contains(err.Error(), "does not match action target") {
+		t.Fatalf("mismatched action target error = %v, want action target mismatch error", err)
+	}
+
+	missingAction := changed
+	missingAction.Action.NodeId = ""
+	if err := ValidateStandbyUpstreamResponse(missingAction); err == nil || !strings.Contains(err.Error(), "action receipt") {
+		t.Fatalf("missing action receipt error = %v, want action receipt error", err)
+	}
+}
+
+func TestValidateStandbyPromotionResponses(t *testing.T) {
+	t.Parallel()
+
+	assessment := StandbyPromotionAssessment{
 		RequiredLsn:        8,
 		ReceivedLsn:        8,
 		AppliedLsn:         8,
@@ -2234,246 +2567,269 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 		CaughtUpToReceived: true,
 		FencingConfirmed:   true,
 		Force:              false,
-		Mode:               HAPromotionModeSafe,
+		Mode:               StandbyPromotionModeSafe,
 		CanPromote:         true,
 		Safe:               true,
 	}
-	assess := HAPromotionAssessResponse{
+	assess := StandbyPromotionAssessResponse{
 		SchemaVersion: 1,
-		Action: HAActionReceipt{
+		Action: StandbyActionReceipt{
 			ActionId:   "promotion_assess:standby-a",
-			ActionKind: HAActionKindPromotionAssess,
+			ActionKind: StandbyActionKindPromotionAssess,
 			Target:     "standby-a",
-			State:      HAActionStateAssessed,
+			State:      StandbyActionStateAssessed,
 			NodeId:     "standby-a",
 		},
 		Assessment: assessment,
 	}
-	if err := ValidateHAPromotionAssessResponse(assess); err != nil {
-		t.Fatalf("ValidateHAPromotionAssessResponse returned error: %v", err)
+	if err := ValidateStandbyPromotionAssessResponse(assess); err != nil {
+		t.Fatalf("ValidateStandbyPromotionAssessResponse returned error: %v", err)
 	}
 	emptyStandbyAssess := assess
 	emptyStandbyAssess.Assessment.RequiredLsn = 0
 	emptyStandbyAssess.Assessment.ReceivedLsn = 0
 	emptyStandbyAssess.Assessment.AppliedLsn = 0
 	emptyStandbyAssess.Assessment.HasRequiredLsn = true
-	if err := ValidateHAPromotionAssessResponse(emptyStandbyAssess); err != nil {
-		t.Fatalf("ValidateHAPromotionAssessResponse with zero required_lsn returned error: %v", err)
+	if err := ValidateStandbyPromotionAssessResponse(emptyStandbyAssess); err != nil {
+		t.Fatalf("ValidateStandbyPromotionAssessResponse with zero required_lsn returned error: %v", err)
 	}
 	wrongAssessNode := assess
 	wrongAssessNode.Action.NodeId = "standby-b"
-	if err := ValidateHAPromotionAssessResponse(wrongAssessNode); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
+	if err := ValidateStandbyPromotionAssessResponse(wrongAssessNode); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
 		t.Fatalf("wrong promotion assess executor error = %v, want executor node mismatch", err)
 	}
 	paddedAssessTarget := assess
 	paddedAssessTarget.Action.Target = "standby-a "
-	if err := ValidateHAPromotionAssessResponse(paddedAssessTarget); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
+	if err := ValidateStandbyPromotionAssessResponse(paddedAssessTarget); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
 		t.Fatalf("padded promotion assess target error = %v, want executor node mismatch", err)
 	}
 	paddedAssessActionID := assess
 	paddedAssessActionID.Action.ActionId = "promotion_assess:standby-a "
-	if err := ValidateHAPromotionAssessResponse(paddedAssessActionID); err == nil || !strings.Contains(err.Error(), "action id") {
+	if err := ValidateStandbyPromotionAssessResponse(paddedAssessActionID); err == nil || !strings.Contains(err.Error(), "action id") {
 		t.Fatalf("padded promotion assess action id error = %v, want action id mismatch", err)
 	}
 	inconsistentAssess := assess
 	inconsistentAssess.Assessment.HasRequiredLsn = false
-	if err := ValidateHAPromotionAssessResponse(inconsistentAssess); err == nil || !strings.Contains(err.Error(), "has_required_lsn") {
+	if err := ValidateStandbyPromotionAssessResponse(inconsistentAssess); err == nil || !strings.Contains(err.Error(), "has_required_lsn") {
 		t.Fatalf("inconsistent promotion assessment error = %v, want has_required_lsn mismatch", err)
 	}
 	wrongMode := assess
-	wrongMode.Assessment.Mode = HAPromotionModeForced
-	if err := ValidateHAPromotionAssessResponse(wrongMode); err == nil || !strings.Contains(err.Error(), "mode") {
+	wrongMode.Assessment.Mode = StandbyPromotionModeForced
+	if err := ValidateStandbyPromotionAssessResponse(wrongMode); err == nil || !strings.Contains(err.Error(), "mode") {
 		t.Fatalf("wrong promotion assessment mode error = %v, want mode mismatch", err)
 	}
 	assess.Assessment.RequiredLsn = 9
-	if err := ValidateHAPromotionAssessResponse(assess); err == nil || !strings.Contains(err.Error(), "assessment fields") {
+	if err := ValidateStandbyPromotionAssessResponse(assess); err == nil || !strings.Contains(err.Error(), "assessment fields") {
 		t.Fatalf("missing assessment error = %v, want assessment fields error", err)
 	}
 
-	identity := HAIdentity{ClusterId: 1, ShardId: 2, TableId: 3, TimelineId: 4, Epoch: 5}
-	promotion := HAPromotionResponse{
+	identity := StandbyIdentity{ClusterId: 1, ShardId: 2, TableId: 3, TimelineId: 4, Epoch: 5}
+	promotion := StandbyPromotionResponse{
 		SchemaVersion:   1,
-		Action:          HAActionReceipt{ActionId: "promotion:standby-a", ActionKind: HAActionKindPromotion, Target: "standby-a", State: HAActionStateApplied, NodeId: "standby-a"},
+		Action:          StandbyActionReceipt{ActionId: "promotion:standby-a", ActionKind: StandbyActionKindPromotion, Target: "standby-a", State: StandbyActionStateApplied, NodeId: "standby-a"},
 		Assessment:      assessment,
 		FenceGeneration: 9,
 		FenceToken:      "fence-token",
-		Promotion: HAPromotionResult{
+		Promotion: StandbyPromotionResult{
 			NodeId:      "standby-a",
 			SwitchLsn:   9,
 			OldIdentity: identity,
-			NewIdentity: HAIdentity{ClusterId: 1, ShardId: 2, TableId: 3, TimelineId: 6, Epoch: 7},
+			NewIdentity: StandbyIdentity{ClusterId: 1, ShardId: 2, TableId: 3, TimelineId: 6, Epoch: 7},
 		},
 	}
-	if err := ValidateHAPromotionResponse(promotion); err != nil {
-		t.Fatalf("ValidateHAPromotionResponse returned error: %v", err)
+	if err := ValidateStandbyPromotionResponse(promotion); err != nil {
+		t.Fatalf("ValidateStandbyPromotionResponse returned error: %v", err)
 	}
 	wrongPromotionNode := promotion
 	wrongPromotionNode.Action.NodeId = "standby-b"
-	if err := ValidateHAPromotionResponse(wrongPromotionNode); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
+	if err := ValidateStandbyPromotionResponse(wrongPromotionNode); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
 		t.Fatalf("wrong promotion node error = %v, want action node mismatch", err)
 	}
 	paddedPromotionTarget := promotion
 	paddedPromotionTarget.Action.Target = "standby-a "
-	if err := ValidateHAPromotionResponse(paddedPromotionTarget); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
+	if err := ValidateStandbyPromotionResponse(paddedPromotionTarget); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
 		t.Fatalf("padded promotion target error = %v, want action node mismatch", err)
 	}
 	paddedPromotionActionID := promotion
 	paddedPromotionActionID.Action.ActionId = "promotion:standby-a "
-	if err := ValidateHAPromotionResponse(paddedPromotionActionID); err == nil || !strings.Contains(err.Error(), "action id") {
+	if err := ValidateStandbyPromotionResponse(paddedPromotionActionID); err == nil || !strings.Contains(err.Error(), "action id") {
 		t.Fatalf("padded promotion action id error = %v, want action id mismatch", err)
 	}
 	wrongSwitchLSN := promotion
 	wrongSwitchLSN.Promotion.SwitchLsn = 10
-	if err := ValidateHAPromotionResponse(wrongSwitchLSN); err == nil || !strings.Contains(err.Error(), "switch_lsn") {
+	if err := ValidateStandbyPromotionResponse(wrongSwitchLSN); err == nil || !strings.Contains(err.Error(), "switch_lsn") {
 		t.Fatalf("wrong promotion switch_lsn error = %v, want switch_lsn mismatch", err)
 	}
 	wrongIdentity := promotion
 	wrongIdentity.Promotion.NewIdentity.ClusterId = 99
-	if err := ValidateHAPromotionResponse(wrongIdentity); err == nil || !strings.Contains(err.Error(), "identity scope") {
+	if err := ValidateStandbyPromotionResponse(wrongIdentity); err == nil || !strings.Contains(err.Error(), "identity scope") {
 		t.Fatalf("wrong promotion identity error = %v, want identity scope mismatch", err)
 	}
 	promotion.FenceToken = ""
-	if err := ValidateHAPromotionResponse(promotion); err == nil || !strings.Contains(err.Error(), "fence_token") {
+	if err := ValidateStandbyPromotionResponse(promotion); err == nil || !strings.Contains(err.Error(), "fence_token") {
 		t.Fatalf("missing fence_token error = %v, want fence_token error", err)
 	}
 	promotion.FenceToken = "fence-token"
 	promotion.Promotion.SwitchLsn = 0
-	if err := ValidateHAPromotionResponse(promotion); err == nil || !strings.Contains(err.Error(), "promotion result") {
+	if err := ValidateStandbyPromotionResponse(promotion); err == nil || !strings.Contains(err.Error(), "promotion result") {
 		t.Fatalf("missing promotion result error = %v, want promotion result error", err)
 	}
 }
 
-func TestValidateHASeedLifecycleReceiptInventory(t *testing.T) {
+func TestValidateStandbySeedLifecycleReceiptInventory(t *testing.T) {
 	t.Parallel()
 	receipt := `{"format_version":2,"generation":"seed-a-7","slot_name":"standby-a","topology_id":"topology-a","topology_generation":7,"node_id":"standby-a","target_pvc_name":"standby-a-data","target_pvc_uid":"pvc-uid-7"}`
 	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(receipt)))
-	response := HASeedLifecycleReceiptInventory{
+	response := StandbySeedLifecycleReceiptInventory{
 		SchemaVersion:    1,
 		FirstCursor:      4,
 		EndCursor:        4,
 		NextCursor:       4,
 		HistoryTruncated: true,
-		Entries: []HASeedLifecycleReceiptEvent{{
-			Cursor: 4, Kind: oapi.HASeedLifecycleReceiptEventKindCapture,
+		Entries: []StandbySeedLifecycleReceiptEvent{{
+			Cursor: 4, Kind: oapi.StandbySeedLifecycleReceiptEventKindCapture,
 			Generation: "seed-a-7", SlotName: "standby-a", TopologyId: "topology-a", TopologyGeneration: 7,
 			NodeId: "standby-a", TargetPvcName: "standby-a-data", TargetPvcUid: "pvc-uid-7",
 			ReceiptSha256: digest, ReceiptJson: receipt, RecordedAtUnixNs: 99,
-			AuthoritativeState: oapi.HASeedLifecycleReceiptEventAuthoritativeStateRetained,
+			AuthoritativeState: oapi.StandbySeedLifecycleReceiptEventAuthoritativeStateRetained,
 		}},
-		Runtime: HARuntimeLifecycleObservation{
-			NodeId: "primary-a", Role: oapi.HARuntimeLifecycleObservationRolePrimary,
+		Runtime: StandbyRuntimeLifecycleObservation{
+			NodeId: "primary-a", Role: oapi.StandbyRuntimeLifecycleObservationRolePrimary,
 			PodUid: "pod-primary-a", Fenced: false, ObservedAtUnixNs: 100,
 		},
 	}
-	if err := ValidateHASeedLifecycleReceiptInventory(response); err != nil {
-		t.Fatalf("ValidateHASeedLifecycleReceiptInventory returned error: %v", err)
+	if err := ValidateStandbySeedLifecycleReceiptInventory(response); err != nil {
+		t.Fatalf("ValidateStandbySeedLifecycleReceiptInventory returned error: %v", err)
 	}
 	badDigest := response
-	badDigest.Entries = append([]HASeedLifecycleReceiptEvent(nil), response.Entries...)
+	badDigest.Entries = append([]StandbySeedLifecycleReceiptEvent(nil), response.Entries...)
 	badDigest.Entries[0].ReceiptJson += " "
-	if err := ValidateHASeedLifecycleReceiptInventory(badDigest); err == nil || !strings.Contains(err.Error(), "digest") {
+	if err := ValidateStandbySeedLifecycleReceiptInventory(badDigest); err == nil || !strings.Contains(err.Error(), "digest") {
 		t.Fatalf("receipt digest mismatch error = %v, want digest error", err)
 	}
 	badCursor := response
 	badCursor.NextCursor = 3
-	if err := ValidateHASeedLifecycleReceiptInventory(badCursor); err == nil || !strings.Contains(err.Error(), "next_cursor") {
+	if err := ValidateStandbySeedLifecycleReceiptInventory(badCursor); err == nil || !strings.Contains(err.Error(), "next_cursor") {
 		t.Fatalf("cursor mismatch error = %v, want next_cursor error", err)
 	}
 }
 
-func TestValidateHAResponseEvidence(t *testing.T) {
+func TestValidateStandbyResponseEvidence(t *testing.T) {
 	t.Parallel()
 
 	slot := `{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"create","slot":{"slot_name":"standby-a","timeline_id":1,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":false,"reseed_required":false,"current_lsn":0}}`
-	if err := ValidateHAReplicationSlotActionResponseEvidence([]byte(slot)); err != nil {
-		t.Fatalf("ValidateHAReplicationSlotActionResponseEvidence returned error: %v", err)
+	if err := ValidateStandbyReplicationSlotActionResponseEvidence([]byte(slot)); err != nil {
+		t.Fatalf("ValidateStandbyReplicationSlotActionResponseEvidence returned error: %v", err)
 	}
-	if err := ValidateHAReplicationSlotActionResponseEvidence([]byte(strings.Replace(slot, `"slot_name":"standby-a",`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
+	if err := ValidateStandbyReplicationSlotActionResponseEvidence([]byte(strings.Replace(slot, `"slot_name":"standby-a",`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
 		t.Fatalf("missing slot name evidence error = %v, want slot field evidence error", err)
 	}
-	if err := ValidateHAReplicationSlotActionResponseEvidence([]byte(strings.Replace(slot, `,"active":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
+	if err := ValidateStandbyReplicationSlotActionResponseEvidence([]byte(strings.Replace(slot, `,"active":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
 		t.Fatalf("missing slot active evidence error = %v, want slot field evidence error", err)
 	}
 	slotList := `{"schema_version":1,"slots":[{"slot_name":"standby-a","timeline_id":1,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":false,"reseed_required":false,"current_lsn":0}]}`
-	if err := ValidateHAReplicationSlotListResponseEvidence([]byte(slotList)); err != nil {
-		t.Fatalf("ValidateHAReplicationSlotListResponseEvidence returned error: %v", err)
+	if err := ValidateStandbyReplicationSlotListResponseEvidence([]byte(slotList)); err != nil {
+		t.Fatalf("ValidateStandbyReplicationSlotListResponseEvidence returned error: %v", err)
 	}
-	if err := ValidateHAReplicationSlotListResponseEvidence([]byte(`{"schema_version":1}`)); err == nil || !strings.Contains(err.Error(), "slots field evidence") {
+	if err := ValidateStandbyReplicationSlotListResponseEvidence([]byte(`{"schema_version":1}`)); err == nil || !strings.Contains(err.Error(), "slots field evidence") {
 		t.Fatalf("missing slot list evidence error = %v, want slots field evidence error", err)
 	}
-	if err := ValidateHAReplicationSlotListResponseEvidence([]byte(strings.Replace(slotList, `,"timeline_id":1`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
+	if err := ValidateStandbyReplicationSlotListResponseEvidence([]byte(strings.Replace(slotList, `,"timeline_id":1`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
 		t.Fatalf("missing slot timeline evidence error = %v, want slot field evidence error", err)
 	}
-	if err := ValidateHAReplicationSlotListResponseEvidence([]byte(strings.Replace(slotList, `,"current_lsn":0`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
+	if err := ValidateStandbyReplicationSlotListResponseEvidence([]byte(strings.Replace(slotList, `,"current_lsn":0`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
 		t.Fatalf("missing slot current_lsn evidence error = %v, want slot field evidence error", err)
 	}
 
 	begin := `{"schema_version":1,"action":{"action_id":"base_backup_begin:manifest-a","action_kind":"base_backup_begin","target":"manifest-a","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"manifest-a","backup_lsn":7,"start_record_lsn":8}`
-	if err := ValidateHABaseBackupBeginResponseEvidence([]byte(begin)); err != nil {
-		t.Fatalf("ValidateHABaseBackupBeginResponseEvidence returned error: %v", err)
+	if err := ValidateStandbyBaseBackupBeginResponseEvidence([]byte(begin)); err != nil {
+		t.Fatalf("ValidateStandbyBaseBackupBeginResponseEvidence returned error: %v", err)
 	}
-	if err := ValidateHABaseBackupBeginResponseEvidence([]byte(strings.Replace(begin, `,"start_record_lsn":8`, "", 1))); err == nil || !strings.Contains(err.Error(), "base backup begin field evidence") {
+	if err := ValidateStandbyBaseBackupBeginResponseEvidence([]byte(strings.Replace(begin, `,"start_record_lsn":8`, "", 1))); err == nil || !strings.Contains(err.Error(), "base backup begin field evidence") {
 		t.Fatalf("missing base backup begin evidence error = %v, want field evidence error", err)
 	}
 	finish := `{"schema_version":1,"action":{"action_id":"base_backup_finish:manifest-a","action_kind":"base_backup_finish","target":"manifest-a","state":"applied","node_id":"primary-a"},"manifest_id":"manifest-a","backup_lsn":7,"end_record_lsn":9}`
-	if err := ValidateHABaseBackupFinishResponseEvidence([]byte(finish)); err != nil {
-		t.Fatalf("ValidateHABaseBackupFinishResponseEvidence returned error: %v", err)
+	if err := ValidateStandbyBaseBackupFinishResponseEvidence([]byte(finish)); err != nil {
+		t.Fatalf("ValidateStandbyBaseBackupFinishResponseEvidence returned error: %v", err)
 	}
-	if err := ValidateHABaseBackupFinishResponseEvidence([]byte(strings.Replace(finish, `,"end_record_lsn":9`, "", 1))); err == nil || !strings.Contains(err.Error(), "base backup finish field evidence") {
+	if err := ValidateStandbyBaseBackupFinishResponseEvidence([]byte(strings.Replace(finish, `,"end_record_lsn":9`, "", 1))); err == nil || !strings.Contains(err.Error(), "base backup finish field evidence") {
 		t.Fatalf("missing base backup finish evidence error = %v, want field evidence error", err)
 	}
 	bootstrap := `{"schema_version":1,"action":{"action_id":"standby_bootstrap:manifest-a","action_kind":"standby_bootstrap","target":"manifest-a","state":"applied","node_id":"standby-a"},"manifest_id":"manifest-a","backup_lsn":7,"checkpoint_lsn":10}`
-	if err := ValidateHAStandbyBootstrapResponseEvidence([]byte(bootstrap)); err != nil {
-		t.Fatalf("ValidateHAStandbyBootstrapResponseEvidence returned error: %v", err)
+	if err := ValidateStandbyBootstrapResponseEvidence([]byte(bootstrap)); err != nil {
+		t.Fatalf("ValidateStandbyBootstrapResponseEvidence returned error: %v", err)
 	}
-	if err := ValidateHAStandbyBootstrapResponseEvidence([]byte(strings.Replace(bootstrap, `,"checkpoint_lsn":10`, "", 1))); err == nil || !strings.Contains(err.Error(), "standby bootstrap field evidence") {
+	if err := ValidateStandbyBootstrapResponseEvidence([]byte(strings.Replace(bootstrap, `,"checkpoint_lsn":10`, "", 1))); err == nil || !strings.Contains(err.Error(), "standby bootstrap field evidence") {
 		t.Fatalf("missing standby bootstrap evidence error = %v, want field evidence error", err)
 	}
 
-	fence := `{"schema_version":1,"action":{"action_id":"fence_acquire:standby-a","action_kind":"fence_acquire","target":"standby-a","state":"applied","node_id":"standby-a"},"receipt":{"identity":{"cluster_id":1,"shard_id":0,"table_id":0,"timeline_id":2,"epoch":3},"old_primary_id":"primary-a","promoted_node_id":"standby-a","parent_timeline_id":2,"parent_epoch":3,"new_timeline_id":4,"new_epoch":5,"required_lsn":8,"observed_lsn":8,"generation":9,"forced":false,"token":"fence-token","reason":""}}`
-	if err := ValidateHAFenceResponseEvidence([]byte(fence)); err != nil {
-		t.Fatalf("ValidateHAFenceResponseEvidence returned error: %v", err)
+	standbyUpstream := `{"schema_version":1,"action":{"action_id":"standby_upstream:standby-a","action_kind":"standby_upstream","target":"standby-a","state":"applied","node_id":"standby-a"},"identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"upstream":{"upstream_url":"https://primary-b.example:5433","slot_name":"standby-a"},"previous":{"upstream_url":"https://primary-a.example:5433","slot_name":"standby-a"},"changed":true}`
+	if err := ValidateStandbyUpstreamResponseEvidence([]byte(standbyUpstream)); err != nil {
+		t.Fatalf("ValidateStandbyUpstreamResponseEvidence returned error: %v", err)
 	}
-	if err := ValidateHAFenceResponseEvidence([]byte(strings.Replace(fence, `,"forced":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "receipt field evidence") {
+	if err := ValidateStandbyUpstreamResponseEvidence([]byte(strings.Replace(standbyUpstream, `,"epoch":6`, "", 1))); err == nil || !strings.Contains(err.Error(), "identity field evidence") {
+		t.Fatalf("missing standby upstream identity evidence error = %v, want identity field evidence error", err)
+	}
+	if err := ValidateStandbyUpstreamResponseEvidence([]byte(strings.Replace(standbyUpstream, `"upstream":{"upstream_url":"https://primary-b.example:5433","slot_name":"standby-a"}`, `"upstream":{"upstream_url":"https://primary-b.example:5433"}`, 1))); err == nil || !strings.Contains(err.Error(), "standby upstream field evidence") {
+		t.Fatalf("missing standby upstream field evidence error = %v, want field evidence error", err)
+	}
+	if err := ValidateStandbyUpstreamResponseEvidence([]byte(strings.Replace(standbyUpstream, `,"changed":true`, "", 1))); err == nil || !strings.Contains(err.Error(), "changed field evidence") {
+		t.Fatalf("missing standby upstream changed evidence error = %v, want changed field evidence error", err)
+	}
+	unchangedWithoutPreviousEvidence := strings.Replace(standbyUpstream, `,"previous":{"upstream_url":"https://primary-a.example:5433","slot_name":"standby-a"}`, "", 1)
+	unchangedWithoutPreviousEvidence = strings.Replace(unchangedWithoutPreviousEvidence, `"changed":true`, `"changed":false`, 1)
+	if err := ValidateStandbyUpstreamResponseEvidence([]byte(unchangedWithoutPreviousEvidence)); err == nil || !strings.Contains(err.Error(), "previous field evidence") {
+		t.Fatalf("unchanged without previous evidence error = %v, want previous field evidence error", err)
+	}
+	partialPreviousEvidence := strings.Replace(standbyUpstream, `"previous":{"upstream_url":"https://primary-a.example:5433","slot_name":"standby-a"}`, `"previous":{"upstream_url":"https://primary-a.example:5433"}`, 1)
+	if err := ValidateStandbyUpstreamResponseEvidence([]byte(partialPreviousEvidence)); err == nil || !strings.Contains(err.Error(), "previous field evidence") {
+		t.Fatalf("partial previous evidence error = %v, want previous field evidence error", err)
+	}
+
+	fence := `{"schema_version":1,"action":{"action_id":"fence_acquire:standby-a","action_kind":"fence_acquire","target":"standby-a","state":"applied","node_id":"standby-a"},"receipt":{"identity":{"cluster_id":1,"shard_id":0,"table_id":0,"timeline_id":2,"epoch":3},"old_primary_id":"primary-a","promoted_node_id":"standby-a","parent_timeline_id":2,"parent_epoch":3,"new_timeline_id":4,"new_epoch":5,"required_lsn":8,"observed_lsn":8,"generation":9,"forced":false,"token":"fence-token","reason":""}}`
+	if err := ValidateStandbyFenceResponseEvidence([]byte(fence)); err != nil {
+		t.Fatalf("ValidateStandbyFenceResponseEvidence returned error: %v", err)
+	}
+	if err := ValidateStandbyFenceResponseEvidence([]byte(strings.Replace(fence, `,"forced":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "receipt field evidence") {
 		t.Fatalf("missing fence forced evidence error = %v, want receipt evidence error", err)
 	}
-	if err := ValidateHACurrentFenceResponseEvidence([]byte(`{"schema_version":1}`)); err == nil || !strings.Contains(err.Error(), "held field evidence") {
+	if err := ValidateStandbyCurrentFenceResponseEvidence([]byte(`{"schema_version":1}`)); err == nil || !strings.Contains(err.Error(), "held field evidence") {
 		t.Fatalf("missing held evidence error = %v, want held evidence error", err)
 	}
 
 	assessment := `"assessment":{"required_lsn":8,"received_lsn":8,"applied_lsn":8,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}`
 	promotionAssess := `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},` + assessment + `}`
-	if err := ValidateHAPromotionAssessResponseEvidence([]byte(promotionAssess)); err != nil {
-		t.Fatalf("ValidateHAPromotionAssessResponseEvidence returned error: %v", err)
+	if err := ValidateStandbyPromotionAssessResponseEvidence([]byte(promotionAssess)); err != nil {
+		t.Fatalf("ValidateStandbyPromotionAssessResponseEvidence returned error: %v", err)
 	}
-	if err := ValidateHAPromotionAssessResponseEvidence([]byte(strings.Replace(promotionAssess, `,"force":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "assessment field evidence") {
+	if err := ValidateStandbyPromotionAssessResponseEvidence([]byte(strings.Replace(promotionAssess, `,"force":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "assessment field evidence") {
 		t.Fatalf("missing promotion force evidence error = %v, want assessment evidence error", err)
 	}
 
 	promotion := `{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},` + assessment + `,"fence_generation":9,"fence_token":"fence-token","forced":false,"promotion":{"node_id":"standby-a","switch_lsn":9,"old_identity":{"cluster_id":1,"shard_id":0,"table_id":0,"timeline_id":2,"epoch":3},"new_identity":{"cluster_id":1,"shard_id":0,"table_id":0,"timeline_id":4,"epoch":5},"data_loss_possible":false,"forced":false}}`
-	if err := ValidateHAPromotionResponseEvidence([]byte(promotion)); err != nil {
-		t.Fatalf("ValidateHAPromotionResponseEvidence returned error: %v", err)
+	if err := ValidateStandbyPromotionResponseEvidence([]byte(promotion)); err != nil {
+		t.Fatalf("ValidateStandbyPromotionResponseEvidence returned error: %v", err)
 	}
-	if err := ValidateHAPromotionResponseEvidence([]byte(strings.Replace(promotion, `,"data_loss_possible":false,"forced":false}}`, `,"forced":false}}`, 1))); err == nil || !strings.Contains(err.Error(), "promotion result field evidence") {
+	if err := ValidateStandbyPromotionResponseEvidence([]byte(strings.Replace(promotion, `,"data_loss_possible":false,"forced":false}}`, `,"forced":false}}`, 1))); err == nil || !strings.Contains(err.Error(), "promotion result field evidence") {
 		t.Fatalf("missing promotion result evidence error = %v, want promotion result evidence error", err)
 	}
 
 	rejoin := `{"schema_version":1,"action":{"action_id":"rejoin_assess:primary-a","action_kind":"rejoin_assess","target":"primary-a","state":"assessed","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":4,"target_epoch":5,"parent_cluster_id":1,"parent_shard_id":0,"parent_table_id":0,"parent_timeline_id":2,"parent_epoch":3,"fork_lsn":8,"former_last_lsn":9,"retained_from_lsn":7,"data_loss_discarded":false},"rewind":{"node_id":"primary-a","target_timeline_id":4,"target_epoch":5,"next_lsn":9,"current_last_lsn":9,"previous_last_lsn":10,"fork_lsn":8,"discarded_lsn_count":1,"data_loss_discarded":false}}`
-	if err := ValidateHARejoinAssessResponseEvidence([]byte(rejoin)); err != nil {
-		t.Fatalf("ValidateHARejoinAssessResponseEvidence returned error: %v", err)
+	if err := ValidateStandbyRejoinAssessResponseEvidence([]byte(rejoin)); err != nil {
+		t.Fatalf("ValidateStandbyRejoinAssessResponseEvidence returned error: %v", err)
 	}
-	if err := ValidateHARejoinAssessResponseEvidence([]byte(strings.Replace(rejoin, `,"data_loss_discarded":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "rejoin assessment field evidence") {
+	if err := ValidateStandbyRejoinAssessResponseEvidence([]byte(strings.Replace(rejoin, `,"data_loss_discarded":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "rejoin assessment field evidence") {
 		t.Fatalf("missing rejoin assessment evidence error = %v, want assessment evidence error", err)
 	}
 }
 
-func TestValidateHAGateResponses(t *testing.T) {
+func TestValidateStandbyGateResponses(t *testing.T) {
 	t.Parallel()
 
-	durability := HADurabilityDecision{
-		Status:          HADurabilityStatusSatisfied,
-		Mode:            HADurabilityModeRemoteWrite,
-		Selection:       HADurabilitySelectionAny,
+	durability := StandbyDurabilityDecision{
+		Status:          StandbyDurabilityStatusSatisfied,
+		Mode:            StandbyDurabilityModeRemoteWrite,
+		Selection:       StandbyDurabilitySelectionAny,
 		TargetLsn:       9,
 		ProgressLsn:     9,
 		RequiredCount:   1,
@@ -2481,40 +2837,40 @@ func TestValidateHAGateResponses(t *testing.T) {
 		CandidateCount:  1,
 		MissingLsnCount: 0,
 	}
-	gate := HACommitGate{
-		Action:     HACommitGateActionAcknowledge,
+	gate := StandbyCommitGate{
+		Action:     StandbyCommitGateActionAcknowledge,
 		TargetLsn:  9,
 		Durability: durability,
 	}
-	if err := ValidateHACommitCheckResponse(HACommitCheckResponse{SchemaVersion: 1, Gate: gate}); err != nil {
-		t.Fatalf("ValidateHACommitCheckResponse returned error: %v", err)
+	if err := ValidateStandbyCommitCheckResponse(StandbyCommitCheckResponse{SchemaVersion: 1, Gate: gate}); err != nil {
+		t.Fatalf("ValidateStandbyCommitCheckResponse returned error: %v", err)
 	}
-	if err := ValidateHACommitAppendResponse(HACommitAppendResponse{SchemaVersion: 1, Lsn: 9, Gate: gate}); err != nil {
-		t.Fatalf("ValidateHACommitAppendResponse returned error: %v", err)
+	if err := ValidateStandbyCommitAppendResponse(StandbyCommitAppendResponse{SchemaVersion: 1, Lsn: 9, Gate: gate}); err != nil {
+		t.Fatalf("ValidateStandbyCommitAppendResponse returned error: %v", err)
 	}
 	mismatchedGate := gate
 	mismatchedGate.Durability.TargetLsn = 8
-	if err := ValidateHACommitCheckResponse(HACommitCheckResponse{SchemaVersion: 1, Gate: mismatchedGate}); err == nil || !strings.Contains(err.Error(), "target_lsn") {
+	if err := ValidateStandbyCommitCheckResponse(StandbyCommitCheckResponse{SchemaVersion: 1, Gate: mismatchedGate}); err == nil || !strings.Contains(err.Error(), "target_lsn") {
 		t.Fatalf("mismatched gate target error = %v, want target_lsn mismatch", err)
 	}
 	impossibleProgress := gate
 	impossibleProgress.Durability.ProgressLsn = 10
-	if err := ValidateHACommitCheckResponse(HACommitCheckResponse{SchemaVersion: 1, Gate: impossibleProgress}); err == nil || !strings.Contains(err.Error(), "progress_lsn") {
+	if err := ValidateStandbyCommitCheckResponse(StandbyCommitCheckResponse{SchemaVersion: 1, Gate: impossibleProgress}); err == nil || !strings.Contains(err.Error(), "progress_lsn") {
 		t.Fatalf("impossible durability progress error = %v, want progress_lsn mismatch", err)
 	}
-	if err := ValidateHACommitAppendResponse(HACommitAppendResponse{SchemaVersion: 1, Lsn: 8, Gate: gate}); err == nil || !strings.Contains(err.Error(), "does not match gate") {
+	if err := ValidateStandbyCommitAppendResponse(StandbyCommitAppendResponse{SchemaVersion: 1, Lsn: 8, Gate: gate}); err == nil || !strings.Contains(err.Error(), "does not match gate") {
 		t.Fatalf("mismatched append lsn error = %v, want gate lsn mismatch", err)
 	}
-	gate.Action = HACommitGateAction("unknown")
-	if err := ValidateHACommitCheckResponse(HACommitCheckResponse{SchemaVersion: 1, Gate: gate}); err == nil || !strings.Contains(err.Error(), "invalid commit gate action") {
+	gate.Action = StandbyCommitGateAction("unknown")
+	if err := ValidateStandbyCommitCheckResponse(StandbyCommitCheckResponse{SchemaVersion: 1, Gate: gate}); err == nil || !strings.Contains(err.Error(), "invalid commit gate action") {
 		t.Fatalf("invalid gate error = %v, want invalid action error", err)
 	}
 
-	read := HAReadCheckResponse{
+	read := StandbyReadCheckResponse{
 		SchemaVersion: 1,
-		Decision: HAReadDecision{
-			Action:                  HAReadDecisionActionServeStandby,
-			Consistency:             HAReadDecisionConsistencyAtLeastLSN,
+		Decision: StandbyReadDecision{
+			Action:                  StandbyReadDecisionActionServeStandby,
+			Consistency:             StandbyReadDecisionConsistencyAtLeastLSN,
 			ReceivedLsn:             9,
 			AppliedLsn:              9,
 			SafeReadLsn:             9,
@@ -2522,177 +2878,177 @@ func TestValidateHAGateResponses(t *testing.T) {
 			MetadataMissingLsnCount: 0,
 		},
 	}
-	if err := ValidateHAReadCheckResponse(read); err != nil {
-		t.Fatalf("ValidateHAReadCheckResponse returned error: %v", err)
+	if err := ValidateStandbyReadCheckResponse(read); err != nil {
+		t.Fatalf("ValidateStandbyReadCheckResponse returned error: %v", err)
 	}
 	badReadProgress := read
 	badReadProgress.Decision.AppliedLsn = 10
-	if err := ValidateHAReadCheckResponse(badReadProgress); err == nil || !strings.Contains(err.Error(), "applied_lsn") {
+	if err := ValidateStandbyReadCheckResponse(badReadProgress); err == nil || !strings.Contains(err.Error(), "applied_lsn") {
 		t.Fatalf("invalid read progress error = %v, want applied_lsn error", err)
 	}
 	badReadMissing := read
 	badReadMissing.Decision.RequiredLsn = 11
-	if err := ValidateHAReadCheckResponse(badReadMissing); err == nil || !strings.Contains(err.Error(), "missing_lsn_count") {
+	if err := ValidateStandbyReadCheckResponse(badReadMissing); err == nil || !strings.Contains(err.Error(), "missing_lsn_count") {
 		t.Fatalf("invalid read missing count error = %v, want missing_lsn_count error", err)
 	}
 	badReadServe := read
 	badReadServe.Decision.ServeLsn = 10
-	if err := ValidateHAReadCheckResponse(badReadServe); err == nil || !strings.Contains(err.Error(), "serve_lsn") {
+	if err := ValidateStandbyReadCheckResponse(badReadServe); err == nil || !strings.Contains(err.Error(), "serve_lsn") {
 		t.Fatalf("invalid read serve lsn error = %v, want serve_lsn error", err)
 	}
 	badReadPrimary := read
-	badReadPrimary.Decision.Consistency = HAReadDecisionConsistencyPrimary
-	if err := ValidateHAReadCheckResponse(badReadPrimary); err == nil || !strings.Contains(err.Error(), "primary consistency") {
+	badReadPrimary.Decision.Consistency = StandbyReadDecisionConsistencyPrimary
+	if err := ValidateStandbyReadCheckResponse(badReadPrimary); err == nil || !strings.Contains(err.Error(), "primary consistency") {
 		t.Fatalf("invalid read primary action error = %v, want primary consistency error", err)
 	}
 	badReadFields := read
-	badReadFields.Decision.Consistency = HAReadDecisionConsistency("unknown")
-	if err := ValidateHAReadCheckResponse(badReadFields); err == nil || !strings.Contains(err.Error(), "read decision fields") {
+	badReadFields.Decision.Consistency = StandbyReadDecisionConsistency("unknown")
+	if err := ValidateStandbyReadCheckResponse(badReadFields); err == nil || !strings.Contains(err.Error(), "read decision fields") {
 		t.Fatalf("invalid read decision error = %v, want read decision fields error", err)
 	}
 
-	identity := HAIdentity{ClusterId: 1, TimelineId: 2, Epoch: 3}
-	write := HAWriteCheckResponse{
+	identity := StandbyIdentity{ClusterId: 1, TimelineId: 2, Epoch: 3}
+	write := StandbyWriteCheckResponse{
 		SchemaVersion: 1,
-		Decision: HAWriteDecision{
-			Action:     HAWriteDecisionActionRejectReadOnly,
-			Role:       HAWriteDecisionRoleStandby,
+		Decision: StandbyWriteDecision{
+			Action:     StandbyWriteDecisionActionRejectReadOnly,
+			Role:       StandbyWriteDecisionRoleStandby,
 			Identity:   identity,
 			DurableLsn: 9,
 			NextLsn:    10,
 		},
 	}
-	if err := ValidateHAWriteCheckResponse(write); err != nil {
-		t.Fatalf("ValidateHAWriteCheckResponse returned error: %v", err)
+	if err := ValidateStandbyWriteCheckResponse(write); err != nil {
+		t.Fatalf("ValidateStandbyWriteCheckResponse returned error: %v", err)
 	}
 	badWriteNext := write
 	badWriteNext.Decision.NextLsn = 12
-	if err := ValidateHAWriteCheckResponse(badWriteNext); err == nil || !strings.Contains(err.Error(), "next_lsn") {
+	if err := ValidateStandbyWriteCheckResponse(badWriteNext); err == nil || !strings.Contains(err.Error(), "next_lsn") {
 		t.Fatalf("invalid write next lsn error = %v, want next_lsn error", err)
 	}
 	badWriteAction := write
-	badWriteAction.Decision.Action = HAWriteDecisionActionAllowWrite
-	if err := ValidateHAWriteCheckResponse(badWriteAction); err == nil || !strings.Contains(err.Error(), "standby role action") {
+	badWriteAction.Decision.Action = StandbyWriteDecisionActionAllowWrite
+	if err := ValidateStandbyWriteCheckResponse(badWriteAction); err == nil || !strings.Contains(err.Error(), "standby role action") {
 		t.Fatalf("invalid write role action error = %v, want standby role action error", err)
 	}
-	promotedIdentity := HAIdentity{ClusterId: 1, TimelineId: 4, Epoch: 5}
-	promotedWrite := HAWriteCheckResponse{
+	promotedIdentity := StandbyIdentity{ClusterId: 1, TimelineId: 4, Epoch: 5}
+	promotedWrite := StandbyWriteCheckResponse{
 		SchemaVersion: 1,
-		Decision: HAWriteDecision{
-			Action:     HAWriteDecisionActionOpenPromotedPrimary,
-			Role:       HAWriteDecisionRolePromotedStandby,
+		Decision: StandbyWriteDecision{
+			Action:     StandbyWriteDecisionActionOpenPromotedPrimary,
+			Role:       StandbyWriteDecisionRolePromotedStandby,
 			Identity:   promotedIdentity,
 			DurableLsn: 12,
 			NextLsn:    13,
-			PromotionHandoff: HAPromotionHandoff{
+			PromotionHandoff: StandbyPromotionHandoff{
 				Identity:  promotedIdentity,
 				SwitchLsn: 12,
 				NextLsn:   13,
 			},
 		},
 	}
-	if err := ValidateHAWriteCheckResponse(promotedWrite); err != nil {
-		t.Fatalf("ValidateHAWriteCheckResponse promoted returned error: %v", err)
+	if err := ValidateStandbyWriteCheckResponse(promotedWrite); err != nil {
+		t.Fatalf("ValidateStandbyWriteCheckResponse promoted returned error: %v", err)
 	}
-	fencedWrite := HAWriteCheckResponse{
+	fencedWrite := StandbyWriteCheckResponse{
 		SchemaVersion: 1,
-		Decision: HAWriteDecision{
-			Action:     HAWriteDecisionActionRejectFencedPrimary,
-			Role:       HAWriteDecisionRoleFencedPrimary,
+		Decision: StandbyWriteDecision{
+			Action:     StandbyWriteDecisionActionRejectFencedPrimary,
+			Role:       StandbyWriteDecisionRoleFencedPrimary,
 			Identity:   identity,
 			DurableLsn: 9,
 			NextLsn:    10,
 		},
 	}
-	if err := ValidateHAWriteCheckResponse(fencedWrite); err != nil {
-		t.Fatalf("ValidateHAWriteCheckResponse fenced primary returned error: %v", err)
+	if err := ValidateStandbyWriteCheckResponse(fencedWrite); err != nil {
+		t.Fatalf("ValidateStandbyWriteCheckResponse fenced primary returned error: %v", err)
 	}
 	badFencedWrite := fencedWrite
-	badFencedWrite.Decision.Action = HAWriteDecisionActionAllowWrite
-	if err := ValidateHAWriteCheckResponse(badFencedWrite); err == nil || !strings.Contains(err.Error(), "fenced_primary role action") {
+	badFencedWrite.Decision.Action = StandbyWriteDecisionActionAllowWrite
+	if err := ValidateStandbyWriteCheckResponse(badFencedWrite); err == nil || !strings.Contains(err.Error(), "fenced_primary role action") {
 		t.Fatalf("invalid fenced write action error = %v, want fenced_primary role action error", err)
 	}
 	badWriteHandoff := promotedWrite
 	badWriteHandoff.Decision.PromotionHandoff.Identity.Epoch = 6
-	if err := ValidateHAWriteCheckResponse(badWriteHandoff); err == nil || !strings.Contains(err.Error(), "promotion_handoff identity") {
+	if err := ValidateStandbyWriteCheckResponse(badWriteHandoff); err == nil || !strings.Contains(err.Error(), "promotion_handoff identity") {
 		t.Fatalf("invalid write handoff error = %v, want promotion_handoff identity error", err)
 	}
 	badWriteFields := write
-	badWriteFields.Decision.Identity = HAIdentity{}
-	if err := ValidateHAWriteCheckResponse(badWriteFields); err == nil || !strings.Contains(err.Error(), "write decision fields") {
+	badWriteFields.Decision.Identity = StandbyIdentity{}
+	if err := ValidateStandbyWriteCheckResponse(badWriteFields); err == nil || !strings.Contains(err.Error(), "write decision fields") {
 		t.Fatalf("invalid write decision error = %v, want write decision fields error", err)
 	}
 
-	owner := HAOwnerJobCheckResponse{
+	owner := StandbyOwnerJobCheckResponse{
 		SchemaVersion: 1,
-		Decision: HAOwnerJobDecision{
-			Action:     HAOwnerJobDecisionActionRun,
-			Kind:       HAOwnerJobDecisionKindCompactionPublish,
-			Role:       HAOwnerJobDecisionRolePrimary,
+		Decision: StandbyOwnerJobDecision{
+			Action:     StandbyOwnerJobDecisionActionRun,
+			Kind:       StandbyOwnerJobDecisionKindCompactionPublish,
+			Role:       StandbyOwnerJobDecisionRolePrimary,
 			Identity:   identity,
 			DurableLsn: 9,
 			NextLsn:    10,
 		},
 	}
-	if err := ValidateHAOwnerJobCheckResponse(owner); err != nil {
-		t.Fatalf("ValidateHAOwnerJobCheckResponse returned error: %v", err)
+	if err := ValidateStandbyOwnerJobCheckResponse(owner); err != nil {
+		t.Fatalf("ValidateStandbyOwnerJobCheckResponse returned error: %v", err)
 	}
 	badOwnerNext := owner
 	badOwnerNext.Decision.NextLsn = 12
-	if err := ValidateHAOwnerJobCheckResponse(badOwnerNext); err == nil || !strings.Contains(err.Error(), "next_lsn") {
+	if err := ValidateStandbyOwnerJobCheckResponse(badOwnerNext); err == nil || !strings.Contains(err.Error(), "next_lsn") {
 		t.Fatalf("invalid owner job next lsn error = %v, want next_lsn error", err)
 	}
 	badOwnerAction := owner
-	badOwnerAction.Decision.Role = HAOwnerJobDecisionRoleStandby
-	if err := ValidateHAOwnerJobCheckResponse(badOwnerAction); err == nil || !strings.Contains(err.Error(), "standby role action") {
+	badOwnerAction.Decision.Role = StandbyOwnerJobDecisionRoleStandby
+	if err := ValidateStandbyOwnerJobCheckResponse(badOwnerAction); err == nil || !strings.Contains(err.Error(), "standby role action") {
 		t.Fatalf("invalid owner job role action error = %v, want standby role action error", err)
 	}
-	promotedOwner := HAOwnerJobCheckResponse{
+	promotedOwner := StandbyOwnerJobCheckResponse{
 		SchemaVersion: 1,
-		Decision: HAOwnerJobDecision{
-			Action:     HAOwnerJobDecisionActionOpenPromotedPrimary,
-			Kind:       HAOwnerJobDecisionKindCompactionPublish,
-			Role:       HAOwnerJobDecisionRolePromotedStandby,
+		Decision: StandbyOwnerJobDecision{
+			Action:     StandbyOwnerJobDecisionActionOpenPromotedPrimary,
+			Kind:       StandbyOwnerJobDecisionKindCompactionPublish,
+			Role:       StandbyOwnerJobDecisionRolePromotedStandby,
 			Identity:   promotedIdentity,
 			DurableLsn: 12,
 			NextLsn:    13,
-			PromotionHandoff: HAPromotionHandoff{
+			PromotionHandoff: StandbyPromotionHandoff{
 				Identity:  promotedIdentity,
 				SwitchLsn: 12,
 				NextLsn:   13,
 			},
 		},
 	}
-	if err := ValidateHAOwnerJobCheckResponse(promotedOwner); err != nil {
-		t.Fatalf("ValidateHAOwnerJobCheckResponse promoted returned error: %v", err)
+	if err := ValidateStandbyOwnerJobCheckResponse(promotedOwner); err != nil {
+		t.Fatalf("ValidateStandbyOwnerJobCheckResponse promoted returned error: %v", err)
 	}
 	badOwnerHandoff := promotedOwner
 	badOwnerHandoff.Decision.PromotionHandoff.NextLsn = 14
-	if err := ValidateHAOwnerJobCheckResponse(badOwnerHandoff); err == nil || !strings.Contains(err.Error(), "promotion_handoff next_lsn") {
+	if err := ValidateStandbyOwnerJobCheckResponse(badOwnerHandoff); err == nil || !strings.Contains(err.Error(), "promotion_handoff next_lsn") {
 		t.Fatalf("invalid owner job handoff error = %v, want promotion_handoff next_lsn error", err)
 	}
 	badOwnerFields := owner
-	badOwnerFields.Decision.Kind = HAOwnerJobDecisionKind("unknown")
-	if err := ValidateHAOwnerJobCheckResponse(badOwnerFields); err == nil || !strings.Contains(err.Error(), "owner job decision fields") {
+	badOwnerFields.Decision.Kind = StandbyOwnerJobDecisionKind("unknown")
+	if err := ValidateStandbyOwnerJobCheckResponse(badOwnerFields); err == nil || !strings.Contains(err.Error(), "owner job decision fields") {
 		t.Fatalf("invalid owner job decision error = %v, want owner job decision fields error", err)
 	}
 }
 
-func TestValidateHARejoinAssessResponse(t *testing.T) {
+func TestValidateStandbyRejoinAssessResponse(t *testing.T) {
 	t.Parallel()
 
-	base := HARejoinAssessResponse{
+	base := StandbyRejoinAssessResponse{
 		SchemaVersion: 1,
-		Action: HAActionReceipt{
+		Action: StandbyActionReceipt{
 			ActionId:   "rejoin_assess:primary-a",
-			ActionKind: HAActionKindRejoinAssess,
+			ActionKind: StandbyActionKindRejoinAssess,
 			Target:     "primary-a",
-			State:      HAActionStateAssessed,
+			State:      StandbyActionStateAssessed,
 			NodeId:     "primary-a",
 		},
-		Assessment: HARejoinAssessment{
-			Action:           HARejoinActionAlreadyCurrent,
-			Reason:           HARejoinReasonCurrentTimeline,
+		Assessment: StandbyRejoinAssessment{
+			Action:           StandbyRejoinActionAlreadyCurrent,
+			Reason:           StandbyRejoinReasonCurrentTimeline,
 			FormerNodeId:     "primary-a",
 			TargetTimelineId: 6,
 			TargetEpoch:      7,
@@ -2706,48 +3062,48 @@ func TestValidateHARejoinAssessResponse(t *testing.T) {
 			RetainedFromLsn:  1,
 		},
 	}
-	if err := ValidateHARejoinAssessResponse(base); err != nil {
-		t.Fatalf("ValidateHARejoinAssessResponse returned error: %v", err)
+	if err := ValidateStandbyRejoinAssessResponse(base); err != nil {
+		t.Fatalf("ValidateStandbyRejoinAssessResponse returned error: %v", err)
 	}
 	assessRewind := base
-	assessRewind.Assessment.Action = HARejoinActionRewind
-	assessRewind.Assessment.Reason = HARejoinReasonParentTimelineRetained
-	if err := ValidateHARejoinAssessResponse(assessRewind); err != nil {
-		t.Fatalf("ValidateHARejoinAssessResponse assess rewind returned error: %v", err)
+	assessRewind.Assessment.Action = StandbyRejoinActionRewind
+	assessRewind.Assessment.Reason = StandbyRejoinReasonParentTimelineRetained
+	if err := ValidateStandbyRejoinAssessResponse(assessRewind); err != nil {
+		t.Fatalf("ValidateStandbyRejoinAssessResponse assess rewind returned error: %v", err)
 	}
 	wrongTarget := base
 	wrongTarget.Action.Target = "primary-b"
-	if err := ValidateHARejoinAssessResponse(wrongTarget); err == nil || !strings.Contains(err.Error(), "target") {
+	if err := ValidateStandbyRejoinAssessResponse(wrongTarget); err == nil || !strings.Contains(err.Error(), "target") {
 		t.Fatalf("wrong target error = %v, want target mismatch error", err)
 	}
 	paddedTarget := base
 	paddedTarget.Action.Target = " primary-a"
-	if err := ValidateHARejoinAssessResponse(paddedTarget); err == nil || !strings.Contains(err.Error(), "target") {
+	if err := ValidateStandbyRejoinAssessResponse(paddedTarget); err == nil || !strings.Contains(err.Error(), "target") {
 		t.Fatalf("padded target error = %v, want target mismatch error", err)
 	}
 	paddedActionID := base
 	paddedActionID.Action.ActionId = "rejoin_assess:primary-a "
-	if err := ValidateHARejoinAssessResponse(paddedActionID); err == nil || !strings.Contains(err.Error(), "action id") {
+	if err := ValidateStandbyRejoinAssessResponse(paddedActionID); err == nil || !strings.Contains(err.Error(), "action id") {
 		t.Fatalf("padded action id error = %v, want action id mismatch error", err)
 	}
 	wrongAssessNode := base
 	wrongAssessNode.Action.NodeId = "primary-b"
-	if err := ValidateHARejoinAssessResponse(wrongAssessNode); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
+	if err := ValidateStandbyRejoinAssessResponse(wrongAssessNode); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
 		t.Fatalf("wrong assess executor error = %v, want executor node mismatch error", err)
 	}
-	base.Assessment.Reason = HARejoinAssessmentReason("unknown")
-	if err := ValidateHARejoinAssessResponse(base); err == nil || !strings.Contains(err.Error(), "assessment fields") {
+	base.Assessment.Reason = StandbyRejoinAssessmentReason("unknown")
+	if err := ValidateStandbyRejoinAssessResponse(base); err == nil || !strings.Contains(err.Error(), "assessment fields") {
 		t.Fatalf("invalid reason error = %v, want assessment fields error", err)
 	}
-	base.Assessment.Reason = HARejoinReasonCurrentTimeline
+	base.Assessment.Reason = StandbyRejoinReasonCurrentTimeline
 
 	rewind := base
 	rewind.Action.ActionId = "rejoin_rewind:primary-a"
-	rewind.Action.ActionKind = HAActionKindRejoinRewind
-	rewind.Action.State = HAActionStateApplied
-	rewind.Assessment.Action = HARejoinActionRewind
-	rewind.Assessment.Reason = HARejoinReasonParentTimelineRetained
-	rewind.Rewind = HARejoinRewindResult{
+	rewind.Action.ActionKind = StandbyActionKindRejoinRewind
+	rewind.Action.State = StandbyActionStateApplied
+	rewind.Assessment.Action = StandbyRejoinActionRewind
+	rewind.Assessment.Reason = StandbyRejoinReasonParentTimelineRetained
+	rewind.Rewind = StandbyRejoinRewindResult{
 		NodeId:           "primary-a",
 		TargetTimelineId: 6,
 		TargetEpoch:      7,
@@ -2756,27 +3112,27 @@ func TestValidateHARejoinAssessResponse(t *testing.T) {
 		NextLsn:          9,
 		ForkLsn:          8,
 	}
-	if err := ValidateHARejoinAssessResponse(rewind); err != nil {
-		t.Fatalf("ValidateHARejoinAssessResponse rewind returned error: %v", err)
+	if err := ValidateStandbyRejoinAssessResponse(rewind); err != nil {
+		t.Fatalf("ValidateStandbyRejoinAssessResponse rewind returned error: %v", err)
 	}
 	wrongRewindNode := rewind
 	wrongRewindNode.Action.NodeId = "primary-b"
-	if err := ValidateHARejoinAssessResponse(wrongRewindNode); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
+	if err := ValidateStandbyRejoinAssessResponse(wrongRewindNode); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
 		t.Fatalf("wrong rewind executor error = %v, want executor node mismatch error", err)
 	}
 	rewind.Rewind.NextLsn = 0
-	if err := ValidateHARejoinAssessResponse(rewind); err == nil || !strings.Contains(err.Error(), "rewind fields") {
+	if err := ValidateStandbyRejoinAssessResponse(rewind); err == nil || !strings.Contains(err.Error(), "rewind fields") {
 		t.Fatalf("missing rewind error = %v, want rewind fields error", err)
 	}
 
 	reseed := base
 	reseed.Action.ActionId = "rejoin_reseed:primary-a"
-	reseed.Action.ActionKind = HAActionKindRejoinReseed
-	reseed.Action.State = HAActionStateApplied
+	reseed.Action.ActionKind = StandbyActionKindRejoinReseed
+	reseed.Action.State = StandbyActionStateApplied
 	reseed.Action.NodeId = "primary-current"
-	reseed.Assessment.Action = HARejoinActionReseed
-	reseed.Assessment.Reason = HARejoinReasonParentTimelineWALExpired
-	reseed.Reseed = HARejoinReseedResult{
+	reseed.Assessment.Action = StandbyRejoinActionReseed
+	reseed.Assessment.Reason = StandbyRejoinReasonParentTimelineWALExpired
+	reseed.Reseed = StandbyRejoinReseedResult{
 		NodeId:             "primary-a",
 		SlotName:           "primary-a",
 		TargetTimelineId:   6,
@@ -2786,16 +3142,16 @@ func TestValidateHARejoinAssessResponse(t *testing.T) {
 		ReseedRequired:     true,
 		BaseBackupRequired: true,
 	}
-	if err := ValidateHARejoinAssessResponse(reseed); err != nil {
-		t.Fatalf("ValidateHARejoinAssessResponse reseed returned error: %v", err)
+	if err := ValidateStandbyRejoinAssessResponse(reseed); err != nil {
+		t.Fatalf("ValidateStandbyRejoinAssessResponse reseed returned error: %v", err)
 	}
 	reseed.Reseed.SlotName = ""
-	if err := ValidateHARejoinAssessResponse(reseed); err == nil || !strings.Contains(err.Error(), "reseed fields") {
+	if err := ValidateStandbyRejoinAssessResponse(reseed); err == nil || !strings.Contains(err.Error(), "reseed fields") {
 		t.Fatalf("missing reseed error = %v, want reseed fields error", err)
 	}
 }
 
-func TestHAClientReturnsStatusError(t *testing.T) {
+func TestStandbyClientReturnsStatusError(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2803,14 +3159,14 @@ func TestHAClientReturnsStatusError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	_, err = client.CurrentFence(context.Background())
-	var apiErr *HAAPIError
+	var apiErr *StandbyAPIError
 	if !errors.As(err, &apiErr) {
-		t.Fatalf("CurrentFence error = %T %v, want *HAAPIError", err, err)
+		t.Fatalf("CurrentFence error = %T %v, want *StandbyAPIError", err, err)
 	}
 	if apiErr.StatusCode != http.StatusConflict {
 		t.Fatalf("StatusCode = %d, want %d", apiErr.StatusCode, http.StatusConflict)
@@ -2819,19 +3175,19 @@ func TestHAClientReturnsStatusError(t *testing.T) {
 		t.Fatalf("Body = %q, want not primary", apiErr.Body)
 	}
 	wrapped := fmt.Errorf("operator context: %w", err)
-	status, ok := HAStatusCode(wrapped)
+	status, ok := StandbyStatusCode(wrapped)
 	if !ok || status != http.StatusConflict {
-		t.Fatalf("HAStatusCode(wrapped) = %d, %t, want %d, true", status, ok, http.StatusConflict)
+		t.Fatalf("StandbyStatusCode(wrapped) = %d, %t, want %d, true", status, ok, http.StatusConflict)
 	}
-	if !HAIsConflict(wrapped) {
-		t.Fatalf("HAIsConflict(wrapped) = false, want true")
+	if !StandbyIsConflict(wrapped) {
+		t.Fatalf("StandbyIsConflict(wrapped) = false, want true")
 	}
-	if HAIsUnauthorized(wrapped) {
-		t.Fatalf("HAIsUnauthorized(wrapped) = true, want false")
+	if StandbyIsUnauthorized(wrapped) {
+		t.Fatalf("StandbyIsUnauthorized(wrapped) = true, want false")
 	}
 }
 
-func TestHAErrorRetryability(t *testing.T) {
+func TestStandbyErrorRetryability(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -2844,23 +3200,23 @@ func TestHAErrorRetryability(t *testing.T) {
 		want: false,
 	}, {
 		name: "service unavailable",
-		err:  &HAAPIError{Operation: "get HA primary status", StatusCode: http.StatusServiceUnavailable},
+		err:  &StandbyAPIError{Operation: "get HA primary status", StatusCode: http.StatusServiceUnavailable},
 		want: true,
 	}, {
 		name: "too many requests",
-		err:  &HAAPIError{Operation: "get HA primary status", StatusCode: http.StatusTooManyRequests},
+		err:  &StandbyAPIError{Operation: "get HA primary status", StatusCode: http.StatusTooManyRequests},
 		want: true,
 	}, {
 		name: "conflict",
-		err:  &HAAPIError{Operation: "get current HA fence", StatusCode: http.StatusConflict},
+		err:  &StandbyAPIError{Operation: "get current HA fence", StatusCode: http.StatusConflict},
 		want: false,
 	}, {
 		name: "bad request",
-		err:  &HAAPIError{Operation: "create HA replication slot", StatusCode: http.StatusBadRequest},
+		err:  &StandbyAPIError{Operation: "create HA replication slot", StatusCode: http.StatusBadRequest},
 		want: false,
 	}, {
 		name: "validation",
-		err:  &HAResponseValidationError{Operation: "create HA replication slot", Err: errors.New("missing action receipt")},
+		err:  &StandbyResponseValidationError{Operation: "create HA replication slot", Err: errors.New("missing action receipt")},
 		want: false,
 	}, {
 		name: "deadline",
@@ -2879,45 +3235,45 @@ func TestHAErrorRetryability(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := HAIsRetryable(tt.err); got != tt.want {
-				t.Fatalf("HAIsRetryable(%T) = %v, want %v", tt.err, got, tt.want)
+			if got := StandbyIsRetryable(tt.err); got != tt.want {
+				t.Fatalf("StandbyIsRetryable(%T) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestHAStatusHelpersClassifyWrappedErrors(t *testing.T) {
+func TestStandbyStatusHelpersClassifyWrappedErrors(t *testing.T) {
 	t.Parallel()
 
-	unauthorized := fmt.Errorf("direct admin call failed: %w", &HAAPIError{
+	unauthorized := fmt.Errorf("direct admin call failed: %w", &StandbyAPIError{
 		Operation:  "get HA primary status",
 		StatusCode: http.StatusUnauthorized,
 		Body:       "missing bearer token",
 	})
-	if !HAIsUnauthorized(unauthorized) {
-		t.Fatal("HAIsUnauthorized(wrapped unauthorized) = false, want true")
+	if !StandbyIsUnauthorized(unauthorized) {
+		t.Fatal("StandbyIsUnauthorized(wrapped unauthorized) = false, want true")
 	}
-	if HAIsConflict(unauthorized) {
-		t.Fatal("HAIsConflict(wrapped unauthorized) = true, want false")
+	if StandbyIsConflict(unauthorized) {
+		t.Fatal("StandbyIsConflict(wrapped unauthorized) = true, want false")
 	}
-	status, ok := HAStatusCode(unauthorized)
+	status, ok := StandbyStatusCode(unauthorized)
 	if !ok || status != http.StatusUnauthorized {
-		t.Fatalf("HAStatusCode(wrapped unauthorized) = %d, %t, want %d, true", status, ok, http.StatusUnauthorized)
+		t.Fatalf("StandbyStatusCode(wrapped unauthorized) = %d, %t, want %d, true", status, ok, http.StatusUnauthorized)
 	}
 
-	validation := fmt.Errorf("missing evidence: %w", &HAResponseValidationError{
+	validation := fmt.Errorf("missing evidence: %w", &StandbyResponseValidationError{
 		Operation: "create HA replication slot",
 		Err:       errors.New("missing action receipt"),
 	})
-	if _, ok := HAStatusCode(validation); ok {
-		t.Fatal("HAStatusCode(validation) returned true, want false")
+	if _, ok := StandbyStatusCode(validation); ok {
+		t.Fatal("StandbyStatusCode(validation) returned true, want false")
 	}
-	if HAIsUnauthorized(validation) || HAIsConflict(validation) {
+	if StandbyIsUnauthorized(validation) || StandbyIsConflict(validation) {
 		t.Fatal("status helpers classified validation error as HTTP API error")
 	}
 }
 
-func haBaseBackupBeginResponseJSON() string {
+func standbyBaseBackupBeginResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"action":{
@@ -2934,7 +3290,7 @@ func haBaseBackupBeginResponseJSON() string {
 	}`
 }
 
-func haBaseBackupFinishResponseJSON() string {
+func standbyBaseBackupFinishResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"action":{
@@ -2950,7 +3306,7 @@ func haBaseBackupFinishResponseJSON() string {
 	}`
 }
 
-func haStandbyBootstrapResponseJSON() string {
+func standbyBootstrapResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"action":{
@@ -2966,7 +3322,36 @@ func haStandbyBootstrapResponseJSON() string {
 	}`
 }
 
-func haFenceAcquireResponseJSON() string {
+func standbyUpstreamResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"action":{
+			"action_id":"standby_upstream:standby-a",
+			"action_kind":"standby_upstream",
+			"target":"standby-a",
+			"state":"applied",
+			"node_id":"standby-a"
+		},
+		"identity":{
+			"cluster_id":100,
+			"shard_id":10,
+			"table_id":20,
+			"timeline_id":4,
+			"epoch":6
+		},
+		"upstream":{
+			"upstream_url":"https://primary-b.example:5433",
+			"slot_name":"standby-a"
+		},
+		"previous":{
+			"upstream_url":"https://primary-a.example:5433",
+			"slot_name":"standby-a"
+		},
+		"changed":true
+	}`
+}
+
+func standbyFenceAcquireResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"action":{
@@ -3000,7 +3385,7 @@ func haFenceAcquireResponseJSON() string {
 	}`
 }
 
-func haPrimaryStatusResponseJSON() string {
+func standbyPrimaryStatusResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"snapshot":{
@@ -3053,7 +3438,7 @@ func haPrimaryStatusResponseJSON() string {
 	}`
 }
 
-func haStandbyStatusResponseJSON() string {
+func standbyStatusResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"snapshot":{
@@ -3084,7 +3469,7 @@ func haStandbyStatusResponseJSON() string {
 	}`
 }
 
-func haPromotionResponseJSON() string {
+func standbyPromotionResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"action":{
@@ -3135,7 +3520,7 @@ func haPromotionResponseJSON() string {
 	}`
 }
 
-func haPromotionAssessResponseJSON() string {
+func standbyPromotionAssessResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"action":{
@@ -3163,7 +3548,7 @@ func haPromotionAssessResponseJSON() string {
 	}`
 }
 
-func haRejoinRewindResponseJSON() string {
+func standbyRejoinRewindResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"action":{
@@ -3203,7 +3588,7 @@ func haRejoinRewindResponseJSON() string {
 	}`
 }
 
-func haRejoinReseedResponseJSON() string {
+func standbyRejoinReseedResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"action":{
@@ -3242,7 +3627,7 @@ func haRejoinReseedResponseJSON() string {
 	}`
 }
 
-func haCommitAppendResponseJSON() string {
+func standbyCommitAppendResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"lsn":9,
@@ -3264,7 +3649,7 @@ func haCommitAppendResponseJSON() string {
 	}`
 }
 
-func haCommitCheckResponseJSON() string {
+func standbyCommitCheckResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"gate":{
@@ -3285,7 +3670,7 @@ func haCommitCheckResponseJSON() string {
 	}`
 }
 
-func haWriteDecisionResponseJSON() string {
+func standbyWriteDecisionResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"decision":{
@@ -3298,7 +3683,7 @@ func haWriteDecisionResponseJSON() string {
 	}`
 }
 
-func haOwnerJobDecisionResponseJSON() string {
+func standbyOwnerJobDecisionResponseJSON() string {
 	return `{
 		"schema_version":1,
 		"decision":{
@@ -3310,4 +3695,445 @@ func haOwnerJobDecisionResponseJSON() string {
 			"role":"primary"
 		}
 	}`
+}
+
+// --- PathStyle tests ---
+//
+// These cover the rename of the hot-standby admin surface from /admin/v1/ha
+// to /admin/v1/standby: the default and explicit-legacy styles must keep
+// sending the pre-rename paths (which is what the OpenAPI spec's generated
+// client no longer builds on its own, now that the spec paths are
+// canonical), the explicit-canonical style must send the new paths, and the
+// deprecated HA* aliases introduced by the rename must still resolve and
+// behave identically to their Standby* counterparts.
+
+func TestStandbyClientPathStyleDefaultsToLegacy(t *testing.T) {
+	t.Parallel()
+
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if gotPath != HAPrimaryStatusPath {
+		t.Fatalf("default path = %s, want legacy %s", gotPath, HAPrimaryStatusPath)
+	}
+}
+
+func TestStandbyClientPathStyleLegacySendsLegacyPaths(t *testing.T) {
+	t.Parallel()
+
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleLegacy)
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if gotPath != HAPrimaryStatusPath {
+		t.Fatalf("legacy path = %s, want %s", gotPath, HAPrimaryStatusPath)
+	}
+}
+
+func TestStandbyClientPathStyleCanonicalSendsCanonicalPaths(t *testing.T) {
+	t.Parallel()
+
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleCanonical)
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if gotPath != StandbyPrimaryStatusPath {
+		t.Fatalf("canonical path = %s, want %s", gotPath, StandbyPrimaryStatusPath)
+	}
+	if gotPath == HAPrimaryStatusPath {
+		t.Fatalf("canonical path unexpectedly matched legacy path %s", HAPrimaryStatusPath)
+	}
+}
+
+func TestStandbyClientPathStyleAndTokenAreIndependent(t *testing.T) {
+	t.Parallel()
+
+	var gotPath, gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+
+	client.WithPathStyle(PathStyleCanonical)
+	client.WithToken("s3cr3t")
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if gotPath != StandbyPrimaryStatusPath {
+		t.Fatalf("path after WithToken = %s, want canonical %s to survive", gotPath, StandbyPrimaryStatusPath)
+	}
+	if gotAuth != "Bearer s3cr3t" {
+		t.Fatalf("Authorization = %q, want Bearer token", gotAuth)
+	}
+
+	client.WithPathStyle(PathStyleLegacy)
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if gotPath != HAPrimaryStatusPath {
+		t.Fatalf("path after switching to legacy = %s, want %s", gotPath, HAPrimaryStatusPath)
+	}
+	if gotAuth != "Bearer s3cr3t" {
+		t.Fatalf("Authorization after WithPathStyle = %q, want bearer token to survive", gotAuth)
+	}
+
+	client.WithToken("")
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if gotAuth != "" {
+		t.Fatalf("Authorization after clearing token = %q, want empty", gotAuth)
+	}
+	if gotPath != HAPrimaryStatusPath {
+		t.Fatalf("path after clearing token = %s, want path style %s to survive", gotPath, HAPrimaryStatusPath)
+	}
+}
+
+func TestDeprecatedHAAliasesResolveToStandbyTypes(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != HAPrimaryStatusPath {
+			t.Fatalf("path = %s, want legacy %s", r.URL.Path, HAPrimaryStatusPath)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	// HAClient is a true type alias for StandbyClient, so the deprecated
+	// constructor returns a value directly usable wherever *StandbyClient
+	// is expected, and it defaults to PathStyleLegacy exactly like
+	// NewStandbyClient.
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	var _ = client
+
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+
+	// Deprecated func aliases behave identically to their canonical
+	// counterparts.
+	apiErr := &HAAPIError{Operation: "op", StatusCode: http.StatusConflict}
+	if !HAIsConflict(apiErr) {
+		t.Fatal("HAIsConflict(apiErr) = false, want true")
+	}
+	if HAIsConflict(apiErr) != StandbyIsConflict(apiErr) {
+		t.Fatal("HAIsConflict and StandbyIsConflict disagree")
+	}
+	if code, ok := HAStatusCode(apiErr); !ok || code != http.StatusConflict {
+		t.Fatalf("HAStatusCode(apiErr) = (%d, %v), want (%d, true)", code, ok, http.StatusConflict)
+	}
+
+	// Deprecated const aliases hold the same values as their canonical
+	// counterparts.
+	if HAActionStateApplied != StandbyActionStateApplied {
+		t.Fatalf("HAActionStateApplied = %v, want %v", HAActionStateApplied, StandbyActionStateApplied)
+	}
+	if HAReadDecisionConsistencyStaleOK != StandbyReadDecisionConsistencyStaleOK {
+		t.Fatalf("HAReadDecisionConsistencyStaleOK = %v, want %v", HAReadDecisionConsistencyStaleOK, StandbyReadDecisionConsistencyStaleOK)
+	}
+
+	// The generic HAResponse[T] alias is identical to StandbyResponse[T].
+	value := 42
+	resp := HAResponse[int]{Value: &value}
+	var canonical = resp
+	if canonical.Value != resp.Value || *canonical.Value != 42 {
+		t.Fatalf("HAResponse[int] alias round-trip = %#v, want Value pointing at 42", canonical)
+	}
+}
+
+const standbyAutoSlotCreateJSON = `{
+	"schema_version":1,
+	"slot_action":"create",
+	"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-a"},
+	"slot":{"slot_name":"standby-a","timeline_id":1,"restart_lsn":7,"received_lsn":7,"applied_lsn":7,"safe_read_lsn":7,"active":true,"reseed_required":false,"current_lsn":7}
+}`
+
+// legacyOnlyStandbyServer emulates a 0.2 server: canonical paths are unrouted
+// and only the /admin/v1/ha spelling answers.
+func legacyOnlyStandbyServer(t *testing.T, counts map[string]int) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		counts[r.URL.Path]++
+		mu.Unlock()
+		if strings.HasPrefix(r.URL.Path, StandbyPath) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case HAPrimaryStatusPath:
+			_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+		case HAReplicationSlotsPath:
+			body, _ := io.ReadAll(r.Body)
+			if !strings.Contains(string(body), `"slot_name":"standby-a"`) {
+				http.Error(w, "body was not replayed: "+string(body), http.StatusBadRequest)
+				return
+			}
+			_, _ = fmt.Fprint(w, standbyAutoSlotCreateJSON)
+		default:
+			http.Error(w, "SlotNotFound", http.StatusNotFound)
+		}
+	}))
+}
+
+func TestStandbyClientPathStyleAutoStaysCanonicalWhenServed(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if !strings.HasPrefix(r.URL.Path, StandbyPath) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto)
+	for i := 0; i < 2; i++ {
+		if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+			t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+		}
+	}
+	if len(paths) != 2 || paths[0] != StandbyPrimaryStatusPath || paths[1] != StandbyPrimaryStatusPath {
+		t.Fatalf("paths = %v, want two canonical requests and no legacy probe", paths)
+	}
+	if style, pinned := client.negotiator.current(); style != PathStyleCanonical || !pinned {
+		t.Fatalf("negotiated style = %v pinned=%v, want canonical pinned", style, pinned)
+	}
+}
+
+func TestStandbyClientPathStyleAutoFallsBackToLegacyOnce(t *testing.T) {
+	t.Parallel()
+
+	counts := map[string]int{}
+	server := legacyOnlyStandbyServer(t, counts)
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto).WithToken("test-token")
+	for i := 0; i < 3; i++ {
+		if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+			t.Fatalf("PrimaryStatusResponse %d returned error: %v", i, err)
+		}
+	}
+	if counts[StandbyPrimaryStatusPath] != 1 {
+		t.Fatalf("canonical probes = %d, want exactly one before pinning legacy", counts[StandbyPrimaryStatusPath])
+	}
+	if counts[HAPrimaryStatusPath] != 3 {
+		t.Fatalf("legacy requests = %d, want 3", counts[HAPrimaryStatusPath])
+	}
+	if style, pinned := client.negotiator.current(); style != PathStyleLegacy || !pinned {
+		t.Fatalf("negotiated style = %v pinned=%v, want legacy pinned", style, pinned)
+	}
+
+	// A later client for the same base URL starts on the remembered spelling.
+	second, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	second.WithPathStyle(PathStyleAuto)
+	if _, err := second.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("second PrimaryStatusResponse returned error: %v", err)
+	}
+	if counts[StandbyPrimaryStatusPath] != 1 {
+		t.Fatalf("canonical probes after cached client = %d, want still 1", counts[StandbyPrimaryStatusPath])
+	}
+}
+
+func TestStandbyClientPathStyleAutoReplaysRequestBodyOnFallback(t *testing.T) {
+	t.Parallel()
+
+	counts := map[string]int{}
+	server := legacyOnlyStandbyServer(t, counts)
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto)
+	resp, err := client.CreateReplicationSlot(context.Background(), ReplicationSlotCreateRequest{SlotName: "standby-a", InitialLsn: 7})
+	if err != nil {
+		t.Fatalf("CreateReplicationSlot returned error: %v", err)
+	}
+	if resp.Slot.SlotName != "standby-a" {
+		t.Fatalf("SlotName = %q, want standby-a", resp.Slot.SlotName)
+	}
+	if counts[StandbyReplicationSlotsPath] != 1 || counts[HAReplicationSlotsPath] != 1 {
+		t.Fatalf("counts = %v, want one canonical probe and one legacy replay", counts)
+	}
+}
+
+func TestStandbyClientPathStyleAutoDoesNotReprobeTypedNotFound(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if !strings.HasPrefix(r.URL.Path, StandbyPath) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == StandbyPrimaryStatusPath {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+			return
+		}
+		http.Error(w, "SlotNotFound", http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto)
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	before := len(paths)
+	if _, err := client.PauseReplicationSlot(context.Background(), "missing"); err == nil {
+		t.Fatalf("PauseReplicationSlot for a missing slot succeeded")
+	}
+	if got := paths[before:]; len(got) != 1 || !strings.HasPrefix(got[0], StandbyPath) {
+		t.Fatalf("requests for typed 404 = %v, want a single canonical request and no legacy retry", got)
+	}
+}
+
+func TestStandbyClientNegotiatedPathStyleReportsPinnedCanonical(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, StandbyPath) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto)
+	if style, pinned := client.NegotiatedPathStyle(); pinned {
+		t.Fatalf("NegotiatedPathStyle before any request = %v pinned=%v, want unpinned", style, pinned)
+	}
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if style, pinned := client.NegotiatedPathStyle(); style != PathStyleCanonical || !pinned {
+		t.Fatalf("NegotiatedPathStyle = %v pinned=%v, want canonical pinned", style, pinned)
+	}
+}
+
+func TestStandbyClientNegotiatedPathStyleReportsPinnedLegacyAfterFallback(t *testing.T) {
+	t.Parallel()
+
+	counts := map[string]int{}
+	server := legacyOnlyStandbyServer(t, counts)
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto)
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if style, pinned := client.NegotiatedPathStyle(); style != PathStyleLegacy || !pinned {
+		t.Fatalf("NegotiatedPathStyle = %v pinned=%v, want legacy pinned", style, pinned)
+	}
+}
+
+func TestStandbyClientNegotiatedPathStyleIgnoredForExplicitStyles(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleCanonical)
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if style, pinned := client.NegotiatedPathStyle(); pinned {
+		t.Fatalf("NegotiatedPathStyle under explicit style = %v pinned=%v, want unpinned (no negotiation occurs)", style, pinned)
+	}
 }

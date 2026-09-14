@@ -718,7 +718,7 @@ regressions pass **2/2** in both Debug and ReleaseSafe.
 | Metadata and acknowledged distributed-data durability | real metadata/Raft paths plus modeled storage | `zig build lib-metadata-vopr-test lib-metadata-vopr-data-test` |
 | Per-group Raft scheduling | real `RawNode` message, persist, apply, restart, partition, proposal, and compaction choices | `zig build raft-vopr-test` |
 | Storage differential and real-backend campaigns | WAL, LMDB, LSM, persistent index, index manager, and DB split | `zig build storage-vopr-test` |
-| HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test antfly-storage-ha-chaos-test` |
+| HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test antfly-storage-hot-standby-chaos-test` |
 | Independent application domains | distributed transaction, data plane, derived workflow, backup/restore, and clock faults | their five focused `*-vopr-test` gates |
 | Production public HTTP on deterministic I/O | `vopr/data_server.zig`, `vopr/http_lifecycle.zig`, borrowed `HttpRuntime` and `BackendRuntime` lanes, transport-neutral metadata executor; chunked upload, keep-alive pipeline, streaming response, and half-close | `zig build data-server-vopr-test` |
 | Production DataServer replicated merge/split seam | `data/runtime.zig`; the focused rollback/fresh-retry history uses one owner and two groups, while `data-server-transition-vopr-test` chains merge into split across three real `DataServer` owners and three replicated groups over time. It uses public HTTP/Raft listeners, routed merge actions, leader transfer, a public post-bootstrap delta write, replicated bootstrap/catch-up/finalize, owner restart, catalog-independent replay, exact routed terminal retry, every-replica range/transition/watermark convergence, document equality, actor-owned teardown, and fresh-root replay of the recorded actor/time schedule on one `VoprIo`. Clock-only stutter is normalized at the explicit physical LSM differential boundary; no different actor may execute, and a recorded actor that does not become ready within the bound is replay divergence. A regression preserves exactly-once split-action lane release when an inline durable job fails | `zig build data-server-transition-vopr-test`; broader `data-server-vopr-test antfly-data-runtime-test lib-data-storage-test` gates remain required before release |
@@ -1320,7 +1320,7 @@ fence stores, replication, application, partition, crash, retention, backup,
 promotion, rejoin assessment, stale-owner fencing, and ordered applied-prefix
 properties.
 
-Focused gates: `ha-vopr-test` and `antfly-storage-ha-chaos-test`.
+Focused gates: `ha-vopr-test` and `antfly-storage-hot-standby-chaos-test`.
 
 ### Data Plane
 

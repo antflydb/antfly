@@ -15,7 +15,7 @@ const transactions = @import("../storage/transactions.zig");
 const tracing = @import("../tracing/antfly_trace_writer.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");
-const backup_manifest = @import("../storage/ha/backup_manifest.zig");
+const backup_manifest = @import("../storage/hot_standby/backup_manifest.zig");
 
 const Allocator = std.mem.Allocator;
 

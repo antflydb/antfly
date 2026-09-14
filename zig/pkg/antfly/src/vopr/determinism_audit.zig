@@ -103,7 +103,7 @@ const replayable_sources = [_]Source{
     },
     .{ .path = "storage/lsm_vopr.zig", .bytes = @embedFile("../storage/lsm_vopr.zig") },
     .{ .path = "storage/lmdb_vopr.zig", .bytes = @embedFile("../storage/lmdb_vopr.zig") },
-    .{ .path = "storage/ha/vopr.zig", .bytes = @embedFile("../storage/ha/vopr.zig") },
+    .{ .path = "storage/hot_standby/vopr.zig", .bytes = @embedFile("../storage/hot_standby/vopr.zig") },
     .{ .path = "storage/wal_vopr.zig", .bytes = @embedFile("../storage/wal_vopr.zig") },
     .{ .path = "storage/persistent_vopr.zig", .bytes = @embedFile("../storage/persistent_vopr.zig") },
     .{ .path = "storage/transaction_vopr.zig", .bytes = @embedFile("../storage/transaction_vopr.zig") },
