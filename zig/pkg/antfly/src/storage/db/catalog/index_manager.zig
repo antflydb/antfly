@@ -16680,7 +16680,7 @@ pub const IndexManager = struct {
     ) !TextPublicationEstimate {
         var context = try self.acquireTextPublicationContext(self.alloc, index_name);
         defer context.deinit();
-        var plan = try self.planTextBatchPublication(index_name, context, writes, std.math.maxInt(usize));
+        var plan = try self.planTextBatchPublication(index_name, &context, writes, std.math.maxInt(usize));
         defer plan.deinit();
         return if (plan.chunks.len == 0) .{} else plan.chunks[0].estimate;
     }
@@ -16688,7 +16688,7 @@ pub const IndexManager = struct {
     pub fn planTextBatchPublication(
         self: *IndexManager,
         index_name: []const u8,
-        context: TextPublicationContext,
+        context: *TextPublicationContext,
         writes: []const types.BatchWrite,
         reservation_limit: usize,
     ) !TextPublicationPlan {
@@ -16698,7 +16698,12 @@ pub const IndexManager = struct {
         if (entry.instance_id != context.instance_id) return error.IndexNotFound;
         entry.lockAnalysisShared();
         defer entry.unlockAnalysisShared();
-        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
+        // Planning has not reserved capacity or prepared segments yet. Sample
+        // the current projection under the same analysis lease used to build
+        // the plan; a revision change is not an index replacement. Admission
+        // still revalidates this context before publishing prepared work.
+        context.projection_revision = entry.projection_revision;
+        context.chunk_backed = textEntryHasExplicitArtifactSources(entry);
 
         var chunks = std.ArrayListUnmanaged(TextPublicationChunk).empty;
         errdefer chunks.deinit(context.alloc);
@@ -16780,7 +16785,7 @@ pub const IndexManager = struct {
     pub fn planTextMapperDocsPublication(
         self: *IndexManager,
         index_name: []const u8,
-        context: TextPublicationContext,
+        context: *TextPublicationContext,
         docs: []const mapper.MapperDoc,
         reservation_limit: usize,
     ) !TextPublicationPlan {
@@ -16790,7 +16795,12 @@ pub const IndexManager = struct {
         if (entry.instance_id != context.instance_id) return error.IndexNotFound;
         entry.lockAnalysisShared();
         defer entry.unlockAnalysisShared();
-        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
+        // Planning has not reserved capacity or prepared segments yet. Sample
+        // the current projection under the same analysis lease used to build
+        // the plan; a revision change is not an index replacement. Admission
+        // still revalidates this context before publishing prepared work.
+        context.projection_revision = entry.projection_revision;
+        context.chunk_backed = textEntryHasExplicitArtifactSources(entry);
 
         var chunks = std.ArrayListUnmanaged(TextPublicationChunk).empty;
         errdefer chunks.deinit(context.alloc);
@@ -17198,7 +17208,7 @@ pub const IndexManager = struct {
             .last_merge_peak_task_alloc_bytes = self.text_merge_scheduler.last_merge_peak_task_alloc_bytes,
             .quarantined_merges = self.text_merge_scheduler.activeQuarantineCount(now_ns),
             .quarantined_segments = self.text_merge_scheduler.quarantinedSegmentCount(now_ns),
-            .last_merge_error = self.text_merge_scheduler.lastMergeError(now_ns),
+            .last_merge_error = types.RuntimeErrorName.init(self.text_merge_scheduler.lastMergeError(now_ns)),
             .retry_after_ns = self.text_merge_scheduler.retryAfterNs(now_ns),
             .deferred_for_pressure = self.text_merge_scheduler.deferred_for_pressure,
         };
@@ -17259,7 +17269,7 @@ pub const IndexManager = struct {
             .last_merge_peak_task_alloc_bytes = self.text_merge_scheduler.last_merge_peak_task_alloc_bytes,
             .quarantined_merges = self.text_merge_scheduler.activeQuarantineCountForIndex(index_name, now_ns),
             .quarantined_segments = self.text_merge_scheduler.quarantinedSegmentCountForIndex(index_name, now_ns),
-            .last_merge_error = self.text_merge_scheduler.lastMergeErrorForIndex(index_name, now_ns),
+            .last_merge_error = types.RuntimeErrorName.init(self.text_merge_scheduler.lastMergeErrorForIndex(index_name, now_ns)),
             .retry_after_ns = self.text_merge_scheduler.retryAfterNsForIndex(index_name, now_ns),
             .deferred_for_pressure = self.text_merge_scheduler.deferred_for_pressure,
         };
@@ -35849,12 +35859,12 @@ test "text publication planning rejects a same-name catalog replacement" {
     }};
     try std.testing.expectError(
         error.IndexNotFound,
-        manager.planTextBatchPublication(config.name, stale_context, &writes, 1),
+        manager.planTextBatchPublication(config.name, &stale_context, &writes, 1),
     );
 
     var current_context = try manager.acquireTextPublicationContext(alloc, config.name);
     defer current_context.deinit();
-    var plan = try manager.planTextBatchPublication(config.name, current_context, &writes, 1);
+    var plan = try manager.planTextBatchPublication(config.name, &current_context, &writes, 1);
     defer plan.deinit();
     try std.testing.expectEqual(@as(usize, 1), plan.chunks.len);
     try std.testing.expectEqual(@as(usize, 1), plan.chunks[0].end);
@@ -35889,7 +35899,7 @@ test "text publication admission refreshes a projection revision change" {
     }};
     var stale_context = try manager.acquireTextPublicationContext(alloc, config.name);
     defer stale_context.deinit();
-    var stale_plan = try manager.planTextBatchPublication(config.name, stale_context, &writes, 1);
+    var stale_plan = try manager.planTextBatchPublication(config.name, &stale_context, &writes, 1);
     defer stale_plan.deinit();
 
     const fields = [_]schema_mod.FullTextField{.{
@@ -35909,23 +35919,44 @@ test "text publication admission refreshes a projection revision change" {
     try std.testing.expect(try schema_mod.saveSchema(&store, alloc, schema));
     try manager.refreshEmptyTextIndexSchemas(&store);
 
+    var stale_mapper_context = stale_context;
+    defer stale_mapper_context.deinit();
+    var admission_context = stale_context;
+    defer admission_context.deinit();
     manager.catalog_mutex.lockShared();
     const stale_after_admission = manager.textPublicationContextCurrentAssumeCatalogLocked(config.name, stale_context);
     manager.catalog_mutex.unlockShared();
     try std.testing.expect(!stale_after_admission);
-    try std.testing.expectError(
-        error.IndexNotFound,
-        manager.planTextBatchPublication(config.name, stale_context, &writes, 1),
-    );
-
-    manager.catalog_mutex.lockShared();
-    const refresh = try manager.refreshTextPublicationContextAssumeCatalogLocked(config.name, &stale_context);
-    manager.catalog_mutex.unlockShared();
-    try std.testing.expectEqual(TextPublicationContextRefresh.projection_changed, refresh);
-    var current_plan = try manager.planTextBatchPublication(config.name, stale_context, &writes, 1);
+    // Planning must admit the current projection of the same index instance.
+    // This used to return IndexNotFound and permanently fail a derived worker
+    // when dynamic schema observation advanced between capture and planning.
+    var current_plan = try manager.planTextBatchPublication(config.name, &stale_context, &writes, 1);
     defer current_plan.deinit();
     try std.testing.expectEqual(@as(usize, 1), current_plan.chunks.len);
     try std.testing.expectEqual(@as(u64, 1), current_plan.chunks[0].estimate.segment_count);
+    var parsed_doc = try std.json.parseFromSlice(std.json.Value, alloc, writes[0].value, .{});
+    defer parsed_doc.deinit();
+    const mapper_docs = [_]mapper.MapperDoc{.{
+        .key = writes[0].key,
+        .value = writes[0].value,
+        .root = parsed_doc.value,
+    }};
+    var mapper_plan = try manager.planTextMapperDocsPublication(config.name, &stale_mapper_context, &mapper_docs, 1);
+    defer mapper_plan.deinit();
+    try std.testing.expectEqual(stale_context.projection_revision, stale_mapper_context.projection_revision);
+    try std.testing.expectEqual(@as(u64, 1), mapper_plan.chunks[0].estimate.segment_count);
+    // An estimate already admitted under the old revision still requires
+    // explicit refresh; planning's refresh does not bless an older context.
+    manager.catalog_mutex.lockShared();
+    const refresh = try manager.refreshTextPublicationContextAssumeCatalogLocked(config.name, &admission_context);
+    manager.catalog_mutex.unlockShared();
+    try std.testing.expectEqual(TextPublicationContextRefresh.projection_changed, refresh);
+    var prepared = try manager.prepareTextMapperDocsPublication(alloc, &store, config.name, &stale_mapper_context, &mapper_docs);
+    defer prepared.deinit();
+    var guard = try manager.lockManagedIndexApply(.{ .name = config.name, .kind = .full_text });
+    defer guard.unlock();
+    try manager.applyPreparedTextMapperPublicationByNameWithOptions(&store, config.name, &.{}, &prepared, .{});
+    try std.testing.expectEqual(@as(u32, 1), manager.textIndex(config.name).?.snapshot().liveDocCount());
 }
 
 test "observed dynamic sortable field capability reports covered queryable state" {
@@ -41911,7 +41942,7 @@ test "text merge failure quarantines source segments" {
     try std.testing.expectEqual(@as(u64, 1), stats.failed_merges);
     try std.testing.expectEqual(@as(u64, 1), stats.quarantined_merges);
     try std.testing.expectEqual(@as(u64, @intCast(task.source.len)), stats.quarantined_segments);
-    try std.testing.expectEqualStrings("InvalidChunk", stats.last_merge_error);
+    try std.testing.expectEqualStrings("InvalidChunk", stats.last_merge_error.slice());
     var blocked_task = try manager.beginTextMergeTask();
     if (blocked_task) |*unexpected| {
         unexpected.deinit(alloc);

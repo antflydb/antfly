@@ -16385,20 +16385,10 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatus {
         if (comptime control_only_storage_sources) {
             const local_source = self.local_write_source orelse return null;
-            var statuses = (local_source.localRuntimeStatuses(alloc, table_name) catch |err| switch (err) {
-                // This probe is used by observational control loops such as
-                // schema-migration finalization. A resident owner can be
-                // momentarily retiring or publishing its generation; absence
-                // is the truthful best-effort result and must not terminate
-                // the node's control loop.
-                error.StorageReadTemporarilyUnavailable => return null,
-                else => return err,
-            }) orelse return null;
-            defer statuses.deinit(alloc);
-            for (statuses.items) |status| {
-                if (status.group_id == group_id) return try status.clone(alloc);
-            }
-            return null;
+            // Keep a group probe O(1) in resident-owner observations. Asking
+            // for the entire table here rescans every sibling once per group
+            // and lets an unrelated busy owner abort this group's refresh.
+            return try local_source.localRuntimeStatusGroupLocal(alloc, group_id, table_name);
         }
         return switch (self.probeManagedWriterGroupBestEffort(table_name, group_id)) {
             .absent, .unknown => null,
@@ -19606,12 +19596,25 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            const result = (try local_source.reconcileTableGroupLocal(
+            var observation = (try local_source.reconcileTableGroupLocalTransientObserved(
+                alloc,
                 group_id,
                 table_name,
                 metadata.target_index_name,
                 false,
             )) orelse return error.StorageKernelOwnerUnavailable;
+            defer observation.deinit(alloc);
+            // The physical mutation alone cannot acknowledge an activation.
+            // Carry the observation sampled under the same exclusive owner
+            // lease into the existing catalog/root/target-fenced publisher.
+            // Busy observation retains the pending group for a later quantum.
+            const status = observation.runtime_status orelse return .busy;
+            try observations.append(alloc, .{
+                .status = status,
+                .opened_root_generation = status.metadata.lsm_root_generation,
+            });
+            observation.runtime_status = null;
+            const result = observation.result;
             return switch (result.state) {
                 .complete => .complete,
                 .repair_pending => .repair_pending,

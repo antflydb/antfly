@@ -4905,7 +4905,7 @@ fn appendTextMergeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
     try out.appendSlice(alloc, ",\"deferred_for_pressure\":");
     try appendIntValue(alloc, out, stats.deferred_for_pressure);
     try out.appendSlice(alloc, ",\"last_merge_error\":");
-    try appendJsonString(alloc, out, stats.last_merge_error);
+    try appendJsonString(alloc, out, stats.last_merge_error.slice());
     try out.append(alloc, '}');
 }
 
@@ -8038,7 +8038,7 @@ fn consumerTests() type {
                 .text_merge = .{
                     .pending_segments = 3,
                     .quarantined_segments = 2,
-                    .last_merge_error = "InvalidChunk",
+                    .last_merge_error = .init("InvalidChunk"),
                     .deferred_for_pressure = 1,
                 },
             };

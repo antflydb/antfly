@@ -32659,7 +32659,7 @@ pub const DB = struct {
             .durable_progress_ticks = runtime_snapshot.durable_progress_ticks,
             .idle_ticks = runtime_snapshot.idle_ticks,
             .error_ticks = runtime_snapshot.error_ticks,
-            .last_error_name = runtime_snapshot.last_error_name,
+            .last_error_name = if (runtime_snapshot.last_error_name) |name| types.RuntimeErrorName.init(name) else null,
             .total_metrics_scanned = @intCast(total.metrics_scanned),
             .total_active_builds = @intCast(total.active_builds),
             .total_builds_started = @intCast(total.builds_started),
@@ -54889,7 +54889,7 @@ fn applyDerivedBatchToIndexContextProfiled(
             const plan_base = write_start;
             var publication_plan = try ctx.index_manager.planTextMapperDocsPublication(
                 index_ref.name,
-                publication_context,
+                &publication_context,
                 collected.docs.items[plan_base..],
                 reservation_limit,
             );
