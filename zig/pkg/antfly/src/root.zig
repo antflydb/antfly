@@ -193,8 +193,8 @@ pub const lmdb_engine = @import("lmdb_engine");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const posting_segment_store = @import("storage/posting_segment_store.zig");
 pub const vector_block_store = @import("storage/vector_block_store.zig");
-pub const ha = @import("storage/ha/mod.zig");
-pub const ha_vopr = @import("storage/ha/vopr.zig");
+pub const hot_standby = @import("storage/hot_standby/mod.zig");
+pub const ha_vopr = @import("storage/hot_standby/vopr.zig");
 pub const wal = @import("storage/wal.zig");
 pub const wal_vopr = @import("storage/wal_vopr.zig");
 pub const persistent = @import("storage/persistent.zig");
@@ -218,6 +218,8 @@ pub const index_manager_vopr = @import("storage/index_manager_vopr.zig");
 pub const db_split_vopr = @import("storage/db_split_vopr.zig");
 
 test {
+    _ = @import("vopr/index_maintenance.zig");
+    _ = @import("cmd/serverless.zig");
     // Storage shard builds compile this authoritative discovery root and then
     // select disjoint test-name prefixes. Keep it unconditional in test mode:
     // an unimported test file must fail the pre-build audit, never disappear.
@@ -360,7 +362,7 @@ test {
     _ = lmdb_vopr;
     _ = lmdb_engine;
     _ = hbc;
-    _ = ha;
+    _ = hot_standby;
     _ = ha_vopr;
     _ = wal;
     _ = wal_vopr;

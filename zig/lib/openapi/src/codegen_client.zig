@@ -132,24 +132,26 @@ pub const ClientGenerator = struct {
 
         try self.w.blank();
 
-        try self.w.line("pub fn fromResponse(allocator: std.mem.Allocator, resp: *httpx.Response) @This() {{", .{});
+        try self.w.line("pub fn fromResponse(allocator: std.mem.Allocator, resp: *httpx.Response) !@This() {{", .{});
         self.w.indent();
         try self.w.line("defer resp.deinit();", .{});
         try self.w.line("if (resp.ok()) {{", .{});
         self.w.indent();
+        try self.w.line("if (resp.status.code == 204 or resp.status.code == 205) return .{{ .status_code = resp.status.code, .allocator = allocator }};", .{});
         try self.w.line("if (resp.body) |body| {{", .{});
         self.w.indent();
-        try self.w.line("const parsed = std.json.parseFromSlice(T, allocator, body, .{{ .allocate = .alloc_always }}) catch {{", .{});
+        try self.w.line("const parsed = std.json.parseFromSlice(T, allocator, body, .{{ .allocate = .alloc_always, .ignore_unknown_fields = true }}) catch |err| {{", .{});
         self.w.indent();
-        try self.w.line("return .{{ .status_code = resp.status.code, .allocator = allocator }};", .{});
+        try self.w.line("return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidApiResponse;", .{});
         self.w.dedent();
         try self.w.line("}};", .{});
         try self.w.line("return .{{ .status_code = resp.status.code, .data = parsed, .allocator = allocator }};", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
+        try self.w.line("return error.InvalidApiResponse;", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
-        try self.w.line("return .{{ .status_code = resp.status.code, .err_body = if (resp.body) |b| (allocator.dupe(u8, b) catch null) else null, .allocator = allocator }};", .{});
+        try self.w.line("return .{{ .status_code = resp.status.code, .err_body = if (resp.body) |b| try allocator.dupe(u8, b) else null, .allocator = allocator }};", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
 

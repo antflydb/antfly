@@ -56,9 +56,9 @@ const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const portable_backup = @import("../storage/portable_backup.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
-const ha_primary_mod = @import("../storage/ha/primary.zig");
-const ha_mutation_barrier_mod = @import("../storage/ha/mutation_barrier.zig");
-const ha_public_gate_state_mod = @import("../storage/ha/public_gate_state.zig");
+const ha_primary_mod = @import("../storage/hot_standby/primary.zig");
+const ha_mutation_barrier_mod = @import("../storage/hot_standby/mutation_barrier.zig");
+const ha_public_gate_state_mod = @import("../storage/hot_standby/public_gate_state.zig");
 const storage_schema = @import("../storage/schema.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
@@ -16391,20 +16391,10 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatus {
         if (comptime control_only_storage_sources) {
             const local_source = self.local_write_source orelse return null;
-            var statuses = (local_source.localRuntimeStatuses(alloc, table_name) catch |err| switch (err) {
-                // This probe is used by observational control loops such as
-                // schema-migration finalization. A resident owner can be
-                // momentarily retiring or publishing its generation; absence
-                // is the truthful best-effort result and must not terminate
-                // the node's control loop.
-                error.StorageReadTemporarilyUnavailable => return null,
-                else => return err,
-            }) orelse return null;
-            defer statuses.deinit(alloc);
-            for (statuses.items) |status| {
-                if (status.group_id == group_id) return try status.clone(alloc);
-            }
-            return null;
+            // Keep a group probe O(1) in resident-owner observations. Asking
+            // for the entire table here rescans every sibling once per group
+            // and lets an unrelated busy owner abort this group's refresh.
+            return try local_source.localRuntimeStatusGroupLocal(alloc, group_id, table_name);
         }
         return switch (self.probeManagedWriterGroupBestEffort(table_name, group_id)) {
             .absent, .unknown => null,
@@ -53351,7 +53341,7 @@ fn implementationTests() type {
             });
             _ = try source.withHAWriteGate(.{ .shared = .{ .state = &gate_state } });
 
-            const ha_effects = @import("../storage/ha/effects.zig");
+            const ha_effects = @import("../storage/hot_standby/effects.zig");
             const payload = try ha_effects.encodeBatchMutationRequestAlloc(alloc, .{
                 .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
             });

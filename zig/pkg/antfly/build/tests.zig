@@ -343,20 +343,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "artifact reprocess job cleanup removes recovered durable expired jobs",
             "artifact reprocess job store applies running cancellation at pass boundary",
             "artifact reprocess job store records cancel requested across stale queued token",
-            "repair job store starts and records a pass",
-            "repair job store applies running cancellation at pass boundary",
-            "repair job store records cancel requested across stale queued token",
-            "repair job store does not expire future live running heartbeat",
-            "table repair job store persists monotonic next id across stale durable writes",
-            "table repair job cleanup pages durable expired jobs",
-            "forced index repair job dispatches force only once",
-            "index repair job keeps degradation gauges as snapshots across retries",
-            "named index repair cancellation remains nonterminal until durable controls finish",
-            "named index repair cancellation restarts its durable traversal after job store recovery",
-            "durable cancellation retries transient failures with backoff",
-            "durable cancellation scan rotates past a backed off head window",
-            "table repair job recovery quarantines corrupt primary without blocking service",
-            "active repair job recovery quarantines malformed secondary entries",
+            "api.repair_jobs.",
+            "api_artifact_reprocess_jobs_test_root.",
             "api http client maps remote repair cancel unavailable",
             "api http client encodes table name for repair cancel callback",
             "public api routes compile",
@@ -783,7 +771,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db split modeled ",
         "serverless",
         "raft.",
-        "storage.ha",
+        "storage.hot_standby",
         "HBC recall",
     };
     const lib_unit_default_filters = [_][]const u8{
@@ -959,7 +947,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db repair preflight retains a canonical generation completed after scheduler selection",
         "db coverage recovery admits a published generation after its admission marker retires",
         "provisioned leader admission rejects uncommitted writes under dense repair pressure",
-        "api maintenance resumes recovered durable named index cancellation without client advance",
+        "api maintenance ",
         "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
         "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
         "managed embedder sends antfly media parts when local provider is configured",
@@ -1454,7 +1442,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const api_http_runtime_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = api_http_runtime_filters,
+        .filters = &api_http_runtime_default_filters,
         // The native-generation merge raised this linked API/DB harness to
         // 16.01 GB in macOS ReleaseFast codegen. Reserve measured usage plus
         // headroom; the shared runner still caps aggregate compilation.
@@ -1469,8 +1457,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         api_http_runtime_tests,
         api_http_runtime_filters,
     );
-    const api_http_runtime_test_step = b.step("antfly-api-http-runtime-test", "Run focused API HTTP and linked-boundary tests");
-    api_http_runtime_test_step.dependOn(&run_api_http_runtime_tests.step);
+    const api_http_runtime_test_step = b.step("antfly-api-test", "Run API contracts and linked-boundary tests");
     root_test_step.dependOn(&run_api_http_runtime_tests.step);
 
     const introducer_tests = b.addTest(.{
@@ -1509,58 +1496,35 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configure(b, cmd_test_mod, true, true);
-    cmd_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
-    const cmd_usermgr_storage_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    cmd_usermgr_storage_mod.addImport("antfly_root", cmd_test_mod);
-    cmd_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
-    cmd_test_mod.addImport("usermgr_storage", cmd_usermgr_storage_mod);
-    cmd_test_mod.addImport("antfly-zig", antfly_mod);
+    antfly_imports.configureCli(cmd_test_mod, true);
     cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const cmd_tests = b.addTest(.{
         .root_module = cmd_test_mod,
-        .filters = &.{
-            "cmd.lite",
-            "cmd.serverless",
-            "cmd.cli.backup",
-            "cmd.cli.index",
-            "cmd.cli.query",
-            "cmd.cli.agents",
-            "cmd.cli.table",
-            "cmd.cli.mod",
-            "cmd.cli.data.test.mutation parser",
-            "cmd.cli.data.test.load parser",
-            "cmd.cli.data.test.checkpoint validation rejects changed source and load config",
-        },
+        .filters = &.{"cmd.cli."},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        // Mach-O debug codegen currently peaks a little above 12 GiB for this
-        // intentionally broad command root. Linux remains within the
-        // aggregate's 7 GiB claim.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
+        // Remote CLI Debug codegen measured about 1 GiB on macOS. Reserve
+        // headroom without carrying the former physical-storage allowance.
+        .max_rss = 3 * 1024 * 1024 * 1024,
     });
-    const run_cmd_tests = addFilteredTestRunArtifact(b, cmd_tests);
-    const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
+    const run_cmd_tests = @import("test_support.zig").addCuratedTestRunArtifact(b, cmd_tests, cmd_tests.filters);
+    const cmd_test_step = b.step("antfly-cmd-test", "Run Antfly command and client CLI tests");
     cmd_test_step.dependOn(&run_cmd_tests.step);
 
-    const graph_metric_command_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/cmd_graph_metric_maintenance_test_root.zig"),
+    const maintenance_worker_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/maintenance_worker_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configure(b, graph_metric_command_test_mod, true, true);
-    graph_metric_command_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
-    graph_metric_command_test_mod.addImport("antfly-zig", antfly_mod);
-    graph_metric_command_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    const graph_metric_command_tests = b.addTest(.{
-        .root_module = graph_metric_command_test_mod,
-        .filters = &.{"cmd.graph_metric_maintenance.test.graph metric maintenance"},
+    test_imports.configure(b, maintenance_worker_test_mod, true, true);
+    maintenance_worker_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    maintenance_worker_test_mod.addImport("antfly-zig", antfly_mod);
+    maintenance_worker_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    const maintenance_worker_tests = b.addTest(.{
+        .root_module = maintenance_worker_test_mod,
+        .filters = &.{"testing.maintenance_worker.test.graph metric maintenance"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -1570,10 +1534,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // headroom as the broad command root without raising Linux admission.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
     });
-    const run_graph_metric_command_tests = addFilteredTestRunArtifact(b, graph_metric_command_tests);
-    const graph_metric_command_test_step = b.step("graph-metric-command-test", "Run graph metric maintenance CLI and supervisor tests");
-    graph_metric_command_test_step.dependOn(&run_graph_metric_command_tests.step);
-    cmd_test_step.dependOn(&run_graph_metric_command_tests.step);
+    const run_maintenance_worker_tests = addFilteredTestRunArtifact(b, maintenance_worker_tests);
 
     const lite_cmd_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_cmd_test.zig"),
@@ -1594,7 +1555,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lite_cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const lite_cmd_tests = b.addTest(.{
         .root_module = lite_cmd_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.query", "cmd.cli.agents", "cmd.cli.table", "cmd.cli.mod" },
+        .filters = &.{ "cmd.lite", "testing.backup_restore" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -1844,21 +1805,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_lsm_vopr_test_step = b.step("lsm-vopr-test", "Run replayable real-backend LSM VOPR campaigns");
     lib_lsm_vopr_test_step.dependOn(&run_lib_lsm_vopr_tests.step);
     const lib_ha_chaos_default_filters = [_][]const u8{
-        "storage.ha chaos crash during base backup preserves slot pin and catch-up boundary",
-        "storage.ha chaos crash after receive replays durable WAL before streaming resumes",
-        "storage.ha chaos rejects noncontiguous records and follows timeline switch across restart",
-        "storage.ha chaos crash during apply preserves remote write and blocks remote apply",
-        "storage.ha chaos crash after apply before ack reports durable progress on resume",
-        "storage.ha chaos primary restart preserves synchronous acknowledgement boundaries",
-        "storage.ha chaos lag retention forces reseed and former primary cannot rewind expired WAL",
-        "storage.ha chaos network partition requires fence before standby promotion",
+        "storage.hot_standby chaos crash during base backup preserves slot pin and catch-up boundary",
+        "storage.hot_standby chaos crash after receive replays durable WAL before streaming resumes",
+        "storage.hot_standby chaos rejects noncontiguous records and follows timeline switch across restart",
+        "storage.hot_standby chaos crash during apply preserves remote write and blocks remote apply",
+        "storage.hot_standby chaos crash after apply before ack reports durable progress on resume",
+        "storage.hot_standby chaos primary restart preserves synchronous acknowledgement boundaries",
+        "storage.hot_standby chaos lag retention forces reseed and former primary cannot rewind expired WAL",
+        "storage.hot_standby chaos network partition requires fence before standby promotion",
     };
     const lib_ha_chaos_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &lib_ha_chaos_default_filters),
     });
     const run_lib_ha_chaos_tests = addFilteredTestRunArtifact(b, lib_ha_chaos_tests);
-    const lib_ha_chaos_test_step = b.step("antfly-storage-ha-chaos-test", "Run HA hot-standby crash and partition hardening tests");
+    const lib_ha_chaos_test_step = b.step("antfly-storage-hot-standby-chaos-test", "Run HA hot-standby crash and partition hardening tests");
     lib_ha_chaos_test_step.dependOn(&run_lib_ha_chaos_tests.step);
     const lib_ha_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -1868,23 +1829,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_ha_vopr_test_step = b.step("ha-vopr-test", "Run replayable HA lifecycle VOPR campaigns");
     lib_ha_vopr_test_step.dependOn(&run_lib_ha_vopr_tests.step);
     const lib_ha_compat_default_filters = [_][]const u8{
-        "storage.ha compat decodes v1 replication record fixture",
-        "storage.ha compat keeps v1 replication record encoding stable",
-        "storage.ha compat decodes v1 timeline switch record fixture",
-        "storage.ha compat keeps v1 timeline switch encoding stable",
-        "storage.ha compat decodes v1 base backup and checkpoint record fixtures",
-        "storage.ha compat keeps v1 base backup and checkpoint encodings stable",
-        "storage.ha compat decodes v1 backup manifest fixture",
-        "storage.ha compat keeps v1 backup manifest encoding stable",
-        "storage.ha compat keeps v1 backup manifest file kind tags stable",
-        "storage.ha compat keeps v1 record kind tags stable",
+        "storage.hot_standby compat decodes v1 replication record fixture",
+        "storage.hot_standby compat keeps v1 replication record encoding stable",
+        "storage.hot_standby compat decodes v1 timeline switch record fixture",
+        "storage.hot_standby compat keeps v1 timeline switch encoding stable",
+        "storage.hot_standby compat decodes v1 base backup and checkpoint record fixtures",
+        "storage.hot_standby compat keeps v1 base backup and checkpoint encodings stable",
+        "storage.hot_standby compat decodes v1 backup manifest fixture",
+        "storage.hot_standby compat keeps v1 backup manifest encoding stable",
+        "storage.hot_standby compat keeps v1 backup manifest file kind tags stable",
+        "storage.hot_standby compat keeps v1 record kind tags stable",
     };
     const lib_ha_compat_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &lib_ha_compat_default_filters),
     });
     const run_lib_ha_compat_tests = addFilteredTestRunArtifact(b, lib_ha_compat_tests);
-    const lib_ha_compat_test_step = b.step("antfly-storage-ha-compat-test", "Run HA replication format compatibility tests");
+    const lib_ha_compat_test_step = b.step("antfly-storage-hot-standby-compat-test", "Run HA replication format compatibility tests");
     lib_ha_compat_test_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
@@ -1935,8 +1896,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = graph_page_test_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    const run_graph_page_tests = addFilteredTestRunArtifact(b, graph_page_tests);
-    b.step("antfly-graph-page-test", "Run immutable graph page construction, query and recovery tests").dependOn(&run_graph_page_tests.step);
+    const graph_test_step = b.step("antfly-graph-test", "Run graph algorithms, topology, pages, query and recovery tests");
 
     const serverless_manifest_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/serverless_manifest_test_root.zig"),
@@ -2206,31 +2166,36 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const ha_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"storage.ha"},
+        .filters = &.{"storage.hot_standby"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_ha_tests = addFilteredTestRunArtifact(b, ha_tests);
-    const ha_test_step = b.step("antfly-storage-ha-test", "Run hot-standby HA storage tests");
+    const ha_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby HA storage tests");
     ha_test_step.dependOn(&run_ha_tests.step);
 
-    // cmd/ha.zig is owned by the distributed runtime unit. Keep its focused
-    // parser root inside pkg/antfly/src so relative imports stay within the Zig
-    // module boundary, without pulling the command back into the CLI unit.
-    const ha_cli_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/ha_cmd_test_root.zig"),
+    // cmd/standby.zig is owned by the distributed runtime unit. Keep its
+    // focused parser root inside pkg/antfly/src so relative imports stay
+    // within the Zig module boundary, without pulling the command back into
+    // the CLI unit.
+    const standby_cli_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/standby_cmd_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    ha_cli_test_mod.addImport("antfly-zig", antfly_mod);
-    const ha_cli_tests = b.addTest(.{
-        .root_module = ha_cli_test_mod,
-        .filters = &.{"ha cmd artifact"},
+    // The root file-imports cli_root.zig, which reaches storage and runtime
+    // sources that need the same module graph as the full test module.
+    test_imports.configure(b, standby_cli_test_mod, true, true);
+    standby_cli_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    standby_cli_test_mod.addImport("antfly-zig", antfly_mod);
+    const standby_cli_tests = b.addTest(.{
+        .root_module = standby_cli_test_mod,
+        .filters = &.{"standby cmd"},
     });
-    const run_ha_cli_tests = b.addRunArtifact(ha_cli_tests);
-    ha_test_step.dependOn(&run_ha_cli_tests.step);
+    const run_standby_cli_tests = b.addRunArtifact(standby_cli_tests);
+    ha_test_step.dependOn(&run_standby_cli_tests.step);
 
     const lsm_backend_runtime_filters = selectTestFilters(b, &.{"storage.lsm_backend."});
     const lsm_backend_tests = b.addTest(.{
@@ -2440,7 +2405,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db dense counter bootstrap admission respects soft background budget",
             "managed startup catch-up advances counterless incomplete dense repair",
             "provisioned leader admission rejects uncommitted writes under dense repair pressure",
-            "api maintenance resumes recovered durable named index cancellation without client advance",
+            "api maintenance ",
             "bulk publication revalidates admission before every publish window",
         },
         .test_runner = .{
@@ -3880,7 +3845,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone CORS middleware",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
             "standalone runtime parses experimental flag",
-            "standalone runtime antfarm path guards keep api routes reserved",
+            "standalone runtime antfarm",
             "standalone startup checkpoint readiness requires applied and safe-read progress",
             "standalone activated seed bootstraps exact standby checkpoint and rejects older progress",
             "parse cli accepts config path",
@@ -3892,9 +3857,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "parse cli accepts HA primary sync policy flags",
             "promoted HA primary retains exact predecessor startup provenance",
             "parse cli accepts HA standby runtime flags",
+            "deprecated --ha-* flags remain aliases for --hot-standby-* flags",
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
             "standalone HA runtime rejects ambiguous role flags",
+            "standalone hot-standby startup migrates a legacy layout before opening local handles",
+            "standalone hot-standby startup migration is a no-op with no hot-standby paths configured",
             "standalone continuous HA mutation guard follows role lifecycle",
             "antfly config uses cli override before common config",
             "standalone memory budget conversion rejects overflow",
@@ -4005,6 +3973,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_capi_tests.step);
     unit_test_step.dependOn(&run_lite_native_tests.step);
     unit_test_step.dependOn(&run_cmd_tests.step);
+    unit_test_step.dependOn(&run_lite_cmd_tests.step);
     unit_test_step.dependOn(&run_introducer_tests.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
@@ -4025,9 +3994,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
     // The aggregate's storage HA shard owns the library tests. Keep only the
-    // command-root coverage that the shard cannot discover; `antfly-storage-ha-test` remains
+    // command-root coverage that the shard cannot discover; `antfly-storage-hot-standby-test` remains
     // available as the convenient focused target containing both artifacts.
-    unit_test_step.dependOn(&run_ha_cli_tests.step);
+    unit_test_step.dependOn(&run_standby_cli_tests.step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_snapshot_maintenance_vopr_tests.step);
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
@@ -4450,6 +4419,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     chaos_test_step.dependOn(storage_vopr_step);
 
     const graph_metric_unit_filters = [_][]const u8{
+        "graph.query.",
+        "index maintenance VOPR regression exact replay",
+        // This bounded smoke shares the storage compilation with its unit coverage.
+        "db graph metric runtime background coordinator and worker pool loops publish pagerank",
         "graph maintenance",
         "lmdb backend read forks",
         "graph metric tree batch validation",
@@ -4538,7 +4511,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = db_test_mod,
         .filters = compileFiltersWithAnchors(
             b,
-            &.{"db default primary backend survives reopen"},
+            &.{ "db default primary backend survives reopen", "graph." },
             &graph_metric_unit_filters,
         ),
         .test_runner = .{
@@ -4546,25 +4519,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const run_graph_metric_unit_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+    const run_graph_metric_unit_tests = @import("test_support.zig").addCuratedTestRunArtifact(
         b,
         graph_metric_unit_tests,
         &graph_metric_unit_filters,
     );
-    const graph_metric_unit_test_step = b.step("graph-metric-unit-test", "Run cheap graph metric runtime, ownership, and query tests");
-    graph_metric_unit_test_step.dependOn(&run_graph_metric_unit_tests.step);
-    b.step("graph-metric-core-test", "Run graph metric core unit tests without rebuilding API/wire harnesses").dependOn(&run_graph_metric_unit_tests.step);
-    const graph_metric_topology_filters = [_][]const u8{"graph metric shared topology"};
-    const graph_metric_topology_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = compileFiltersWithAnchors(b, &.{"db default primary backend survives reopen"}, &graph_metric_topology_filters),
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
-    });
-    const run_graph_metric_topology_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, graph_metric_topology_tests, &graph_metric_topology_filters);
-    const graph_metric_topology_test_step = b.step("graph-metric-topology-test", "Run durable topology preparation, sharing, recovery, and reclamation tests");
-    graph_metric_topology_test_step.dependOn(&run_graph_metric_topology_tests.step);
     unit_test_step.dependOn(&run_graph_metric_unit_tests.step);
-    unit_test_step.dependOn(&run_graph_metric_command_tests.step);
+    @import("test_support.zig").addOwnerTestRuns(b, graph_test_step, &.{
+        .{ .artifact = graph_metric_unit_tests, .filters = &.{"graph."} },
+        .{ .artifact = graph_page_tests, .filters = &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store." } },
+    }, &.{});
+    integration_test_step.dependOn(&run_maintenance_worker_tests.step);
 
     const graph_metric_fan_in_filters = [_][]const u8{
         "query parser accepts direct graph metric reads",
@@ -4628,10 +4593,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const run_graph_metric_fan_in_tests = addFilteredTestRunArtifact(b, graph_metric_fan_in_tests);
-    const graph_metric_fan_in_test_step = b.step("graph-metric-fan-in-test", "Run graph metric API contract and fail-closed distributed fan-in tests");
-    graph_metric_fan_in_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
-    graph_metric_unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
+    const run_graph_metric_fan_in_tests = @import("test_support.zig").addCuratedTestRunArtifact(b, graph_metric_fan_in_tests, &graph_metric_fan_in_filters);
     unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
 
     const graph_metric_remote_wire_filters = [_][]const u8{
@@ -4650,53 +4612,33 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "hosted cross-range graph metric fan-in rejects missing remote hits status",
         "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations",
     };
-    const graph_metric_remote_wire_tests = @import("linked_tests.zig").addPair(b, .{
-        .name = "api-graph-metric-wire-tests",
-        // macOS ReleaseFast measured 13.45 GB after the native-generation
-        // merge. Admit this indivisible compiler job with headroom; the shared
-        // runner's 22 GiB cap still bounds aggregate concurrent compilation.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
-        .root_module = api_table_reads_docid_test_mod,
-        .filters = &graph_metric_remote_wire_filters,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    }, api_tests_addTests_result.write_implementation_tests);
+    const graph_metric_remote_wire_tests = @import("linked_tests.zig").Pair{
+        .consumer = @import("linked_tests.zig").add(b, .{
+            .name = "api-graph-metric-wire-tests",
+            // macOS ReleaseFast measured 13.45 GB after the native-generation
+            // merge. Admit this indivisible compiler job with headroom; the shared
+            // runner's 22 GiB cap still bounds aggregate concurrent compilation.
+            .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+            .root_module = api_table_reads_docid_test_mod,
+            .filters = &graph_metric_remote_wire_filters,
+            .test_runner = .{
+                .path = b.path("pkg/antfly/src/test_runner.zig"),
+                .mode = .simple,
+            },
+        }),
+        .implementation = api_tests_addTests_result.write_implementation_tests,
+    };
     const run_graph_metric_remote_wire_tests = graph_metric_remote_wire_tests.run(b);
-    const graph_metric_remote_wire_test_step = b.step("graph-metric-remote-wire-test", "Run hosted graph metric shard request and remote-wire tests");
-    graph_metric_remote_wire_test_step.dependOn(&run_graph_metric_remote_wire_tests.step);
-    graph_metric_unit_test_step.dependOn(&run_graph_metric_remote_wire_tests.step);
     unit_test_step.dependOn(&run_graph_metric_remote_wire_tests.step);
 
-    const graph_metric_smoke_filters = [_][]const u8{
-        "db graph metric runtime background coordinator and worker pool loops publish pagerank",
-    };
-    const graph_metric_smoke_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = compileFiltersWithAnchors(
-            b,
-            &.{"db default primary backend survives reopen"},
-            &graph_metric_smoke_filters,
-        ),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_graph_metric_smoke_tests = addFilteredTestRunArtifactWithRuntimeFilters(
-        b,
-        graph_metric_smoke_tests,
-        &graph_metric_smoke_filters,
-    );
-    const graph_metric_smoke_test_step = b.step("graph-metric-smoke-test", "Run a small end-to-end PageRank scheduler and worker smoke test");
-    graph_metric_smoke_test_step.dependOn(&run_graph_metric_smoke_tests.step);
-    unit_test_step.dependOn(&run_graph_metric_smoke_tests.step);
+    @import("test_support.zig").addOwnerTestRuns(b, api_http_runtime_test_step, &.{
+        .{ .artifact = api_http_runtime_tests, .filters = &api_http_runtime_default_filters },
+        .{ .artifact = graph_metric_fan_in_tests, .filters = &graph_metric_fan_in_filters },
+        .{ .artifact = graph_metric_remote_wire_tests.consumer.executable, .filters = &graph_metric_remote_wire_filters },
+        .{ .artifact = graph_metric_remote_wire_tests.implementation, .filters = &graph_metric_remote_wire_filters },
+    }, &.{});
 
     const graph_metric_integration_filters = [_][]const u8{
-        "graph.graph.test.graph pagerank ",
-        "graph.graph.test.graph eigenvector ",
-        "graph.graph.test.graph hits ",
         "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime background ",
         "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime planned ",
         "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime query ",
@@ -4715,7 +4657,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = db_test_mod,
         .filters = compileFiltersWithAnchors(
             b,
-            &.{"db default primary backend survives reopen"},
+            &.{ "db default primary backend survives reopen", "index maintenance VOPR " },
             &graph_metric_integration_filters,
         ),
         .test_runner = .{
@@ -4723,29 +4665,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const run_graph_metric_integration_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+    const run_graph_metric_integration_tests = @import("test_support.zig").addCuratedTestRunArtifact(
         b,
         graph_metric_integration_tests,
         &graph_metric_integration_filters,
     );
-    const graph_metric_integration_test_step = b.step("graph-metric-integration-test", "Run graph metric scheduler, worker, query, cleanup, and runtime lifecycle tests");
-    graph_metric_integration_test_step.dependOn(&run_graph_metric_integration_tests.step);
     integration_test_step.dependOn(&run_graph_metric_integration_tests.step);
+    // The full gate runs complete graph owner coverage from the same compiler
+    // artifact used by the bounded base selection, including page contracts.
+    integration_test_step.dependOn(graph_test_step);
+    // Reuse the same storage compilation for full VOPR qualification.
+    const run_index_maintenance_vopr = addFilteredTestRunArtifactWithRuntimeFilters(b, graph_metric_integration_tests, &.{"index maintenance VOPR "});
+    vopr_test_step.dependOn(&run_index_maintenance_vopr.step);
 
-    const db_unit_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &.{}),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_db_unit_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, db_unit_tests, selectTestFilters(b, &.{}));
-    addRuntimeSkipTestFilters(run_db_unit_tests, &release_scale_test_filters);
-    // This root contains the complete former full-root DB and result-shape
-    // inventory as well as its own unique cases. Run that union once.
-    const db_test_step = b.step("antfly-storage-db-test", "Run storage/db tests");
-    db_test_step.dependOn(&run_db_unit_tests.step);
+    const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
 
     const graph_runtime_filters = [_][]const u8{
         "storage.db.graph_runtime.test.",
@@ -5033,7 +4966,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.typed_doc_values_coverage.",
             "storage.db.types.",
         },
-        &.{"storage.ha."},
+        &.{"storage.hot_standby."},
         &.{
             "storage.lite.",
             "storage.lsm.",
@@ -5248,6 +5181,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = 12 * 1024 * 1024 * 1024,
     });
     unit_storage_db_core_tests.step.dependOn(&unit_storage_shard_audit.step);
+    @import("test_support.zig").addOwnerTestRuns(b, db_test_step, &.{
+        .{ .artifact = unit_storage_support_tests, .filters = &.{"storage.db."} },
+        .{ .artifact = unit_storage_db_core_tests, .filters = &.{"storage.db."}, .skip_filters = unit_storage_support_compile_filters },
+    }, &release_scale_test_filters);
     const unit_storage_compile_step = b.step(
         "unit-storage-compile",
         "Compile the three storage antfly-unit-test artifacts without running them",

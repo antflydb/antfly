@@ -949,9 +949,12 @@ from .table_catalog_changed_conflict_code import TableCatalogChangedConflictCode
 from .table_indexes import TableIndexes
 from .table_migration import TableMigration
 from .table_migration_state import TableMigrationState
+from .table_repair_control_job_start_request import TableRepairControlJobStartRequest
+from .table_repair_control_job_start_request_control import TableRepairControlJobStartRequestControl
 from .table_repair_issue import TableRepairIssue
 from .table_repair_issue_list import TableRepairIssueList
 from .table_repair_job import TableRepairJob
+from .table_repair_job_control import TableRepairJobControl
 from .table_repair_job_phase import TableRepairJobPhase
 from .table_repair_job_repair_status import TableRepairJobRepairStatus
 from .table_repair_job_start_request import TableRepairJobStartRequest
@@ -2000,9 +2003,12 @@ __all__ = (
     "TableIndexes",
     "TableMigration",
     "TableMigrationState",
+    "TableRepairControlJobStartRequest",
+    "TableRepairControlJobStartRequestControl",
     "TableRepairIssue",
     "TableRepairIssueList",
     "TableRepairJob",
+    "TableRepairJobControl",
     "TableRepairJobPhase",
     "TableRepairJobRepairStatus",
     "TableRepairJobStartRequest",

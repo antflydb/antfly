@@ -28,7 +28,7 @@ pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
 pub const serverless = @import("serverless/mod.zig");
 
-pub const ha = @import("storage/ha/mod.zig");
+pub const hot_standby = @import("storage/hot_standby/mod.zig");
 pub const db = @import("storage/db/selected_root.zig").db;
 pub const lite = @import("storage/lite/mod.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");

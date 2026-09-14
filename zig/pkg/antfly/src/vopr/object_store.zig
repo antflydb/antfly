@@ -35,8 +35,8 @@ const api_mod = @import("../serverless/api/mod.zig");
 const api_codec = @import("../serverless/api/codec.zig");
 const document_segment = @import("../serverless/document_segment/mod.zig");
 const runtime_manager = @import("../serverless/runtime/manager.zig");
-const backup_manifest = @import("../storage/ha/backup_manifest.zig");
-const seed_artifact = @import("../storage/ha/seed_artifact.zig");
+const backup_manifest = @import("../storage/hot_standby/backup_manifest.zig");
+const seed_artifact = @import("../storage/hot_standby/seed_artifact.zig");
 
 const RejectConditionalAppendWal = struct {
     inner: *wal_mod.WalStore,

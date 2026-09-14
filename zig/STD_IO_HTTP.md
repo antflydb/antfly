@@ -1406,7 +1406,7 @@ systems and architectures, and the real ARM64 `ReleaseFast` linked build. The
 linked-runtime bridge needs both ABI-focused tests and an executable smoke test;
 a host Debug build alone does not validate the original compiler-memory issue.
 
-API HTTP and linked-boundary tests use the focused `antfly-api-http-runtime-test`
+API HTTP and linked-boundary tests use the focused `antfly-api-test`
 discovery root. They are also part of `root-test` and `antfly-unit-test`, but no longer
 force transport-specific test code through the monolithic library test root.
 This keeps the existing 7 GiB aggregate compiler reservation honest instead of

@@ -366,7 +366,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 } else struct {
     alloc: Allocator,
-    io_impl: ?*Io.Threaded,
+    runtime_io: ?Io,
     maintenance_boundary: MaintenanceBoundary,
     config: Config,
     lease_key: []u8,
@@ -386,15 +386,15 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         backend_runtime: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !GraphMetricRuntime {
-        const io_impl = backend_runtime.io_impl;
+        const runtime_io = backend_runtime.io();
         _ = apply_mutex;
-        if (config.enabled and io_impl == null) return error.MissingBackendRuntimeIo;
+        if (config.enabled and runtime_io == null) return error.MissingBackendRuntimeIo;
         try validateConfig(config);
         const lease_key = try runtimeLeaseKeyAlloc(alloc, config);
         errdefer alloc.free(lease_key);
         return .{
             .alloc = alloc,
-            .io_impl = io_impl,
+            .runtime_io = runtime_io,
             .maintenance_boundary = MaintenanceBoundary.direct(index_manager),
             .config = config,
             .lease_key = lease_key,
@@ -408,8 +408,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn stopRuntime(self: *GraphMetricRuntime) void {
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
+        if (self.runtime_io) |io| {
             self.mutex.lockUncancelable(io);
             self.shutdown = true;
             self.notified = true;
@@ -438,15 +437,14 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn start(self: *GraphMetricRuntime) !void {
         if (!self.config.enabled) return;
         if (!self.config.start_background_loop) return;
-        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
-        self.future = try io_impl.io().concurrent(workerMain, .{self});
+        const runtime_io = self.runtime_io orelse return error.MissingBackendRuntimeIo;
+        self.future = try runtime_io.concurrent(workerMain, .{self});
         self.recordStarted();
     }
 
     pub fn notify(self: *GraphMetricRuntime) void {
         if (!self.config.enabled) return;
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.runtime_io orelse return;
         self.mutex.lockUncancelable(io);
         self.notified = true;
         self.mutex.unlock(io);
@@ -454,8 +452,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn stats(self: *GraphMetricRuntime) Stats {
-        const io_impl = self.io_impl orelse return self.stats_snapshot;
-        const io = io_impl.io();
+        const io = self.runtime_io orelse return self.stats_snapshot;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         var snapshot = self.stats_snapshot;
@@ -584,7 +581,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         const worker_ids = self.config.planned_options.worker_ids;
         const page_budget = self.config.planned_options.max_pages_per_round;
         if (worker_ids.len > 1 and page_budget > 1) {
-            const io = (self.io_impl orelse return error.MissingBackendRuntimeIo).io();
+            const io = self.runtime_io orelse return error.MissingBackendRuntimeIo;
             const width = @min(worker_ids.len, page_budget);
             var results: [max_runtime_workers]index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult = @splat(.{});
             var failures: [max_runtime_workers]?anyerror = @splat(null);
@@ -637,8 +634,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn ensureRuntimeLease(self: *GraphMetricRuntime, now_ms: u64) bool {
-        const io_impl = self.io_impl orelse return false;
-        const io = io_impl.io();
+        const io = self.runtime_io orelse return false;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.ownership.ensureLease(now_ms) catch {
@@ -648,22 +644,22 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn recordStarted(self: *GraphMetricRuntime) void {
-        const io_impl = self.io_impl orelse {
+        const runtime_io = self.runtime_io orelse {
             self.stats_snapshot.started = true;
             return;
         };
-        const io = io_impl.io();
+        const io = runtime_io;
         self.mutex.lockUncancelable(io);
         self.stats_snapshot.started = true;
         self.mutex.unlock(io);
     }
 
     fn recordTickStarted(self: *GraphMetricRuntime) void {
-        const io_impl = self.io_impl orelse {
+        const runtime_io = self.runtime_io orelse {
             self.stats_snapshot.ticks_started += 1;
             return;
         };
-        const io = io_impl.io();
+        const io = runtime_io;
         self.mutex.lockUncancelable(io);
         self.stats_snapshot.ticks_started += 1;
         self.mutex.unlock(io);
@@ -673,22 +669,22 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         self: *GraphMetricRuntime,
         result: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult,
     ) void {
-        const io_impl = self.io_impl orelse {
+        const runtime_io = self.runtime_io orelse {
             updateSuccessStats(&self.stats_snapshot, result);
             return;
         };
-        const io = io_impl.io();
+        const io = runtime_io;
         self.mutex.lockUncancelable(io);
         updateSuccessStats(&self.stats_snapshot, result);
         self.mutex.unlock(io);
     }
 
     fn recordTickError(self: *GraphMetricRuntime, err: anyerror) void {
-        const io_impl = self.io_impl orelse {
+        const runtime_io = self.runtime_io orelse {
             updateErrorStats(&self.stats_snapshot, err);
             return;
         };
-        const io = io_impl.io();
+        const io = runtime_io;
         self.mutex.lockUncancelable(io);
         updateErrorStats(&self.stats_snapshot, err);
         self.mutex.unlock(io);
@@ -1226,8 +1222,7 @@ fn waitForWork(runtime: *GraphMetricRuntime) void {
     var remaining_ms = runtime.config.idle_interval_ms;
     if (remaining_ms == 0) remaining_ms = 1;
 
-    const io_impl = runtime.io_impl orelse return;
-    const io = io_impl.io();
+    const io = runtime.runtime_io orelse return;
     runtime.mutex.lockUncancelable(io);
     if (runtime.notified or runtime.shutdown) {
         runtime.notified = false;
@@ -1279,19 +1274,18 @@ fn runtimeSleepSlice(runtime: *GraphMetricRuntime, ms: u64) void {
         runtime.config.clock.sleepMs(ms);
         return;
     }
-    const io_impl = runtime.io_impl orelse {
+    const runtime_io = runtime.runtime_io orelse {
         runtime.config.clock.sleepMs(ms);
         return;
     };
     std.Io.Clock.Duration.sleep(.{
         .clock = .awake,
         .raw = .fromMilliseconds(@intCast(if (ms == 0) @as(u64, 1) else ms)),
-    }, io_impl.io()) catch {};
+    }, runtime_io) catch {};
 }
 
 fn isShutdown(runtime: *GraphMetricRuntime) bool {
-    const io_impl = runtime.io_impl orelse return runtime.shutdown;
-    const io = io_impl.io();
+    const io = runtime.runtime_io orelse return runtime.shutdown;
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
     return runtime.shutdown;

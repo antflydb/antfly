@@ -79,7 +79,10 @@ const standalone_session_cleanup_interval_ns: u64 = std.time.ns_per_min;
 const standalone_session_max_count: usize = 1024;
 const standalone_session_max_record_bytes: usize = 16 * 1024 * 1024;
 const standalone_session_savepoint_limit: usize = 64;
-const antfarm_installed_asset_root = "../share/antfly/antfarm";
+const antfarm_installed_asset_roots = [_][]const u8{
+    "../share/antfly/antfarm", // Prefix installation: bin/antfly.
+    "share/antfly/antfarm", // Release archive: antfly at the archive root.
+};
 const antfarm_asset_roots = [_][]const u8{
     "zig/pkg/antfly/antfarm",
     "pkg/antfly/antfarm",
@@ -156,10 +159,10 @@ const CliConfig = struct {
     ha_retention_max_lag_lsn: ?u64 = null,
     ha_retention_max_retained_bytes: ?u64 = null,
     ha_retention_max_retained_age_ns: ?u64 = null,
-    ha_sync_mode: ?antfly.ha.primary.DurabilityMode = null,
-    ha_sync_selection: ?antfly.ha.primary.StandbySelection = null,
+    ha_sync_mode: ?antfly.hot_standby.primary.DurabilityMode = null,
+    ha_sync_selection: ?antfly.hot_standby.primary.StandbySelection = null,
     ha_sync_required: ?usize = null,
-    ha_sync_failure_policy: ?antfly.ha.primary.FailurePolicy = null,
+    ha_sync_failure_policy: ?antfly.hot_standby.primary.FailurePolicy = null,
     ha_sync_standby_names: std.ArrayListUnmanaged([]const u8) = .empty,
     ha_standby_log: ?[]const u8 = null,
     ha_standby_progress: ?[]const u8 = null,
@@ -245,7 +248,7 @@ fn resolveKernelJitMode(
 const RuntimeLeaseWatchdog = struct {
     const ObservationFailureStage = enum { fetch, validation };
 
-    watchdog: antfly.ha.kubernetes_lease_watchdog.Watchdog,
+    watchdog: antfly.hot_standby.kubernetes_lease_watchdog.Watchdog,
     io: std.Io,
     executor: lease_executor.LeaseExecutor,
     uri: []u8,
@@ -285,15 +288,15 @@ const RuntimeLeaseWatchdog = struct {
         const grace_ms = std.fmt.parseInt(u64, grace_raw, 10) catch return error.HALeaseGraceInvalid;
         if (grace_ms < ha_lease_min_grace_ms or grace_ms >= 30_000) return error.HALeaseGraceInvalid;
         const requested_generation = cli.ha_startup_generation orelse "initial";
-        const sentinel_generation = try antfly.ha.kubernetes_lease_watchdog.loadSentinelGenerationAlloc(alloc, io, sentinel_path);
+        const sentinel_generation = try antfly.hot_standby.kubernetes_lease_watchdog.loadSentinelGenerationAlloc(alloc, io, sentinel_path);
         defer if (sentinel_generation) |generation| alloc.free(generation);
         const repaired_generation = if (sentinel_generation != null)
-            try antfly.ha.kubernetes_lease_watchdog.loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, topology_id, node_id)
+            try antfly.hot_standby.kubernetes_lease_watchdog.loadValidatedRepairGenerationAlloc(alloc, io, sentinel_path, topology_id, node_id)
         else
             null;
         errdefer if (repaired_generation) |generation| alloc.free(generation);
         if (repaired_generation) |generation| {
-            try antfly.ha.kubernetes_lease_watchdog.rotateSentinelAfterValidatedRepair(
+            try antfly.hot_standby.kubernetes_lease_watchdog.rotateSentinelAfterValidatedRepair(
                 alloc,
                 io,
                 sentinel_path,
@@ -306,7 +309,7 @@ const RuntimeLeaseWatchdog = struct {
         var entropy: [32]u8 = undefined;
         try io.randomSecure(&entropy);
         const process_boot_id = std.fmt.bytesToHex(entropy, .lower);
-        const scope = antfly.ha.kubernetes_lease_watchdog.Scope{
+        const scope = antfly.hot_standby.kubernetes_lease_watchdog.Scope{
             .topology_id = topology_id,
             .node_id = node_id,
             .data_generation = data_generation,
@@ -315,7 +318,7 @@ const RuntimeLeaseWatchdog = struct {
         var executor = try lease_executor.LeaseExecutor.init(
             alloc,
             io,
-            env.get("ANTFLY_HA_LEASE_CA_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_ca_path,
+            env.get("ANTFLY_HA_LEASE_CA_PATH") orelse antfly.hot_standby.kubernetes_lease_watchdog.service_account_ca_path,
             ha_lease_max_response_bytes,
         );
         errdefer executor.deinit();
@@ -327,8 +330,8 @@ const RuntimeLeaseWatchdog = struct {
             }, sentinel_generation, repaired_generation),
             .io = io,
             .executor = executor,
-            .uri = try antfly.ha.kubernetes_lease_watchdog.leaseURLAlloc(alloc, api_endpoint.host, api_endpoint.port, namespace, lease_name),
-            .token_path = env.get("ANTFLY_HA_LEASE_TOKEN_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_token_path,
+            .uri = try antfly.hot_standby.kubernetes_lease_watchdog.leaseURLAlloc(alloc, api_endpoint.host, api_endpoint.port, namespace, lease_name),
+            .token_path = env.get("ANTFLY_HA_LEASE_TOKEN_PATH") orelse antfly.hot_standby.kubernetes_lease_watchdog.service_account_token_path,
             .lease_name = lease_name,
             .lease_namespace = namespace,
             .stable_topology_id = topology_id,
@@ -340,7 +343,7 @@ const RuntimeLeaseWatchdog = struct {
         };
     }
 
-    fn proofSource(self: *const RuntimeLeaseWatchdog) antfly.ha.http_admin.Server.AuthOptions.LeaseWatchdogProofSource {
+    fn proofSource(self: *const RuntimeLeaseWatchdog) antfly.hot_standby.http_admin.Server.AuthOptions.LeaseWatchdogProofSource {
         return .{ .ptr = self, .snapshot_fn = proofSnapshot };
     }
 
@@ -354,13 +357,13 @@ const RuntimeLeaseWatchdog = struct {
         self.watchdog.cfg.scope.process_boot_id = &self.process_boot_id;
     }
 
-    fn repairReceiptSink(self: *RuntimeLeaseWatchdog) antfly.ha.http_admin.Server.AuthOptions.RepairReceiptSink {
+    fn repairReceiptSink(self: *RuntimeLeaseWatchdog) antfly.hot_standby.http_admin.Server.AuthOptions.RepairReceiptSink {
         return .{ .ptr = self, .record_fn = recordRepairReceipt };
     }
 
-    fn recordRepairReceipt(ptr: *anyopaque, result: antfly.ha.rejoin.RewindResult) !void {
+    fn recordRepairReceipt(ptr: *anyopaque, result: antfly.hot_standby.rejoin.RewindResult) !void {
         const self: *RuntimeLeaseWatchdog = @ptrCast(@alignCast(ptr));
-        _ = try antfly.ha.kubernetes_lease_watchdog.persistRepairReceipt(
+        _ = try antfly.hot_standby.kubernetes_lease_watchdog.persistRepairReceipt(
             self.executor.alloc,
             self.io,
             self.watchdog.cfg.sentinel_path,
@@ -424,7 +427,7 @@ const RuntimeLeaseWatchdog = struct {
         const poll_started_ns = platform_time.authorityNs();
         if (poll_started_ns < self.next_poll_ns) return;
         self.next_poll_ns = poll_started_ns +| ha_lease_poll_interval_ns;
-        const body = antfly.ha.kubernetes_lease_watchdog.fetchLeaseAlloc(
+        const body = antfly.hot_standby.kubernetes_lease_watchdog.fetchLeaseAlloc(
             alloc,
             io,
             self.executor.executor(),
@@ -465,7 +468,7 @@ const RuntimeLeaseWatchdog = struct {
     // process remains inactive.
     fn publishValidatedObservationLocked(
         self: *RuntimeLeaseWatchdog,
-        decision: antfly.ha.kubernetes_lease_watchdog.Decision,
+        decision: antfly.hot_standby.kubernetes_lease_watchdog.Decision,
         observed_monotonic_ns: u64,
     ) void {
         switch (decision) {
@@ -482,7 +485,7 @@ const RuntimeLeaseWatchdog = struct {
     }
 
     const ObservationFailureTransition = struct {
-        decision: antfly.ha.kubernetes_lease_watchdog.Decision,
+        decision: antfly.hot_standby.kubernetes_lease_watchdog.Decision,
         should_log: bool,
     };
 
@@ -523,11 +526,11 @@ const RuntimeLeaseWatchdog = struct {
         stage: ObservationFailureStage,
         err: anyerror,
         now_ns: u64,
-    ) antfly.ha.kubernetes_lease_watchdog.Decision {
+    ) antfly.hot_standby.kubernetes_lease_watchdog.Decision {
         const transition = self.transitionObservationFailureLocked(stage, now_ns);
         if (transition.should_log) switch (stage) {
-            .fetch => std.log.err("HA Lease watchdog Kubernetes Lease fetch failed err={s}", .{@errorName(err)}),
-            .validation => std.log.err("HA Lease watchdog Lease response validation failed err={s}", .{@errorName(err)}),
+            .fetch => std.log.err("Hot-standby lease watchdog Kubernetes Lease fetch failed err={s}", .{@errorName(err)}),
+            .validation => std.log.err("Hot-standby lease watchdog Lease response validation failed err={s}", .{@errorName(err)}),
         };
         return transition.decision;
     }
@@ -557,7 +560,7 @@ const RuntimeLeaseWatchdog = struct {
         alloc: std.mem.Allocator,
         io: std.Io,
         data_server: *antfly.data.runtime.DataServer,
-        decision: antfly.ha.kubernetes_lease_watchdog.Decision,
+        decision: antfly.hot_standby.kubernetes_lease_watchdog.Decision,
     ) !void {
         switch (decision) {
             .waiting, .observed, .pending_authority, .grace => {},
@@ -719,7 +722,7 @@ fn standaloneReadyFromState(api_server_initialized: bool, unified_api_ready: boo
     return api_server_initialized and unified_api_ready;
 }
 
-fn startupCheckpointSatisfied(progress: antfly.ha.standby.Progress, checkpoint_lsn: u64) bool {
+fn startupCheckpointSatisfied(progress: antfly.hot_standby.standby.Progress, checkpoint_lsn: u64) bool {
     return progress.applied_lsn >= checkpoint_lsn and progress.safe_read_lsn >= checkpoint_lsn;
 }
 
@@ -1961,6 +1964,7 @@ pub fn runFromIterator(
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
+    if (loaded_config) |*cfg| try applyHAConfigDefaults(alloc, &cli, cfg);
 
     antfly.common.config.Config.validateServerTlsConfig(if (loaded_config) |*cfg| cfg.tls else null) catch |err| {
         std.log.err("standalone startup rejected configured tls: built-in server TLS is unsupported; terminate TLS at a trusted reverse proxy", .{});
@@ -2465,7 +2469,7 @@ pub fn runFromIterator(
                 return err;
             };
         }
-        break :blk antfly.ha.seed_activation.validateActivatedGeneration(alloc, expectation) catch |err| {
+        break :blk antfly.hot_standby.seed_activation.validateActivatedGeneration(alloc, expectation) catch |err| {
             std.log.err("standalone startup failed step=validate_ha_active_generation err={}", .{err});
             return err;
         };
@@ -2479,7 +2483,7 @@ pub fn runFromIterator(
             if (init.environ_map.get("ANTFLY_HA_LEASE_SENTINEL_PATH")) |sentinel_path| {
                 if (init.environ_map.get("ANTFLY_HA_LEASE_TOPOLOGY_ID")) |topology_id| {
                     if (!std.mem.eql(u8, topology_id, expectation.binding.topology_id)) return error.HALeaseSentinelScopeMismatch;
-                    const existing = try antfly.ha.kubernetes_lease_watchdog.loadValidatedRepairGenerationAlloc(
+                    const existing = try antfly.hot_standby.kubernetes_lease_watchdog.loadValidatedRepairGenerationAlloc(
                         alloc,
                         setup_io.io(),
                         sentinel_path,
@@ -2487,8 +2491,8 @@ pub fn runFromIterator(
                         expectation.binding.node_id,
                     );
                     defer if (existing) |generation| alloc.free(generation);
-                    if (existing == null and try antfly.ha.kubernetes_lease_watchdog.sentinelExists(setup_io.io(), sentinel_path)) {
-                        _ = try antfly.ha.kubernetes_lease_watchdog.persistRepairReceipt(
+                    if (existing == null and try antfly.hot_standby.kubernetes_lease_watchdog.sentinelExists(setup_io.io(), sentinel_path)) {
+                        _ = try antfly.hot_standby.kubernetes_lease_watchdog.persistRepairReceipt(
                             alloc,
                             setup_io.io(),
                             sentinel_path,
@@ -2504,6 +2508,7 @@ pub fn runFromIterator(
             }
         }
     }
+    try migrateHALegacyLayoutFromCli(alloc, setup_io.io(), cli);
     var ha_sync_policy = try haSyncPolicyFromCli(alloc, cli);
     defer ha_sync_policy.deinit(alloc);
     const ha_retention_policy = try haRetentionPolicyFromCli(cli);
@@ -3761,14 +3766,20 @@ fn serveInstalledAntfarmFile(ctx: *httpx.Context, rel_path: []const u8) anyerror
     const exe_dir = std.process.executableDirPathAlloc(ctx.io, ctx.allocator) catch return null;
     defer ctx.allocator.free(exe_dir);
 
-    var full_path_buf: [4096]u8 = undefined;
-    const full_path = std.fmt.bufPrint(
-        &full_path_buf,
-        "{s}/{s}/{s}",
-        .{ exe_dir, antfarm_installed_asset_root, rel_path },
-    ) catch return null;
+    return serveAntfarmFileFromExecutableDir(ctx, exe_dir, rel_path);
+}
 
-    return try serveAntfarmPath(ctx, rel_path, full_path);
+fn serveAntfarmFileFromExecutableDir(ctx: *httpx.Context, exe_dir: []const u8, rel_path: []const u8) anyerror!?httpx.Response {
+    for (antfarm_installed_asset_roots) |root| {
+        var full_path_buf: [4096]u8 = undefined;
+        const full_path = std.fmt.bufPrint(
+            &full_path_buf,
+            "{s}/{s}/{s}",
+            .{ exe_dir, root, rel_path },
+        ) catch continue;
+        if (try serveAntfarmPath(ctx, rel_path, full_path)) |resp| return resp;
+    }
+    return null;
 }
 
 fn serveAntfarmPath(ctx: *httpx.Context, rel_path: []const u8, full_path: []const u8) anyerror!?httpx.Response {
@@ -4004,6 +4015,14 @@ fn parsePreloadModelFlag(value: []const u8) !inference_bridge.WarmModel {
     };
 }
 
+/// Matches a parsed argument against a flag's canonical spelling or its
+/// deprecated `--ha-*` alias. The `--ha-*` spellings predate the `ha` ->
+/// `standby` rename (see HOT_STANDBY.md "Naming") and are kept working for
+/// one minor release because the Kubernetes operator still generates them.
+fn flagMatches(arg: []const u8, canonical: []const u8, legacy_alias: []const u8) bool {
+    return std.mem.eql(u8, arg, canonical) or std.mem.eql(u8, arg, legacy_alias);
+}
+
 fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConfig {
     var cfg = CliConfig{};
     errdefer cfg.deinit(alloc);
@@ -4172,27 +4191,27 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             try cfg.secret_store_paths.append(alloc, args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-primary-log")) {
+        if (flagMatches(arg, "--hot-standby-primary-log", "--ha-primary-log")) {
             cfg.ha_primary_log = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-primary-slots")) {
+        if (flagMatches(arg, "--hot-standby-primary-slots", "--ha-primary-slots")) {
             cfg.ha_primary_slots = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-primary-node-id")) {
+        if (flagMatches(arg, "--hot-standby-primary-node-id", "--ha-primary-node-id")) {
             cfg.ha_primary_node_id = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-seed-capture-root")) {
+        if (flagMatches(arg, "--hot-standby-seed-capture-root", "--ha-seed-capture-root")) {
             cfg.ha_seed_capture_root = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-fence-wal")) {
+        if (flagMatches(arg, "--hot-standby-fence-wal", "--ha-fence-wal")) {
             cfg.ha_fence_wal = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-former-primary-log")) {
+        if (flagMatches(arg, "--hot-standby-former-primary-log", "--ha-former-primary-log")) {
             cfg.ha_former_primary_log = args.next() orelse return error.InvalidArguments;
             continue;
         }
@@ -4200,143 +4219,143 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.admin_token_env = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-retention-max-lag-lsn")) {
+        if (flagMatches(arg, "--hot-standby-retention-max-lag-lsn", "--ha-retention-max-lag-lsn")) {
             cfg.ha_retention_max_lag_lsn = try parsePositiveU64(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-retention-max-retained-bytes")) {
+        if (flagMatches(arg, "--hot-standby-retention-max-retained-bytes", "--ha-retention-max-retained-bytes")) {
             cfg.ha_retention_max_retained_bytes = try parsePositiveU64(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-retention-max-retained-age-ns")) {
+        if (flagMatches(arg, "--hot-standby-retention-max-retained-age-ns", "--ha-retention-max-retained-age-ns")) {
             cfg.ha_retention_max_retained_age_ns = try parsePositiveU64(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-sync-mode")) {
+        if (flagMatches(arg, "--hot-standby-sync-mode", "--ha-sync-mode")) {
             cfg.ha_sync_mode = try parseHASyncDurabilityMode(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-sync-selection")) {
+        if (flagMatches(arg, "--hot-standby-sync-selection", "--ha-sync-selection")) {
             cfg.ha_sync_selection = try parseHASyncStandbySelection(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-sync-required")) {
+        if (flagMatches(arg, "--hot-standby-sync-required", "--ha-sync-required")) {
             cfg.ha_sync_required = try parsePositiveUsize(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-sync-standby")) {
+        if (flagMatches(arg, "--hot-standby-sync-standby", "--ha-sync-standby")) {
             try cfg.ha_sync_standby_names.append(alloc, args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-sync-failure")) {
+        if (flagMatches(arg, "--hot-standby-sync-failure", "--ha-sync-failure")) {
             cfg.ha_sync_failure_policy = try parseHASyncFailurePolicy(args.next() orelse return error.InvalidArguments);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-standby-log")) {
+        if (flagMatches(arg, "--hot-standby-log", "--ha-standby-log")) {
             cfg.ha_standby_log = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-standby-progress")) {
+        if (flagMatches(arg, "--hot-standby-progress", "--ha-standby-progress")) {
             cfg.ha_standby_progress = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-standby-node-id")) {
+        if (flagMatches(arg, "--hot-standby-node-id", "--ha-standby-node-id")) {
             cfg.ha_standby_node_id = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-standby-upstream-url")) {
+        if (flagMatches(arg, "--hot-standby-upstream-url", "--ha-standby-upstream-url")) {
             cfg.ha_standby_upstream_url = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-standby-slot")) {
+        if (flagMatches(arg, "--hot-standby-slot", "--ha-standby-slot")) {
             cfg.ha_standby_slot = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-target-root")) {
+        if (flagMatches(arg, "--hot-standby-startup-target-root", "--ha-startup-target-root")) {
             cfg.ha_startup_target_root = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-topology-id")) {
+        if (flagMatches(arg, "--hot-standby-startup-topology-id", "--ha-startup-topology-id")) {
             cfg.ha_startup_topology_id = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-topology-generation")) {
+        if (flagMatches(arg, "--hot-standby-startup-topology-generation", "--ha-startup-topology-generation")) {
             cfg.ha_startup_topology_generation = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-generation")) {
+        if (flagMatches(arg, "--hot-standby-startup-generation", "--ha-startup-generation")) {
             cfg.ha_startup_generation = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-slot-name")) {
+        if (flagMatches(arg, "--hot-standby-startup-slot-name", "--ha-startup-slot-name")) {
             cfg.ha_startup_slot_name = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-timeline-id")) {
+        if (flagMatches(arg, "--hot-standby-startup-timeline-id", "--ha-startup-timeline-id")) {
             cfg.ha_startup_timeline_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-epoch")) {
+        if (flagMatches(arg, "--hot-standby-startup-epoch", "--ha-startup-epoch")) {
             cfg.ha_startup_epoch = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-target-pvc-name")) {
+        if (flagMatches(arg, "--hot-standby-startup-target-pvc-name", "--ha-startup-target-pvc-name")) {
             cfg.ha_startup_target_pvc_name = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-target-pvc-uid")) {
+        if (flagMatches(arg, "--hot-standby-startup-target-pvc-uid", "--ha-startup-target-pvc-uid")) {
             cfg.ha_startup_target_pvc_uid = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-manifest-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-manifest-sha256", "--ha-startup-manifest-sha256")) {
             cfg.ha_startup_manifest_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-aggregate-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-aggregate-sha256", "--ha-startup-aggregate-sha256")) {
             cfg.ha_startup_aggregate_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-seed-receipt-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-seed-receipt-sha256", "--ha-startup-seed-receipt-sha256")) {
             cfg.ha_startup_seed_receipt_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-capture-receipt-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-capture-receipt-sha256", "--ha-startup-capture-receipt-sha256")) {
             cfg.ha_startup_capture_receipt_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-materialized-receipt-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-materialized-receipt-sha256", "--ha-startup-materialized-receipt-sha256")) {
             cfg.ha_startup_materialized_receipt_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-materialized-aggregate-sha256")) {
+        if (flagMatches(arg, "--hot-standby-startup-materialized-aggregate-sha256", "--ha-startup-materialized-aggregate-sha256")) {
             cfg.ha_startup_materialized_aggregate_sha256 = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-target-local-node-id")) {
+        if (flagMatches(arg, "--hot-standby-startup-target-local-node-id", "--ha-startup-target-local-node-id")) {
             cfg.ha_startup_target_local_node_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-startup-target-replica-id")) {
+        if (flagMatches(arg, "--hot-standby-startup-target-replica-id", "--ha-startup-target-replica-id")) {
             cfg.ha_startup_target_replica_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-cluster-id")) {
+        if (flagMatches(arg, "--hot-standby-cluster-id", "--ha-cluster-id")) {
             cfg.ha_cluster_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-shard-id")) {
+        if (flagMatches(arg, "--hot-standby-shard-id", "--ha-shard-id")) {
             cfg.ha_shard_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-table-id")) {
+        if (flagMatches(arg, "--hot-standby-table-id", "--ha-table-id")) {
             cfg.ha_table_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-timeline-id")) {
+        if (flagMatches(arg, "--hot-standby-timeline-id", "--ha-timeline-id")) {
             cfg.ha_timeline_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--ha-epoch")) {
+        if (flagMatches(arg, "--hot-standby-epoch", "--ha-epoch")) {
             cfg.ha_epoch = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
@@ -4599,6 +4618,48 @@ fn resolvePublicListener(cli: CliConfig) antfly.metadata.runtime.ListenerConfig 
     };
 }
 
+/// Fills HA flags that were not given on the command line from the config
+/// file's `ha` section. Command-line flags always win, so operator-generated
+/// argument lists keep their exact meaning; the section only removes the need
+/// to repeat the same paths and identity on every invocation. Strings borrow
+/// from `cfg`, which outlives `cli` in `run`.
+fn applyHAConfigDefaults(alloc: std.mem.Allocator, cli: *CliConfig, cfg: *const antfly.common.config.Config) !void {
+    const ha = cfg.ha orelse return;
+    if (cli.admin_token_env == null) cli.admin_token_env = ha.admin_token_env;
+    if (cli.ha_cluster_id == null) cli.ha_cluster_id = ha.cluster_id;
+    if (cli.ha_shard_id == null) cli.ha_shard_id = ha.shard_id;
+    if (cli.ha_table_id == null) cli.ha_table_id = ha.table_id;
+    if (cli.ha_timeline_id == null) cli.ha_timeline_id = ha.timeline_id;
+    if (cli.ha_epoch == null) cli.ha_epoch = ha.epoch;
+    if (cli.ha_primary_log == null) cli.ha_primary_log = ha.primary_log;
+    if (cli.ha_primary_slots == null) cli.ha_primary_slots = ha.primary_slots;
+    if (cli.ha_primary_node_id == null) cli.ha_primary_node_id = ha.primary_node_id;
+    if (cli.ha_seed_capture_root == null) cli.ha_seed_capture_root = ha.seed_capture_root;
+    if (cli.ha_standby_log == null) cli.ha_standby_log = ha.standby_log;
+    if (cli.ha_standby_progress == null) cli.ha_standby_progress = ha.standby_progress;
+    if (cli.ha_standby_node_id == null) cli.ha_standby_node_id = ha.standby_node_id;
+    if (cli.ha_standby_upstream_url == null) cli.ha_standby_upstream_url = ha.standby_upstream_url;
+    if (cli.ha_standby_slot == null) cli.ha_standby_slot = ha.standby_slot;
+    if (cli.ha_fence_wal == null) cli.ha_fence_wal = ha.fence_wal;
+    if (cli.ha_former_primary_log == null) cli.ha_former_primary_log = ha.former_primary_log;
+    if (cli.ha_sync_mode == null) {
+        if (ha.sync_mode) |raw| cli.ha_sync_mode = try parseHASyncDurabilityMode(raw);
+    }
+    if (cli.ha_sync_selection == null) {
+        if (ha.sync_selection) |raw| cli.ha_sync_selection = try parseHASyncStandbySelection(raw);
+    }
+    if (cli.ha_sync_required == null) cli.ha_sync_required = ha.sync_required;
+    if (cli.ha_sync_failure_policy == null) {
+        if (ha.sync_failure) |raw| cli.ha_sync_failure_policy = try parseHASyncFailurePolicy(raw);
+    }
+    if (cli.ha_sync_standby_names.items.len == 0) {
+        for (ha.sync_standbys) |name| try cli.ha_sync_standby_names.append(alloc, name);
+    }
+    if (cli.ha_retention_max_lag_lsn == null) cli.ha_retention_max_lag_lsn = ha.retention_max_lag_lsn;
+    if (cli.ha_retention_max_retained_bytes == null) cli.ha_retention_max_retained_bytes = ha.retention_max_retained_bytes;
+    if (cli.ha_retention_max_retained_age_ns == null) cli.ha_retention_max_retained_age_ns = ha.retention_max_retained_age_ns;
+}
+
 fn haPrimaryRequested(cli: CliConfig) bool {
     return cli.ha_primary_log != null or
         cli.ha_primary_slots != null or
@@ -4631,7 +4692,7 @@ fn haContinuousMutationGuardEnabled(cli: CliConfig) bool {
         cli.ha_table_id != null;
 }
 
-fn haRemoteApplyMutationsEnabled(policy: antfly.ha.primary.SyncPolicy) bool {
+fn haRemoteApplyMutationsEnabled(policy: antfly.hot_standby.primary.SyncPolicy) bool {
     return policy.mode == .remote_apply and
         policy.failure_policy == .block and
         policy.standby_names.len > 0;
@@ -4692,12 +4753,12 @@ fn validateHARole(cli: CliConfig) !void {
         _ = try requireHAPath(cli.ha_former_primary_log, error.HAFormerPrimaryLogInvalid, error.HAFormerPrimaryLogInvalid);
     }
     if (cli.admin_token_env) |env_var| {
-        switch (antfly.ha.validation.classifyHAString(env_var)) {
+        switch (antfly.hot_standby.validation.classifyHAString(env_var)) {
             .ok => {},
             .missing => return error.AdminTokenEnvMissing,
             .padded => return error.AdminTokenEnvInvalid,
         }
-        if (!antfly.ha.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
+        if (!antfly.hot_standby.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
     }
     if (primary_requested or standby_requested) {
         _ = try requireHAPath(cli.ha_fence_wal, error.HAFenceWalMissing, error.HAFenceWalInvalid);
@@ -4720,7 +4781,7 @@ fn validateHAIdentity(cli: CliConfig) !void {
 }
 
 fn requireHAString(value: ?[]const u8, comptime missing_err: anyerror, comptime padded_err: anyerror) ![]const u8 {
-    switch (antfly.ha.validation.classifyHAString(value)) {
+    switch (antfly.hot_standby.validation.classifyHAString(value)) {
         .ok => return value.?,
         .missing => return missing_err,
         .padded => return padded_err,
@@ -4729,19 +4790,19 @@ fn requireHAString(value: ?[]const u8, comptime missing_err: anyerror, comptime 
 
 fn requireHAPath(value: ?[]const u8, comptime missing_err: anyerror, comptime invalid_err: anyerror) ![]const u8 {
     const raw = try requireHAString(value, missing_err, invalid_err);
-    if (!antfly.ha.validation.isAbsoluteNormalizedPath(raw)) return invalid_err;
+    if (!antfly.hot_standby.validation.isAbsoluteNormalizedPath(raw)) return invalid_err;
     return raw;
 }
 
 fn requireHAPathWithinRoot(value: ?[]const u8, root: []const u8, comptime missing_err: anyerror, comptime invalid_err: anyerror) ![]const u8 {
     const raw = try requireHAPath(value, missing_err, invalid_err);
-    if (!antfly.ha.validation.isAbsoluteNormalizedPathWithinRoot(raw, root)) return invalid_err;
+    if (!antfly.hot_standby.validation.isAbsoluteNormalizedPathWithinRoot(raw, root)) return invalid_err;
     return raw;
 }
 
 fn requireHAIdentifier(value: ?[]const u8, comptime missing_err: anyerror, comptime invalid_err: anyerror) ![]const u8 {
     const raw = try requireHAString(value, missing_err, invalid_err);
-    if (!antfly.ha.validation.isIdentifier(raw)) return invalid_err;
+    if (!antfly.hot_standby.validation.isIdentifier(raw)) return invalid_err;
     return raw;
 }
 
@@ -4780,7 +4841,7 @@ fn validateHAPathsUnderRoot(cli: CliConfig, data_root: []const u8) !void {
     }
 }
 
-fn haStartupExpectationFromCli(cli: CliConfig) !?antfly.ha.seed_activation.StartupExpectation {
+fn haStartupExpectationFromCli(cli: CliConfig) !?antfly.hot_standby.seed_activation.StartupExpectation {
     if (!haStartupGateRequested(cli)) return null;
     const primary_requested = haPrimaryRequested(cli);
     const standby_requested = haStandbyRequested(cli);
@@ -4810,7 +4871,7 @@ fn haStartupExpectationFromCli(cli: CliConfig) !?antfly.ha.seed_activation.Start
         // would turn a seed receipt into an alternate primary-creation path.
         return error.HAStartupReplicationIdentityMismatch;
     }
-    const binding = antfly.ha.seed_activation.ActivationBinding{
+    const binding = antfly.hot_standby.seed_activation.ActivationBinding{
         .topology_id = try requireHAIdentifier(cli.ha_startup_topology_id, error.HAStartupTopologyIdMissing, error.HAStartupTopologyIdInvalid),
         .topology_generation = cli.ha_startup_topology_generation orelse return error.HAStartupTopologyGenerationMissing,
         .node_id = runtime_node_id,
@@ -4883,7 +4944,7 @@ fn haStandbyReplicationConfigFromCliWithBearerToken(
     if (cli.ha_standby_upstream_url == null and cli.ha_standby_slot == null) return null;
     const upstream = try requireHAString(cli.ha_standby_upstream_url, error.HAStandbyUpstreamUrlMissing, error.HAStandbyUpstreamUrlInvalid);
     const slot = try requireHAIdentifier(cli.ha_standby_slot, error.HAStandbySlotMissing, error.HAStandbySlotInvalid);
-    const parsed = antfly.ha.validation.parseURLNoHiddenWhitespace(upstream) catch return error.HAStandbyUpstreamUrlInvalid;
+    const parsed = antfly.hot_standby.validation.parseURLNoHiddenWhitespace(upstream) catch return error.HAStandbyUpstreamUrlInvalid;
     if (!isHAReplicationUpstreamScheme(parsed)) return error.HAStandbyUpstreamUrlInvalid;
     if (parsed.host == null) return error.HAStandbyUpstreamUrlInvalid;
     return .{
@@ -4900,7 +4961,7 @@ fn isHAReplicationUpstreamScheme(parsed: std.Uri) bool {
 }
 
 const OwnedHASyncPolicy = struct {
-    policy: antfly.ha.primary.SyncPolicy = .{},
+    policy: antfly.hot_standby.primary.SyncPolicy = .{},
     standby_names: []const []const u8 = &.{},
 
     fn deinit(self: *OwnedHASyncPolicy, alloc: std.mem.Allocator) void {
@@ -4919,7 +4980,7 @@ fn haSyncPolicyFromCli(alloc: std.mem.Allocator, cli: CliConfig) !OwnedHASyncPol
     const selection = cli.ha_sync_selection orelse .any;
     if (selection == .all and cli.ha_sync_required != null) return error.InvalidHASyncPolicy;
 
-    const policy = antfly.ha.primary.SyncPolicy{
+    const policy = antfly.hot_standby.primary.SyncPolicy{
         .mode = cli.ha_sync_mode orelse .remote_write,
         .selection = selection,
         .required = if (selection == .all) names.len else cli.ha_sync_required orelse 1,
@@ -4934,7 +4995,7 @@ fn haSyncPolicyFromCli(alloc: std.mem.Allocator, cli: CliConfig) !OwnedHASyncPol
     };
 }
 
-fn haRetentionPolicyFromCli(cli: CliConfig) !antfly.ha.slot_store.RetentionPolicy {
+fn haRetentionPolicyFromCli(cli: CliConfig) !antfly.hot_standby.slot_store.RetentionPolicy {
     if (!haRetentionPolicyRequested(cli)) return .{};
     if (!haPrimaryRequested(cli)) return error.HARetentionPolicyRequiresPrimary;
     return .{
@@ -4944,7 +5005,7 @@ fn haRetentionPolicyFromCli(cli: CliConfig) !antfly.ha.slot_store.RetentionPolic
     };
 }
 
-fn validateHASyncPolicy(policy: antfly.ha.primary.SyncPolicy) !void {
+fn validateHASyncPolicy(policy: antfly.hot_standby.primary.SyncPolicy) !void {
     if (policy.required == 0) return error.InvalidHASyncPolicy;
     if (policy.mode == .async) return;
     if (policy.standby_names.len == 0) return error.InvalidHASyncPolicy;
@@ -4953,7 +5014,7 @@ fn validateHASyncPolicy(policy: antfly.ha.primary.SyncPolicy) !void {
     }
 }
 
-fn haPrimaryIdentity(cli: CliConfig) !antfly.ha.primary.Identity {
+fn haPrimaryIdentity(cli: CliConfig) !antfly.hot_standby.primary.Identity {
     return .{
         .cluster_id = cli.ha_cluster_id orelse return error.HAClusterIdMissing,
         .shard_id = cli.ha_shard_id orelse 0,
@@ -4963,7 +5024,47 @@ fn haPrimaryIdentity(cli: CliConfig) !antfly.ha.primary.Identity {
     };
 }
 
-fn openHAPrimaryFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.primary.Primary {
+/// Moves an existing pre-0.3 `<root>/ha/` hot-standby tree to the canonical
+/// `<root>/standby/` layout, once, before any hot-standby store below is
+/// opened. See `storage/hot_standby/layout.zig` for the exact algorithm.
+/// A no-op when no hot-standby path is configured at all, and idempotent on
+/// every later startup once a root has been migrated.
+fn migrateHALegacyLayoutFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !void {
+    const candidates = [_]?[]const u8{
+        cli.ha_primary_log,
+        cli.ha_primary_slots,
+        cli.ha_standby_log,
+        cli.ha_standby_progress,
+        cli.ha_fence_wal,
+        cli.ha_former_primary_log,
+        cli.ha_seed_capture_root,
+        cli.ha_startup_target_root,
+    };
+    var configured_paths: [candidates.len][]const u8 = undefined;
+    var count: usize = 0;
+    for (candidates) |maybe_path| {
+        const path = maybe_path orelse continue;
+        configured_paths[count] = path;
+        count += 1;
+    }
+    if (count == 0) return;
+
+    const report = try antfly.hot_standby.layout.migrateLegacyLayout(io, alloc, configured_paths[0..count]);
+    if (report.changed()) {
+        std.log.info(
+            "standalone hot-standby layout migration moved legacy state: dirs_renamed={d} files_renamed={d}",
+            .{ report.dirs_renamed, report.files_renamed },
+        );
+    }
+    if (report.coexisting_roots != 0) {
+        std.log.warn(
+            "standalone hot-standby layout migration found {d} root(s) with both a legacy 'ha' tree and a canonical 'standby' tree present; the legacy tree was left in place",
+            .{report.coexisting_roots},
+        );
+    }
+}
+
+fn openHAPrimaryFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.hot_standby.primary.Primary {
     if (!haPrimaryRequested(cli)) return null;
     const log_path = cli.ha_primary_log orelse return error.HAPrimaryLogMissing;
     const slots_path = cli.ha_primary_slots orelse return error.HAPrimarySlotsMissing;
@@ -4977,10 +5078,10 @@ fn openHAPrimaryFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
     const slots_z = try alloc.dupeZ(u8, slots_path);
     defer alloc.free(slots_z);
 
-    return try antfly.ha.primary.Primary.open(alloc, log_z.ptr, slots_z.ptr, try haPrimaryIdentity(cli), .{});
+    return try antfly.hot_standby.primary.Primary.open(alloc, log_z.ptr, slots_z.ptr, try haPrimaryIdentity(cli), .{});
 }
 
-fn haStandbyIdentity(cli: CliConfig) !antfly.ha.standby.Identity {
+fn haStandbyIdentity(cli: CliConfig) !antfly.hot_standby.standby.Identity {
     return .{
         .cluster_id = cli.ha_cluster_id orelse return error.HAClusterIdMissing,
         .shard_id = cli.ha_shard_id orelse 0,
@@ -4990,7 +5091,7 @@ fn haStandbyIdentity(cli: CliConfig) !antfly.ha.standby.Identity {
     };
 }
 
-fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.standby.Standby {
+fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.hot_standby.standby.Standby {
     if (!haStandbyRequested(cli)) return null;
     const log_path = cli.ha_standby_log orelse return error.HAStandbyLogMissing;
     const progress_path = cli.ha_standby_progress orelse return error.HAStandbyProgressMissing;
@@ -5004,7 +5105,7 @@ fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
     const progress_z = try alloc.dupeZ(u8, progress_path);
     defer alloc.free(progress_z);
 
-    return try antfly.ha.standby.Standby.open(alloc, log_z.ptr, progress_z.ptr, try haStandbyIdentity(cli), .{});
+    return try antfly.hot_standby.standby.Standby.open(alloc, log_z.ptr, progress_z.ptr, try haStandbyIdentity(cli), .{});
 }
 
 /// The activated storage snapshot already contains every mutation through the
@@ -5015,7 +5116,7 @@ fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
 /// materialized data would make both safe-read and promotion LSNs untrustworthy.
 fn bootstrapHAStandbyAtActivatedCheckpoint(
     alloc: std.mem.Allocator,
-    standby: *antfly.ha.standby.Standby,
+    standby: *antfly.hot_standby.standby.Standby,
     generation: []const u8,
     slot_name: []const u8,
     checkpoint_lsn: u64,
@@ -5042,7 +5143,7 @@ fn bootstrapHAStandbyAtActivatedCheckpoint(
     }
 }
 
-fn openHAFenceStoreFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.fencing.Store {
+fn openHAFenceStoreFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.hot_standby.fencing.Store {
     const fence_wal_path = cli.ha_fence_wal orelse return null;
     if (!haPrimaryRequested(cli) and !haStandbyRequested(cli)) return error.HARoleMissing;
 
@@ -5051,10 +5152,10 @@ fn openHAFenceStoreFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig)
     const fence_wal_z = try alloc.dupeZ(u8, fence_wal_path);
     defer alloc.free(fence_wal_z);
 
-    return try antfly.ha.fencing.Store.open(alloc, fence_wal_z.ptr, .{});
+    return try antfly.hot_standby.fencing.Store.open(alloc, fence_wal_z.ptr, .{});
 }
 
-fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.replication_log.ReplicationLog {
+fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.hot_standby.replication_log.ReplicationLog {
     const former_primary_log_path = cli.ha_former_primary_log orelse return null;
     if (!haPrimaryRequested(cli) and !haStandbyRequested(cli)) return error.HARoleMissing;
     if (cli.ha_primary_log) |primary_log_path| {
@@ -5069,14 +5170,14 @@ fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliC
     const former_primary_log_z = try alloc.dupeZ(u8, former_primary_log_path);
     defer alloc.free(former_primary_log_z);
 
-    return try antfly.ha.replication_log.ReplicationLog.open(former_primary_log_z.ptr, .{});
+    return try antfly.hot_standby.replication_log.ReplicationLog.open(former_primary_log_z.ptr, .{});
 }
 
 fn resolveAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?[]u8 {
     const raw_env_var = cli.admin_token_env orelse return null;
     const env_var = std.mem.trim(u8, raw_env_var, " \t\r\n");
     if (env_var.len == 0) return error.AdminTokenEnvMissing;
-    if (!antfly.ha.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
+    if (!antfly.hot_standby.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
 
     const env_var_z = try alloc.dupeZ(u8, env_var);
     defer alloc.free(env_var_z);
@@ -5090,7 +5191,7 @@ fn resolveAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?[]
 fn resolveHAPodUID(alloc: std.mem.Allocator) !?[]u8 {
     const raw_z = std.c.getenv("ANTFLY_POD_UID") orelse return null;
     const pod_uid = std.mem.trim(u8, std.mem.span(raw_z), " \t\r\n");
-    if (!antfly.ha.validation.isIdentifier(pod_uid)) return error.HAPodUIDInvalid;
+    if (!antfly.hot_standby.validation.isIdentifier(pod_uid)) return error.HAPodUIDInvalid;
     return try alloc.dupe(u8, pod_uid);
 }
 
@@ -5799,45 +5900,46 @@ fn printUsage() void {
         \\  --snapshot-root-dir <path>            Snapshot root directory
         \\  --extension-package-store <path>      Extension package store directory
         \\  --secret-store-path <path>            Antfly secrets.json file path; repeat for fallback layers
-        \\  --ha-primary-log <path>               Enable HA primary WAL/admin API with this replication log path
-        \\  --ha-primary-slots <path>             HA primary replication slot store path
-        \\  --ha-primary-node-id <id>             HA primary node id for typed admin receipts
-        \\  --ha-seed-capture-root <path>          Durable runtime-owned immutable seed generation root
-        \\  --ha-fence-wal <path>                 Durable HA promotion fence WAL path
-        \\  --ha-former-primary-log <path>        Durable HA log used by former-primary rewind admin workflows
-        \\  --admin-token-env <name>              Require Authorization: Bearer token from this environment variable for admin and HA APIs
-        \\  --ha-retention-max-lag-lsn <n>        HA primary marks slots reseed-required after this LSN retention lag
-        \\  --ha-retention-max-retained-bytes <n> HA primary marks oldest slots reseed-required above this retained WAL byte cap
-        \\  --ha-retention-max-retained-age-ns <n> HA primary marks oldest slots reseed-required above this retained WAL age cap
-        \\  --ha-sync-mode <mode>                 HA primary sync mode: async, remote-write, remote-apply
-        \\  --ha-sync-selection <selection>       HA sync standby selection: any, first, all
-        \\  --ha-sync-required <n>                HA sync required standby acknowledgements
-        \\  --ha-sync-standby <name>              HA sync standby name; repeat for multiple standbys
-        \\  --ha-sync-failure <policy>            HA sync failure policy: block, fail-closed, degrade-to-async
-        \\  --ha-standby-log <path>               Enable HA standby admin API with this received replication log path
-        \\  --ha-standby-progress <path>          HA standby durable receive/apply progress WAL path
-        \\  --ha-standby-node-id <id>             HA standby node id for typed admin receipts
-        \\  --ha-standby-upstream-url <url>       Upstream primary URL for continuous standby pull/apply
-        \\  --ha-standby-slot <name>              Upstream replication slot name for continuous standby pull/apply
-        \\  --ha-startup-target-root <path>       Activated generation root; requires the complete startup evidence set
-        \\  --ha-startup-topology-id <id>         Exact topology id bound into the activation receipt
-        \\  --ha-startup-topology-generation <n>  Exact topology generation bound into the activation receipt
-        \\  --ha-startup-generation <id>          Exact activated seed generation
-        \\  --ha-startup-slot-name <id>           Exact slot bound into the activation receipt
-        \\  --ha-startup-timeline-id <id>         Exact predecessor timeline bound into the activation receipt
-        \\  --ha-startup-epoch <id>               Exact predecessor epoch bound into the activation receipt
-        \\  --ha-startup-target-pvc-name <name>   Exact target PVC name bound into the activation receipt
-        \\  --ha-startup-target-pvc-uid <uid>     Exact target PVC UID bound into the activation receipt
-        \\  --ha-startup-capture-receipt-sha256 <sha256> Exact runtime capture authority digest
-        \\  --ha-startup-materialized-receipt-sha256 <sha256> Exact materialized topology receipt digest
-        \\  --ha-startup-materialized-aggregate-sha256 <sha256> Exact materialized file aggregate digest
-        \\  --ha-startup-target-local-node-id <id> Exact local node id used to materialize the live generation
-        \\  --ha-startup-target-replica-id <id>   Exact replica id used to materialize the live generation
-        \\  --ha-cluster-id <id>                  HA replicated cluster id
-        \\  --ha-shard-id <id>                    HA replicated shard id (default: 0)
-        \\  --ha-table-id <id>                    HA replicated table id (default: 0)
-        \\  --ha-timeline-id <id>                 HA primary timeline id
-        \\  --ha-epoch <id>                       HA primary epoch
+        \\  --hot-standby-primary-log <path>      Enable hot-standby primary WAL/admin API with this replication log path
+        \\  --hot-standby-primary-slots <path>    Hot-standby primary replication slot store path
+        \\  --hot-standby-primary-node-id <id>    Hot-standby primary node id for typed admin receipts
+        \\  --hot-standby-seed-capture-root <path> Durable runtime-owned immutable seed generation root
+        \\  --hot-standby-fence-wal <path>        Durable hot-standby promotion fence WAL path
+        \\  --hot-standby-former-primary-log <path> Durable hot-standby log used by former-primary rewind admin workflows
+        \\  --admin-token-env <name>              Require Authorization: Bearer token from this environment variable for admin and hot-standby APIs
+        \\  --hot-standby-retention-max-lag-lsn <n> Hot-standby primary marks slots reseed-required after this LSN retention lag
+        \\  --hot-standby-retention-max-retained-bytes <n> Hot-standby primary marks oldest slots reseed-required above this retained WAL byte cap
+        \\  --hot-standby-retention-max-retained-age-ns <n> Hot-standby primary marks oldest slots reseed-required above this retained WAL age cap
+        \\  --hot-standby-sync-mode <mode>        Hot-standby primary sync mode: async, remote-write, remote-apply
+        \\  --hot-standby-sync-selection <selection> Hot-standby sync standby selection: any, first, all
+        \\  --hot-standby-sync-required <n>       Hot-standby sync required standby acknowledgements
+        \\  --hot-standby-sync-standby <name>     Hot-standby sync standby name; repeat for multiple standbys
+        \\  --hot-standby-sync-failure <policy>   Hot-standby sync failure policy: block, fail-closed, degrade-to-async
+        \\  --hot-standby-log <path>              Enable hot-standby admin API with this received replication log path
+        \\  --hot-standby-progress <path>         Hot-standby durable receive/apply progress WAL path
+        \\  --hot-standby-node-id <id>            Hot-standby node id for typed admin receipts
+        \\  --hot-standby-upstream-url <url>      Upstream primary URL for continuous standby pull/apply
+        \\  --hot-standby-slot <name>             Upstream replication slot name for continuous standby pull/apply
+        \\  --hot-standby-startup-target-root <path> Activated generation root; requires the complete startup evidence set
+        \\  --hot-standby-startup-topology-id <id> Exact topology id bound into the activation receipt
+        \\  --hot-standby-startup-topology-generation <n> Exact topology generation bound into the activation receipt
+        \\  --hot-standby-startup-generation <id> Exact activated seed generation
+        \\  --hot-standby-startup-slot-name <id>  Exact slot bound into the activation receipt
+        \\  --hot-standby-startup-timeline-id <id> Exact predecessor timeline bound into the activation receipt
+        \\  --hot-standby-startup-epoch <id>      Exact predecessor epoch bound into the activation receipt
+        \\  --hot-standby-startup-target-pvc-name <name> Exact target PVC name bound into the activation receipt
+        \\  --hot-standby-startup-target-pvc-uid <uid> Exact target PVC UID bound into the activation receipt
+        \\  --hot-standby-startup-capture-receipt-sha256 <sha256> Exact runtime capture authority digest
+        \\  --hot-standby-startup-materialized-receipt-sha256 <sha256> Exact materialized topology receipt digest
+        \\  --hot-standby-startup-materialized-aggregate-sha256 <sha256> Exact materialized file aggregate digest
+        \\  --hot-standby-startup-target-local-node-id <id> Exact local node id used to materialize the live generation
+        \\  --hot-standby-startup-target-replica-id <id> Exact replica id used to materialize the live generation
+        \\  --hot-standby-cluster-id <id>         Hot-standby replicated cluster id
+        \\  --hot-standby-shard-id <id>           Hot-standby replicated shard id (default: 0)
+        \\  --hot-standby-table-id <id>           Hot-standby replicated table id (default: 0)
+        \\  --hot-standby-timeline-id <id>        Hot-standby primary timeline id
+        \\  --hot-standby-epoch <id>              Hot-standby primary epoch
+        \\  --ha-* spellings of the flags above    Deprecated aliases for --hot-standby-*; kept for one minor release
         \\  -h, --help                            Show this help
         \\
     , .{});
@@ -5849,21 +5951,21 @@ fn parseBoolFlag(raw: []const u8) ?bool {
     return null;
 }
 
-fn parseHASyncDurabilityMode(raw: []const u8) !antfly.ha.primary.DurabilityMode {
+fn parseHASyncDurabilityMode(raw: []const u8) !antfly.hot_standby.primary.DurabilityMode {
     if (std.mem.eql(u8, raw, "async")) return .async;
     if (std.mem.eql(u8, raw, "remote_write") or std.mem.eql(u8, raw, "remote-write")) return .remote_write;
     if (std.mem.eql(u8, raw, "remote_apply") or std.mem.eql(u8, raw, "remote-apply")) return .remote_apply;
     return error.InvalidHASyncMode;
 }
 
-fn parseHASyncStandbySelection(raw: []const u8) !antfly.ha.primary.StandbySelection {
+fn parseHASyncStandbySelection(raw: []const u8) !antfly.hot_standby.primary.StandbySelection {
     if (std.mem.eql(u8, raw, "any")) return .any;
     if (std.mem.eql(u8, raw, "first")) return .first;
     if (std.mem.eql(u8, raw, "all")) return .all;
     return error.InvalidHASyncSelection;
 }
 
-fn parseHASyncFailurePolicy(raw: []const u8) !antfly.ha.primary.FailurePolicy {
+fn parseHASyncFailurePolicy(raw: []const u8) !antfly.hot_standby.primary.FailurePolicy {
     if (std.mem.eql(u8, raw, "block")) return .block;
     if (std.mem.eql(u8, raw, "fail_closed") or std.mem.eql(u8, raw, "fail-closed")) return .fail_closed;
     if (std.mem.eql(u8, raw, "degrade_to_async") or std.mem.eql(u8, raw, "degrade-to-async")) return .degrade_to_async;
@@ -6830,6 +6932,41 @@ test "standalone runtime registers antfarm static routes" {
     try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
+test "standalone runtime antfarm assets support archive and prefix layouts outside cwd" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    for ([_][]const u8{ "archive", "prefix/bin" }) |layout| {
+        const exe_dir = try std.fs.path.join(alloc, &.{ root, layout });
+        defer alloc.free(exe_dir);
+        try std.Io.Dir.cwd().createDirPath(io, exe_dir);
+        const asset_root = if (std.mem.eql(u8, layout, "archive")) "archive/share/antfly/antfarm" else "prefix/share/antfly/antfarm";
+        for ([_][]const u8{ "index.html", "assets/app.js", "fonts/test.woff2" }) |rel_path| {
+            const path = try std.fs.path.join(alloc, &.{ root, asset_root, rel_path });
+            defer alloc.free(path);
+            try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+            var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+            defer file.close(io);
+            try file.writeStreamingAll(io, rel_path);
+
+            var request = try httpx.Request.init(alloc, .GET, "/");
+            defer request.deinit();
+            var ctx = httpx.Context.init(alloc, io, &request);
+            defer ctx.deinit();
+            var response = (try serveAntfarmFileFromExecutableDir(&ctx, exe_dir, rel_path)).?;
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            try std.testing.expectEqualStrings(rel_path, response.body.?);
+            try std.testing.expectEqualStrings(antfarmContentType(rel_path), response.headers.get("Content-Type").?);
+            try std.testing.expectEqual(null, try serveAntfarmFileFromExecutableDir(&ctx, exe_dir, "missing.js"));
+        }
+    }
+}
+
 test "standalone runtime antfarm path guards keep api routes reserved" {
     try std.testing.expect(isAntfarmReservedPath("/db/v1/tables"));
     try std.testing.expect(isAntfarmReservedPath("/ai/v1/models"));
@@ -6940,35 +7077,35 @@ test "parse cli preserves registry variants and recognizes explicit preload back
 
 test "parse cli accepts HA primary runtime flags" {
     var argv = [_][*:0]const u8{
-        "--ha-primary-log",
+        "--hot-standby-primary-log",
         "/tmp/ha-primary.log",
-        "--ha-primary-slots",
+        "--hot-standby-primary-slots",
         "/tmp/ha-slots.wal",
-        "--ha-primary-node-id",
+        "--hot-standby-primary-node-id",
         "primary-a",
-        "--ha-seed-capture-root",
+        "--hot-standby-seed-capture-root",
         "/tmp/ha-seed-captures",
-        "--ha-fence-wal",
+        "--hot-standby-fence-wal",
         "/tmp/ha-fence.wal",
-        "--ha-former-primary-log",
+        "--hot-standby-former-primary-log",
         "/tmp/ha-primary.log",
         "--admin-token-env",
         "ANTFLY_HA_ADMIN_TOKEN",
-        "--ha-retention-max-lag-lsn",
+        "--hot-standby-retention-max-lag-lsn",
         "500",
-        "--ha-retention-max-retained-bytes",
+        "--hot-standby-retention-max-retained-bytes",
         "8192",
-        "--ha-retention-max-retained-age-ns",
+        "--hot-standby-retention-max-retained-age-ns",
         "1000000",
-        "--ha-cluster-id",
+        "--hot-standby-cluster-id",
         "100",
-        "--ha-shard-id",
+        "--hot-standby-shard-id",
         "10",
-        "--ha-table-id",
+        "--hot-standby-table-id",
         "20",
-        "--ha-timeline-id",
+        "--hot-standby-timeline-id",
         "3",
-        "--ha-epoch",
+        "--hot-standby-epoch",
         "4",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -6994,31 +7131,31 @@ test "parse cli accepts HA primary runtime flags" {
 
 test "parse cli accepts HA primary sync policy flags" {
     var argv = [_][*:0]const u8{
-        "--ha-primary-log",
+        "--hot-standby-primary-log",
         "/tmp/ha-primary.log",
-        "--ha-primary-slots",
+        "--hot-standby-primary-slots",
         "/tmp/ha-slots.wal",
-        "--ha-primary-node-id",
+        "--hot-standby-primary-node-id",
         "primary-a",
-        "--ha-fence-wal",
+        "--hot-standby-fence-wal",
         "/tmp/ha-fence.wal",
-        "--ha-cluster-id",
+        "--hot-standby-cluster-id",
         "100",
-        "--ha-timeline-id",
+        "--hot-standby-timeline-id",
         "3",
-        "--ha-epoch",
+        "--hot-standby-epoch",
         "4",
-        "--ha-sync-mode",
+        "--hot-standby-sync-mode",
         "remote-apply",
-        "--ha-sync-selection",
+        "--hot-standby-sync-selection",
         "first",
-        "--ha-sync-required",
+        "--hot-standby-sync-required",
         "2",
-        "--ha-sync-standby",
+        "--hot-standby-sync-standby",
         "standby-a",
-        "--ha-sync-standby",
+        "--hot-standby-sync-standby",
         "standby-b",
-        "--ha-sync-failure",
+        "--hot-standby-sync-failure",
         "fail-closed",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -7029,10 +7166,10 @@ test "parse cli accepts HA primary sync policy flags" {
     var sync_policy = try haSyncPolicyFromCli(std.testing.allocator, cfg);
     defer sync_policy.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(antfly.ha.primary.DurabilityMode.remote_apply, sync_policy.policy.mode);
-    try std.testing.expectEqual(antfly.ha.primary.StandbySelection.first, sync_policy.policy.selection);
+    try std.testing.expectEqual(antfly.hot_standby.primary.DurabilityMode.remote_apply, sync_policy.policy.mode);
+    try std.testing.expectEqual(antfly.hot_standby.primary.StandbySelection.first, sync_policy.policy.selection);
     try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.required);
-    try std.testing.expectEqual(antfly.ha.primary.FailurePolicy.fail_closed, sync_policy.policy.failure_policy);
+    try std.testing.expectEqual(antfly.hot_standby.primary.FailurePolicy.fail_closed, sync_policy.policy.failure_policy);
     try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.standby_names.len);
     try std.testing.expectEqualStrings("standby-a", sync_policy.policy.standby_names[0]);
     try std.testing.expectEqualStrings("standby-b", sync_policy.policy.standby_names[1]);
@@ -7040,27 +7177,27 @@ test "parse cli accepts HA primary sync policy flags" {
 
 test "parse cli treats ALL HA sync policy as all named standbys" {
     var argv = [_][*:0]const u8{
-        "--ha-primary-log",
+        "--hot-standby-primary-log",
         "/tmp/ha-primary.log",
-        "--ha-primary-slots",
+        "--hot-standby-primary-slots",
         "/tmp/ha-primary.slots",
-        "--ha-primary-node-id",
+        "--hot-standby-primary-node-id",
         "primary-a",
-        "--ha-fence-wal",
+        "--hot-standby-fence-wal",
         "/tmp/ha-fence.wal",
-        "--ha-cluster-id",
+        "--hot-standby-cluster-id",
         "100",
-        "--ha-timeline-id",
+        "--hot-standby-timeline-id",
         "3",
-        "--ha-epoch",
+        "--hot-standby-epoch",
         "4",
-        "--ha-sync-mode",
+        "--hot-standby-sync-mode",
         "remote-apply",
-        "--ha-sync-selection",
+        "--hot-standby-sync-selection",
         "all",
-        "--ha-sync-standby",
+        "--hot-standby-sync-standby",
         "standby-a",
-        "--ha-sync-standby",
+        "--hot-standby-sync-standby",
         "standby-b",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -7071,8 +7208,8 @@ test "parse cli treats ALL HA sync policy as all named standbys" {
     var sync_policy = try haSyncPolicyFromCli(std.testing.allocator, cfg);
     defer sync_policy.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(antfly.ha.primary.DurabilityMode.remote_apply, sync_policy.policy.mode);
-    try std.testing.expectEqual(antfly.ha.primary.StandbySelection.all, sync_policy.policy.selection);
+    try std.testing.expectEqual(antfly.hot_standby.primary.DurabilityMode.remote_apply, sync_policy.policy.mode);
+    try std.testing.expectEqual(antfly.hot_standby.primary.StandbySelection.all, sync_policy.policy.selection);
     try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.required);
     try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.standby_names.len);
 
@@ -7082,25 +7219,25 @@ test "parse cli treats ALL HA sync policy as all named standbys" {
 
 test "parse cli accepts HA primary retention policy flags" {
     var argv = [_][*:0]const u8{
-        "--ha-primary-log",
+        "--hot-standby-primary-log",
         "/tmp/ha-primary.log",
-        "--ha-primary-slots",
+        "--hot-standby-primary-slots",
         "/tmp/ha-slots.wal",
-        "--ha-primary-node-id",
+        "--hot-standby-primary-node-id",
         "primary-a",
-        "--ha-fence-wal",
+        "--hot-standby-fence-wal",
         "/tmp/ha-fence.wal",
-        "--ha-cluster-id",
+        "--hot-standby-cluster-id",
         "100",
-        "--ha-timeline-id",
+        "--hot-standby-timeline-id",
         "3",
-        "--ha-epoch",
+        "--hot-standby-epoch",
         "4",
-        "--ha-retention-max-lag-lsn",
+        "--hot-standby-retention-max-lag-lsn",
         "50",
-        "--ha-retention-max-retained-bytes",
+        "--hot-standby-retention-max-retained-bytes",
         "4096",
-        "--ha-retention-max-retained-age-ns",
+        "--hot-standby-retention-max-retained-age-ns",
         "1000000",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -7164,51 +7301,51 @@ test "parse cli accepts HA standby runtime flags" {
     var argv = [_][*:0]const u8{
         "--id",
         "7",
-        "--ha-standby-log",
+        "--hot-standby-log",
         "/tmp/ha-standby.log",
-        "--ha-standby-progress",
+        "--hot-standby-progress",
         "/tmp/ha-standby-progress.wal",
-        "--ha-standby-node-id",
+        "--hot-standby-node-id",
         "standby-a",
-        "--ha-seed-capture-root",
+        "--hot-standby-seed-capture-root",
         "/tmp/ha-seed-captures",
-        "--ha-fence-wal",
+        "--hot-standby-fence-wal",
         "/tmp/ha-fence.wal",
-        "--ha-standby-upstream-url",
+        "--hot-standby-upstream-url",
         "http://primary.antfly.svc:8080",
-        "--ha-standby-slot",
+        "--hot-standby-slot",
         "standby-a",
-        "--ha-startup-target-root",
+        "--hot-standby-startup-target-root",
         "/tmp/active",
-        "--ha-startup-topology-id",
+        "--hot-standby-startup-topology-id",
         "topology-a",
-        "--ha-startup-topology-generation",
+        "--hot-standby-startup-topology-generation",
         "3",
-        "--ha-startup-generation",
+        "--hot-standby-startup-generation",
         "generation-a",
-        "--ha-startup-target-pvc-name",
+        "--hot-standby-startup-target-pvc-name",
         "standby-a-data",
-        "--ha-startup-target-pvc-uid",
+        "--hot-standby-startup-target-pvc-uid",
         "pvc-uid-1",
-        "--ha-startup-capture-receipt-sha256",
+        "--hot-standby-startup-capture-receipt-sha256",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "--ha-startup-materialized-receipt-sha256",
+        "--hot-standby-startup-materialized-receipt-sha256",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "--ha-startup-materialized-aggregate-sha256",
+        "--hot-standby-startup-materialized-aggregate-sha256",
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        "--ha-startup-target-local-node-id",
+        "--hot-standby-startup-target-local-node-id",
         "7",
-        "--ha-startup-target-replica-id",
+        "--hot-standby-startup-target-replica-id",
         "1",
-        "--ha-cluster-id",
+        "--hot-standby-cluster-id",
         "100",
-        "--ha-shard-id",
+        "--hot-standby-shard-id",
         "10",
-        "--ha-table-id",
+        "--hot-standby-table-id",
         "20",
-        "--ha-timeline-id",
+        "--hot-standby-timeline-id",
         "3",
-        "--ha-epoch",
+        "--hot-standby-epoch",
         "4",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -7285,6 +7422,94 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectError(error.HAStartupTargetReplicaIDMismatch, haStartupExpectationFromCli(wrong_target_replica));
 }
 
+test "deprecated --ha-* flags remain aliases for --hot-standby-* flags" {
+    // HOT_STANDBY.md "Naming": the role segment collapses for --ha-standby-*
+    // (`--hot-standby-log` etc.), --ha-primary-* keeps its role segment
+    // (`--hot-standby-primary-*`), and every other --ha-* just swaps its
+    // prefix. Every pair below must parse to the identical field value
+    // regardless of which spelling is used, proving flagMatches keeps the
+    // legacy alias working.
+    const Pair = struct {
+        canonical: [:0]const u8,
+        legacy: [:0]const u8,
+        value: [:0]const u8,
+        field: []const u8,
+    };
+    const pairs = [_]Pair{
+        .{ .canonical = "--hot-standby-primary-log", .legacy = "--ha-primary-log", .value = "/tmp/primary.log", .field = "ha_primary_log" },
+        .{ .canonical = "--hot-standby-primary-slots", .legacy = "--ha-primary-slots", .value = "/tmp/slots.wal", .field = "ha_primary_slots" },
+        .{ .canonical = "--hot-standby-primary-node-id", .legacy = "--ha-primary-node-id", .value = "primary-a", .field = "ha_primary_node_id" },
+        .{ .canonical = "--hot-standby-seed-capture-root", .legacy = "--ha-seed-capture-root", .value = "/tmp/seed-captures", .field = "ha_seed_capture_root" },
+        .{ .canonical = "--hot-standby-fence-wal", .legacy = "--ha-fence-wal", .value = "/tmp/fence.wal", .field = "ha_fence_wal" },
+        .{ .canonical = "--hot-standby-former-primary-log", .legacy = "--ha-former-primary-log", .value = "/tmp/former-primary.log", .field = "ha_former_primary_log" },
+        .{ .canonical = "--hot-standby-retention-max-lag-lsn", .legacy = "--ha-retention-max-lag-lsn", .value = "500", .field = "ha_retention_max_lag_lsn" },
+        .{ .canonical = "--hot-standby-retention-max-retained-bytes", .legacy = "--ha-retention-max-retained-bytes", .value = "8192", .field = "ha_retention_max_retained_bytes" },
+        .{ .canonical = "--hot-standby-retention-max-retained-age-ns", .legacy = "--ha-retention-max-retained-age-ns", .value = "1000000", .field = "ha_retention_max_retained_age_ns" },
+        .{ .canonical = "--hot-standby-sync-mode", .legacy = "--ha-sync-mode", .value = "remote-apply", .field = "ha_sync_mode" },
+        .{ .canonical = "--hot-standby-sync-selection", .legacy = "--ha-sync-selection", .value = "first", .field = "ha_sync_selection" },
+        .{ .canonical = "--hot-standby-sync-required", .legacy = "--ha-sync-required", .value = "2", .field = "ha_sync_required" },
+        .{ .canonical = "--hot-standby-sync-failure", .legacy = "--ha-sync-failure", .value = "fail-closed", .field = "ha_sync_failure_policy" },
+        .{ .canonical = "--hot-standby-log", .legacy = "--ha-standby-log", .value = "/tmp/standby.log", .field = "ha_standby_log" },
+        .{ .canonical = "--hot-standby-progress", .legacy = "--ha-standby-progress", .value = "/tmp/standby-progress.wal", .field = "ha_standby_progress" },
+        .{ .canonical = "--hot-standby-node-id", .legacy = "--ha-standby-node-id", .value = "standby-a", .field = "ha_standby_node_id" },
+        .{ .canonical = "--hot-standby-upstream-url", .legacy = "--ha-standby-upstream-url", .value = "http://primary.antfly.svc:8080", .field = "ha_standby_upstream_url" },
+        .{ .canonical = "--hot-standby-slot", .legacy = "--ha-standby-slot", .value = "standby-a", .field = "ha_standby_slot" },
+        .{ .canonical = "--hot-standby-startup-target-root", .legacy = "--ha-startup-target-root", .value = "/tmp/active", .field = "ha_startup_target_root" },
+        .{ .canonical = "--hot-standby-startup-topology-id", .legacy = "--ha-startup-topology-id", .value = "topology-a", .field = "ha_startup_topology_id" },
+        .{ .canonical = "--hot-standby-startup-topology-generation", .legacy = "--ha-startup-topology-generation", .value = "3", .field = "ha_startup_topology_generation" },
+        .{ .canonical = "--hot-standby-startup-generation", .legacy = "--ha-startup-generation", .value = "generation-a", .field = "ha_startup_generation" },
+        .{ .canonical = "--hot-standby-startup-slot-name", .legacy = "--ha-startup-slot-name", .value = "standby-a", .field = "ha_startup_slot_name" },
+        .{ .canonical = "--hot-standby-startup-timeline-id", .legacy = "--ha-startup-timeline-id", .value = "1", .field = "ha_startup_timeline_id" },
+        .{ .canonical = "--hot-standby-startup-epoch", .legacy = "--ha-startup-epoch", .value = "1", .field = "ha_startup_epoch" },
+        .{ .canonical = "--hot-standby-startup-target-pvc-name", .legacy = "--ha-startup-target-pvc-name", .value = "standby-a-data", .field = "ha_startup_target_pvc_name" },
+        .{ .canonical = "--hot-standby-startup-target-pvc-uid", .legacy = "--ha-startup-target-pvc-uid", .value = "pvc-uid-1", .field = "ha_startup_target_pvc_uid" },
+        .{ .canonical = "--hot-standby-startup-manifest-sha256", .legacy = "--ha-startup-manifest-sha256", .value = "sha-manifest", .field = "ha_startup_manifest_sha256" },
+        .{ .canonical = "--hot-standby-startup-aggregate-sha256", .legacy = "--ha-startup-aggregate-sha256", .value = "sha-aggregate", .field = "ha_startup_aggregate_sha256" },
+        .{ .canonical = "--hot-standby-startup-seed-receipt-sha256", .legacy = "--ha-startup-seed-receipt-sha256", .value = "sha-seed-receipt", .field = "ha_startup_seed_receipt_sha256" },
+        .{ .canonical = "--hot-standby-startup-capture-receipt-sha256", .legacy = "--ha-startup-capture-receipt-sha256", .value = "sha-capture-receipt", .field = "ha_startup_capture_receipt_sha256" },
+        .{ .canonical = "--hot-standby-startup-materialized-receipt-sha256", .legacy = "--ha-startup-materialized-receipt-sha256", .value = "sha-materialized-receipt", .field = "ha_startup_materialized_receipt_sha256" },
+        .{ .canonical = "--hot-standby-startup-materialized-aggregate-sha256", .legacy = "--ha-startup-materialized-aggregate-sha256", .value = "sha-materialized-aggregate", .field = "ha_startup_materialized_aggregate_sha256" },
+        .{ .canonical = "--hot-standby-startup-target-local-node-id", .legacy = "--ha-startup-target-local-node-id", .value = "7", .field = "ha_startup_target_local_node_id" },
+        .{ .canonical = "--hot-standby-startup-target-replica-id", .legacy = "--ha-startup-target-replica-id", .value = "1", .field = "ha_startup_target_replica_id" },
+        .{ .canonical = "--hot-standby-cluster-id", .legacy = "--ha-cluster-id", .value = "100", .field = "ha_cluster_id" },
+        .{ .canonical = "--hot-standby-shard-id", .legacy = "--ha-shard-id", .value = "10", .field = "ha_shard_id" },
+        .{ .canonical = "--hot-standby-table-id", .legacy = "--ha-table-id", .value = "20", .field = "ha_table_id" },
+        .{ .canonical = "--hot-standby-timeline-id", .legacy = "--ha-timeline-id", .value = "3", .field = "ha_timeline_id" },
+        .{ .canonical = "--hot-standby-epoch", .legacy = "--ha-epoch", .value = "4", .field = "ha_epoch" },
+    };
+
+    inline for (pairs) |pair| {
+        var canonical_argv = [_][*:0]const u8{ pair.canonical, pair.value };
+        var canonical_iter = std.process.Args.Iterator.init(.{ .vector = canonical_argv[0..] });
+        var canonical_cfg = try parseCli(std.testing.allocator, &canonical_iter);
+        defer canonical_cfg.deinit(std.testing.allocator);
+
+        var legacy_argv = [_][*:0]const u8{ pair.legacy, pair.value };
+        var legacy_iter = std.process.Args.Iterator.init(.{ .vector = legacy_argv[0..] });
+        var legacy_cfg = try parseCli(std.testing.allocator, &legacy_iter);
+        defer legacy_cfg.deinit(std.testing.allocator);
+
+        try std.testing.expectEqualDeep(@field(canonical_cfg, pair.field), @field(legacy_cfg, pair.field));
+    }
+
+    // ha_sync_standby_names is list-appended rather than assigned, so it is
+    // checked separately from the scalar/string table above.
+    var canonical_sync_standby_argv = [_][*:0]const u8{ "--hot-standby-sync-standby", "standby-a" };
+    var canonical_sync_standby_iter = std.process.Args.Iterator.init(.{ .vector = canonical_sync_standby_argv[0..] });
+    var canonical_sync_standby_cfg = try parseCli(std.testing.allocator, &canonical_sync_standby_iter);
+    defer canonical_sync_standby_cfg.deinit(std.testing.allocator);
+
+    var legacy_sync_standby_argv = [_][*:0]const u8{ "--ha-sync-standby", "standby-a" };
+    var legacy_sync_standby_iter = std.process.Args.Iterator.init(.{ .vector = legacy_sync_standby_argv[0..] });
+    var legacy_sync_standby_cfg = try parseCli(std.testing.allocator, &legacy_sync_standby_iter);
+    defer legacy_sync_standby_cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(
+        canonical_sync_standby_cfg.ha_sync_standby_names.items,
+        legacy_sync_standby_cfg.ha_sync_standby_names.items,
+    );
+}
+
 test "standalone HA standby replication flags require upstream and slot" {
     try std.testing.expectError(error.HAStandbySlotMissing, haStandbyReplicationConfigFromCli(.{
         .ha_standby_upstream_url = "http://primary.antfly.svc:8080",
@@ -7343,12 +7568,12 @@ test "standalone HA standby replication flags require upstream and slot" {
 }
 
 test "standalone HA string classifier distinguishes missing padded and valid values" {
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.missing, antfly.ha.validation.classifyHAString(null));
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.missing, antfly.ha.validation.classifyHAString(""));
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.missing, antfly.ha.validation.classifyHAString(" \t\r\n"));
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.padded, antfly.ha.validation.classifyHAString(" standby-a"));
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.padded, antfly.ha.validation.classifyHAString("standby-a\n"));
-    try std.testing.expectEqual(antfly.ha.validation.HAStringValidation.ok, antfly.ha.validation.classifyHAString("standby-a"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.missing, antfly.hot_standby.validation.classifyHAString(null));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.missing, antfly.hot_standby.validation.classifyHAString(""));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.missing, antfly.hot_standby.validation.classifyHAString(" \t\r\n"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.padded, antfly.hot_standby.validation.classifyHAString(" standby-a"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.padded, antfly.hot_standby.validation.classifyHAString("standby-a\n"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.ok, antfly.hot_standby.validation.classifyHAString("standby-a"));
 
     try std.testing.expectError(error.HAStandbySlotMissing, requireHAString(null, error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
     try std.testing.expectError(error.HAStandbySlotMissing, requireHAString(" \t", error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
@@ -7682,10 +7907,10 @@ test "standalone HA runtime rejects ambiguous role flags" {
     try validateHARole(promoted_policy_cli);
     var promoted_policy = try haSyncPolicyFromCli(std.testing.allocator, promoted_policy_cli);
     defer promoted_policy.deinit(std.testing.allocator);
-    try std.testing.expectEqual(antfly.ha.primary.DurabilityMode.remote_apply, promoted_policy.policy.mode);
+    try std.testing.expectEqual(antfly.hot_standby.primary.DurabilityMode.remote_apply, promoted_policy.policy.mode);
     try std.testing.expectEqual(@as(usize, 1), promoted_policy.policy.required);
     try std.testing.expectEqualStrings("primary-a", promoted_policy.policy.standby_names[0]);
-    try std.testing.expectEqual(antfly.ha.primary.FailurePolicy.block, promoted_policy.policy.failure_policy);
+    try std.testing.expectEqual(antfly.hot_standby.primary.FailurePolicy.block, promoted_policy.policy.failure_policy);
     try std.testing.expectError(error.InvalidHASyncPolicy, haSyncPolicyFromCli(std.testing.allocator, .{
         .ha_primary_log = "/tmp/primary.log",
         .ha_fence_wal = "/tmp/fence.wal",
@@ -7695,6 +7920,86 @@ test "standalone HA runtime rejects ambiguous role flags" {
         .ha_sync_mode = .remote_write,
         .ha_sync_required = 1,
     }));
+}
+
+test "standalone hot-standby startup migrates a legacy layout before opening local handles" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root: [:0]u8 = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+
+    const writeFile = struct {
+        fn call(dir_path: []const u8, name: []const u8, body: []const u8) !void {
+            const a = std.testing.allocator;
+            const path = try std.fs.path.join(a, &.{ dir_path, name });
+            defer a.free(path);
+            if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+            var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, body);
+        }
+    }.call;
+    const testPathExists = struct {
+        fn call(path: []const u8) bool {
+            std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return false;
+            return true;
+        }
+    }.call;
+
+    const legacy = try std.fs.path.join(alloc, &.{ root, "ha" });
+    defer alloc.free(legacy);
+    try writeFile(legacy, "primary.wal", "primary");
+    try writeFile(legacy, "slots", "slots");
+    try writeFile(legacy, "standby.wal", "standby-log");
+    try writeFile(legacy, "standby-progress.wal", "standby-progress");
+    try writeFile(legacy, "fence.wal", "fence");
+    try writeFile(legacy, "seed-captures/generations/gen-1/complete.json", "capture");
+
+    const canonical = try std.fs.path.join(alloc, &.{ root, "standby" });
+    defer alloc.free(canonical);
+    const primary_log = try std.fs.path.join(alloc, &.{ canonical, "primary.wal" });
+    defer alloc.free(primary_log);
+    const primary_slots = try std.fs.path.join(alloc, &.{ canonical, "slots" });
+    defer alloc.free(primary_slots);
+    const standby_log = try std.fs.path.join(alloc, &.{ canonical, "log.wal" });
+    defer alloc.free(standby_log);
+    const standby_progress = try std.fs.path.join(alloc, &.{ canonical, "progress.wal" });
+    defer alloc.free(standby_progress);
+    const fence_wal = try std.fs.path.join(alloc, &.{ canonical, "fence.wal" });
+    defer alloc.free(fence_wal);
+    const seed_capture_root = try std.fs.path.join(alloc, &.{ canonical, "seed-captures" });
+    defer alloc.free(seed_capture_root);
+
+    const cli = CliConfig{
+        .ha_primary_log = primary_log,
+        .ha_primary_slots = primary_slots,
+        .ha_standby_log = standby_log,
+        .ha_standby_progress = standby_progress,
+        .ha_fence_wal = fence_wal,
+        .ha_seed_capture_root = seed_capture_root,
+    };
+
+    try migrateHALegacyLayoutFromCli(alloc, std.testing.io, cli);
+
+    try std.testing.expect(!testPathExists(legacy));
+    try std.testing.expect(testPathExists(primary_log));
+    try std.testing.expect(testPathExists(primary_slots));
+    try std.testing.expect(testPathExists(standby_log));
+    try std.testing.expect(testPathExists(standby_progress));
+    try std.testing.expect(testPathExists(fence_wal));
+    const migrated_capture = try std.fs.path.join(alloc, &.{ seed_capture_root, "generations/gen-1/complete.json" });
+    defer alloc.free(migrated_capture);
+    try std.testing.expect(testPathExists(migrated_capture));
+
+    // Calling again with an already-canonical tree is a no-op that must not
+    // error, matching every later startup on this node.
+    try migrateHALegacyLayoutFromCli(alloc, std.testing.io, cli);
+    try std.testing.expect(testPathExists(primary_log));
+}
+
+test "standalone hot-standby startup migration is a no-op with no hot-standby paths configured" {
+    try migrateHALegacyLayoutFromCli(std.testing.allocator, std.testing.io, .{});
 }
 
 test "standalone HA runtime requires HA paths under resolved data root" {
@@ -7800,7 +8105,7 @@ test "standalone activated seed bootstraps exact standby checkpoint and rejects 
     defer alloc.free(receive_path);
     const progress_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/standby-progress.wal", .{tmp.sub_path}, 0);
     defer alloc.free(progress_path);
-    const identity = antfly.ha.standby.Identity{
+    const identity = antfly.hot_standby.standby.Identity{
         .cluster_id = 101,
         .shard_id = 202,
         .table_id = 303,
@@ -7809,7 +8114,7 @@ test "standalone activated seed bootstraps exact standby checkpoint and rejects 
     };
 
     {
-        var standby = try antfly.ha.standby.Standby.open(alloc, receive_path.ptr, progress_path.ptr, identity, .{});
+        var standby = try antfly.hot_standby.standby.Standby.open(alloc, receive_path.ptr, progress_path.ptr, identity, .{});
         defer standby.close();
         try bootstrapHAStandbyAtActivatedCheckpoint(alloc, &standby, "seed-generation-7", "standby-a", 41);
         const progress = standby.currentProgress();
@@ -7828,7 +8133,7 @@ test "standalone activated seed bootstraps exact standby checkpoint and rejects 
         );
     }
 
-    var reopened = try antfly.ha.standby.Standby.open(alloc, receive_path.ptr, progress_path.ptr, identity, .{});
+    var reopened = try antfly.hot_standby.standby.Standby.open(alloc, receive_path.ptr, progress_path.ptr, identity, .{});
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 42), reopened.nextReceiveLsn());
 }
@@ -8839,7 +9144,7 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
     ;
     const after_expiry: u64 = 1_784_116_831 * std.time.ns_per_s;
     var runtime_watchdog = RuntimeLeaseWatchdog{
-        .watchdog = try antfly.ha.kubernetes_lease_watchdog.Watchdog.init(.{
+        .watchdog = try antfly.hot_standby.kubernetes_lease_watchdog.Watchdog.init(.{
             .scope = .{
                 .topology_id = "topology-7",
                 .node_id = "standby-a",
@@ -8870,7 +9175,7 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
     runtime_watchdog.publishValidatedObservationLocked(decision, observed_monotonic_ns);
     runtime_watchdog.proof_mutex.unlock();
 
-    try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, decision);
+    try std.testing.expectEqual(antfly.hot_standby.kubernetes_lease_watchdog.Decision.waiting, decision);
     const proof = (try RuntimeLeaseWatchdog.proofSnapshot(&runtime_watchdog, std.testing.allocator)).?;
     defer std.testing.allocator.free(proof.observed_holder_node_id);
     try std.testing.expect(proof.active);
@@ -8888,7 +9193,7 @@ test "standalone metadata catalog source provides compact routing" {
 test "runtime lease watchdog fetch and validation failures publish no bootstrap capability" {
     inline for ([_]RuntimeLeaseWatchdog.ObservationFailureStage{ .fetch, .validation }) |stage| {
         var runtime_watchdog = RuntimeLeaseWatchdog{
-            .watchdog = try antfly.ha.kubernetes_lease_watchdog.Watchdog.init(.{
+            .watchdog = try antfly.hot_standby.kubernetes_lease_watchdog.Watchdog.init(.{
                 .scope = .{
                     .topology_id = "topology-7",
                     .node_id = "primary-a",
@@ -8912,9 +9217,9 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
         const transition = runtime_watchdog.transitionObservationFailureLocked(stage, 1);
         const repeated_transition = runtime_watchdog.transitionObservationFailureLocked(stage, 2);
         runtime_watchdog.proof_mutex.unlock();
-        try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, transition.decision);
+        try std.testing.expectEqual(antfly.hot_standby.kubernetes_lease_watchdog.Decision.waiting, transition.decision);
         try std.testing.expect(transition.should_log);
-        try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, repeated_transition.decision);
+        try std.testing.expectEqual(antfly.hot_standby.kubernetes_lease_watchdog.Decision.waiting, repeated_transition.decision);
         try std.testing.expect(!repeated_transition.should_log);
         try std.testing.expectEqual(stage == .fetch, runtime_watchdog.fetch_failure_logged);
         try std.testing.expectEqual(stage == .validation, runtime_watchdog.validation_failure_logged);
@@ -8929,7 +9234,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
     }
 
     var source = RuntimeLeaseWatchdog{
-        .watchdog = try antfly.ha.kubernetes_lease_watchdog.Watchdog.init(.{
+        .watchdog = try antfly.hot_standby.kubernetes_lease_watchdog.Watchdog.init(.{
             .scope = .{
                 .topology_id = "topology-7",
                 .node_id = "primary-a",
@@ -8977,4 +9282,42 @@ test "runtime lease watchdog prefers a DNS-verified Kubernetes API host and reta
     const overridden_endpoint = try haLeaseAPIEndpoint(&env);
     try std.testing.expectEqualStrings("kubernetes.default.svc.cluster.local", overridden_endpoint.host);
     try std.testing.expectEqualStrings("443", overridden_endpoint.port);
+}
+
+test "standalone fills ha flags from the config ha section without overriding flags" {
+    const alloc = std.testing.allocator;
+    var cfg = try antfly.common.config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "ha": {
+        \\    "admin": { "token_env": "ANTFLY_HA_ADMIN_TOKEN" },
+        \\    "identity": { "cluster_id": 7, "shard_id": 1, "timeline_id": 3, "epoch": 2 },
+        \\    "primary": { "log": "/data/ha/primary.wal", "slots": "/data/ha/slots", "node_id": "primary-a" },
+        \\    "sync": { "mode": "remote-apply", "selection": "all", "standbys": ["standby-a"], "failure": "degrade-to-async" },
+        \\    "retention": { "max_lag_lsn": 4096 },
+        \\    "fence_wal": "/data/ha/fence.wal"
+        \\  }
+        \\}
+    );
+    defer cfg.deinit();
+
+    var cli = CliConfig{ .ha_epoch = 9, .ha_primary_node_id = "flag-primary" };
+    defer cli.deinit(alloc);
+    try applyHAConfigDefaults(alloc, &cli, &cfg);
+
+    try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", cli.admin_token_env.?);
+    try std.testing.expectEqual(@as(u64, 7), cli.ha_cluster_id.?);
+    try std.testing.expectEqual(@as(u64, 1), cli.ha_shard_id.?);
+    try std.testing.expectEqual(@as(u64, 3), cli.ha_timeline_id.?);
+    try std.testing.expectEqual(@as(u64, 9), cli.ha_epoch.?);
+    try std.testing.expectEqualStrings("/data/ha/primary.wal", cli.ha_primary_log.?);
+    try std.testing.expectEqualStrings("flag-primary", cli.ha_primary_node_id.?);
+    try std.testing.expect(haPrimaryRequested(cli));
+    try std.testing.expect(!haStandbyRequested(cli));
+    try std.testing.expectEqual(antfly.hot_standby.primary.DurabilityMode.remote_apply, cli.ha_sync_mode.?);
+    try std.testing.expectEqual(antfly.hot_standby.primary.StandbySelection.all, cli.ha_sync_selection.?);
+    try std.testing.expectEqual(antfly.hot_standby.primary.FailurePolicy.degrade_to_async, cli.ha_sync_failure_policy.?);
+    try std.testing.expectEqual(@as(usize, 1), cli.ha_sync_standby_names.items.len);
+    try std.testing.expectEqual(@as(u64, 4096), cli.ha_retention_max_lag_lsn.?);
+    try std.testing.expectEqualStrings("/data/ha/fence.wal", cli.ha_fence_wal.?);
+    try std.testing.expect(cli.ha_standby_log == null);
 }

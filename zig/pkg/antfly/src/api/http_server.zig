@@ -90,8 +90,8 @@ const table_reads = if (builtin.is_test) @import("antfly_source_root").antfly_so
 const table_router = @import("table_router.zig");
 const table_writes = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_writes else @import("table_write_source.zig");
 const table_index_config = @import("table_index_config.zig");
-const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
-const ha_http_operation = @import("../storage/ha/http_operation.zig");
+const ha_mutation_inventory = @import("../storage/hot_standby/mutation_inventory.zig");
+const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
@@ -4030,12 +4030,12 @@ pub const ApiHttpServer = struct {
         };
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
-        // Durable named-index cancellation is correctness work, not a client
-        // polling obligation. Advance at most one queued pass per supervisor
+        // Durable index controls and cancellation are server-owned work.
+        // Advance at most one queued pass per supervisor
         // tick; the repair-job FIFO and BackendRuntime maintenance queue keep
         // this O(1), bounded, and fair with other maintenance.
-        self.resumePendingDurableRepairCancellationOnce() catch |err| {
-            std.log.warn("failed to resume durable table repair cancellation err={s}", .{@errorName(err)});
+        self.resumePendingDurableRepairMaintenanceOnce() catch |err| {
+            std.log.warn("failed to resume durable table repair maintenance err={s}", .{@errorName(err)});
         };
         self.join_job_store.cleanupExpiredJoinJobs();
         self.artifact_reprocess_job_store.cleanupExpiredJobs();
@@ -4189,13 +4189,13 @@ pub const ApiHttpServer = struct {
         }
     }
 
-    fn resumePendingDurableRepairCancellationOnce(self: *ApiHttpServer) !void {
+    fn resumePendingDurableRepairMaintenanceOnce(self: *ApiHttpServer) !void {
         if (self.table_writes == null) return;
-        const encoded = (try self.repair_job_store.nextPendingDurableCancelAlloc(self.alloc)) orelse return;
+        const encoded = (try self.repair_job_store.nextPendingMaintenanceAlloc(self.alloc)) orelse return;
         defer self.alloc.free(encoded);
         var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        try self.continueDurableRepairCancellation(parsed.value.table_name, encoded);
+        try self.continueDurableRepairMaintenance(parsed.value.table_name, encoded);
     }
 
     const SessionMaintenanceWork = struct {
@@ -15721,16 +15721,27 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicStartTableRepairJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        return self.startTableMaintenanceJob(table_name, body, false);
+    }
+
+    pub fn handlePublicStartTableRepairControlJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        return self.startTableMaintenanceJob(table_name, body, true);
+    }
+
+    fn startTableMaintenanceJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8, control_job: bool) !public_table_http.OwnedResponse {
         if (self.table_writes == null) return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         var parsed = std.json.parseFromSlice(repair_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
             return try publicOperationTextResponse(self.alloc, 400, "invalid repair job request");
         };
         defer parsed.deinit();
-        if (std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) == null) return try publicOperationTextResponse(self.alloc, 400, "invalid repair target");
-        if (parsed.value.limit == 0) return try publicOperationTextResponse(self.alloc, 400, "invalid limit");
+        if (control_job != (parsed.value.control != null)) return try publicOperationTextResponse(self.alloc, 400, "use the matching repair or control job endpoint");
+        if (control_job) parsed.value.target = "index";
+        repair_jobs.validateStartRequest(parsed.value) catch return try publicOperationTextResponse(self.alloc, 400, "invalid repair job request");
 
         const encoded = try self.repair_job_store.startJob(self.alloc, table_name, .{
             .target = parsed.value.target,
+            .control = parsed.value.control,
+            .repair_id = parsed.value.repair_id,
             .kind = parsed.value.kind,
             .index = parsed.value.index,
             .cursor = parsed.value.cursor,
@@ -15859,8 +15870,8 @@ pub const ApiHttpServer = struct {
                 return err;
             };
             defer work.server.alloc.free(updated);
-            work.server.continueDurableRepairCancellation(work.table_name, updated) catch |err| {
-                std.log.warn("failed to continue durable table repair cancellation table={s} err={s}", .{ work.table_name, @errorName(err) });
+            work.server.continueDurableRepairMaintenance(work.table_name, updated) catch |err| {
+                std.log.warn("failed to continue durable table repair maintenance table={s} err={s}", .{ work.table_name, @errorName(err) });
             };
         }
 
@@ -16010,10 +16021,10 @@ pub const ApiHttpServer = struct {
         return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, running_encoded);
     }
 
-    fn continueDurableRepairCancellation(self: *ApiHttpServer, table_name: []const u8, encoded: []const u8) !void {
+    fn continueDurableRepairMaintenance(self: *ApiHttpServer, table_name: []const u8, encoded: []const u8) !void {
         var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        if (!repair_jobs.requiresDurableCancel(parsed.value) or
+        if (!repair_jobs.requiresAutomaticAdvance(parsed.value) or
             !std.mem.eql(u8, parsed.value.phase, repair_jobs.phaseString(.queued))) return;
 
         const begin = try self.repair_job_store.beginAdvance(self.alloc, parsed.value);
@@ -16064,6 +16075,8 @@ pub const ApiHttpServer = struct {
         };
         var result = (source.repairArtifactIssuesControlled(self.alloc, table_name, .{
             .target = target,
+            .control = running_state.control,
+            .repair_id = if (running_state.repair_id) |raw| try std.fmt.parseInt(u128, raw, 10) else null,
             .artifact_kind = running_state.kind,
             .index_name = running_state.index,
             .limit = running_state.limit,
@@ -16081,7 +16094,7 @@ pub const ApiHttpServer = struct {
             error.Canceled => {
                 return try self.repair_job_store.markPhase(self.alloc, running_state, .cancelled, "cancel_requested");
             },
-            error.InvalidArgument => {
+            error.InvalidArgument, error.StaleIndexRepairControl => {
                 return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
             },
             error.NotFound => {
@@ -19878,7 +19891,9 @@ pub fn requiresAdminPermission(path: []const u8) bool {
 }
 
 fn isHaAdminPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, admin_routes.ha) or std.mem.startsWith(u8, path, admin_routes.ha ++ "/");
+    // Canonical `/admin/v1/standby` plus the pre-0.3 `/admin/v1/ha` alias.
+    return std.mem.eql(u8, path, admin_routes.standby) or std.mem.startsWith(u8, path, admin_routes.standby ++ "/") or
+        std.mem.eql(u8, path, admin_routes.legacy_standby_prefix) or std.mem.startsWith(u8, path, admin_routes.legacy_standby_prefix ++ "/");
 }
 
 fn isStorageMaintenancePath(path: []const u8) bool {
@@ -19901,7 +19916,8 @@ fn storageRuntimeStatus(status: @import("../storage/maintenance.zig").Status) me
 }
 
 fn isHaInternalPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, internal_api_routes.ha) or std.mem.startsWith(u8, path, internal_api_routes.ha ++ "/");
+    return std.mem.eql(u8, path, internal_api_routes.standby) or std.mem.startsWith(u8, path, internal_api_routes.standby ++ "/") or
+        std.mem.eql(u8, path, internal_api_routes.legacy_standby) or std.mem.startsWith(u8, path, internal_api_routes.legacy_standby ++ "/");
 }
 
 fn isExtensionPath(path: []const u8) bool {
@@ -19986,7 +20002,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         .POST => .admin,
         .GET, .PUT, .DELETE => return null,
     });
-    if (routes.Routes.matchTableRepairJobs(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+    if (routes.Routes.matchTableRepairJobs(path) orelse routes.Routes.matchTableRepairControlJobs(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
         .POST => .admin,
         .GET, .PUT, .DELETE => return null,
     });
@@ -20744,6 +20760,71 @@ test "api maintenance resumes recovered durable named index cancellation without
     var parsed_finished = try std.json.parseFromSlice(repair_jobs.JobState, alloc, finished, .{ .ignore_unknown_fields = true });
     defer parsed_finished.deinit();
     try std.testing.expectEqualStrings("cancelled", parsed_finished.value.phase);
+}
+
+test "api maintenance advances durable control pages and stops on stale repair fences" {
+    const alloc = std.testing.allocator;
+    const permission = (try requiredPermissionForRequest(alloc, .POST, "/tables/docs/repair/control-jobs")).?;
+    defer permission.deinit(alloc);
+    try std.testing.expectEqual(usermgr.PermissionType.admin, permission.permission_type);
+    const Source = struct {
+        groups: usize = 0,
+        expected: db_mod.types.IndexRepairControl,
+        stale: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+        fn repair(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, req: db_mod.types.ArtifactRepairRunRequest, _: db_mod.types.ArtifactRepairRunOptions) anyerror!?db_mod.types.ArtifactRepairResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.expected, req.control.?);
+            try std.testing.expectEqual(@as(u128, 17), req.repair_id.?);
+            if (self.stale) return error.StaleIndexRepairControl;
+            const start = if (req.cursor) |raw| try std.fmt.parseInt(usize, raw[0 .. raw.len - 1], 10) else 0;
+            try std.testing.expectEqual(self.groups, start);
+            const count = @min(@as(usize, 64), 130 - start);
+            self.groups += count;
+            return .{ .scanned = count, .groups_scanned = count, .controls_applied = count, .has_more = self.groups < 130, .debt_remaining = true, .in_progress = 1, .next_cursor = if (self.groups < 130) try std.fmt.allocPrint(a, "{d}:", .{self.groups}) else null };
+        }
+    };
+    for ([_]db_mod.types.IndexRepairControl{ .pause_automatic, .resume_automatic, .cancel_current_attempt }) |control| {
+        var source = Source{ .expected = control };
+        var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Source.status } }, null, .{ .ptr = &source, .vtable = &.{ .batch = Source.batch, .repair_artifact_issues_controlled = Source.repair } });
+        defer server.deinit();
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .index = "dense", .control = control, .repair_id = "17" }, .{});
+        defer alloc.free(body);
+        var wrong_endpoint = try server.handlePublicStartTableRepairJob("docs", body);
+        defer wrong_endpoint.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), wrong_endpoint.status);
+        try std.testing.expectEqual(@as(usize, 0), source.groups);
+        var missing_control = try server.handlePublicStartTableRepairControlJob("docs", "{\"index\":\"dense\"}");
+        defer missing_control.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), missing_control.status);
+        var response = try server.handlePublicStartTableRepairControlJob("docs", body);
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), response.status);
+        var first = try std.json.parseFromSlice(repair_jobs.JobState, alloc, response.body, .{});
+        defer first.deinit();
+        try std.testing.expectEqualStrings("64:", first.value.cursor.?);
+        try server.runSessionMaintenanceOnce();
+        try server.runSessionMaintenanceOnce();
+        try std.testing.expectEqual(@as(usize, 130), source.groups);
+        const final_json = (try server.repair_job_store.loadJobAlloc(alloc, first.value.job_id)).?;
+        defer alloc.free(final_json);
+        var final = try std.json.parseFromSlice(repair_jobs.JobState, alloc, final_json, .{});
+        defer final.deinit();
+        try std.testing.expectEqualStrings("succeeded", final.value.phase);
+        source.stale = true;
+        var stale = try server.handlePublicStartTableRepairControlJob("docs", body);
+        defer stale.deinit(alloc);
+        var failed = try std.json.parseFromSlice(repair_jobs.JobState, alloc, stale.body, .{});
+        defer failed.deinit();
+        try std.testing.expectEqualStrings("failed", failed.value.phase);
+        try std.testing.expectEqualStrings("StaleIndexRepairControl", failed.value.last_error.?);
+        try std.testing.expect((try server.repair_job_store.nextPendingMaintenanceAlloc(alloc)) == null);
+    }
 }
 
 fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
@@ -28145,9 +28226,16 @@ test "typed HA route operation dispatches admin and internal executors" {
     try std.testing.expectEqualStrings(internal_api_routes.ha_replication_status, internal_exec.last_uri.?);
     try std.testing.expectEqualStrings("{\"slot_name\":\"standby-a\"}", internal_exec.last_body.?);
 
-    var missing = try executeHaRouteForTest(&server, .get, admin_routes.ha, null, "");
+    var missing = try executeHaRouteForTest(&server, .get, admin_routes.standby, null, "");
     defer missing.deinit();
     try std.testing.expectEqual(@as(u16, 401), missing.status);
+    try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
+
+    // The pre-0.3 prefix reaches the same gate: unauthenticated is 401, not
+    // an unrouted 404.
+    var legacy_missing = try executeHaRouteForTest(&server, .get, admin_routes.legacy_standby_prefix ++ "/primary/status", null, "");
+    defer legacy_missing.deinit();
+    try std.testing.expectEqual(@as(u16, 401), legacy_missing.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
 }
 
@@ -34773,8 +34861,8 @@ test "api http server preserves public query availability errors" {
         .{ .query_error = error.ReadUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "standby_read_unavailable", .unavailable_message = "standby read unavailable" },
         .{ .query_error = error.DistributedQueryUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
         .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "", .json = true, .unavailable_code = "read_requires_primary", .unavailable_message = "read requires primary" },
-        .{ .query_error = error.StorageBusy, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
+        .{ .query_error = error.StorageBusy, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .query_error = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
         .{ .query_error = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
         .{ .query_error = error.RerankRateLimited, .status = 429, .body = "{\"code\":\"reranker_rate_limited\",\"error\":\"reranker_rate_limited\",\"message\":\"reranker rate limited\",\"retryable\":true}", .json = true, .retry_after = true },

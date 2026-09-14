@@ -396,7 +396,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "legacy stored destinations can be adopted idempotently",
         "api http server cluster restore",
         "cluster restore repository errors preserve operational failure semantics",
-        "internal namespace requires a service principal except HA",
+        "internal namespace requires a service principal except hot standby",
         "usermgr api key permission intersection narrows owner and key wildcards",
         "httpx internal control routes call typed operations directly",
     };
@@ -1311,6 +1311,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "target and reducing watermarks commute across every callback permutation",
             "runtime status group batches reject duplicate group ids before publication",
             "table runtime snapshot cache clones stored status",
+            "projection continuity preserves lifecycle classification as one bundle",
+            "table runtime snapshot cache summarizes replay debt",
             "table runtime snapshot cache batch publication is table epoch atomic",
             "table runtime snapshot cache publication fence preserves the last snapshot",
             "targeted publication fence preserves only untouched siblings during catch up",

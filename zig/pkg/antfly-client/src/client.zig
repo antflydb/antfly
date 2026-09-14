@@ -281,6 +281,40 @@ pub const AntflyClient = struct {
         return resp;
     }
 
+    // Resource maintenance uses the public contract and preserves error responses.
+
+    pub fn executeGraphMetricAction(self: *AntflyClient, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !openapi.ApiResponse(openapi.types.GraphMetricActionResponse) {
+        return self.inner.executeGraphMetricAction(table_name, index_name, metric_name, action);
+    }
+
+    pub fn listTableRepairIssues(self: *AntflyClient, table_name: []const u8, body: ?openapi.types.RepairIssueListRequest) !openapi.ApiResponse(openapi.types.TableRepairIssueList) {
+        return self.inner.listTableRepairIssues(table_name, body);
+    }
+
+    pub fn runTableRepair(self: *AntflyClient, table_name: []const u8, body: ?openapi.types.RepairRunRequest) !openapi.ApiResponse(openapi.types.TableRepairRunResponse) {
+        return self.inner.runTableRepair(table_name, body);
+    }
+
+    pub fn startTableRepairJob(self: *AntflyClient, table_name: []const u8, body: ?openapi.types.TableRepairJobStartRequest) !openapi.ApiResponse(openapi.types.TableRepairJob) {
+        return self.inner.startTableRepairJob(table_name, body);
+    }
+
+    pub fn startTableRepairControlJob(self: *AntflyClient, table_name: []const u8, body: openapi.types.TableRepairControlJobStartRequest) !openapi.ApiResponse(openapi.types.TableRepairJob) {
+        return self.inner.startTableRepairControlJob(table_name, body);
+    }
+
+    pub fn getTableRepairJob(self: *AntflyClient, table_name: []const u8, job_id: []const u8) !openapi.ApiResponse(openapi.types.TableRepairJob) {
+        return self.inner.getTableRepairJob(table_name, job_id);
+    }
+
+    pub fn advanceTableRepairJob(self: *AntflyClient, table_name: []const u8, job_id: []const u8) !openapi.ApiResponse(openapi.types.TableRepairJob) {
+        return self.inner.advanceTableRepairJob(table_name, job_id);
+    }
+
+    pub fn cancelTableRepairJob(self: *AntflyClient, table_name: []const u8, job_id: []const u8) !openapi.ApiResponse(openapi.types.TableRepairJob) {
+        return self.inner.cancelTableRepairJob(table_name, job_id);
+    }
+
     // --- Artifact operations ---
 
     pub fn listDocumentArtifactManifests(
@@ -389,7 +423,7 @@ pub const AntflyClient = struct {
         defer self.allocator.free(json_body);
         const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |header| &.{header} else null;
         var raw_resp = try self.inner.http.post(url, .{ .json = json_body, .headers = headers });
-        var resp = openapi.ApiResponse(openapi.types.BatchResponse).fromResponse(self.allocator, &raw_resp);
+        var resp = try openapi.ApiResponse(openapi.types.BatchResponse).fromResponse(self.allocator, &raw_resp);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);

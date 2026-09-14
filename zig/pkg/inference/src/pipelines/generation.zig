@@ -575,7 +575,34 @@ pub const GenerationTimingMs = struct {
     decode: u64 = 0,
     text_decode: u64 = 0,
     total: u64 = 0,
+
+    /// Round cumulative milestones, then subtract adjacent boundaries. This
+    /// keeps the exclusive phases additive even for sub-millisecond stages.
+    fn fromElapsedMs(milestones: [7]u64) GenerationTimingMs {
+        var elapsed = milestones;
+        for (1..elapsed.len) |i| elapsed[i] = @max(elapsed[i], elapsed[i - 1]);
+        return .{
+            .prompt_format = elapsed[0],
+            .tokenize = elapsed[1] - elapsed[0],
+            .multimodal_prepare = elapsed[2] - elapsed[1],
+            .runtime_prepare = elapsed[3] - elapsed[2],
+            .prefill = elapsed[4] - elapsed[3],
+            .decode = elapsed[5] - elapsed[4],
+            .text_decode = elapsed[6] - elapsed[5],
+            .total = elapsed[6],
+        };
+    }
 };
+
+test "generation timing excludes detokenization from decode and reconciles rounded phases" {
+    const timing = GenerationTimingMs.fromElapsedMs(.{ 0, 1, 1, 2, 10, 23, 26 });
+    try std.testing.expectEqual(@as(u64, 13), timing.decode);
+    try std.testing.expectEqual(@as(u64, 3), timing.text_decode);
+    try std.testing.expectEqual(@as(u64, 0), timing.multimodal_prepare);
+    try std.testing.expectEqual(timing.total, timing.prompt_format + timing.tokenize +
+        timing.multimodal_prepare + timing.runtime_prepare + timing.prefill +
+        timing.decode + timing.text_decode);
+}
 
 pub const MtpQualityStats = struct {
     mismatches: usize = 0,
@@ -4904,16 +4931,15 @@ pub const NativeGenerationPipeline = struct {
             );
         }
         const finished_generate_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        const timing_ms: ?GenerationTimingMs = if (self.io != null) .{
-            .prompt_format = timestampDurationMillis(started_at, formatted_prompt_at),
-            .tokenize = timestampDurationMillis(formatted_prompt_at, encoded_prompt_at),
-            .multimodal_prepare = timestampDurationMillis(encoded_prompt_at, runtime_prepare_started_at),
-            .runtime_prepare = timestampDurationMillis(runtime_prepare_started_at, prefill_started_at),
-            .prefill = timestampDurationMillis(prefill_started_at, finished_prefill_at),
-            .decode = timestampDurationMillis(finished_prefill_at, finished_generate_at),
-            .text_decode = timestampDurationMillis(text_decode_started_at, finished_generate_at),
-            .total = timestampDurationMillis(started_at, finished_generate_at),
-        } else null;
+        const timing_ms: ?GenerationTimingMs = if (self.io != null) GenerationTimingMs.fromElapsedMs(.{
+            timestampDurationMillis(started_at, formatted_prompt_at),
+            timestampDurationMillis(started_at, encoded_prompt_at),
+            timestampDurationMillis(started_at, runtime_prepare_started_at),
+            timestampDurationMillis(started_at, prefill_started_at),
+            timestampDurationMillis(started_at, finished_prefill_at),
+            timestampDurationMillis(started_at, text_decode_started_at),
+            timestampDurationMillis(started_at, finished_generate_at),
+        }) else null;
         if (self.print_timing and timing_ms != null) {
             const timing = timing_ms.?;
             std.debug.print(

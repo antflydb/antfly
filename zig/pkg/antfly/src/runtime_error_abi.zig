@@ -364,6 +364,7 @@ pub const Detail = enum(c_int) {
     index_generation_mismatch,
     generation_transition_active,
     storage_busy,
+    storage_kernel_failure,
 };
 
 pub const Status = extern struct {
@@ -705,6 +706,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.ImmutableTableStorageSettings => status(.conflict, .immutable_table_storage_settings),
         error.VectorStoreLifecycleUnsupported => status(.unsupported, .vector_store_lifecycle_unsupported),
         error.VectorStoreReferenceFormatRequired => status(.unsupported, .vector_store_reference_format_required),
+        error.StorageKernelFailure => status(.internal, .storage_kernel_failure),
         else => status(.internal, .none),
     };
 }
@@ -1062,6 +1064,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .provider_quota_registry_full => "ProviderQuotaRegistryFull",
         .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
         .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
+        .storage_kernel_failure => "StorageKernelFailure",
     };
 }
 

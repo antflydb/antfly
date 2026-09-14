@@ -24,6 +24,12 @@ marker applies to the whole directory tree, not to an individual node mode.
     catalog.txt
     snapshots/
 
+  standby/                 (only when hot standby is configured)
+    primary.wal
+    slots
+    log.wal
+    progress.wal
+    fence.wal
 ```
 
 ## Design
@@ -47,6 +53,26 @@ directories as standalone metadata, data, and inference nodes.
 - `data/replicas/` stores hosted data group table state.
 - `data/catalog.txt` stores the data replica catalog.
 - `data/snapshots/` stores data raft snapshot transport payloads.
+
+`standby/` holds hot-standby replication state when a node runs as a primary
+or a standby: the primary replication log and slot store, the standby
+receive log and progress WAL, and the fence WAL. `antfly standalone` takes
+these paths through its `--hot-standby-*` flags (the `--ha-*` spellings
+remain aliases for one minor release), and `antfly standby --data-dir
+<data-dir>` opens whichever of these files exist and reads the log identity
+from them (`antfly ha` is a deprecated alias for `antfly standby`). Nodes
+created before 0.3 have this state under a legacy `ha/` tree instead
+(`ha/{primary.wal,slots,standby.wal,standby-progress.wal,fence.wal}`);
+`antfly standby --data-dir` reads either layout, preferring the canonical
+`standby/` tree when both exist, and never moves anything. The server does the
+move: when its hot-standby flags point into a `standby/` directory that does
+not exist yet and a sibling `ha/` directory does, it renames `ha/` to
+`standby/` once at startup (everything inside moves with it) and then renames
+`standby.wal` to `log.wal` and `standby-progress.wal` to `progress.wal`. The
+Kubernetes operator switches a cluster's default pod paths from
+`/antflydb/ha/` to `/antflydb/standby/` once it has seen the cluster's nodes
+run a server with this migration (`status.haStatus.dataLayout`); new clusters
+start on `standby/` directly.
 
 Table database snapshots are a lower-level DB artifact and remain adjacent to
 the database path as `<db_path>.snapshots/<snapshot-id>/...`.

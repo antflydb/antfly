@@ -7,18 +7,18 @@ const types = @import("types.zig");
 
 /// --- Extractors (framework-agnostic) ---
 /// Parse the JSON request body for createHAReplicationStreamingSlot.
-pub fn parseCreateHAReplicationStreamingSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.HACreateReplicationSlotRequest) {
-    return std.json.parseFromSlice(types.HACreateReplicationSlotRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseCreateHAReplicationStreamingSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyCreateReplicationSlotRequest) {
+    return std.json.parseFromSlice(types.StandbyCreateReplicationSlotRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for startHAReplication.
-pub fn parseStartHAReplicationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.HAStartReplicationRequest) {
-    return std.json.parseFromSlice(types.HAStartReplicationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseStartHAReplicationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyStartReplicationRequest) {
+    return std.json.parseFromSlice(types.StandbyStartReplicationRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for updateHAStandbyStatus.
-pub fn parseUpdateHAStandbyStatusBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.HAStandbyStatusUpdateRequest) {
-    return std.json.parseFromSlice(types.HAStandbyStatusUpdateRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseUpdateHAStandbyStatusBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyStatusUpdateRequest) {
+    return std.json.parseFromSlice(types.StandbyStatusUpdateRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Route metadata for all operations.
@@ -33,10 +33,10 @@ pub const Route = struct {
 };
 
 pub const routes = [_]Route{
-    .{ .method = "GET", .path = "/ha/replication/identify", .operation_id = "identifyHAReplicationSystem", .request_body = .none, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/replication/slots", .operation_id = "createHAReplicationStreamingSlot", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/replication/start", .operation_id = "startHAReplication", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/replication/status", .operation_id = "updateHAStandbyStatus", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/standby/replication/identify", .operation_id = "identifyHAReplicationSystem", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/replication/slots", .operation_id = "createHAReplicationStreamingSlot", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/replication/start", .operation_id = "startHAReplication", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/replication/status", .operation_id = "updateHAStandbyStatus", .request_body = .buffered, .streaming_response = false },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -65,32 +65,32 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
-            try server.get("/ha/replication/identify", httpx.Handler.bind(self.impl, identifyHAReplicationSystem));
-            try server.post("/ha/replication/slots", httpx.Handler.bind(self.impl, createHAReplicationStreamingSlot));
-            try server.post("/ha/replication/start", httpx.Handler.bind(self.impl, startHAReplication));
-            try server.post("/ha/replication/status", httpx.Handler.bind(self.impl, updateHAStandbyStatus));
+            try server.get("/standby/replication/identify", httpx.Handler.bind(self.impl, identifyHAReplicationSystem));
+            try server.post("/standby/replication/slots", httpx.Handler.bind(self.impl, createHAReplicationStreamingSlot));
+            try server.post("/standby/replication/start", httpx.Handler.bind(self.impl, startHAReplication));
+            try server.post("/standby/replication/status", httpx.Handler.bind(self.impl, updateHAStandbyStatus));
         }
 
         /// Identify this primary replication system
-        /// GET /ha/replication/identify
+        /// GET /standby/replication/identify
         fn identifyHAReplicationSystem(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.identifyHAReplicationSystem(ctx);
         }
 
         /// Create or reserve a runtime replication slot
-        /// POST /ha/replication/slots
+        /// POST /standby/replication/slots
         fn createHAReplicationStreamingSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.createHAReplicationStreamingSlot(ctx);
         }
 
-        /// Pull ordered HA replication records from a slot
-        /// POST /ha/replication/start
+        /// Pull ordered hot-standby replication records from a slot
+        /// POST /standby/replication/start
         fn startHAReplication(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.startHAReplication(ctx);
         }
 
         /// Report durable receive and apply progress for a standby slot
-        /// POST /ha/replication/status
+        /// POST /standby/replication/status
         fn updateHAStandbyStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.updateHAStandbyStatus(ctx);
         }

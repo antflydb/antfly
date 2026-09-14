@@ -84,16 +84,16 @@ test {
 }
 
 const change_journal_mod = @import("derived/change_journal.zig");
-const ha_effects_mod = @import("../ha/effects.zig");
-const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
-const ha_fencing_mod = @import("../ha/fencing.zig");
-const ha_mutation_barrier_mod = @import("../ha/mutation_barrier.zig");
-const ha_primary_mod = @import("../ha/primary.zig");
-const ha_public_gate_state_mod = @import("../ha/public_gate_state.zig");
-const ha_replication_record_mod = @import("../ha/replication_record.zig");
-const ha_session_mod = @import("../ha/session.zig");
-const ha_standby_mod = @import("../ha/standby.zig");
-const ha_write_gate_mod = @import("../ha/write_gate.zig");
+const ha_effects_mod = @import("../hot_standby/effects.zig");
+const ha_commit_gate_mod = @import("../hot_standby/commit_gate.zig");
+const ha_fencing_mod = @import("../hot_standby/fencing.zig");
+const ha_mutation_barrier_mod = @import("../hot_standby/mutation_barrier.zig");
+const ha_primary_mod = @import("../hot_standby/primary.zig");
+const ha_public_gate_state_mod = @import("../hot_standby/public_gate_state.zig");
+const ha_replication_record_mod = @import("../hot_standby/replication_record.zig");
+const ha_session_mod = @import("../hot_standby/session.zig");
+const ha_standby_mod = @import("../hot_standby/standby.zig");
+const ha_write_gate_mod = @import("../hot_standby/write_gate.zig");
 const replay_stream_mod = @import("derived/replay_stream.zig");
 const derived_types = @import("derived/derived_types.zig");
 const derived_worker = @import("derived/derived_worker.zig");
@@ -32719,7 +32719,7 @@ pub const DB = struct {
             .durable_progress_ticks = runtime_snapshot.durable_progress_ticks,
             .idle_ticks = runtime_snapshot.idle_ticks,
             .error_ticks = runtime_snapshot.error_ticks,
-            .last_error_name = runtime_snapshot.last_error_name,
+            .last_error_name = if (runtime_snapshot.last_error_name) |name| types.RuntimeErrorName.init(name) else null,
             .total_metrics_scanned = @intCast(total.metrics_scanned),
             .total_active_builds = @intCast(total.active_builds),
             .total_builds_started = @intCast(total.builds_started),
@@ -51436,7 +51436,7 @@ test "db resolution handoff completion publishes fanout in one metadata batch" {
     }
 }
 
-test "storage.ha resolution handoff fence rejects completion after durable HA replay" {
+test "storage.hot_standby resolution handoff fence rejects completion after durable HA replay" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.heap.c_allocator;
@@ -55131,7 +55131,7 @@ fn applyDerivedBatchToIndexContextProfiled(
             const plan_base = write_start;
             var publication_plan = try ctx.index_manager.planTextMapperDocsPublication(
                 index_ref.name,
-                publication_context,
+                &publication_context,
                 collected.docs.items[plan_base..],
                 reservation_limit,
             );
@@ -95130,7 +95130,7 @@ test "db reopen replays pending derived embeddings from durable log" {
     try std.testing.expectEqual(appended_sequence, applied);
 }
 
-test "storage.ha db mirrors appended derived replay records into HA stream" {
+test "storage.hot_standby db mirrors appended derived replay records into HA stream" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -95194,7 +95194,7 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
     try std.testing.expectEqual(change_journal_mod.TargetHint.graph, decoded.record.target_hints[0]);
 }
 
-test "storage.ha db waits for remote apply before completing derived enrichment" {
+test "storage.hot_standby db waits for remote apply before completing derived enrichment" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -95275,7 +95275,7 @@ test "storage.ha db waits for remote apply before completing derived enrichment"
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
 }
 
-test "storage.ha db mirrors committed batch mutations into HA stream for standby apply" {
+test "storage.hot_standby db mirrors committed batch mutations into HA stream for standby apply" {
     const alloc = std.testing.allocator;
 
     var primary_db_path_tmp = try TestDirectory.init("db");
@@ -95381,7 +95381,7 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", found.json);
 }
 
-test "storage.ha seed capture barrier prevents local commit without matching wal" {
+test "storage.hot_standby seed capture barrier prevents local commit without matching wal" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.heap.c_allocator;
@@ -95450,7 +95450,7 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
     try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
 }
 
-test "storage.ha seed snapshot predrains enrichment before exclusive capture" {
+test "storage.hot_standby seed snapshot predrains enrichment before exclusive capture" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -95550,7 +95550,7 @@ test "storage.ha seed snapshot predrains enrichment before exclusive capture" {
     try std.testing.expect(snapshot_size > 0);
 }
 
-test "storage.ha fence cannot strand a local commit beyond the HA tail" {
+test "storage.hot_standby fence cannot strand a local commit beyond the HA tail" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.heap.c_allocator;
@@ -95626,7 +95626,7 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
     try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
 }
 
-test "storage.ha schema json mutation does not reacquire shared barrier behind queued capture" {
+test "storage.hot_standby schema json mutation does not reacquire shared barrier behind queued capture" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -95715,7 +95715,7 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
 }
 
-test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
+test "storage.hot_standby db evaluates sync commit gate for mirrored batch mutations" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -95778,7 +95778,7 @@ test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
     try std.testing.expectEqual(@as(u64, 1), degraded.load(.acquire));
 }
 
-test "storage.ha db block sync policy waits for standby acknowledgement" {
+test "storage.hot_standby db block sync policy waits for standby acknowledgement" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -95854,7 +95854,7 @@ test "storage.ha db block sync policy waits for standby acknowledgement" {
     try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
 }
 
-test "storage.ha synchronous waits pipeline later commits by lsn" {
+test "storage.hot_standby synchronous waits pipeline later commits by lsn" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.heap.c_allocator;
@@ -95966,7 +95966,7 @@ test "storage.ha synchronous waits pipeline later commits by lsn" {
     defer alloc.free(second_value);
 }
 
-test "storage.ha durable outbox recovery does not duplicate an appended batch" {
+test "storage.hot_standby durable outbox recovery does not duplicate an appended batch" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -96050,7 +96050,7 @@ test "storage.ha durable outbox recovery does not duplicate an appended batch" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ha_batch_outbox_key));
 }
 
-test "storage.ha durable outbox cleanup is mutation scoped" {
+test "storage.hot_standby durable outbox cleanup is mutation scoped" {
     const alloc = std.testing.allocator;
     var db_path_tmp = try TestDirectory.init("db");
     defer db_path_tmp.cleanup();
@@ -96082,7 +96082,7 @@ test "storage.ha durable outbox cleanup is mutation scoped" {
     try std.testing.expectEqualStrings("b", (try decodeDurableHAOutbox(surviving)).payload);
 }
 
-test "storage.ha db session sync wait satisfies remote apply through standby DB apply" {
+test "storage.hot_standby db session sync wait satisfies remote apply through standby DB apply" {
     const alloc = std.testing.allocator;
 
     var primary_db_path_tmp = try TestDirectory.init("db");
@@ -96183,7 +96183,7 @@ test "storage.ha db session sync wait satisfies remote apply through standby DB 
     try std.testing.expectEqualStrings("{\"title\":\"remote-apply\"}", found.json);
 }
 
-test "storage.ha db allows progress but rejects acknowledgement when fenced during remote apply wait" {
+test "storage.hot_standby db allows progress but rejects acknowledgement when fenced during remote apply wait" {
     const alloc = std.testing.allocator;
 
     var primary_db_path_tmp = try TestDirectory.init("db");
@@ -96322,7 +96322,7 @@ test "storage.ha db allows progress but rejects acknowledgement when fenced duri
     try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
 }
 
-test "storage.ha db session sync wait remote write acknowledges durable receive despite apply failure" {
+test "storage.hot_standby db session sync wait remote write acknowledges durable receive despite apply failure" {
     const alloc = std.testing.allocator;
 
     var primary_db_path_tmp = try TestDirectory.init("db");
@@ -96424,7 +96424,7 @@ test "storage.ha db session sync wait remote write acknowledges durable receive 
     try std.testing.expectEqualStrings("{\"title\":\"remote-write\"}", found.json);
 }
 
-test "storage.ha db primary progress sync wait observes reported remote apply ack" {
+test "storage.hot_standby db primary progress sync wait observes reported remote apply ack" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -96508,7 +96508,7 @@ test "storage.ha db primary progress sync wait observes reported remote apply ac
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
 }
 
-test "storage.ha primary progress sync wait fast fails without enough eligible candidates" {
+test "storage.hot_standby primary progress sync wait fast fails without enough eligible candidates" {
     const alloc = std.testing.allocator;
 
     var ha_log_path_tmp = try TestDirectory.init("db");
@@ -96558,7 +96558,7 @@ test "storage.ha primary progress sync wait fast fails without enough eligible c
     try std.testing.expectEqual(@as(usize, 1), poll.calls);
 }
 
-test "storage.ha db primary progress sync wait returns would block without reported ack" {
+test "storage.hot_standby db primary progress sync wait returns would block without reported ack" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -96620,7 +96620,7 @@ test "storage.ha db primary progress sync wait returns would block without repor
     try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
 }
 
-test "storage.ha pending acknowledgement preserves batch and replay tail order" {
+test "storage.hot_standby pending acknowledgement preserves batch and replay tail order" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -96762,7 +96762,7 @@ test "db transaction HA retry drains durable mirror outbox" {
     try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
 }
 
-test "storage.ha db primary progress sync wait survives primary restart before ack" {
+test "storage.hot_standby db primary progress sync wait survives primary restart before ack" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -96850,7 +96850,7 @@ test "storage.ha db primary progress sync wait survives primary restart before a
     }
 }
 
-test "storage.ha db block sync policy surfaces wait provider errors" {
+test "storage.hot_standby db block sync policy surfaces wait provider errors" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -96920,7 +96920,7 @@ test "storage.ha db block sync policy surfaces wait provider errors" {
     try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
 }
 
-test "storage.ha db fail-closed sync policy rejects before local batch commit" {
+test "storage.hot_standby db fail-closed sync policy rejects before local batch commit" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -97012,7 +97012,7 @@ test "db transaction recovery identity context owns schema generations" {
     try std.testing.expectEqual(@as(u32, 2), ctx.relational_schema_version);
 }
 
-test "storage.ha schema wait failure reports unknown after durable local commit" {
+test "storage.hot_standby schema wait failure reports unknown after durable local commit" {
     const alloc = std.testing.allocator;
     const public_schema_json =
         \\{"version":7,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
@@ -97095,7 +97095,7 @@ test "storage.ha schema wait failure reports unknown after durable local commit"
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
-test "storage.ha db mirrors and applies schema metadata mutation records" {
+test "storage.hot_standby db mirrors and applies schema metadata mutation records" {
     const alloc = std.testing.allocator;
     const public_schema_json =
         \\{"version":12,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","enum":["active"]}},"required":["id","status"],"additionalProperties":false}}}}
@@ -97206,7 +97206,7 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
     try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
 }
 
-test "storage.ha db applies batch mutation records through replication session callback" {
+test "storage.hot_standby db applies batch mutation records through replication session callback" {
     const alloc = std.testing.allocator;
 
     var standby_db_path_tmp = try TestDirectory.init("db");
@@ -97318,7 +97318,7 @@ test "storage.ha db applies batch mutation records through replication session c
     try std.testing.expectEqual(@as(usize, 2), replay_after_duplicates.len);
 }
 
-test "storage.ha db persists applied replication marker across reopen" {
+test "storage.hot_standby db persists applied replication marker across reopen" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -97373,7 +97373,7 @@ test "storage.ha db persists applied replication marker across reopen" {
     try std.testing.expectEqual(@as(u64, 1), replay_entries[0].sequence);
 }
 
-test "storage.ha db applies timeline switch as durable replication boundary" {
+test "storage.hot_standby db applies timeline switch as durable replication boundary" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -97410,7 +97410,7 @@ test "storage.ha db applies timeline switch as durable replication boundary" {
     try std.testing.expectEqual(@as(u64, 7), try reopened.haAppliedReplicationLsn());
 }
 
-test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {
+test "storage.hot_standby db write gate rejects client writes on standby but allows replicated apply" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -97472,7 +97472,7 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectEqualStrings("{\"title\":\"replicated\"}", found.json);
 }
 
-test "storage.ha db write gate rejects fenced former primary writes" {
+test "storage.hot_standby db write gate rejects fenced former primary writes" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -97542,7 +97542,7 @@ test "storage.ha db write gate rejects fenced former primary writes" {
     }
 }
 
-test "storage.ha db standby role suppresses mutating background runtimes" {
+test "storage.hot_standby db standby role suppresses mutating background runtimes" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");

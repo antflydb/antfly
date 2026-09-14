@@ -253,9 +253,9 @@ pub fn configureUnitStorageTestRun(
     if (allow_empty_filter) run.addArg("--allow-empty-test-filter");
     addRuntimeSkipTestFilters(run, unit_skip_filters);
     for (root_skip_filters) |filter| {
-        // `storage.ha` keeps the HA suite out of broad root-module test runs.
+        // `storage.hot_standby` keeps the HA suite out of broad root-module test runs.
         // Applying it to the dedicated shard would select zero tests.
-        if (is_ha_shard and std.mem.eql(u8, filter, "storage.ha")) continue;
+        if (is_ha_shard and std.mem.eql(u8, filter, "storage.hot_standby")) continue;
         run.addArgs(&.{ "--skip-test-filter", filter });
     }
     addRuntimeSkipTestFilters(run, extra_skip_filters);
@@ -330,6 +330,52 @@ pub fn addCuratedTestRunArtifact(
     for (suite_filters) |filter| run.addArgs(&.{ "--suite-filter", filter });
     addRuntimeTestFilters(b, run, selectTestFilters(b, suite_filters));
     return run;
+}
+
+/// An owner can span disjoint compiler shards without turning caller filters
+/// into compiler inputs. Validate the selection against their combined inventory
+/// before running; Zig retains ownership of native/foreign execution.
+pub const OwnerTests = struct {
+    artifact: *std.Build.Step.Compile,
+    filters: []const []const u8,
+    skip_filters: []const []const u8 = &.{},
+};
+
+pub fn addOwnerTestRuns(b: *std.Build, owner: *std.Build.Step, shards: []const OwnerTests, skips: []const []const u8) void {
+    const selected = selectTestFilters(b, &.{});
+    const audit = b.addSystemCommand(&.{"python3"});
+    audit.addFileArg(b.path("tools/audit_test_selection.py"));
+    for (selected) |filter| audit.addArgs(&.{ "--filter", filter });
+    for (skips) |filter| audit.addArgs(&.{ "--skip-filter", filter });
+    const args = b.args orelse &.{};
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        if (std.mem.eql(u8, args[index], "--allow-empty-test-filter")) {
+            audit.addArg("--allow-empty");
+        } else if (std.mem.eql(u8, args[index], "--skip-test-filter")) {
+            index += 1;
+            if (index >= args.len) @panic("missing skip test filter");
+            audit.addArgs(&.{ "--skip-filter", args[index] });
+        } else if (std.mem.startsWith(u8, args[index], "--skip-test-filter=")) {
+            audit.addArgs(&.{ "--skip-filter", args[index]["--skip-test-filter=".len..] });
+        }
+    }
+    var previous: *std.Build.Step = &audit.step;
+    for (shards) |shard| {
+        const inventory = b.addRunArtifact(shard.artifact);
+        inventory.addArgs(&.{ "--list-tests", "--allow-empty-test-filter" });
+        for (shard.filters) |filter| inventory.addArgs(&.{ "--suite-filter", filter });
+        addRuntimeSkipTestFilters(inventory, shard.skip_filters);
+        audit.addArg("--inventory");
+        audit.addFileArg(inventory.captureStdErr(.{}));
+        const run = addCuratedTestRunArtifact(b, shard.artifact, shard.filters);
+        run.addArg("--allow-empty-test-filter");
+        addRuntimeSkipTestFilters(run, skips);
+        addRuntimeSkipTestFilters(run, shard.skip_filters);
+        run.step.dependOn(previous);
+        previous = &run.step;
+    }
+    owner.dependOn(previous);
 }
 
 pub fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
