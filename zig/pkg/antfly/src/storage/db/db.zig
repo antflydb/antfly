@@ -112661,8 +112661,8 @@ test "db general profiled search retains direct and lowered dense telemetry" {
     try db.addIndex(.{ .name = "vec", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}" });
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"_embeddings\":{\"vec\":[1,0,0]}}" },
-            .{ .key = "doc:b", .value = "{\"_embeddings\":{\"vec\":[0,1,0]}}" },
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"vec\":[1,0,0]}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"vec\":[0,1,0]}}" },
         },
         .sync_level = .full_index,
     });
@@ -112672,13 +112672,13 @@ test "db general profiled search retains direct and lowered dense telemetry" {
         .{ .index_name = "vec", .query = .{ .dense_knn = dense }, .limit = 2, .profile = true },
         .{ .dense_queries = &.{.{ .name = "vec", .index_name = "vec", .query = dense }}, .limit = 2, .profile = true },
     }) |req| {
+        var ordinary = try db.searchWithCapturedRequest(alloc, req);
+        defer ordinary.result.deinit();
         var profiled = try db.searchWithDenseProfile(alloc, req);
         defer profiled.result.deinit();
         const profile = profiled.dense_profile orelse return error.MissingDenseProfile;
         try std.testing.expect(profile.search_route.len > 0);
         try std.testing.expectEqual(@as(u64, 2), profile.returned_hit_count);
-        var ordinary = try db.searchWithCapturedRequest(alloc, req);
-        defer ordinary.result.deinit();
         try std.testing.expectEqual(ordinary.request.identity_read_generation, profiled.request.identity_read_generation);
         try std.testing.expectEqual(ordinary.result.hits.len, profiled.result.hits.len);
         for (ordinary.result.hits, profiled.result.hits) |expected, actual| {
