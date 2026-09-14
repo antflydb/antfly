@@ -1559,7 +1559,7 @@ const AsyncContext = struct {
     // after admission.
     portable_runtime_activation_pending: std.atomic.Value(bool) = .init(false),
     snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
-    repair_replay_mutex: ?*std.atomic.Mutex = null,
+    repair_replay_mutex: ?*std.Io.Mutex = null,
     repair_sequence: u64 = 0,
     repair_issue_counter: ?*AtomicU64 = null,
     allow_graph_materialization: bool = true,
@@ -2213,7 +2213,7 @@ const EnrichmentAppendContext = struct {
     portable_runtime_activation_pending: ?*const std.atomic.Value(bool) = null,
     snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
-    repair_replay_mutex: ?*std.atomic.Mutex = null,
+    repair_replay_mutex: ?*std.Io.Mutex = null,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     executor: *derived_executor_mod.Executor,
@@ -2286,7 +2286,7 @@ const BatchExecutionContext = struct {
     portable_runtime_activation_pending: ?*const std.atomic.Value(bool) = null,
     snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
-    repair_replay_mutex: ?*std.atomic.Mutex = null,
+    repair_replay_mutex: ?*std.Io.Mutex = null,
     log_mutex: *std.atomic.Mutex,
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: ?*std.atomic.Value(bool) = null,
@@ -15643,8 +15643,8 @@ pub const DB = struct {
         alloc: Allocator,
         repair_id: u128,
     ) !PinnedIndexRepairSnapshot {
-        lockAtomic(self.core.repair_replay_mutex);
-        defer self.core.repair_replay_mutex.unlock();
+        self.core.repair_replay_mutex.lockUncancelable(self.core.index_manager.checkpointIo());
+        defer self.core.repair_replay_mutex.unlock(self.core.index_manager.checkpointIo());
         const location = try self.indexRepairStateLocation();
         var state = try index_repair_state.loadAt(alloc, location);
         defer state.deinit(alloc);
@@ -17200,8 +17200,8 @@ pub const DB = struct {
         // leases are insufficient because two different indexes may complete
         // concurrently.
         const repair_replay_mutex = ctx.repair_replay_mutex orelse return error.DurableIndexRepairStateUnavailable;
-        lockAtomic(repair_replay_mutex);
-        defer repair_replay_mutex.unlock();
+        repair_replay_mutex.lockUncancelable(ctx.index_manager.checkpointIo());
+        defer repair_replay_mutex.unlock(ctx.index_manager.checkpointIo());
         const location = try indexRepairStateLocationContext(ctx);
         var state = try index_repair_state.loadAt(alloc, location);
         defer state.deinit(alloc);
@@ -59873,8 +59873,8 @@ fn clampReplayTruncationForRepairPins(
 
 fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
-    if (ctx.repair_replay_mutex) |mutex| lockAtomic(mutex);
-    defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock();
+    if (ctx.repair_replay_mutex) |mutex| mutex.lockUncancelable(ctx.index_manager.checkpointIo());
+    defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock(ctx.index_manager.checkpointIo());
     var effective = sequence;
     // Generated enrichment consumes the same durable replay journal as the
     // managed-index executor, but advances independently. The executor may
@@ -59906,8 +59906,8 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
 }
 
 fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
-    if (ctx.repair_replay_mutex) |mutex| lockAtomic(mutex);
-    defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock();
+    if (ctx.repair_replay_mutex) |mutex| mutex.lockUncancelable(ctx.index_manager.checkpointIo());
+    defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock(ctx.index_manager.checkpointIo());
     if (!ctx.index_manager.hasManagedIndexes()) return;
 
     const managed_indexes = try ctx.index_manager.managedIndexes(ctx.alloc);
@@ -66238,6 +66238,81 @@ test "db close retires runtime owners for memory primary backend" {
         .run = Fns.run,
         .deinit = Fns.deinit,
     }));
+}
+
+test "db replay truncation waits for repair pins through borrowed VoprIo" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{});
+    defer vopr_io.deinit();
+    const io = vopr_io.io();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = io },
+    });
+    defer runtime.deinit();
+    var db = try DB.open(alloc, "/replay-pin-lock-vopr", .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const Work = struct {
+        fn run(database: *DB, asynchronous: bool, completed: *bool) !void {
+            if (asynchronous) {
+                try truncateReplaySequenceAsync(database.async_context, 0);
+            } else {
+                var ctx = database.batchContext();
+                try truncateReplayJournalIfSafeContext(&ctx);
+            }
+            completed.* = true;
+        }
+    };
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    for ([_]bool{ false, true }) |asynchronous| {
+        const mutex = db.core.repair_replay_mutex;
+        mutex.lockUncancelable(io);
+        var locked = true;
+        var completed = false;
+        var future = io.async(Work.run, .{ &db, asynchronous, &completed });
+        defer {
+            if (locked) mutex.unlock(io);
+            _ = vopr_io.cancelAndDrainTasksForTeardown(alloc, 64) catch @panic("replay pin test cleanup failed");
+            _ = future.cancel(io) catch {};
+        }
+        const scheduler = vopr_io.scheduler();
+        for (0..16) |_| {
+            if (vopr_io.futureTaskSnapshot(future.any_future.?).?.waiting_on_futex) break;
+            enabled.items.clearRetainingCapacity();
+            try scheduler.enumerateReady(&enabled, alloc);
+            try enabled.canonicalize();
+            try std.testing.expect(enabled.items.items.len != 0);
+            try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
+        }
+        try std.testing.expect(!completed);
+        try std.testing.expect(vopr_io.futureTaskSnapshot(future.any_future.?).?.waiting_on_futex);
+        mutex.unlock(io);
+        locked = false;
+        for (0..32) |_| {
+            if (scheduler.quiescent()) break;
+            enabled.items.clearRetainingCapacity();
+            try scheduler.enumerateReady(&enabled, alloc);
+            try enabled.canonicalize();
+            try std.testing.expect(enabled.items.items.len != 0);
+            try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
+        }
+        try std.testing.expect(scheduler.quiescent());
+        try future.await(io);
+        try std.testing.expect(completed);
+    }
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "db implicit batch timestamps use the borrowed runtime clock" {

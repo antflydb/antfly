@@ -71,10 +71,10 @@ pub fn reclaimSliceLocked(backend: anytype) void {
     if (!pending(backend)) return;
     backend.memtable_reclaim_in_flight = true;
     backend.retainReaderKind(.other);
-    const started = clock.monotonicNs();
+    const started = runtime.workNowNs(backend);
     const deadline = started +| 2 * std.time.ns_per_ms;
     var credits: usize = 2048;
-    while (credits != 0 and clock.monotonicNs() < deadline) {
+    while (credits != 0 and runtime.workNowNs(backend) < deadline) {
         if (backend.memtable_reclaimer == null) {
             const state = backend.retired_memory_head orelse break;
             backend.retired_memory_head = state.retired_next;
@@ -96,7 +96,7 @@ pub fn reclaimSliceLocked(backend: anytype) void {
     }
     backend.memtable_reclaim_slices +|= 1;
     backend.memtable_reclaim_units +|= 2048 - credits;
-    backend.memtable_reclaim_max_slice_ns = @max(backend.memtable_reclaim_max_slice_ns, clock.monotonicNs() -| started);
+    backend.memtable_reclaim_max_slice_ns = @max(backend.memtable_reclaim_max_slice_ns, runtime.workNowNs(backend) -| started);
     backend.releaseReaderKind(.other);
     backend.memtable_reclaim_in_flight = false;
     backend.syncTrackedInMemoryStateUsageCurrentLocked();
@@ -338,4 +338,35 @@ test "memtable reclamation last-reference latency benchmark" {
         const drain_ns = clock.monotonicNs() -| drain_start;
         std.debug.print("\nmemtable-retirement rows={d} old_deinit_ns={d} read_release_ns={d} remaining_drain_ns={d} slices={d} max_slice_ns={d}\n", .{ count, old_ns, release_ns, drain_ns, backend.memtable_reclaim_slices, backend.memtable_reclaim_max_slice_ns });
     }
+}
+
+test "memtable reclamation honors the borrowed work deadline" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Clock = struct {
+        var first: bool = true;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const value: i96 = if (first) 0 else 3 * std.time.ns_per_ms;
+            first = false;
+            return .fromNanoseconds(value);
+        }
+    };
+    Clock.first = true;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    var io = std.testing.io;
+    io.vtable = &vtable;
+    var backend = Backend.init(std.testing.allocator, .{ .read_runtime = .{ .io = io } });
+    defer backend.close();
+    const state = try makeState(std.testing.allocator, 9, .tree);
+    try std.testing.expect(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    retire(&backend, state);
+    // The owner clock expires the first slice before any destruction. The
+    // next slice starts at the new time and can reclaim the retained state.
+    Clock.first = true;
+    reclaimSliceLocked(&backend);
+    try std.testing.expectEqual(@as(u64, 0), backend.memtable_reclaim_units);
+    try std.testing.expect(pending(&backend));
+    reclaimSliceLocked(&backend);
+    try std.testing.expect(!pending(&backend));
 }

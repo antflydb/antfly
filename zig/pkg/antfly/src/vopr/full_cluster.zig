@@ -922,8 +922,26 @@ pub const Scenario = struct {
         fn init(alloc: std.mem.Allocator) !*State {
             const self = try alloc.create(State);
             errdefer alloc.destroy(self);
-            self.owner_alloc = alloc;
-            self.fixture_allocator = .init;
+            try self.initAllocated(alloc);
+            return self;
+        }
+
+        fn initAllocated(self: *State, alloc: std.mem.Allocator) !void {
+            // Apply every declared default before acquiring resources, including
+            // teardown ownership when the allocator reuses a released State.
+            self.* = .{
+                .owner_alloc = alloc,
+                .fixture_allocator = .init,
+                .sim = undefined,
+                .service_rate_model = undefined,
+                .data_service_rate_adapters = undefined,
+                .graph_service_rate_adapters = undefined,
+                .serverless_service_rate_adapter = undefined,
+                .query_cache_service_rate_adapter = undefined,
+                .replication_service_rate_adapter = undefined,
+                .replication = undefined,
+                .serverless = undefined,
+            };
             errdefer _ = self.fixture_allocator.deinit();
             const fixture_alloc = self.fixture_allocator.allocator();
             self.sim = try vopr.vopr_io.VoprIo.init(.{
@@ -938,8 +956,6 @@ pub const Scenario = struct {
                 .instrumentation = .{ .enabled = false, .map_digest = 0x4655_4c4c },
             });
             errdefer self.sim.deinit();
-            self.service_rates_enabled = false;
-            self.service_rates_healed = false;
             self.service_rate_model = try vopr.service_rate.Model.init(
                 fixture_alloc,
                 &service_nodes,
@@ -968,7 +984,6 @@ pub const Scenario = struct {
                 .port = try self.service_rate_model.port(self.sim.io(), service_nodes[0].id),
                 .healed = &self.service_rates_healed,
             };
-            self.replication_pre_heal_done = false;
             self.replication_service_rate_adapter = .{
                 // The production replication worker targets node 1's public
                 // owner first, so its own work rounds and the resulting
@@ -983,52 +998,7 @@ pub const Scenario = struct {
             errdefer self.replication.deinit();
             self.serverless = try serverless_workflow.Scenario.Fixture.initWithVoprIo(fixture_alloc, &self.sim);
             errdefer self.serverless.deinit();
-            self.mode = null;
-            self.public_cluster = null;
-            self.production_cluster = null;
-            self.ha_scaling_enabled = false;
-            self.deployment = null;
-            self.serverless_future = null;
-            self.query_cache_future = null;
-            self.replication_future = null;
-            self.completion_future = null;
-            self.initialization_done = false;
-            self.initialization_failed = false;
-            self.initialization_error_code = 0;
-            self.serverless_done = false;
-            self.serverless_sound = false;
-            self.serverless_public_sound = false;
-            self.serverless_public_error_code = 0;
-            self.query_cache_compute_release = .unset;
-            self.query_cache_producer_started = false;
-            self.query_cache_pre_heal_done = false;
-            self.query_cache_done = false;
-            self.query_cache_sound = false;
-            self.query_cache_error_code = 0;
-            self.query_cache_compute_calls = 0;
-            self.query_cache_successful_results = 0;
-            self.query_cache_waiter_timed_out = false;
-            self.query_cache_owner_restarted = false;
-            self.query_cache_restart_empty = false;
-            self.query_cache_durable_read = false;
-            self.query_cache_restart_read_attempts = 0;
-            self.query_cache_restart_read_failures = 0;
-            self.query_cache_restart_read_error_code = 0;
-            self.query_cache_pre_restart_stats = .{};
-            self.query_cache_post_restart_stats = .{};
-            self.query_cache_pre_restart_budget_used = 0;
-            self.query_cache_post_restart_budget_used = 0;
-            self.replication_pre_heal_done = false;
-            self.replication_done = false;
-            self.replication_sound = false;
-            self.replication_public_visible = false;
-            self.replication_error_code = 0;
-            self.shared_io_sound = false;
-            self.deployment_sound = false;
-            self.complete = false;
-            self.tearing_down = false;
             self.initialization_future = self.sim.io().async(initializeAndRun, .{self});
-            return self;
         }
 
         fn releaseRuntime(self: *State) void {
@@ -1046,6 +1016,10 @@ pub const Scenario = struct {
                 self.fixture_allocator.allocator(),
                 100_000,
             ) catch |err| {
+                var task_index: usize = 0;
+                while (self.sim.taskSnapshotAt(task_index)) |task| : (task_index += 1) {
+                    if (task.status != .finished) std.debug.print("full-cluster teardown retained task={any}\n", .{task});
+                }
                 if (self.sim.firstCapabilityViolation()) |violation| std.debug.panic(
                     "full-cluster VOPR teardown could not drain canceled tasks: {s}; first capability violation={s} sequence={}",
                     .{ @errorName(err), @tagName(violation.operation), violation.sequence },
@@ -1978,7 +1952,7 @@ pub const Scenario = struct {
                     );
                 }
             } else {
-                public_fixture = metadata_vopr.VoprPublicClusterFixture.init(
+                public_fixture = metadata_vopr.VoprPublicClusterFixture.create(
                     self.fixture_allocator.allocator(),
                     &self.sim,
                 ) catch |err| {
@@ -1988,7 +1962,17 @@ pub const Scenario = struct {
                     self.complete = true;
                     return;
                 };
+                // Publish ownership before bootstrap can suspend. Replay may
+                // stop at any startup transition, so teardown must also signal
+                // partially initialized listeners and background owners.
                 self.public_cluster = public_fixture;
+                public_fixture.?.bootstrap() catch |err| {
+                    self.initialization_failed = true;
+                    self.initialization_error_code = @intFromError(err);
+                    self.initialization_done = true;
+                    self.complete = true;
+                    return;
+                };
             }
             self.deployment = vopr.deployment.Composer.init(
                 self.fixture_allocator.allocator(),
@@ -3353,6 +3337,37 @@ pub const HAScalingScenario = struct {
     }
 };
 
+test "full cluster VOPR initializes teardown ownership on reused memory" {
+    const alloc = std.testing.allocator;
+    const backing = try alloc.alloc(u8, @sizeOf(Scenario.State) + @alignOf(Scenario.State));
+    defer alloc.free(backing);
+    // A previously released State leaves this boolean true. Make that heap
+    // history deterministic instead of relying on fresh pages being zeroed.
+    var owner = std.heap.FixedBufferAllocator.init(backing);
+    const state = try owner.allocator().create(Scenario.State);
+    @memset(std.mem.asBytes(state), 1);
+    try state.initAllocated(owner.allocator());
+    defer state.deinit();
+    state.releaseRuntime();
+    const skipped_cleanup = !state.tearing_down;
+    if (skipped_cleanup) {
+        // Unwind even the broken implementation so the regression reports an
+        // assertion instead of leaking its pending initialization task.
+        state.runtime_released = false;
+        state.releaseRuntime();
+    }
+    try std.testing.expect(!skipped_cleanup);
+    try std.testing.expect(state.sim.scheduler().quiescent());
+    const resources = state.sim.resourceSnapshot();
+    try std.testing.expectEqual(@as(usize, 0), resources.active_tasks);
+    try std.testing.expectEqual(@as(usize, 0), resources.total_tasks);
+    try std.testing.expectEqual(@as(usize, 0), resources.open_file_handles);
+    try std.testing.expectEqual(@as(usize, 0), resources.open_sockets);
+    // Finalization and deinit both release the runtime; the second call must
+    // remain safe after all owned fixtures have already been destroyed.
+    state.releaseRuntime();
+}
+
 pub fn recordHAScaling(alloc: std.mem.Allocator, seed: u64, transition_budget: u64) !vopr.trace.Trace {
     var choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{}, seed);
     const backends = vopr.vopr_io.artifactBackendIds();
@@ -3688,6 +3703,21 @@ fn runExactMode(
     }
 }
 
+test "full cluster VOPR bounded startup cleanup exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = @intFromEnum(Scenario.Mode.clean);
+    for ([_]u64{ 1, 32, 512, 8192 }) |budget| {
+        try runExactMode(
+            history_allocator.allocator(),
+            Scenario.mode_ids[ordinal],
+            ordinal,
+            budget,
+            .bounded_lifecycle,
+        );
+    }
+}
+
 test "full cluster VOPR exact replays the composed deployment and recovery" {
     // Stackful fibers make host unwinding both expensive and unsafe. Preserve
     // leak and ownership checking while keeping stack capture disabled, as the
@@ -3709,6 +3739,7 @@ test "full cluster VOPR exact replays the composed deployment and recovery" {
     };
     for (promoted_mode_ordinals) |mode_ordinal| {
         const mode_id = Scenario.mode_ids[mode_ordinal];
+        std.debug.print("full-cluster replay mode={s}\n", .{Scenario.mode_names[mode_ordinal]});
         try runExactMode(history_alloc, mode_id, mode_ordinal, 50_000, .complete);
     }
 }

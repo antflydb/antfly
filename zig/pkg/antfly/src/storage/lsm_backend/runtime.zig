@@ -41,6 +41,31 @@ const namespaceOf = state_mod.namespaceOf;
 const compareNamespace = state_mod.compareNamespace;
 const compareEntryTo = state_mod.compareEntryTo;
 
+/// CPU work slices share the I/O authority used for cooperative continuation.
+/// Storage timestamps separately govern retention and durable file ages.
+pub fn workNowNs(backend: anytype) u64 {
+    return workIoNowNs(if (comptime @hasDecl(@TypeOf(backend.*), "manifestCoordinationIo")) backend.manifestCoordinationIo() else null);
+}
+
+fn workIoNowNs(io: ?std.Io) u64 {
+    if (io) |owner| {
+        const now = std.Io.Clock.awake.now(owner).toNanoseconds();
+        return @intCast(@max(0, @min(now, std.math.maxInt(u64))));
+    }
+    return @import("antfly_platform").time.monotonicNs();
+}
+
+/// Keep the clock with deadlines passed to cursors that do not own a backend.
+/// Callers explicitly select native time with null when no I/O owner exists.
+pub const WorkDeadline = struct {
+    io: ?std.Io,
+    at_ns: u64,
+
+    pub fn expired(self: WorkDeadline) bool {
+        return workIoNowNs(self.io) >= self.at_ns;
+    }
+};
+
 const OwnedBytes = struct {
     allocator: Allocator,
     bytes: []u8,

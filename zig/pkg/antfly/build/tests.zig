@@ -2808,8 +2808,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "metadata raft apply store catalog projection uses storage snapshot independently from apply mutex",
             "db modeled index repair adopts replacements with the serving allocator",
             "db implicit batch timestamps use the borrowed runtime clock",
+            "db replay truncation waits for repair pins through borrowed VoprIo",
             "graph workers report retired ranges as topology unavailability",
             "full cluster production data plane VOPR bounded cutoff exact replay",
+            "full cluster VOPR initializes teardown ownership on reused memory",
+            "full cluster VOPR bounded startup cleanup exact replay",
             "full cluster VOPR exact replays the composed deployment and recovery",
             "full cluster VOPR exact replays resource pressure recovery",
             "shared stateless batch retries borrow IO and preserve unknown outcomes",
@@ -2841,7 +2844,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const full_cluster_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"full cluster VOPR exact replays"},
+        .filters = &.{
+            "full cluster VOPR exact replays",
+            "full cluster VOPR initializes teardown ownership on reused memory",
+            "full cluster VOPR bounded startup cleanup exact replay",
+        },
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_full_cluster_vopr_tests = b.addRunArtifact(full_cluster_vopr_tests);
@@ -3638,6 +3645,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "background maintenance services lifecycle runs on borrowed VoprIo",
         "generation publication replays durable identities on borrowed VoprIo",
         "graph ownership cleanup runs on borrowed VoprIo before replicated merge",
+        "db replay truncation waits for repair pins through borrowed VoprIo",
         "replicated split destination seeds inherited doc identity before range publication",
         "replicated merge retains its resident writer while graph ownership cleanup is pending",
         "table provisioner materializes metadata indexes into hosted group dbs",
