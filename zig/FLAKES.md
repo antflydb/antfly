@@ -108,6 +108,47 @@ with four workers and no retries, failures, or skips. The log is
 hash are recorded in `/tmp/maintenance-followup-validation.json`. These are
 native macOS arm64 Debug results; Linux CI validation remains pending.
 
+### Review follow-up: transient borrowing and activation assertions
+
+Review of #723 found that an observational lease marked a transient owner as
+adopted. A status probe overlapping warmup could therefore retain an idle DB
+indefinitely. Residency now belongs explicitly to foreground admission or
+retained background debt. Status and maintenance leases only borrow the owner;
+transient cleanup records retirement and the final borrower closes it. New
+observations cannot prolong pending retirement, while foreground admission can
+adopt the same owner before the last borrower releases it. Prepared Raft writes
+also adopt residency. Restore-marker reads use the same pinned retirement
+protocol, eliminating their remaining release-then-retire-by-group path.
+
+The linked owner suite exercises five deterministic lease histories: a status
+probe finishing before warmup cleanup, a probe spanning cleanup, maintenance
+spanning cleanup, foreground adoption, and prepared-Raft adoption. It also
+checks that completed leases cannot retire a replacement owner. The activation
+regression now requires a newer, fresh, target-complete publication for group
+7001 and the expected dense-index generation/configuration hash, instead of
+accepting an idle worker alone. These regressions run in the existing storage
+owner aggregates.
+
+Restoring observational adoption in a temporary negative-control build made
+the new lease-history regression fail at `expect(!original.resident)`; the
+other three checks passed, and no leaks were reported. The corrected source
+was restored byte-for-byte. Evidence:
+`/tmp/maintenance-review-negative-control.log`.
+
+The restored revision passed **4/4** linked owner checks with no skips,
+failures, or leaks (`/tmp/maintenance-review-owner-final.log`). A fresh soak
+again passed **100/100 per scenario, 400/400 total**, with four workers and no
+retries or skips (`/tmp/maintenance-review-e2e-100.log`). The three complete E2E
+modules passed **54 tests**, with the opt-in million-chunk scale test skipped,
+using four pytest workers and two process slots
+(`/tmp/maintenance-review-modules.log`). Formatting and diff checks passed;
+the temporary validation build step was removed.
+
+The native macOS arm64 Debug binary SHA-256 is
+`1bab589bbe0948595bdd213bec52f399f61b1f72fd24da1ee59999361c08de25`.
+Per-scenario counts are in `/tmp/maintenance-followup-validation.json`.
+Linux CI must validate this pushed revision independently.
+
 ## 2026-09-12: combined unit build/test budget terminates progressing DB-core (#716)
 
 [The Linux unit job](https://github.com/antflydb/antfly/actions/runs/34714680318/job/103609868433)

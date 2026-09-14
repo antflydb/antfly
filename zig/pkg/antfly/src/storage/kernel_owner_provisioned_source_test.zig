@@ -288,6 +288,12 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     // A compiled owner must return its post-reconcile observation to the
     // control-plane publisher. Completing the DB mutation without those facts
     // leaves exact activation retrying EmptyTargetedIndexObservation forever.
+    var before_activation = (try snapshot_cache.snapshot(alloc, "articles")).?;
+    defer before_activation.deinit(alloc);
+    const before_status = before_activation.items[0];
+    const expected_index = for (before_status.stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, "dense_idx")) break item;
+    } else return error.ExpectedDenseIndex;
     _ = try write_source.source().createIndex(alloc, "articles", "dense_idx", "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}");
     {
         const time = @import("antfly_platform").time;
@@ -297,6 +303,23 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         while (write_source.structural_reconcile_scheduled.load(.acquire) and time.monotonicNs() < deadline)
             try io_impl.io().sleep(.fromMilliseconds(5), .awake);
         try std.testing.expect(!write_source.structural_reconcile_scheduled.load(.acquire));
+        // Completion requires fresh publication of this exact incarnation,
+        // not merely an idle worker (which could also mean discarded work).
+        var published = (try snapshot_cache.snapshot(alloc, "articles")) orelse return error.ExpectedActivationPublication;
+        defer published.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), published.items.len);
+        const status = published.items[0];
+        try std.testing.expectEqual(@as(u64, 7001), status.group_id);
+        try std.testing.expectEqual(generations.generation, status.metadata.lsm_root_generation);
+        try std.testing.expectEqual(.fresh, status.metadata.freshness);
+        try std.testing.expectEqual(.live_writer_publish, status.metadata.source);
+        try std.testing.expect(status.metadata.target_observation_complete);
+        try std.testing.expect(status.metadata.updated_at_ns > before_status.metadata.updated_at_ns);
+        const activated = for (status.stats.indexes) |item| {
+            if (std.mem.eql(u8, item.name, "dense_idx")) break item;
+        } else return error.ExpectedActivatedDenseIndex;
+        try std.testing.expectEqual(expected_index.coverage_generation, activated.coverage_generation);
+        try std.testing.expectEqual(expected_index.coverage_config_hash, activated.coverage_config_hash);
     }
     const initial_cache_stats = owner_source.cacheStats();
     try std.testing.expect(initial_cache_stats.miss_count >= 1);
