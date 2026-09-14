@@ -71,7 +71,10 @@ const standalone_session_cleanup_interval_ns: u64 = std.time.ns_per_min;
 const standalone_session_max_count: usize = 1024;
 const standalone_session_max_record_bytes: usize = 16 * 1024 * 1024;
 const standalone_session_savepoint_limit: usize = 64;
-const antfarm_installed_asset_root = "../share/antfly/antfarm";
+const antfarm_installed_asset_roots = [_][]const u8{
+    "../share/antfly/antfarm", // Prefix installation: bin/antfly.
+    "share/antfly/antfarm", // Release archive: antfly at the archive root.
+};
 const antfarm_asset_roots = [_][]const u8{
     "zig/pkg/antfly/antfarm",
     "pkg/antfly/antfarm",
@@ -3560,14 +3563,20 @@ fn serveInstalledAntfarmFile(ctx: *httpx.Context, rel_path: []const u8) anyerror
     const exe_dir = std.process.executableDirPathAlloc(ctx.io, ctx.allocator) catch return null;
     defer ctx.allocator.free(exe_dir);
 
-    var full_path_buf: [4096]u8 = undefined;
-    const full_path = std.fmt.bufPrint(
-        &full_path_buf,
-        "{s}/{s}/{s}",
-        .{ exe_dir, antfarm_installed_asset_root, rel_path },
-    ) catch return null;
+    return serveAntfarmFileFromExecutableDir(ctx, exe_dir, rel_path);
+}
 
-    return try serveAntfarmPath(ctx, rel_path, full_path);
+fn serveAntfarmFileFromExecutableDir(ctx: *httpx.Context, exe_dir: []const u8, rel_path: []const u8) anyerror!?httpx.Response {
+    for (antfarm_installed_asset_roots) |root| {
+        var full_path_buf: [4096]u8 = undefined;
+        const full_path = std.fmt.bufPrint(
+            &full_path_buf,
+            "{s}/{s}/{s}",
+            .{ exe_dir, root, rel_path },
+        ) catch continue;
+        if (try serveAntfarmPath(ctx, rel_path, full_path)) |resp| return resp;
+    }
+    return null;
 }
 
 fn serveAntfarmPath(ctx: *httpx.Context, rel_path: []const u8, full_path: []const u8) anyerror!?httpx.Response {
@@ -6796,6 +6805,41 @@ test "standalone runtime registers antfarm static routes" {
     try std.testing.expect(server.hasRoute(.get, "/assets/*"));
     try std.testing.expect(server.hasRoute(.get, "/fonts/*"));
     try std.testing.expect(server.hasRoute(.get, "/*"));
+}
+
+test "standalone runtime antfarm assets support archive and prefix layouts outside cwd" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    for ([_][]const u8{ "archive", "prefix/bin" }) |layout| {
+        const exe_dir = try std.fs.path.join(alloc, &.{ root, layout });
+        defer alloc.free(exe_dir);
+        try std.Io.Dir.cwd().createDirPath(io, exe_dir);
+        const asset_root = if (std.mem.eql(u8, layout, "archive")) "archive/share/antfly/antfarm" else "prefix/share/antfly/antfarm";
+        for ([_][]const u8{ "index.html", "assets/app.js", "fonts/test.woff2" }) |rel_path| {
+            const path = try std.fs.path.join(alloc, &.{ root, asset_root, rel_path });
+            defer alloc.free(path);
+            try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+            var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+            defer file.close(io);
+            try file.writeStreamingAll(io, rel_path);
+
+            var request = try httpx.Request.init(alloc, .GET, "/");
+            defer request.deinit();
+            var ctx = httpx.Context.init(alloc, io, &request);
+            defer ctx.deinit();
+            var response = (try serveAntfarmFileFromExecutableDir(&ctx, exe_dir, rel_path)).?;
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            try std.testing.expectEqualStrings(rel_path, response.body.?);
+            try std.testing.expectEqualStrings(antfarmContentType(rel_path), response.headers.get("Content-Type").?);
+            try std.testing.expectEqual(null, try serveAntfarmFileFromExecutableDir(&ctx, exe_dir, "missing.js"));
+        }
+    }
 }
 
 test "standalone runtime antfarm path guards keep api routes reserved" {

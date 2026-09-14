@@ -7926,7 +7926,7 @@ pub fn build(b: *std.Build) void {
             "standalone CORS middleware",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
             "standalone runtime parses experimental flag",
-            "standalone runtime antfarm path guards keep api routes reserved",
+            "standalone runtime antfarm",
             "standalone startup checkpoint readiness requires applied and safe-read progress",
             "standalone activated seed bootstraps exact standby checkpoint and rejects older progress",
             "parse cli accepts config path",
