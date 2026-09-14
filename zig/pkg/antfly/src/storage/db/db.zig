@@ -70211,8 +70211,15 @@ test "relational columnar maintenance advances past hot ranges across restart" {
     try std.testing.expect(try db.runRelationalColumnMaintenancePass() > 0);
     relational_columns.test_now_ns = 111 * std.time.ns_per_s;
     _ = try db.runRelationalColumnMaintenancePass();
-    for (0..8) |_| {
+    // A bounded pass may discover a range after the clock advance and arm
+    // another age timer. Drive its requested wakeup instead of polling a
+    // frozen clock or assuming all cleanup fits into eight native quanta.
+    for (0..200) |_| {
         if (!db.relational_column_maintenance.pending.load(.acquire)) break;
+        relational_columns.test_now_ns = @max(
+            relational_columns.test_now_ns.?,
+            db.relational_column_maintenance.waiting_until_ns.load(.acquire),
+        );
         _ = try db.runRelationalColumnMaintenancePass();
     }
     const maintenance = db.relational_column_maintenance.snapshot();
