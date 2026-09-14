@@ -680,11 +680,15 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn reportNodeBaseline(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8) !@import("store_report_baseline.zig").Progress {
+        return self.reportNodeBaselineWithBudget(base_uri, store_id, body, null);
+    }
+
+    pub fn reportNodeBaselineWithBudget(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8, budget: ?RequestBudget) !@import("store_report_baseline.zig").Progress {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/nodes/{d}/status/baseline", .{store_id});
         defer self.alloc.free(path);
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
-        var resp = try self.executeWithRetry(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms });
+        var resp = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms }, budget);
         defer resp.deinit(self.alloc);
         if (resp.status == 405) return error.UnsupportedOperation;
         try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch);

@@ -426,3 +426,18 @@ registration, catalog readiness, and fixture acquisition remain separate from
 measurements. Partial checkpoints preserve progress if the workload aborts.
 Every real data process must survive. Five local Debug samples diagnose gross
 algorithmic regressions; they do not establish production throughput or p95 SLOs.
+
+
+Compare `--baseline-mode chunked` and `--baseline-mode batched` on the same binary
+and host to isolate batch admission from unrelated revisions. Both modes record
+logical chunks, fragment counts, actual HTTP requests and rejected discovery attempts.
+The default is batched. For index-heavy tenants, use `--groups 8
+--indexes-per-group 1200`; each group then needs multiple durable frames. This measures
+large-group transport and activation independently of actual shard placement.
+
+The production sender has a separate regression scenario, `system catalog baseline
+worker keeps control scheduling live and cancels transport on shutdown` in the data
+runtime test target. It stalls the real worker's HTTP executor, runs 2,000 full/heartbeat
+scheduling attempts without recollection or another HTTP request, verifies an unrelated
+maintenance job completes, and checks transport cancellation and worker release. This
+is a controlled scheduling regression, not a claim about hosted-group throughput.

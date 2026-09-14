@@ -4693,6 +4693,12 @@ pub const RaftApplyStore = struct {
         chain: [32]u8 = @splat(0),
         last_chunk_digest: [32]u8 = @splat(0),
         last_group_id: u64 = 0,
+        fragment_start: u32 = 0,
+        fragment_count: u32 = 0,
+        fragment_received: u64 = 0,
+        fragment_total: u64 = 0,
+        fragment_group_id: u64 = 0,
+        fragment_digest: [32]u8 = @splat(0),
         expected_header: [32]u8,
         admission_cursor: ?store_report_update.Cursor,
         report_header_digest: [32]u8,
@@ -4702,6 +4708,8 @@ pub const RaftApplyStore = struct {
         upload: ?BaselineUpload = null,
         garbage: ?store_report_baseline.Generation = null,
         gc_page: usize = 0,
+        gc_fragment: u32 = 0,
+        gc_fragment_end: u32 = 0,
     };
     fn baselinePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
         return std.fmt.bufPrint(buf, "\x00\x00__metadata__:store_report_baseline:{d}:", .{group_id});
@@ -4734,7 +4742,7 @@ pub const RaftApplyStore = struct {
         const state = try baselineStateTxn(self.alloc, &txn, group_id, request.store_id);
         if (state.upload) |upload| {
             if (std.meta.eql(upload.cursor, request.cursor)) {
-                if (request.action == .chunk and request.chunk_index < upload.next_chunk) {
+                if ((request.action == .chunk or request.action == .fragment) and request.chunk_index < upload.next_chunk) {
                     if (request.chunk_index + 1 != upload.next_chunk or !std.mem.eql(u8, &upload.last_chunk_digest, &request.chunk_digest)) return error.StoreReportBaseMismatch;
                 }
                 return .{ .cursor = upload.cursor, .next_chunk = upload.next_chunk, .collecting = state.garbage != null };
@@ -4749,6 +4757,13 @@ pub const RaftApplyStore = struct {
     fn collectBaselinePageTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64, state: *BaselineState) !void {
         const generation = state.garbage orelse return;
         const address: ReportAddress = .{ .store_id = store_id, .generation = generation };
+        if (state.gc_fragment < state.gc_fragment_end) {
+            try txn.delete(try address.key(a, group_id, "fragment", state.gc_fragment));
+            state.gc_fragment += 1;
+            if (state.gc_fragment < state.gc_fragment_end) return;
+        }
+        state.gc_fragment = 0;
+        state.gc_fragment_end = 0;
         const membership_key = try reportMembershipKey(a, group_id, address);
         const directory = txn.get(membership_key) catch |err| switch (err) {
             error.NotFound => report_members_magic,
@@ -4779,8 +4794,89 @@ pub const RaftApplyStore = struct {
         }
     }
 
+    fn validateBaselineFragment(upload: BaselineUpload, request: store_report_baseline.Request) !void {
+        const fragment = request.fragment orelse return error.InvalidStoreReporterFence;
+        if (!std.meta.eql(upload.cursor, request.cursor) or request.chunk_index != upload.next_chunk or fragment.group_id <= upload.last_group_id or
+            fragment.offset != upload.fragment_received) return error.StoreReportBaseMismatch;
+        if (upload.fragment_count != 0 and (fragment.group_id != upload.fragment_group_id or fragment.total_bytes != upload.fragment_total or
+            !std.mem.eql(u8, &fragment.digest, &upload.fragment_digest))) return error.StoreReportBaseMismatch;
+    }
+
+    /// Materialize a completed group once, never its growing prefix. The
+    /// generation-wide byte limit bounds allocation before any data is read.
+    fn readBaselineFragmentReportTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, request: store_report_baseline.Request, upload: BaselineUpload) !metadata.StoreStatusReport {
+        try validateBaselineFragment(upload, request);
+        const fragment = request.fragment.?;
+        if (!try fragment.final() or fragment.total_bytes > store_report_baseline.max_inventory_bytes) return error.InvalidStoreReporterFence;
+        const bytes = try a.alloc(u8, @intCast(fragment.total_bytes));
+        defer a.free(bytes);
+        const address: ReportAddress = .{ .store_id = request.report.store_id, .generation = request.generation() };
+        var offset: usize = 0;
+        for (0..upload.fragment_count) |i| {
+            const data = try txn.get(try address.key(a, group_id, "fragment", upload.fragment_start + i));
+            if (data.len > bytes.len - offset) return error.InvalidCatalogRecord;
+            @memcpy(bytes[offset..][0..data.len], data);
+            offset += data.len;
+        }
+        if (offset != fragment.offset) return error.InvalidCatalogRecord;
+        try std.base64.standard.Decoder.decode(bytes[offset..], fragment.data);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &fragment.digest)) return error.InvalidStoreReporterFence;
+        const parsed = try std.json.parseFromSlice(metadata.StoreStatusReport, a, bytes, .{ .allocate = .alloc_always });
+        // The caller supplies its operation arena, including parsed ownership.
+        const report = parsed.value;
+        try (store_report_update.Update{ .sequence = request.cursor.sequence, .report = report }).validate(a);
+        var header = report;
+        header.group_statuses = &.{};
+        header.runtime_statuses = &.{};
+        if (!std.mem.eql(u8, &try store_report_baseline.reportDigest(header), &try store_report_baseline.reportDigest(request.report))) return error.InvalidStoreReporterFence;
+        if (report.group_statuses.len + report.runtime_statuses.len == 0) return error.InvalidStoreReporterFence;
+        for (report.group_statuses) |item| if (item.group_id != fragment.group_id) return error.InvalidStoreReporterFence;
+        for (report.runtime_statuses) |item| {
+            if (item.group_id != fragment.group_id) return error.InvalidStoreReporterFence;
+            for (item.indexes) |index| if (index.embedding_activity_observed or !std.meta.eql(index.embedding_activity, @as(@TypeOf(index.embedding_activity), .{}))) return error.InvalidStoreReporterFence;
+        }
+        return report;
+    }
+
+    /// Admission stays inside the storage owner. Compiled callers receive only
+    /// the required runtime protocol version, never a reconstructed group body.
+    pub fn admitBaselineFragment(self: *RaftApplyStore, group_id: u64, request: store_report_baseline.Request) !u16 {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const report = blk: {
+            var txn = try self.store.beginReadTxn();
+            defer txn.abort();
+            const state = try baselineStateTxn(a, &txn, group_id, request.report.store_id);
+            break :blk try readBaselineFragmentReportTxn(a, &txn, group_id, request, state.upload orelse return error.StoreReportBaseMismatch);
+        };
+        const prior = (try self.readStoreReportTargets(a, group_id, .{
+            .sequence = request.cursor.sequence,
+            .base = .{ .reporter_incarnation = request.cursor.reporter_incarnation, .sequence = 0, .digest = @splat(0) },
+            .report = report,
+        })) orelse return error.UnknownStore;
+        const admitted = try metadata_store_observer.admitObservation(a, prior, report, true);
+        if (admitted == null and !metadata_store_observer.reportsDurablyEqual(store_report_update.asReport(prior), report)) return error.StoreReportBaseMismatch;
+        return storeRuntimeStatusRecordVersion(admitted orelse prior) orelse runtime_status_protocol.v0_2_0_record_version;
+    }
+
     fn applyStoreReportBaselineTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         if (bytes.len > store_report_baseline.max_chunk_bytes) return error.CatalogCommandTooLarge;
+        if (bytes.len >= 2 and std.mem.readInt(u16, bytes[0..2], .little) == 2) {
+            var pos: usize = 2;
+            const count = try readInt(bytes, &pos, u16);
+            if (count < 2 or count > store_report_baseline.max_batch_chunks) return error.InvalidMetadataTransitionEncoding;
+            for (0..count) |_| {
+                const len = try readInt(bytes, &pos, u32);
+                if (len < 2 or len > bytes.len - pos or std.mem.readInt(u16, bytes[pos..][0..2], .little) != 1) return error.InvalidMetadataTransitionEncoding;
+                try self.applyStoreReportBaselineTxn(txn, group_id, bytes[pos..][0..len]);
+                pos += len;
+            }
+            if (pos != bytes.len) return error.InvalidMetadataTransitionEncoding;
+            return;
+        }
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -4802,12 +4898,15 @@ pub const RaftApplyStore = struct {
         report_header.runtime_statuses = &.{};
         const report_header_digest = try store_report_baseline.reportDigest(report_header);
         switch (request.action) {
+            .batch => return error.InvalidMetadataTransitionEncoding,
             .prepare => {
                 if (state.upload) |upload| {
                     if (std.meta.eql(upload.cursor, request.cursor)) return;
                     if (upload.cursor.reporter_incarnation == request.cursor.reporter_incarnation and upload.cursor.sequence >= request.cursor.sequence) return;
                     if (state.garbage != null) return error.InvalidCatalogRecord;
                     state.garbage = .{ .incarnation = upload.cursor.reporter_incarnation, .sequence = upload.cursor.sequence };
+                    state.gc_fragment = upload.fragment_start;
+                    state.gc_fragment_end = upload.fragment_start + upload.fragment_count;
                     state.upload = null;
                 }
                 try collectBaselinePageTxn(a, txn, group_id, header.store_id, &state);
@@ -4820,27 +4919,57 @@ pub const RaftApplyStore = struct {
                     .report_header_digest = report_header_digest,
                 };
             },
-            .chunk, .activate => {
+            .chunk, .fragment, .activate => {
                 const upload = if (state.upload) |*value| value else return;
                 if (!std.meta.eql(upload.cursor, request.cursor) or upload.chunk_count != request.chunk_count or upload.total_bytes != request.total_bytes or !std.mem.eql(u8, &upload.expected_header, &command.expected_header) or !std.meta.eql(upload.admission_cursor, active_cursor) or !std.mem.eql(u8, &upload.report_header_digest, &report_header_digest)) return;
-                if (request.action == .chunk) {
+                if (request.action == .chunk or request.action == .fragment) {
                     const size = command.report_bytes;
                     if (size > store_report_baseline.max_report_bytes or size > upload.total_bytes -| upload.received_bytes) return;
                     if (request.chunk_index != upload.next_chunk) return;
+                    var replacement_report = request.report;
+                    if (request.fragment) |fragment| {
+                        validateBaselineFragment(upload.*, request) catch return;
+                        const address: ReportAddress = .{ .store_id = header.store_id, .generation = request.generation() };
+                        if (try fragment.final()) {
+                            replacement_report = try readBaselineFragmentReportTxn(a, txn, group_id, request, upload.*);
+                        } else {
+                            const data = try a.alloc(u8, try fragment.size());
+                            try std.base64.standard.Decoder.decode(data, fragment.data);
+                            try txn.put(try address.key(a, group_id, "fragment", request.chunk_index), data);
+                            if (upload.fragment_count == 0) {
+                                upload.fragment_start = request.chunk_index;
+                                upload.fragment_total = fragment.total_bytes;
+                                upload.fragment_group_id = fragment.group_id;
+                                upload.fragment_digest = fragment.digest;
+                            }
+                            upload.fragment_count += 1;
+                            upload.fragment_received += size;
+                        }
+                    } else if (upload.fragment_count != 0) return;
                     var max_group_id = upload.last_group_id;
-                    for (request.report.group_statuses) |item| {
+                    for (replacement_report.group_statuses) |item| {
                         if (item.group_id <= upload.last_group_id) return;
                         max_group_id = @max(max_group_id, item.group_id);
                     }
-                    for (request.report.runtime_statuses) |item| {
+                    for (replacement_report.runtime_statuses) |item| {
                         if (item.group_id <= upload.last_group_id) return;
                         max_group_id = @max(max_group_id, item.group_id);
                     }
-                    var replacement = metadata_store_observer.applyObservation(header, request.report);
-                    replacement = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, replacement);
-                    if (!try admitDenseNativeStoreTxn(self, txn, group_id, replacement)) return;
-                    if (storeRuntimeStatusRecordVersion(replacement)) |version| try activateRuntimeStatusProtocolTxn(txn, group_id, version);
-                    _ = try self.writeStoreGenerationTxn(txn, group_id, header.store_id, replacement, false, if (upload.next_chunk == 0) null else &.{}, null, request.generation());
+                    if (request.fragment == null or try request.fragment.?.final()) {
+                        var replacement = metadata_store_observer.applyObservation(header, replacement_report);
+                        replacement = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, replacement);
+                        if (!try admitDenseNativeStoreTxn(self, txn, group_id, replacement)) return;
+                        if (storeRuntimeStatusRecordVersion(replacement)) |version| try activateRuntimeStatusProtocolTxn(txn, group_id, version);
+                        _ = try self.writeStoreGenerationTxn(txn, group_id, header.store_id, replacement, false, if (upload.last_group_id == 0) null else &.{}, null, request.generation());
+                        // Keep the prefix retryable until every admission check
+                        // succeeds and the complete group has been staged.
+                        if (request.fragment != null) {
+                            const address: ReportAddress = .{ .store_id = header.store_id, .generation = request.generation() };
+                            for (0..upload.fragment_count) |i| try txn.delete(try address.key(a, group_id, "fragment", upload.fragment_start + i));
+                            upload.fragment_count = 0;
+                            upload.fragment_received = 0;
+                        }
+                    }
                     const digest = command.report_digest;
                     upload.chain = store_report_baseline.chainDigest(upload.chain, digest);
                     upload.last_chunk_digest = digest;
@@ -4848,7 +4977,7 @@ pub const RaftApplyStore = struct {
                     upload.received_bytes += size;
                     upload.last_group_id = max_group_id;
                 } else {
-                    if (upload.next_chunk != upload.chunk_count or upload.received_bytes != upload.total_bytes or !std.mem.eql(u8, &upload.chain, &upload.cursor.digest)) return;
+                    if (upload.fragment_count != 0 or upload.next_chunk != upload.chunk_count or upload.received_bytes != upload.total_bytes or !std.mem.eql(u8, &upload.chain, &upload.cursor.digest)) return;
                     const address: ReportAddress = .{ .store_id = header.store_id, .generation = request.generation() };
                     const staged_header = try txn.get(try address.key(a, group_id, "header", 0));
                     var store_key: [160]u8 = undefined;
@@ -4958,6 +5087,8 @@ pub const RaftApplyStore = struct {
             if (state.upload) |upload| {
                 state.garbage = .{ .incarnation = upload.cursor.reporter_incarnation, .sequence = upload.cursor.sequence };
                 state.gc_page = 0;
+                state.gc_fragment = upload.fragment_start;
+                state.gc_fragment_end = upload.fragment_start + upload.fragment_count;
                 while (state.garbage != null) try collectBaselinePageTxn(a, txn, group_id, store_id, &state);
             }
             txn.delete(try baselineKey(a, group_id, store_id)) catch |err| if (err != error.NotFound) return err;
@@ -5484,7 +5615,7 @@ pub const RaftApplyStore = struct {
         for (try docstore.DocStore.scanPrefixTxn(listing_alloc, txn, try baselinePrefixForGroup(&baseline_buf, group_id))) |row| {
             const state = (try std.json.parseFromSlice(BaselineState, listing_alloc, row.value, .{})).value;
             const upload = state.upload orelse continue;
-            if (upload.next_chunk == 0) continue;
+            if (upload.last_group_id == 0) continue;
             const separator = std.mem.lastIndexOfScalar(u8, row.key, ':') orelse return error.InvalidCatalogRecord;
             const store_id = try std.fmt.parseInt(u64, row.key[separator + 1 ..], 10);
             const address: ReportAddress = .{ .store_id = store_id, .generation = .{ .incarnation = upload.cursor.reporter_incarnation, .sequence = upload.cursor.sequence } };
@@ -6013,6 +6144,8 @@ pub const RaftApplyStore = struct {
                     parsed.value.active = .{};
                     parsed.value.garbage = null;
                     parsed.value.gc_page = 0;
+                    parsed.value.gc_fragment = 0;
+                    parsed.value.gc_fragment_end = 0;
                     const encoded = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
                     alloc.free(row.value);
                     row.value = encoded;
@@ -9778,11 +9911,34 @@ const max_store_report_update_bytes = 32 * 1024 * 1024;
 /// report decoding belongs to HTTP admission, never the Raft apply thread.
 pub fn encodeStoreReportBaseline(alloc: std.mem.Allocator, command: store_report_baseline.Command) ![]u8 {
     try command.request.validate(alloc);
-    var manifest = command;
-    if (command.request.action == .chunk) {
-        manifest.report_digest = try store_report_baseline.reportDigest(command.request.report);
-        manifest.report_bytes = try store_report_baseline.reportSize(command.request.report);
+    if (command.request.action == .batch) {
+        var commands: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (commands.items) |bytes| alloc.free(bytes);
+            commands.deinit(alloc);
+        }
+        for (command.request.batch) |request| {
+            var child = command;
+            child.request = request;
+            const encoded = try encodeStoreReportBaseline(alloc, child);
+            commands.append(alloc, encoded) catch |err| {
+                alloc.free(encoded);
+                return err;
+            };
+        }
+        return encodeStoreReportBaselineBatch(alloc, commands.items);
     }
+    var admitted = command;
+    const facts = try command.request.admissionFacts();
+    admitted.report_digest = facts.digest;
+    admitted.report_bytes = facts.bytes;
+    return encodeAdmittedStoreReportBaseline(alloc, admitted);
+}
+
+/// Only the admission path constructs these facts. Apply uses the replicated
+/// digest and byte count without expanding reports back to canonical JSON.
+pub fn encodeAdmittedStoreReportBaseline(alloc: std.mem.Allocator, command: store_report_baseline.Command) ![]u8 {
+    var manifest = command;
     manifest.request.report.group_statuses = &.{};
     manifest.request.report.runtime_statuses = &.{};
     const header = try std.json.Stringify.valueAlloc(alloc, manifest, .{});
@@ -9798,6 +9954,20 @@ pub fn encodeStoreReportBaseline(alloc: std.mem.Allocator, command: store_report
     }
     try appendStoreRecord(alloc, &out, record);
     if (out.items.len > store_report_baseline.max_chunk_bytes) return error.CatalogCommandTooLarge;
+    return out.toOwnedSlice(alloc);
+}
+
+pub fn encodeStoreReportBaselineBatch(alloc: std.mem.Allocator, commands: []const []const u8) ![]u8 {
+    if (commands.len < 2 or commands.len > store_report_baseline.max_batch_chunks) return error.InvalidStoreReporterFence;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try appendInt(alloc, &out, u16, 2);
+    try appendInt(alloc, &out, u16, @intCast(commands.len));
+    for (commands) |command| {
+        if (command.len > store_report_baseline.max_chunk_bytes -| (out.items.len + 4)) return error.CatalogCommandTooLarge;
+        try appendInt(alloc, &out, u32, @intCast(command.len));
+        try out.appendSlice(alloc, command);
+    }
     return out.toOwnedSlice(alloc);
 }
 
@@ -19782,4 +19952,108 @@ test "system catalog baseline binary envelope rejects corruption and preserves a
     bad[0] = 2;
     try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeStoreReportBaseline(arena.allocator(), bad[0..bytes.len]));
     try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeStoreReportBaseline(arena.allocator(), bytes[0..5]));
+}
+
+test "system catalog baseline frames oversized groups across snapshot and batches ordinary groups" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/baseline-frames", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = .{ .store_id = 20, .node_id = 30, .reporter_incarnation = 77 } });
+        try txn.commit();
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const indexes = try arena.allocator().alloc(metadata.RuntimeIndexStatusReport, 1500);
+    for (indexes, 0..) |*index, i| index.* = .{ .name = try std.fmt.allocPrint(arena.allocator(), "index_{d}", .{i}), .kind = "full_text", .doc_count = i };
+    var runtime = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = 100, .indexes = indexes }};
+    var groups: [260]metadata.GroupStatusReport = undefined;
+    for (&groups, 0..) |*group, i| group.* = .{ .group_id = i + 100 };
+    var publisher: store_report_update.Publisher = .{};
+    defer publisher.deinit(a);
+    var prepared = try publisher.prepare(a, .{ .store_id = 20, .reporter_incarnation = 77, .group_statuses = &groups, .runtime_statuses = &runtime }, true, false);
+    defer prepared.deinit(a);
+    var plan = try store_report_baseline.Plan.init(a, &prepared);
+    defer plan.deinit();
+    try std.testing.expect(plan.fragments[0] != null);
+    try applyTestBaseline(&store, a, plan.request);
+    var next: u32 = 0;
+    var batch_buffer: [store_report_baseline.max_batch_chunks]store_report_baseline.Request = undefined;
+    var batches: usize = 0;
+    while (next < plan.chunks.len) {
+        const request = try plan.nextRequest(next, &batch_buffer);
+        if (request.action == .batch) {
+            batches += 1;
+            std.mem.swap(store_report_baseline.Request, &batch_buffer[0], &batch_buffer[1]);
+            try std.testing.expectError(error.InvalidStoreReporterFence, request.validate(a));
+            std.mem.swap(store_report_baseline.Request, &batch_buffer[0], &batch_buffer[1]);
+        }
+        if (request.fragment) |fragment| {
+            if (try fragment.final()) {
+                var corrupt = request;
+                const data = try a.dupe(u8, fragment.data);
+                defer a.free(data);
+                data[0] = if (data[0] == 'A') 'B' else 'A';
+                corrupt.fragment.?.data = data;
+                try std.testing.expectError(error.InvalidStoreReporterFence, store.admitBaselineFragment(21, corrupt));
+                try std.testing.expectError(error.InvalidStoreReporterFence, applyTestBaseline(&store, a, corrupt));
+                try std.testing.expectEqual(next, (try store.reportBaselineProgress(21, plan.request)).next_chunk);
+            } else {
+                var out_of_order = request;
+                out_of_order.fragment.?.offset += 1;
+                try applyTestBaseline(&store, a, out_of_order);
+                try std.testing.expectEqual(next, (try store.reportBaselineProgress(21, plan.request)).next_chunk);
+            }
+        }
+        try request.validate(a);
+        const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(bytes);
+        try std.testing.expect(bytes.len <= store_report_baseline.max_chunk_bytes);
+        try applyTestBaseline(&store, a, request);
+        const progress = try store.reportBaselineProgress(21, request);
+        try applyTestBaseline(&store, a, request); // exact retry after a lost response
+        try std.testing.expectEqualDeep(progress, try store.reportBaselineProgress(21, request));
+        if (next == 0) {
+            const snapshot = try store.snapshotBuilder().buildSnapshot(a, 21);
+            defer a.free(snapshot);
+            try RaftApplyStore.installSnapshotFromRaft(&store, a, 21, 10, snapshot);
+        }
+        next = progress.next_chunk;
+        const visible = (try store.readStore(a, 21, 20, true)).?;
+        defer metadata_table_manager.freeStore(a, visible);
+        try std.testing.expectEqual(@as(usize, 0), visible.group_statuses.len);
+    }
+    try std.testing.expect(batches > 0);
+    try applyTestBaseline(&store, a, try plan.nextRequest(next, &batch_buffer));
+    const visible = (try store.readStore(a, 21, 20, true)).?;
+    defer metadata_table_manager.freeStore(a, visible);
+    try std.testing.expectEqual(groups.len, visible.group_statuses.len);
+    try std.testing.expectEqual(@as(usize, 1), visible.runtime_statuses.len);
+    try std.testing.expectEqualDeep(indexes, visible.runtime_statuses[0].indexes);
+
+    // Superseding an upload that only has a partial first group must collect
+    // its raw frames even though no membership page exists yet.
+    plan.request.cursor.sequence += 1;
+    while (true) {
+        try applyTestBaseline(&store, a, plan.request);
+        if (!(try store.reportBaselineProgress(21, plan.request)).collecting) break;
+    }
+    const first = try plan.nextRequest(0, &batch_buffer);
+    try applyTestBaseline(&store, a, first);
+    const abandoned = first.generation();
+    plan.request.cursor.sequence += 1;
+    try applyTestBaseline(&store, a, plan.request);
+    var txn = try store.store.beginReadTxn();
+    defer txn.abort();
+    const address: RaftApplyStore.ReportAddress = .{ .store_id = 20, .generation = abandoned };
+    const key = try address.key(a, 21, "fragment", 0);
+    defer a.free(key);
+    try std.testing.expectError(error.NotFound, txn.get(key));
 }

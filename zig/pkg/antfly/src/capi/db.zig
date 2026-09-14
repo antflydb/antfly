@@ -3122,6 +3122,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.topologyActivation(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .report_baseline_fragment_admission => |input| {
+                    const value = handle.store.admitBaselineFragment(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .report_baseline_progress => |input| {
                     const value = handle.store.reportBaselineProgressForKey(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

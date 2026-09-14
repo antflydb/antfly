@@ -2789,6 +2789,7 @@ pub const MetadataHttpServer = struct {
             error.InvalidArgument, error.StoreIdentityMismatch, error.InvalidStoreReporterFence, error.InvalidNodeID => ctx.status(400).text("invalid node request"),
             error.NodeNotFound, error.UnknownStore => ctx.status(404).text("node not found"),
             error.StoreReportBaseMismatch => ctx.status(409).text("store report generation changed; send a full report"),
+            error.ResourceTemporarilyUnavailable => ctx.status(503).text("report admission capacity exhausted"),
             error.ActiveNodeFinalizeRejected => ctx.status(409).text("node is not ready to finalize"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             else => metadataReadError(ctx, err),

@@ -1216,6 +1216,7 @@ test "stable detail detection distinguishes private errors" {
 }
 
 test "every classified boundary outcome retains its identity" {
+    @setEvalBranchQuota(32 * std.meta.fields(Detail).len);
     const classified = comptime blk: {
         const details = std.meta.tags(Detail)[1..];
         var errors: [details.len]anyerror = undefined;

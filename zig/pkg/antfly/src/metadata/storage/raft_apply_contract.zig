@@ -219,5 +219,6 @@ pub const CatalogProjectionRequest = union(enum) {
     report_cursor: u64,
     read_control_stores: []const u64,
     report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
+    report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
     catalog_snapshot: void,
 };

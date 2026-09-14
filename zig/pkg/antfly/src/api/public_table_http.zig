@@ -4651,7 +4651,7 @@ test "public table query handler maps exact graph execution failures" {
     try std.testing.expectEqualStrings("pattern", work_error.operation);
     try std.testing.expectEqualStrings("match", work_error.mode);
     try std.testing.expectEqualStrings("intermediate_states", work_error.dimension);
-    try std.testing.expectEqual(@as(i64, 100_000), work_error.maximum);
+    try std.testing.expectEqual(@as(u64, 100_000), work_error.maximum);
 
     kind = .path_weight_domain;
     var weight_resp = try handleTableQueryRequest(

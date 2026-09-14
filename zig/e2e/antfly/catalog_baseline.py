@@ -7,6 +7,7 @@ Retaining number lexemes lets this client hash that canonical Zig representation
 without changing floating-point spelling during a Python JSON round trip.
 """
 
+import base64
 import hashlib
 import json
 import time
@@ -85,11 +86,29 @@ def plan_baseline(header, stored, sequence):
             body = encode(report).encode()
             if len(body) <= 1024 * 1024:
                 break
-            assert count > 1, "single group exceeds the protocol limit"
+            if count == 1:
+                break
             count = max(1, count // 2)
         total_bytes += len(body)
-        chain = hashlib.sha256(chain + hashlib.sha256(body).digest()).digest()
-        chunks.append(report)
+        if len(body) > 1024 * 1024:
+            digest = list(hashlib.sha256(body).digest())
+            for offset in range(0, len(body), 512 * 1024):
+                fragment = {
+                    "group_id": selected[0],
+                    "offset": offset,
+                    "total_bytes": len(body),
+                    "digest": digest,
+                    "data": base64.b64encode(
+                        body[offset : offset + 512 * 1024]
+                    ).decode(),
+                }
+                chain = hashlib.sha256(
+                    chain + hashlib.sha256(encode(fragment).encode()).digest()
+                ).digest()
+                chunks.append({"$fragment": fragment})
+        else:
+            chain = hashlib.sha256(chain + hashlib.sha256(body).digest()).digest()
+            chunks.append(report)
         start += count
     request = {
         "version": 1,
@@ -105,6 +124,35 @@ def plan_baseline(header, stored, sequence):
         "report": canonical_report(header, [], []),
     }
     return request, chunks
+
+
+def next_baseline_request(manifest, chunks, next_chunk, *, batch_size=8):
+    if next_chunk == len(chunks):
+        return {**manifest, "action": "activate"}
+    chunk = chunks[next_chunk]
+    if "$fragment" in chunk:
+        return {
+            **manifest,
+            "action": "fragment",
+            "chunk_index": next_chunk,
+            "fragment": chunk["$fragment"],
+        }
+    requests = []
+    size = 0
+    for index in range(next_chunk, min(next_chunk + batch_size, len(chunks))):
+        chunk = chunks[index]
+        if "$fragment" in chunk:
+            break
+        encoded_size = len(encode(chunk).encode())
+        if requests and size + encoded_size > 1536 * 1024:
+            break
+        requests.append(
+            {**manifest, "action": "chunk", "chunk_index": index, "report": chunk}
+        )
+        size += encoded_size
+    if len(requests) == 1:
+        return requests[0]
+    return {**manifest, "action": "batch", "chunk_index": next_chunk, "batch": requests}
 
 
 def post_baseline(cluster, request, attempts=None):

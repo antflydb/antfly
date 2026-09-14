@@ -4781,7 +4781,13 @@ pub const DataServer = struct {
     reporter_incarnation: u64 = 0,
     store_status_generation: std.atomic.Value(u64) = .init(1),
     store_report_publisher: store_report_update.Publisher = .{},
-    store_report_baseline: ?struct { prepared: store_report_update.Publisher.Prepared, plan: store_report_baseline.Plan } = null,
+    store_report_baseline: ?struct { prepared: store_report_update.Publisher.Prepared, plan: ?store_report_baseline.Plan = null } = null,
+    store_report_baseline_pending: std.atomic.Value(bool) = .init(false),
+    store_report_cancellation: antfly.raft.transport.http_common.RequestCancellation = .{},
+    store_report_baseline_active: std.atomic.Value(bool) = .init(false),
+    store_report_baseline_future: ?std.Io.Future(void) = null,
+    store_report_worker_mutex: std.atomic.Mutex = .unlocked,
+    store_report_worker_lease: ?backend_runtime_mod.BackendRuntime.WorkerLease = null,
     store_report_publish_mutex: std.Io.Mutex = .init,
     telemetry_mutex: std.atomic.Mutex = .unlocked,
     telemetry_pending: ?*PendingTelemetry = null,
@@ -7350,6 +7356,7 @@ pub const DataServer = struct {
         self.background_worker_mutex.unlock();
         self.unregisterMetadataLocalProviders();
         if (self.data_raft) |raft| raft.stop();
+        self.stopStoreReportWorker();
         self.stopLsmMaintenanceBackground();
         self.stopDataServerBackgroundJobs();
         if (self.maintenance_worker_lease) |*lease| lease.release();
@@ -7473,7 +7480,7 @@ pub const DataServer = struct {
         if (self.telemetry_pending) |pending| pending.destroy(self.alloc);
         self.telemetry_pending = null;
         if (self.store_report_baseline) |*pending| {
-            pending.plan.deinit();
+            if (pending.plan) |*plan| plan.deinit();
             pending.prepared.deinit(self.alloc);
         }
         self.store_report_publisher.deinit(self.alloc);
@@ -7567,7 +7574,7 @@ pub const DataServer = struct {
         };
     }
 
-    const BackgroundLane = enum { maintenance };
+    const BackgroundLane = enum { maintenance, store_report };
 
     fn ensureBackgroundWorkerIo(self: *DataServer, lane: BackgroundLane) !std.Io {
         lockAtomic(&self.background_worker_mutex);
@@ -7575,11 +7582,13 @@ pub const DataServer = struct {
         if (self.background_worker_closing) return error.BackgroundOwnerClosing;
         const slot = switch (lane) {
             .maintenance => &self.maintenance_worker_lease,
+            .store_report => &self.store_report_worker_lease,
         };
         if (slot.* == null) slot.* = try (try self.ensureBackendRuntime()).acquireWorkers(.{
             .capacity = switch (lane) {
                 // Builder and completed-publication consumer must progress independently.
                 .maintenance => 2,
+                .store_report => 1,
             },
         });
         return slot.*.?.io();
@@ -14424,6 +14433,10 @@ pub const DataServer = struct {
     }
 
     fn reportStoreStatus(self: *DataServer) !void {
+        if (self.store_report_baseline_pending.load(.acquire)) {
+            try self.requestStoreReportWorker();
+            return error.StoreReportBaselinePending;
+        }
         const remote_metadata = self.remote_metadata orelse return;
         const registration = self.store_registration orelse return;
         // Claim the work before collecting the report. A mutation racing with
@@ -15348,48 +15361,90 @@ pub const DataServer = struct {
         _ = try remote.reportNodeUpdate(batch.report.store_id, bytes);
     }
 
+    // The control loop only schedules this independently reserved lane. The
+    // pinned generation is never recollected while transport is in flight.
+    fn requestStoreReportWorker(self: *DataServer) !void {
+        lockAtomic(&self.store_report_worker_mutex);
+        defer self.store_report_worker_mutex.unlock();
+        if (self.store_report_baseline_active.load(.acquire) or self.background_jobs_shutdown.load(.acquire)) return;
+        const io = try self.ensureBackgroundWorkerIo(.store_report);
+        if (self.store_report_baseline_future) |*future| future.await(io);
+        self.store_report_baseline_future = null;
+        self.store_report_baseline_active.store(true, .release);
+        errdefer self.store_report_baseline_active.store(false, .release);
+        self.store_report_baseline_future = try io.concurrent(storeReportWorkerMain, .{self});
+    }
+
+    fn stopStoreReportWorker(self: *DataServer) void {
+        lockAtomic(&self.store_report_worker_mutex);
+        defer self.store_report_worker_mutex.unlock();
+        self.store_report_cancellation.cancel();
+        if (self.store_report_baseline_future) |*future| {
+            future.cancel(self.store_report_worker_lease.?.io());
+            self.store_report_baseline_future = null;
+        }
+        if (self.store_report_worker_lease) |*lease| lease.release();
+        self.store_report_worker_lease = null;
+    }
+
+    fn storeReportWorkerMain(self: *DataServer) void {
+        defer self.store_report_baseline_active.store(false, .release);
+        const remote = self.remote_metadata orelse return;
+        self.store_report_publish_mutex.lockUncancelable(remote.io);
+        defer self.store_report_publish_mutex.unlock(remote.io);
+        if (self.backgroundMonotonicMs() < self.store_report_update_retry_at_ms) return;
+        self.resumeStoreReportBaseline(remote) catch |err| {
+            if (err == error.StoreReportBaseMismatch or err == error.UnknownStore) {
+                if (self.store_report_baseline) |*pending| {
+                    if (pending.plan) |*plan| plan.deinit();
+                    pending.prepared.deinit(self.alloc);
+                }
+                self.store_report_baseline = null;
+                self.store_report_publisher.cursor = null;
+                self.store_report_baseline_pending.store(false, .release);
+            }
+            // A bounded retry pause prevents a failing peer from turning the
+            // control ticker into an unbounded worker launch loop.
+            self.store_report_update_retry_at_ms = self.backgroundMonotonicMs() + 1000;
+            self.markStoreStatusDirtyImmediate();
+            if (err != error.StoreReportBaselinePending and err != error.Canceled)
+                std.log.warn("store baseline delivery deferred err={s}", .{@errorName(err)});
+        };
+    }
+
     fn resumeStoreReportBaseline(self: *DataServer, remote: *RemoteMetadataSource) !void {
         const pending = if (self.store_report_baseline) |*value| value else return;
-        var request = pending.plan.request;
-        var steps: usize = 0;
-        // Bound one reporting turn as well as individual requests. The pinned
-        // generation survives transport failure and resumes from applied state.
-        while (steps < 32) : (steps += 1) {
+        if (pending.plan == null) pending.plan = try store_report_baseline.Plan.init(self.alloc, &pending.prepared);
+        const plan = &pending.plan.?;
+        var request = plan.request;
+        var batch_buffer: [store_report_baseline.max_batch_chunks]store_report_baseline.Request = undefined;
+        const budget: antfly.metadata_http_client.RequestBudget = .{
+            .deadline_ns = remote.awakeNs() +| 2 * std.time.ns_per_s,
+            .cancellation = &self.store_report_cancellation,
+            .io = remote.io,
+        };
+        for (0..32) |_| {
+            if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+            try RemoteMetadataSource.ensureBudgetActive(budget);
             const body = try stringifyJsonAlloc(self.alloc, request);
             defer self.alloc.free(body);
             if (body.len > store_report_baseline.max_chunk_bytes) return error.ResourceRequestTooLarge;
-            const progress = remote.reportNodeBaseline(request.report.store_id, body) catch |err| switch (err) {
-                // A rolling metadata upgrade cannot yet decode the new command.
-                // Keep the pinned generation and retry without sending an
-                // oversized legacy report or terminating the reporting lane.
-                error.UnsupportedOperation => {
-                    self.store_report_update_retry_at_ms = self.backgroundMonotonicMs() + std.time.ms_per_s;
-                    self.markStoreStatusDirtyImmediate();
-                    return error.StoreReportBaselinePending;
-                },
-                else => return err,
-            };
-            self.store_report_update_retry_at_ms = 0;
-            if (!std.meta.eql(progress.cursor, pending.plan.request.cursor) or progress.next_chunk > pending.plan.chunks.len) return error.InvalidStoreReporterFence;
+            const progress = try remote.reportNodeBaseline(request.report.store_id, body, budget);
+            if (!std.meta.eql(progress.cursor, plan.request.cursor) or progress.next_chunk > plan.chunks.len) return error.InvalidStoreReporterFence;
             if (progress.activated) {
                 self.store_report_publisher.commit(self.alloc, &pending.prepared, progress.cursor);
-                pending.plan.deinit();
+                plan.deinit();
                 pending.prepared.deinit(self.alloc);
                 self.store_report_baseline = null;
+                self.store_report_update_retry_at_ms = 0;
+                self.markStoreStatusDirtyImmediate();
+                self.store_report_baseline_pending.store(false, .release);
                 return;
             }
-            request = pending.plan.request;
+            request = plan.request;
             if (progress.collecting) continue;
-            if (progress.next_chunk == pending.plan.chunks.len) {
-                request.action = .activate;
-            } else {
-                request.action = .chunk;
-                request.chunk_index = progress.next_chunk;
-                request.report = pending.plan.chunks[progress.next_chunk];
-            }
+            request = try plan.nextRequest(progress.next_chunk, &batch_buffer);
         }
-        self.markStoreStatusDirtyImmediate();
-        self.clearMetadataBootstrapRetry();
         return error.StoreReportBaselinePending;
     }
 
@@ -15401,21 +15456,7 @@ pub const DataServer = struct {
             if (self.store_report_baseline != null) return error.StoreReportBaselinePending;
             return false;
         }
-        if (self.store_report_baseline) |*pending| {
-            if (pending.plan.request.report.reporter_incarnation != report.reporter_incarnation) {
-                pending.plan.deinit();
-                pending.prepared.deinit(self.alloc);
-                self.store_report_baseline = null;
-            } else self.resumeStoreReportBaseline(remote) catch |err| {
-                if (err == error.StoreReportBaseMismatch) {
-                    pending.plan.deinit();
-                    pending.prepared.deinit(self.alloc);
-                    self.store_report_baseline = null;
-                    self.store_report_publisher.cursor = null;
-                }
-                return err;
-            };
-        }
+        if (self.store_report_baseline != null) return error.StoreReportBaselinePending;
         if (retain_runtime and self.store_report_publisher.cursor == null) return false;
         for (0..2) |attempt| {
             var prepared = try self.store_report_publisher.prepare(self.alloc, report, attempt != 0, retain_runtime);
@@ -15428,12 +15469,13 @@ pub const DataServer = struct {
             const encoded_size = try store_report_baseline.reportSize(prepared.update);
             if (!prepared.full and encoded_size > store_report_baseline.max_report_bytes) continue;
             if (prepared.full and encoded_size > store_report_baseline.max_report_bytes) {
-                const plan = try store_report_baseline.Plan.init(self.alloc, &prepared);
-                self.store_report_baseline = .{ .prepared = prepared, .plan = plan };
+                prepared.update.report.health_class = try prepared.arena.allocator().dupe(u8, report.health_class);
+                self.store_report_baseline = .{ .prepared = prepared };
+                self.store_report_baseline_pending.store(true, .release);
                 prepared_owned = false;
                 self.embedding_activity_status_dirty.store(true, .release);
-                try self.resumeStoreReportBaseline(remote);
-                return true;
+                try self.requestStoreReportWorker();
+                return error.StoreReportBaselinePending;
             }
             const body = try stringifyJsonAlloc(prepared.arena.allocator(), prepared.update);
             const cursor = remote.reportNodeUpdate(report.store_id, body) catch |err| switch (err) {
@@ -15465,6 +15507,10 @@ pub const DataServer = struct {
     }
 
     fn reportStoreStatusHeartbeat(self: *DataServer) !void {
+        if (self.store_report_baseline_pending.load(.acquire)) {
+            try self.requestStoreReportWorker();
+            return error.StoreReportBaselinePending;
+        }
         const remote_metadata = self.remote_metadata orelse return;
         const registration = self.store_registration orelse return;
         const reference = remote_metadata.supports_runtime_reference.load(.acquire);
@@ -20081,15 +20127,20 @@ const RemoteMetadataSource = struct {
         comptime callFn: anytype,
         ctx: anytype,
     ) !T {
+        return self.withMetadataApiClientBudget(T, callFn, ctx, null);
+    }
+
+    fn withMetadataApiClientBudget(self: *RemoteMetadataSource, comptime T: type, comptime callFn: anytype, ctx: anytype, budget: ?antfly.metadata_http_client.RequestBudget) !T {
         var last_err: anyerror = error.MissingMetadataApi;
         const start = self.metadataApiIndexForAttempt(0);
         for (0..self.base_uris.len) |attempt| {
+            try ensureBudgetActive(budget);
             const index = (start + attempt) % self.base_uris.len;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
-            const head = metadata_client.fetchHead(self.base_uris[index]) catch |err| {
+            const head = metadata_client.fetchHeadWithBudget(self.base_uris[index], budget) catch |err| {
                 last_err = err;
                 continue;
             };
@@ -21852,13 +21903,13 @@ const RemoteMetadataSource = struct {
         self.supports_runtime_reference.store(supported, .release);
     }
 
-    fn reportNodeBaseline(self: *RemoteMetadataSource, store_id: u64, body: []const u8) !store_report_baseline.Progress {
-        const Request = struct { store_id: u64, body: []const u8 };
-        return self.withMetadataApiClient(store_report_baseline.Progress, struct {
+    fn reportNodeBaseline(self: *RemoteMetadataSource, store_id: u64, body: []const u8, budget: antfly.metadata_http_client.RequestBudget) !store_report_baseline.Progress {
+        const Request = struct { store_id: u64, body: []const u8, budget: antfly.metadata_http_client.RequestBudget };
+        return self.withMetadataApiClientBudget(store_report_baseline.Progress, struct {
             fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, req: Request) !store_report_baseline.Progress {
-                return client.reportNodeBaseline(base_uri, req.store_id, req.body);
+                return client.reportNodeBaselineWithBudget(base_uri, req.store_id, req.body, req.budget);
             }
-        }.call, Request{ .store_id = store_id, .body = body });
+        }.call, Request{ .store_id = store_id, .body = body, .budget = budget }, budget);
     }
     fn reportNodeUpdate(self: *RemoteMetadataSource, store_id: u64, body: []const u8) !store_report_update.Cursor {
         const Request = struct { store_id: u64, body: []const u8 };
@@ -27120,6 +27171,79 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "system catalog baseline worker keeps control scheduling live and cancels transport on shutdown" {
+            if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+            const a = std.testing.allocator;
+            const Http = antfly.common.http;
+            const Fake = struct {
+                entered: std.atomic.Value(bool) = .init(false),
+                cancelled: std.atomic.Value(bool) = .init(false),
+                requests: std.atomic.Value(usize) = .init(0),
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: Http.HttpRequest) !Http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = self.requests.fetchAdd(1, .monotonic);
+                    if (request.method == .GET) return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataHead{ .metadata_group_id = 9, .metadata_incarnation = [_]u8{'1'} ** 32 }, .{}) };
+                    self.entered.store(true, .release);
+                    const cancel = request.cancellation orelse return error.MissingCancellation;
+                    const until = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+                    while (!cancel.isCancelled() and platform_time.monotonicNs() < until) platform_time.sleepNs(std.time.ns_per_ms);
+                    self.cancelled.store(cancel.isCancelled(), .release);
+                    return error.Canceled;
+                }
+            };
+            var fake: Fake = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://baseline.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
+            var server: DataServer = .{
+                .alloc = a,
+                .remote_metadata = &source,
+                .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a),
+                .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
+                .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
+                .status_source = undefined,
+                .api_server_cfg = undefined,
+                .query_async_limit = .nothing,
+                .listener_cfg = undefined,
+            };
+            // This fixture borrows the source; production DataServer owns it.
+            defer {
+                server.stopStoreReportWorker();
+                server.remote_metadata = null;
+                server.deinit();
+            }
+            var groups = [_]antfly.metadata.table_manager.GroupStatusReport{.{ .group_id = 100 }};
+            const prepared = try server.store_report_publisher.prepare(a, .{ .store_id = 20, .reporter_incarnation = 77, .group_statuses = &groups }, true, false);
+            server.store_report_baseline = .{ .prepared = prepared };
+            server.store_report_baseline_pending.store(true, .release);
+            try server.requestStoreReportWorker();
+            const deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+            while (!fake.entered.load(.acquire) and platform_time.monotonicNs() < deadline) platform_time.sleepNs(std.time.ns_per_ms);
+            try std.testing.expect(fake.entered.load(.acquire));
+            const requests = fake.requests.load(.acquire);
+            const start = platform_time.monotonicNs();
+            for (0..1000) |_| {
+                try std.testing.expectError(error.StoreReportBaselinePending, server.reportStoreStatus());
+                try std.testing.expectError(error.StoreReportBaselinePending, server.reportStoreStatusHeartbeat());
+            }
+            try std.testing.expectEqual(requests, fake.requests.load(.acquire));
+            try std.testing.expect(platform_time.monotonicNs() - start < std.time.ns_per_s);
+            const Job = struct {
+                fn run(ptr: *anyopaque) !void {
+                    const owner: *DataServer = @ptrCast(@alignCast(ptr));
+                    _ = owner.provisioned_warmup_completed.fetchAdd(1, .release);
+                }
+                fn deinit(_: *anyopaque) void {}
+            };
+            const runtime = server.backend_runtime.?;
+            const owner = try server.dataServerBackgroundOwnerId(runtime);
+            try runtime.durable_jobs.submit(.{ .owner_id = owner, .class = .maintenance, .ptr = &server, .run = Job.run, .deinit = Job.deinit });
+            while (server.provisioned_warmup_completed.load(.acquire) == 0 and platform_time.monotonicNs() < deadline) platform_time.sleepNs(std.time.ns_per_ms);
+            try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_completed.load(.acquire));
+            server.stopStoreReportWorker();
+            try std.testing.expect(fake.cancelled.load(.acquire));
+            try std.testing.expect(server.store_report_worker_lease == null);
+        }
+
         test "system catalog report failover preserves repair signals and stable peer order" {
             const alloc = std.testing.allocator;
             const Http = antfly.raft.transport.http_common;

@@ -271,7 +271,13 @@ pub const RaftApplyStore = struct {
         return self.catalogProjection(?topology_protocol.Activation, self.alloc, group_id, .{ .topology_activation = {} });
     }
     pub fn reportBaselineProgress(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/store_report_baseline.zig").Request) !@import("../metadata/store_report_baseline.zig").Progress {
-        return self.catalogProjection(@import("../metadata/store_report_baseline.zig").Progress, self.alloc, group_id, .{ .report_baseline_progress = try request.progressQuery() });
+        return self.reportBaselineProgressForKey(group_id, try request.progressQuery());
+    }
+    pub fn reportBaselineProgressForKey(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/store_report_baseline.zig").ProgressQuery) !@import("../metadata/store_report_baseline.zig").Progress {
+        return self.catalogProjection(@import("../metadata/store_report_baseline.zig").Progress, self.alloc, group_id, .{ .report_baseline_progress = request });
+    }
+    pub fn admitBaselineFragment(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/store_report_baseline.zig").Request) !u16 {
+        return self.catalogProjection(u16, self.alloc, group_id, .{ .report_baseline_fragment_admission = request });
     }
     pub fn reportCursor(self: *RaftApplyStore, group_id: u64, store_id: u64) !?store_report_update.Cursor {
         return self.catalogProjection(?store_report_update.Cursor, self.alloc, group_id, .{ .report_cursor = store_id });

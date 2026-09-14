@@ -10,6 +10,7 @@ new binaries can be measured with --baseline-mode full or chunked respectively.
 """
 
 import argparse
+import copy
 import hashlib
 import json
 import threading
@@ -20,7 +21,13 @@ from pathlib import Path
 import requests
 from benchmark_catalog_resilience import wait_for_catalog_ready
 from benchmark_system_catalog import ZIG_ROOT, positive, server, summary
-from catalog_baseline import canonical_report, encode, plan_baseline, post_baseline
+from catalog_baseline import (
+    canonical_report,
+    encode,
+    next_baseline_request,
+    plan_baseline,
+    post_baseline,
+)
 from conftest import internal_service_headers
 from test_catalog_resilience import read_pages, register_reporter
 
@@ -50,6 +57,13 @@ def run(args):
                     raise
                 time.sleep(1)
         stored = next(s for s in snapshot["stores"] if s["store_id"] == 1000)
+        if args.indexes_per_group > 1:
+            for runtime in stored["runtime_statuses"]:
+                template = runtime["indexes"][0]
+                runtime["indexes"] = [
+                    {**copy.deepcopy(template), "name": f"dense_{i}"}
+                    for i in range(args.indexes_per_group)
+                ]
         full_report = canonical_report(
             header, stored["group_statuses"], stored["runtime_statuses"]
         )
@@ -77,6 +91,8 @@ def run(args):
                 cursor = response.json()
         else:
             manifest, chunks = plan_baseline(header, stored, 2)
+            baseline["logical_chunks"] = len(chunks)
+            baseline["fragment_chunks"] = sum("$fragment" in chunk for chunk in chunks)
             baseline["plan_ms"] = (time.perf_counter_ns() - started) / 1e6
             delivery_started = time.perf_counter_ns()
             request = manifest
@@ -99,14 +115,12 @@ def run(args):
                 request = dict(manifest)
                 if progress["collecting"]:
                     continue
-                if progress["next_chunk"] == len(chunks):
-                    request["action"] = "activate"
-                else:
-                    request.update(
-                        action="chunk",
-                        chunk_index=progress["next_chunk"],
-                        report=chunks[progress["next_chunk"]],
-                    )
+                request = next_baseline_request(
+                    manifest,
+                    chunks,
+                    progress["next_chunk"],
+                    batch_size=8 if args.baseline_mode == "batched" else 1,
+                )
             baseline.update(
                 status=200,
                 delivery_ms=(time.perf_counter_ns() - delivery_started) / 1e6,
@@ -183,7 +197,7 @@ def run(args):
         )
         bursts = []
         sequence = cursor["sequence"] + 1
-        for count in (32, 33, 128):
+        for count in sorted({min(size, args.groups) for size in (32, 33, 128)}):
             samples = []
             for sample in range(args.warmup + args.samples):
                 for item in stored["group_statuses"][:count]:
@@ -266,6 +280,7 @@ def run(args):
         return {
             "startup_ms": startup,
             "groups": args.groups,
+            "indexes_per_group": args.indexes_per_group,
             "metadata_nodes": 3,
             "real_data_nodes": 3,
             "all_real_data_nodes_alive": True,
@@ -286,10 +301,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ZIG_ROOT / "zig-out/bin/antfly")
     parser.add_argument("--groups", type=positive, default=10000)
+    parser.add_argument("--indexes-per-group", type=positive, default=1)
     parser.add_argument("--samples", type=positive, default=5)
     parser.add_argument("--warmup", type=positive, default=1)
     parser.add_argument(
-        "--baseline-mode", choices=("full", "chunked"), default="chunked"
+        "--baseline-mode", choices=("full", "chunked", "batched"), default="batched"
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

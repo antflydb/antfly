@@ -673,34 +673,50 @@ different captures are never combined.
 ### Resumable full store inventories
 
 Protocol 10 adds `POST /internal/v1/nodes/:node_id/status/baseline`. Prepare creates
-an invisible generation identified by reporter incarnation and sequence. Each
-ordered chunk contains complete replacements for at most 64 groups and at most
-1 MiB of canonical report JSON; the HTTP envelope is limited to 2 MiB. An inventory
-has at most 4,096 chunks and 512 MiB of report data. A single group above the chunk
-budget is rejected explicitly. Smaller reports retain the ordinary sparse endpoint.
+an invisible generation identified by reporter incarnation and sequence. Ordinary
+chunks contain complete replacements for at most 64 groups and 1 MiB of canonical
+report JSON. Up to eight consecutive chunks share one ReadIndex barrier and one
+Raft entry, capped at 1.5 MiB of report data and 2 MiB for the HTTP/replicated envelope.
+The generation remains limited to 4,096 logical chunks and 512 MiB of report data.
+Smaller reports retain the ordinary sparse endpoint.
 
-The publisher pins the prepared inventory and owns only chunk descriptors and one
-encoded request at a time. A reporting turn performs at most 32 requests, then
-resumes from the replicated next-chunk offset without applying failure backoff to
-normal progress. Incarnation changes discard the pending plan. Transport failures
-and leader changes resume the same generation, with an idempotent last-chunk retry.
-During a metadata rolling upgrade, unsupported baseline requests retain the pending
-plan and retry after a bounded delay; they do not fall back to an oversized body.
+A group larger than one ordinary chunk uses 512 KiB canonical byte fragments,
+base64 encoded on the wire. The full-group digest, group identity, offsets, and
+fragment digest chain fence assembly. Each fragment persists independently and
+survives snapshot installation. The last fragment verifies and materializes the
+complete group once; no growing prefix is repeatedly parsed or rewritten. Group
+materialization is bounded by the generation byte limit and admitted one at a time
+per metadata service. It is proportional to that group's size, not constant-time.
+Admission stays inside the storage owner, including compiled storage, returning only
+the required runtime-status protocol version. The final fragment command contains
+only that fragment; it does not retransmit the assembled group.
 
-HTTP admission validates observations and computes the canonical size and SHA-256
-chunk digest. Command 58 carries those admitted facts, a small manifest, and the
-existing binary store codec. Raft apply never expands runtime reports to JSON.
-Chunks write normalized generation-addressed pages; they do not invalidate the
-visible report cache. Activation checks the complete digest chain, byte count,
-chunk count, and original header/cursor fences, then swaps the active root, compact
-header, and acknowledged cursor in one transaction. No partial inventory is visible.
+The publisher pins the prepared generation in an independently reserved reporting
+worker. Control rounds skip inventory collection while it is pending, leaving
+maintenance scheduling available during slow uploads. A worker quantum has a shared
+two-second transport deadline across discovery, requests, and retries, plus a
+32-request ceiling. Shutdown cancels transport and joins the worker before releasing
+its owner. Ordinary payloads remain borrowed from the pinned generation; exceptional
+large groups retain immutable frame bytes. Transport failures resume from replicated
+progress, including after leader changes or lost responses. A rejected header/cursor
+fence discards the generation and schedules fresh collection. Unsupported requests
+retain the plan and retry after a bounded pause.
+
+HTTP admission computes each chunk's canonical digest once and reuses it for replay
+checks, the binary command, and the application receipt. Command 58 carries admitted
+facts and the binary store codec. Batches apply in one storage transaction. Chunks
+write normalized generation-addressed pages without invalidating the visible report
+cache. Activation checks the complete digest chain, byte count, chunk count, and
+original header/cursor fences, then swaps the active root, compact header, and
+acknowledged cursor in one transaction. No partial group or inventory is visible.
 
 A store retains at most active, pending, and retired generations. Collection reclaims
-one retired page (at most 64 covering references) per subsequent report or prepare
-step; activation itself stays constant-size. Logical Raft snapshots retain the active
-inventory and pending upload state/pages, exclude retired data, and normalize the
-active generation on install. Selective reads rebuild missing derived indexes before
-using them after installation.
+one retired fragment or page (at most 64 covering references) per subsequent report
+or prepare step; activation stays constant-size. Completed-group temporary fragments
+are removed when that group is installed. Logical snapshots retain active inventory
+and pending upload state/pages/fragments, exclude retired data, and normalize the
+active generation on install. Derived-index reconstruction also handles a generation
+whose only durable content is an incomplete first group.
 
 
 ### Compiled storage ownership

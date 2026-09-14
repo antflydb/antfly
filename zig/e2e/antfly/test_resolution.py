@@ -624,9 +624,16 @@ def _wait_for_entities(
     last_error: str | None = None
 
     while not deadline.expired():
+        exhausted = False
         for key in list(pending):
+            remaining = deadline.remaining()
+            if remaining < 0.1:
+                exhausted = True
+                break
             try:
-                doc = api.lookup("entities", key, timeout=deadline.request_timeout())
+                doc = api.lookup(
+                    "entities", key, timeout=min(POLL_REQUEST_TIMEOUT_S, remaining)
+                )
             except requests.RequestException as exc:
                 if not _transient_poll_error(exc):
                     raise
@@ -638,6 +645,8 @@ def _wait_for_entities(
                 pending.remove(key)
         if not pending:
             return found
+        if exhausted:
+            break
         deadline.sleep()
 
     raise AssertionError(

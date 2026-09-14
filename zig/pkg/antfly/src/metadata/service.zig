@@ -6927,6 +6927,7 @@ pub const MetadataHttpService = struct {
     runtime_mutex: std.Io.Mutex = .init,
     catalog_mutation_mutex: std.Io.RwLock = .init,
     store_report_lanes: [64]std.Io.Mutex = @splat(.init),
+    baseline_fragment_materialization_mutex: std.atomic.Mutex = .unlocked,
     table_catalog_mutation_lanes: [table_catalog_mutation_lane_count]std.Io.Mutex = @splat(.init),
     placement_reconcile_mutex: std.Io.Mutex = .init,
     transition_mutex: std.Io.Mutex = .init,
@@ -8003,13 +8004,18 @@ pub const MetadataHttpService = struct {
         if (bytes.len > store_report_baseline.max_chunk_bytes) return error.CatalogCommandTooLarge;
         var parsed = try std.json.parseFromSlice(store_report_baseline.Request, alloc, bytes, .{});
         defer parsed.deinit();
-        const request = parsed.value;
-        try request.validate(alloc);
+        const envelope = parsed.value;
+        try envelope.validate(alloc);
+        const materializes_fragment = if (envelope.fragment) |fragment| try fragment.final() else false;
+        // A large group may need more memory than one transport frame. Admit
+        // at most one reconstruction per service, without queuing control work.
+        if (materializes_fragment and !self.baseline_fragment_materialization_mutex.tryLock()) return error.ResourceTemporarilyUnavailable;
+        defer if (materializes_fragment) self.baseline_fragment_materialization_mutex.unlock();
         const readiness = self.ensureTableTopologyProtocolReadyWithContext(context, metadata_topology_protocol.store_report_baseline_version) catch |err| switch (err) {
             error.TableTopologyProtocolUpgradeRequired => return error.UnsupportedOperation,
             else => return err,
         };
-        const lane = &self.store_report_lanes[request.report.store_id % self.store_report_lanes.len];
+        const lane = &self.store_report_lanes[envelope.report.store_id % self.store_report_lanes.len];
         lane.lockUncancelable(std.Options.debug_io);
         defer lane.unlock(std.Options.debug_io);
         try self.ensureLinearizableReadWithContext(context);
@@ -8017,47 +8023,73 @@ pub const MetadataHttpService = struct {
         var catalog_locked = true;
         defer if (catalog_locked) self.catalog_mutation_mutex.unlockShared(std.Options.debug_io);
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const cursor = try store.reportCursor(self.metadata_group_id, request.report.store_id);
-        if (cursor) |active| {
-            if (std.meta.eql(active, request.cursor)) return .{ .cursor = active, .next_chunk = request.chunk_count, .activated = true };
-            if (active.reporter_incarnation == request.cursor.reporter_incarnation and active.sequence >= request.cursor.sequence) return error.StoreReportBaseMismatch;
+        const last_request = if (envelope.action == .batch) envelope.batch[envelope.batch.len - 1] else envelope;
+        const last_admission = try last_request.admissionFacts();
+        const last_facts = last_request.progressQueryWithDigest(last_admission.digest);
+        // Check the end of the batch first: an acknowledged retry never rewrites
+        // a prefix. The Raft entry applies all chunks in one storage transaction.
+        const existing = store.reportBaselineProgressForKey(self.metadata_group_id, last_facts) catch |err| switch (err) {
+            error.StoreReportBaseMismatch => null,
+            else => return err,
+        };
+        if (existing) |value| {
+            if (value.activated or ((last_request.action == .chunk or last_request.action == .fragment) and value.next_chunk > last_request.chunk_index)) return value;
         }
-        // Admission checks only this chunk's complete group replacements.
-        // Root activation independently compares the original header and cursor.
-        const prior = (try store.readStoreReportTargets(alloc, self.metadata_group_id, .{
-            .sequence = request.cursor.sequence,
-            .base = .{ .reporter_incarnation = request.cursor.reporter_incarnation, .sequence = 0, .digest = @splat(0) },
-            .report = request.report,
-        })) orelse return error.UnknownStore;
-        defer metadata_table_manager.freeStore(alloc, prior);
-        if (prior.reporter_incarnation != request.report.reporter_incarnation or request.report.status_generation < prior.status_generation) return error.StoreReportBaseMismatch;
-        if (request.action == .chunk) {
-            if (try metadata_store_observer.admitObservation(alloc, prior, request.report, true)) |admitted| {
-                defer metadata_table_manager.freeStore(alloc, admitted);
-                if (!runtimeStatusProtocolVersionReady(self, runtimeStatusRequiredRecordVersion(admitted))) return error.RuntimeStatusProtocolUnavailable;
-            } else if (!metadata_store_observer.reportsDurablyEqual(store_report_update.asReport(prior), request.report)) return error.StoreReportBaseMismatch;
-            // A lost response may be retried without duplicating page writes.
-            const progress = store.reportBaselineProgress(self.metadata_group_id, request) catch |err| switch (err) {
-                error.StoreReportBaseMismatch => null,
-                else => return err,
+        var commands: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (commands.items) |command| alloc.free(command);
+            commands.deinit(alloc);
+        }
+        const requests = if (envelope.action == .batch) envelope.batch else &.{envelope};
+        for (requests, 0..) |request, i| {
+            const facts = if (i + 1 == requests.len) last_admission else try request.admissionFacts();
+            const cursor = try store.reportCursor(self.metadata_group_id, request.report.store_id);
+            if (cursor) |active| {
+                if (std.meta.eql(active, request.cursor)) return .{ .cursor = active, .next_chunk = request.chunk_count, .activated = true };
+                if (active.reporter_incarnation == request.cursor.reporter_incarnation and active.sequence >= request.cursor.sequence) return error.StoreReportBaseMismatch;
+            }
+            const fragment_final = if (request.fragment) |fragment| try fragment.final() else false;
+            if (fragment_final and !runtimeStatusProtocolVersionReady(self, try store.admitBaselineFragment(self.metadata_group_id, request))) return error.RuntimeStatusProtocolUnavailable;
+            const report = request.report;
+            // Admission checks only this chunk's complete group replacements.
+            // Root activation independently compares the original header and cursor.
+            const prior = (try store.readStoreReportTargets(alloc, self.metadata_group_id, .{
+                .sequence = request.cursor.sequence,
+                .base = .{ .reporter_incarnation = request.cursor.reporter_incarnation, .sequence = 0, .digest = @splat(0) },
+                .report = report,
+            })) orelse return error.UnknownStore;
+            defer metadata_table_manager.freeStore(alloc, prior);
+            if (prior.reporter_incarnation != request.report.reporter_incarnation or request.report.status_generation < prior.status_generation) return error.StoreReportBaseMismatch;
+            if (request.action == .chunk) {
+                if (try metadata_store_observer.admitObservation(alloc, prior, report, true)) |admitted| {
+                    defer metadata_table_manager.freeStore(alloc, admitted);
+                    if (!runtimeStatusProtocolVersionReady(self, runtimeStatusRequiredRecordVersion(admitted))) return error.RuntimeStatusProtocolUnavailable;
+                } else if (!metadata_store_observer.reportsDurablyEqual(store_report_update.asReport(prior), report)) return error.StoreReportBaseMismatch;
+            }
+            try self.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+            const command = try metadata_storage.raft_apply_store.encodeAdmittedStoreReportBaseline(alloc, store_report_baseline.Command{
+                .request = request,
+                .expected_header = try metadata_storage.raft_apply_store.RaftApplyStore.reportHeaderDigest(alloc, prior),
+                .admission_cursor = cursor,
+                .report_digest = facts.digest,
+                .report_bytes = facts.bytes,
+            });
+            commands.append(alloc, command) catch |err| {
+                alloc.free(command);
+                return err;
             };
-            if (progress) |value| if (value.next_chunk > request.chunk_index) return value;
+            if (command.len > store_report_baseline.max_chunk_bytes) return error.CatalogCommandTooLarge;
         }
-        try self.validateTableTopologyProtocolReadinessWithContext(context, readiness);
-        const command = try metadata_storage.raft_apply_store.encodeStoreReportBaseline(alloc, store_report_baseline.Command{
-            .request = request,
-            .expected_header = try metadata_storage.raft_apply_store.RaftApplyStore.reportHeaderDigest(alloc, prior),
-            .admission_cursor = cursor,
-        });
-        defer alloc.free(command);
-        if (command.len > store_report_baseline.max_chunk_bytes) return error.CatalogCommandTooLarge;
+        const combined = if (commands.items.len > 1) try metadata_storage.raft_apply_store.encodeStoreReportBaselineBatch(alloc, commands.items) else null;
+        defer if (combined) |bytes_owned| alloc.free(bytes_owned);
+        const command = combined orelse commands.items[0];
         const receipt = try self.proposeTransitionCommandWithReceipt(.{ .apply_store_report_baseline = command });
         self.catalog_mutation_mutex.unlockShared(std.Options.debug_io);
         catalog_locked = false;
         try self.waitForTransitionAppliedWithContext(receipt, context);
-        const observed = try store.reportBaselineProgress(self.metadata_group_id, request);
-        if (request.action == .chunk and observed.next_chunk != request.chunk_index + 1) return error.StoreReportBaseMismatch;
-        if (request.action == .activate and !observed.activated) return error.StoreReportBaseMismatch;
+        const observed = try store.reportBaselineProgressForKey(self.metadata_group_id, last_facts);
+        if ((last_request.action == .chunk or last_request.action == .fragment) and observed.next_chunk != last_request.chunk_index + 1) return error.StoreReportBaseMismatch;
+        if (last_request.action == .activate and !observed.activated) return error.StoreReportBaseMismatch;
         return observed;
     }
 

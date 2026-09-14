@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Elastic-2.0
 """Production catalog failover, large control views, and telemetry isolation."""
 
+import copy
 import json
 import os
 import time
@@ -9,7 +10,12 @@ from pathlib import Path
 
 import pytest
 import requests
-from catalog_baseline import JsonNumber, plan_baseline, post_baseline
+from catalog_baseline import (
+    JsonNumber,
+    next_baseline_request,
+    plan_baseline,
+    post_baseline,
+)
 from conftest import DEFAULT_ANTFLY_BIN, internal_service_headers
 from test_scaling import MultiNodeScalingCluster
 
@@ -345,4 +351,42 @@ def test_report_baseline_resumes_after_leader_failure_and_keeps_partial_inventor
     )
     assert response.json()["sequence"] == 3
     assert original_cursor["sequence"] == 1
+    assert all(proc.poll() is None for proc in c.data_procs)
+
+
+def test_report_baseline_fragments_large_group_and_batches_neighbors(catalog_cluster):
+    c = catalog_cluster
+    report, _, leader = register_reporter(c, 260)
+    snapshot, _ = read_pages(
+        c, leader, retry_admission=True, control=False, number_lexemes=True
+    )
+    stored = next(item for item in snapshot["stores"] if item["store_id"] == 1000)
+    template = stored["runtime_statuses"][0]["indexes"][0]
+    stored["runtime_statuses"][0]["indexes"] = [
+        {**copy.deepcopy(template), "name": f"dense_{i}"} for i in range(1200)
+    ]
+    manifest, chunks = plan_baseline(report, stored, 2)
+    assert "$fragment" in chunks[0]
+    _, progress, _ = post_baseline(c, manifest)
+    actions = []
+    while not progress["activated"]:
+        request = next_baseline_request(manifest, chunks, progress["next_chunk"])
+        actions.append(request["action"])
+        leader, progress, size = post_baseline(c, request)
+        assert size <= 2 * 1024 * 1024
+        _, repeated, _ = post_baseline(c, request)
+        assert repeated == progress
+        if len(actions) == 1:
+            # A persisted partial group must neither replace nor append to the
+            # active report, even when queried through the diagnostic reader.
+            before, _ = read_pages(c, leader, retry_admission=True, control=False)
+            visible = next(
+                item for item in before["stores"] if item["store_id"] == 1000
+            )
+            assert len(visible["runtime_statuses"][0]["indexes"]) == 1
+    assert "fragment" in actions and "batch" in actions
+    after, _ = read_pages(c, leader, retry_admission=True, control=False)
+    visible = next(item for item in after["stores"] if item["store_id"] == 1000)
+    assert len(visible["group_statuses"]) == 260
+    assert len(visible["runtime_statuses"][0]["indexes"]) == 1200
     assert all(proc.poll() is None for proc in c.data_procs)

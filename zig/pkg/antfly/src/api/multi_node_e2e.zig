@@ -1578,7 +1578,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     try std.testing.expect(parsed_updated_schema.value.schema.?.document_schemas != null);
     try std.testing.expect(parsed_updated_schema.value.migration != null);
     try std.testing.expectEqualStrings("rebuilding", parsed_updated_schema.value.migration.?.state);
-    try std.testing.expectEqual(@as(?i64, 0), parsed_updated_schema.value.migration.?.read_schema.version);
+    try std.testing.expectEqual(@as(?u32, 0), parsed_updated_schema.value.migration.?.read_schema.version);
 
     var table_detail_after_schema = try client.fetchTable(client_base, "docs");
     defer table_detail_after_schema.deinit(std.heap.page_allocator);

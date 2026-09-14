@@ -9532,7 +9532,7 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
     defer std.testing.allocator.free(proof.observed_holder_node_id);
     try std.testing.expect(proof.active);
     try std.testing.expect(!proof.authority_granted);
-    try std.testing.expectEqual(@as(i64, 0), proof.authority_remaining_ms);
+    try std.testing.expectEqual(@as(u64, 0), proof.authority_remaining_ms);
     try std.testing.expectEqual(@as(i64, 3), proof.observed_lease_transitions);
     try std.testing.expectEqualStrings("primary-a", proof.observed_holder_node_id);
 }
@@ -9580,7 +9580,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
         defer std.testing.allocator.free(proof.observed_holder_node_id);
         try std.testing.expect(!proof.active);
         try std.testing.expect(!proof.authority_granted);
-        try std.testing.expectEqual(@as(i64, 0), proof.authority_remaining_ms);
+        try std.testing.expectEqual(@as(u64, 0), proof.authority_remaining_ms);
         try std.testing.expectEqual(@as(i64, 0), proof.observed_lease_transitions);
         try std.testing.expectEqual(@as(usize, 0), proof.observed_holder_node_id.len);
     }

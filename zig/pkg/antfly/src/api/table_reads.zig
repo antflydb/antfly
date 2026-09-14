@@ -15500,7 +15500,7 @@ fn consumerTests() type {
                     const right = std.mem.indexOf(u8, req.body, "doc:z") != null;
                     _ = self.calls.fetchAdd(1, .monotonic);
                     _ = self.keys_seen.fetchAdd(@as(usize, @intFromBool(left)) + @intFromBool(right), .monotonic);
-                    if (left == right) return error.TestUnexpectedResult;
+                    try std.testing.expect(left != right);
                     try std.testing.expectEqual(left, std.mem.indexOf(u8, req.uri, "/groups/7/") != null);
                     try std.testing.expectEqual(right, std.mem.indexOf(u8, req.uri, "/groups/8/") != null);
                     // Stop after wire capture; both fibers must still finish. This
