@@ -126,6 +126,7 @@ def post_baseline(cluster, request, attempts=None):
                 {
                     "endpoint": index,
                     "action": request["action"],
+                    "request_bytes": len(body),
                     "chunk_index": request["chunk_index"],
                     "status": response.status_code,
                     "elapsed_ms": (time.perf_counter_ns() - started) / 1e6,

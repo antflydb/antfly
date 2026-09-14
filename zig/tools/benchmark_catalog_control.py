@@ -111,6 +111,10 @@ def run(args):
                 status=200,
                 delivery_ms=(time.perf_counter_ns() - delivery_started) / 1e6,
                 requests=len(times),
+                http_attempts=len(attempts),
+                total_attempt_request_bytes=sum(
+                    row["request_bytes"] for row in attempts
+                ),
                 request_latency=summary(times),
                 request_raw_ms=times,
                 total_request_bytes=sum(sizes),
@@ -137,6 +141,7 @@ def run(args):
                 "elapsed_ms": (time.perf_counter_ns() - tick) / 1e6,
                 "token": response.headers.get("X-Antfly-Snapshot-Token"),
                 "bytes": response.headers.get("X-Antfly-Snapshot-Bytes"),
+                "error": response.text[:300] if not response.ok else "",
             }
 
         def release(row):
@@ -233,6 +238,7 @@ def run(args):
                             "attempts": attempts,
                             "control_ms": view["elapsed_ms"],
                             "control_status": view["status"],
+                            "control_error": view["error"],
                             "request_bytes": len(body),
                         }
                     )

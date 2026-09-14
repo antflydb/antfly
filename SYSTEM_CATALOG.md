@@ -648,10 +648,12 @@ at most 512 KiB. A token names one capture; the client checks token and total si
 on every page and publishes only the fully decoded view after authority checks.
 Control and diagnostic transfers use independent admission lanes. A completed
 client releases its token; abandoned tokens expire after 30 seconds. Control views
-have a 16 MiB ceiling and 32 MiB lane budget; diagnostic views have a 64 MiB ceiling
-and 96 MiB lane budget. Before collecting any view, admission reserves its maximum
-size and one of the lane's bounded slots. Concurrent diagnostic callers cannot
-consume control capacity or hold its capture lock. Reservations are conservative:
+have a 16 MiB ceiling and 128 MiB lane budget; diagnostic views have a 64 MiB ceiling
+and 96 MiB lane budget. The aggregate encoding budget is 224 MiB; the control
+lane supports up to eight concurrent maximum-size reservations, accommodating
+background reader fan-in independently of diagnostics. Before collecting a view,
+admission reserves its maximum size and one of the lane's bounded slots.
+Diagnostic callers cannot use control slots or its byte budget. Reservations are conservative:
 a second diagnostic capture can receive 503 even when its eventual encoded size
 might fit. The encoder sizes its output before allocation; oversized views return
 413. Failed and canceled captures release their reservations.

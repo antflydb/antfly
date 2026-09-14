@@ -7,7 +7,10 @@ const std = @import("std");
 pub const path = "/internal/v1/snapshots/read";
 pub const page_bytes = 512 * 1024;
 pub const max_snapshot_bytes = 64 * 1024 * 1024;
-pub const max_retained_bytes = 128 * 1024 * 1024;
+pub const control_snapshot_bytes = 16 * 1024 * 1024;
+pub const control_retained_bytes = 128 * 1024 * 1024;
+pub const diagnostic_retained_bytes = 96 * 1024 * 1024;
+pub const max_retained_bytes = control_retained_bytes + diagnostic_retained_bytes;
 pub const ttl_ns = 30 * std.time.ns_per_s;
 pub const Request = struct {
     token: u64 = 0,
@@ -167,13 +170,14 @@ test "system catalog snapshot transfer capacity is released and encoding is exac
     try std.testing.expectEqual(@as(usize, 64), cache.retained);
 }
 
-/// Control captures own 32 MiB of admission, diagnostic captures 96 MiB.
-/// Retained encodings plus in-flight encoding reservations never exceed the
-/// original aggregate 128 MiB budget. Object capture is bounded separately by
-/// the inventory and one maximum-sized reservation per admitted capture.
+/// Control admission allows up to eight concurrent maximum-size captures.
+/// Default clusters have several independent background control readers; two
+/// reservations rejected ordinary probes even with tiny retained views. Keep
+/// their 128 MiB budget independent of the 96 MiB diagnostic lane. Retained
+/// encodings plus in-flight encoding reservations are bounded by 224 MiB.
 pub const Transfers = struct {
-    control: Cache = .{ .snapshot_limit = 16 * 1024 * 1024, .retained_limit = 32 * 1024 * 1024 },
-    diagnostic: Cache = .{ .next_token = 1, .retained_limit = 96 * 1024 * 1024 },
+    control: Cache = .{ .snapshot_limit = control_snapshot_bytes, .retained_limit = control_retained_bytes },
+    diagnostic: Cache = .{ .next_token = 1, .retained_limit = diagnostic_retained_bytes },
     pub fn lane(self: *Transfers, request: Request) *Cache {
         if (request.token != 0) return if (request.token & 1 == 0) &self.control else &self.diagnostic;
         return if (request.control) &self.control else &self.diagnostic;
@@ -207,4 +211,21 @@ test "system catalog diagnostic reservations cannot block control and failure re
     try std.testing.expectEqual(@as(usize, 0), diagnostic.reserved);
     try std.testing.expectError(error.CatalogGenerationChanged, diagnostic.read(a, a, .{ .token = replacement, .release = true }, 6));
     control.cancel(a, control_token);
+}
+
+test "system catalog control admission accommodates cluster fan-in under diagnostics" {
+    const a = std.testing.allocator;
+    var transfers: Transfers = .{};
+    defer transfers.deinit(a);
+    const diagnostic = try transfers.diagnostic.reserve(a, 1);
+    defer transfers.diagnostic.cancel(a, diagnostic);
+    // An outstanding page must not consume a whole capture reservation.
+    _ = try transfers.control.install(a, try a.dupe(u8, "{}"), 2);
+    var tokens: [7]u64 = undefined;
+    for (&tokens) |*token| token.* = try transfers.control.reserve(a, 3);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, transfers.control.reserve(a, 4));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, transfers.diagnostic.reserve(a, 4));
+    try std.testing.expect(transfers.control.retained + transfers.control.reserved + transfers.diagnostic.reserved <= max_retained_bytes);
+    for (tokens) |token| transfers.control.cancel(a, token);
+    try std.testing.expectEqual(@as(usize, 0), transfers.control.reserved);
 }
