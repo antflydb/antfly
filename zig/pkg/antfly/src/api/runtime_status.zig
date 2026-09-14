@@ -4364,8 +4364,11 @@ fn preserveIndexProjectionLifecycle(
 }
 
 fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
-    if (statusHasRuntimeFacts(status)) return true;
-    return false;
+    // A physical owner can be idle or empty. Its identity proves that these
+    // are sampled runtime facts even when workload counters are all zero.
+    // This retains stale observations; serving/convergence authority remains
+    // independently fenced. Root invalidation discards the owner and its facts.
+    return status.stats.runtime_owner_id != 0 or statusHasRuntimeFacts(status);
 }
 
 fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
@@ -4857,16 +4860,16 @@ fn mergeCachedStatusWithNonAuthoritativePlaceholder(
     // captured before an actual catalog mutation.
     merged.cache_observation_generation = previous.cache_observation_generation;
 
-    merged.stats.storage_change_token = previous.stats.storage_change_token;
-    merged.stats.source_doc_count = previous.stats.source_doc_count;
-    merged.stats.doc_count = previous.stats.doc_count;
-    merged.stats.enrichment = previous.stats.enrichment;
-    merged.stats.ttl_cleanup = previous.stats.ttl_cleanup;
-    merged.stats.transaction_recovery = previous.stats.transaction_recovery;
-    merged.stats.text_merge = previous.stats.text_merge;
-    merged.stats.term_doc_freq_cache_hits = previous.stats.term_doc_freq_cache_hits;
-    merged.stats.term_doc_freq_cache_misses = previous.stats.term_doc_freq_cache_misses;
-    merged.stats.async_indexing = previous.stats.async_indexing;
+    // The cached owner supplies every table runtime fact. The catalog supplies
+    // index membership and fresh disk observations, not replacement zero stats.
+    // Exchange owned stats, then restore the catalog's index array. The retained
+    // value owns the old index array for the incarnation-fenced moves below and
+    // the unused placeholder diagnostics for cleanup. No field-by-field runtime
+    // allowlist or additional allocations are needed.
+    var retained = try previous.clone(alloc);
+    defer retained.deinit(alloc);
+    std.mem.swap(db_mod.types.DBStats, &merged.stats, &retained.stats);
+    std.mem.swap([]db_mod.types.DBIndexStats, &merged.stats.indexes, &retained.stats.indexes);
     merged.stats.index_count = @intCast(merged.stats.indexes.len);
 
     // Relabel before copying exact cached index snapshots. replaceMetadata
@@ -4874,10 +4877,6 @@ fn mergeCachedStatusWithNonAuthoritativePlaceholder(
     // immediately erase the owner acknowledgement we are trying to retain.
     merged.replaceMetadata(cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns));
 
-    // Each snapshot owns its index strings and nested arrays. Moving a deep
-    // clone preserves that ownership when the previous cache entry retires.
-    var retained = try previous.clone(alloc);
-    defer retained.deinit(alloc);
     var previous_lookup = try IndexObservationLookup.init(alloc, previous.stats.indexes);
     defer previous_lookup.deinit(alloc);
     for (merged.stats.indexes) |*dst| {
@@ -5303,6 +5302,66 @@ fn seedSnapshotValues(value: anytype) @TypeOf(value) {
         else => {},
     }
     return result;
+}
+
+fn testSyntheticSnapshotStatsOwnership(alloc: std.mem.Allocator) !void {
+    const types = db_mod.types;
+    var source_arena = std.heap.ArenaAllocator.init(alloc);
+    defer source_arena.deinit();
+    const source_alloc = source_arena.allocator();
+    var previous_indexes = [_]types.DBIndexStats{
+        .{ .name = "keep", .kind = .graph, .doc_count = 3, .load_error = "retained diagnostic" },
+        .{ .name = "remove", .kind = .full_text, .doc_count = 4 },
+        .{ .name = "remove_too", .kind = .full_text, .doc_count = 5 },
+    };
+    var catalog_indexes = [_]types.DBIndexStats{
+        .{ .name = "new", .kind = .full_text },
+        .{ .name = "keep", .kind = .graph },
+    };
+    var resolver = [_]types.ResolverReplayDiagnostic{.{ .name = "resolver", .table = "docs", .source_artifact = "source", .resolution_artifact = "resolved" }};
+    var expected = seedSnapshotValues(types.DBStats{});
+    expected.schema_index_state = "ready";
+    expected.index_count = previous_indexes.len;
+    expected.indexes = &previous_indexes;
+    expected.resolver_replay.resolvers = &resolver;
+    expected.text_merge.last_merge_error = .init("RetainedMergeFailure");
+    expected.graph_metric_runtime.last_error_name = .init("RetainedWorkerFailure");
+    // Both inputs contain independent heap-backed diagnostics. Neither input
+    // arena nor the unused catalog diagnostics may back the merged snapshot.
+    const previous = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .cache_observation_generation = 11,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = try cloneDBStats(source_alloc, expected),
+    };
+    const placeholder = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .disk_bytes = 123,
+        .disk_bytes_known = true,
+        .disk_observation_generation = 20,
+        .metadata = .{ .source = .synthetic_config, .freshness = .stale },
+        .stats = try cloneDBStats(source_alloc, .{ .index_count = 2, .indexes = &catalog_indexes, .resolver_replay = .{ .resolvers = &resolver } }),
+    };
+    var merged = try mergeCachedStatusWithNonAuthoritativePlaceholder(alloc, previous, placeholder, 30, null, false);
+    defer merged.deinit(alloc);
+    _ = source_arena.reset(.free_all);
+    // Compare every table fact; only catalog index membership/count is overlaid.
+    var table_facts = merged.stats;
+    table_facts.indexes = expected.indexes;
+    table_facts.index_count = expected.index_count;
+    try std.testing.expectEqualDeep(expected, table_facts);
+    try std.testing.expectEqual(@as(u32, 2), merged.stats.index_count);
+    try std.testing.expectEqual(@as(usize, 2), merged.stats.indexes.len);
+    try std.testing.expectEqualStrings("new", merged.stats.indexes[0].name);
+    try std.testing.expectEqual(@as(u64, 0), merged.stats.indexes[0].doc_count);
+    try std.testing.expectEqualStrings("keep", merged.stats.indexes[1].name);
+    try std.testing.expectEqual(@as(u64, 3), merged.stats.indexes[1].doc_count);
+    try std.testing.expectEqualStrings("retained diagnostic", merged.stats.indexes[1].load_error.?);
+    try std.testing.expectEqual(@as(u64, 11), merged.cache_observation_generation);
+    try std.testing.expectEqual(@as(u64, 123), merged.disk_bytes);
+    try std.testing.expectEqual(@as(u64, 20), merged.disk_observation_generation);
+    try std.testing.expectEqual(RuntimeStatusSource.cached_snapshot, merged.metadata.source);
+    try std.testing.expect(!merged.metadata.target_observation_complete);
 }
 
 fn testSnapshotStatsCompleteness(alloc: std.mem.Allocator) !void {
@@ -6403,6 +6462,93 @@ fn consumerTests() type {
             try std.testing.expect(failing.has_induced_failure);
             try std.testing.expect((try cache.snapshot(std.testing.allocator, "docs")) == null);
             try std.testing.expectEqual(@as(u64, 8), cache.tables.get("docs").?.groups.get(8).?.stats.doc_count);
+        }
+
+        test "table runtime snapshot cache clones stored status synthetic merge ownership" {
+            try testSyntheticSnapshotStatsOwnership(std.testing.allocator);
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, testSyntheticSnapshotStatsOwnership, .{});
+        }
+
+        test "table runtime snapshot cache clones stored status across synthetic and root transitions" {
+            const alloc = std.testing.allocator;
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            var indexes = [_]db_mod.types.DBIndexStats{.{ .name = "graph", .kind = .graph }};
+            var live = LocalTableRuntimeStatus{
+                .group_id = 7,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+                .stats = .{
+                    .index_count = 1,
+                    .indexes = &indexes,
+                    .runtime_owner_id = 10,
+                    .schema_epoch = 7,
+                    .row_format_version = 2,
+                    .table_catalog_generation = 8,
+                    .schema_index_state = "building",
+                    .columnar_maintenance = .{ .passes = 5 },
+                    .visibility = .{ .cache_hits_total = 6 },
+                    .graph_metric_runtime = .{ .enabled = true, .worker_count = 2 },
+                },
+            };
+            _ = try publishGroupForTest(&cache, "docs", live);
+            // A same-root catalog fence cannot erase physical runtime facts.
+            const before_catalog = try cache.capturePublicationToken("docs");
+            cache.fenceTablePublications("docs");
+            try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.stale_table, try cache.publishGroup(before_catalog, "docs", live));
+            const placeholder = LocalTableRuntimeStatus{
+                .group_id = 7,
+                .metadata = .{ .source = .synthetic_config, .freshness = .stale, .lsm_root_generation = 9 },
+                .stats = .{ .index_count = 1, .indexes = &indexes },
+            };
+            for (0..2) |_| {
+                _ = try publishGroupForTest(&cache, "docs", placeholder);
+                var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+                defer observed.deinit(alloc);
+                var facts = observed.stats;
+                facts.indexes = live.stats.indexes;
+                try std.testing.expectEqualDeep(live.stats, facts);
+                try std.testing.expectEqual(RuntimeStatusFreshness.stale, observed.metadata.freshness);
+                try std.testing.expect(!observed.metadata.target_observation_complete);
+            }
+            // An authoritative owner observation replaces cached values,
+            // including legitimate decreases and disabled runtime components.
+            live.stats.schema_epoch = 8;
+            live.stats.table_catalog_generation = 9;
+            live.stats.graph_metric_runtime = .{};
+            live.stats.columnar_maintenance.passes = 0;
+            _ = try publishGroupForTest(&cache, "docs", live);
+            var refreshed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+            defer refreshed.deinit(alloc);
+            try std.testing.expectEqualDeep(live.stats, refreshed.stats);
+
+            // An idle/empty owner still supplies physical catalog facts even
+            // when optional runtimes are disabled and counters are zero.
+            for (0..2) |_| {
+                _ = try publishGroupForTest(&cache, "docs", placeholder);
+                var idle = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+                defer idle.deinit(alloc);
+                var facts = idle.stats;
+                facts.indexes = live.stats.indexes;
+                try std.testing.expectEqualDeep(live.stats, facts);
+            }
+
+            // A replacement root cannot inherit the previous root's facts,
+            // and a delayed publication cannot resurrect them.
+            const before_root = try cache.capturePublicationToken("docs");
+            cache.invalidateTable("docs");
+            try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.stale_table, try cache.publishGroup(before_root, "docs", live));
+            _ = try publishGroupForTest(&cache, "docs", placeholder);
+            var empty_root = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+            defer empty_root.deinit(alloc);
+            try std.testing.expectEqualDeep(placeholder.stats, empty_root.stats);
+            live.metadata.lsm_root_generation = 10;
+            live.stats.runtime_owner_id = 20;
+            live.stats.schema_epoch = 1;
+            live.stats.table_catalog_generation = 1;
+            _ = try publishGroupForTest(&cache, "docs", live);
+            var replacement = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+            defer replacement.deinit(alloc);
+            try std.testing.expectEqualDeep(live.stats, replacement.stats);
         }
 
         test "table runtime snapshot cache clones stored status diagnostic wire bounds" {

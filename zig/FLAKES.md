@@ -122,6 +122,46 @@ retries, skips in the soak, or timeout increases. The final soak evidence is
 `/tmp/pr723-snapshot-fix-soak-500.log`. `origin/main` was fetched again and was
 already included before this push. Linux validation remains CI's responsibility.
 
+### Synthetic refresh preservation
+
+The next review reproduced loss after a live → synthetic cache publication:
+schema epoch 7, catalog generation 8, columnar passes 5, visibility hits 6,
+and an enabled two-worker graph-metric runtime became zero/disabled, while
+document counts survived (`/tmp/pr723-review-current.log`). The clone was
+correct; the synthetic merge still restored only a list of selected fields.
+
+The merge now retains the complete owned table stats from the cached owner,
+then applies catalog index membership using the existing incarnation fences.
+Fresh disk observations remain independent, and stale metadata cannot assert
+latest-target completeness. It reuses the existing two clones and transfers
+ownership without adding allocations. Both unused placeholder diagnostics
+and removed cached indexes are freed by the retained temporary snapshot.
+
+The transition regression also reproduced a second refresh erasing an idle
+owner after its runtimes became disabled (`/tmp/pr723-synthetic-idle-negative.log`).
+Preservation now recognizes the physical runtime-owner identity rather than
+requiring nonzero workload counters. Root invalidation still discards it.
+
+The existing snapshot family now covers all table values, heap-backed resolver
+and index diagnostics after both source lifetimes end, index additions/removals,
+repeated synthetic refreshes, live updates that decrease or clear counters,
+same-root catalog fencing, replacement roots, and rejected delayed publications.
+All **112 snapshot checks** pass, including allocation-failure injection and
+existing allocation-free publication checks, with no leaks
+(`/tmp/pr723-synthetic-fix-unit-final.log`). No test target or filter was added.
+
+The final native macOS arm64 Debug build passed **37/37 steps**
+(`/tmp/pr723-synthetic-fix-build-final.log`). Its executable SHA-256 is
+`643f68bb54b5a5b0d6f1c29d6df19ed5d4401757eaacee2e412e162a6828f8cc`.
+The same executable passed **54 E2E tests** (the existing opt-in scale case
+skipped) across the three affected modules, and **500/500 flake repetitions**:
+exactly 100 for each of the five scenarios, four workers and 25 iterations.
+The modules ran concurrently with the start of the soak. There were no failed-case
+retries, soak skips, or timeout increases. Evidence:
+`/tmp/pr723-synthetic-fix-modules.log` and
+`/tmp/pr723-synthetic-fix-soak-500.log`. The latest fetched `origin/main` was
+already included. Linux validation remains CI's responsibility.
+
 ## 2026-09-13: overlapping storage owner E2E failures (#626, #722)
 
 [PR #626's Antfly E2E job](https://github.com/antflydb/antfly/actions/runs/34781521711/job/103794277696)
