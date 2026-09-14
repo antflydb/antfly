@@ -395,6 +395,55 @@ test "opaque storage owner fences exact source targets before acknowledging writ
     try std.testing.expect(!observer.invalid.load(.acquire));
 }
 
+test "opaque storage owner schedules source verification after reopen without traffic" {
+    const alloc = std.testing.allocator;
+    const time = @import("antfly_platform").time;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-source-maintenance");
+    defer directory.cleanup();
+    const path = std.mem.span(directory.path().ptr);
+    {
+        var owner = try client.Owner.open(.{
+            .path = .fromSlice(path),
+            .table_name = .fromSlice("docs"),
+            .group_id = 7001,
+            .dense_embedding_storage = .vector_store,
+            .indexes_json = .fromSlice("{\"model\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}"),
+        });
+        defer owner.deinit();
+        var response = try owner.batchJson("docs",
+            \\{"inserts":{"a":{"title":"retained","_embeddings":{"model":[1,0,0]}}},"sync_level":"full_index"}
+        );
+        defer response.deinit();
+    }
+    // Reopen with persisted policy and no requests that explicitly drain
+    // maintenance. Status observation must not be required to perform GC.
+    var owner = try client.Owner.open(.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7001,
+    });
+    defer owner.deinit();
+    const deadline = time.monotonicNs() + 15 * std.time.ns_per_s;
+    while (time.monotonicNs() < deadline) {
+        var response = try ownerStatusEventually(&owner);
+        defer response.deinit();
+        const Status = struct {
+            source_vectors: ?struct { collections: u64, retained_payloads: u64, live_payloads_at_collection: u64 } = null,
+        };
+        var parsed = try std.json.parseFromSlice(Status, alloc, response.bytes(), .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.source_vectors) |source| {
+            if (source.collections > 0) {
+                try std.testing.expectEqual(@as(u64, 1), source.retained_payloads);
+                try std.testing.expectEqual(@as(u64, 1), source.live_payloads_at_collection);
+                return;
+            }
+        }
+        try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.SourceVerificationDidNotRun;
+}
+
 fn ownerStatusEventually(owner: *client.Owner) !client.Response {
     const time = @import("antfly_platform").time;
     const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;

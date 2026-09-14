@@ -4380,6 +4380,10 @@ pub fn storageOwnerOpen(
         if (owner_context) |context| context.remoteContent() else null,
         &handle.storage_owner_managed_config,
     ) catch |err| return storageOwnerStatusFromError(err);
+    // The opaque handle now owns the DB at its final address. Match resident
+    // cache installation: source verification and other DB-owned maintenance
+    // must progress even when this owner receives no foreground requests.
+    handle.db.startResidentBackgroundWorkersIfNeeded();
     success = true;
     out_owner.* = handle;
     context_borrowed = false;

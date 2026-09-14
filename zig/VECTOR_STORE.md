@@ -2,6 +2,27 @@
 
 > Paths under `.benchmark-results/` refer to local benchmark output that is not tracked in git.
 
+## September 13: compiled-owner maintenance and fresh ownership comparison
+
+The post-merge 1M GC screen stopped before its first arm qualified: automatic
+source verification never completed. An idle reproduction recorded zero GC
+steps for three minutes. The compiled storage-owner open path omitted the
+shared resident-worker startup call after installing the DB at its final address.
+It now registers that maintenance after successful owner configuration, using
+the same stop/join lifecycle as resident cache entries. A compiled-owner regression
+reopens a source-backed table and requires automatic liveness verification without
+foreground traffic or an explicit maintenance drain; it fails on the old path
+and passes with the registration restored, with no test leaks.
+
+The incomplete screen's roughly 920 peak QPS was measured without functioning
+background source verification and must not be used as promotion evidence.
+The [fresh ownership comparison](../.benchmark-results/vector-store-promotion-20260913/README.md)
+requires working automatic GC and matching query results across saved-1M restarts
+before timing fresh primary_lsm/vector_store tables in AB/BA order at 50K and 1M.
+Both modes use the established common ANN/read settings. New GC-policy, adaptive
+read, and native-only snapshot experiments remain disabled pending independent
+fresh-workload qualification. No creation default is changed.
+
 ## September 13: GC policy implementation and qualification
 
 The [GC policy experiment](../.benchmark-results/vector-store-gc-policy-20260913/README.md)
