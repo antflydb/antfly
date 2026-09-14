@@ -1509,3 +1509,96 @@ storage inventory audit, generated-source checks, 17 Python audit tests, Ruff,
 Zig formatting, and whitespace checks passed. The native restore, graph path,
 diagnostic ownership, report recovery, and public-name regressions found while
 integrating main were fixed without weakening shutdown or disk-space guards.
+
+
+## Resumable inventory and control isolation — 2026-09-13
+
+[Raw runs, retries, rejection counts, and provenance](system_catalog_control_workloads_2026_09_13.json)
+retain the baseline, two completed intermediate runs, and the final run.
+The baseline binary is from `821b5007b`; final source is `2faa02d71`. Both include
+main `c1a39a3ae`. These are macOS ARM64 Debug builds with Zig 0.16.0, three
+metadata voters, three real data nodes, and a synthetic 10,000-group inventory
+with one embedding index per group. No Zig compilers were detected before the
+final run, and no task builds or tests ran during it.
+
+### Large inventory recovery
+
+The 46,140,485-byte ordinary baseline request returned HTTP 413 on the previous
+binary. Resumable generation publication succeeds on the final binary: 157 chunks
+plus prepare and activation, each HTTP body at most 296,029 bytes. Client-side
+planning took 2.235 seconds; delivery took 64.543 seconds, including discovery;
+total recovery took 66.778 seconds. Activation took 442.199 ms, including Raft
+commit scheduling. It publishes the root/header/cursor atomically rather than
+rewriting the inventory. Timing is not constant: an intermediate run recorded
+47.295 ms for activation.
+
+The harness probes metadata endpoints in order for each baseline command. The
+159 logical commands required 318 HTTP attempts: 159 follower rejections and
+159 successful attempts. All attempts and response bodies are retained. Accepted
+request bodies totaled 46,256,442 bytes; actual attempted request bodies totaled
+92,512,884 bytes. Production endpoint affinity can avoid that repeated discovery;
+these measurements do not isolate server apply time from client planning,
+encoding, discovery, and Raft durability.
+
+### Control traffic during diagnostics and report bursts
+
+Five measured idle and five contended control captures use the same workload.
+Each contended capture starts 150 ms after four simultaneous diagnostic requests.
+
+| Control capture | Before p50 / maximum | Final p50 / maximum |
+| --- | --- | --- |
+| Idle | 245.307 / 1,622.921 ms | 52.360 / 53.252 ms |
+| During diagnostics | 2,140.435 / 3,926.267 ms | 53.092 / 55.944 ms |
+
+Median contended control latency improved 40.3× in this run. All ten captures
+returned 200. All three real data nodes remained alive throughout the final
+workload, and the post-baseline catalog readiness check succeeded.
+
+Each burst size has one warmup and five measured publications. Control capture
+immediately follows the publication; latencies are measured separately.
+
+| Changed groups | Publish before p50 / p95 | Publish final p50 / p95 | Control before p50 / p95 | Control final p50 / p95 |
+| --- | --- | --- | --- | --- |
+| 32 | 65.862 / 78.249 ms | 102.850 / 509.459 ms | 293.339 / 2,335.109 ms | 92.719 / 96.276 ms |
+| 33 | 116.424 / 1,723.856 ms | 378.368 / 479.920 ms | 1,558.274 / 2,211.989 ms | 92.738 / 93.168 ms |
+| 128 | 363.893 / 1,824.210 ms | 552.722 / 964.074 ms | 1,637.942 / 2,333.331 ms | 186.897 / 608.967 ms |
+
+All 15 final burst publications succeeded on their first endpoint attempt, and
+all 15 following control captures returned 200. The 33-group first-reader cliff
+is gone. Publication medians did **not** improve; this result supports control
+isolation and bounded recovery, not a blanket write-latency improvement. With
+five samples, p95 is the maximum and tail estimates are noisy.
+
+### Admission capacity and limitations
+
+The first separated control lane reserved only 32 MiB, enough for two maximum-size
+captures. A completed run with that budget recorded one contended control 503 and
+two control 503s after 33-group bursts. Their response bodies were not captured by
+that harness version. The deterministic fan-in regression now covers seven
+concurrent control reservations alongside a retained page and a full diagnostic
+reservation. The final lane reserves 128 MiB, allowing up to eight maximum-size
+captures, and the final benchmark has zero control failures across all 25 probes.
+
+Diagnostics keep their independent 96 MiB budget and a 64 MiB maximum view.
+The aggregate encoding/reservation cap is 224 MiB; buffers allocate their exact
+encoded size rather than preallocating the reservation. Admission remains
+conservative: 17 of 20 final diagnostic probes returned the explicit capacity
+503 in 1.164–2.030 ms, while three completed in 712–725 ms. The previous binary
+completed nine and rejected eleven diagnostic probes, with rejections taking
+roughly 0.9–5.8 seconds. This trades diagnostic concurrency for bounded work and
+prompt overload responses. It does not claim improved diagnostic throughput.
+
+Synthetic groups are outside authoritative table placement, so the roughly 8 KiB
+control view is not a size estimate for 10,000 active shard placements. These
+small-sample, single-host development runs are not production capacity claims.
+
+Validation passed 57 selected E2Es in 210.34 seconds, then six distributed
+recovery/status/drain E2Es in 70.21 seconds after the admission adjustment.
+The HA fixture always uses a cluster identity above the signed 64-bit range.
+All 394 HA unit tests, 99 CLI tests, 35 graph-maintenance command tests, 33 OpenAPI
+contract tests in both test roots, and four snapshot-transfer tests passed.
+Catalog/store/API/transport, metadata-service, compiled-storage, transaction
+allocation-failure, and production DataServer simulation regressions also passed.
+OpenAPI generation, generated-file consistency, test-ownership audit, lint,
+formatting, and diff checks passed. This is local validation; hosted CI is
+reported independently on the PR.
