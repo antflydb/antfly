@@ -6,7 +6,8 @@
 Run from zig/: uv run --project e2e/antfly python tools/benchmark_catalog_control.py
 --output result.json. Timed publications try each metadata endpoint at most once and retain every
 attempt; their latency includes discovery. Snapshot measurements never retry. Both old and
-new binaries can be measured with --baseline-mode full or chunked respectively.
+new binaries can be measured with --baseline-mode full or chunked respectively;
+compare chunked and batched on one binary to isolate transport batching.
 """
 
 import argparse

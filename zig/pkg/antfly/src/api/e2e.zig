@@ -104,7 +104,7 @@ fn createTableIndexWithProbeRetry(
     return error.EmbeddingProbeUnavailable;
 }
 
-fn queryResponseTotal(body: []const u8) !i64 {
+fn queryResponseTotal(body: []const u8) !u64 {
     var parsed = try std.json.parseFromSlice(
         metadata_openapi.QueryResponses,
         std.testing.allocator,
@@ -125,7 +125,7 @@ fn fetchQueryUntilTotal(
     base_uri: []const u8,
     table_name: []const u8,
     body: []const u8,
-    expected_total: i64,
+    expected_total: u64,
 ) !http_client.QueryResponse {
     for (0..600) |_| {
         var response = try client.fetchQuery(base_uri, table_name, body);
@@ -720,6 +720,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -1568,6 +1569,7 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -1660,7 +1662,7 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
     defer parsed_updated_schema.deinit();
     try std.testing.expect(parsed_updated_schema.value.migration != null);
     try std.testing.expectEqualStrings("rebuilding", parsed_updated_schema.value.migration.?.state);
-    try std.testing.expectEqual(@as(i64, 0), parsed_updated_schema.value.migration.?.read_schema.version);
+    try std.testing.expectEqual(@as(?u32, 0), parsed_updated_schema.value.migration.?.read_schema.version);
     try std.testing.expect(parsed_updated_schema.value.indexes.map.get("full_text_index_v1") != null);
 
     // Schema replacement is accepted before the writer-owned structural
@@ -1838,6 +1840,7 @@ test "public api e2e rejects table backup during active schema migration" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -1945,6 +1948,7 @@ test "public api e2e rejects table restore for migration-state backup manifests"
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -2061,6 +2065,7 @@ test "public api e2e rejects table restore when target already exists" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -2167,6 +2172,7 @@ test "public api e2e rejects table restore for mismatched backup manifests" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -2281,6 +2287,7 @@ test "public api e2e validates backup and restore request shapes and locations" 
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -2480,6 +2487,7 @@ test "public api e2e backs up drops and restores a table" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -3354,6 +3362,7 @@ test "public api e2e supports managed semantic search and sparse embeddings" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -3483,6 +3492,7 @@ test "public api e2e adds managed embeddings indexes to existing tables" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -3800,6 +3810,7 @@ test "public api e2e restores managed embeddings from table backup" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -3981,6 +3992,7 @@ test "public api e2e supports managed sparse embeddings generation" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4095,6 +4107,7 @@ test "public api e2e supports hybrid query pruner and reranker" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4233,6 +4246,7 @@ test "public api e2e supports retrieval agent pipeline queries" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4328,6 +4342,7 @@ test "public api e2e supports retrieval agent generation step" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4432,6 +4447,7 @@ test "public api e2e supports retrieval agent semantic and hybrid strategies" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4556,6 +4572,7 @@ test "public api e2e supports retrieval agent tree search pipeline" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4661,6 +4678,7 @@ test "public api e2e supports retrieval agent tree search from roots" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4764,6 +4782,7 @@ test "public api e2e supports retrieval agent classification confidence and foll
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -4874,6 +4893,7 @@ test "public api e2e supports retrieval agent fixed-body sse streaming" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5008,6 +5028,7 @@ test "public api e2e retrieval streaming emits clarification events" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5127,6 +5148,7 @@ test "public api e2e supports bounded agentic retrieval mode" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5221,6 +5243,7 @@ test "public api e2e agentic retrieval selects the best declared query" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5313,6 +5336,7 @@ test "public api e2e agentic retrieval evaluates misses and falls back to the ne
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5421,6 +5445,7 @@ test "public api e2e agentic retrieval can require clarification and continue fr
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5528,6 +5553,7 @@ test "public api e2e restores managed sparse embeddings from table backup" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5723,6 +5749,7 @@ test "public api e2e supports embedding_template remote media helper" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -5897,6 +5924,7 @@ test "public api e2e supports template chunked remote text enrichment and query 
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -6145,6 +6173,7 @@ test "public api e2e supports fixed and antfly chunked semantic search" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -6323,6 +6352,7 @@ test "public api e2e restores chunked managed embeddings from table backup" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -6539,6 +6569,7 @@ test "public api e2e supports graph queries" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -6759,6 +6790,7 @@ test "public api e2e graph queries respect full_index sync level" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -7183,6 +7215,7 @@ test "public api smoke e2e queries across split ranges" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -7403,6 +7436,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
             bootstrap_read_source.source(),
             bootstrap_write_source.source(),
         );
+        defer bootstrap_server.deinit();
         var bootstrap_listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &bootstrap_server);
         defer bootstrap_listener.deinit();
         const bootstrap_uri = try bootstrap_listener.baseUri(std.testing.allocator);
@@ -7711,6 +7745,7 @@ test "public api e2e serves cluster backup list and restore routes" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -7965,6 +8000,7 @@ test "public api e2e does not publish or restore a partial cluster backup" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -8101,6 +8137,7 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -8296,6 +8333,7 @@ test "public api smoke e2e commits transaction across split ranges" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -8465,6 +8503,7 @@ test "public api smoke e2e commits transactions across two tables atomically" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -8668,6 +8707,7 @@ test "public api smoke e2e queries after merge finalization" {
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 

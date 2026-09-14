@@ -2299,8 +2299,10 @@ pub const MetadataHttpServer = struct {
             return err;
         };
         defer ctx.allocator.free(page.bytes);
-        try ctx.setHeader("X-Antfly-Snapshot-Token", try std.fmt.allocPrint(ctx.allocator, "{d}", .{page.token}));
-        try ctx.setHeader("X-Antfly-Snapshot-Bytes", try std.fmt.allocPrint(ctx.allocator, "{d}", .{page.total}));
+        var token_buffer: [20]u8 = undefined;
+        var total_buffer: [20]u8 = undefined;
+        try ctx.setHeader("X-Antfly-Snapshot-Token", try std.fmt.bufPrint(&token_buffer, "{d}", .{page.token}));
+        try ctx.setHeader("X-Antfly-Snapshot-Bytes", try std.fmt.bufPrint(&total_buffer, "{d}", .{page.total}));
         return ctx.status(200).text(page.bytes);
     }
 

@@ -658,6 +658,29 @@ def _wait_for_entities(
     )
 
 
+def test_entity_deadline_retains_diagnostics_below_request_floor(monkeypatch):
+    class Server:
+        def native_stack_dumps(self):
+            return "captured native stacks"
+
+    class Api:
+        _server = Server()
+
+        def lookup(self, *args, **kwargs):
+            raise AssertionError("must not start a request below the time floor")
+
+        def diagnostic(self):
+            return "captured entity diagnostics"
+
+    deadline = _Deadline(115.0)
+    monkeypatch.setattr(deadline, "remaining", lambda: 0.09)
+    with pytest.raises(AssertionError) as failure:
+        _wait_for_entities(Api(), {"entity:a": "Alice"}, deadline=deadline)
+    assert "pending=['entity:a']" in str(failure.value)
+    assert "captured native stacks" in str(failure.value)
+    assert "captured entity diagnostics" in str(failure.value)
+
+
 def _doc_text(doc: dict) -> str:
     """The lookup response carries the stored document; flatten it to text so the
     assertions tolerate whichever envelope the public API uses."""

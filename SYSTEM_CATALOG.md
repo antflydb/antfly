@@ -683,9 +683,10 @@ Smaller reports retain the ordinary sparse endpoint.
 A group larger than one ordinary chunk uses 512 KiB canonical byte fragments,
 base64 encoded on the wire. The full-group digest, group identity, offsets, and
 fragment digest chain fence assembly. Each fragment persists independently and
-survives snapshot installation. The last fragment verifies and materializes the
-complete group once; no growing prefix is repeatedly parsed or rewritten. Group
-materialization is bounded by the generation byte limit and admitted one at a time
+survives snapshot installation. Only the last fragment materializes the complete
+group, once for admission and once for atomic apply; no growing prefix is repeatedly
+parsed or rewritten. Group materialization is bounded by the generation byte limit
+and admitted one at a time
 per metadata service. It is proportional to that group's size, not constant-time.
 Admission stays inside the storage owner, including compiled storage, returning only
 the required runtime-status protocol version. The final fragment command contains
@@ -711,8 +712,8 @@ original header/cursor fences, then swaps the active root, compact header, and
 acknowledged cursor in one transaction. No partial group or inventory is visible.
 
 A store retains at most active, pending, and retired generations. Collection reclaims
-one retired fragment or page (at most 64 covering references) per subsequent report
-or prepare step; activation stays constant-size. Completed-group temporary fragments
+at most one retired fragment and one page (at most 64 covering references) per
+subsequent report or prepare step; activation stays constant-size. Completed-group temporary fragments
 are removed when that group is installed. Logical snapshots retain active inventory
 and pending upload state/pages/fragments, exclude retired data, and normalize the
 active generation on install. Derived-index reconstruction also handles a generation
