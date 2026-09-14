@@ -3,7 +3,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
-from validate_vdbbench_result import validate_lifecycle_log, validate_metrics, restart_recall_comparison
+from validate_vdbbench_result import (
+    validate_lifecycle_log,
+    validate_metrics,
+    restart_recall_comparison,
+)
 
 
 class ResultValidationTest(unittest.TestCase):
@@ -32,9 +36,13 @@ class ResultValidationTest(unittest.TestCase):
             {"label": "cold", "recall": 0.96},
             {"label": "warm", "recall": 0.96},
         ]
-        self.assertTrue(restart_recall_comparison(rows, "before", "cold", "warm")["qualified"])
+        self.assertTrue(
+            restart_recall_comparison(rows, "before", "cold", "warm")["qualified"]
+        )
         rows[-1]["recall"] = 0.958
-        self.assertFalse(restart_recall_comparison(rows, "before", "cold", "warm")["qualified"])
+        self.assertFalse(
+            restart_recall_comparison(rows, "before", "cold", "warm")["qualified"]
+        )
         with self.assertRaisesRegex(ValueError, "expected one"):
             restart_recall_comparison(rows[2:], "before", "cold", "warm")
 

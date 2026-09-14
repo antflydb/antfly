@@ -80,7 +80,8 @@ def main():
         print("reclamation start", name, flush=True)
         if sys.platform == "darwin":
             subprocess.run(
-                ["/bin/cp", "-cR", str(source / "data"), str(output / "data")], check=True
+                ["/bin/cp", "-cR", str(source / "data"), str(output / "data")],
+                check=True,
             )
         else:
             shutil.copytree(source / "data", output / "data")
@@ -142,20 +143,35 @@ def main():
             status_ready_at = None
             sampler = None
             if sys.platform == "darwin":
-                sampler = subprocess.Popen([
-                    sys.executable, "-B", str(Path(__file__).with_name("sample_macos_process_memory.py")),
-                    "--pid", str(process.pid), "--output", str(output / "resources.jsonl"),
-                    "--seconds", str(args.timeout + 60),
-                ], stdout=subprocess.DEVNULL)
+                sampler = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-B",
+                        str(Path(__file__).with_name("sample_macos_process_memory.py")),
+                        "--pid",
+                        str(process.pid),
+                        "--output",
+                        str(output / "resources.jsonl"),
+                        "--seconds",
+                        str(args.timeout + 60),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                )
             try:
                 while time.monotonic() - started < args.timeout:
                     if process.poll() is not None:
                         raise RuntimeError("reclamation server exited: " + name)
                     try:
                         if status_ready_at is None:
-                            index = get_json(f"http://127.0.0.1:{args.port}/db/v1/tables/vdbbench/indexes/vec")
+                            index = get_json(
+                                f"http://127.0.0.1:{args.port}/db/v1/tables/vdbbench/indexes/vec"
+                            )
                             status = index.get("status") or {}
-                            if not status.get("readiness", {}).get("complete") or status.get("searchable_vectors") != expected or status.get("rebuilding"):
+                            if (
+                                not status.get("readiness", {}).get("complete")
+                                or status.get("searchable_vectors") != expected
+                                or status.get("rebuilding")
+                            ):
                                 time.sleep(1)
                                 continue
                             status_ready_at = time.monotonic()
@@ -177,7 +193,9 @@ def main():
                             )
                             query_started = time.monotonic()
                             query = get_json(request, timeout=180)
-                            result["first_query_seconds"] = time.monotonic() - query_started
+                            result["first_query_seconds"] = (
+                                time.monotonic() - query_started
+                            )
                             (output / "resident-query.json").write_text(
                                 json.dumps(query, indent=2) + "\n"
                             )

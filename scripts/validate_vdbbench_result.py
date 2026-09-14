@@ -38,7 +38,9 @@ def restart_recall_comparison(rows, before_label, cold_label, warm_label):
     for label in (before_label, cold_label, warm_label):
         matches = [row for row in rows if row.get("label") == label]
         if len(matches) != 1:
-            raise ValueError(f"expected one recall result for {label}, got {len(matches)}")
+            raise ValueError(
+                f"expected one recall result for {label}, got {len(matches)}"
+            )
         recall = matches[0].get("recall")
         if not positive_finite(recall) or recall > 1:
             raise ValueError(f"invalid recall for {label}: {recall}")

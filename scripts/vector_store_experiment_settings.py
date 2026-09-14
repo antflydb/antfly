@@ -177,8 +177,15 @@ TREATMENTS["mark_planning_sparse"] = {
 CONTROLS["batch_reads"] = {"ANTFLY_SOURCE_VECTOR_BATCH_READS": "0"}
 TREATMENTS["batch_reads"] = {"ANTFLY_SOURCE_VECTOR_BATCH_READS": "1"}
 # Positional leases require sharing; hold catalog ownership constant to isolate I/O.
-CONTROLS["positional_reads"] = {"ANTFLY_SOURCE_VECTOR_BATCH_READS": "1", "ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS": "0", "ANTFLY_SOURCE_VECTOR_SHARED_CATALOG": "1"}
-TREATMENTS["positional_reads"] = {"ANTFLY_SOURCE_VECTOR_BATCH_READS": "1", "ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS": "1"}
+CONTROLS["positional_reads"] = {
+    "ANTFLY_SOURCE_VECTOR_BATCH_READS": "1",
+    "ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS": "0",
+    "ANTFLY_SOURCE_VECTOR_SHARED_CATALOG": "1",
+}
+TREATMENTS["positional_reads"] = {
+    "ANTFLY_SOURCE_VECTOR_BATCH_READS": "1",
+    "ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS": "1",
+}
 # Matched configuration for comparisons between two pinned binaries.
 CONTROLS["batch_reads_enabled"] = TREATMENTS["batch_reads"].copy()
 TREATMENTS["batch_reads_enabled"] = TREATMENTS["batch_reads"].copy()
@@ -219,9 +226,12 @@ for name, flags in {
     CONTROLS[name] = dict(_SOURCE_IO_BASE)
     TREATMENTS[name] = flags
 CONTROLS["source_checkpoint_unlocked"] = {
-    **_SOURCE_IO_BASE, "ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS": "0",
+    **_SOURCE_IO_BASE,
+    "ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS": "0",
 }
-TREATMENTS["source_checkpoint_unlocked"] = {"ANTFLY_SOURCE_VECTOR_UNLOCKED_CHECKPOINT": "1"}
+TREATMENTS["source_checkpoint_unlocked"] = {
+    "ANTFLY_SOURCE_VECTOR_UNLOCKED_CHECKPOINT": "1"
+}
 
 ALL_FLAGS = sorted(
     {key for flags in [*TREATMENTS.values(), *CONTROLS.values()] for key in flags}

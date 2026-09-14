@@ -48,12 +48,16 @@ class WorkloadErrorTests(unittest.TestCase):
             root = Path(directory)
             (root / "vdbbench-live.log").write_text("Success to finish task\n")
             (root / "antfly-initial.log").write_text("info: ready\n")
-            (root / "vdbbench-framework.log").write_text("VectorDB search_embedding error: 500 Internal Server Error\n")
+            (root / "vdbbench-framework.log").write_text(
+                "VectorDB search_embedding error: 500 Internal Server Error\n"
+            )
             result = inspect_workload_errors(root)
             self.assertFalse(result["qualified"])
             self.assertEqual(result["counts"]["client_query_error"], 1)
             (root / "vdbbench-framework.log").write_text("")
-            (root / "antfly-reopened.log").write_text("warning: public table query read failed table=test err=error.ResourceBudgetExceeded\n")
+            (root / "antfly-reopened.log").write_text(
+                "warning: public table query read failed table=test err=error.ResourceBudgetExceeded\n"
+            )
             self.assertFalse(inspect_workload_errors(root)["qualified"])
 
     def test_missing_workload_logs_fail_closed(self):

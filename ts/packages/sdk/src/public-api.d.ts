@@ -4695,10 +4695,10 @@ export interface components {
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
-        /** @description Immutable source embedding storage selected when creating a table. */
+        /** @description Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required. */
         TableStorageSettings: {
             /**
-             * @description Experimental vector_store mode requires a fresh local single-shard table without HA or replication.
+             * @description Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
              * @default primary_lsm
              * @enum {string}
              */
