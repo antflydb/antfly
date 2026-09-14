@@ -832,4 +832,5 @@ and exclusive lease fence the physical generation. Exact repair selection uses t
 resident name index, leaves the general repair cursor unchanged, honors paused and
 future-dated intents, and excludes unrelated repair debt from the target's readiness.
 Ordinary repairs retain their existing leader admission. Busy runtime observations
-cross the compiled boundary as the existing retryable storage-unavailable identity.
+retain their typed errors across the compiled boundary; the control owner preserves
+refresh debt before using cached or synthetic facts.

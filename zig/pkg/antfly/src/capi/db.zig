@@ -1270,7 +1270,7 @@ const JsonTextMergeStats = struct {
     failed_merges: u64,
     quarantined_merges: u64,
     quarantined_segments: u64,
-    last_merge_error: []const u8,
+    last_merge_error: db_mod.types.RuntimeErrorName,
     backpressure_events: u64,
     backpressure_ns: u64,
     max_pending_segments: u64,

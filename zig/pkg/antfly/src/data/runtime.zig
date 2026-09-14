@@ -16050,11 +16050,18 @@ pub const DataServer = struct {
         table_name: []const u8,
         group_id: u64,
     ) !?runtime_status.LocalTableRuntimeStatus {
-        if (try self.liveRuntimeWriteSource().snapshotManagedWriterGroupStatusBestEffort(alloc, table_name, group_id)) |status| {
-            return status;
-        }
-        if (self.data_raft_apply != null) {
-            return try self.write_source.snapshotManagedWriterGroupStatusBestEffort(alloc, table_name, group_id);
+        const sources = [_]*antfly.public_api.ProvisionedTableWriteSource{ self.liveRuntimeWriteSource(), &self.write_source };
+        for (sources[0..if (self.data_raft_apply != null) @as(usize, 2) else 1]) |source| {
+            const observed = source.snapshotManagedWriterGroupStatusBestEffort(alloc, table_name, group_id) catch |err| switch (err) {
+                error.StorageBusy, error.StorageReadTemporarilyUnavailable => {
+                    // Preserve the retry independently of whether this pass
+                    // can publish cached/synthetic facts for this group.
+                    self.runtime_status_dirty.store(true, .release);
+                    continue;
+                },
+                else => return err,
+            };
+            if (observed) |status| return status;
         }
         return null;
     }
@@ -27605,7 +27612,7 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
-        test "system catalog runtime observation isolates busy and nonlocal groups" {
+        test "system catalog runtime observation targets its group and preserves errors" {
             if (comptime !control_only_storage_sources) return error.SkipZigTest;
             const Fake = struct {
                 failure: ?anyerror = null,
@@ -27633,7 +27640,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 42), status.stats.doc_count);
             for ([_]anyerror{ error.StorageBusy, error.StorageReadTemporarilyUnavailable }) |err| {
                 fake.failure = err;
-                try std.testing.expect((try source.snapshotManagedWriterGroupStatusBestEffort(std.testing.allocator, "tenant", 102)) == null);
+                try std.testing.expectError(err, source.snapshotManagedWriterGroupStatusBestEffort(std.testing.allocator, "tenant", 102));
             }
             fake.failure = error.OutOfMemory;
             try std.testing.expectError(error.OutOfMemory, source.snapshotManagedWriterGroupStatusBestEffort(std.testing.allocator, "tenant", 102));
@@ -31478,6 +31485,46 @@ fn consumerTests() type {
                 null,
             );
             try std.testing.expectEqual(fingerprint_a, fingerprint_b);
+        }
+
+        test "data runtime busy owner observation preserves refresh debt" {
+            if (comptime !control_only_storage_sources) return error.SkipZigTest;
+            const Probe = struct {
+                calls: usize = 0,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: antfly.db.types.BatchRequest) !?void {
+                    return error.UnexpectedBatch;
+                }
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8) !?runtime_status.LocalTableRuntimeStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(@as(u64, 77), group_id);
+                    return error.StorageBusy;
+                }
+            };
+            var probe = Probe{};
+            var server: DataServer = .{
+                .alloc = std.testing.allocator,
+                .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator),
+                .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+                    ".",
+                    antfly.public_api.table_catalog.emptyCatalogSource(),
+                    antfly.raft.read_gate.alreadyReadSafeBarrier(),
+                ),
+                .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", antfly.public_api.table_catalog.emptyCatalogSource()),
+                .status_source = undefined,
+                .api_server_cfg = .{},
+                .query_async_limit = .limited(8),
+                .listener_cfg = undefined,
+            };
+            defer server.deinit();
+            _ = server.write_source.withLocalWriteSource(.{
+                .ptr = &probe,
+                .vtable = &.{ .batch = Probe.batch, .local_runtime_status_group_local = Probe.observe },
+            });
+            server.runtime_status_dirty.store(false, .release);
+            try std.testing.expect((try server.snapshotManagedWriterGroupStatusBestEffort(std.testing.allocator, "docs", 77)) == null);
+            try std.testing.expectEqual(@as(usize, 1), probe.calls);
+            try std.testing.expect(server.runtime_status_dirty.load(.acquire));
         }
 
         test "data runtime raft status changes force immediate store status publication" {

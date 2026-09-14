@@ -4,6 +4,309 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-14: producer readiness snapshot loss (#723)
+
+[The Antfly E2E job on #723](https://github.com/antflydb/antfly/actions/runs/34801864332/job/103853126220)
+ran `07bb51bdf0a063ad0f4782e35a48669b6c253f2c` and reported one failure,
+445 passes, and five skips. The four previously investigated cases passed.
+`test_embedding_producer_registry_rejects_orphans_and_owner_mismatches`
+timed out requiring `enrichment_runtime.embed_batches_completed > 0`, despite
+one indexed, query-visible document and complete durable source coverage.
+Its aggregate readiness also reported `source_observation_incomplete` while
+the individual shard reported complete publication without its source list.
+
+The counter is scoped to the enrichment runtime, not durable completion.
+Catalog descriptor changes can close/reopen an owner, and restart necessarily
+replaces it. The exact CI replacement interleaving was not captured; the
+unchanged executable passed 20 isolated repetitions locally. The test now
+requires complete readiness for the configured artifact source and successful
+semantic queries through both the producer index and its artifact consumer,
+before and after a forced process restart. It does not require replaying
+already-published artifacts just to increment a new runtime's counters.
+
+The readiness contradiction has a deterministic production cause:
+`runtime_status.cloneDBStats` omitted `DBIndexStats.source_replay`. That copy
+runs when an ABI response is detached from its JSON parser and when the
+control-plane cache publishes or returns a snapshot. Source names, replay
+watermarks, repair facts, and observation counts now retain independent
+ownership across these copies. The regression covers complete, lagging, and
+failed sources, frees the original backing arena, destroys the intermediate
+cache, and checks the retained result. Allocation-failure injection checks
+partial-clone cleanup. It belongs to the existing runtime snapshot test family.
+
+The same native reproduction exposed poisoned diagnostic labels (`0xaa` byte
+arrays) after the ABI parser was freed. Enrichment phase/checkpoint/stall and
+index repair/checkpoint labels now resolve to immutable labels, using the
+owner enums where available and an explicit `unknown` for unsupported peer
+values. This keeps native DBStats' borrowed-label contract and does not add
+allocations to status merges.
+
+Before the fix, the new unit regression reported **expected three sources,
+found zero**; the strengthened E2E case timed out on the original executable
+with `source_observation_incomplete`. Logs are
+`/tmp/pr723-source-negative.log` and `/tmp/pr723-source-e2e-before.log`.
+After merging `origin/main` at `3554f82101` (merge `19162ef60f`), the native
+macOS arm64 Debug build passed all 49 steps and six focused owner/snapshot
+checks. The binary SHA-256 is
+`d7dce3ac5b091d32acad40c2b5fd99eb4a91b01b22c73dbc1a248dce90698eb2`.
+It passed **100/100 repetitions of each of the five flake scenarios, 500/500
+total**, with four regression workers and 25 iterations per worker. There
+were no failed-case retries, skips, or timeout increases. The complete three
+E2E modules passed **54 tests**, with only the existing opt-in million-chunk
+scale case skipped, using four pytest workers and two process slots alongside
+the soak.
+
+Expanding validation to the snapshot/source-readiness family exposed two
+pre-existing fixture inconsistencies: the lifecycle-continuity test expected
+cached lifecycle to override an explicit `action_required` failure, and the
+replay summary expected two LSM samples while providing only one. The former
+now tests both ordinary continuity and authoritative failure; the latter
+supplies both intended samples without relaxing the expected totals. Both
+are included in the existing derived-coverage suite. All **114 checks** in
+the expanded linked owner/snapshot/source-readiness run passed, including
+allocation-failure injection, with no leaks. These last fixture-only changes
+do not change the runtime code used by the soak. Temporary validation targets
+were removed.
+
+Evidence: `/tmp/pr723-merged-build.log`,
+`/tmp/pr723-merged-soak-500.log`, `/tmp/pr723-merged-modules.log`, and
+`/tmp/pr723-merged-snapshot-suite-fixed.log`. The initial expanded run is
+retained at `/tmp/pr723-merged-snapshot-suite.log`. Linux validation remains
+CI's responsibility; passing native soaks do not establish the precise
+interleaving of the original CI counter reset.
+
+### Snapshot review follow-up
+
+A review of the same ABI copy path reproduced two further defects. After
+replacing the source buffer, both table and index `last_merge_error` contained
+`xxxxxxxxxxxx` instead of `InvalidChunk`. A snapshot with schema epoch 7,
+catalog generation 8, and an enabled two-worker graph-metric runtime returned
+zero/disabled defaults. The original reproductions are retained in
+`/tmp/pr723-review-snapshot.log`.
+
+Table and index merge error names, and the graph-metric runtime error name,
+now contain their own bytes using the existing inline status-text convention
+(256-byte identifiers; oversized JSON values are rejected). JSON remains a
+string, or null for the optional graph-metric diagnostic. Copies, retained
+artifact visibility, and aggregates need no new allocation or ownership
+transfer. The C ABI's JSON projection retains the value too.
+
+`LocalTableRuntimeStatus`, `DBStats`, and `DBIndexStats` cloning now preserve
+value fields by default. A recursive compile-time pointer check requires an
+explicit ownership override for pointer-bearing fields. Schema state labels
+are re-interned through the catalog enum. This preserves columnar maintenance,
+schema/catalog/row-format facts, visibility, and graph-metric runtime facts
+without maintaining a second list of every counter.
+
+The regression seeds scalar fields, compares the complete snapshot after an
+ABI JSON round trip, destroys the response/parser and intermediate cache,
+and checks diagnostic ownership through allocation-free copies and JSON
+serialization. Allocation-failure injection also covers optional algebraic
+candidate/progress diagnostics; their partial-clone cleanup is now complete.
+All **111 snapshot checks** passed with no leaks, including existing
+allocation-free commit checks (`/tmp/pr723-snapshot-focused-final.log`). The
+repository's locked Ruff formatter and Python format check also pass; Black
+is not the repository formatter.
+
+The final linked Debug build passed **49/49 steps**, and the expanded
+owner/snapshot/source-readiness suite passed **116 checks**, with no leaks.
+The three affected E2E modules passed **54 tests** with the existing opt-in
+scale case skipped. Evidence is in `/tmp/pr723-snapshot-fix-build-final.log`
+and `/tmp/pr723-snapshot-fix-modules.log`. The native macOS arm64 executable
+SHA-256 is `cfe5769abc4a2a3fe11dbc2fd1024e903da1449ff0f30409976126dd893be68a`.
+Temporary validation target/root changes were removed.
+The same executable passed **500/500 flake repetitions**, exactly 100 per
+scenario, using four workers and 25 iterations each. The complete E2E modules
+ran concurrently with the beginning of the soak; there were no failed-case
+retries, skips in the soak, or timeout increases. The final soak evidence is
+`/tmp/pr723-snapshot-fix-soak-500.log`. `origin/main` was fetched again and was
+already included before this push. Linux validation remains CI's responsibility.
+
+### Synthetic refresh preservation
+
+The next review reproduced loss after a live → synthetic cache publication:
+schema epoch 7, catalog generation 8, columnar passes 5, visibility hits 6,
+and an enabled two-worker graph-metric runtime became zero/disabled, while
+document counts survived (`/tmp/pr723-review-current.log`). The clone was
+correct; the synthetic merge still restored only a list of selected fields.
+
+The merge now retains the complete owned table stats from the cached owner,
+then applies catalog index membership using the existing incarnation fences.
+Fresh disk observations remain independent, and stale metadata cannot assert
+latest-target completeness. It reuses the existing two clones and transfers
+ownership without adding allocations. Both unused placeholder diagnostics
+and removed cached indexes are freed by the retained temporary snapshot.
+
+The transition regression also reproduced a second refresh erasing an idle
+owner after its runtimes became disabled (`/tmp/pr723-synthetic-idle-negative.log`).
+Preservation now recognizes the physical runtime-owner identity rather than
+requiring nonzero workload counters. Root invalidation still discards it.
+
+The existing snapshot family now covers all table values, heap-backed resolver
+and index diagnostics after both source lifetimes end, index additions/removals,
+repeated synthetic refreshes, live updates that decrease or clear counters,
+same-root catalog fencing, replacement roots, and rejected delayed publications.
+All **112 snapshot checks** pass, including allocation-failure injection and
+existing allocation-free publication checks, with no leaks
+(`/tmp/pr723-synthetic-fix-unit-final.log`). No test target or filter was added.
+
+The final native macOS arm64 Debug build passed **37/37 steps**
+(`/tmp/pr723-synthetic-fix-build-final.log`). Its executable SHA-256 is
+`643f68bb54b5a5b0d6f1c29d6df19ed5d4401757eaacee2e412e162a6828f8cc`.
+The same executable passed **54 E2E tests** (the existing opt-in scale case
+skipped) across the three affected modules, and **500/500 flake repetitions**:
+exactly 100 for each of the five scenarios, four workers and 25 iterations.
+The modules ran concurrently with the start of the soak. There were no failed-case
+retries, soak skips, or timeout increases. Evidence:
+`/tmp/pr723-synthetic-fix-modules.log` and
+`/tmp/pr723-synthetic-fix-soak-500.log`. The latest fetched `origin/main` was
+already included. Linux validation remains CI's responsibility.
+
+## 2026-09-13: overlapping storage owner E2E failures (#626, #722)
+
+[PR #626's Antfly E2E job](https://github.com/antflydb/antfly/actions/runs/34781521711/job/103794277696)
+ran merge revision `62181d9cbae16aa1599c7e4c9202fcabf9aa0dbc` and reported
+**two failures, 444 passes, five skips** on Linux with Python 3.12.3:
+
+- `test_artifact_coverage_terminal_outcomes_by_policy_after_restart` lost the
+  partial-policy index's runtime observation after restart: zero reported
+  groups, one missing group, `runtime_unavailable`, and `missing_group`. This
+  matches the signature in both #722 CI attempts and the retained native
+  reproduction described in [the E2E investigation](e2e/FLAKES.md).
+- `test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query`
+  failed its batch request with HTTP 500 `RuntimeBoundaryFailure`. The server
+  first logged `IndexNotFound` in the `full_text_index_v0` derived worker at
+  journal sequence 1, then an untransportable `StorageKernelFailure` from
+  `commit_batch_with_cancellation`. This is an additional failure, distinct
+  from #722's query callback returning an untransportable `StorageBusy`.
+
+The #626 log is retained at `/tmp/pr626-job103794277696.log`. Repeated
+`EmptyTargetedIndexObservation` messages precede the batch failure. They are
+evidence to investigate, not proof that reconciliation caused it. The restart
+signature's recurrence on another branch does not by itself establish its
+introducing commit. The deterministic follow-up investigation is recorded
+below on `codex/maintenance-e2e-fixes`.
+
+The additional batch case belongs in the existing regression loop alongside
+the three #722 cases; preserve the failing process roots and test the containing
+`test_index_lifecycle.py` module as well, because CI shares that process between
+tests. Do not retry committed writes or relax coverage/deadline assertions to
+hide these failures.
+
+The unchanged merged executable passed **100/100** isolated repetitions of the
+additional packed-ingest case (four workers, 25 repetitions). Evidence is
+`/tmp/pr626-local-packed-100.log`; this does not reproduce the shared-module
+history or prove the worker is race-free.
+
+The follow-up has established these defects with deterministic negative controls:
+
+1. Warmup retired a resident owner installed by another operation. The linked
+   owner regression expected one owner after delayed warmup and found zero.
+   Transient cleanup now retires only the exact, still-leased owner it created,
+   and preserves owners adopted by another operation. The same rule closes
+   the release-then-retire race in transient reconciliation.
+2. Compiled structural reconciliation returned its mutation result without
+   appending an observation to the control-plane publication batch. An unchanged
+   empty dense index reproduced eight `EmptyTargetedIndexObservation` retries
+   and failed the existing five-second bound. Reconciliation now samples status
+   under its exclusive owner lease and passes it through the existing root,
+   catalog, and targeted-activation fences. A busy observation retains the group
+   for another bounded quantum; it cannot acknowledge completion without facts.
+3. Text publication planning reported an ordinary same-instance projection
+   revision change as `IndexNotFound`. The regression changes an empty index's
+   schema between capture and planning and failed at that exact check. Both
+   JSON and parsed-document planning now refresh the context while holding the
+   analysis lease used to construct the plan. Admission still revalidates it;
+   delete/recreate replacement remains rejected. This explains a path from a
+   legitimate schema refresh to a terminal derived-worker failure without
+   treating every `IndexNotFound` as retryable.
+
+`git blame` traces the warmup and compiled-reconciliation defects to
+`332817c668f` ([#536](https://github.com/antflydb/antfly/pull/536)), and the
+projection revision check to `aefe3bad405`
+([#502](https://github.com/antflydb/antfly/pull/502)). Both are ancestors of
+`c1a39a3aeb65e62d9e4494c5b785a028e4520c5d`, #722's unchanged base, so these
+demonstrated defects predate #722 even though its base soak did not expose them.
+
+Status collection also preserves independent sibling observations when another
+group is cold or busy, probes only the requested group's owner, and retains
+refresh debt when that probe is busy. `StorageBusy` and `StorageKernelFailure`
+retain their semantic identities across the callback ABI; public query
+contention is HTTP 503 rather than HTTP 500. Mutation retry semantics are
+unchanged.
+
+Negative-control logs: `/tmp/maintenance-owner-before.log`,
+`/tmp/maintenance-owner-activation-before.log`, and
+`/tmp/maintenance-text-before.log`. The warmup and activation fixes passed the
+linked owner suite with no leaks. A fresh batch containing those two fixes
+passed **100/100 per scenario, 400/400 total**, with the four unchanged E2E
+tests and no retries or skips. Its executable SHA-256 is
+`988f3c8414a168f76a1ffc9a75b79d94c8fd091e1555b9d209e657718dfaa010`;
+output is `/tmp/maintenance-followup-e2e-100.log`. That executable predates the
+text-planning and observation/error-transport changes; final validation of the
+complete change set is recorded below. These deterministic defects and passing
+soaks do not establish the precise interleaving of every original CI failure.
+
+Final native Debug focused checks passed: the linked-owner suite (two tests),
+text publication (two substantive tests plus two import checks), public query
+availability (one table-driven test plus six import checks), the compiled
+busy-owner refresh-debt regression, and all 12 stable runtime error ABI tests.
+No leaks were reported. Temporary focused build steps used for the negative
+controls were removed; the regressions remain in their existing owner suites.
+The final binary SHA-256 is
+`de2c5f7e99bb3074ed3238ed7e64f9b230387e949af6b0559b551ce1d6503519`.
+All **54/54** tests in the three affected E2E modules passed using four pytest
+workers and two process slots, preserving CI's shared-module fixture history.
+Evidence: `/tmp/maintenance-complete-build-tests-final.log`,
+`/tmp/maintenance-data-observation-tests.log`,
+`/tmp/maintenance-error-abi-tests.log`, and `/tmp/maintenance-final-modules.log`.
+The fresh final-binary batch passed **100/100 per scenario, 400/400 total**,
+with four workers and no retries, failures, or skips. The log is
+`/tmp/maintenance-final-e2e-100.log`; per-scenario counts and the executable
+hash are recorded in `/tmp/maintenance-followup-validation.json`. These are
+native macOS arm64 Debug results; Linux CI validation remains pending.
+
+### Review follow-up: transient borrowing and activation assertions
+
+Review of #723 found that an observational lease marked a transient owner as
+adopted. A status probe overlapping warmup could therefore retain an idle DB
+indefinitely. Residency now belongs explicitly to foreground admission or
+retained background debt. Status and maintenance leases only borrow the owner;
+transient cleanup records retirement and the final borrower closes it. New
+observations cannot prolong pending retirement, while foreground admission can
+adopt the same owner before the last borrower releases it. Prepared Raft writes
+also adopt residency. Restore-marker reads use the same pinned retirement
+protocol, eliminating their remaining release-then-retire-by-group path.
+
+The linked owner suite exercises five deterministic lease histories: a status
+probe finishing before warmup cleanup, a probe spanning cleanup, maintenance
+spanning cleanup, foreground adoption, and prepared-Raft adoption. It also
+checks that completed leases cannot retire a replacement owner. The activation
+regression now requires a newer, fresh, target-complete publication for group
+7001 and the expected dense-index generation/configuration hash, instead of
+accepting an idle worker alone. These regressions run in the existing storage
+owner aggregates.
+
+Restoring observational adoption in a temporary negative-control build made
+the new lease-history regression fail at `expect(!original.resident)`; the
+other three checks passed, and no leaks were reported. The corrected source
+was restored byte-for-byte. Evidence:
+`/tmp/maintenance-review-negative-control.log`.
+
+The restored revision passed **4/4** linked owner checks with no skips,
+failures, or leaks (`/tmp/maintenance-review-owner-final.log`). A fresh soak
+again passed **100/100 per scenario, 400/400 total**, with four workers and no
+retries or skips (`/tmp/maintenance-review-e2e-100.log`). The three complete E2E
+modules passed **54 tests**, with the opt-in million-chunk scale test skipped,
+using four pytest workers and two process slots
+(`/tmp/maintenance-review-modules.log`). Formatting and diff checks passed;
+the temporary validation build step was removed.
+
+The native macOS arm64 Debug binary SHA-256 is
+`1bab589bbe0948595bdd213bec52f399f61b1f72fd24da1ee59999361c08de25`.
+Per-scenario counts are in `/tmp/maintenance-followup-validation.json`.
+Linux CI must validate this pushed revision independently.
+
 ## 2026-09-12: combined unit build/test budget terminates progressing DB-core (#716)
 
 [The Linux unit job](https://github.com/antflydb/antfly/actions/runs/34714680318/job/103609868433)
