@@ -1153,6 +1153,7 @@ jobs:
         env:
           SKIP_BUILD: "1"
           ANTFLY_E2E_SUITE: ${{ matrix.suite }}
+          ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE: "1"
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
       - name: Run inference config contract with a real CPU model
@@ -1186,6 +1187,15 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }}
           scripts/ci/zig-e2e-regression-loop.sh
           e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
+
+      - name: Retain failed standalone E2E server logs
+        if: failure() && matrix.suite == 'antfly'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfly-e2e-server-logs-${{ github.run_attempt }}
+          path: ${{ env.TMPDIR }}/antfly-zig-standalone-e2e-*/server.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   e2e-base:
     name: e2e-base
