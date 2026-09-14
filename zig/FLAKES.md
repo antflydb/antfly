@@ -4,7 +4,7 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
-## 2026-09-13: producer readiness snapshot loss (#723)
+## 2026-09-14: producer readiness snapshot loss (#723)
 
 [The Antfly E2E job on #723](https://github.com/antflydb/antfly/actions/runs/34801864332/job/103853126220)
 ran `07bb51bdf0a063ad0f4782e35a48669b6c253f2c` and reported one failure,
@@ -45,7 +45,35 @@ Before the fix, the new unit regression reported **expected three sources,
 found zero**; the strengthened E2E case timed out on the original executable
 with `source_observation_incomplete`. Logs are
 `/tmp/pr723-source-negative.log` and `/tmp/pr723-source-e2e-before.log`.
-Final merged-revision validation is recorded below when complete.
+After merging `origin/main` at `3554f82101` (merge `19162ef60f`), the native
+macOS arm64 Debug build passed all 49 steps and six focused owner/snapshot
+checks. The binary SHA-256 is
+`d7dce3ac5b091d32acad40c2b5fd99eb4a91b01b22c73dbc1a248dce90698eb2`.
+It passed **100/100 repetitions of each of the five flake scenarios, 500/500
+total**, with four regression workers and 25 iterations per worker. There
+were no failed-case retries, skips, or timeout increases. The complete three
+E2E modules passed **54 tests**, with only the existing opt-in million-chunk
+scale case skipped, using four pytest workers and two process slots alongside
+the soak.
+
+Expanding validation to the snapshot/source-readiness family exposed two
+pre-existing fixture inconsistencies: the lifecycle-continuity test expected
+cached lifecycle to override an explicit `action_required` failure, and the
+replay summary expected two LSM samples while providing only one. The former
+now tests both ordinary continuity and authoritative failure; the latter
+supplies both intended samples without relaxing the expected totals. Both
+are included in the existing derived-coverage suite. All **114 checks** in
+the expanded linked owner/snapshot/source-readiness run passed, including
+allocation-failure injection, with no leaks. These last fixture-only changes
+do not change the runtime code used by the soak. Temporary validation targets
+were removed.
+
+Evidence: `/tmp/pr723-merged-build.log`,
+`/tmp/pr723-merged-soak-500.log`, `/tmp/pr723-merged-modules.log`, and
+`/tmp/pr723-merged-snapshot-suite-fixed.log`. The initial expanded run is
+retained at `/tmp/pr723-merged-snapshot-suite.log`. Linux validation remains
+CI's responsibility; passing native soaks do not establish the precise
+interleaving of the original CI counter reset.
 
 ## 2026-09-13: overlapping storage owner E2E failures (#626, #722)
 

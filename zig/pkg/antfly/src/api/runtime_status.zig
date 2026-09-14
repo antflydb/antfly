@@ -10924,61 +10924,68 @@ fn consumerTests() type {
         }
 
         test "projection continuity preserves lifecycle classification as one bundle" {
-            var previous_indexes = [_]db_mod.types.DBIndexStats{.{
-                .name = @constCast("thumbnail"),
-                .kind = .dense_vector,
-                .serving_snapshot_ready = true,
-                .coverage_config_hash = 77,
-                .coverage_generation = 42,
-                .coverage_identity_ready = true,
-                .coverage_summary_ready = true,
-                .projection_checkpoint_applied_sequence = 10,
-                .projection_checkpoint_generation = 4,
-                .projection_checkpoint_config_hash = 77,
-                .index_repair_id = 91,
-                .index_lifecycle_work_class = .initial_build,
-                .index_repair_trigger = "catalog_admission",
-                .index_repair_phase = "building",
-                .index_repair_status = .rebuilding,
-            }};
-            const previous = LocalTableRuntimeStatus{
-                .group_id = 7,
-                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
-                .stats = .{ .index_count = 1, .indexes = previous_indexes[0..] },
-            };
+            for ([_]bool{ false, true }) |action_required| {
+                var previous_indexes = [_]db_mod.types.DBIndexStats{.{
+                    .name = @constCast("thumbnail"),
+                    .kind = .dense_vector,
+                    .serving_snapshot_ready = true,
+                    .coverage_config_hash = 77,
+                    .coverage_generation = 42,
+                    .coverage_identity_ready = true,
+                    .coverage_summary_ready = true,
+                    .projection_checkpoint_applied_sequence = 10,
+                    .projection_checkpoint_generation = 4,
+                    .projection_checkpoint_config_hash = 77,
+                    .index_repair_id = 91,
+                    .index_lifecycle_work_class = .initial_build,
+                    .index_repair_trigger = "catalog_admission",
+                    .index_repair_phase = "building",
+                    .index_repair_status = .rebuilding,
+                }};
+                const previous = LocalTableRuntimeStatus{
+                    .group_id = 7,
+                    .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+                    .stats = .{ .index_count = 1, .indexes = previous_indexes[0..] },
+                };
 
-            var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
-                .name = @constCast("thumbnail"),
-                .kind = .dense_vector,
-                .coverage_config_hash = 77,
-                .coverage_generation = 42,
-                .coverage_identity_ready = true,
-                .projection_checkpoint_applied_sequence = 0,
-                .projection_checkpoint_generation = 4,
-                .projection_checkpoint_config_hash = 77,
-                // A separately sampled lifecycle must not be combined with the
-                // retained projection generation.
-                .index_repair_id = 92,
-                .index_lifecycle_work_class = .repair,
-                .index_repair_trigger = "artifact_coverage_mismatch",
-                .index_repair_phase = "preflight",
-                .index_repair_status = .waiting,
-                .index_repair_action_required = true,
-            }};
-            var incoming = LocalTableRuntimeStatus{
-                .group_id = 7,
-                .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
-                .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
-            };
+                var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
+                    .name = @constCast("thumbnail"),
+                    .kind = .dense_vector,
+                    .coverage_config_hash = 77,
+                    .coverage_generation = 42,
+                    .coverage_identity_ready = true,
+                    .projection_checkpoint_applied_sequence = 0,
+                    .projection_checkpoint_generation = 4,
+                    .projection_checkpoint_config_hash = 77,
+                    // A separately sampled lifecycle must not be combined with the
+                    // retained projection generation.
+                    .index_repair_id = 92,
+                    .index_lifecycle_work_class = .repair,
+                    .index_repair_trigger = "artifact_coverage_mismatch",
+                    .index_repair_phase = "preflight",
+                    .index_repair_status = .waiting,
+                    .index_repair_action_required = action_required,
+                }};
+                var incoming = LocalTableRuntimeStatus{
+                    .group_id = 7,
+                    .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
+                    .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
+                };
 
-            try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
-            const retained = incoming.stats.indexes[0];
-            try std.testing.expectEqual(@as(?u128, 91), retained.index_repair_id);
-            try std.testing.expectEqual(db_mod.types.IndexLifecycleWorkClass.initial_build, retained.index_lifecycle_work_class);
-            try std.testing.expectEqualStrings("catalog_admission", retained.index_repair_trigger);
-            try std.testing.expectEqualStrings("building", retained.index_repair_phase);
-            try std.testing.expectEqual(db_mod.types.IndexRepairStatus.rebuilding, retained.index_repair_status.?);
-            try std.testing.expect(!retained.index_repair_action_required);
+                const incoming_expected = incoming_indexes[0];
+                try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
+                const retained = incoming.stats.indexes[0];
+                // Retained serving facts keep their lifecycle unless the incoming
+                // owner explicitly requires repair; that failure remains authoritative.
+                const expected = if (action_required) incoming_expected else previous_indexes[0];
+                try std.testing.expect(retained.serving_snapshot_ready);
+                try std.testing.expectEqual(@as(?u128, if (action_required) 92 else 91), retained.index_repair_id);
+                try std.testing.expectEqual(expected.index_lifecycle_work_class, retained.index_lifecycle_work_class);
+                try std.testing.expectEqualStrings(expected.index_repair_trigger, retained.index_repair_trigger);
+                try std.testing.expectEqualStrings(expected.index_repair_phase, retained.index_repair_phase);
+                try std.testing.expectEqual(expected.index_repair_status, retained.index_repair_status);
+                try std.testing.expectEqual(action_required, retained.index_repair_action_required);
+            }
         }
 
         test "catching up observation cannot preserve a same-config replacement incarnation" {
@@ -11621,6 +11628,12 @@ fn consumerTests() type {
             const docs_items = try std.testing.allocator.alloc(LocalTableRuntimeStatus, 2);
             docs_items[0] = .{
                 .group_id = 7,
+                .lsm_storage_stats = .{
+                    .maintenance = .{ .mutable_entries = 11, .total_runs = 2 },
+                    .write = .{ .flushes = 3, .table_file_compression_codec_mask = 0b001 },
+                    .maintenance_score = 4,
+                    .maintenance_debt_hint = 5,
+                },
                 .stats = .{
                     .doc_count = 11,
                     .index_count = 2,
