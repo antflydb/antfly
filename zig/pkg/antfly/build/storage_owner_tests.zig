@@ -24,6 +24,7 @@ pub fn add(
     vopr: *std.Build.Module,
     artifacts: [std.meta.fields(runtime.RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
 ) Result {
+    const owner_filter = b.option([]const u8, "storage-owner-test-filter", "Compile and run one matching storage owner test subset");
     const test_metadata = @import("../../../lib/build_info/build_support.zig").create(b, .{
         .root = b.path("lib/build_info"),
         .target = target,
@@ -50,11 +51,16 @@ pub fn add(
             const tests = @import("linked_tests.zig").add(b, .{
                 .name = if (index == 0) "storage-owner-tests" else if (index == 1) "storage-owner-source-tests" else "storage-owner-enrichment-tests",
                 .root_module = module,
-                .filters = &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
+                .filters = if (index == 0 and owner_filter != null)
+                    &.{owner_filter.?}
+                else
+                    &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
                 .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
             });
             tests.executable.root_module.addObject(test_metadata.object);
             runs[index] = tests.run(b);
+            if (index == 0)
+                b.step("antfly-storage-owner-test", "Run tests through the compiled storage owner boundary").dependOn(&runs[index].step);
             if (index == 2) {
                 tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
             } else {

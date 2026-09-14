@@ -35,6 +35,13 @@ This uses the schema decoder's existing supported formats, without adding
 vector-store format compatibility. The failed arm is retained as recovery
 evidence and is excluded from performance results.
 
+The next saved-fixture check opened successfully and matched the expected first
+hit set, but exposed missing dense telemetry in the compiled local-query provider.
+That provider now honors `profile: true` through the DB's captured profiled search
+and shares the public dense-profile mapping with in-process reads. Query identity
+still comes from the result's read lease. Diagnostic qualification requires the
+dense profile and adaptive decision counters; absent telemetry is a gate failure.
+
 ## September 13 UTC: remaining GC costs investigated
 
 The [follow-up exploration](../.benchmark-results/vector-store-gc-followup-exploration-20260913/README.md)

@@ -35035,6 +35035,7 @@ pub const DB = struct {
     /// with multiple dense lanes intentionally leave it unset rather than
     /// publishing an ambiguous aggregate.
     pub fn searchWithDenseProfile(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+        try self.enforcePortableRuntimeGate();
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
         defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
         const snapshot_input = directSingleVectorRequest(req) orelse req;
@@ -35047,6 +35048,7 @@ pub const DB = struct {
         };
         const search_access = self.beginDenseSearchAccess(req);
         defer self.endDenseSearchAccess(search_access);
+        try self.enforcePortableRuntimeGate();
         const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
         var dense_profile: db_query_search.DenseSearchProfile = .{};
         const result = try self.searchLockedWithExecutionContextImpl(alloc, snapshot_req, .{}, true, &dense_profile);
@@ -35199,7 +35201,7 @@ pub const DB = struct {
         else if (selection_req.full_text) |text|
             try self.searchTextQuery(alloc, selection_req, text)
         else if (selection_req.dense) |dense|
-            try self.searchDense(alloc, selection_req, dense)
+            try self.searchDenseWithProfileSink(alloc, selection_req, dense, dense_profile_sink)
         else if (selection_req.sparse) |sparse|
             try self.searchSparse(alloc, selection_req, sparse)
         else switch (selection_req.query) {
@@ -35224,7 +35226,7 @@ pub const DB = struct {
             .wildcard,
             .regexp,
             => try self.searchText(alloc, selection_req),
-            .dense_knn => |dense| try self.searchDense(alloc, selection_req, dense),
+            .dense_knn => |dense| try self.searchDenseWithProfileSink(alloc, selection_req, dense, dense_profile_sink),
             .sparse_knn => |sparse| try self.searchSparse(alloc, selection_req, sparse),
             .graph => |graph| try self.searchGraph(alloc, selection_req, graph, null),
         };
@@ -36757,6 +36759,16 @@ pub const DB = struct {
         }
         db_query_metrics.observeSortProfile(metric_name, .vector, platform_time.monotonicNs() -| start_ns, result.sort_profile);
         return result;
+    }
+
+    fn searchDenseWithProfileSink(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery, sink: ?*db_query_search.DenseSearchProfile) !types.SearchResult {
+        const profile = sink orelse return self.searchDense(alloc, req, dense);
+        // The general search already owns its read lease and identity token.
+        // Direct dense lowering must retain telemetry just like a composed
+        // dense lane, without reacquiring the outer search lock.
+        const profiled = try self.searchDenseProfiledAtSnapshot(alloc, req, dense);
+        profile.* = profiled.profile;
+        return profiled.result;
     }
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
@@ -112638,6 +112650,42 @@ test "db search supports fused graph selectors for single-lane full-text searche
     try std.testing.expectEqualStrings("citations", result.graph_results[0].name);
     try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
     try std.testing.expectEqualStrings("paper:2", result.graph_results[0].hits[0].id);
+}
+
+test "db general profiled search retains direct and lowered dense telemetry" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-direct-dense-profile");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "vec", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"_embeddings\":{\"vec\":[1,0,0]}}" },
+            .{ .key = "doc:b", .value = "{\"_embeddings\":{\"vec\":[0,1,0]}}" },
+        },
+        .sync_level = .full_index,
+    });
+    const dense: types.DenseKnnQuery = .{ .vector = &.{ 1, 0, 0 }, .k = 2 };
+    for ([_]types.SearchRequest{
+        .{ .index_name = "vec", .dense = dense, .limit = 2, .profile = true },
+        .{ .index_name = "vec", .query = .{ .dense_knn = dense }, .limit = 2, .profile = true },
+        .{ .dense_queries = &.{.{ .name = "vec", .index_name = "vec", .query = dense }}, .limit = 2, .profile = true },
+    }) |req| {
+        var profiled = try db.searchWithDenseProfile(alloc, req);
+        defer profiled.result.deinit();
+        const profile = profiled.dense_profile orelse return error.MissingDenseProfile;
+        try std.testing.expect(profile.search_route.len > 0);
+        try std.testing.expectEqual(@as(u64, 2), profile.returned_hit_count);
+        var ordinary = try db.searchWithCapturedRequest(alloc, req);
+        defer ordinary.result.deinit();
+        try std.testing.expectEqual(ordinary.request.identity_read_generation, profiled.request.identity_read_generation);
+        try std.testing.expectEqual(ordinary.result.hits.len, profiled.result.hits.len);
+        for (ordinary.result.hits, profiled.result.hits) |expected, actual| {
+            try std.testing.expectEqualStrings(expected.id, actual.id);
+            try std.testing.expectEqual(expected.score, actual.score);
+        }
+    }
 }
 
 test "db search fuses full_text and dense named searches before graph expansion" {
