@@ -382,7 +382,7 @@ const RuntimeLeaseWatchdog = struct {
         const deadline = self.proof_authority_deadline_ns.load(.acquire);
         const capability_deadline = self.proof_capability_deadline_ns.load(.acquire);
         const now = platform_time.authorityNs();
-        const authority_remaining_ms: i64 = if (deadline > now)
+        const authority_remaining_ms: u64 = if (deadline > now)
             @intCast(@min(
                 (deadline - now) / std.time.ns_per_ms,
                 self.watchdog.cfg.grace_ns / std.time.ns_per_ms,
@@ -3142,6 +3142,13 @@ pub fn runFromIterator(
         else
             null;
     }
+    const session_root = if (lite_path == null) try std.fmt.allocPrint(alloc, "{s}/api-transaction-sessions", .{resolved.replica_root_dir}) else null;
+    defer if (session_root) |path| alloc.free(path);
+    var session_backend: ?antfly.lsm_backend.BackendHandle = if (session_root) |path| try antfly.lsm_backend.BackendHandle.open(alloc, path, .{}) else null;
+    defer if (session_backend) |*backend| backend.close();
+    var native_session_store: ?antfly.storage_backend_erased.Store = if (session_backend) |*backend| try backend.backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" }) else null;
+    defer if (native_session_store) |*store| store.deinit();
+    var native_sessions = if (native_session_store) |*store| antfly.public_api.transactions.DurableSessionStore.initRuntime(alloc, store) else null;
     var lite_session_store = if (comptime control_only_storage_sources)
         if (kernel_session_backend) |*store|
             antfly.public_api.transactions.DurableSessionStore.initRuntime(alloc, store)
@@ -3322,7 +3329,7 @@ pub fn runFromIterator(
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
             .user_manager = if (user_manager) |*manager| manager else null,
-            .session_store = if (lite_session_store) |*store| store else null,
+            .session_store = if (lite_session_store) |*store| store else if (native_sessions) |*store| store else null,
             .restore_job_store = restore_job_store,
             .incoming_graph_route_store = incoming_graph_route_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,

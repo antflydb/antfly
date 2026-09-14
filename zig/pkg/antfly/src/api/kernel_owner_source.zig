@@ -350,6 +350,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .text_memory_attribution_stats_best_effort = textMemoryAttributionStatsBestEffort,
                 .preflight_write_admission_group_local = preflightWriteAdmissionGroupLocal,
                 .prepare_ha_seed_snapshot_group_local = prepareHASeedSnapshotGroupLocal,
+                .capture_ha_seed_snapshot_group_local = captureHASeedSnapshotGroupLocal,
                 .find_median_key_group_local = findMedianKeyGroupLocal,
                 .reconcile_table_group_local = reconcileTableGroupLocal,
                 .reconcile_table_group_local_transient = reconcileTableGroupLocalTransient,
@@ -650,6 +651,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
+    fn captureHASeedSnapshotGroupLocal(ptr: *anyopaque, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        // Preparation opened the owner before the exclusive HA freeze. Never
+        // resolve catalog metadata or open a competing owner inside that freeze.
+        var lease = (try self.acquireIfPresent(group_id, table_name)) orelse return error.StorageKernelOwnerUnavailable;
+        defer lease.deinit();
+        try lease.owner().captureHASeedSnapshot(table_name, token, destination);
+        return {};
+    }
+
     fn prepareHASeedSnapshotGroupLocal(
         ptr: *anyopaque,
         group_id: u64,
@@ -657,7 +668,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         deadline_ns: u64,
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var lease = (try self.acquireIfPresent(group_id, table_name)) orelse return {};
+        var lease = self.acquire(group_id, table_name) catch |err| {
+            std.log.warn("HA seed owner acquisition failed group_id={d} err={s}", .{ group_id, @errorName(err) });
+            return err;
+        };
         defer lease.deinit();
         try lease.owner().prepareHASeedSnapshot(table_name, deadline_ns);
         return {};

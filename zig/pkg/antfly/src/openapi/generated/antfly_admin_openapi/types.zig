@@ -19,8 +19,8 @@ pub const CommitAppendRequest = struct {
     payload: []const u8,
     kind: ?[]const u8 = null,
     payload_codec: ?[]const u8 = null,
-    shard_id: ?i64 = null,
-    table_id: ?i64 = null,
+    shard_id: ?u64 = null,
+    table_id: ?u64 = null,
     commit_timestamp_ns: ?i64 = null,
     sync_policy: HASyncPolicy,
 
@@ -74,7 +74,7 @@ pub const CommitAppendRequest = struct {
 };
 
 pub const CommitCheckRequest = struct {
-    target_lsn: i64,
+    target_lsn: u64,
     sync_policy: HASyncPolicy,
 };
 
@@ -82,12 +82,12 @@ pub const FenceAcquireRequest = struct {
     identity: HAIdentity,
     old_primary_id: HANodeID,
     promoted_node_id: HANodeID,
-    new_timeline_id: i64,
-    new_epoch: i64,
+    new_timeline_id: u64,
+    new_epoch: u64,
     /// Exact Kubernetes Lease transition generation authorizing this fence.
-    generation: i64,
-    required_lsn: i64,
-    observed_lsn: i64,
+    generation: u64,
+    required_lsn: u64,
+    observed_lsn: u64,
     force: bool,
     reason: ?[]const u8 = null,
 
@@ -155,46 +155,46 @@ pub const HAActionReceipt = struct {
 };
 
 pub const HABaseBackupBeginResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     action: HAActionReceipt,
     /// Stable standby replication slot reserved for the base backup.
     slot_name: HASlotName,
     /// Stable base-backup manifest id for retry and action correlation.
     manifest_id: []const u8,
     /// LSN reserved as the base-backup start boundary.
-    backup_lsn: i64,
+    backup_lsn: u64,
     /// Durable `backup_start` record LSN.
-    start_record_lsn: i64,
+    start_record_lsn: u64,
 };
 
 pub const HABaseBackupFinishResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     action: HAActionReceipt,
     manifest_id: []const u8,
-    backup_lsn: i64,
+    backup_lsn: u64,
     /// Durable `backup_end` record LSN.
-    end_record_lsn: i64,
+    end_record_lsn: u64,
 };
 
 pub const HACommitAppendResponse = struct {
-    schema_version: i64,
-    lsn: i64,
+    schema_version: u32,
+    lsn: u64,
     gate: HACommitGate,
 };
 
 pub const HACommitCheckResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     gate: HACommitGate,
 };
 
 pub const HACommitGate = struct {
-    target_lsn: i64,
+    target_lsn: u64,
     action: []const u8,
     durability: HADurabilityDecision,
 };
 
 pub const HACurrentFenceResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     held: bool,
     receipt: ?HAFenceReceipt = null,
 
@@ -231,32 +231,32 @@ pub const HADurabilityDecision = struct {
     status: []const u8,
     mode: []const u8,
     selection: []const u8,
-    target_lsn: i64,
-    progress_lsn: i64,
-    missing_lsn_count: i64,
-    satisfied_count: i64,
-    required_count: i64,
-    candidate_count: i64,
+    target_lsn: u64,
+    progress_lsn: u64,
+    missing_lsn_count: u64,
+    satisfied_count: u64,
+    required_count: u64,
+    candidate_count: u64,
 };
 
 pub const HAFenceReceipt = struct {
     identity: HAIdentity,
     old_primary_id: HANodeID,
     promoted_node_id: HANodeID,
-    parent_timeline_id: i64,
-    parent_epoch: i64,
-    new_timeline_id: i64,
-    new_epoch: i64,
-    required_lsn: i64,
-    observed_lsn: i64,
-    generation: i64,
+    parent_timeline_id: u64,
+    parent_epoch: u64,
+    new_timeline_id: u64,
+    new_epoch: u64,
+    required_lsn: u64,
+    observed_lsn: u64,
+    generation: u64,
     forced: bool,
     token: []const u8,
     reason: []const u8,
 };
 
 pub const HAFenceResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     action: HAActionReceipt,
     receipt: HAFenceReceipt,
 };
@@ -265,23 +265,23 @@ pub const HAFenceResponse = struct {
 pub const HAIdentifier = []const u8;
 
 pub const HAIdentity = struct {
-    cluster_id: i64,
+    cluster_id: u64,
     /// Shard identity. Use 0 for whole-instance HA scope.
-    shard_id: i64,
+    shard_id: u64,
     /// Table identity. Use 0 for whole-instance HA scope.
-    table_id: i64,
-    timeline_id: i64,
-    epoch: i64,
+    table_id: u64,
+    timeline_id: u64,
+    epoch: u64,
 };
 
 pub const HALeaseWatchdogProof = struct {
-    capability_version: i64,
+    capability_version: u32,
     /// Watchdog capability is running and has validated this exact shared Lease.
     active: bool,
     /// This process is the current holder and its suspend-inclusive local deadline has not elapsed.
     authority_granted: bool,
     /// Suspend-inclusive local authority remaining when this proof snapshot was created; zero when authority is not granted.
-    authority_remaining_ms: i64,
+    authority_remaining_ms: u64,
     lease_name: []const u8,
     lease_namespace: []const u8,
     stable_topology_id: []const u8,
@@ -291,15 +291,15 @@ pub const HALeaseWatchdogProof = struct {
     observed_holder_node_id: HANodeID,
     pod_uid: []const u8,
     process_boot_id: []const u8,
-    observed_lease_transitions: i64,
-    max_fence_latency_ms: i64,
+    observed_lease_transitions: u64,
+    max_fence_latency_ms: u64,
 };
 
 /// Stable HA node id.
 pub const HANodeID = []const u8;
 
 pub const HAOwnerJobCheckResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     decision: HAOwnerJobDecision,
 };
 
@@ -308,8 +308,8 @@ pub const HAOwnerJobDecision = struct {
     role: []const u8,
     action: []const u8,
     identity: HAIdentity,
-    durable_lsn: i64,
-    next_lsn: i64,
+    durable_lsn: u64,
+    next_lsn: u64,
     promotion_handoff: ?HAPromotionHandoff = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -358,7 +358,7 @@ pub const HAPrimarySnapshot = struct {
     /// Node id for the node-local admin endpoint that produced this status snapshot.
     node_id: HANodeID,
     identity: HAIdentity,
-    current_lsn: i64,
+    current_lsn: u64,
     slots: []const HASlotSnapshot,
     retention: HARetentionSnapshot,
     durability: ?HADurabilityDecision = null,
@@ -411,20 +411,20 @@ pub const HAPrimarySnapshot = struct {
 };
 
 pub const HAPrimaryStatusResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     snapshot: HAPrimarySnapshot,
 };
 
 pub const HAPromotionAssessResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     action: HAActionReceipt,
     assessment: HAPromotionAssessment,
 };
 
 pub const HAPromotionAssessment = struct {
-    required_lsn: i64,
-    received_lsn: i64,
-    applied_lsn: i64,
+    required_lsn: u64,
+    received_lsn: u64,
+    applied_lsn: u64,
     has_required_lsn: bool,
     caught_up_to_received: bool,
     fencing_confirmed: bool,
@@ -440,16 +440,16 @@ pub const HAPromotionAssessment = struct {
 
 pub const HAPromotionHandoff = struct {
     identity: HAIdentity,
-    switch_lsn: i64,
-    next_lsn: i64,
+    switch_lsn: u64,
+    next_lsn: u64,
 };
 
 pub const HAPromotionResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     action: HAActionReceipt,
     assessment: HAPromotionAssessment,
     promotion: HAPromotionResult,
-    fence_generation: i64,
+    fence_generation: u64,
     fence_token: []const u8,
     forced: bool,
 };
@@ -457,7 +457,7 @@ pub const HAPromotionResponse = struct {
 pub const HAPromotionResult = struct {
     /// Standby node id that executed the promotion.
     node_id: HANodeID,
-    switch_lsn: i64,
+    switch_lsn: u64,
     old_identity: HAIdentity,
     new_identity: HAIdentity,
     forced: bool,
@@ -465,22 +465,22 @@ pub const HAPromotionResult = struct {
 };
 
 pub const HAReadCheckResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     decision: HAReadDecision,
 };
 
 pub const HAReadDecision = struct {
     action: []const u8,
     consistency: []const u8,
-    required_lsn: OpenApiOptionalNullable(i64) = .absent,
-    required_metadata_lsn: OpenApiOptionalNullable(i64) = .absent,
-    received_lsn: i64,
-    applied_lsn: i64,
-    safe_read_lsn: i64,
-    metadata_applied_lsn: OpenApiOptionalNullable(i64) = .absent,
-    serve_lsn: OpenApiOptionalNullable(i64) = .absent,
-    missing_lsn_count: i64,
-    metadata_missing_lsn_count: i64,
+    required_lsn: OpenApiOptionalNullable(u64) = .absent,
+    required_metadata_lsn: OpenApiOptionalNullable(u64) = .absent,
+    received_lsn: u64,
+    applied_lsn: u64,
+    safe_read_lsn: u64,
+    metadata_applied_lsn: OpenApiOptionalNullable(u64) = .absent,
+    serve_lsn: OpenApiOptionalNullable(u64) = .absent,
+    missing_lsn_count: u64,
+    metadata_missing_lsn_count: u64,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -547,7 +547,7 @@ pub const HAReadDecision = struct {
 };
 
 pub const HARejoinAssessResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     action: HAActionReceipt,
     assessment: HARejoinAssessment,
     /// Present when `/ha/rejoin/rewind` executed against a configured local former-primary log.
@@ -596,21 +596,21 @@ pub const HARejoinAssessment = struct {
     action: []const u8,
     reason: []const u8,
     former_node_id: HANodeID,
-    target_timeline_id: i64,
-    target_epoch: i64,
+    target_timeline_id: u64,
+    target_epoch: u64,
     /// Cluster identity of the retained parent-timeline fork record.
-    parent_cluster_id: i64,
+    parent_cluster_id: u64,
     /// Shard identity of the retained parent-timeline fork record.
-    parent_shard_id: i64,
+    parent_shard_id: u64,
     /// Table identity of the retained parent-timeline fork record.
-    parent_table_id: i64,
+    parent_table_id: u64,
     /// Parent timeline that must contain the fork record before rewind.
-    parent_timeline_id: i64,
+    parent_timeline_id: u64,
     /// Parent epoch that must contain the fork record before rewind.
-    parent_epoch: i64,
-    fork_lsn: i64,
-    former_last_lsn: i64,
-    retained_from_lsn: i64,
+    parent_epoch: u64,
+    fork_lsn: u64,
+    former_last_lsn: u64,
+    retained_from_lsn: u64,
     data_loss_discarded: bool,
 };
 
@@ -618,10 +618,10 @@ pub const HARejoinReseedResult = struct {
     /// Former primary node id scheduled for reseed.
     node_id: HANodeID,
     slot_name: HASlotName,
-    target_timeline_id: i64,
-    target_epoch: i64,
-    fork_lsn: i64,
-    former_last_lsn: i64,
+    target_timeline_id: u64,
+    target_epoch: u64,
+    fork_lsn: u64,
+    former_last_lsn: u64,
     reseed_required: bool,
     base_backup_required: bool,
 };
@@ -629,27 +629,27 @@ pub const HARejoinReseedResult = struct {
 pub const HARejoinRewindResult = struct {
     /// Former primary node id whose local log was rewound.
     node_id: HANodeID,
-    fork_lsn: i64,
-    previous_last_lsn: i64,
-    current_last_lsn: i64,
-    next_lsn: i64,
-    discarded_lsn_count: i64,
-    target_timeline_id: i64,
-    target_epoch: i64,
+    fork_lsn: u64,
+    previous_last_lsn: u64,
+    current_last_lsn: u64,
+    next_lsn: u64,
+    discarded_lsn_count: u64,
+    target_timeline_id: u64,
+    target_epoch: u64,
     data_loss_discarded: bool,
 };
 
 pub const HAReplicationSlot = struct {
     slot_name: HASlotName,
-    timeline_id: i64,
-    restart_lsn: i64,
-    received_lsn: i64,
-    applied_lsn: i64,
-    safe_read_lsn: i64,
+    timeline_id: u64,
+    restart_lsn: u64,
+    received_lsn: u64,
+    applied_lsn: u64,
+    safe_read_lsn: u64,
     active: bool,
     reseed_required: bool,
     last_error: OpenApiOptionalNullable([]const u8) = .absent,
-    current_lsn: i64,
+    current_lsn: u64,
     dropped: OpenApiOptionalNullable(bool) = .absent,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -699,25 +699,25 @@ pub const HAReplicationSlot = struct {
 };
 
 pub const HAReplicationSlotActionResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     action: HAActionReceipt,
     slot_action: []const u8,
     slot: HAReplicationSlot,
 };
 
 pub const HAReplicationSlotListResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     slots: []const HAReplicationSlot,
 };
 
 pub const HARetentionSnapshot = struct {
-    primary_lsn: i64,
-    oldest_restart_lsn: i64,
-    retained_lsn_count: i64,
-    retained_byte_count: i64,
-    retained_age_ns: i64,
-    active_slots: i64,
-    reseed_recommended: i64,
+    primary_lsn: u64,
+    oldest_restart_lsn: u64,
+    retained_lsn_count: u64,
+    retained_byte_count: u64,
+    retained_age_ns: u64,
+    active_slots: u64,
+    reseed_recommended: u64,
 };
 
 pub const HARuntimeLifecycleObservation = struct {
@@ -725,7 +725,7 @@ pub const HARuntimeLifecycleObservation = struct {
     role: []const u8,
     pod_uid: OpenApiOptionalNullable([]const u8) = .absent,
     fenced: bool,
-    observed_at_unix_ns: i64,
+    observed_at_unix_ns: u64,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -762,30 +762,30 @@ pub const HARuntimeLifecycleObservation = struct {
 };
 
 pub const HASeedArtifactCaptureResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     action: HAActionReceipt,
     slot_name: HASlotName,
     generation: []const u8,
     topology_id: []const u8,
-    topology_generation: i64,
+    topology_generation: u64,
     node_id: []const u8,
     target_pvc_name: []const u8,
     target_pvc_uid: []const u8,
-    cluster_id: i64,
-    shard_id: i64,
-    table_id: i64,
-    timeline_id: i64,
-    epoch: i64,
+    cluster_id: u64,
+    shard_id: u64,
+    table_id: u64,
+    timeline_id: u64,
+    epoch: u64,
     manifest_id: []const u8,
     source_plan_sha256: []const u8,
-    backup_lsn: i64,
-    checkpoint_lsn: i64,
-    end_record_lsn: i64,
+    backup_lsn: u64,
+    checkpoint_lsn: u64,
+    end_record_lsn: u64,
     manifest_sha256: []const u8,
     /// SHA-256 of the exact immutable runtime capture COMPLETE response bytes.
     capture_receipt_sha256: []const u8,
-    file_count: i64,
-    total_bytes: i64,
+    file_count: u64,
+    total_bytes: u64,
     generation_root: []const u8,
     content_root: []const u8,
     manifest_path: []const u8,
@@ -793,18 +793,18 @@ pub const HASeedArtifactCaptureResponse = struct {
 };
 
 pub const HASeedLifecycleReceiptEvent = struct {
-    cursor: i64,
+    cursor: u64,
     kind: []const u8,
     generation: []const u8,
     slot_name: HASlotName,
     topology_id: []const u8,
-    topology_generation: i64,
+    topology_generation: u64,
     node_id: []const u8,
     target_pvc_name: []const u8,
     target_pvc_uid: []const u8,
     receipt_sha256: []const u8,
     receipt_json: []const u8,
-    recorded_at_unix_ns: i64,
+    recorded_at_unix_ns: u64,
     pod_uid: OpenApiOptionalNullable([]const u8) = .absent,
     authoritative_state: []const u8,
 
@@ -852,11 +852,11 @@ pub const HASeedLifecycleReceiptEvent = struct {
 };
 
 pub const HASeedLifecycleReceiptInventoryResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     entries: []const HASeedLifecycleReceiptEvent,
-    first_cursor: i64,
-    end_cursor: i64,
-    next_cursor: i64,
+    first_cursor: u64,
+    end_cursor: u64,
+    next_cursor: u64,
     history_truncated: bool,
     gap: bool,
     has_more: bool,
@@ -864,13 +864,13 @@ pub const HASeedLifecycleReceiptInventoryResponse = struct {
 };
 
 pub const HASeededSlotActivateResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     action: HAActionReceipt,
     slot_name: HASlotName,
     generation: []const u8,
     manifest_id: []const u8,
-    timeline_id: i64,
-    checkpoint_lsn: i64,
+    timeline_id: u64,
+    checkpoint_lsn: u64,
     seed_receipt_sha256: []const u8,
     /// SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
     capture_receipt_sha256: []const u8,
@@ -883,17 +883,17 @@ pub const HASlotName = []const u8;
 
 pub const HASlotSnapshot = struct {
     name: []const u8,
-    timeline_id: i64,
+    timeline_id: u64,
     active: bool,
     reseed_required: bool,
-    restart_lsn: i64,
-    received_lsn: i64,
-    applied_lsn: i64,
-    safe_read_lsn: i64,
-    write_lag_lsn: i64,
-    apply_lag_lsn: i64,
-    safe_read_lag_lsn: i64,
-    retention_lag_lsn: i64,
+    restart_lsn: u64,
+    received_lsn: u64,
+    applied_lsn: u64,
+    safe_read_lsn: u64,
+    write_lag_lsn: u64,
+    apply_lag_lsn: u64,
+    safe_read_lag_lsn: u64,
+    retention_lag_lsn: u64,
     status: []const u8,
     last_error: OpenApiOptionalNullable([]const u8) = .absent,
 
@@ -941,12 +941,12 @@ pub const HASlotSnapshot = struct {
 };
 
 pub const HAStandbyBootstrapResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     action: HAActionReceipt,
     manifest_id: []const u8,
-    backup_lsn: i64,
+    backup_lsn: u64,
     /// Standby checkpoint LSN after manifest validation.
-    checkpoint_lsn: i64,
+    checkpoint_lsn: u64,
 };
 
 pub const HAStandbySnapshot = struct {
@@ -954,22 +954,22 @@ pub const HAStandbySnapshot = struct {
     /// Node id for the node-local admin endpoint that produced this status snapshot.
     node_id: HANodeID,
     identity: HAIdentity,
-    received_lsn: i64,
-    applied_lsn: i64,
-    safe_read_lsn: i64,
-    upstream_lsn: OpenApiOptionalNullable(i64) = .absent,
-    write_lag_lsn: OpenApiOptionalNullable(i64) = .absent,
-    receive_lag_lsn: OpenApiOptionalNullable(i64) = .absent,
-    apply_lag_lsn: OpenApiOptionalNullable(i64) = .absent,
+    received_lsn: u64,
+    applied_lsn: u64,
+    safe_read_lsn: u64,
+    upstream_lsn: OpenApiOptionalNullable(u64) = .absent,
+    write_lag_lsn: OpenApiOptionalNullable(u64) = .absent,
+    receive_lag_lsn: OpenApiOptionalNullable(u64) = .absent,
+    apply_lag_lsn: OpenApiOptionalNullable(u64) = .absent,
     /// Last local standby replication pull or apply error observed by the node-local runtime.
     last_error: OpenApiOptionalNullable([]const u8) = .absent,
     /// Monotonic nanosecond timestamp for the most recent local standby replication attempt.
-    last_attempt_ns: OpenApiOptionalNullable(i64) = .absent,
+    last_attempt_ns: OpenApiOptionalNullable(u64) = .absent,
     /// Monotonic nanosecond timestamp for the most recent successful local standby replication round.
-    last_success_ns: OpenApiOptionalNullable(i64) = .absent,
+    last_success_ns: OpenApiOptionalNullable(u64) = .absent,
     /// Local standby replication rounds that exited early with an error.
-    replication_failures_total: OpenApiOptionalNullable(i64) = .absent,
-    unapplied_lsn_count: i64,
+    replication_failures_total: OpenApiOptionalNullable(u64) = .absent,
+    unapplied_lsn_count: u64,
     caught_up_to_received: bool,
     can_serve_safe_reads: bool,
     lease_watchdog: ?HALeaseWatchdogProof = null,
@@ -1121,7 +1121,7 @@ pub const HAStandbySnapshot = struct {
 };
 
 pub const HAStandbyStatusResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     snapshot: HAStandbySnapshot,
 };
 
@@ -1131,7 +1131,7 @@ pub const HASyncPolicy = struct {
     /// How named standbys are selected to satisfy the policy.
     selection: ?[]const u8 = null,
     /// Number of eligible standbys required for `any` selection.
-    required: ?i64 = null,
+    required: ?u64 = null,
     /// Ordered candidate standby names for synchronous commit.
     standby_names: ?[]const HASlotName = null,
     /// Caller-visible action when synchronous durability is not currently satisfied.
@@ -1179,12 +1179,12 @@ pub const HASyncPolicy = struct {
 };
 
 pub const HAWatchdogProofResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     proof: HALeaseWatchdogProof,
 };
 
 pub const HAWriteCheckResponse = struct {
-    schema_version: i64,
+    schema_version: u32,
     decision: HAWriteDecision,
 };
 
@@ -1192,8 +1192,8 @@ pub const HAWriteDecision = struct {
     role: []const u8,
     action: []const u8,
     identity: HAIdentity,
-    durable_lsn: i64,
-    next_lsn: i64,
+    durable_lsn: u64,
+    next_lsn: u64,
     promotion_handoff: ?HAPromotionHandoff = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -1269,7 +1269,7 @@ pub const OwnerJobCheckRequest = struct {
 };
 
 pub const PromotionAssessRequest = struct {
-    required_lsn: ?i64,
+    required_lsn: ?u64,
     fencing_confirmed: bool,
     force: bool,
     use_current_fence: bool,
@@ -1306,9 +1306,9 @@ pub const PromotionAssessRequest = struct {
 
 pub const ReadCheckRequest = struct {
     consistency: ?[]const u8 = null,
-    required_lsn: OpenApiOptionalNullable(i64) = .absent,
-    required_metadata_lsn: OpenApiOptionalNullable(i64) = .absent,
-    metadata_applied_lsn: OpenApiOptionalNullable(i64) = .absent,
+    required_lsn: OpenApiOptionalNullable(u64) = .absent,
+    required_metadata_lsn: OpenApiOptionalNullable(u64) = .absent,
+    metadata_applied_lsn: OpenApiOptionalNullable(u64) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -1374,9 +1374,9 @@ pub const RejoinAssessRequest = struct {
     node_id: HANodeID,
     identity: HAIdentity,
     /// Last local LSN durably present on the former primary.
-    last_lsn: i64,
+    last_lsn: u64,
     /// Earliest parent-timeline WAL LSN still retained for rewind.
-    retained_from_lsn: i64,
+    retained_from_lsn: u64,
     allow_rewind_after_forced_promotion: bool,
     /// Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
     receipt: ?HAFenceReceipt = null,
@@ -1422,7 +1422,7 @@ pub const RejoinAssessRequest = struct {
 pub const ReplicationSlotCreateRequest = struct {
     slot_name: HASlotName,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
-    initial_lsn: OpenApiOptionalNullable(i64) = .absent,
+    initial_lsn: OpenApiOptionalNullable(u64) = .absent,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -1447,7 +1447,7 @@ pub const SeedArtifactCaptureRequest = struct {
     slot_name: HASlotName,
     generation: []const u8,
     topology_id: []const u8,
-    topology_generation: i64,
+    topology_generation: u64,
     node_id: []const u8,
     target_pvc_name: []const u8,
     target_pvc_uid: []const u8,
@@ -1457,8 +1457,8 @@ pub const SeededSlotActivateRequest = struct {
     slot_name: HASlotName,
     generation: []const u8,
     manifest_id: []const u8,
-    timeline_id: i64,
-    checkpoint_lsn: i64,
+    timeline_id: u64,
+    checkpoint_lsn: u64,
     seed_receipt_sha256: []const u8,
     /// SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
     capture_receipt_sha256: []const u8,
@@ -1493,7 +1493,7 @@ pub const StandbyBootstrapRequest = struct {
 
 pub const StorageMaintenanceJob = struct {
     /// Opaque non-sequential job identifier.
-    job_id: i64,
+    job_id: u64,
     operation: StorageMaintenanceOperation,
     state: StorageMaintenanceState,
     created_at_ms: i64,
@@ -1583,14 +1583,14 @@ pub const StorageMaintenanceOperation = enum {
 pub const StorageMaintenanceResult = struct {
     valid: ?bool = null,
     issue: ?[]const u8 = null,
-    file_size: ?i64 = null,
-    valid_prefix_size: ?i64 = null,
-    reclaimable_bytes: ?i64 = null,
-    before_size: ?i64 = null,
-    after_size: ?i64 = null,
-    reclaimed_bytes: ?i64 = null,
-    live_file_count: ?i64 = null,
-    live_bytes: ?i64 = null,
+    file_size: ?u64 = null,
+    valid_prefix_size: ?u64 = null,
+    reclaimable_bytes: ?u64 = null,
+    before_size: ?u64 = null,
+    after_size: ?u64 = null,
+    reclaimed_bytes: ?u64 = null,
+    live_file_count: ?u64 = null,
+    live_bytes: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{

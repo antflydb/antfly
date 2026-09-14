@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const store_report_update = @import("../metadata/store_report_update.zig");
+const store_report_baseline = @import("../metadata/store_report_baseline.zig");
 const report_collection = @import("../metadata/report_collection.zig");
 const system_catalog = @import("../system_catalog/domain.zig");
 const runtime_io_abi = @import("../runtime_io_abi.zig");
@@ -4780,6 +4781,7 @@ pub const DataServer = struct {
     reporter_incarnation: u64 = 0,
     store_status_generation: std.atomic.Value(u64) = .init(1),
     store_report_publisher: store_report_update.Publisher = .{},
+    store_report_baseline: ?struct { prepared: store_report_update.Publisher.Prepared, plan: store_report_baseline.Plan } = null,
     store_report_publish_mutex: std.Io.Mutex = .init,
     telemetry_mutex: std.atomic.Mutex = .unlocked,
     telemetry_pending: ?*PendingTelemetry = null,
@@ -6765,7 +6767,10 @@ pub const DataServer = struct {
         // mutation barrier; the provider performs a second bounded check after
         // the close. Custom providers own their own immutable source contract.
         if (self.ha_cfg.seed_snapshot_provider == null)
-            try self.prepareDefaultHASeedSnapshotMaintenance();
+            self.prepareDefaultHASeedSnapshotMaintenance() catch |err| {
+                std.log.warn("HA seed preparation failed err={s}", .{@errorName(err)});
+                return err;
+            };
 
         // Global ordering is non-negotiable: capture excludes every durable
         // mutation before freezing the role pointer that keeps Primary alive.
@@ -7083,7 +7088,7 @@ pub const DataServer = struct {
         if (!self.store_registration_confirmed) try self.registerNodeIfConfigured();
         _ = self.store_status_ticks.fetchAdd(1, .monotonic);
         self.store_status_ticks.store(0, .release);
-        try self.reportStoreStatus();
+        self.reportStoreStatus() catch |err| if (err != error.StoreReportBaselinePending) return err;
     }
 
     /// Schedules only the production maintenance lanes that can turn newly
@@ -7248,6 +7253,7 @@ pub const DataServer = struct {
                             .none => unreachable,
                         };
                         result catch |err| switch (err) {
+                            error.StoreReportBaselinePending => {},
                             // Split runtime can briefly observe placement before the
                             // local replica root is fully provisioned on disk.
                             error.LsmRootWriterAlreadyOpen,
@@ -7466,6 +7472,10 @@ pub const DataServer = struct {
         self.provisioned_index_repair_routes.deinit(self.alloc);
         if (self.telemetry_pending) |pending| pending.destroy(self.alloc);
         self.telemetry_pending = null;
+        if (self.store_report_baseline) |*pending| {
+            pending.plan.deinit();
+            pending.prepared.deinit(self.alloc);
+        }
         self.store_report_publisher.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
         self.provisioned_storage.deinit();
@@ -10428,6 +10438,7 @@ pub const DataServer = struct {
             };
         }
         self.reportStoreStatus() catch |err| switch (err) {
+            error.StoreReportBaselinePending,
             error.FileNotFound,
             error.UnknownGroup,
             error.LmdbUnexpected,
@@ -15337,17 +15348,93 @@ pub const DataServer = struct {
         _ = try remote.reportNodeUpdate(batch.report.store_id, bytes);
     }
 
+    fn resumeStoreReportBaseline(self: *DataServer, remote: *RemoteMetadataSource) !void {
+        const pending = if (self.store_report_baseline) |*value| value else return;
+        var request = pending.plan.request;
+        var steps: usize = 0;
+        // Bound one reporting turn as well as individual requests. The pinned
+        // generation survives transport failure and resumes from applied state.
+        while (steps < 32) : (steps += 1) {
+            const body = try stringifyJsonAlloc(self.alloc, request);
+            defer self.alloc.free(body);
+            if (body.len > store_report_baseline.max_chunk_bytes) return error.ResourceRequestTooLarge;
+            const progress = remote.reportNodeBaseline(request.report.store_id, body) catch |err| switch (err) {
+                // A rolling metadata upgrade cannot yet decode the new command.
+                // Keep the pinned generation and retry without sending an
+                // oversized legacy report or terminating the reporting lane.
+                error.UnsupportedOperation => {
+                    self.store_report_update_retry_at_ms = self.backgroundMonotonicMs() + std.time.ms_per_s;
+                    self.markStoreStatusDirtyImmediate();
+                    return error.StoreReportBaselinePending;
+                },
+                else => return err,
+            };
+            self.store_report_update_retry_at_ms = 0;
+            if (!std.meta.eql(progress.cursor, pending.plan.request.cursor) or progress.next_chunk > pending.plan.chunks.len) return error.InvalidStoreReporterFence;
+            if (progress.activated) {
+                self.store_report_publisher.commit(self.alloc, &pending.prepared, progress.cursor);
+                pending.plan.deinit();
+                pending.prepared.deinit(self.alloc);
+                self.store_report_baseline = null;
+                return;
+            }
+            request = pending.plan.request;
+            if (progress.collecting) continue;
+            if (progress.next_chunk == pending.plan.chunks.len) {
+                request.action = .activate;
+            } else {
+                request.action = .chunk;
+                request.chunk_index = progress.next_chunk;
+                request.report = pending.plan.chunks[progress.next_chunk];
+            }
+        }
+        self.markStoreStatusDirtyImmediate();
+        self.clearMetadataBootstrapRetry();
+        return error.StoreReportBaselinePending;
+    }
+
     fn publishStoreReportUpdate(self: *DataServer, report: antfly.metadata.table_manager.StoreStatusReport, retain_runtime: bool) !bool {
         const remote = self.remote_metadata orelse return false;
         self.store_report_publish_mutex.lockUncancelable(remote.io);
         defer self.store_report_publish_mutex.unlock(remote.io);
-        if (self.backgroundMonotonicMs() < self.store_report_update_retry_at_ms) return false;
+        if (self.backgroundMonotonicMs() < self.store_report_update_retry_at_ms) {
+            if (self.store_report_baseline != null) return error.StoreReportBaselinePending;
+            return false;
+        }
+        if (self.store_report_baseline) |*pending| {
+            if (pending.plan.request.report.reporter_incarnation != report.reporter_incarnation) {
+                pending.plan.deinit();
+                pending.prepared.deinit(self.alloc);
+                self.store_report_baseline = null;
+            } else self.resumeStoreReportBaseline(remote) catch |err| {
+                if (err == error.StoreReportBaseMismatch) {
+                    pending.plan.deinit();
+                    pending.prepared.deinit(self.alloc);
+                    self.store_report_baseline = null;
+                    self.store_report_publisher.cursor = null;
+                }
+                return err;
+            };
+        }
         if (retain_runtime and self.store_report_publisher.cursor == null) return false;
         for (0..2) |attempt| {
             var prepared = try self.store_report_publisher.prepare(self.alloc, report, attempt != 0, retain_runtime);
-            defer prepared.deinit(self.alloc);
+            var prepared_owned = true;
+            defer if (prepared_owned) prepared.deinit(self.alloc);
             const activity = prepared.update.activity;
             prepared.update.activity = &.{};
+            // Measure without allocating a full JSON body. Full inventories
+            // larger than one chunk use the resumable generation protocol.
+            const encoded_size = try store_report_baseline.reportSize(prepared.update);
+            if (!prepared.full and encoded_size > store_report_baseline.max_report_bytes) continue;
+            if (prepared.full and encoded_size > store_report_baseline.max_report_bytes) {
+                const plan = try store_report_baseline.Plan.init(self.alloc, &prepared);
+                self.store_report_baseline = .{ .prepared = prepared, .plan = plan };
+                prepared_owned = false;
+                self.embedding_activity_status_dirty.store(true, .release);
+                try self.resumeStoreReportBaseline(remote);
+                return true;
+            }
             const body = try stringifyJsonAlloc(prepared.arena.allocator(), prepared.update);
             const cursor = remote.reportNodeUpdate(report.store_id, body) catch |err| switch (err) {
                 error.StoreReportBaseMismatch => if (attempt == 0) continue else return err,
@@ -20253,7 +20340,7 @@ const RemoteMetadataSource = struct {
                 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
                 var metadata_client = self.metadataClient(arena.allocator());
-                var parsed = metadata_client.fetchPagedSnapshot(self.base_uris[index], false, true, budget) catch |err| {
+                var parsed = metadata_client.fetchPagedSnapshot(self.base_uris[index], true, true, budget) catch |err| {
                     if (err == error.UnsupportedOperation) {
                         self.noteLinearizableSnapshotUnsupported(index, self.awakeNs());
                         unsupported_count += 1;
@@ -21765,6 +21852,14 @@ const RemoteMetadataSource = struct {
         self.supports_runtime_reference.store(supported, .release);
     }
 
+    fn reportNodeBaseline(self: *RemoteMetadataSource, store_id: u64, body: []const u8) !store_report_baseline.Progress {
+        const Request = struct { store_id: u64, body: []const u8 };
+        return self.withMetadataApiClient(store_report_baseline.Progress, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, req: Request) !store_report_baseline.Progress {
+                return client.reportNodeBaseline(base_uri, req.store_id, req.body);
+            }
+        }.call, Request{ .store_id = store_id, .body = body });
+    }
     fn reportNodeUpdate(self: *RemoteMetadataSource, store_id: u64, body: []const u8) !store_report_update.Cursor {
         const Request = struct { store_id: u64, body: []const u8 };
         return self.withMetadataApiClient(store_report_update.Cursor, struct {
@@ -25492,6 +25587,25 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 headers[1] = .{ .name = try response_alloc.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = &.{} };
                 errdefer headers[1].deinit(response_alloc);
                 headers[1].value = try response_alloc.dupe(u8, &snapshot.status.metadata_incarnation.?);
+                return .{ .status = 200, .body = body, .headers = headers };
+            }
+            if (std.mem.endsWith(u8, request.uri, @import("../metadata/snapshot_transfer.zig").path)) {
+                const transfer = try std.json.parseFromSlice(@import("../metadata/snapshot_transfer.zig").Request, response_alloc, request.body, .{});
+                defer transfer.deinit();
+                if (transfer.value.release) return .{ .status = 204 };
+                // Fixture views fit one page; retain the production transfer
+                // contract so linearizable consumers exercise that boundary.
+                const body = try std.json.Stringify.valueAlloc(response_alloc, snapshot.*, .{});
+                errdefer response_alloc.free(body);
+                if (body.len > @import("../metadata/snapshot_transfer.zig").page_bytes or transfer.value.offset != 0) return error.TestUnexpectedResult;
+                const headers = try response_alloc.alloc(antfly.common.http.Header, 2);
+                errdefer response_alloc.free(headers);
+                headers[0] = .{ .name = try response_alloc.dupe(u8, "X-Antfly-Snapshot-Token"), .value = &.{} };
+                errdefer headers[0].deinit(response_alloc);
+                headers[0].value = try response_alloc.dupe(u8, "2");
+                headers[1] = .{ .name = try response_alloc.dupe(u8, "X-Antfly-Snapshot-Bytes"), .value = &.{} };
+                errdefer headers[1].deinit(response_alloc);
+                headers[1].value = try std.fmt.allocPrint(response_alloc, "{d}", .{body.len});
                 return .{ .status = 200, .body = body, .headers = headers };
             }
             if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.capabilities)) {

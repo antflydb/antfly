@@ -394,3 +394,35 @@ measured telemetry and namespace requests never retry. Both workers start
 together and perform the configured number of collections/pairs. Their elapsed
 work windows can differ. Preserve failed setup attempts and mixed latency results
 when recording a run; see the final compiled-storage results for an example.
+
+
+### Node inventory recovery, restart bursts, and operator diagnostics
+
+`tools/benchmark_catalog_control.py` runs three metadata voters and three real
+data processes with a synthetic 10,000-group reporter (one index per group):
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_catalog_control.py \
+  --samples 5 --output /tmp/catalog-control.json
+```
+
+It exercises three operational scenarios: replacing a node's complete inventory,
+32/33/128-group durable status bursts following a restart, and four concurrent
+operator diagnostic captures alongside a control read. The synthetic groups are
+outside actual placement; this measures inventory and reporting pressure, not
+10,000 hosted Raft groups. Use `--baseline-mode full --binary /path/to/old/antfly`
+for the preceding implementation's ordinary full-report endpoint.
+
+The recovery phase records planning time, total delivery time, each request's
+latency and endpoint attempts, maximum request size, and root-activation latency.
+The burst phase records each publication's endpoint discovery attempts. Those
+latencies include discovery; snapshot observations never retry. Successful
+control latency summaries exclude rejected responses, whose counts and raw
+samples remain in the artifact. Diagnostic saturation is an expected scenario;
+compare admission failures and their latency alongside successful captures.
+
+Each burst size has one warmup and the requested measured samples. Initial
+registration, catalog readiness, and fixture acquisition remain separate from
+measurements. Partial checkpoints preserve progress if the workload aborts.
+Every real data process must survive. Five local Debug samples diagnose gross
+algorithmic regressions; they do not establish production throughput or p95 SLOs.

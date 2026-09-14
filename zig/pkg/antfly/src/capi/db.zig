@@ -3059,7 +3059,7 @@ pub fn metadataApplyStoreProjection(
     const alloc = handle.alloc;
     return switch (request.kind) {
         .system_catalog => blk: {
-            const contract = @import("../metadata/storage/raft_apply_contract.zig");
+            const contract = metadata_raft_apply.apply_contract;
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const a = arena.allocator();
@@ -3075,7 +3075,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .read_store_report_targets => |input| {
-                    const value = handle.store.readStoreReportTargetsWithRuntime(a, group_id, input.update, input.include_runtime) catch |err| break :blk storageOwnerStatusFromError(err);
+                    const value = handle.store.readStoreReportTargetsWithRuntime(a, group_id, .{ .sequence = 1, .report = .{ .store_id = input.store_id }, .base = if (input.full) null else .{ .reporter_incarnation = 0, .sequence = 0, .digest = @splat(0) }, .removed_groups = input.group_ids }, input.include_runtime) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .catalog_read => |input| {
@@ -3120,6 +3120,14 @@ pub fn metadataApplyStoreProjection(
                 },
                 .topology_activation => {
                     const value = handle.store.topologyActivation(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .report_baseline_progress => |input| {
+                    const value = handle.store.reportBaselineProgressForKey(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .read_control_stores => |groups| {
+                    const value = handle.store.readControlStores(a, group_id, groups) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .report_cursor => |input| {
@@ -6453,15 +6461,26 @@ pub fn storageOwnerMaintenance(
             }
             out_result.progressed = @intFromBool(out_result.dense_steps != 0);
         },
+        .capture_ha_seed_snapshot => {
+            const token = request.snapshot_token.slice();
+            const destination = request.destination_root.slice();
+            if (!antfly.ha_validation.isIdentifier(token) or !std.fs.path.isAbsolute(destination)) return .invalid_argument;
+            antfly.ha_seed_snapshot.capture(handle.alloc, &handle.db, handle.db.core.path, token, destination) catch |err| {
+                std.log.warn("storage owner HA seed capture failed err={s}", .{@errorName(err)});
+                return storageOwnerStatusFromError(err);
+            };
+        },
         .prepare_ha_seed_snapshot => {
             if (request.deadline_ns == 0) return .invalid_argument;
-            handle.db.prepareHASeedSnapshot(request.deadline_ns) catch |err|
+            handle.db.prepareHASeedSnapshot(request.deadline_ns) catch |err| {
+                std.log.warn("storage owner HA seed preparation failed err={s}", .{@errorName(err)});
                 return storageOwnerStatusFromError(err);
+            };
         },
     }
 
     out_result.maintenance_score = switch (action) {
-        .inspect, .lsm_step, .prepare_ha_seed_snapshot => @max(
+        .inspect, .lsm_step, .prepare_ha_seed_snapshot, .capture_ha_seed_snapshot => @max(
             handle.db.lsmMaintenanceScore(),
             handle.db.lsmMaintenanceDebtHint(),
         ),

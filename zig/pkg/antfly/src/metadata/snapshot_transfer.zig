@@ -18,44 +18,82 @@ pub const Request = struct {
 };
 pub const Page = struct { token: u64, total: usize, bytes: []u8 };
 pub const Cache = struct {
-    const Entry = struct { token: u64, bytes: []u8, touched: u64 };
+    const Entry = struct { token: u64, bytes: []u8, touched: u64, capturing: bool = false };
     mutex: std.Io.Mutex = .init,
-    capture_mutex: std.Io.Mutex = .init,
     entries: [32]?Entry = @splat(null),
     retained: usize = 0,
     next_token: u64 = 0,
+    reserved: usize = 0,
+    snapshot_limit: usize = max_snapshot_bytes,
+    retained_limit: usize = max_retained_bytes,
+
+    /// Reserve both the token and worst-case encoding before taking a metadata
+    /// lease. Busy readers fail immediately; they never queue behind a capture.
+    pub fn reserve(self: *Cache, alloc: std.mem.Allocator, now: u64) !u64 {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        for (&self.entries) |*entry| if (entry.*) |e| {
+            if (!e.capturing and now -| e.touched >= ttl_ns) self.remove(alloc, entry);
+        };
+        if (self.retained + self.reserved + self.snapshot_limit > self.retained_limit) return error.ResourceTemporarilyUnavailable;
+        for (&self.entries) |*entry| if (entry.* == null) {
+            // Low bit identifies the admission lane, including continuations
+            // whose JSON omits the original control flag.
+            self.next_token = (self.next_token + 2) & std.math.maxInt(u63);
+            if (self.next_token < 2) self.next_token += 2;
+            entry.* = .{ .token = self.next_token, .bytes = &.{}, .touched = now, .capturing = true };
+            self.reserved += self.snapshot_limit;
+            return self.next_token;
+        };
+        return error.ResourceTemporarilyUnavailable;
+    }
+
+    pub fn cancel(self: *Cache, alloc: std.mem.Allocator, token: u64) void {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        for (&self.entries) |*entry| if (entry.*) |e| {
+            if (e.token == token and e.capturing) self.remove(alloc, entry);
+        };
+    }
+
+    /// Transfers ownership only on success. A failed capture releases its
+    /// reservation through cancel, so retries cannot exhaust slots or bytes.
+    pub fn publish(self: *Cache, bytes: []u8, token: u64, now: u64) !void {
+        if (bytes.len > self.snapshot_limit) return error.ResourceRequestTooLarge;
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        for (&self.entries) |*slot| if (slot.*) |*entry| {
+            if (entry.token != token or !entry.capturing) continue;
+            self.reserved -= self.snapshot_limit;
+            self.retained += bytes.len;
+            entry.* = .{ .token = token, .bytes = bytes, .touched = now };
+            return;
+        };
+        return error.CatalogGenerationChanged;
+    }
 
     pub fn deinit(self: *Cache, alloc: std.mem.Allocator) void {
         for (&self.entries) |*entry| self.remove(alloc, entry);
     }
     fn remove(self: *Cache, alloc: std.mem.Allocator, entry: *?Entry) void {
         if (entry.*) |e| {
+            if (e.capturing) self.reserved -= self.snapshot_limit;
             self.retained -= e.bytes.len;
             alloc.free(e.bytes);
             entry.* = null;
         }
     }
     pub fn install(self: *Cache, alloc: std.mem.Allocator, bytes: []u8, now: u64) !u64 {
-        if (bytes.len > max_snapshot_bytes) return error.ResourceRequestTooLarge;
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
-        for (&self.entries) |*entry| if (entry.*) |e| {
-            if (now -| e.touched >= ttl_ns) self.remove(alloc, entry);
-        };
-        if (self.retained + bytes.len > max_retained_bytes) return error.ResourceTemporarilyUnavailable;
-        for (&self.entries) |*entry| if (entry.* == null) {
-            self.next_token = @max(self.next_token +| 1, now);
-            entry.* = .{ .token = self.next_token, .bytes = bytes, .touched = now };
-            self.retained += bytes.len;
-            return self.next_token;
-        };
-        return error.ResourceTemporarilyUnavailable;
+        const token = try self.reserve(alloc, now);
+        errdefer self.cancel(alloc, token);
+        try self.publish(bytes, token, now);
+        return token;
     }
     pub fn read(self: *Cache, alloc: std.mem.Allocator, output: std.mem.Allocator, request: Request, now: u64) !Page {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
         for (&self.entries) |*slot| if (slot.*) |*entry| {
-            if (entry.token != request.token) continue;
+            if (entry.token != request.token or entry.capturing) continue;
             if (request.release or now -| entry.touched >= ttl_ns) {
                 self.remove(alloc, slot);
                 return error.CatalogGenerationChanged;
@@ -69,13 +107,17 @@ pub const Cache = struct {
 };
 
 pub fn encode(alloc: std.mem.Allocator, value: anytype) ![]u8 {
+    return encodeBounded(alloc, value, max_snapshot_bytes);
+}
+
+pub fn encodeBounded(alloc: std.mem.Allocator, value: anytype, limit: usize) ![]u8 {
     // Size before allocation, so even an oversized diagnostic response cannot
     // allocate an unbounded encoded buffer or monopolize the transfer cache.
     var buffer: [4096]u8 = undefined;
     var count = std.Io.Writer.Discarding.init(&buffer);
     try std.json.Stringify.value(value, .{}, &count.writer);
     const size = count.fullCount();
-    if (size > max_snapshot_bytes) return error.ResourceRequestTooLarge;
+    if (size > limit) return error.ResourceRequestTooLarge;
     const bytes = try alloc.alloc(u8, @intCast(size));
     errdefer alloc.free(bytes);
     var writer = std.Io.Writer.fixed(bytes);
@@ -123,4 +165,46 @@ test "system catalog snapshot transfer capacity is released and encoding is exac
     const replacement = try a.dupe(u8, "{}");
     _ = try cache.install(a, replacement, 35);
     try std.testing.expectEqual(@as(usize, 64), cache.retained);
+}
+
+/// Control captures own 32 MiB of admission, diagnostic captures 96 MiB.
+/// Retained encodings plus in-flight encoding reservations never exceed the
+/// original aggregate 128 MiB budget. Object capture is bounded separately by
+/// the inventory and one maximum-sized reservation per admitted capture.
+pub const Transfers = struct {
+    control: Cache = .{ .snapshot_limit = 16 * 1024 * 1024, .retained_limit = 32 * 1024 * 1024 },
+    diagnostic: Cache = .{ .next_token = 1, .retained_limit = 96 * 1024 * 1024 },
+    pub fn lane(self: *Transfers, request: Request) *Cache {
+        if (request.token != 0) return if (request.token & 1 == 0) &self.control else &self.diagnostic;
+        return if (request.control) &self.control else &self.diagnostic;
+    }
+    pub fn deinit(self: *Transfers, alloc: std.mem.Allocator) void {
+        self.control.deinit(alloc);
+        self.diagnostic.deinit(alloc);
+    }
+};
+
+test "system catalog diagnostic reservations cannot block control and failure releases capacity" {
+    const a = std.testing.allocator;
+    var transfers: Transfers = .{};
+    defer transfers.deinit(a);
+    const diagnostic = transfers.lane(.{ .control = false });
+    const token = try diagnostic.reserve(a, 1);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, diagnostic.reserve(a, 2));
+    const control = transfers.lane(.{});
+    const control_token = try control.reserve(a, 3);
+    try std.testing.expect(transfers.lane(.{ .token = token }) == diagnostic);
+    try std.testing.expect(transfers.lane(.{ .token = control_token }) == control);
+    try std.testing.expect(transfers.lane(.{ .linearizable = true }) == control);
+    // Failed/oversized captures reclaim their reservation without publishing.
+    try std.testing.expectError(error.ResourceRequestTooLarge, encodeBounded(a, "too large", 1));
+    diagnostic.cancel(a, token);
+    try std.testing.expectEqual(@as(usize, 0), diagnostic.reserved);
+    const replacement = try diagnostic.reserve(a, 4);
+    const bytes = try a.dupe(u8, "{}");
+    try diagnostic.publish(bytes, replacement, 5);
+    try std.testing.expectEqual(@as(usize, 2), diagnostic.retained);
+    try std.testing.expectEqual(@as(usize, 0), diagnostic.reserved);
+    try std.testing.expectError(error.CatalogGenerationChanged, diagnostic.read(a, a, .{ .token = replacement, .release = true }, 6));
+    control.cancel(a, control_token);
 }

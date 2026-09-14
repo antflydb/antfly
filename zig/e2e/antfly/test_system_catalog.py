@@ -634,3 +634,41 @@ def test_catalog_graph_metric_actions_follow_identity_after_rename(stateful_api)
     assert resumed["status"]["maintenance_paused"] is False
     api.delete(renamed)
     api.delete(f"/databases/{database}")
+
+
+def test_catalog_transaction_session_keeps_bound_identity_through_rename(stateful_api):
+    api = stateful_api
+    original = "txn_catalog_" + uuid.uuid4().hex[:12]
+    renamed = original + "_renamed"
+    api.post(f"/tables/{original}", {})
+    session = api.begin_transaction_session(sync_level="write")
+    txn_id = session["transaction_id"]
+    api.stage_transaction_session(
+        txn_id, tables={original: {"inserts": {"doc:1": {"value": "bound"}}}}
+    )
+    api.post(
+        f"/databases/default/namespaces/public/tables/{original}/rename",
+        {"name": renamed},
+    )
+    api.post(f"/tables/{original}", {})
+    conflicting_stage = api._request(
+        "POST",
+        f"/transactions/{txn_id}/stage",
+        {
+            "read_set": [],
+            "tables": {original: {"inserts": {"doc:2": {"value": "replacement"}}}},
+        },
+    )
+    assert conflicting_stage.status_code == 409, conflicting_stage.text
+    # Reopen exercises durable bindings, not an in-memory name lookup cache.
+    api.restart_server()
+    status, result = api.commit_transaction_session(txn_id)
+    assert status == 200, result
+    assert original in result["tables"]
+    assert api.get(f"/tables/{renamed}/documents/doc:1") == {"value": "bound"}
+    assert api._request("GET", f"/tables/{original}/documents/doc:1").status_code == 404
+    retry_status, retry_result = api.commit_transaction_session(txn_id)
+    assert retry_status == 200, retry_result
+    assert original in retry_result["tables"]
+    api.delete(f"/tables/{original}")
+    api.delete(f"/tables/{renamed}")

@@ -153,7 +153,7 @@ pub const Publisher = struct {
             alloc.destroy(self);
         }
     };
-    const Pending = struct { id: u64, group: *Group };
+    pub const Pending = struct { id: u64, group: *Group };
     pub const Prepared = struct {
         arena: std.heap.ArenaAllocator,
         update: Update,

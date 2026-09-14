@@ -679,6 +679,19 @@ pub const MetadataHttpClient = struct {
         return responseHasHeaderValueAnyStatus(resp, metadata_table_manager.store_runtime_reference_header, "1");
     }
 
+    pub fn reportNodeBaseline(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8) !@import("store_report_baseline.zig").Progress {
+        const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/nodes/{d}/status/baseline", .{store_id});
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        var resp = try self.executeWithRetry(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms });
+        defer resp.deinit(self.alloc);
+        if (resp.status == 405) return error.UnsupportedOperation;
+        try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch);
+        var parsed = try std.json.parseFromSlice(@import("store_report_baseline.zig").Progress, self.alloc, resp.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
     pub fn reportNodeUpdate(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8) !store_report_update.Cursor {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/nodes/{d}/status/update", .{store_id});
         defer self.alloc.free(path);

@@ -15500,13 +15500,13 @@ fn consumerTests() type {
                     const right = std.mem.indexOf(u8, req.body, "doc:z") != null;
                     _ = self.calls.fetchAdd(1, .monotonic);
                     _ = self.keys_seen.fetchAdd(@as(usize, @intFromBool(left)) + @intFromBool(right), .monotonic);
-                    try std.testing.expect(left != right);
+                    if (left == right) return error.TestUnexpectedResult;
                     try std.testing.expectEqual(left, std.mem.indexOf(u8, req.uri, "/groups/7/") != null);
                     try std.testing.expectEqual(right, std.mem.indexOf(u8, req.uri, "/groups/8/") != null);
                     // Stop after wire capture; both fibers must still finish. This
                     // exercises the real parallel dispatch and serializer, not merely
                     // the partition helper or the final result set.
-                    return error.CapturedCandidateRequest;
+                    return error.InvalidQueryRequest;
                 }
             };
             var capture = Capture{};
@@ -15517,7 +15517,7 @@ fn consumerTests() type {
             const req: db_mod.types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "doc:a", "doc:z" }, .document_lookup_groups = &.{ 7, 8 }, .limit = 100 };
             try std.testing.expect(planQueryFanout(hosted.io_impl, 2, req).parallel);
             var generations = [_]?u64{ null, null };
-            try std.testing.expectError(error.CapturedCandidateRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
+            try std.testing.expectError(error.InvalidQueryRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
             try std.testing.expectEqual(@as(usize, 2), capture.calls.load(.monotonic));
             try std.testing.expectEqual(@as(usize, 2), capture.keys_seen.load(.monotonic));
         }

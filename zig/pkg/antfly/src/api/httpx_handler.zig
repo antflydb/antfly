@@ -3444,22 +3444,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
+        self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), commit_req, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
         if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req.*))) {
             _ = ctx.status(403);
             return ctx.text("forbidden");
-        }
-
-        if (self.api_server.source.vtable.system_catalog != null) {
-            for (commit_req.tables) |*table| {
-                const physical = self.api_server.resolveCatalogNameAlloc(alloc, operationContext(ctx, authenticated_identity), table.table_name, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
-                alloc.free(table.table_name);
-                table.table_name = physical;
-            }
-            for (commit_req.read_set) |*item| {
-                const physical = self.api_server.resolveCatalogNameAlloc(alloc, operationContext(ctx, authenticated_identity), item.table_name, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
-                alloc.free(item.table_name);
-                item.table_name = physical;
-            }
         }
 
         const distributed_tables = try commit_req.distributedTables(alloc);
@@ -3794,6 +3782,7 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer stage_req.deinit(alloc);
+        self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), &stage_req, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
         if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, stage_req))) {
             _ = ctx.status(403);
             return ctx.text("forbidden");
@@ -3803,6 +3792,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
+            error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
             error.TransactionCommitSealed => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
@@ -3845,6 +3835,9 @@ pub const AntflyApiHandler = struct {
             }
         }
 
+        var stage_req = try transactions_api.ownedRequestFromStageReadRequest(alloc, read_req);
+        defer stage_req.deinit(alloc);
+        self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), &stage_req, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
         var owned_snapshot = (self.api_server.txn_sessions.getReadSnapshot(alloc, txn_id, read_req.table_name, read_req.key) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
@@ -3859,12 +3852,12 @@ pub const AntflyApiHandler = struct {
         defer owned_snapshot.deinit(alloc);
 
         if (owned_snapshot.version == 0 and self.api_server.table_reads != null) {
-            const fetched = try self.api_server.lookupStageReadSnapshot(read_req.table_name, read_req.key);
+            const fetched = try self.api_server.lookupStageReadSnapshot(stage_req.physicalName(read_req.table_name), read_req.key);
             if (owned_snapshot.document_json) |document_json| alloc.free(document_json);
             alloc.free(owned_snapshot.table_name);
             alloc.free(owned_snapshot.key);
             owned_snapshot = .{
-                .table_name = try alloc.dupe(u8, fetched.table_name),
+                .table_name = try alloc.dupe(u8, read_req.table_name),
                 .key = try alloc.dupe(u8, fetched.key),
                 .version = fetched.version,
                 .document_json = if (fetched.document_json) |document_json| try alloc.dupe(u8, document_json) else null,
@@ -3899,13 +3892,12 @@ pub const AntflyApiHandler = struct {
             return ctx.openApiJson(response);
         }
 
-        var stage_req = try transactions_api.ownedRequestFromStageReadRequest(alloc, read_req);
-        defer stage_req.deinit(alloc);
         const session = (self.api_server.txn_sessions.stageRead(alloc, txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
+            error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
             error.TransactionCommitSealed => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
@@ -3958,6 +3950,7 @@ pub const AntflyApiHandler = struct {
             },
         };
         defer stage_req.deinit(alloc);
+        self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), &stage_req, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
         if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, stage_req))) {
             _ = ctx.status(403);
             return ctx.text("forbidden");
@@ -3967,6 +3960,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
+            error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
             error.TransactionCommitSealed => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
@@ -4001,6 +3995,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
+            error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
             error.TransactionCommitSealed => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
@@ -4043,6 +4038,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
+            error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
             error.TransactionCommitSealed => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
@@ -4092,7 +4088,12 @@ pub const AntflyApiHandler = struct {
                 else => return err,
             };
         }
+        if (parsed_req) |*request| {
+            self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), request, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
+            if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, request.*))) return textResponse(ctx, 403, "forbidden");
+        }
         var commit_req = (self.api_server.txn_sessions.cloneCommitRequest(alloc, txn_id, if (parsed_req) |*value| value else null) catch |err| switch (err) {
+            error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
             error.TransactionCommitRequestMismatch => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit retry body does not match the sealed request");

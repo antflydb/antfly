@@ -923,6 +923,17 @@ pub const Owner = struct {
         return result;
     }
 
+    pub fn captureHASeedSnapshot(self: *Owner, table_name: []const u8, token: []const u8, destination: []const u8) !void {
+        var result: abi.MaintenanceResult = .{};
+        try statusToError(abi.antfly_storage_owner_maintenance(self.handle, &.{
+            .action = @intFromEnum(abi.MaintenanceAction.capture_ha_seed_snapshot),
+            .table_name = .fromSlice(table_name),
+            .snapshot_token = .fromSlice(token),
+            .destination_root = .fromSlice(destination),
+        }, &result));
+        if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+    }
+
     pub fn prepareHASeedSnapshot(
         self: *Owner,
         table_name: []const u8,

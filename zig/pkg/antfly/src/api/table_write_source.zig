@@ -448,6 +448,7 @@ pub const TableWriteSource = struct {
             group_id: u64,
             table_name: []const u8,
         ) anyerror!?void = null,
+        capture_ha_seed_snapshot_group_local: ?*const fn (ptr: *anyopaque, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) anyerror!?void = null,
         prepare_ha_seed_snapshot_group_local: ?*const fn (
             ptr: *anyopaque,
             group_id: u64,
@@ -1373,6 +1374,11 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.preflight_write_admission_group_local orelse return null;
         return try BoundaryAbi.call("preflight_write_admission_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name });
+    }
+
+    pub fn captureHASeedSnapshotGroupLocal(self: TableWriteSource, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) !?void {
+        const fn_ptr = self.vtable.capture_ha_seed_snapshot_group_local orelse return null;
+        return try BoundaryAbi.call("capture_ha_seed_snapshot_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, token, destination });
     }
 
     pub fn prepareHASeedSnapshotGroupLocal(

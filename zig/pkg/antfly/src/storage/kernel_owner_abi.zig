@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 54;
+pub const abi_version: u32 = 55;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1124,6 +1124,7 @@ pub const MaintenanceAction = enum(u32) {
     prepare_ha_seed_snapshot = 5,
     publish_dense_checkpoints = 6,
     vector_block_idle = 7,
+    capture_ha_seed_snapshot = 8,
 };
 
 pub const MaintenanceRequest = extern struct {
@@ -1131,6 +1132,8 @@ pub const MaintenanceRequest = extern struct {
     action: u32 = @intFromEnum(MaintenanceAction.inspect),
     table_name: BorrowedBytes = .{},
     deadline_ns: u64 = 0,
+    snapshot_token: BorrowedBytes = .{},
+    destination_root: BorrowedBytes = .{},
 };
 
 pub const MaintenanceResult = extern struct {

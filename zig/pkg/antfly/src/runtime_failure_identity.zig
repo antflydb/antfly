@@ -63,6 +63,8 @@ const mappings = [_]Mapping{
     .{ .status = .table_topology_protocol_upgrade_required, .err = error.TableTopologyProtocolUpgradeRequired },
     .{ .status = .tablespace_in_use, .err = error.TablespaceInUse },
     .{ .status = .tablespace_not_found, .err = error.TablespaceNotFound },
+    .{ .status = .ha_seed_snapshot_runtime_busy, .err = error.HASeedSnapshotRuntimeBusy },
+    .{ .status = .ha_seed_capture_already_in_progress, .err = error.HASeedCaptureAlreadyInProgress },
 
     .{ .status = .invalid_abi, .err = error.InvalidAbiVersion },
     .{ .status = .invalid_argument, .err = error.InvalidArgument },

@@ -382,6 +382,9 @@ pub const Detail = enum(c_int) {
     invalid_catalog_record,
     catalog_id_exhausted,
     table_topology_protocol_upgrade_required,
+    ha_seed_snapshot_runtime_busy,
+    ha_seed_capture_already_in_progress,
+    storage_kernel_owner_unavailable,
 };
 
 pub const Status = extern struct {
@@ -399,6 +402,9 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.HASeedSnapshotRuntimeBusy => status(.unavailable, .ha_seed_snapshot_runtime_busy),
+        error.HASeedCaptureAlreadyInProgress => status(.unavailable, .ha_seed_capture_already_in_progress),
+        error.StorageKernelOwnerUnavailable => status(.unavailable, .storage_kernel_owner_unavailable),
         error.TableTopologyProtocolUpgradeRequired => status(.unavailable, .table_topology_protocol_upgrade_required),
         error.DatabaseNotFound => status(.not_found, .database_not_found),
         error.NamespaceNotFound => status(.not_found, .namespace_not_found),
@@ -804,6 +810,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .catalog_id_exhausted => "CatalogIdExhausted",
 
         .none => "RuntimeBoundaryFailure",
+        .ha_seed_snapshot_runtime_busy => "HASeedSnapshotRuntimeBusy",
+        .ha_seed_capture_already_in_progress => "HASeedCaptureAlreadyInProgress",
+        .storage_kernel_owner_unavailable => "StorageKernelOwnerUnavailable",
         .invalid_table_storage_settings => "InvalidTableStorageSettings",
         .vector_store_requires_local_single_shard_table => "VectorStoreRequiresLocalSingleShardTable",
         .vector_store_requires_empty_table => "VectorStoreRequiresEmptyTable",
@@ -1268,4 +1277,10 @@ test "ambiguous backup outcome survives runtime transport without rollback autho
     const wire = statusFromError(error.BackupOutcomeAmbiguous);
     try std.testing.expectEqual(@intFromEnum(Code.conflict), wire.code);
     try std.testing.expectEqual(error.BackupOutcomeAmbiguous, errorFromStatus(wire));
+}
+
+test "HA capture availability survives runtime callback transport" {
+    inline for (.{ error.HASeedSnapshotRuntimeBusy, error.HASeedCaptureAlreadyInProgress, error.StorageKernelOwnerUnavailable }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
 }

@@ -107,6 +107,15 @@ references must resolve at the same revision; a concurrent catalog mutation
 returns a catalog-generation conflict instead of mixing views. This cache is
 request-owned, never a process-wide name cache with a time-based expiry.
 
+Transaction admission binds all read-set and mutation targets in one catalog read.
+The request retains logical labels separately from physical table identities.
+Row-filter reads and distributed participants use the physical bindings; responses
+and permission checks retain logical names. Staged requests and savepoints persist
+server-authored bindings in their private session records. Public transaction JSON
+cannot supply those bindings. Native standalone persists sessions in a reserved
+storage-engine namespace, just as Lite does inside its file, so restart followed
+by rename or name reuse cannot redirect a staged write.
+
 ## Metadata reads and durability
 
 Catalog records, revisions, and table topology commit through metadata Raft.
@@ -637,21 +646,72 @@ cannot hide remote index status.
 `POST /internal/v1/snapshots/read` transfers an immutable encoded view in pages of
 at most 512 KiB. A token names one capture; the client checks token and total size
 on every page and publishes only the fully decoded view after authority checks.
-Control and diagnostic transfers share this transport. A completed client releases
-its token; abandoned tokens expire after 30 seconds. Retention is bounded to 32
-transfers and 128 MiB per server, with at most 64 MiB for one encoded view. Captures
-are serialized independently of the page-cache mutex. The encoder sizes its output
-before allocation. Capacity exhaustion returns 503 and oversized views return 413;
-data-node control loops back off rather than terminate on these conditions.
+Control and diagnostic transfers use independent admission lanes. A completed
+client releases its token; abandoned tokens expire after 30 seconds. Control views
+have a 16 MiB ceiling and 32 MiB lane budget; diagnostic views have a 64 MiB ceiling
+and 96 MiB lane budget. Before collecting any view, admission reserves its maximum
+size and one of the lane's bounded slots. Concurrent diagnostic callers cannot
+consume control capacity or hold its capture lock. Reservations are conservative:
+a second diagnostic capture can receive 503 even when its eventual encoded size
+might fit. The encoder sizes its output before allocation; oversized views return
+413. Failed and canceled captures release their reservations.
 
-This is bounded whole-view transfer, not a claim of constant-memory reconstruction:
-a client still materializes the complete compact view, and diagnostic export still
-owns the full diagnostic payload. A changed or expired transfer is restarted as a
-whole; pages from different captures are never combined. Full initial uploads and
-the diagnostic export ceiling remain explicit capacity limits.
+The store report cache and the placement/progress cache publish under separate
+locks. Report projection, materialization, and diagnostic cloning do not hold the
+Raft runtime mutex. Control reads fetch store headers and only the authoritative
+group facts through the covering index, without loading runtime index payloads.
+The commit listener records changed group IDs in a shared, allocation-free journal
+of 8,192 entries. The old 32-groups-per-store cliff is removed. Journal overflow
+invalidates only the affected store; allocation and deduplication run in the reader.
+
+Clients still assemble the complete bounded view, and full diagnostics remain
+inventory-sized. A changed or expired transfer restarts as a whole; pages from
+different captures are never combined.
+
+### Resumable full store inventories
+
+Protocol 10 adds `POST /internal/v1/nodes/:node_id/status/baseline`. Prepare creates
+an invisible generation identified by reporter incarnation and sequence. Each
+ordered chunk contains complete replacements for at most 64 groups and at most
+1 MiB of canonical report JSON; the HTTP envelope is limited to 2 MiB. An inventory
+has at most 4,096 chunks and 512 MiB of report data. A single group above the chunk
+budget is rejected explicitly. Smaller reports retain the ordinary sparse endpoint.
+
+The publisher pins the prepared inventory and owns only chunk descriptors and one
+encoded request at a time. A reporting turn performs at most 32 requests, then
+resumes from the replicated next-chunk offset without applying failure backoff to
+normal progress. Incarnation changes discard the pending plan. Transport failures
+and leader changes resume the same generation, with an idempotent last-chunk retry.
+During a metadata rolling upgrade, unsupported baseline requests retain the pending
+plan and retry after a bounded delay; they do not fall back to an oversized body.
+
+HTTP admission validates observations and computes the canonical size and SHA-256
+chunk digest. Command 58 carries those admitted facts, a small manifest, and the
+existing binary store codec. Raft apply never expands runtime reports to JSON.
+Chunks write normalized generation-addressed pages; they do not invalidate the
+visible report cache. Activation checks the complete digest chain, byte count,
+chunk count, and original header/cursor fences, then swaps the active root, compact
+header, and acknowledged cursor in one transaction. No partial inventory is visible.
+
+A store retains at most active, pending, and retired generations. Collection reclaims
+one retired page (at most 64 covering references) per subsequent report or prepare
+step; activation itself stays constant-size. Logical Raft snapshots retain the active
+inventory and pending upload state/pages, exclude retired data, and normalize the
+active generation on install. Selective reads rebuild missing derived indexes before
+using them after installation.
 
 
 ### Compiled storage ownership
+
+Native HA seed capture prepares the physical owner before the exclusive mutation
+freeze, then captures through that same leased owner. The frozen phase never
+opens another owner or resolves catalog metadata. Inline and compiled execution
+share the storage snapshot implementation and its durable artifact copy. Retryable
+capture contention has a stable ABI identity so the admin route can return 503.
+HA identities, LSNs, and counters retain their declared unsigned OpenAPI widths
+through generation, request validation, owner responses, and CLI rendering.
+Valid 64-bit physical identities must never be narrowed to signed integers.
+
 
 Catalog operations cross the storage boundary as complete requests: admission,
 qualified resolution, scoped listing, export, and targeted report reads each

@@ -863,7 +863,7 @@ fn executeTypedRemote(
         },
         .commit_check => |command| {
             var out = try client.checkCommit(remote_url, .{
-                .target_lsn = try i64FromU64(command.target_lsn),
+                .target_lsn = command.target_lsn,
                 .sync_policy = try syncPolicyOpenApi(command.policy),
             });
             defer out.deinit(alloc);
@@ -875,8 +875,8 @@ fn executeTypedRemote(
                 .payload = command.append.payload,
                 .kind = try recordKindName(command.append.kind),
                 .payload_codec = try payloadCodecName(command.append.payload_codec),
-                .shard_id = if (command.append.shard_id) |raw| try i64FromU64(raw) else null,
-                .table_id = if (command.append.table_id) |raw| try i64FromU64(raw) else null,
+                .shard_id = if (command.append.shard_id) |raw| raw else null,
+                .table_id = if (command.append.table_id) |raw| raw else null,
                 .commit_timestamp_ns = command.append.commit_timestamp_ns,
                 .sync_policy = try syncPolicyOpenApi(command.policy),
             });
@@ -887,9 +887,9 @@ fn executeTypedRemote(
         .read_check => |request| {
             var out = try client.checkRead(remote_url, .{
                 .consistency = @tagName(request.consistency),
-                .required_lsn = if (request.required_lsn) |raw| .{ .value = try i64FromU64(raw) } else .absent,
-                .required_metadata_lsn = if (request.required_metadata_lsn) |raw| .{ .value = try i64FromU64(raw) } else .absent,
-                .metadata_applied_lsn = if (request.metadata_applied_lsn) |raw| .{ .value = try i64FromU64(raw) } else .absent,
+                .required_lsn = if (request.required_lsn) |raw| .{ .value = raw } else .absent,
+                .required_metadata_lsn = if (request.required_metadata_lsn) |raw| .{ .value = raw } else .absent,
+                .metadata_applied_lsn = if (request.metadata_applied_lsn) |raw| .{ .value = raw } else .absent,
             });
             defer out.deinit(alloc);
             try writeTypedRemoteBody(alloc, io, plan.output, out.body);
@@ -928,7 +928,7 @@ fn executeTypedRemote(
         },
         .promote_assess => |command| {
             var out = try client.assessPromotion(remote_url, .{
-                .required_lsn = if (command.check.required_lsn) |raw| try i64FromU64(raw) else null,
+                .required_lsn = if (command.check.required_lsn) |raw| raw else null,
                 .fencing_confirmed = command.check.fencing_confirmed,
                 .force = command.check.force,
                 .use_current_fence = command.use_current_fence,
@@ -1104,14 +1104,14 @@ fn primaryMetricsFromAdminSnapshot(alloc: std.mem.Allocator, snapshot: admin_api
     var max_retention_lag_lsn: u64 = 0;
 
     for (snapshot.slots, 0..) |slot, idx| {
-        const received_lsn = try u64FromI64(slot.received_lsn);
-        const applied_lsn = try u64FromI64(slot.applied_lsn);
-        const safe_read_lsn = try u64FromI64(slot.safe_read_lsn);
-        const restart_lsn = try u64FromI64(slot.restart_lsn);
-        const write_lag_lsn = try u64FromI64(slot.write_lag_lsn);
-        const apply_lag_lsn = try u64FromI64(slot.apply_lag_lsn);
-        const safe_read_lag_lsn = try u64FromI64(slot.safe_read_lag_lsn);
-        const retention_lag_lsn = try u64FromI64(slot.retention_lag_lsn);
+        const received_lsn = slot.received_lsn;
+        const applied_lsn = slot.applied_lsn;
+        const safe_read_lsn = slot.safe_read_lsn;
+        const restart_lsn = slot.restart_lsn;
+        const write_lag_lsn = slot.write_lag_lsn;
+        const apply_lag_lsn = slot.apply_lag_lsn;
+        const safe_read_lag_lsn = slot.safe_read_lag_lsn;
+        const retention_lag_lsn = slot.retention_lag_lsn;
         const status_code = @intFromEnum(try slotStatusCodeFromAdmin(slot.status));
 
         if (slot.active) active_slots += 1;
@@ -1154,7 +1154,7 @@ fn primaryMetricsFromAdminSnapshot(alloc: std.mem.Allocator, snapshot: admin_api
         0;
 
     return .{
-        .current_lsn = try u64FromI64(snapshot.current_lsn),
+        .current_lsn = snapshot.current_lsn,
         .slot_count = @intCast(snapshot.slots.len),
         .active_slots = active_slots,
         .reseed_required_slots = reseed_required_slots,
@@ -1162,36 +1162,36 @@ fn primaryMetricsFromAdminSnapshot(alloc: std.mem.Allocator, snapshot: admin_api
         .max_apply_lag_lsn = max_apply_lag_lsn,
         .max_safe_read_lag_lsn = max_safe_read_lag_lsn,
         .max_retention_lag_lsn = max_retention_lag_lsn,
-        .retention_oldest_restart_lsn = try u64FromI64(snapshot.retention.oldest_restart_lsn),
-        .retention_retained_lsn_count = try u64FromI64(snapshot.retention.retained_lsn_count),
-        .retention_retained_byte_count = try u64FromI64(snapshot.retention.retained_byte_count),
-        .retention_retained_age_ns = try u64FromI64(snapshot.retention.retained_age_ns),
-        .retention_active_slots = try u64FromI64(snapshot.retention.active_slots),
-        .retention_reseed_recommended = try u64FromI64(snapshot.retention.reseed_recommended),
+        .retention_oldest_restart_lsn = snapshot.retention.oldest_restart_lsn,
+        .retention_retained_lsn_count = snapshot.retention.retained_lsn_count,
+        .retention_retained_byte_count = snapshot.retention.retained_byte_count,
+        .retention_retained_age_ns = snapshot.retention.retained_age_ns,
+        .retention_active_slots = snapshot.retention.active_slots,
+        .retention_reseed_recommended = snapshot.retention.reseed_recommended,
         .durability_configured = boolGauge(durability != null),
         .durability_satisfied = durability_satisfied,
         .durability_degraded = durability_degraded,
         .durability_status_code = durability_status_code,
-        .durability_target_lsn = if (durability) |decision| try u64FromI64(decision.target_lsn) else 0,
-        .durability_progress_lsn = if (durability) |decision| try u64FromI64(decision.progress_lsn) else 0,
-        .durability_missing_lsn_count = if (durability) |decision| try u64FromI64(decision.missing_lsn_count) else 0,
-        .durability_required_count = if (durability) |decision| try u64FromI64(decision.required_count) else 0,
-        .durability_satisfied_count = if (durability) |decision| try u64FromI64(decision.satisfied_count) else 0,
-        .durability_candidate_count = if (durability) |decision| try u64FromI64(decision.candidate_count) else 0,
+        .durability_target_lsn = if (durability) |decision| decision.target_lsn else 0,
+        .durability_progress_lsn = if (durability) |decision| decision.progress_lsn else 0,
+        .durability_missing_lsn_count = if (durability) |decision| decision.missing_lsn_count else 0,
+        .durability_required_count = if (durability) |decision| decision.required_count else 0,
+        .durability_satisfied_count = if (durability) |decision| decision.satisfied_count else 0,
+        .durability_candidate_count = if (durability) |decision| decision.candidate_count else 0,
         .slots = slots,
     };
 }
 
 fn standbyMetricsFromAdminSnapshot(snapshot: admin_api.HAStandbySnapshot) !ha.metrics.StandbyMetrics {
     return .{
-        .received_lsn = try u64FromI64(snapshot.received_lsn),
-        .applied_lsn = try u64FromI64(snapshot.applied_lsn),
-        .safe_read_lsn = try u64FromI64(snapshot.safe_read_lsn),
+        .received_lsn = snapshot.received_lsn,
+        .applied_lsn = snapshot.applied_lsn,
+        .safe_read_lsn = snapshot.safe_read_lsn,
         .upstream_configured = boolGauge(snapshot.upstream_lsn.valueOrNull() != null),
-        .write_lag_lsn = if (snapshot.write_lag_lsn.valueOrNull()) |raw| try u64FromI64(raw) else 0,
-        .receive_lag_lsn = if (snapshot.receive_lag_lsn.valueOrNull()) |raw| try u64FromI64(raw) else 0,
-        .apply_lag_lsn = if (snapshot.apply_lag_lsn.valueOrNull()) |raw| try u64FromI64(raw) else 0,
-        .unapplied_lsn_count = try u64FromI64(snapshot.unapplied_lsn_count),
+        .write_lag_lsn = if (snapshot.write_lag_lsn.valueOrNull()) |raw| raw else 0,
+        .receive_lag_lsn = if (snapshot.receive_lag_lsn.valueOrNull()) |raw| raw else 0,
+        .apply_lag_lsn = if (snapshot.apply_lag_lsn.valueOrNull()) |raw| raw else 0,
+        .unapplied_lsn_count = snapshot.unapplied_lsn_count,
         .caught_up_to_received = boolGauge(snapshot.caught_up_to_received),
         .can_serve_safe_reads = boolGauge(snapshot.can_serve_safe_reads),
     };
@@ -1199,9 +1199,9 @@ fn standbyMetricsFromAdminSnapshot(snapshot: admin_api.HAStandbySnapshot) !ha.me
 
 fn promotionMetricsFromAdminAssessment(assessment: admin_api.HAPromotionAssessment) !ha.metrics.PromotionMetrics {
     return .{
-        .required_lsn = try u64FromI64(assessment.required_lsn),
-        .received_lsn = try u64FromI64(assessment.received_lsn),
-        .applied_lsn = try u64FromI64(assessment.applied_lsn),
+        .required_lsn = assessment.required_lsn,
+        .received_lsn = assessment.received_lsn,
+        .applied_lsn = assessment.applied_lsn,
         .has_required_lsn = boolGauge(assessment.has_required_lsn),
         .caught_up_to_received = boolGauge(assessment.caught_up_to_received),
         .fencing_confirmed = boolGauge(assessment.fencing_confirmed),
@@ -1231,11 +1231,6 @@ fn durabilityStatusCodeFromAdmin(raw: []const u8) !ha.metrics.DurabilityStatusCo
 
 fn boolGauge(enabled: bool) u64 {
     return if (enabled) 1 else 0;
-}
-
-fn u64FromI64(raw: i64) !u64 {
-    if (raw < 0) return error.InvalidHaCommand;
-    return @intCast(raw);
 }
 
 fn renderJsonTableAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -1314,7 +1309,7 @@ fn syncPolicyOpenApi(policy: ha.primary.SyncPolicy) !admin_api.openapi.HASyncPol
     return .{
         .mode = @tagName(policy.mode),
         .selection = @tagName(policy.selection),
-        .required = try i64FromU64(policy.required),
+        .required = policy.required,
         .standby_names = policy.standby_names,
         .failure_policy = @tagName(policy.failure_policy),
     };
@@ -1322,11 +1317,11 @@ fn syncPolicyOpenApi(policy: ha.primary.SyncPolicy) !admin_api.openapi.HASyncPol
 
 fn adminIdentity(identity: ha.standby.Identity) !admin_api.openapi.HAIdentity {
     return .{
-        .cluster_id = try i64FromU64(identity.cluster_id),
-        .shard_id = try i64FromU64(identity.shard_id),
-        .table_id = try i64FromU64(identity.table_id),
-        .timeline_id = try i64FromU64(identity.timeline_id),
-        .epoch = try i64FromU64(identity.epoch),
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
     };
 }
 
@@ -1335,11 +1330,11 @@ fn fenceRequestOpenApi(request: ha.fencing.FenceRequest) !admin_api.openapi.Fenc
         .identity = try adminIdentity(request.identity),
         .old_primary_id = request.old_primary_id,
         .promoted_node_id = request.promoted_node_id,
-        .new_timeline_id = try i64FromU64(request.new_timeline_id),
-        .new_epoch = try i64FromU64(request.new_epoch),
-        .generation = try i64FromU64(request.generation),
-        .required_lsn = try i64FromU64(request.required_lsn),
-        .observed_lsn = try i64FromU64(request.observed_lsn),
+        .new_timeline_id = request.new_timeline_id,
+        .new_epoch = request.new_epoch,
+        .generation = request.generation,
+        .required_lsn = request.required_lsn,
+        .observed_lsn = request.observed_lsn,
         .force = request.force,
         .reason = request.reason,
     };
@@ -1350,13 +1345,13 @@ fn fenceReceiptOpenApi(receipt: ha.fencing.Receipt) !admin_api.openapi.HAFenceRe
         .identity = try adminIdentity(receipt.identity),
         .old_primary_id = receipt.old_primary_id,
         .promoted_node_id = receipt.promoted_node_id,
-        .parent_timeline_id = try i64FromU64(receipt.parent_timeline_id),
-        .parent_epoch = try i64FromU64(receipt.parent_epoch),
-        .new_timeline_id = try i64FromU64(receipt.new_timeline_id),
-        .new_epoch = try i64FromU64(receipt.new_epoch),
-        .required_lsn = try i64FromU64(receipt.required_lsn),
-        .observed_lsn = try i64FromU64(receipt.observed_lsn),
-        .generation = try i64FromU64(receipt.generation),
+        .parent_timeline_id = receipt.parent_timeline_id,
+        .parent_epoch = receipt.parent_epoch,
+        .new_timeline_id = receipt.new_timeline_id,
+        .new_epoch = receipt.new_epoch,
+        .required_lsn = receipt.required_lsn,
+        .observed_lsn = receipt.observed_lsn,
+        .generation = receipt.generation,
         .forced = receipt.forced,
         .token = receipt.token,
         .reason = receipt.reason,
@@ -1367,8 +1362,8 @@ fn rejoinRequestOpenApi(command: ha.admin_cli.RejoinAssessCommand) !admin_api.op
     return .{
         .node_id = command.former.node_id,
         .identity = try adminIdentity(command.former.identity),
-        .last_lsn = try i64FromU64(command.former.last_lsn),
-        .retained_from_lsn = try i64FromU64(command.policy.retained_from_lsn),
+        .last_lsn = command.former.last_lsn,
+        .retained_from_lsn = command.policy.retained_from_lsn,
         .allow_rewind_after_forced_promotion = command.policy.allow_rewind_after_forced_promotion,
         .receipt = if (command.receipt) |receipt| try fenceReceiptOpenApi(receipt) else null,
     };
@@ -1396,11 +1391,6 @@ fn payloadCodecName(codec: ha.replication_record.PayloadCodec) ![]const u8 {
         .binary => "binary",
         _ => error.InvalidHaCommand,
     };
-}
-
-fn i64FromU64(raw: u64) !i64 {
-    if (raw > @as(u64, @intCast(std.math.maxInt(i64)))) return error.InvalidHaCommand;
-    return @intCast(raw);
 }
 
 fn zPath(alloc: std.mem.Allocator, path: []const u8) ![:0]u8 {

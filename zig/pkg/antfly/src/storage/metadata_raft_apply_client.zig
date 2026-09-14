@@ -218,6 +218,9 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    pub fn readControlStores(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, groups: []const u64) ![]metadata.StoreRecord {
+        return self.catalogProjection([]metadata.StoreRecord, alloc, group_id, .{ .read_control_stores = groups });
+    }
     pub fn readStore(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, store_id: u64, reports: bool) !?metadata.StoreRecord {
         return self.catalogProjection(?metadata.StoreRecord, alloc, group_id, .{ .read_store = .{ .store_id = store_id, .reports = reports } });
     }
@@ -225,7 +228,14 @@ pub const RaftApplyStore = struct {
         return self.catalogProjection(?metadata.StoreRecord, alloc, group_id, .{ .read_store_group_facts = store_id });
     }
     pub fn readStoreReportTargetsWithRuntime(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, update: store_report_update.Update, include_runtime: bool) !?metadata.StoreRecord {
-        return self.catalogProjection(?metadata.StoreRecord, alloc, group_id, .{ .read_store_report_targets = .{ .update = update, .include_runtime = include_runtime } });
+        var ids: std.ArrayListUnmanaged(u64) = .empty;
+        defer ids.deinit(alloc);
+        if (update.base != null) {
+            for (update.report.group_statuses) |item| try ids.append(alloc, item.group_id);
+            for (update.report.runtime_statuses) |item| try ids.append(alloc, item.group_id);
+            try ids.appendSlice(alloc, update.removed_groups);
+        }
+        return self.catalogProjection(?metadata.StoreRecord, alloc, group_id, .{ .read_store_report_targets = .{ .store_id = update.report.store_id, .group_ids = ids.items, .full = update.base == null, .include_runtime = include_runtime } });
     }
     pub fn systemCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Read) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_read = request });
@@ -259,6 +269,9 @@ pub const RaftApplyStore = struct {
     }
     pub fn topologyActivation(self: *RaftApplyStore, group_id: u64) !?topology_protocol.Activation {
         return self.catalogProjection(?topology_protocol.Activation, self.alloc, group_id, .{ .topology_activation = {} });
+    }
+    pub fn reportBaselineProgress(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/store_report_baseline.zig").Request) !@import("../metadata/store_report_baseline.zig").Progress {
+        return self.catalogProjection(@import("../metadata/store_report_baseline.zig").Progress, self.alloc, group_id, .{ .report_baseline_progress = try request.progressQuery() });
     }
     pub fn reportCursor(self: *RaftApplyStore, group_id: u64, store_id: u64) !?store_report_update.Cursor {
         return self.catalogProjection(?store_report_update.Cursor, self.alloc, group_id, .{ .report_cursor = store_id });

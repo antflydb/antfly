@@ -7423,7 +7423,7 @@ pub const ApiHttpServer = struct {
     ) !?transactions_api.CommitConflict {
         const source = self.table_reads orelse return null;
         for (req.read_set) |item| {
-            var lookup = (try source.lookup(self.alloc, item.table_name, item.key, .{}, .read_index)) orelse {
+            var lookup = (try source.lookup(self.alloc, req.physicalName(item.table_name), item.key, .{}, .read_index)) orelse {
                 if (readSetVersionMatches(item.expected_version, null)) continue;
                 return transactions_api.versionConflict(item.table_name, item.key, item.expected_version, 0);
             };
@@ -10951,6 +10951,7 @@ pub const ApiHttpServer = struct {
                 authenticated_identity,
                 read.table_name,
                 read.key,
+                request.physicalName(read.table_name),
             ))) return false;
         }
         for (request.tables) |table| {
@@ -10964,13 +10965,14 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         table_name: []const u8,
         key: []const u8,
+        physical_table_name: []const u8,
     ) !bool {
         if (!admittedTablePermissionAllowed(authenticated_identity, table_name, .read)) return false;
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
         const filter = row_filter_json orelse return true;
         const source = self.table_reads orelse return false;
-        var lookup = (try source.lookup(self.alloc, table_name, key, .{}, .read_index)) orelse return true;
+        var lookup = (try source.lookup(self.alloc, physical_table_name, key, .{}, .read_index)) orelse return true;
         defer lookup.deinit(self.alloc);
         return try self.docJsonMatchesRowFilter(key, lookup.json, filter);
     }
@@ -11016,13 +11018,14 @@ pub const ApiHttpServer = struct {
         req: transactions_api.OwnedTransactionCommitRequest,
         conflict: distributed_txn.CommitConflict,
     ) !transactions_api.CommitConflict {
-        const base = transactions_api.conflictFromOutcome(conflict);
+        var base = transactions_api.conflictFromOutcome(conflict);
+        base.table_name = req.logicalName(conflict.table_name);
         if (base.kind != .version_conflict) return base;
         var enriched = transactions_api.versionConflict(
             base.table_name,
             base.key,
             expectedVersionForConflict(req, base.table_name, base.key),
-            try self.currentVersionForConflict(base.table_name, base.key),
+            try self.currentVersionForConflict(req.physicalName(base.table_name), base.key),
         );
         enriched.group_id = base.group_id;
         enriched.phase = base.phase;
@@ -15373,6 +15376,30 @@ pub const ApiHttpServer = struct {
         var selected = snapshot;
         selected.tables = try tables.toOwnedSlice(arena);
         return .{ .snapshot = selected, .labels = labels };
+    }
+
+    pub fn bindCatalogTransaction(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, request: *transactions_api.OwnedTransactionCommitRequest, identity: *?AuthenticatedIdentity) !void {
+        if (self.source.vtable.system_catalog == null) return;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var targets: std.ArrayList(system_catalog.Target) = .empty;
+        var names: std.ArrayList([]const u8) = .empty;
+        for (request.tables) |table| {
+            try targets.append(a, try system_catalog.Target.literal(table.table_name));
+            try names.append(a, table.table_name);
+        }
+        for (request.read_set) |read| {
+            try targets.append(a, try system_catalog.Target.literal(read.table_name));
+            try names.append(a, read.table_name);
+        }
+        var resolver: CatalogQueryResolver = .{ .arena = a };
+        const resolved = try self.resolveQueryCatalog(&resolver, context, targets.items, false);
+        for (names.items, resolved.tables) |name, table| {
+            const value = table orelse return error.TableNotFound;
+            try request.bind(alloc, name, value.name);
+            if (identity.*) |*auth| try projectCatalogIdentity(self.alloc, auth, name, value.name);
+        }
     }
 
     pub fn resolveCatalogNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, name: []const u8, identity: *?AuthenticatedIdentity) ![]u8 {
@@ -23272,6 +23299,7 @@ test "artifact operations apply source document row filter visibility" {
     var source = FakeSource{};
     var reads = FakeReads{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+    defer server.deinit();
 
     var row_filters = [_]usermgr.RowFilterEntry{
         try usermgr.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"tenant\":\"acme\"}}"),
@@ -23465,6 +23493,7 @@ test "query builder runtime preflight injects mandatory row filter" {
     var status = FakeStatus{};
     var reads = FakeReads{};
     var server = ApiHttpServer.init(alloc, .{}, status.iface(), reads.source(), null);
+    defer server.deinit();
     var row_filters = [_]usermgr.RowFilterEntry{
         try usermgr.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"tenant\":\"visible\"}}"),
     };
@@ -23914,6 +23943,7 @@ test "api http server serves status" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
     var resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.status });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
@@ -24349,6 +24379,7 @@ test "api http point lookup retries bounded local readiness races" {
         reads.source(),
         DummyWrites.source(),
     );
+    defer server.deinit();
     var response = (try server.lookupWithReadinessRetry(
         std.testing.allocator,
         reads.source(),
@@ -24939,6 +24970,7 @@ test "api http plain public query preserves outer absolute request deadline" {
 
     var reads = FakeReads{ .expected_deadline_ns = outer_deadline_ns };
     var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+    defer server.deinit();
     const body =
         \\{"query":{"match_all":{}},"timeout_ms":999999}
     ;
@@ -25705,6 +25737,7 @@ test "api http server serves extension catalog reads" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var packages_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.extensions_v1_packages });
     defer packages_resp.deinit(std.testing.allocator);
@@ -25818,6 +25851,7 @@ test "api http server validates writes against extension data shape members" {
     defer db.close();
     var table_source = table_writes.BoundTableWriteSource.init("memories", &db);
     var routed_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, table_source.source());
+    defer routed_server.deinit();
 
     const valid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:c\":{\"body\":\"remember this\",\"kind\":\"note\"}}}");
     defer alloc.free(valid_body);
@@ -25884,6 +25918,7 @@ test "api http server dispatches extension lifecycle mutations" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
     var install_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/extensions/v1/installed/memoryaf",
@@ -28316,6 +28351,7 @@ test "api http server requires auth on public routes when enabled" {
         .auth_enabled = true,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
+    defer server.deinit();
 
     var unauthorized = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.status });
     defer unauthorized.deinit(std.testing.allocator);
@@ -28430,6 +28466,7 @@ test "continuous HA rejects non-replicated public mutations before handlers" {
         @field(config, "ha_failover_safe_mutations_only") = true;
     }
     var server = ApiHttpServer.init(std.testing.allocator, config, source.iface(), null, null);
+    defer server.deinit();
 
     const cases = [_]struct {
         method: http_common.Method,
@@ -28514,6 +28551,7 @@ test "continuous HA freezes pre-existing restore workers and resumption" {
     var server = ApiHttpServer.init(std.testing.allocator, .{
         .ha_failover_safe_mutations_only = true,
     }, source.iface(), null, null);
+    defer server.deinit();
 
     try std.testing.expect(!server.restoreExecutionPermitted());
     try std.testing.expect(!server.mutationBackgroundExecutionPermitted());
@@ -28547,6 +28585,7 @@ test "continuous HA allows a configured RemoteApply batch write" {
         .ha_failover_safe_mutations_only = true,
         .ha_remote_apply_mutations_enabled = true,
     }, source.iface(), null, table_source.source());
+    defer server.deinit();
     const body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:ha\":{\"title\":\"remote-apply\"}}}");
     defer alloc.free(body);
     var response = try executeHttpxTestRequest(&server, .{
@@ -28882,6 +28921,7 @@ test "typed HA route operation dispatches admin and internal executors" {
         .ha_admin_executor = admin_exec.executor(),
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
+    defer server.deinit();
 
     var admin_resp = try executeHaRouteForTest(
         &server,
@@ -29036,6 +29076,7 @@ test "typed HA route operation requires exact bearer token for internal replicat
     var disabled_server = ApiHttpServer.init(alloc, .{
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
+    defer disabled_server.deinit();
     var disabled = try executeHaRouteForTest(&disabled_server, .get, internal_api_routes.ha_replication_identify, "Bearer ha-internal-secret", "");
     defer disabled.deinit();
     try std.testing.expectEqual(@as(u16, 403), disabled.status);
@@ -29045,6 +29086,7 @@ test "typed HA route operation requires exact bearer token for internal replicat
         .admin_bearer_token = "",
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
+    defer empty_token_server.deinit();
     var empty_token = try executeHaRouteForTest(&empty_token_server, .get, internal_api_routes.ha_replication_identify, "Bearer ", "");
     defer empty_token.deinit();
     try std.testing.expectEqual(@as(u16, 403), empty_token.status);
@@ -29107,6 +29149,7 @@ test "api http server serves secrets crud when backed by a local store" {
         .deployment_mode = .standalone,
         .secret_store = &store,
     }, source.iface(), null, null);
+    defer server.deinit();
 
     var put_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
@@ -29215,6 +29258,7 @@ test "api http server status includes secret store reload health" {
         .deployment_mode = .standalone,
         .secret_store = &store,
     }, source.iface(), null, null);
+    defer server.deinit();
 
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
         .sub_path = store_path,
@@ -29256,6 +29300,7 @@ test "api http server lists secrets status without a local secret store" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -29327,6 +29372,7 @@ test "api http server forbids non-admin secret access when auth is enabled" {
         .secret_store = &store,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
+    defer server.deinit();
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
@@ -29409,6 +29455,7 @@ test "api http server query builder requires table read permission when auth is 
         .auth_enabled = true,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
+    defer server.deinit();
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
@@ -29511,6 +29558,7 @@ test "api http server restricts runtime schema debug to admins when auth is enab
         .auth_enabled = true,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
+    defer server.deinit();
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
@@ -29586,6 +29634,7 @@ test "api http server serves user management routes when auth is enabled" {
         .auth_enabled = true,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
+    defer server.deinit();
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
@@ -29802,6 +29851,7 @@ test "api http server serves api key and row filter routes" {
         .auth_enabled = true,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
+    defer server.deinit();
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
@@ -30011,6 +30061,7 @@ test "api http server returns json user auth errors" {
         .auth_enabled = true,
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
+    defer server.deinit();
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
@@ -30065,6 +30116,7 @@ test "api http server rejects secret writes without a local secret store" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/secrets/openai.api_key",
@@ -30218,6 +30270,7 @@ test "api http server allows explicit stale table lookup consistency" {
     };
 
     var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
+    defer server.deinit();
     var resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=stale" });
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
@@ -30296,6 +30349,7 @@ test "api http server decodes percent-encoded lookup keys" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
+    defer server.deinit();
     var resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs/documents/docs%2Fgetting-started.md?fields=title" });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
@@ -31025,6 +31079,7 @@ test "api http server serves table scan as ndjson" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
+    defer server.deinit();
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/documents",
@@ -31110,6 +31165,7 @@ test "api http server serves table query response envelope" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
+    defer server.deinit();
     const query_body = try test_contract_helpers.encodeMatchQueryRequest(std.testing.allocator, "body", "hello", &.{}, 5);
     defer std.testing.allocator.free(query_body);
     var resp = try executeHttpxTestRequest(&server, .{
@@ -31182,6 +31238,7 @@ test "api http server query string boolean controls survive reopen" {
         var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
         var source = FakeSource{};
         var server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
+        defer server.deinit();
         for (cases) |case| {
             const body = try std.fmt.allocPrint(alloc, "{{\"full_text_search\":{s},\"limit\":10}}", .{case.query});
             defer alloc.free(body);
@@ -31264,6 +31321,7 @@ test "api http server executes public Query filter roots and compositions" {
         table_source.source(),
         null,
     );
+    defer server.deinit();
     const filters = [_][]const u8{
         "{\"term\":\"active\",\"field\":\"status\"}",
         "{\"prefix\":\"tenant/\",\"field\":\"path\"}",
@@ -31406,6 +31464,7 @@ test "api http server serves table query with SearchAF-shaped terms aggregations
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
+    defer server.deinit();
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/files/query",
@@ -31700,6 +31759,7 @@ test "api http server maps retrieval agent doc identity mismatch to unavailable"
     var source = FakeSource{};
     var reads = FakeReads{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+    defer server.deinit();
     const retrieval_body =
         \\{"query":"find hello","stream":false,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
     ;
@@ -31881,6 +31941,7 @@ test "api http server serves eval response envelope" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     const eval_body =
         \\{"evaluators":["precision","recall","relevance","faithfulness"],"query":"How does raft consensus work?","output":"Raft uses leader election and replicated logs. [doc:1]","context":[{"title":"Raft","body":"Raft uses leader election and replicated logs."},{"title":"Other","body":"Unrelated content."}],"retrieved_ids":["doc:1","doc:2"],"ground_truth":{"relevant_ids":["doc:1"],"expectations":"leader election replicated logs"}}
@@ -31948,6 +32009,7 @@ test "api http server serves query builder response envelope" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     const query_builder_body =
         \\{"table":"docs","intent":"find published raft articles","mode":"auto","output":"query_request","constraints":{"limit":7},"max_internal_iterations":0,"max_user_clarifications":2}
@@ -32045,6 +32107,7 @@ test "api http server query builder infers semantic indexes from table metadata"
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -32172,6 +32235,7 @@ test "api http server query builder maps doc identity mismatch to unavailable" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), FakeReads.source(), null);
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -32288,6 +32352,7 @@ test "api http server query builder loads structured table index metadata" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), ColdReads.source(), null);
+    defer server.deinit();
     const context = try server.loadQueryBuilderTableContext("docs");
     defer freeQueryBuilderTableContext(alloc, context);
 
@@ -32379,6 +32444,7 @@ test "api http server query builder handles tree graph indexes" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var inferred_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -32499,6 +32565,7 @@ test "api http server query builder replays clarification decisions" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var table_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -32628,6 +32695,7 @@ test "api http server returns json eval and query builder validation errors" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var eval_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -32694,6 +32762,7 @@ test "api http server returns json not found for missing query builder table" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -32781,6 +32850,7 @@ test "api http server routes table query through read schema full text index" {
     var source = FakeSource{};
     var reads = FakeReads{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), reads.source(), null);
+    defer server.deinit();
     const query_body = try test_contract_helpers.encodeMatchQueryRequest(std.testing.allocator, "body", "hello", &.{}, 5);
     defer std.testing.allocator.free(query_body);
 
@@ -32835,6 +32905,7 @@ test "api http server serves table batch writes" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
+    defer server.deinit();
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"deletes\":[\"doc:gone\"]}");
     defer std.testing.allocator.free(batch_body);
     var resp = try executeHttpxTestRequest(&server, .{
@@ -32978,6 +33049,7 @@ test "api http server routes table batches through the batch commit hook" {
     var status = FakeStatus{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, status.iface(), null, writes.source());
+    defer server.deinit();
     const batch_body = try test_contract_helpers.normalizeBatchRequest(
         std.testing.allocator,
         "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"deletes\":[\"doc:gone\"],\"sync_level\":\"write\"}",
@@ -33102,6 +33174,7 @@ test "api http server serves table batch transforms" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
+    defer server.deinit();
 
     const insert_body = try test_contract_helpers.normalizeBatchRequest(
         std.testing.allocator,
@@ -33185,6 +33258,7 @@ test "api http graph push preserves projected edges across restart" {
 
         var source = FakeSource{};
         var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, table_source.source());
+        defer server.deinit();
 
         const insert_body = try test_contract_helpers.normalizeBatchRequest(alloc,
             \\{"inserts":{"a":{"title":"A","_edges":{"graph":{"FRIEND":[{"target":"b","weight":2,"metadata":{"since":2024}}]}}},"b":{"title":"B"},"c":{"title":"C"}},"sync_level":"full_index"}
@@ -33307,6 +33381,7 @@ test "api http server updates local table schema through bound write source" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
+    defer server.deinit();
 
     var managed_version_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
@@ -33386,6 +33461,7 @@ test "api http server serves public transaction commit route" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), table_source.source());
+    defer server.deinit();
 
     const commit_batch = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:a\":{\"title\":\"beta\"}}}");
     defer std.testing.allocator.free(commit_batch);
@@ -33536,6 +33612,7 @@ test "api http server surfaces structured participant diagnostics for unavailabl
     var source = FakeSource{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
 
     const commit_body = try test_contract_helpers.encodeTransactionCommitRequest(
         alloc,
@@ -33644,6 +33721,7 @@ test "api http server surfaces structured decision conflicts for transaction com
     var source = FakeSource{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
 
     const commit_body = try test_contract_helpers.encodeTransactionCommitRequest(
         alloc,
@@ -33750,6 +33828,7 @@ test "api http server surfaces structured doc identity conflicts for transaction
     var source = FakeSource{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
 
     const commit_body = try test_contract_helpers.encodeTransactionCommitRequest(
         alloc,
@@ -33858,6 +33937,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
     var source = FakeSource{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
 
     const commit_body = try test_contract_helpers.encodeTransactionCommitRequest(
         alloc,
@@ -33963,6 +34043,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
     var source = FakeSource{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
 
     const commit_body = try test_contract_helpers.encodeTransactionCommitRequest(
         alloc,
@@ -36149,6 +36230,7 @@ test "api http server serves table metadata list and detail" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var list_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables?prefix=do" });
     defer list_resp.deinit(std.testing.allocator);
@@ -36270,6 +36352,7 @@ test "api http server serves runtime schema debug on table and index detail" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var table_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs?debug=runtime_schema" });
     defer table_resp.deinit(std.testing.allocator);
@@ -36384,6 +36467,7 @@ test "api http server serves table index metadata routes" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -36526,6 +36610,7 @@ test "api http server index status falls back when the metadata cache is cold" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -36603,6 +36688,7 @@ test "api http server reports table storage empty from read visibility" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), null);
+    defer server.deinit();
 
     var empty_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -36744,6 +36830,7 @@ test "api http server table status uses runtime stats without probing storage" {
     var source = FakeSource{};
     var reads = FakeReads{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -36862,6 +36949,7 @@ test "api http server storage status does not block on a direct lsm probe" {
     var source = FakeSource{};
     var reads = FakeReads{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+    defer server.deinit();
 
     const status = (try server.bestEffortSingleTableStorageStatus("docs")).?;
     try std.testing.expectEqual(@as(u32, 1), reads.runtime_status_calls.load(.monotonic));
@@ -36978,6 +37066,7 @@ test "api http server serves local index runtime status" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), null);
+    defer server.deinit();
 
     var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -37828,6 +37917,7 @@ test "api http server exposes ambiguous index mutations without a replay signal"
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
     const expected_body =
         "{\"error\":\"metadata_mutation_outcome_unknown\",\"message\":\"index mutation outcome is unknown; observe index state before retrying\",\"retryable\":false}";
 
@@ -38014,6 +38104,7 @@ test "api http server create index expands schema-derived algebraic config" {
         null,
         writes.source(),
     );
+    defer server.deinit();
 
     const create_index_body =
         \\{"name":"sales_rollup","type":"algebraic","derive_from_schema":true}
@@ -38110,6 +38201,7 @@ test "api http server rejects public algebraic materialization config" {
         null,
         null,
     );
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -38266,6 +38358,7 @@ test "api http server serves provisioned index runtime backfill status across sh
 
     var read_source = table_reads.ProvisionedTableReadSource.init(path, FakeCatalog.iface(), raft_mod.read_gate.alreadyReadSafeBarrier());
     var server = ApiHttpServer.init(std.testing.allocator, .{}, FakeSource.iface(), read_source.source(), null);
+    defer server.deinit();
 
     var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -38505,6 +38598,7 @@ test "api http server serves table create and drop" {
     var source = FakeSource.init();
     defer source.deinit(std.testing.allocator);
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "docs table");
     defer std.testing.allocator.free(create_body);
@@ -38637,6 +38731,7 @@ test "api http server table visibility helper prefers metadata lifecycle wait" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     try server.waitForTableVisibility("docs", .present);
     try std.testing.expectEqual(@as(u32, 1), source.lifecycle_wait_calls.load(.monotonic));
@@ -38781,6 +38876,7 @@ test "api http server create table with local writes waits for projected presenc
     var source = FakeSource{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
 
     var invalid_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -38867,6 +38963,7 @@ test "api http server rejects oversized table definitions before parsing across 
     @memset(oversized, ' ');
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
 
     var public_response = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -38922,6 +39019,7 @@ test "api http server reports exhausted table mutation authority consistently" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
     server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 2 };
 
     var public_create = try executeHttpxTestRequest(&server, .{
@@ -38996,6 +39094,7 @@ test "api http server marks every proven table mutation pre-admission failure" {
         };
         var source = FakeSource{ .mutation_error = mutation_error };
         var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+        defer server.deinit();
 
         var create_response = try executeHttpxTestRequest(&server, .{
             .method = .POST,
@@ -39061,6 +39160,7 @@ test "api http server retries only pre-admission public table drop failures" {
 
     var recovered_source = FakeSource{ .mode = .transient_then_success };
     var recovered_server = ApiHttpServer.init(alloc, .{}, recovered_source.iface(), null, null);
+    defer recovered_server.deinit();
     recovered_server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
     var recovered = try executeHttpxTestRequest(&recovered_server, .{
         .method = .DELETE,
@@ -39078,6 +39178,7 @@ test "api http server retries only pre-admission public table drop failures" {
     for (ambiguous_modes) |mode| {
         var ambiguous_source = FakeSource{ .mode = mode };
         var ambiguous_server = ApiHttpServer.init(alloc, .{}, ambiguous_source.iface(), null, null);
+        defer ambiguous_server.deinit();
         ambiguous_server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
         var ambiguous = try executeHttpxTestRequest(&ambiguous_server, .{
             .method = .DELETE,
@@ -39128,6 +39229,7 @@ test "api http server retries only pre-admission public table drop failures" {
 
     var legacy_source: LegacySource = .{};
     var legacy_server = ApiHttpServer.init(alloc, .{}, legacy_source.iface(), null, null);
+    defer legacy_server.deinit();
     legacy_server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
     var legacy_response = try executeHttpxTestRequest(&legacy_server, .{
         .method = .DELETE,
@@ -39149,6 +39251,7 @@ test "schema projection expectation uses backend committed generation" {
         .vtable = &.{ .status = FakeSource.status },
     };
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source, null, null);
+    defer server.deinit();
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 7,
         .name = "docs",
@@ -39319,6 +39422,7 @@ test "schema projection detects a superseding backend generation" {
 
     var fake = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, fake.iface(), null, null);
+    defer server.deinit();
     var expectation = try server.schemaProjectionExpectationAlloc(
         std.testing.allocator,
         &fake.table,
@@ -39361,6 +39465,7 @@ test "api http server rejects unsupported table index before metadata publicatio
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
@@ -39399,6 +39504,7 @@ test "api http server rejects caller-managed schema version before metadata publ
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
@@ -39848,6 +39954,7 @@ test "api index status uses read runtime status without consulting write source"
     var reads = FakeReads{ .identity = identity };
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -40253,6 +40360,7 @@ test "api index status prefers current same-name incarnation from write source" 
     var reads = FakeReads{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -40463,6 +40571,7 @@ test "api index status uses propagated remote store runtime status" {
     var reads = FakeReads{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -40677,6 +40786,7 @@ test "table storage status sums complete fresh shard disk usage" {
         .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
     };
     var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), null, null);
+    defer server.deinit();
 
     const complete = (try server.bestEffortSingleTableStorageStatusWithSnapshot("docs", &snapshot)).?;
     try std.testing.expectEqual(false, complete.empty);
@@ -40914,6 +41024,7 @@ test "api index status ignores propagated runtime status from removed owner" {
     var reads = FakeReads{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -41054,6 +41165,7 @@ test "api index status reports missing remote shard as not ready" {
     var reads = FakeReads{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -41194,6 +41306,7 @@ test "api http server drop table observes metadata absence before local cleanup"
     var source = FakeSource{};
     var writes = FakeWrites{ .lifecycle_wait_calls = &source.lifecycle_wait_calls };
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
@@ -41320,6 +41433,7 @@ test "api http server get missing index returns 404 without runtime status looku
     var reads = FakeReads{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
+    defer server.deinit();
 
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -41470,6 +41584,7 @@ test "api http server serves table metadata routes against real metadata service
     derived_drop.deinit(std.testing.allocator);
 
     var server = ApiHttpServer.init(std.testing.allocator, .{}, testMetadataServiceSourceWithoutLifecycle(&svc), null, null);
+    defer server.deinit();
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "docs table");
     defer std.testing.allocator.free(create_body);
@@ -41683,6 +41798,7 @@ test "api http server create table with replication sources returns encoded tabl
     try svc.runRound();
 
     var server = ApiHttpServer.init(std.testing.allocator, .{}, testMetadataServiceSourceWithoutLifecycle(&svc), null, null);
+    defer server.deinit();
 
     const create_body =
         \\{
@@ -41795,6 +41911,7 @@ test "api http server lists cluster backups through public route" {
     var node_config = try testBackupNodeConfig(alloc);
     defer node_config.deinit();
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, source.iface(), null, null);
+    defer server.deinit();
     const uri = try std.fmt.allocPrint(alloc, "/backups?location={s}&connection=test-backups", .{location_uri});
     defer alloc.free(uri);
 
@@ -41966,6 +42083,7 @@ test "api http server does not replay create when local reconcile lease is lost"
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
     server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
     const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
     defer alloc.free(create_body);
@@ -42025,6 +42143,7 @@ test "api http server returns retryable not leader when metadata proposal is dro
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
     server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
     const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
     defer alloc.free(create_body);
@@ -42106,6 +42225,7 @@ test "api http server returns retryable not leader through public table adapter 
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
     const create_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "body");
     defer alloc.free(create_index_body);
 

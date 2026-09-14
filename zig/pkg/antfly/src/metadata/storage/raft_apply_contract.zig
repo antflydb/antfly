@@ -204,7 +204,7 @@ const store_report_update = @import("../store_report_update.zig");
 pub const CatalogProjectionRequest = union(enum) {
     read_store: struct { store_id: u64, reports: bool },
     read_store_group_facts: u64,
-    read_store_report_targets: struct { update: store_report_update.Update, include_runtime: bool },
+    read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
     catalog_read: system_catalog.Read,
     catalog_export: void,
     catalog_list_tables: system_catalog.TableList,
@@ -217,5 +217,7 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_query_definition: []const u8,
     topology_activation: void,
     report_cursor: u64,
+    read_control_stores: []const u64,
+    report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
     catalog_snapshot: void,
 };

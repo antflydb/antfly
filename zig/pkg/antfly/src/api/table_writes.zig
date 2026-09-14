@@ -16105,7 +16105,11 @@ pub const ProvisionedTableWriteSource = struct {
         snapshot_token: []const u8,
         destination_root: []const u8,
     ) !void {
-        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            _ = (try owner.captureHASeedSnapshotGroupLocal(group_id, table_name, snapshot_token, destination_root)) orelse return error.StorageKernelOwnerUnavailable;
+            return;
+        }
         var probe = self.probeManagedWriterGroupBestEffort(table_name, group_id);
         defer probe.deinit();
         switch (probe) {
@@ -16251,33 +16255,8 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn captureHASeedDbSnapshot(
-        alloc: std.mem.Allocator,
-        db: *db_mod.DB,
-        db_path: []const u8,
-        snapshot_token: []const u8,
-        destination_root: []const u8,
-    ) !void {
-        switch (db.primary_backend) {
-            .lmdb, .lsm => {},
-            .mem, .lsm_memory => return error.HASeedSnapshotUnsupportedBackend,
-        }
-        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
-        defer alloc.free(snapshot_root);
-        var io_impl = Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
-        defer Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
-        const maintenance_clock = db.backend_runtime.monotonicClock();
-        const maintenance_deadline_ns = maintenance_clock.nowRealtimeNs() +| std.time.ns_per_s;
-        _ = db.snapshotHASeed(snapshot_token, maintenance_deadline_ns) catch |err| switch (err) {
-            error.EnrichmentWaitCanceled,
-            error.EnrichmentWaitTimeout,
-            error.EnrichmentRetryInProgress,
-            => return error.HASeedSnapshotRuntimeBusy,
-            else => return err,
-        };
-        try backups_api.copyDirectoryRecursive(alloc, snapshot_root, destination_root);
+    fn captureHASeedDbSnapshot(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, snapshot_token: []const u8, destination_root: []const u8) !void {
+        return @import("../storage/ha/seed_snapshot.zig").capture(alloc, db, db_path, snapshot_token, destination_root);
     }
 
     fn hasActiveBulkIngestSessionForTableBestEffort(

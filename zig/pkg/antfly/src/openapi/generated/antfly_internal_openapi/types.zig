@@ -6,7 +6,7 @@ const std = @import("std");
 pub const HACreateReplicationSlotRequest = struct {
     slot_name: HASlotName,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
-    initial_lsn: ?i64 = null,
+    initial_lsn: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -39,17 +39,17 @@ pub const HAIdentifier = []const u8;
 
 pub const HAIdentifySystemResponse = struct {
     identity: HAIdentity,
-    current_lsn: i64,
-    next_lsn: i64,
-    record_format_version: i64,
+    current_lsn: u64,
+    next_lsn: u64,
+    record_format_version: u32,
 };
 
 pub const HAIdentity = struct {
-    cluster_id: i64,
-    shard_id: i64,
-    table_id: i64,
-    timeline_id: i64,
-    epoch: i64,
+    cluster_id: u64,
+    shard_id: u64,
+    table_id: u64,
+    timeline_id: u64,
+    epoch: u64,
 };
 
 pub const HAPayloadCodec = enum {
@@ -127,7 +127,7 @@ pub const HARecordKind = enum {
 };
 
 pub const HAReplicationFrame = struct {
-    lsn: i64,
+    lsn: u64,
     kind: HARecordKind,
     payload_codec: HAPayloadCodec,
     /// Base64-encoded complete replication record envelope.
@@ -136,15 +136,15 @@ pub const HAReplicationFrame = struct {
 
 pub const HAReplicationSlotResponse = struct {
     slot_name: HASlotName,
-    timeline_id: i64,
-    restart_lsn: i64,
-    received_lsn: i64,
-    applied_lsn: i64,
-    safe_read_lsn: i64,
+    timeline_id: u64,
+    restart_lsn: u64,
+    received_lsn: u64,
+    applied_lsn: u64,
+    safe_read_lsn: u64,
     active: bool,
     reseed_required: bool,
     last_error: OpenApiOptionalNullable([]const u8) = .absent,
-    current_lsn: i64,
+    current_lsn: u64,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -186,11 +186,11 @@ pub const HASlotName = []const u8;
 
 pub const HAStandbyStatusUpdateRequest = struct {
     slot_name: HASlotName,
-    timeline_id: i64,
-    received_lsn: i64,
-    applied_lsn: i64,
+    timeline_id: u64,
+    received_lsn: u64,
+    applied_lsn: u64,
     /// Optional safe-read boundary. Defaults to applied_lsn.
-    safe_read_lsn: ?i64 = null,
+    safe_read_lsn: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -229,15 +229,15 @@ pub const HAStandbyStatusUpdateRequest = struct {
 
 pub const HAStandbyStatusUpdateResponse = struct {
     slot_name: HASlotName,
-    timeline_id: i64,
-    restart_lsn: i64,
-    received_lsn: i64,
-    applied_lsn: i64,
-    safe_read_lsn: i64,
+    timeline_id: u64,
+    restart_lsn: u64,
+    received_lsn: u64,
+    applied_lsn: u64,
+    safe_read_lsn: u64,
     active: bool,
     reseed_required: bool,
     last_error: OpenApiOptionalNullable([]const u8) = .absent,
-    current_lsn: i64,
+    current_lsn: u64,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -276,11 +276,11 @@ pub const HAStandbyStatusUpdateResponse = struct {
 
 pub const HAStartReplicationRequest = struct {
     slot_name: HASlotName,
-    from_lsn: i64,
+    from_lsn: u64,
     /// Optional maximum record count. Zero means no record-count limit.
-    max_records: ?i64 = null,
+    max_records: ?u64 = null,
     /// Optional encoded byte budget. Zero means no byte limit.
-    max_encoded_bytes: ?i64 = null,
+    max_encoded_bytes: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -319,14 +319,14 @@ pub const HAStartReplicationRequest = struct {
 pub const HAStartReplicationResponse = struct {
     slot_name: HASlotName,
     identity: HAIdentity,
-    record_format_version: i64,
-    timeline_id: i64,
-    from_lsn: i64,
-    current_lsn: i64,
-    last_sent_lsn: i64,
-    next_lsn: i64,
+    record_format_version: u32,
+    timeline_id: u64,
+    from_lsn: u64,
+    current_lsn: u64,
+    last_sent_lsn: u64,
+    next_lsn: u64,
     end_of_wal: bool,
-    encoded_bytes: i64,
+    encoded_bytes: u64,
     records: []const HAReplicationFrame,
 };
 
