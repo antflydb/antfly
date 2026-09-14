@@ -32,6 +32,8 @@ class ZigValidationScopeTests(unittest.TestCase):
         inputs = {
             "zig/lib/vopr/src/runner.zig",
             "zig/pkg/antfly/src/vopr/cli.zig",
+            "zig/pkg/antfly/src/storage/hot_standby/vopr.zig",
+            "zig/pkg/antfly/src/storage/hot_standby/standby.zig",
             "zig/pkg/antfly/src/raft/transport/http_driver.zig",
             "zig/pkg/antfly/src/raft/transport/http_snapshot.zig",
             "zig/pkg/antfly/src/raft/host.zig",

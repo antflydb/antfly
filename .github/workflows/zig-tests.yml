@@ -233,6 +233,7 @@ jobs:
             zig/build.zig.zon \
             ':(glob)zig/lib/vopr/**' \
             ':(glob)zig/pkg/antfly/src/vopr/**' \
+            ':(glob)zig/pkg/antfly/src/storage/hot_standby/**' \
             ':(glob)zig/pkg/antfly/src/raft/transport/**' \
             zig/pkg/antfly/src/raft/host.zig \
             zig/pkg/antfly/src/raft/reconciler.zig \
