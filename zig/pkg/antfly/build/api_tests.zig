@@ -398,7 +398,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "legacy stored destinations can be adopted idempotently",
         "api http server cluster restore",
         "cluster restore repository errors preserve operational failure semantics",
-        "internal namespace requires a service principal except HA",
+        "internal namespace requires a service principal except hot standby",
         "usermgr api key permission intersection narrows owner and key wildcards",
         "httpx internal control routes call typed operations directly",
     };

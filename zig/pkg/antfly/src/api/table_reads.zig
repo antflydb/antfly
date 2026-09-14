@@ -45,9 +45,9 @@ else
 const doc_set = @import("../storage/db/doc_set.zig");
 const doc_identity = if (control_only_storage_sources) struct {} else @import("../storage/db/doc_identity.zig");
 const db_embedder = if (control_only_storage_sources) struct {} else @import("../storage/db/enrichment/embedder.zig");
-const ha_public_gate_state = @import("../storage/ha/public_gate_state.zig");
-const ha_read_gate_mod = @import("../storage/ha/read_gate.zig");
-const ha_standby_mod = @import("../storage/ha/standby.zig");
+const ha_public_gate_state = @import("../storage/hot_standby/public_gate_state.zig");
+const ha_read_gate_mod = @import("../storage/hot_standby/read_gate.zig");
+const ha_standby_mod = @import("../storage/hot_standby/standby.zig");
 const storage_schema = @import("../storage/schema.zig");
 const dynamic_field_capability = @import("../storage/db/dynamic_field_capability.zig");
 const internal_keys = @import("../storage/internal_keys.zig");

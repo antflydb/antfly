@@ -93,8 +93,8 @@ const table_reads = if (builtin.is_test) @import("antfly_source_root").antfly_so
 const table_router = @import("table_router.zig");
 const table_writes = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_writes else @import("table_write_source.zig");
 const table_index_config = @import("table_index_config.zig");
-const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
-const ha_http_operation = @import("../storage/ha/http_operation.zig");
+const ha_mutation_inventory = @import("../storage/hot_standby/mutation_inventory.zig");
+const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
@@ -20598,7 +20598,9 @@ pub fn requiresAdminPermission(path: []const u8) bool {
 }
 
 fn isHaAdminPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, admin_routes.ha) or std.mem.startsWith(u8, path, admin_routes.ha ++ "/");
+    // Canonical `/admin/v1/standby` plus the pre-0.3 `/admin/v1/ha` alias.
+    return std.mem.eql(u8, path, admin_routes.standby) or std.mem.startsWith(u8, path, admin_routes.standby ++ "/") or
+        std.mem.eql(u8, path, admin_routes.legacy_standby_prefix) or std.mem.startsWith(u8, path, admin_routes.legacy_standby_prefix ++ "/");
 }
 
 fn isStorageMaintenancePath(path: []const u8) bool {
@@ -20621,7 +20623,8 @@ fn storageRuntimeStatus(status: @import("../storage/maintenance.zig").Status) me
 }
 
 fn isHaInternalPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, internal_api_routes.ha) or std.mem.startsWith(u8, path, internal_api_routes.ha ++ "/");
+    return std.mem.eql(u8, path, internal_api_routes.standby) or std.mem.startsWith(u8, path, internal_api_routes.standby ++ "/") or
+        std.mem.eql(u8, path, internal_api_routes.legacy_standby) or std.mem.startsWith(u8, path, internal_api_routes.legacy_standby ++ "/");
 }
 
 fn isExtensionPath(path: []const u8) bool {
@@ -29030,9 +29033,16 @@ test "typed HA route operation dispatches admin and internal executors" {
     try std.testing.expectEqualStrings(internal_api_routes.ha_replication_status, internal_exec.last_uri.?);
     try std.testing.expectEqualStrings("{\"slot_name\":\"standby-a\"}", internal_exec.last_body.?);
 
-    var missing = try executeHaRouteForTest(&server, .get, admin_routes.ha, null, "");
+    var missing = try executeHaRouteForTest(&server, .get, admin_routes.standby, null, "");
     defer missing.deinit();
     try std.testing.expectEqual(@as(u16, 401), missing.status);
+    try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
+
+    // The pre-0.3 prefix reaches the same gate: unauthenticated is 401, not
+    // an unrouted 404.
+    var legacy_missing = try executeHaRouteForTest(&server, .get, admin_routes.legacy_standby_prefix ++ "/primary/status", null, "");
+    defer legacy_missing.deinit();
+    try std.testing.expectEqual(@as(u16, 401), legacy_missing.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
 }
 

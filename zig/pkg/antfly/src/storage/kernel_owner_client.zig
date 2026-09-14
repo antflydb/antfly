@@ -227,7 +227,7 @@ fn haSeedRequest(operation: abi.HASeedOperation, request_json: []const u8) abi.H
 pub fn haSeedActivate(request_json: []const u8) !Response {
     var response: Response = .{};
     var failure: abi.FailureIdentity = .{};
-    const status = abi.antfly_storage_ha_seed_activate_json(
+    const status = abi.antfly_storage_hot_standby_seed_activate_json(
         &haSeedRequest(.activate, request_json),
         &response.buffer,
         &failure,
@@ -239,7 +239,7 @@ pub fn haSeedActivate(request_json: []const u8) !Response {
 pub fn haSeedValidateActivatedGeneration(request_json: []const u8) !u64 {
     var result: abi.HASeedValidationResult = .{};
     var failure: abi.FailureIdentity = .{};
-    const status = abi.antfly_storage_ha_seed_validate_json(
+    const status = abi.antfly_storage_hot_standby_seed_validate_json(
         &haSeedRequest(.validate_activated_generation, request_json),
         &result,
         &failure,
@@ -253,7 +253,7 @@ pub fn haSeedValidateActivatedGeneration(request_json: []const u8) !u64 {
 pub fn haSeedPruneActivatedGenerations(request_json: []const u8) !Response {
     var response: Response = .{};
     var failure: abi.FailureIdentity = .{};
-    const status = abi.antfly_storage_ha_seed_prune_json(
+    const status = abi.antfly_storage_hot_standby_seed_prune_json(
         &haSeedRequest(.prune_activated_generations, request_json),
         &response.buffer,
         &failure,

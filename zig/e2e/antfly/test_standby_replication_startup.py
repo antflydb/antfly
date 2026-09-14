@@ -34,7 +34,11 @@ def test_standby_waits_for_delayed_first_replication(ha_cluster):
         def forward(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             if (
-                self.path == "/internal/v1/ha/replication/start"
+                self.path
+                in (
+                    "/internal/v1/standby/replication/start",
+                    "/internal/v1/ha/replication/start",
+                )
                 and not delayed.is_set()
             ):
                 delayed.set()
