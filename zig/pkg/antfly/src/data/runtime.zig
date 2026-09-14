@@ -6426,8 +6426,7 @@ pub const DataServer = struct {
         std.mem.sort(u64, group_ids, {}, std.sort.asc(u64));
 
         if (metadata_snapshot.status.metadata_epoch == 0 or
-            metadata_snapshot.tables.len == 0 or
-            metadata_snapshot.ranges.len == 0 or
+            (metadata_snapshot.tables.len == 0) != (metadata_snapshot.ranges.len == 0) or
             group_ids.len != metadata_snapshot.ranges.len)
             return error.HASeedSnapshotIncompleteTopology;
         std.mem.sort(antfly.metadata.TableRecord, metadata_snapshot.tables, {}, struct {
@@ -6598,7 +6597,7 @@ pub const DataServer = struct {
     fn prepareDefaultHASeedSnapshotMaintenance(self: *DataServer) !void {
         var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
-        if (metadata_snapshot.tables.len == 0 or metadata_snapshot.ranges.len == 0)
+        if ((metadata_snapshot.tables.len == 0) != (metadata_snapshot.ranges.len == 0))
             return error.HASeedSnapshotIncompleteTopology;
 
         const now_ns = if (self.write_source.backend_runtime) |backend_runtime|
@@ -6670,7 +6669,10 @@ pub const DataServer = struct {
         }
 
         var store_dir = std.Io.Dir.cwd().openDir(io, store_root, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return error.HASeedExtensionCatalogMismatch,
+            // A fresh instance has no package directory until its first
+            // extension is installed. The catalog/store match above already
+            // rejects missing packages; an absent empty store needs no copy.
+            error.FileNotFound => if (packages.len == 0) return else return error.HASeedExtensionCatalogMismatch,
             else => return err,
         };
         defer store_dir.close(io);
@@ -6801,9 +6803,6 @@ pub const DataServer = struct {
         ) catch return error.InvalidHASeedSnapshotTopology;
         defer parsed.deinit();
         const topology = parsed.value;
-        if (topology.format_version != ha_seed_snapshot_format_version or
-            !std.mem.eql(u8, topology.generation, generation) or topology.replicas.len == 0)
-            return error.InvalidHASeedSnapshotTopology;
         antfly.hot_standby.seed_topology.validate(
             alloc,
             io,
