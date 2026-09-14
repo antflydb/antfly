@@ -5074,6 +5074,11 @@ spec:
                 properties:
                   automaticPromotionAllowed:
                     type: boolean
+                  dataLayout:
+                    enum:
+                    - ha
+                    - standby
+                    type: string
                   desiredStandbyCount:
                     format: int32
                     type: integer

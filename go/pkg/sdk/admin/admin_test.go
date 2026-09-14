@@ -3853,7 +3853,7 @@ func TestDeprecatedHAAliasesResolveToStandbyTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHAClient returned error: %v", err)
 	}
-	var _ *StandbyClient = client
+	var _ = client
 
 	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
 		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
@@ -3884,7 +3884,7 @@ func TestDeprecatedHAAliasesResolveToStandbyTypes(t *testing.T) {
 	// The generic HAResponse[T] alias is identical to StandbyResponse[T].
 	value := 42
 	resp := HAResponse[int]{Value: &value}
-	var canonical StandbyResponse[int] = resp
+	var canonical = resp
 	if canonical.Value != resp.Value || *canonical.Value != 42 {
 		t.Fatalf("HAResponse[int] alias round-trip = %#v, want Value pointing at 42", canonical)
 	}
@@ -4064,5 +4064,76 @@ func TestStandbyClientPathStyleAutoDoesNotReprobeTypedNotFound(t *testing.T) {
 	}
 	if got := paths[before:]; len(got) != 1 || !strings.HasPrefix(got[0], StandbyPath) {
 		t.Fatalf("requests for typed 404 = %v, want a single canonical request and no legacy retry", got)
+	}
+}
+
+func TestStandbyClientNegotiatedPathStyleReportsPinnedCanonical(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, StandbyPath) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto)
+	if style, pinned := client.NegotiatedPathStyle(); pinned {
+		t.Fatalf("NegotiatedPathStyle before any request = %v pinned=%v, want unpinned", style, pinned)
+	}
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if style, pinned := client.NegotiatedPathStyle(); style != PathStyleCanonical || !pinned {
+		t.Fatalf("NegotiatedPathStyle = %v pinned=%v, want canonical pinned", style, pinned)
+	}
+}
+
+func TestStandbyClientNegotiatedPathStyleReportsPinnedLegacyAfterFallback(t *testing.T) {
+	t.Parallel()
+
+	counts := map[string]int{}
+	server := legacyOnlyStandbyServer(t, counts)
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleAuto)
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if style, pinned := client.NegotiatedPathStyle(); style != PathStyleLegacy || !pinned {
+		t.Fatalf("NegotiatedPathStyle = %v pinned=%v, want legacy pinned", style, pinned)
+	}
+}
+
+func TestStandbyClientNegotiatedPathStyleIgnoredForExplicitStyles(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, standbyGeneratedPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewStandbyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewStandbyClient returned error: %v", err)
+	}
+	client.WithPathStyle(PathStyleCanonical)
+	if _, err := client.PrimaryStatusResponse(context.Background(), nil); err != nil {
+		t.Fatalf("PrimaryStatusResponse returned error: %v", err)
+	}
+	if style, pinned := client.NegotiatedPathStyle(); pinned {
+		t.Fatalf("NegotiatedPathStyle under explicit style = %v pinned=%v, want unpinned (no negotiation occurs)", style, pinned)
 	}
 }

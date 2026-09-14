@@ -81,11 +81,17 @@ class HAStandaloneNode:
         sync_standby_name: str | None = None,
         admin_token_env: str | None = None,
         admin_token: str | None = None,
+        layout: str = "standby",
     ):
         self.binary = binary
         self.root = root
         self.role = role
         self.node_id = node_id
+        # "standby" (default) exercises the canonical 0.3 on-disk layout;
+        # "ha" exercises the pre-0.3 legacy layout the server migrates on
+        # startup. See zig/HOT_STANDBY.md "Naming" (Data directory row) and
+        # "Layout migration".
+        self.layout = layout
         self.host = "127.0.0.1"
         with ExitStack() as setup:
             self.port_reservations = LoopbackPortReservations(self.host)
@@ -115,7 +121,7 @@ class HAStandaloneNode:
     def ha_root(self) -> Path:
         # See zig/HOT_STANDBY.md "Naming" (Data directory row): the on-disk
         # tree moved from <node>/ha/ to <node>/standby/.
-        return self.node_root / "standby"
+        return self.node_root / self.layout
 
     @property
     def catalog_path(self) -> Path:
@@ -986,6 +992,79 @@ def _slot_by_name(status: dict[str, Any], slot_name: str) -> dict[str, Any]:
         for slot in status["snapshot"]["slots"]
         if slot.get("slot_name", slot.get("name")) == slot_name
     )
+
+
+def test_primary_migrates_legacy_ha_layout_to_canonical_standby_on_restart():
+    """The server moves an existing pre-0.3 `ha/` tree to `standby/` itself,
+    once, at startup (zig/HOT_STANDBY.md "Layout migration"). A node created
+    under the legacy layout must come back up unchanged, under the canonical
+    layout, when next started with canonical flags -- as the Kubernetes
+    operator will do once it adopts the 0.3 path spellings.
+    """
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if not Path(binary).exists():
+        pytest.skip(f"Antfly binary not found: {binary}")
+    if Path(binary).name != "antfly":
+        pytest.skip("HA standby e2e requires the supported Zig antfly binary")
+    if not _binary_supports_ha_standalone(binary):
+        pytest.skip(
+            f"Antfly binary does not expose HA standalone flags; rebuild current Zig binary: {binary}"
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="antfly-ha-layout-migration-e2e-"
+    ) as tempdir:
+        root = Path(tempdir).resolve()
+        table_name = "ha_layout_migration_docs"
+
+        legacy_node = HAStandaloneNode(
+            binary=binary,
+            root=root,
+            role="primary",
+            node_id="primary-a",
+            cluster_id=100,
+            timeline_id=1,
+            epoch=1,
+            layout="ha",
+            admin_token_env="ANTFLY_HA_E2E_ADMIN_TOKEN",
+            admin_token="layout-migration-token",
+        )
+        try:
+            legacy_node.start()
+            legacy_node.create_table(table_name)
+            before = legacy_node.admin_get("/primary/status")
+            before_identity = before["snapshot"]["identity"]
+            before_lsn = int(before["snapshot"]["current_lsn"])
+            legacy_ha_root = legacy_node.ha_root
+            assert legacy_ha_root.is_dir()
+            assert (legacy_ha_root / "primary.wal").exists()
+            assert (legacy_ha_root / "slots").exists()
+        finally:
+            legacy_node.close()
+
+        canonical_node = HAStandaloneNode(
+            binary=binary,
+            root=root,
+            role="primary",
+            node_id="primary-a",
+            cluster_id=100,
+            timeline_id=1,
+            epoch=1,
+            layout="standby",
+            admin_token_env="ANTFLY_HA_E2E_ADMIN_TOKEN",
+            admin_token="layout-migration-token",
+        )
+        try:
+            canonical_node.start()
+            assert not legacy_ha_root.exists()
+            assert (canonical_node.ha_root / "primary.wal").exists()
+            assert (canonical_node.ha_root / "slots").exists()
+
+            after = canonical_node.admin_get("/primary/status")
+            assert after["snapshot"]["identity"] == before_identity
+            assert int(after["snapshot"]["current_lsn"]) == before_lsn
+        finally:
+            canonical_node.close()
 
 
 def test_standby_streams_public_writes_restarts_and_rejects_writes(

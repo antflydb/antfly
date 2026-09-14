@@ -551,7 +551,7 @@ func TestStandbyClientStandbyStatusParsedResponseValidatesRawBody(t *testing.T) 
 	if len(response.Body) == 0 {
 		t.Fatalf("Body is empty, want raw response body")
 	}
-	var parsed *ParsedStandbyStatus = response.Value
+	var parsed = response.Value
 	if parsed.Snapshot.ReceivedLsn != 12 || parsed.Snapshot.AppliedLsn != 11 || !parsed.Snapshot.CanServeSafeReads || parsed.Snapshot.LastError != "ConnectionRefused" {
 		t.Fatalf("parsed response = %+v, want received=12 applied=11 safe reads", parsed)
 	}

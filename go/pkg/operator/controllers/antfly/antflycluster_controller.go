@@ -149,13 +149,30 @@ const (
 	// standbyAdminTokenDefaultEnvVar is the preferred name for the operator's
 	// own token. Managed pods keep haAdminTokenDefaultEnvVar as their default
 	// (it is a CRD-visible default and changing it would roll every cluster).
-	standbyAdminTokenDefaultEnvVar      = "ANTFLY_STANDBY_ADMIN_TOKEN" // #nosec G101 -- environment variable name, not a credential
-	defaultHAPrimaryLogPath             = "/antflydb/ha/primary.wal"
-	defaultHAPrimarySlotsPath           = "/antflydb/ha/slots"
-	defaultHASeedCaptureRoot            = "/antflydb/ha/seed-captures"
-	defaultHAFencePath                  = "/antflydb/ha/fence.wal"
-	defaultHAStandbyLogPath             = "/antflydb/ha/standby.wal"
-	defaultHAStandbyProgressPath        = "/antflydb/ha/standby-progress.wal"
+	standbyAdminTokenDefaultEnvVar = "ANTFLY_STANDBY_ADMIN_TOKEN" // #nosec G101 -- environment variable name, not a credential
+	// Legacy (pre-0.3) hot-standby on-disk layout:
+	// <root>/ha/{primary.wal,slots,standby.wal,standby-progress.wal,fence.wal}.
+	// These remain the operator's default until a cluster's
+	// status.haStatus.dataLayout is decided as HADataLayoutStandby; see
+	// haDefaultDataLayoutPaths.
+	defaultHAPrimaryLogPath      = "/antflydb/ha/primary.wal"
+	defaultHAPrimarySlotsPath    = "/antflydb/ha/slots"
+	defaultHASeedCaptureRoot     = "/antflydb/ha/seed-captures"
+	defaultHAFencePath           = "/antflydb/ha/fence.wal"
+	defaultHAStandbyLogPath      = "/antflydb/ha/standby.wal"
+	defaultHAStandbyProgressPath = "/antflydb/ha/standby-progress.wal"
+	// 0.3 hot-standby on-disk layout:
+	// <root>/standby/{primary.wal,slots,log.wal,progress.wal,fence.wal}. A 0.3
+	// server performs a one-shot migration at startup from the legacy ha/
+	// tree; a 0.2 server does not, so the operator may only render these
+	// paths once it knows every managed node runs a server with that
+	// migration (see haDecideDataLayout).
+	defaultStandbyPrimaryLogPath        = "/antflydb/standby/primary.wal"
+	defaultStandbyPrimarySlotsPath      = "/antflydb/standby/slots"
+	defaultStandbySeedCaptureRoot       = "/antflydb/standby/seed-captures"
+	defaultStandbyFencePath             = "/antflydb/standby/fence.wal"
+	defaultStandbyLogPath               = "/antflydb/standby/log.wal"
+	defaultStandbyProgressPath          = "/antflydb/standby/progress.wal"
 	defaultHADirectAdminRetryLimit      = int32(8)
 	defaultHADirectAdminRetryBase       = 5 * time.Second
 	defaultHADirectAdminRetryMaximum    = 2 * time.Minute
@@ -193,6 +210,11 @@ const (
 	haAdminJobPhaseSucceeded           = "Succeeded"
 	haAdminJobPhaseFailed              = "Failed"
 	haAdminJobPhaseMissingAdminURL     = "MissingAdminURL"
+
+	// haDataLayoutStandbyEventReason is emitted once when
+	// status.haStatus.dataLayout is first decided or flips to standby (never
+	// the reverse; see antflyv1.HADataLayout).
+	haDataLayoutStandbyEventReason = "HotStandbyLayoutStandby"
 
 	defaultManagedInferenceAPIPort = 8080
 )
@@ -712,18 +734,59 @@ func hasExplicitStandaloneStoragePVC(statefulSet *appsv1.StatefulSet, storageVol
 	return false
 }
 
-func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration string) string {
+// haDataLayoutPaths is the set of default hot-standby on-disk paths for one
+// layout generation (legacy ha/ or 0.3 standby/). Explicit
+// spec.highAvailability.runtime.*Path overrides always win regardless of
+// layout; these are only the operator's defaults.
+type haDataLayoutPaths struct {
+	primaryLogPath   string
+	primarySlotsPath string
+	seedCaptureRoot  string
+	fencePath        string
+	standbyLogPath   string
+	standbyProgress  string
+	generationsRoot  string
+}
+
+// haDefaultDataLayoutPaths returns the default path set for layout. An
+// empty or unrecognized layout is treated as the legacy layout, matching
+// "undecided defaults to ha" elsewhere in the reconciler.
+func haDefaultDataLayoutPaths(layout antflyv1.HADataLayout) haDataLayoutPaths {
+	if layout == antflyv1.HADataLayoutStandby {
+		return haDataLayoutPaths{
+			primaryLogPath:   defaultStandbyPrimaryLogPath,
+			primarySlotsPath: defaultStandbyPrimarySlotsPath,
+			seedCaptureRoot:  defaultStandbySeedCaptureRoot,
+			fencePath:        defaultStandbyFencePath,
+			standbyLogPath:   defaultStandbyLogPath,
+			standbyProgress:  defaultStandbyProgressPath,
+			generationsRoot:  "/antflydb/standby/standby-generations",
+		}
+	}
+	return haDataLayoutPaths{
+		primaryLogPath:   defaultHAPrimaryLogPath,
+		primarySlotsPath: defaultHAPrimarySlotsPath,
+		seedCaptureRoot:  defaultHASeedCaptureRoot,
+		fencePath:        defaultHAFencePath,
+		standbyLogPath:   defaultHAStandbyLogPath,
+		standbyProgress:  defaultHAStandbyProgressPath,
+		generationsRoot:  "/antflydb/ha/standby-generations",
+	}
+}
+
+func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration string, layout antflyv1.HADataLayout) string {
 	if ha == nil || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil || ha.Identity == nil {
 		return ""
 	}
 	runtime := ha.Runtime
 	identity := ha.Identity
+	defaults := haDefaultDataLayoutPaths(layout)
 	var args strings.Builder
-	seedCaptureRoot := defaultHASeedCaptureRoot
+	seedCaptureRoot := defaults.seedCaptureRoot
 	if value := strings.TrimSpace(runtime.SeedCaptureRoot); value != "" {
 		seedCaptureRoot = value
 	}
-	fencePath := defaultHAFencePath
+	fencePath := defaults.fencePath
 	if value := strings.TrimSpace(runtime.FencePath); value != "" {
 		fencePath = value
 	}
@@ -745,8 +808,8 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration strin
 	switch runtime.Role {
 	case antflyv1.HARuntimeRolePrimary:
 		primary := runtime.Primary
-		logPath := defaultHAPrimaryLogPath
-		slotsPath := defaultHAPrimarySlotsPath
+		logPath := defaults.primaryLogPath
+		slotsPath := defaults.primarySlotsPath
 		if primary != nil {
 			if value := strings.TrimSpace(primary.LogPath); value != "" {
 				logPath = value
@@ -780,14 +843,14 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration strin
 		appendStandaloneHASyncPolicyArgs(&args, ha.SyncPolicy)
 	case antflyv1.HARuntimeRoleStandby:
 		standby := runtime.Standby
-		logPath := defaultHAStandbyLogPath
-		progressPath := defaultHAStandbyProgressPath
+		logPath := defaults.standbyLogPath
+		progressPath := defaults.standbyProgress
 		// A materialized seed snapshot supersedes all receive/apply state from
 		// prior topologies. Keep operator-default standby WALs generation-scoped
 		// so an exact reseed starts from its validated checkpoint while ordinary
 		// restarts of that same generation retain their progress.
 		if generation := strings.TrimSpace(startupGeneration); generation != "" {
-			generationRoot := path.Join("/antflydb/ha/standby-generations", generation)
+			generationRoot := path.Join(defaults.generationsRoot, generation)
 			logPath = path.Join(generationRoot, "receive.wal")
 			progressPath = path.Join(generationRoot, "progress.wal")
 		}
@@ -919,6 +982,84 @@ func appendStandaloneHASyncPolicyArgs(args *strings.Builder, policy *antflyv1.HA
 	}
 	if policy.FailurePolicy != "" {
 		appendArg("--ha-sync-failure", standaloneHAFailurePolicy(policy.FailurePolicy))
+	}
+}
+
+// decideHADataLayout returns the hot-standby on-disk layout to render into
+// this reconcile's pod args, deciding and durably persisting a fresh choice
+// into cluster.Status.HAStatus.DataLayout (via the caller's existing status
+// update path) when one is needed. See antflyv1.HADataLayout: a decision of
+// standby is never reverted to ha, because a 0.2 server pointed at an
+// unmigrated standby/ tree on an existing volume would silently start empty.
+//
+//   - already decided: return the persisted value unconditionally.
+//   - brand-new cluster (statefulSetExists is false): there is no ha/ tree to
+//     migrate, so any supported server simply creates the standby/ tree
+//     fresh. Decide and persist standby immediately.
+//   - existing cluster, undecided: keep rendering the legacy ha/ layout.
+//     recordHADataLayoutObservation flips this once the operator has proof a
+//     node runs the 0.3 startup migration.
+func (r *AntflyClusterReconciler) decideHADataLayout(cluster *antflyv1.AntflyCluster, statefulSetExists bool) antflyv1.HADataLayout {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Mode != antflyv1.HAModeHotStandby {
+		return antflyv1.HADataLayoutLegacy
+	}
+	if cluster.Status.HAStatus != nil && cluster.Status.HAStatus.DataLayout != "" {
+		return cluster.Status.HAStatus.DataLayout
+	}
+	if statefulSetExists {
+		return antflyv1.HADataLayoutLegacy
+	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: cluster.Spec.HighAvailability.Mode}
+	}
+	cluster.Status.HAStatus.DataLayout = antflyv1.HADataLayoutStandby
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, haDataLayoutStandbyEventReason, "HotStandbyLayoutDecided",
+			"New cluster has no existing hot-standby data to migrate; the operator will render /antflydb/standby paths for this cluster's pods")
+	}
+	return antflyv1.HADataLayoutStandby
+}
+
+// recordHADataLayoutObservation flips status.haStatus.dataLayout to standby
+// once the operator has evidence that a managed node's server understands
+// the 0.3 standby/ layout and performs the ha/ -> standby/ migration at
+// startup (see zig/HOT_STANDBY.md's "Data directory" row). It never reverts
+// an existing standby decision.
+//
+// The evidence differs by configured admin path style:
+//   - PathStyleLegacy: never flip. The operator has been told (or defaults
+//     to believing) that it must speak the legacy /admin/v1/ha routes, so a
+//     successful legacy-routed probe is not proof of 0.3 support.
+//   - PathStyleCanonical: any successful probe is proof, because reaching
+//     this typed response at all already required the server to route
+//     /admin/v1/standby.
+//   - PathStyleAuto (the operator's recommended default): proof requires the
+//     client's negotiator to have pinned the canonical spelling for this
+//     node, via adminClient.NegotiatedPathStyle().
+func (r *AntflyClusterReconciler) recordHADataLayoutObservation(cluster *antflyv1.AntflyCluster, adminClient *adminsdk.StandbyClient) {
+	if cluster == nil || cluster.Status.HAStatus == nil || cluster.Status.HAStatus.DataLayout == antflyv1.HADataLayoutStandby {
+		return
+	}
+	proof := false
+	switch r.StandbyAdminPathStyle {
+	case adminsdk.PathStyleCanonical:
+		proof = true
+	case adminsdk.PathStyleAuto:
+		if adminClient != nil {
+			if style, pinned := adminClient.NegotiatedPathStyle(); pinned && style == adminsdk.PathStyleCanonical {
+				proof = true
+			}
+		}
+	default: // adminsdk.PathStyleLegacy, including the unset zero value.
+		proof = false
+	}
+	if !proof {
+		return
+	}
+	cluster.Status.HAStatus.DataLayout = antflyv1.HADataLayoutStandby
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, haDataLayoutStandbyEventReason, "HotStandbyLayoutObserved",
+			"Observed a canonical hot-standby admin API; the operator will render /antflydb/standby paths for this cluster's pods on the next rollout")
 	}
 }
 
@@ -4545,6 +4686,21 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	statefulSetName := standaloneStatefulSetName(cluster)
 	storageVolumeName := standaloneStorageVolumeName(cluster)
 
+	// A brand-new cluster (this StatefulSet does not exist yet) has no ha/
+	// tree on disk to migrate, so the operator may safely default it straight
+	// to the 0.3 standby/ layout. An existing cluster stays on the ha/
+	// layout until an admin probe proves a node performs the 0.3 startup
+	// migration; see decideHADataLayout and recordHADataLayoutObservation.
+	existingStandaloneSts := &appsv1.StatefulSet{}
+	standaloneStsExists := true
+	if err := r.Get(ctx, types.NamespacedName{Name: statefulSetName, Namespace: cluster.Namespace}, existingStandaloneSts); err != nil {
+		if !errors.IsNotFound(err) {
+			return err
+		}
+		standaloneStsExists = false
+	}
+	haDataLayout := r.decideHADataLayout(cluster, standaloneStsExists)
+
 	envFromSources := append([]corev1.EnvFromSource{}, standalone.EnvFrom...)
 
 	volumeClaimTemplates := []corev1.PersistentVolumeClaim{
@@ -4748,7 +4904,7 @@ exec /antfly standalone --id %d --config /config/config.json \
 								standalone.MetadataAPI.Port,
 								standalone.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
-								standaloneHAArgs(cluster.Spec.HighAvailability, standaloneHAStartupGeneration(cluster)),
+								standaloneHAArgs(cluster.Spec.HighAvailability, standaloneHAStartupGeneration(cluster), haDataLayout),
 								standaloneHAStartupArgs(cluster),
 							),
 						},
@@ -10923,6 +11079,7 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 			return status, fmt.Errorf("HA Lease watchdog authority is pending for node %s", status.NodeID)
 		}
 	}
+	r.recordHADataLayoutObservation(cluster, adminClient)
 	return status, nil
 }
 
@@ -10951,6 +11108,7 @@ func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Contex
 		}
 		observed.Status.WatchdogProof = proof
 	}
+	r.recordHADataLayoutObservation(cluster, adminClient)
 	return observed.Status, nil
 }
 
@@ -13049,13 +13207,6 @@ func haAdminJobTokenEnv(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdmin
 			SecretKeyRef: ref,
 		},
 	}}
-}
-
-func haAdminTokenEnvVar(admin *antflyv1.HAAdminSpec) string {
-	if configured := haAdminConfiguredTokenEnvVar(admin); configured != "" {
-		return configured
-	}
-	return haAdminTokenDefaultEnvVar
 }
 
 func haAdminConfiguredTokenEnvVar(admin *antflyv1.HAAdminSpec) string {

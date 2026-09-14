@@ -650,7 +650,7 @@ func StandbyReceiptMatches(receipt StandbyActionReceipt, expectation StandbyRece
 		return false
 	}
 	if actionKind != expectedKind || actionTarget != expectedTarget || actionState != expectedState {
-		if !(expectedState == string(StandbyActionStateApplied) && actionState == string(StandbyActionStateAlreadyApplied)) {
+		if expectedState != string(StandbyActionStateApplied) || actionState != string(StandbyActionStateAlreadyApplied) {
 			return false
 		}
 	}
@@ -3068,6 +3068,22 @@ func (c *StandbyClient) WithPathStyle(style PathStyle) *StandbyClient {
 	c.pathStyle = style
 	c.rebuildEditors()
 	return c
+}
+
+// NegotiatedPathStyle reports the admin path style this client has confirmed
+// for its target. Under PathStyleAuto, the second return value is false
+// until a request has actually succeeded (or a previous client in this
+// process already pinned an answer for the same base URL), and the first
+// return value is meaningless until then. Under an explicit PathStyleLegacy
+// or PathStyleCanonical, this simply reports that fixed style with pinned
+// set to false, since no negotiation ever occurs: callers that need to treat
+// a successful explicit-style request as proof should key off the client's
+// configured style directly rather than this accessor.
+func (c *StandbyClient) NegotiatedPathStyle() (PathStyle, bool) {
+	if c == nil || c.negotiator == nil || c.pathStyle != PathStyleAuto {
+		return PathStyleLegacy, false
+	}
+	return c.negotiator.current()
 }
 
 func acceptJSONEditor(_ context.Context, req *http.Request) error {

@@ -56,6 +56,7 @@ pub const http_internal = @import("http_internal.zig");
 pub const http_operation = @import("http_operation.zig");
 pub const http_replication_client = @import("http_replication_client.zig");
 pub const http_client = @import("http_client.zig");
+pub const layout = @import("layout.zig");
 
 test {
     _ = @import("lifecycle_receipt_inventory_test.zig");
@@ -104,4 +105,5 @@ test {
     _ = http_operation;
     _ = http_replication_client;
     _ = http_client;
+    _ = layout;
 }

@@ -54,8 +54,13 @@ All notable changes to Antfly will be documented in this file.
   release; the operator keeps generating them for now.
 - **Data directory `standby/`** — `antfly standby --data-dir` now looks for
   `standby/{primary.wal,slots,log.wal,progress.wal,fence.wal}` and falls back
-  to the pre-0.3 `ha/` tree. The operator's default pod paths stay under
-  `/antflydb/ha/` until a one-shot migration ships.
+  to the pre-0.3 `ha/` tree. The server migrates an `ha/` tree to `standby/`
+  once at startup when its flags point at the new tree (directory rename plus
+  `standby.wal` -> `log.wal`, `standby-progress.wal` -> `progress.wal`; nothing
+  is deleted or overwritten). The operator switches a cluster's default pod
+  paths to `/antflydb/standby/` once it has seen the cluster's nodes speak the
+  0.3 admin API and records the choice in `status.haStatus.dataLayout`; new
+  clusters start on `standby/`.
 - **Server metrics `antfly_standby_*`** — every `antfly_ha_*` series is also
   emitted under the new name for one minor release.
 - **OpenAPI tags and config schemas** — tags `standby` / `standby-replication`;

@@ -58,6 +58,26 @@ Automatic failover additionally requires a supported fencing authority, a
 primary-route selector, a promotion target with safe-read progress, and admin
 URLs for every node the operator may promote, demote, rewind, or reseed.
 
+### Data layout on the pod volume
+
+Default runtime paths live under `/antflydb/standby/` (`primary.wal`, `slots`,
+`log.wal`, `progress.wal`, `fence.wal`, `seed-captures/`,
+`standby-generations/`). Clusters created before 0.3 have the same files under
+`/antflydb/ha/` with `standby.wal` and `standby-progress.wal`. The operator
+records which layout it renders in `status.haStatus.dataLayout` (`ha` or
+`standby`) and never moves it back. New clusters start on `standby`. An
+existing cluster stays on `ha` until the operator's admin client has
+negotiated the 0.3 `/admin/v1/standby` paths with one of its nodes, which
+proves the nodes run a server that can migrate; the operator then flips the
+status, emits a `HotStandbyLayoutStandby` event, and the next pod rollout
+carries the new paths. On
+that start each node renames `ha/` to `standby/` once (everything inside moves
+with it) and renames the two standby files; nothing is deleted or overwritten.
+Explicit `spec.highAvailability.runtime.*Path` values are rendered as given
+and never migrated. Do not switch a cluster to explicit `/antflydb/standby/`
+paths by hand while it still runs a 0.2 image: a 0.2 server has no migration
+and would start empty at the new paths.
+
 ## Admin Token Handling
 
 Inject the token from a Secret into process environments; the operator does

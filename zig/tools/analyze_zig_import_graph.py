@@ -43,7 +43,14 @@ DEFAULT_ROOTS = {
     "raft": "raft/mod.zig",
 }
 
-SERVER_ROLES = ("data", "metadata", "serverless", "standalone", "inference", "hot_standby")
+SERVER_ROLES = (
+    "data",
+    "metadata",
+    "serverless",
+    "standalone",
+    "inference",
+    "hot_standby",
+)
 RUNTIME_BOUNDARIES = (
     "data/runtime.zig",
     "metadata/runtime.zig",

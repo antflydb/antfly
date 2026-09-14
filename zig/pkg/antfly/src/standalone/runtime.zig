@@ -2502,6 +2502,7 @@ pub fn runFromIterator(
             }
         }
     }
+    try migrateHALegacyLayoutFromCli(alloc, setup_io.io(), cli);
     var ha_sync_policy = try haSyncPolicyFromCli(alloc, cli);
     defer ha_sync_policy.deinit(alloc);
     const ha_retention_policy = try haRetentionPolicyFromCli(cli);
@@ -5009,6 +5010,46 @@ fn haPrimaryIdentity(cli: CliConfig) !antfly.hot_standby.primary.Identity {
         .timeline_id = cli.ha_timeline_id orelse return error.HATimelineIdMissing,
         .epoch = cli.ha_epoch orelse return error.HAEpochMissing,
     };
+}
+
+/// Moves an existing pre-0.3 `<root>/ha/` hot-standby tree to the canonical
+/// `<root>/standby/` layout, once, before any hot-standby store below is
+/// opened. See `storage/hot_standby/layout.zig` for the exact algorithm.
+/// A no-op when no hot-standby path is configured at all, and idempotent on
+/// every later startup once a root has been migrated.
+fn migrateHALegacyLayoutFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !void {
+    const candidates = [_]?[]const u8{
+        cli.ha_primary_log,
+        cli.ha_primary_slots,
+        cli.ha_standby_log,
+        cli.ha_standby_progress,
+        cli.ha_fence_wal,
+        cli.ha_former_primary_log,
+        cli.ha_seed_capture_root,
+        cli.ha_startup_target_root,
+    };
+    var configured_paths: [candidates.len][]const u8 = undefined;
+    var count: usize = 0;
+    for (candidates) |maybe_path| {
+        const path = maybe_path orelse continue;
+        configured_paths[count] = path;
+        count += 1;
+    }
+    if (count == 0) return;
+
+    const report = try antfly.hot_standby.layout.migrateLegacyLayout(io, alloc, configured_paths[0..count]);
+    if (report.changed()) {
+        std.log.info(
+            "standalone hot-standby layout migration moved legacy state: dirs_renamed={d} files_renamed={d}",
+            .{ report.dirs_renamed, report.files_renamed },
+        );
+    }
+    if (report.coexisting_roots != 0) {
+        std.log.warn(
+            "standalone hot-standby layout migration found {d} root(s) with both a legacy 'ha' tree and a canonical 'standby' tree present; the legacy tree was left in place",
+            .{report.coexisting_roots},
+        );
+    }
 }
 
 fn openHAPrimaryFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.hot_standby.primary.Primary {
@@ -7800,6 +7841,86 @@ test "standalone HA runtime rejects ambiguous role flags" {
         .ha_sync_mode = .remote_write,
         .ha_sync_required = 1,
     }));
+}
+
+test "standalone hot-standby startup migrates a legacy layout before opening local handles" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root: [:0]u8 = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+
+    const writeFile = struct {
+        fn call(dir_path: []const u8, name: []const u8, body: []const u8) !void {
+            const a = std.testing.allocator;
+            const path = try std.fs.path.join(a, &.{ dir_path, name });
+            defer a.free(path);
+            if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+            var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, body);
+        }
+    }.call;
+    const testPathExists = struct {
+        fn call(path: []const u8) bool {
+            std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return false;
+            return true;
+        }
+    }.call;
+
+    const legacy = try std.fs.path.join(alloc, &.{ root, "ha" });
+    defer alloc.free(legacy);
+    try writeFile(legacy, "primary.wal", "primary");
+    try writeFile(legacy, "slots", "slots");
+    try writeFile(legacy, "standby.wal", "standby-log");
+    try writeFile(legacy, "standby-progress.wal", "standby-progress");
+    try writeFile(legacy, "fence.wal", "fence");
+    try writeFile(legacy, "seed-captures/generations/gen-1/complete.json", "capture");
+
+    const canonical = try std.fs.path.join(alloc, &.{ root, "standby" });
+    defer alloc.free(canonical);
+    const primary_log = try std.fs.path.join(alloc, &.{ canonical, "primary.wal" });
+    defer alloc.free(primary_log);
+    const primary_slots = try std.fs.path.join(alloc, &.{ canonical, "slots" });
+    defer alloc.free(primary_slots);
+    const standby_log = try std.fs.path.join(alloc, &.{ canonical, "log.wal" });
+    defer alloc.free(standby_log);
+    const standby_progress = try std.fs.path.join(alloc, &.{ canonical, "progress.wal" });
+    defer alloc.free(standby_progress);
+    const fence_wal = try std.fs.path.join(alloc, &.{ canonical, "fence.wal" });
+    defer alloc.free(fence_wal);
+    const seed_capture_root = try std.fs.path.join(alloc, &.{ canonical, "seed-captures" });
+    defer alloc.free(seed_capture_root);
+
+    const cli = CliConfig{
+        .ha_primary_log = primary_log,
+        .ha_primary_slots = primary_slots,
+        .ha_standby_log = standby_log,
+        .ha_standby_progress = standby_progress,
+        .ha_fence_wal = fence_wal,
+        .ha_seed_capture_root = seed_capture_root,
+    };
+
+    try migrateHALegacyLayoutFromCli(alloc, std.testing.io, cli);
+
+    try std.testing.expect(!testPathExists(legacy));
+    try std.testing.expect(testPathExists(primary_log));
+    try std.testing.expect(testPathExists(primary_slots));
+    try std.testing.expect(testPathExists(standby_log));
+    try std.testing.expect(testPathExists(standby_progress));
+    try std.testing.expect(testPathExists(fence_wal));
+    const migrated_capture = try std.fs.path.join(alloc, &.{ seed_capture_root, "generations/gen-1/complete.json" });
+    defer alloc.free(migrated_capture);
+    try std.testing.expect(testPathExists(migrated_capture));
+
+    // Calling again with an already-canonical tree is a no-op that must not
+    // error, matching every later startup on this node.
+    try migrateHALegacyLayoutFromCli(alloc, std.testing.io, cli);
+    try std.testing.expect(testPathExists(primary_log));
+}
+
+test "standalone hot-standby startup migration is a no-op with no hot-standby paths configured" {
+    try migrateHALegacyLayoutFromCli(std.testing.allocator, std.testing.io, .{});
 }
 
 test "standalone HA runtime requires HA paths under resolved data root" {

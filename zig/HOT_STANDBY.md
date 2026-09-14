@@ -818,7 +818,7 @@ This release renames the surface to **`standby`**:
 | Internal replication API | `/internal/v1/ha/replication/...`, `HAIdentity`, `HAReplicationFrame`, ... | `/internal/v1/standby/replication/...`, `StandbyIdentity`, `StandbyReplicationFrame`, ...; the old prefix is served as an alias and a new standby falls back to it once when its primary still runs 0.2, so either side may be upgraded first |
 | Internal package | `storage/ha` | `storage/hot_standby` (`storage.hot_standby` in Zig; test names and build steps follow: `antfly-storage-hot-standby-test`) |
 | Server flags | `antfly standalone --ha-primary-log`, `--ha-standby-log`, `--ha-cluster-id`, ... | `--hot-standby-primary-log`, `--hot-standby-log`, `--hot-standby-cluster-id`, ...: `--ha-standby-X` becomes `--hot-standby-X` (the role segment collapses like the routes), `--ha-primary-X` becomes `--hot-standby-primary-X`, every other `--ha-X` becomes `--hot-standby-X`; the `--ha-*` spellings stay as aliases for one minor and the operator keeps generating them until its minimum server has the new ones |
-| Data directory | `<data-dir>/ha/{primary.wal,slots,standby.wal,standby-progress.wal,fence.wal}` | `<data-dir>/standby/{primary.wal,slots,log.wal,progress.wal,fence.wal}`; `antfly standby --data-dir` prefers the new tree and falls back to an existing `ha/` tree; the operator's default pod paths stay under `/antflydb/ha/` this release because changing them needs a one-shot on-disk migration (Open work) |
+| Data directory | `<data-dir>/ha/{primary.wal,slots,standby.wal,standby-progress.wal,fence.wal}` | `<data-dir>/standby/{primary.wal,slots,log.wal,progress.wal,fence.wal}`; `antfly standby --data-dir` prefers the new tree and falls back to an existing `ha/` tree; a 0.3 server migrates an `ha/` tree to `standby/` once at startup when its flags point at the new tree, and the operator switches a cluster's default pod paths to `/antflydb/standby/` once it has seen the cluster's nodes speak the 0.3 admin API (`status.haStatus.dataLayout`) |
 | Server metrics | `antfly_ha_*` | `antfly_standby_*`, dual-emitted with the old names for one minor |
 | OpenAPI tags | `ha`, `ha-replication` ("HA Replication") | `standby`, `standby-replication` ("Hot Standby", "Hot Standby Replication") |
 | Config schemas | `HotStandbyPrimaryRoleConfig`, `HotStandbyStandbyRoleConfig` | `HotStandbyPrimaryConfig`, `HotStandbyStandbyConfig` (mirror the `hot_standby.primary` / `hot_standby.standby` keys) |
@@ -919,10 +919,39 @@ in `DATA_DIR.md`. The directory and the file names follow the flags
 
 Nodes created before 0.3 have `ha/{primary.wal,slots,standby.wal,
 standby-progress.wal,fence.wal}`; `--data-dir` prefers the `standby/` tree and
-falls back to an existing `ha/` tree, and never creates either. The Kubernetes
-operator's default pod paths remain `/antflydb/ha/...` this release: moving
-them needs a one-shot on-disk migration on the node, which is listed under
-Open work.
+falls back to an existing `ha/` tree, and never creates either.
+
+#### Layout migration
+
+The server moves an old tree itself, once, at startup
+(`storage/hot_standby/layout.zig`, called before any hot-standby store is
+opened). For every configured hot-standby path whose parent directory is
+named `standby`: if that directory is absent and a sibling `ha/` exists, the
+whole directory is renamed `ha/` -> `standby/` (one atomic rename, so the
+operator's `seed-captures/` and `standby-generations/` move with it); then,
+inside `standby/`, `standby.wal` becomes `log.wal` and `standby-progress.wal`
+becomes `progress.wal` when the new name is absent. Nothing is deleted or
+overwritten: if both spellings of a file exist the server keeps both and
+warns, and if both `ha/` and `standby/` directories exist it leaves `ha/`
+alone. A crash between the directory rename and the file renames is
+harmless because the file step is per-file and idempotent, so the next start
+finishes it. Paths whose parent is not named `standby` are never touched, so
+custom layouts are unaffected. `antfly standby --data-dir` never migrates; it
+only reads.
+
+The Kubernetes operator drives the switch. It records the layout it renders
+into pod arguments in `status.haStatus.dataLayout` (`ha` or `standby`) and
+never moves it back. A brand-new cluster (no hot-standby StatefulSet yet) gets
+`standby` immediately: there is nothing to migrate, and a 0.2 server simply
+creates the new tree. An existing cluster stays on `ha` until the operator's
+admin client has negotiated the canonical `/admin/v1/standby` path style with
+one of its nodes, which proves the nodes run a server that has the migration;
+it then flips the status, emits an event, and the next pod rollout carries the
+new paths, at which point each node migrates its own volume on start. Explicit
+`spec.highAvailability.runtime.*Path` overrides are rendered as given and are
+never migrated by the operator. Server flags stay on the `--ha-*` spellings in
+generated arguments until the operator's minimum server is 0.3, because every
+supported server accepts those.
 
 Role is inferred from which files exist: primary if `primary.wal` and `slots`
 are present, standby if `log.wal` and `progress.wal` (or their legacy names)
@@ -1508,14 +1537,10 @@ described in [Implementation](#implementation):
   `go/pkg/operator/docs/operations/hot-standby-ha.md`, but further work to
   make edge cases boring (for example, richer degraded-state guidance) can
   continue without changing the core contract.
-- **Operator adoption of the 0.3 spellings on pods**: the operator still
-  generates `--ha-*` server flags and the `/antflydb/ha/...` default paths for
-  the pods it manages. The flags are aliases, so they can flip whenever the
-  operator's minimum server is 0.3; the paths cannot flip without a one-shot
-  on-disk migration (`ha/` -> `standby/` with the new file names) performed by
-  the node at startup when the configured `standby/` tree is absent and the
-  `ha/` tree exists. Ship the migration in the server first, then let the
-  operator switch its defaults.
+- **Operator flag spellings**: the operator still generates the `--ha-*`
+  server flags (aliases every supported server accepts). Switch to
+  `--hot-standby-*` once the operator's minimum server is 0.3; the data layout
+  already switches per cluster via `status.haStatus.dataLayout`.
 - **Operator-planned switchover**: `antfly standby switchover` composes the planned
   sequence from typed routes, but the Kubernetes operator still plans only
   failover; a `spec`-driven planned switchover that reuses the same steps and

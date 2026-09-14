@@ -3899,6 +3899,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
             "standalone HA runtime rejects ambiguous role flags",
+            "standalone hot-standby startup migrates a legacy layout before opening local handles",
+            "standalone hot-standby startup migration is a no-op with no hot-standby paths configured",
             "standalone continuous HA mutation guard follows role lifecycle",
             "antfly config uses cli override before common config",
             "standalone memory budget conversion rejects overflow",

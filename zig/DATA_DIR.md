@@ -64,8 +64,15 @@ from them (`antfly ha` is a deprecated alias for `antfly standby`). Nodes
 created before 0.3 have this state under a legacy `ha/` tree instead
 (`ha/{primary.wal,slots,standby.wal,standby-progress.wal,fence.wal}`);
 `antfly standby --data-dir` reads either layout, preferring the canonical
-`standby/` tree when both exist. The Kubernetes operator's default pod paths
-remain under `/antflydb/ha/...` this release.
+`standby/` tree when both exist, and never moves anything. The server does the
+move: when its hot-standby flags point into a `standby/` directory that does
+not exist yet and a sibling `ha/` directory does, it renames `ha/` to
+`standby/` once at startup (everything inside moves with it) and then renames
+`standby.wal` to `log.wal` and `standby-progress.wal` to `progress.wal`. The
+Kubernetes operator switches a cluster's default pod paths from
+`/antflydb/ha/` to `/antflydb/standby/` once it has seen the cluster's nodes
+run a server with this migration (`status.haStatus.dataLayout`); new clusters
+start on `standby/` directly.
 
 Table database snapshots are a lower-level DB artifact and remain adjacent to
 the database path as `<db_path>.snapshots/<snapshot-id>/...`.

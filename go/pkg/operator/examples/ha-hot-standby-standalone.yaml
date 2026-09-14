@@ -76,16 +76,16 @@ spec:
     runtime:
       role: Primary
       nodeID: primary-a
-      fencePath: /antflydb/ha/fence.wal
-      formerPrimaryLogPath: /antflydb/ha/primary.wal
+      fencePath: /antflydb/standby/fence.wal
+      formerPrimaryLogPath: /antflydb/standby/primary.wal
       adminTokenEnvVar: ANTFLY_HA_ADMIN_TOKEN
       adminTokenSecretRef:
         name: antfly-ha-admin-token
         key: token
         optional: false
       primary:
-        logPath: /antflydb/ha/primary.wal
-        slotsPath: /antflydb/ha/slots
+        logPath: /antflydb/standby/primary.wal
+        slotsPath: /antflydb/standby/slots
     standbys:
     - name: standby-a
       slotName: standby-a
@@ -177,15 +177,15 @@ spec:
     runtime:
       role: Standby
       nodeID: standby-a
-      fencePath: /antflydb/ha/fence.wal
+      fencePath: /antflydb/standby/fence.wal
       adminTokenEnvVar: ANTFLY_HA_ADMIN_TOKEN
       adminTokenSecretRef:
         name: antfly-ha-admin-token
         key: token
         optional: false
       standby:
-        logPath: /antflydb/ha/standby.wal
-        progressPath: /antflydb/ha/standby-progress.wal
+        logPath: /antflydb/standby/log.wal
+        progressPath: /antflydb/standby/progress.wal
         upstreamURL: http://antfly-primary-public-api.default.svc.cluster.local:80
         slotName: standby-a
 
