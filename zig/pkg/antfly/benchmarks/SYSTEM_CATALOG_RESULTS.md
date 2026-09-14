@@ -1698,3 +1698,49 @@ in 61.44 seconds, including rebuilding existing documents under a new schema,
 Both production DataServer simulations and 11 reporting/snapshot regressions
 passed without leaks. The catalog storage, API, and progress targets and generated
 consistency checks passed. Functional durations are not production latency claims.
+
+## Report cache and replica migration finalization — 2026-09-14
+
+Source `0528208791beabb5ccc255bae0bfa27a45c44731`, including main
+`2032ed7d871ee8bbb8bdaf31824677ec045df556`; macOS arm64, Debug, `c_allocator`.
+[Raw samples, commands, executable hashes, and limitations](system_catalog_scheduling_workloads_2026_09_14.json)
+are retained. Runs were sequential, without concurrent task-owned builds or E2Es.
+Benchmark steps always execute fresh samples, including when a normal test run
+previously populated Zig's run cache.
+
+| Component workload | Former path median | New path median | Ratio |
+| --- | ---: | ---: | ---: |
+| Runtime cache, 1,000 groups × 32 indexes | Deep copy/free: 11.473 ms | Retain/release: 1.075 ms | 10.7× |
+| Runtime cache, 10,000 groups × 32 indexes | Deep copy/free: 114.894 ms | Retain/release: 11.642 ms | 9.9× |
+| Finalization, 100 migrations / 1,000 groups / 3,000 placements | Nested scans: 2,779.695 ms | Shared readiness index: 2.127 ms | 1,306.9× |
+
+The cache comparison uses one warmup and nine samples, emitted in sorted order.
+Capture and release are timed; fixture and publisher construction are excluded.
+The publisher retains the acknowledged leaves throughout each measurement, so
+final leaf destruction is outside the interval. The fixture repeats 32 index
+descriptors per group. This measures cache ownership costs, not heartbeat latency.
+Production clean Raft reporting ticks now use the cached heartbeat path; ownership
+changes, dirty inventory, and the full-refresh interval still trigger collection.
+
+Finalization uses one warmup and five paired samples. Each sample checks every
+indexed answer against the former scan, including an additional unhosted table.
+The new interval includes schema parsing, map construction, and equality checks;
+the reference excludes schema parsing. New index destruction is excluded, while
+the reference includes destruction of each temporary host list. These are local
+component comparisons; HTTP, Raft, storage I/O, and document rebuilding are excluded.
+
+The merged server passed all 10 catalog, migration, and drain E2Es in 96.90 seconds.
+Three tables with two shards and three replicas each completed concurrent schema
+cutover and document validation in 4.225 seconds, excluding provisioning. This is
+one functional measurement, not a latency distribution. The scenario caught two
+causes of stalled cutover: whole-table status probes discarded healthy local facts,
+and leader-only repair left follower indexes rebuilding. Group-scoped observations
+preserve retry debt; exact schema-index repair now runs on every hosting replica
+with at most one attempt per startup-maintenance pass.
+
+Catalog storage, API, progress, and finalization targets passed on merge
+`98f043a7b31470333bb374867361a1bee776f496`, as did both production DataServer
+simulations and 12 reporting/runtime regressions without leaks. Three targeted
+repair-scheduler and sibling-isolation tests passed before the merge. Generated
+checks passed after the merge. The subsequent timing-source commit changes only
+benchmark step execution; server code is identical to the validated merge.
