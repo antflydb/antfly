@@ -253,9 +253,9 @@ pub fn configureUnitStorageTestRun(
     if (allow_empty_filter) run.addArg("--allow-empty-test-filter");
     addRuntimeSkipTestFilters(run, unit_skip_filters);
     for (root_skip_filters) |filter| {
-        // `storage.ha` keeps the HA suite out of broad root-module test runs.
+        // `storage.hot_standby` keeps the HA suite out of broad root-module test runs.
         // Applying it to the dedicated shard would select zero tests.
-        if (is_ha_shard and std.mem.eql(u8, filter, "storage.ha")) continue;
+        if (is_ha_shard and std.mem.eql(u8, filter, "storage.hot_standby")) continue;
         run.addArgs(&.{ "--skip-test-filter", filter });
     }
     addRuntimeSkipTestFilters(run, extra_skip_filters);

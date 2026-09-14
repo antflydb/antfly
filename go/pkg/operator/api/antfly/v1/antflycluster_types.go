@@ -570,6 +570,20 @@ const (
 	HAModeHotStandby HAMode = "HotStandby"
 )
 
+// HADataLayout selects the on-disk hot-standby data layout the operator
+// renders into pod arguments and default paths.
+type HADataLayout string
+
+const (
+	// HADataLayoutLegacy is the pre-0.3 layout:
+	// <root>/ha/{primary.wal,slots,standby.wal,standby-progress.wal,fence.wal}.
+	HADataLayoutLegacy HADataLayout = "ha"
+
+	// HADataLayoutStandby is the 0.3 layout:
+	// <root>/standby/{primary.wal,slots,log.wal,progress.wal,fence.wal}.
+	HADataLayoutStandby HADataLayout = "standby"
+)
+
 // HADurabilityMode selects when a primary write may be acknowledged.
 type HADurabilityMode string
 
@@ -1945,6 +1959,13 @@ type HAStatus struct {
 	// Mode is the observed HA mode.
 	// +optional
 	Mode HAMode `json:"mode,omitempty"`
+
+	// DataLayout is the hot-standby on-disk layout the operator renders into
+	// pod arguments. Empty means undecided; once set to standby it never
+	// reverts.
+	// +kubebuilder:validation:Enum=ha;standby
+	// +optional
+	DataLayout HADataLayout `json:"dataLayout,omitempty"`
 
 	// PrimaryLSN is the current primary replication LSN.
 	// +optional

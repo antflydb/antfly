@@ -95,3 +95,8 @@ scripts/__pycache__/
 
 # TLA+ model checker state directories
 specs/tla/states/
+
+# Scratch database created by the Lite command tests when run from zig/
+zig/__antfly_lite/
+# Scratch state created by graph-metric command tests when run from zig/
+zig/incoming-graph-routes/

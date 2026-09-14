@@ -16,6 +16,77 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **`antfly standby` replaces `antfly ha`** — the hot-standby command is
+  renamed; `antfly ha` remains a hidden alias for one minor release. It gains
+  `--data-dir` (opens the node's standby state under `<dir>/ha/` and reads the
+  log identity from the files), `--config` (reads the server's `hot_standby`
+  section), unprefixed flags (`--admin-url`, `--admin-token-env`,
+  `--cluster-id`, ...; the `--ha-*` spellings remain aliases), and
+  `ANTFLY_STANDBY_ADMIN_URL` / `ANTFLY_STANDBY_ADMIN_TOKEN` defaults (the
+  `ANTFLY_HA_*` names are read as fallbacks). The `--` separator before the
+  verb is optional. Help text rewritten.
+- **`hot_standby:` config section** — `antfly standalone --config` fills any
+  `--ha-*` flag it was not given from
+  `hot_standby.{admin,identity,primary,standby,sync,retention}`; flags still
+  win. The deprecated `ha:` key is still read for one minor release.
+- **Admin API moved to `/admin/v1/standby/...` and `/standby/v1/...`**, and the
+  internal replication API to `/internal/v1/standby/replication/...`. The
+  standby-role routes drop their now-redundant segment (`/standby/status`,
+  `/standby/bootstrap`, `/standby/upstream`). The old `/admin/v1/ha/...`,
+  `/ha/v1/...`, and `/internal/v1/ha/...` paths are served as aliases for one
+  minor release, and the CLI and a replicating standby fall back to them once
+  when they meet a 0.2 server, so either side of a pair may be upgraded first.
+  The Kubernetes operator negotiates per server (`--standby-admin-path-style`,
+  default `auto`) instead of waiting for a minimum server version, and reads
+  its own token from `ANTFLY_STANDBY_ADMIN_TOKEN` before `ANTFLY_HA_ADMIN_TOKEN`.
+- **Schemas renamed `HA*` -> `Standby*`** — in the admin and internal OpenAPI
+  specs and the generated SDKs. The Go SDK keeps every `HA*` name as a
+  deprecated alias, adds `PathStyleAuto` (canonical first, one fallback to the
+  old spelling, remembered per base URL), and keeps the legacy style as its
+  zero-value default for this release.
+- **Operator metrics** — dual-emitted under both the `ha` and `standby`
+  subsystems during the deprecation window.
+- **`antfly standalone --hot-standby-*` flags** replace `--ha-*`:
+  `--ha-standby-X` becomes `--hot-standby-X` (`--hot-standby-log`,
+  `--hot-standby-progress`, ...), `--ha-primary-X` becomes
+  `--hot-standby-primary-X`, and every other `--ha-X` becomes
+  `--hot-standby-X`. The `--ha-*` spellings remain aliases for one minor
+  release; the operator keeps generating them for now.
+- **Data directory `standby/`** — `antfly standby --data-dir` now looks for
+  `standby/{primary.wal,slots,log.wal,progress.wal,fence.wal}` and falls back
+  to the pre-0.3 `ha/` tree. The server migrates an `ha/` tree to `standby/`
+  once at startup when its flags point at the new tree (directory rename plus
+  `standby.wal` -> `log.wal`, `standby-progress.wal` -> `progress.wal`; nothing
+  is deleted or overwritten). The operator switches a cluster's default pod
+  paths to `/antflydb/standby/` once it has seen the cluster's nodes speak the
+  0.3 admin API and records the choice in `status.haStatus.dataLayout`; new
+  clusters start on `standby/`.
+- **Server metrics `antfly_standby_*`** — every `antfly_ha_*` series is also
+  emitted under the new name for one minor release.
+- **OpenAPI tags and config schemas** — tags `standby` / `standby-replication`;
+  `HotStandbyPrimaryConfig` / `HotStandbyStandbyConfig`.
+- **`storage/hot_standby` package** — the Zig package moved from
+  `storage/ha`, the command source from `cmd/ha.zig` to `cmd/standby.zig`, and
+  the root alias from `antfly.ha` to `antfly.hot_standby`; test names and
+  build steps are `storage.hot_standby ...`, `standby cmd ...`, and
+  `antfly-storage-hot-standby-*`.
+- **Planned switchover** — `antfly standby switchover --to <standby>` fences the
+  old primary first, waits for the standby to reach the final LSN, fences and
+  promotes the standby with the same fence generation, assesses the old
+  primary's rejoin (reseed applied immediately, rewind pending its restart as
+  a standby), and repoints `--follower` standbys.
+- **`antfly standby follow`** and `POST /admin/v1/standby/upstream` — repoint a
+  running standby at a new primary without a restart, guarded by an expected
+  identity precondition; idempotent on retry. Also fixes a race where the
+  replication round read its upstream config outside the standby state mutex.
+- **Fence generation allocation** — `POST /admin/v1/standby/fence` no longer
+  requires `generation`; without a Kubernetes Lease authority the node
+  allocates the next generation, and an identical omitted-generation retry
+  returns the held receipt instead of double-fencing.
+- The `ha cmd` test root now runs all of its tests (the filter previously ran
+  7 of 35); tests that wrote to stdout under the build runner were the cause
+  of a hung `zig build`.
+
 - Relational packed base-row storage lands behind the relational table profile
 - HBC vector LSM replaced with native WAL-backed generations
 - Self-contained deterministic VOPR testing, with production HA promotion and scaling composed in simulation against retained corpora

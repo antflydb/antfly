@@ -34,7 +34,7 @@ DEFAULT_ROOTS = {
     "serverless": "serverless/mod.zig",
     "standalone": "standalone/mod.zig",
     "inference": "inference_runtime/runtime.zig",
-    "ha": "storage/ha/mod.zig",
+    "hot_standby": "storage/hot_standby/mod.zig",
     "lite": "storage/lite/mod.zig",
     "public_api": "api/mod.zig",
     "db": "storage/db/mod.zig",
@@ -43,7 +43,14 @@ DEFAULT_ROOTS = {
     "raft": "raft/mod.zig",
 }
 
-SERVER_ROLES = ("data", "metadata", "serverless", "standalone", "inference", "ha")
+SERVER_ROLES = (
+    "data",
+    "metadata",
+    "serverless",
+    "standalone",
+    "inference",
+    "hot_standby",
+)
 RUNTIME_BOUNDARIES = (
     "data/runtime.zig",
     "metadata/runtime.zig",
@@ -76,10 +83,10 @@ INFERENCE_ABI_FORBIDDEN_TOKENS = (
 # storage owner, so lexical transitive reachability is intentional; only a
 # direct import of the physical WAL bypasses the compiled ownership boundary.
 CONTROL_WAL_CONSUMERS = (
-    "storage/ha/replication_log.zig",
-    "storage/ha/standby.zig",
-    "storage/ha/fencing.zig",
-    "storage/ha/slot_store.zig",
+    "storage/hot_standby/replication_log.zig",
+    "storage/hot_standby/standby.zig",
+    "storage/hot_standby/fencing.zig",
+    "storage/hot_standby/slot_store.zig",
     "raft/storage/wal_replica_state.zig",
 )
 NATIVE_WAL_IMPLEMENTATION = "storage/wal.zig"
@@ -116,18 +123,18 @@ DISTRIBUTED_FORBIDDEN_STORAGE_FILES = (
     "storage/db/core.zig",
     "storage/db/catalog/index_manager.zig",
     "storage/db/enrichment/enrichment_runtime.zig",
-    "storage/ha/seed_activation.zig",
-    "storage/ha/seed_materialization.zig",
+    "storage/hot_standby/seed_activation.zig",
+    "storage/hot_standby/seed_materialization.zig",
     "storage/persistent.zig",
 )
 
 HA_SEED_FAILURE_SOURCE_FILES = (
-    "storage/ha/seed_activation.zig",
-    "storage/ha/seed_materialization.zig",
-    "storage/ha/seed_topology.zig",
-    "storage/ha/seed_artifact.zig",
-    "storage/ha/local_generation_gc.zig",
-    "storage/ha/lifecycle_receipt_ledger.zig",
+    "storage/hot_standby/seed_activation.zig",
+    "storage/hot_standby/seed_materialization.zig",
+    "storage/hot_standby/seed_topology.zig",
+    "storage/hot_standby/seed_artifact.zig",
+    "storage/hot_standby/local_generation_gc.zig",
+    "storage/hot_standby/lifecycle_receipt_ledger.zig",
 )
 
 # Deliberate test-only failures must remain unexpected provider defects rather

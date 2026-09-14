@@ -46,7 +46,7 @@ const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
-const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
+const ha_mutation_inventory = @import("../storage/hot_standby/mutation_inventory.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const connections_api = @import("connections.zig");
@@ -310,15 +310,21 @@ test "gzip request completes with combined encoded and decoded budget" {
 fn requiresInternalServicePrincipal(path: []const u8) bool {
     const in_internal_namespace = std.mem.eql(u8, path, internal_routes.base) or
         std.mem.startsWith(u8, path, internal_routes.base ++ "/");
-    const ha_exempt = std.mem.eql(u8, path, internal_routes.ha) or
-        std.mem.startsWith(u8, path, internal_routes.ha ++ "/");
-    return in_internal_namespace and !ha_exempt;
+    // Hot-standby replication authenticates with its own bearer token; the
+    // legacy `/internal/v1/ha` spelling stays exempt for one minor release.
+    const standby_exempt = std.mem.eql(u8, path, internal_routes.standby) or
+        std.mem.startsWith(u8, path, internal_routes.standby ++ "/") or
+        std.mem.eql(u8, path, internal_routes.legacy_standby) or
+        std.mem.startsWith(u8, path, internal_routes.legacy_standby ++ "/");
+    return in_internal_namespace and !standby_exempt;
 }
 
-test "internal namespace requires a service principal except HA" {
+test "internal namespace requires a service principal except hot standby" {
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1"));
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1/capabilities"));
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1/future-operation"));
+    try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/standby"));
+    try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/standby/replication/start"));
     try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/ha"));
     try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/ha/replication/start"));
     try std.testing.expect(!requiresInternalServicePrincipal("/tables/internal/v1"));
@@ -999,7 +1005,14 @@ pub const AntflyApiHandler = struct {
         try server.post(routes.agents_v1_extensions_prefix ++ "*", extension_agent_handler);
         try server.put(routes.agents_v1_extensions_prefix ++ "*", extension_agent_handler);
 
-        const ha_admin_paths = [_][]const u8{ admin_routes.ha, admin_routes.ha ++ "/*" };
+        // Canonical `/admin/v1/standby` and the pre-0.3 `/admin/v1/ha` alias;
+        // the hot-standby handler normalises the path before dispatch.
+        const ha_admin_paths = [_][]const u8{
+            admin_routes.standby,
+            admin_routes.standby ++ "/*",
+            admin_routes.legacy_standby_prefix,
+            admin_routes.legacy_standby_prefix ++ "/*",
+        };
         const ha_handler = httpx.Handler.bind(self, haRoute);
         inline for (ha_admin_paths) |path| {
             try server.get(path, ha_handler);
@@ -1014,7 +1027,12 @@ pub const AntflyApiHandler = struct {
         try self.registerRaftAdminRoutes(server);
         try server.delete(admin_routes.maintenance_jobs_prefix ++ "*", httpx.Handler.bind(self, cancelStorageMaintenanceJob));
 
-        const ha_internal_paths = [_][]const u8{ internal_routes.ha, internal_routes.ha ++ "/*" };
+        const ha_internal_paths = [_][]const u8{
+            internal_routes.standby,
+            internal_routes.standby ++ "/*",
+            internal_routes.legacy_standby,
+            internal_routes.legacy_standby ++ "/*",
+        };
         inline for (ha_internal_paths) |path| {
             try server.get(path, ha_handler);
             try server.post(path, ha_handler);
