@@ -540,19 +540,36 @@ def interleaved_schedule(iterations: int) -> list[str]:
 
 
 def bootstrap_ratio_ci(
-    antfly_ms: list[float], reference_ms: list[float], samples: int, seed: int
+    antfly_ms: list[float],
+    reference_ms: list[float],
+    samples: int,
+    seed: int,
+    *,
+    statistic: str = "mean",
 ) -> dict[str, float]:
     if len(antfly_ms) != len(reference_ms) or not antfly_ms:
         raise ValueError("bootstrap inputs must be non-empty and paired")
+    if samples < 1 or any(
+        not math.isfinite(x) or x <= 0 for x in antfly_ms + reference_ms
+    ):
+        raise ValueError("bootstrap requires positive finite latency samples")
+    reducers = {
+        "mean": statistics.fmean,
+        "median": statistics.median,
+        "p95": lambda values: percentile(list(values), 0.95),
+    }
+    if statistic not in reducers:
+        raise ValueError("unknown bootstrap statistic")
+    reduce = reducers[statistic]
     rng = random.Random(seed)
     ratios = []
     for _ in range(samples):
         indices = [rng.randrange(len(antfly_ms)) for _ in antfly_ms]
-        antfly_mean = statistics.fmean(antfly_ms[index] for index in indices)
-        reference_mean = statistics.fmean(reference_ms[index] for index in indices)
-        ratios.append(reference_mean / antfly_mean)
+        antfly_value = reduce(antfly_ms[index] for index in indices)
+        reference_value = reduce(reference_ms[index] for index in indices)
+        ratios.append(reference_value / antfly_value)
     return {
-        "estimate": statistics.fmean(reference_ms) / statistics.fmean(antfly_ms),
+        "estimate": reduce(reference_ms) / reduce(antfly_ms),
         "lower_95": percentile(ratios, 0.025),
         "upper_95": percentile(ratios, 0.975),
     }
