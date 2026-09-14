@@ -421,6 +421,8 @@ pub const Status = enum(u32) {
     transaction_too_large = 463,
     unsupported_operation = 464,
     read_index_timeout = 465,
+    index_rebuilding = 466,
+    incomplete_published_snapshot = 467,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
