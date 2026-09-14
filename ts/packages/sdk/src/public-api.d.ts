@@ -1292,6 +1292,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/repair/control-jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a durable index control job
+         * @description Applies pause, resume, or attempt cancellation across all table groups.
+         *     Traversal is durable and server-owned. The resulting repair job can be
+         *     inspected or cancelled with the regular repair job endpoints. Cancelling
+         *     a control job stops remaining passes without undoing applied controls.
+         *     This distinct endpoint prevents older servers from interpreting a control
+         *     request as ordinary repair work.
+         */
+        post: operations["startTableRepairControlJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/repair/jobs/{jobId}": {
         parameters: {
             query?: never;
@@ -4180,7 +4208,7 @@ export interface components {
              * @description Effective repair limit.
              */
             limit: number;
-            /** @description Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor. */
+            /** @description Opaque cursor for the next artifact repair pass when has_more is true. Named-index operations may return a continuation cursor when table groups remain. */
             next_cursor?: string | null;
             /** @description Whether another repair scan page is available via next_cursor. */
             has_more: boolean;
@@ -4225,6 +4253,30 @@ export interface components {
              */
             advance?: boolean;
         };
+        /** @description Starts a durable named-index control traversal. The server advances every bounded pass, including after restart. Use the repair job status and cancellation endpoints to inspect or stop the traversal. */
+        TableRepairControlJobStartRequest: {
+            /** @description Index to control across the table. */
+            index: string;
+            /**
+             * @description Durable named-index control applied in bounded server-owned passes across every table group.
+             * @enum {string}
+             */
+            control: "pause_automatic" | "resume_automatic" | "cancel_current_attempt";
+            /** @description Decimal repair attempt fence, preserved across every pass. A stale fence fails the control job. */
+            repair_id?: string;
+            /** @description Opaque continuation cursor from a prior bounded control response. */
+            cursor?: string;
+            /**
+             * Format: uint32
+             * @default 100
+             */
+            limit?: number;
+            /**
+             * @description Attempt the first bounded pass immediately. Remaining passes always run server-side.
+             * @default true
+             */
+            advance?: boolean;
+        };
         /** @description Durable table repair job state. */
         TableRepairJob: {
             /**
@@ -4253,6 +4305,13 @@ export interface components {
             kind?: components["schemas"]["ArtifactRepairKind"];
             /** @description Index name when the job is restricted to one index. */
             index?: string;
+            /**
+             * @description Durable named-index control applied in bounded server-owned passes across every table group.
+             * @enum {string}
+             */
+            control?: "pause_automatic" | "resume_automatic" | "cancel_current_attempt";
+            /** @description Decimal repair attempt fence, preserved across every pass. A stale fence fails the control job. */
+            repair_id?: string;
             /** @description Opaque continuation cursor for the next bounded repair pass. */
             cursor?: string | null;
             /**
@@ -4265,8 +4324,13 @@ export interface components {
             result: components["schemas"]["TableRepairRunResult"];
             /** @description Last stable job-level error code. */
             last_error?: string | null;
-            /** @description Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes. */
+            /** @description Whether cancellation is pending. For a named-index repair/rebuild job, cancellation durably pauses the matching repair in every group. Cancelling a control job stops remaining passes without undoing controls already applied. */
             cancel_requested: boolean;
+            /**
+             * Format: uint64
+             * @description Unix epoch milliseconds when a deferred pass may next run; zero means immediately eligible.
+             */
+            next_retry_at_millis?: number;
             /**
              * Format: uint64
              * @description Unix epoch milliseconds when the job was created.
@@ -18235,6 +18299,46 @@ export interface operations {
         requestBody?: {
             content: {
                 "application/json": components["schemas"]["TableRepairJobStartRequest"];
+            };
+        };
+        responses: {
+            /** @description Job completed during the initial advance. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            /** @description Repair job accepted or advanced but not terminal. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    startTableRepairControlJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TableRepairControlJobStartRequest"];
             };
         };
         responses: {

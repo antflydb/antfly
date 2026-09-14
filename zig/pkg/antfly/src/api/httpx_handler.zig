@@ -6010,6 +6010,20 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
+    pub fn startTableRepairControlJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (ctx.request.uri.query) |query| {
+            if (query.len != 0) return textResponse(ctx, 400, "repair job requests use json body");
+        }
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const body_data = (try ctx.body()) orelse "";
+        var response = try self.api_server.handlePublicStartTableRepairControlJob(decoded_table_name, body_data);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
     pub fn getTableRepairJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -8502,6 +8516,14 @@ test "httpx storage maintenance routes call typed operations directly" {
     try std.testing.expectEqual(@as(u16, 200), status_response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, status_response.body.?, "\"engine\":\"lite\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_response.body.?, "\"vacuum\":true") != null);
+
+    // Exercise generated public routing/admission on a node without writes.
+    // Table-admin permission for this route is checked in the API owner tests.
+    const control_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/repair/control-jobs", .{base_url});
+    defer alloc.free(control_url);
+    var control_unsupported = try requestWithRetry(&client, client_io.io(), .POST, control_url, "{\"index\":\"dense\",\"control\":\"pause_automatic\"}", null, 20);
+    defer control_unsupported.deinit();
+    try std.testing.expectEqual(@as(u16, 405), control_unsupported.status.code);
 
     const check_url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, admin_routes.maintenance_check });
     defer alloc.free(check_url);

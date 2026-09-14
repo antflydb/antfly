@@ -25,6 +25,7 @@ fn region(comptime source: []const u8, comptime begin: []const u8, comptime end:
 }
 
 const replayable_sources = [_]Source{
+    .{ .path = "vopr/index_maintenance.zig", .bytes = @embedFile("index_maintenance.zig") },
     .{ .path = "vopr/admission.zig", .bytes = @embedFile("admission.zig") },
     .{ .path = "vopr/auth_lifecycle.zig", .bytes = @embedFile("auth_lifecycle.zig") },
     .{ .path = "vopr/backfill_marker_discovery.zig", .bytes = @embedFile("backfill_marker_discovery.zig") },

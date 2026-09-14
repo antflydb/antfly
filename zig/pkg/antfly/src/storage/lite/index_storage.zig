@@ -49,6 +49,7 @@ pub const Store = struct {
         .rename_absolute = renameAbsolute,
         .delete_file_absolute = deleteFileAbsolute,
         .delete_tree = deleteTree,
+        .list_file_names_alloc = listFileNamesAlloc,
         .sync_contents_absolute = syncContentsAbsolute,
         .sync_parent_absolute = syncParentAbsolute,
         .now_ns = nowNs,
@@ -237,6 +238,32 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     try self.docs.file.putIndexCatalogBatch(mutations.items);
 }
 
+fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
+    try validateIndexPath(self, directory);
+    lockStore(self.docs);
+    defer self.docs.mutex.unlock();
+
+    // Enumerate current keys without reading file payloads. The snapshot
+    // resolves overwrites and tombstones under the same checkpoint lock.
+    const keys = try self.docs.file.snapshotIndexCatalogKeysAlloc(allocator);
+    defer native.NativeFile.freeSnapshotCatalogKeys(allocator, keys);
+    var names = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    for (keys) |record| {
+        const parent = std.fs.path.dirname(record.key) orelse continue;
+        if (!std.mem.eql(u8, parent, directory)) continue;
+        const name = try allocator.dupe(u8, std.fs.path.basename(record.key));
+        errdefer allocator.free(name);
+        try names.append(allocator, name);
+    }
+    return try names.toOwnedSlice(allocator);
+}
+
 fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
@@ -403,6 +430,45 @@ test "lite native index storage persists logical files across reopen" {
         defer allocator.free(range);
         try std.testing.expectEqualStrings("cdef", range);
     }
+}
+
+test "lite native index storage lists immediate live files within its namespace" {
+    const alloc = std.testing.allocator;
+    var fixture = try @import("../../common/test_directory.zig").TestDirectory.init("listing.aflite");
+    defer fixture.cleanup();
+    {
+        var docs = try docstore.Store.create(alloc, fixture.path(), true);
+        defer docs.close();
+        var indexes = Store.init(alloc, &docs);
+        const storage = indexes.storage();
+        for ([_][]const u8{ "/a/blocks/live", "/a/blocks/deleted", "/a/blocks/renamed", "/a/blocks/nested/child", "/a/blocks-other/sibling", "/b/blocks/other" }) |path|
+            try storage.writeFileAbsolute(path, "data");
+        try storage.writeFileAbsolute("/a/blocks/live", "replacement");
+        try storage.deleteFileAbsolute("/a/blocks/deleted");
+        try storage.renameAbsolute("/a/blocks/renamed", "/a/blocks/moved");
+    }
+    // Listing works on a read-only checkpoint and does not resurrect old keys.
+    var docs = try docstore.Store.open(alloc, fixture.path(), true);
+    defer docs.close();
+    const before = docs.file.activeCheckpoint().commit_sequence;
+    var indexes = Store.initWithNamespace(alloc, &docs, "/a");
+    const storage = indexes.storage();
+    const Check = struct {
+        fn run(a: Allocator, s: StorageIo) !void {
+            const names = try s.listFileNamesAlloc(a, "/a/blocks/");
+            defer StorageIo.freeFileNames(a, names);
+            try std.testing.expectEqual(@as(usize, 2), names.len);
+            try std.testing.expectEqualStrings("live", names[0]);
+            try std.testing.expectEqualStrings("moved", names[1]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{storage});
+    const empty = try storage.listFileNamesAlloc(alloc, "/a/missing");
+    defer StorageIo.freeFileNames(alloc, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.listFileNamesAlloc(alloc, "/b/blocks"));
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.listFileNamesAlloc(alloc, "/a/../b"));
+    try std.testing.expectEqual(before, docs.file.activeCheckpoint().commit_sequence);
 }
 
 test "lite native index storage root identity is physical and namespaced" {

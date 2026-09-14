@@ -11224,6 +11224,64 @@ pub const TableMigration = struct {
     }
 };
 
+/// Starts a durable named-index control traversal. The server advances every bounded pass, including after restart. Use the repair job status and cancellation endpoints to inspect or stop the traversal.
+pub const TableRepairControlJobStartRequest = struct {
+    /// Index to control across the table.
+    index: []const u8,
+    /// Durable named-index control applied in bounded server-owned passes across every table group.
+    control: []const u8,
+    /// Decimal repair attempt fence, preserved across every pass. A stale fence fails the control job.
+    repair_id: ?[]const u8 = null,
+    /// Opaque continuation cursor from a prior bounded control response.
+    cursor: ?[]const u8 = null,
+    limit: ?i64 = null,
+    /// Attempt the first bounded pass immediately. Remaining passes always run server-side.
+    advance: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "control", "control", false },
+        .{ "repair_id", "repair_id", true },
+        .{ "cursor", "cursor", true },
+        .{ "limit", "limit", true },
+        .{ "advance", "advance", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("control");
+        try jw.write(self.control);
+        if (self.repair_id) |value| {
+            try jw.objectField("repair_id");
+            try jw.write(value);
+        }
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.advance) |value| {
+            try jw.objectField("advance");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status.
 pub const TableRepairIssue = struct {
     artifact_kind: ArtifactRepairKind,
@@ -11432,6 +11490,10 @@ pub const TableRepairJob = struct {
     kind: ?ArtifactRepairKind = null,
     /// Index name when the job is restricted to one index.
     index: ?[]const u8 = null,
+    /// Durable named-index control applied in bounded server-owned passes across every table group.
+    control: ?[]const u8 = null,
+    /// Decimal repair attempt fence, preserved across every pass. A stale fence fails the control job.
+    repair_id: ?[]const u8 = null,
     /// Opaque continuation cursor for the next bounded repair pass.
     cursor: OpenApiOptionalNullable([]const u8) = .absent,
     /// Effective per-pass repair limit.
@@ -11441,8 +11503,10 @@ pub const TableRepairJob = struct {
     result: TableRepairRunResult,
     /// Last stable job-level error code.
     last_error: OpenApiOptionalNullable([]const u8) = .absent,
-    /// Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes.
+    /// Whether cancellation is pending. For a named-index repair/rebuild job, cancellation durably pauses the matching repair in every group. Cancelling a control job stops remaining passes without undoing controls already applied.
     cancel_requested: bool,
+    /// Unix epoch milliseconds when a deferred pass may next run; zero means immediately eligible.
+    next_retry_at_millis: ?i64 = null,
     /// Unix epoch milliseconds when the job was created.
     created_at_millis: i64,
     /// Unix epoch milliseconds when the job state was last updated.
@@ -11460,12 +11524,15 @@ pub const TableRepairJob = struct {
         .{ "target", "target", false },
         .{ "kind", "kind", true },
         .{ "index", "index", true },
+        .{ "control", "control", true },
+        .{ "repair_id", "repair_id", true },
         .{ "cursor", "cursor", false },
         .{ "limit", "limit", false },
         .{ "force", "force", false },
         .{ "result", "result", false },
         .{ "last_error", "last_error", false },
         .{ "cancel_requested", "cancel_requested", false },
+        .{ "next_retry_at_millis", "next_retry_at_millis", true },
         .{ "created_at_millis", "created_at_millis", false },
         .{ "last_updated_at_millis", "last_updated_at_millis", false },
         .{ "expires_at_millis", "expires_at_millis", false },
@@ -11501,6 +11568,14 @@ pub const TableRepairJob = struct {
             try jw.objectField("index");
             try jw.write(value);
         }
+        if (self.control) |value| {
+            try jw.objectField("control");
+            try jw.write(value);
+        }
+        if (self.repair_id) |value| {
+            try jw.objectField("repair_id");
+            try jw.write(value);
+        }
         switch (self.cursor) {
             .absent => {},
             .null_value => {
@@ -11531,6 +11606,10 @@ pub const TableRepairJob = struct {
         }
         try jw.objectField("cancel_requested");
         try jw.write(self.cancel_requested);
+        if (self.next_retry_at_millis) |value| {
+            try jw.objectField("next_retry_at_millis");
+            try jw.write(value);
+        }
         try jw.objectField("created_at_millis");
         try jw.write(self.created_at_millis);
         try jw.objectField("last_updated_at_millis");
@@ -11649,7 +11728,7 @@ pub const TableRepairRunResult = struct {
     controls_applied: i64,
     /// Effective repair limit.
     limit: i64,
-    /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
+    /// Opaque cursor for the next artifact repair pass when has_more is true. Named-index operations may return a continuation cursor when table groups remain.
     next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
     /// Whether another repair scan page is available via next_cursor.
     has_more: bool,

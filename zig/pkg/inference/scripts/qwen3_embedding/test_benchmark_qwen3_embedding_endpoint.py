@@ -128,6 +128,22 @@ class StatsTests(unittest.TestCase):
         self.assertEqual(0.5, first["lower_95"])
         self.assertEqual(0.5, first["upper_95"])
 
+    def test_bootstrap_median_and_tail_preserve_pairing_under_drift(self) -> None:
+        baseline = [10.0, 20.0, 80.0, 100.0, 200.0]
+        candidate = [x / 2 for x in baseline]
+        for statistic in ("median", "p95"):
+            result = benchmark.bootstrap_ratio_ci(
+                candidate, baseline, 100, 7, statistic=statistic
+            )
+            self.assertEqual(
+                {"estimate": 2.0, "lower_95": 2.0, "upper_95": 2.0}, result
+            )
+
+    def test_bootstrap_rejects_invalid_latencies(self) -> None:
+        for value in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                benchmark.bootstrap_ratio_ci([value], [1.0], 100, 7)
+
 
 class CosineTests(unittest.TestCase):
     def test_identical_vectors_have_unit_cosine(self) -> None:
@@ -436,7 +452,7 @@ class FixtureTests(unittest.TestCase):
         cases = benchmark.load_fixture(path)
         by_length = {
             length: benchmark.select_fixture_token_count(cases, length)
-            for length in (511, 2551)
+            for length in (20, 256, 511, 2551, 4096, 8192)
         }
         self.assertEqual(24, len(by_length[511]))
         self.assertEqual(24, len(by_length[2551]))

@@ -89,6 +89,7 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "queryTable", .class = .query },
     .{ .operation_id = "listTableRepairIssues", .class = .none },
     .{ .operation_id = "startTableRepairJob", .class = .none },
+    .{ .operation_id = "startTableRepairControlJob", .class = .none },
     .{ .operation_id = "getTableRepairJob", .class = .none },
     .{ .operation_id = "advanceTableRepairJob", .class = .none },
     .{ .operation_id = "cancelTableRepairJob", .class = .none },

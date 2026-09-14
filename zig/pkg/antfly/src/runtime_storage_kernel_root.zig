@@ -37,14 +37,6 @@ fn liteEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "lite", runLite);
 }
 
-fn runGraphMetricMaintenance(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
-    return @import("cmd/graph_metric_maintenance.zig").runFromIterator(init, "antfly", args);
-}
-
-fn graphMetricMaintenanceEntry(context: *const bridge.Context) callconv(.c) c_int {
-    return runtimeEntry(context, "graph_metric_maintenance", runGraphMetricMaintenance);
-}
-
 comptime {
     // The kernel owns physical DB and local-query compilation plus
     // the C API. Product-mode orchestration stays in the distributed
@@ -53,7 +45,6 @@ comptime {
     _ = storage_kernel_exports;
     exportInternal(&storage_kernel_exports.storageOwnerMergeArtifactsPage, "antfly_storage_owner_merge_artifacts_page");
     exportInternal(&liteEntry, "antfly_runtime_lite");
-    exportInternal(&graphMetricMaintenanceEntry, "antfly_runtime_graph_metric_maintenance");
     exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
     exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
     exportInternal(&@import("storage/db/enrichment/enrichment_types.zig").interactiveActivity, "antfly_storage_interactive_activity");
