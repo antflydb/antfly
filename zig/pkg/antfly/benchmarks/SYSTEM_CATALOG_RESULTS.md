@@ -1659,3 +1659,42 @@ Merged validation: 54 catalog/resolution/standby E2Es passed in 176.88 seconds;
 tests, and both production DataServer simulations passed. The simulations cover
 public writes, failover, restart, split, and merge. Worker regressions and generated
 file checks passed. Hosted CI status is reported separately on the PR.
+
+
+## Reporting worker and schema migration progress — 2026-09-14
+
+Source `64a11bf6d44082967e3c9fc86671b0eae5de033e`, based on main
+`3554f821010a7e4b9ac01b30378322ef79abb53f`; local macOS arm64, Debug.
+[Raw samples, commands, executable hashes, and limitations](system_catalog_reporter_workloads_2026_09_14.json)
+are retained. Benchmark commands ran sequentially after validation, with no
+concurrent task-owned builds or E2Es.
+
+| Component workload | Comparison median | New path median |
+| --- | ---: | ---: |
+| Unchanged heartbeat, 1,000 groups × 32 indexes | Full-runtime preparation: 4.552 ms | Retained: 0.922 ms |
+| One changed group, 1,000 groups × 32 indexes | Full-runtime preparation: 4.393 ms | Retained: 0.877 ms |
+| Unchanged heartbeat, 10,000 groups × 32 indexes | Full-runtime preparation: 47.066 ms | Retained: 10.431 ms |
+| One changed group, 10,000 groups × 32 indexes | Full-runtime preparation: 47.542 ms | Retained: 8.294 ms |
+| Migration readiness, 100 tables / 2,000 groups | Former nested scan: 1,610.391 ms | Indexed: 63.639 ms |
+
+Heartbeat preparation uses one warmup and nine samples per case, with
+`c_allocator`. It measures preparation only and checks the number of replacement
+leaves. The comparison uses ordinary full-runtime preparation in the **new** binary,
+including its activity scan; it is not an exact old/new retained-heartbeat comparison.
+The fixture repeats 32 index descriptors per group. HTTP, Raft, destruction, and
+fixture construction are excluded.
+
+Schema readiness uses one warmup and five paired samples with
+`std.testing.allocator`. The former scan is retained as a reference and every
+result is checked for equality. The indexed collector is **25.3× faster** in this
+case, including schema parsing and map construction. Result destruction, HTTP,
+Raft, and document rebuilding are excluded. The 100 ready records require two
+batches under the 64-record bound; after replicated acknowledgement, the delta is
+empty and sends no request. These request counts are derived from the algorithm.
+
+Functional validation on the rebuilt server passed seven cluster/migration E2Es
+in 61.44 seconds, including rebuilding existing documents under a new schema,
+64-record batch apply/replay, invalid batches, and the 16 KiB HTTP body limit.
+Both production DataServer simulations and 11 reporting/snapshot regressions
+passed without leaks. The catalog storage, API, and progress targets and generated
+consistency checks passed. Functional durations are not production latency claims.

@@ -464,3 +464,31 @@ intents. Both implementations must produce identical results. The timed indexed
 path includes building and freeing its map; setup and equality checks are outside
 the interval. One warmup precedes five samples. This isolates annotation CPU cost
 and excludes collection I/O, network, and hosted Raft processing.
+
+
+## Wide heartbeat inventories and concurrent schema migrations
+
+```sh
+ANTFLY_CATALOG_REPORT_BENCH=1 zig build antfly-system-catalog-report-bench
+ANTFLY_CATALOG_REPORT_BENCH=1 zig build antfly-system-catalog-progress-test
+```
+
+Run these sequentially without competing builds or server workloads. The reporting
+target includes unchanged and single-group-change heartbeats at 1,000 and 10,000
+groups with 32 indexes per group. It compares full-runtime preparation with retained
+immutable runtime leaves in the same binary, using one warmup and nine samples.
+The progress target models 100 migrating tenant tables across 2,000 hosted groups:
+it checks indexed readiness against the former nested scan and verifies that
+replicated acknowledgements suppress unchanged progress while missing or stale
+acknowledgements are resent. It uses one warmup and five samples. Both are component
+benchmarks; see the recorded results for allocator choices and timing boundaries.
+
+The real-workflow correctness companion uses existing documents and checks schema
+rebuild/cutover, plus bounded batch acknowledgement through a three-metadata,
+three-data-node cluster:
+
+```sh
+ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest \
+  e2e/antfly/test_schema_migration.py \
+  e2e/antfly/test_catalog_resilience.py
+```
