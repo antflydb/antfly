@@ -5944,7 +5944,9 @@ pub const HttpHandler = struct {
             const build_result = self.catalog.buildTableWithCancellation(table_name, sync_cancellation) catch |err| switch (err) {
                 error.Canceled => return error.CommittedPending,
                 error.NamespaceNotFound => return error.CommittedRepairRequired,
-                error.HeadChanged => null,
+                // Background publication may own or take over the lease.
+                // Observe its progress and retry within the same sync deadline.
+                error.HeadChanged, error.WorkLeaseLost => null,
                 else => {
                     std.log.err("serverless public table batch build failed table={s} sync_level={} err={}", .{ table_name, sync_level, err });
                     return error.CommittedRepairRequired;
@@ -13364,9 +13366,42 @@ test "http handler honors public serverless sync levels on table batch writes" {
     var manifest_store = fs_manifests.manifestStore();
     defer manifest_store.deinit();
 
-    var fs_progress = try @import("../catalog/fs_progress_store.zig").FsProgressStore.init(alloc, std.mem.span(manifest_root));
-    var progress_store = fs_progress.progressStore();
+    const ContendedProgress = struct {
+        const FsProgressStore = @import("../catalog/fs_progress_store.zig").FsProgressStore;
+        const Lease = build_mod.work_lease;
+
+        fs: FsProgressStore,
+        lease_vtable: Lease.Provider.VTable = undefined,
+        denied_acquisitions: usize = 0,
+
+        fn leaseProvider(ptr: *anyopaque) Lease.Provider {
+            const fs: *FsProgressStore = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("fs", fs);
+            return .{ .ptr = ptr, .vtable = &self.lease_vtable };
+        }
+
+        fn acquire(ptr: *anyopaque, namespace: []const u8, owner: []const u8, now: u64, ttl: u64) !?Lease.Acquisition {
+            const fs: *FsProgressStore = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("fs", fs);
+            if (self.denied_acquisitions > 0) {
+                self.denied_acquisitions -= 1;
+                return null;
+            }
+            var base = fs.progressStore();
+            const provider = try base.workLeaseProvider();
+            return provider.acquire(namespace, owner, now, ttl);
+        }
+    };
+    var progress_fixture = ContendedProgress{
+        .fs = try ContendedProgress.FsProgressStore.init(alloc, std.mem.span(manifest_root)),
+    };
+    var progress_store = progress_fixture.fs.progressStore();
     defer progress_store.deinit();
+    progress_fixture.lease_vtable = (try progress_store.workLeaseProvider()).vtable.*;
+    progress_fixture.lease_vtable.acquire = ContendedProgress.acquire;
+    var progress_vtable = progress_store.vtable.*;
+    progress_vtable.work_lease_provider = ContendedProgress.leaseProvider;
+    progress_store.vtable = &progress_vtable;
 
     var fs_wal = try @import("../wal/mod.zig").FsStore.init(alloc, std.mem.span(wal_root));
     var wal_store = fs_wal.walStore();
@@ -13399,6 +13434,9 @@ test "http handler honors public serverless sync levels on table batch writes" {
     defer create_docs.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), create_docs.status);
 
+    // A background publisher owns the lease during the first two attempts.
+    // The batch must wait for publication instead of returning repair_required.
+    progress_fixture.denied_acquisitions = 2;
     var full_text_batch = try handler.handle(.{
         .method = .post,
         .path = "/tables/docs/batch",
@@ -13408,6 +13446,7 @@ test "http handler honors public serverless sync levels on table batch writes" {
     });
     defer full_text_batch.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), full_text_batch.status);
+    try std.testing.expectEqual(@as(usize, 0), progress_fixture.denied_acquisitions);
 
     var search = try handler.handle(.{
         .method = .post,
