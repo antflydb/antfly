@@ -10360,3 +10360,65 @@ remove new debt. Owner/root/catalog identity checks and observation publication
 fences remain enforced. Focused tests cover foreground admission, structural
 writer preference, deferred retry retention and eventual completion. All six owner-source suite checks pass with no leaks. Saved-workload recovery
 and fresh same-binary comparison qualification are pending; this change does not promote vector-store ownership to the default.
+
+
+#### Completed fresh ownership comparison after admission repair
+
+The pinned `5a90e99d6e` binary passed all eight fresh arms: 50K and 1M,
+LSM/vector-store and vector-store/LSM order. Every workload, strict request-error
+gate, restart and reclamation check passed. Before timing, six owner-source tests,
+two unsampled 60-second saved mixed workloads across restart, three vector-store
+restart/automatic-GC checks and two LSM restart/concurrent-query checks passed.
+The saved mixed runs completed 25,935 queries and 424,300 written rows without
+request errors. This fixes the reproduced foreground admission failure; changing
+HTTP error classification alone was not accepted as qualification.
+
+Both modes use the same binary and explicit common ANN settings, float32 serving
+encoding, durability, batch size, concurrency and recall policy. The tables are
+fresh, single-shard standalone tables on the available host. The 50K dataset is
+OpenAI 1536D; the 1M dataset is Cohere 768D. Their absolute QPS is not comparable
+as a size-only scaling result. Two runs per mode provide paired evidence, not a
+confidence interval. Full results and receipts are in
+[the comparison report](../.benchmark-results/vector-store-owner-admission-20260914/RESULTS.md).
+
+| 1M pair/order | Ownership | Readiness s | Peak QPS | Mixed QPS | Mixed write rows/s | Mixed query p99 ms |
+|---|---|---:|---:|---:|---:|---:|
+| 1 / AB | primary_lsm | 273.25 | 1144.2 | 211.29 | 4031.5 | 104.30 |
+| 1 / AB | vector_store | 247.44 | 1210.3 | 232.80 | 3977.6 | 95.38 |
+| 2 / BA | vector_store | 265.38 | 1225.6 | 225.02 | 3948.8 | 100.64 |
+| 2 / BA | primary_lsm | 264.22 | 1141.9 | 189.00 | 3674.9 | 113.90 |
+
+At 1M, vector-store peak QPS improves 5.8%/7.3%, mixed query QPS improves
+10.2%/19.1%, and mixed query p99 improves 8.6%/11.6%. Readiness improves 9.4%
+in the first pair and is essentially equal in the second (+0.4%). Recall stays
+at 0.9901–0.9904. Total allocated disk after restart, including journals, falls
+43.4% in both pairs: LSM uses 6.74–6.77 GiB and vector-store 3.82–3.84 GiB.
+Maximum observed server RSS falls about 28% in both pairs, from 9.35/10.06 GiB
+with LSM to 6.71/7.25 GiB with vector-store. These RSS figures use the continuous
+resource sampler. The separate footprint demand metric has one sample per arm
+and must not be presented as an ingestion peak. Kernel-reported lifetime
+footprint is 5.18/4.76 GiB for LSM and 1.13/1.15 GiB for vector-store.
+
+The remaining tradeoffs are measurable. At 50K, vector-store uses 47–49% less
+disk, but peak QPS changes +5.8%/-22.5% and mixed query QPS changes -4.1%/-1.3%.
+At 1M, fixed-count update/delete churn is 4.4%/15.5% slower. Reclamation settles
+in 149/155 seconds with vector-store versus about 33 seconds with LSM, including
+the gate's stability observation period. Each vector-store collection reads
+3,072,000,000 bytes and writes 3,192,012,800 bytes, marks 29,080,108 rows across
+its passes, and finishes with exactly 1M retained payloads and zero unreferenced
+payload bytes at the final collection. Completion proves reclamation works;
+it does not remove the full-rewrite cost. The controlled enrichment workload
+also remains a tradeoff: updated embedding readiness is 1.12/1.90 seconds for
+vector-store versus 1.00/1.04 seconds for LSM in the 1M arms.
+
+The post-mixed 50K profiles identify a concrete follow-up: the two vector-store
+runs perform almost identical scoring work, but resolve 0.225 versus 45.939
+metadata entries per query. Average rerank vector loading rises from 0.245 to
+1.496 ms while leaf scoring remains about 0.978 ms. These profiles run after
+mixed updates and do not prove the cause of the earlier read-only peak-QPS
+difference. Trace why the resolved fast path misses while preserving exact
+generation/identity validation, then qualify any change against the saved data.
+For GC, isolate copy/mark work and scheduling delays before selecting a different
+policy. The large-table result favors vector-store, but the small-table lookup
+variability and reclamation cost remain targets before blanket default promotion.
+`primary_lsm` remains the creation default.
