@@ -1046,9 +1046,9 @@ components:
         identity:
           $ref: "#/components/schemas/HotStandbyIdentityConfig"
         primary:
-          $ref: "#/components/schemas/HotStandbyPrimaryRoleConfig"
+          $ref: "#/components/schemas/HotStandbyPrimaryConfig"
         standby:
-          $ref: "#/components/schemas/HotStandbyStandbyRoleConfig"
+          $ref: "#/components/schemas/HotStandbyStandbyConfig"
         sync:
           $ref: "#/components/schemas/HotStandbySyncConfig"
         retention:
@@ -1114,7 +1114,7 @@ components:
           format: int64
           minimum: 1
           description: "Current epoch (`--ha-epoch`)."
-    HotStandbyPrimaryRoleConfig:
+    HotStandbyPrimaryConfig:
       type: object
       additionalProperties: false
       description: "Primary-role state. Setting `log` and `slots` enables the primary hot-standby role."
@@ -1131,7 +1131,7 @@ components:
         seed_capture_root:
           type: string
           description: "Runtime-owned immutable seed generation root (`--ha-seed-capture-root`)."
-    HotStandbyStandbyRoleConfig:
+    HotStandbyStandbyConfig:
       type: object
       additionalProperties: false
       description: "Standby-role state. Setting `log` and `progress` enables the standby hot-standby role."

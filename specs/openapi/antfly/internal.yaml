@@ -13,13 +13,13 @@ servers:
   - url: /internal/v1
     description: Node-local internal API
 tags:
-  - name: ha-replication
-    x-displayName: HA Replication
+  - name: standby-replication
+    x-displayName: Hot Standby Replication
     description: Runtime-to-runtime hot-standby replication protocol.
 paths:
   /standby/replication/identify:
     get:
-      tags: [ha-replication]
+      tags: [standby-replication]
       operationId: identifyHAReplicationSystem
       summary: Identify this primary replication system
       responses:
@@ -33,7 +33,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/replication/slots:
     post:
-      tags: [ha-replication]
+      tags: [standby-replication]
       operationId: createHAReplicationStreamingSlot
       summary: Create or reserve a runtime replication slot
       requestBody:
@@ -55,9 +55,9 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/replication/start:
     post:
-      tags: [ha-replication]
+      tags: [standby-replication]
       operationId: startHAReplication
-      summary: Pull ordered HA replication records from a slot
+      summary: Pull ordered hot-standby replication records from a slot
       requestBody:
         required: true
         content:
@@ -79,7 +79,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/replication/status:
     post:
-      tags: [ha-replication]
+      tags: [standby-replication]
       operationId: updateHAStandbyStatus
       summary: Report durable receive and apply progress for a standby slot
       requestBody:
@@ -124,7 +124,7 @@ components:
   schemas:
     StandbyIdentifier:
       type: string
-      description: Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+      description: Stable hot-standby node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
       minLength: 1
       maxLength: 128
       pattern: "^[A-Za-z0-9_.:-]+$"

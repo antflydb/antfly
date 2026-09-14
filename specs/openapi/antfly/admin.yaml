@@ -7,7 +7,7 @@ info:
 
     This API is separate from the public `/db/v1` API and from node-to-node
     `/internal/v1` RPCs. Kubernetes operators, automation, and CLIs should use
-    this surface for typed HA control-plane operations.
+    this surface for typed hot-standby control-plane operations.
 servers:
   - url: /admin/v1
     description: Node-local admin API
@@ -17,9 +17,9 @@ tags:
   - name: maintenance
     x-displayName: Storage Maintenance
     description: Engine-neutral asynchronous storage inspection and reclamation.
-  - name: ha
-    x-displayName: High Availability
-    description: Hot-standby HA status and replication-slot management.
+  - name: standby
+    x-displayName: Hot Standby
+    description: Hot-standby status and replication-slot management.
 paths:
   /maintenance/check:
     post:
@@ -115,9 +115,9 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
   /standby/primary/status:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: getHAPrimaryStatus
-      summary: Get primary HA status
+      summary: Get primary hot-standby status
       parameters:
         - name: max_lag_lsn
           in: query
@@ -195,7 +195,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/watchdog-proof:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: getHAWatchdogProof
       summary: Get the runtime Lease watchdog capability proof
       description: >-
@@ -216,9 +216,9 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/status:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: getHAStandbyStatus
-      summary: Get standby HA status
+      summary: Get standby status
       parameters:
         - name: upstream_lsn
           in: query
@@ -241,7 +241,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/commit/check:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: checkHACommit
       summary: Evaluate synchronous commit durability for an existing LSN
       requestBody:
@@ -265,7 +265,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/commit/append:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: appendHACommit
       summary: Append a primary WAL/effects record and evaluate synchronous commit durability
       requestBody:
@@ -289,7 +289,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/read/check:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: checkHARead
       summary: Evaluate standby read freshness and routing
       requestBody:
@@ -313,7 +313,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/write/check:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: checkHAWrite
       summary: Evaluate whether this node can accept writes
       requestBody:
@@ -337,7 +337,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/owner-jobs/check:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: checkHAOwnerJob
       summary: Evaluate whether an owner-only background job may run
       requestBody:
@@ -361,9 +361,9 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/replication-slots:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: listHAReplicationSlots
-      summary: List HA replication slots
+      summary: List hot-standby replication slots
       responses:
         "200":
           description: Replication slot list.
@@ -376,9 +376,9 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: createHAReplicationSlot
-      summary: Create an HA replication slot
+      summary: Create a hot-standby replication slot
       requestBody:
         required: true
         content:
@@ -400,9 +400,9 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/replication-slots/{slot_name}:
     delete:
-      tags: [ha]
+      tags: [standby]
       operationId: dropHAReplicationSlot
-      summary: Drop an HA replication slot
+      summary: Drop a hot-standby replication slot
       parameters:
         - $ref: "#/components/parameters/SlotName"
       responses:
@@ -420,9 +420,9 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/replication-slots/{slot_name}/pause:
     put:
-      tags: [ha]
+      tags: [standby]
       operationId: pauseHAReplicationSlot
-      summary: Pause an HA replication slot
+      summary: Pause a hot-standby replication slot
       parameters:
         - $ref: "#/components/parameters/SlotName"
       responses:
@@ -440,9 +440,9 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/replication-slots/{slot_name}/resume:
     put:
-      tags: [ha]
+      tags: [standby]
       operationId: resumeHAReplicationSlot
-      summary: Resume an HA replication slot
+      summary: Resume a hot-standby replication slot
       parameters:
         - $ref: "#/components/parameters/SlotName"
       responses:
@@ -460,9 +460,9 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/base-backups:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: beginHABaseBackup
-      summary: Begin an HA base backup and reserve its replication slot
+      summary: Begin a hot-standby base backup and reserve its replication slot
       requestBody:
         required: true
         content:
@@ -484,9 +484,9 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/base-backups/finish:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: finishHABaseBackup
-      summary: Finish an HA base backup from a local manifest path
+      summary: Finish a hot-standby base backup from a local manifest path
       requestBody:
         required: true
         content:
@@ -508,7 +508,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/base-backups/capture:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: captureHASeedArtifact
       summary: Capture an immutable seed from runtime-owned primary storage
       requestBody:
@@ -532,9 +532,9 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/seed-lifecycle/receipts:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: getHASeedLifecycleReceipts
-      summary: Read durable runtime-owned HA seed lifecycle receipts
+      summary: Read durable runtime-owned hot-standby seed lifecycle receipts
       description: |
         Returns an authenticated, read-only cursor page from the runtime-owned
         append-only receipt ledger. `history_truncated` and `gap` make bounded
@@ -580,7 +580,7 @@ paths:
           description: Durable ledger or authoritative retained receipt is corrupt.
   /standby/base-backups/activate:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: activateHASeededSlot
       summary: Activate a seeded slot after durable target-generation publication
       requestBody:
@@ -604,7 +604,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/bootstrap:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: bootstrapHAStandby
       summary: Bootstrap this standby from a local base-backup manifest and copied files
       requestBody:
@@ -628,7 +628,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/upstream:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: setHAStandbyUpstream
       summary: Repoint a running standby at a different primary
       description: |
@@ -660,9 +660,9 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/fence:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: acquireHAFence
-      summary: Acquire a durable HA promotion fence
+      summary: Acquire a durable hot-standby promotion fence
       requestBody:
         required: true
         content:
@@ -684,9 +684,9 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/fence/current:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: getHACurrentFence
-      summary: Get the current durable HA promotion fence
+      summary: Get the current durable hot-standby promotion fence
       responses:
         "200":
           description: Current fence receipt, if any.
@@ -700,7 +700,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/promotion/assess:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: assessHAPromotion
       summary: Assess whether this standby can be promoted
       requestBody:
@@ -724,7 +724,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/promotion/current-fence:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: promoteHAWithCurrentFence
       summary: Promote this standby using the current durable fence receipt
       responses:
@@ -740,7 +740,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/promotion:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: promoteHA
       summary: Acquire a fence and promote this standby
       requestBody:
@@ -764,7 +764,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/rejoin/assess:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: assessHARejoin
       summary: Assess whether a former primary can safely rejoin
       requestBody:
@@ -786,7 +786,7 @@ paths:
           $ref: "#/components/responses/Unauthorized"
   /standby/rejoin/rewind:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: rewindHARejoin
       summary: Rewind a fenced former primary onto the promoted timeline
       requestBody:
@@ -810,7 +810,7 @@ paths:
           $ref: "#/components/responses/Conflict"
   /standby/rejoin/reseed:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: reseedHARejoin
       summary: Reseed a fenced former primary when rewind is unsafe
       requestBody:
@@ -859,7 +859,7 @@ components:
       name: slot_name
       in: path
       required: true
-      description: Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
+      description: Stable standby replication slot name. Path values are percent-encoded; names must be hot-standby identifiers.
       schema:
         $ref: "#/components/schemas/StandbySlotName"
   responses:
@@ -870,7 +870,7 @@ components:
           schema:
             type: string
     Conflict:
-      description: HA operation cannot be completed in the current state.
+      description: Hot-standby operation cannot be completed in the current state.
       content:
         text/plain:
           schema:
@@ -946,7 +946,7 @@ components:
         error: { type: string }
     StandbyIdentifier:
       type: string
-      description: Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+      description: Stable hot-standby node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
       minLength: 1
       maxLength: 128
       pattern: "^[A-Za-z0-9_.:-]+$"
@@ -957,7 +957,7 @@ components:
       maxLength: 128
       pattern: "^[A-Za-z0-9_.:-]+$"
     StandbyNodeID:
-      description: Stable HA node id.
+      description: Stable hot-standby node id.
       type: string
       minLength: 1
       maxLength: 128
@@ -994,7 +994,7 @@ components:
       properties:
         manifest_path:
           type: string
-          description: Absolute normalized pod-local path to the HA base-backup manifest.
+          description: Absolute normalized pod-local path to the hot-standby base-backup manifest.
           minLength: 1
     StandbyBootstrapRequest:
       type: object
@@ -1003,7 +1003,7 @@ components:
       properties:
         manifest_path:
           type: string
-          description: Absolute normalized pod-local path to the HA base-backup manifest.
+          description: Absolute normalized pod-local path to the hot-standby base-backup manifest.
           minLength: 1
         content_root:
           type: string
@@ -1366,12 +1366,12 @@ components:
           type: integer
           format: uint64
           minimum: 0
-          description: Shard identity. Use 0 for whole-instance HA scope.
+          description: Shard identity. Use 0 for whole-instance hot-standby scope.
         table_id:
           type: integer
           format: uint64
           minimum: 0
-          description: Table identity. Use 0 for whole-instance HA scope.
+          description: Table identity. Use 0 for whole-instance hot-standby scope.
         timeline_id:
           type: integer
           format: uint64
@@ -1695,7 +1695,7 @@ components:
         action_id:
           type: string
           minLength: 1
-          description: Stable action correlation id derived from the acted-on HA resource and boundary values.
+          description: Stable action correlation id derived from the acted-on hot-standby resource and boundary values.
         action_kind:
           type: string
           enum:
@@ -1715,7 +1715,7 @@ components:
             - rejoin_rewind
             - rejoin_reseed
             - standby_upstream
-          description: Typed HA action that produced this response.
+          description: Typed hot-standby action that produced this response.
         target:
           type: string
           minLength: 1

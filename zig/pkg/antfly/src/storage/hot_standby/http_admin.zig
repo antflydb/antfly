@@ -1403,9 +1403,9 @@ pub const Server = struct {
         if (expected_action) |expected| {
             if (assessment.action != expected) {
                 const message = switch (expected) {
-                    .rewind => "HA rejoin assessment does not allow rewind",
-                    .reseed => "HA rejoin assessment does not allow reseed",
-                    else => "HA rejoin assessment does not allow requested action",
+                    .rewind => "hot-standby rejoin assessment does not allow rewind",
+                    .reseed => "hot-standby rejoin assessment does not allow reseed",
+                    else => "hot-standby rejoin assessment does not allow requested action",
                 };
                 return try textResponse(self.alloc, 409, message);
             }

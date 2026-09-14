@@ -2215,25 +2215,26 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const ha_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby HA storage tests");
     ha_test_step.dependOn(&run_ha_tests.step);
 
-    // cmd/ha.zig is owned by the distributed runtime unit. Keep its focused
-    // parser root inside pkg/antfly/src so relative imports stay within the Zig
-    // module boundary, without pulling the command back into the CLI unit.
-    const ha_cli_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/ha_cmd_test_root.zig"),
+    // cmd/standby.zig is owned by the distributed runtime unit. Keep its
+    // focused parser root inside pkg/antfly/src so relative imports stay
+    // within the Zig module boundary, without pulling the command back into
+    // the CLI unit.
+    const standby_cli_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/standby_cmd_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
     // The root file-imports cli_root.zig, which reaches storage and runtime
     // sources that need the same module graph as the full test module.
-    test_imports.configure(b, ha_cli_test_mod, true, true);
-    ha_cli_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
-    ha_cli_test_mod.addImport("antfly-zig", antfly_mod);
-    const ha_cli_tests = b.addTest(.{
-        .root_module = ha_cli_test_mod,
-        .filters = &.{"ha cmd"},
+    test_imports.configure(b, standby_cli_test_mod, true, true);
+    standby_cli_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    standby_cli_test_mod.addImport("antfly-zig", antfly_mod);
+    const standby_cli_tests = b.addTest(.{
+        .root_module = standby_cli_test_mod,
+        .filters = &.{"standby cmd"},
     });
-    const run_ha_cli_tests = b.addRunArtifact(ha_cli_tests);
-    ha_test_step.dependOn(&run_ha_cli_tests.step);
+    const run_standby_cli_tests = b.addRunArtifact(standby_cli_tests);
+    ha_test_step.dependOn(&run_standby_cli_tests.step);
 
     const lsm_backend_runtime_filters = selectTestFilters(b, &.{"storage.lsm_backend."});
     const lsm_backend_tests = b.addTest(.{
@@ -3894,6 +3895,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "parse cli accepts HA primary sync policy flags",
             "promoted HA primary retains exact predecessor startup provenance",
             "parse cli accepts HA standby runtime flags",
+            "deprecated --ha-* flags remain aliases for --hot-standby-* flags",
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
             "standalone HA runtime rejects ambiguous role flags",
@@ -4028,7 +4030,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // The aggregate's storage HA shard owns the library tests. Keep only the
     // command-root coverage that the shard cannot discover; `antfly-storage-hot-standby-test` remains
     // available as the convenient focused target containing both artifacts.
-    unit_test_step.dependOn(&run_ha_cli_tests.step);
+    unit_test_step.dependOn(&run_standby_cli_tests.step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_snapshot_maintenance_vopr_tests.step);
     unit_test_step.dependOn(&run_raft_runtime_tests.step);

@@ -19,7 +19,7 @@ pub const storage_backend_erased = @import("storage/backend_erased.zig");
 
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 
-const ha_runtime = @import("cmd/ha.zig");
+const standby_runtime = @import("cmd/standby.zig");
 
 const data_runtime = @import("data/runtime.zig");
 
@@ -31,8 +31,8 @@ fn runData(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterat
     return data_runtime.runFromIterator(init, "antfly", args);
 }
 
-fn runHa(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
-    return ha_runtime.runFromIterator(init, "antfly", args);
+fn runStandby(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
+    return standby_runtime.runFromIterator(init, "antfly", args);
 }
 
 fn runMetadata(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
@@ -47,8 +47,8 @@ fn dataEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "data", runData);
 }
 
-fn haEntry(context: *const bridge.Context) callconv(.c) c_int {
-    return runtimeEntry(context, "ha", runHa);
+fn standbyEntry(context: *const bridge.Context) callconv(.c) c_int {
+    return runtimeEntry(context, "standby", runStandby);
 }
 
 fn metadataEntry(context: *const bridge.Context) callconv(.c) c_int {
@@ -71,7 +71,7 @@ fn standaloneLiteEntry(context: *const bridge.Context) callconv(.c) c_int {
 
 comptime {
     exportInternal(&dataEntry, "antfly_runtime_data");
-    exportInternal(&haEntry, "antfly_runtime_ha");
+    exportInternal(&standbyEntry, "antfly_runtime_standby");
     exportInternal(&metadataEntry, "antfly_runtime_metadata");
     exportInternal(&standaloneEntry, "antfly_runtime_standalone");
     exportInternal(&standaloneLiteEntry, "antfly_runtime_standalone_lite");

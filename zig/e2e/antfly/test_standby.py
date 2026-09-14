@@ -113,7 +113,9 @@ class HAStandaloneNode:
 
     @property
     def ha_root(self) -> Path:
-        return self.node_root / "ha"
+        # See zig/HOT_STANDBY.md "Naming" (Data directory row): the on-disk
+        # tree moved from <node>/ha/ to <node>/standby/.
+        return self.node_root / "standby"
 
     @property
     def catalog_path(self) -> Path:
@@ -128,44 +130,47 @@ class HAStandaloneNode:
         if self.role == "primary":
             command.extend(
                 [
-                    "--ha-primary-log",
-                    str(self.ha_root / "primary.log"),
-                    "--ha-primary-slots",
-                    str(self.ha_root / "primary-slots.wal"),
-                    "--ha-primary-node-id",
+                    "--hot-standby-primary-log",
+                    str(self.ha_root / "primary.wal"),
+                    "--hot-standby-primary-slots",
+                    str(self.ha_root / "slots"),
+                    "--hot-standby-primary-node-id",
                     self.node_id,
                 ]
             )
         elif self.role == "standby":
             command.extend(
                 [
-                    "--ha-standby-log",
-                    str(self.ha_root / "standby.log"),
-                    "--ha-standby-progress",
-                    str(self.ha_root / "standby-progress.wal"),
-                    "--ha-standby-node-id",
+                    "--hot-standby-log",
+                    str(self.ha_root / "log.wal"),
+                    "--hot-standby-progress",
+                    str(self.ha_root / "progress.wal"),
+                    "--hot-standby-node-id",
                     self.node_id,
                 ]
             )
             if enable_replication and self.upstream_url is not None:
-                command.extend(["--ha-standby-upstream-url", self.upstream_url])
+                command.extend(["--hot-standby-upstream-url", self.upstream_url])
             if enable_replication and self.slot_name is not None:
-                command.extend(["--ha-standby-slot", self.slot_name])
+                command.extend(["--hot-standby-slot", self.slot_name])
         else:
             raise ValueError(f"unsupported HA role {self.role!r}")
 
         command.extend(
             [
+                # Intentionally kept as the deprecated --ha-* spelling so the
+                # e2e suite exercises the alias flagMatches() keeps working;
+                # see zig/HOT_STANDBY.md "Naming" (Server flags row).
                 "--ha-fence-wal",
                 str(self.ha_root / "fence.wal"),
-                "--ha-cluster-id",
+                "--hot-standby-cluster-id",
                 str(self.cluster_id),
             ]
         )
         if self.shard_id is not None:
-            command.extend(["--ha-shard-id", str(self.shard_id)])
+            command.extend(["--hot-standby-shard-id", str(self.shard_id)])
         if self.table_id is not None:
-            command.extend(["--ha-table-id", str(self.table_id)])
+            command.extend(["--hot-standby-table-id", str(self.table_id)])
         if (
             self.role == "primary"
             and self.sync_standby_name is not None
@@ -173,23 +178,23 @@ class HAStandaloneNode:
         ):
             command.extend(
                 [
-                    "--ha-sync-mode",
+                    "--hot-standby-sync-mode",
                     "remote_apply",
-                    "--ha-sync-selection",
+                    "--hot-standby-sync-selection",
                     "first",
-                    "--ha-sync-required",
+                    "--hot-standby-sync-required",
                     "1",
-                    "--ha-sync-standby",
+                    "--hot-standby-sync-standby",
                     self.sync_standby_name,
-                    "--ha-sync-failure",
+                    "--hot-standby-sync-failure",
                     "block",
                 ]
             )
         command.extend(
             [
-                "--ha-timeline-id",
+                "--hot-standby-timeline-id",
                 str(self.timeline_id),
-                "--ha-epoch",
+                "--hot-standby-epoch",
                 str(self.epoch),
             ]
         )
@@ -916,7 +921,10 @@ def _binary_supports_ha_standalone(binary: str) -> bool:
         timeout=10,
         check=False,
     )
-    return "--ha-primary-log" in result.stdout and "--ha-standby-log" in result.stdout
+    return (
+        "--hot-standby-primary-log" in result.stdout
+        and "--hot-standby-log" in result.stdout
+    )
 
 
 def _assert_admin_requires_bearer(node: HAStandaloneNode, path: str) -> None:

@@ -114,7 +114,7 @@ pub const entries = [_]Entry{
     .{ .surface = .restore_job, .disposition = .reject, .path_pattern = "/restore/jobs/{id}", .methods = &.{.DELETE}, .reason = "restore workflow cancellation mutates primary-local durable job state" },
     .{ .surface = .internal_mutation, .disposition = .reject, .path_pattern = "/internal/v1/{groups|tables}/...", .methods = post_put_delete, .reason = "standalone public ingress must not bypass the HA mirror through internal mutation routes" },
     .{ .surface = .unclassified_non_get, .disposition = .reject, .path_pattern = "*", .methods = post_put_delete, .reason = "new non-GET routes fail closed until their HA durability disposition is inventoried" },
-    .{ .surface = .default_admin_seed, .disposition = .reject, .path_pattern = "background:startup/default-admin", .methods = &.{}, .reason = "HA startup requires auth restored from the portable seed and never creates primary-local credentials" },
+    .{ .surface = .default_admin_seed, .disposition = .reject, .path_pattern = "background:startup/default-admin", .methods = &.{}, .reason = "hot-standby startup requires auth restored from the portable seed and never creates primary-local credentials" },
     .{ .surface = .extension_package_sync, .disposition = .reject, .path_pattern = "background:startup/extension-package-sync", .methods = &.{}, .reason = "filesystem package discovery cannot mutate the standalone catalog while continuous HA is active" },
     .{ .surface = .schema_finalizer, .disposition = .reject, .path_pattern = "background:metadata/schema-finalizer", .methods = &.{}, .reason = "standalone catalog migration finalization is frozen because catalog generations are not continuously replicated" },
     .{ .surface = .restore_worker, .disposition = .reject, .path_pattern = "background:restore/resume-advance", .methods = &.{}, .reason = "pre-existing restore jobs cannot resume or publish a replacement generation during HA" },
@@ -224,7 +224,7 @@ fn rejected(surface: Surface) Classification {
     return .{ .surface = surface, .disposition = .reject };
 }
 
-test "HA mutation inventory JSON exactly covers runtime surfaces and dispositions" {
+test "hot-standby mutation inventory JSON exactly covers runtime surfaces and dispositions" {
     const JsonEntry = struct {
         surface: []const u8,
         disposition: []const u8,
@@ -246,7 +246,7 @@ test "HA mutation inventory JSON exactly covers runtime surfaces and disposition
     }
 }
 
-test "HA mutation classifier covers acknowledged security catalog and workflow writes" {
+test "hot-standby mutation classifier covers acknowledged security catalog and workflow writes" {
     const cases = [_]struct { method: http_common.Method, path: []const u8, surface: Surface }{
         .{ .method = .POST, .path = "/auth/v1/users/alice", .surface = .auth_user },
         .{ .method = .PUT, .path = "/auth/v1/users/alice/password", .surface = .auth_password },
@@ -273,7 +273,7 @@ test "HA mutation classifier covers acknowledged security catalog and workflow w
     }
 }
 
-test "HA background producer inventory freezes local state and mirrors logical DB effects" {
+test "hot-standby background producer inventory freezes local state and mirrors logical DB effects" {
     const expected = [_]struct { surface: Surface, disposition: Disposition }{
         .{ .surface = .default_admin_seed, .disposition = .reject },
         .{ .surface = .extension_package_sync, .disposition = .reject },
@@ -296,7 +296,7 @@ test "HA background producer inventory freezes local state and mirrors logical D
     }
 }
 
-test "HA mutation classifier leaves reads and RemoteApply data writes available" {
+test "hot-standby mutation classifier leaves reads and RemoteApply data writes available" {
     try std.testing.expect(classify(.GET, "/auth/v1/users/alice") == null);
     try std.testing.expectEqual(Disposition.read_only, classify(.POST, "/query").?.disposition);
     try std.testing.expectEqual(Disposition.read_only, classify(.POST, "/tables/docs/query").?.disposition);
@@ -305,7 +305,7 @@ test "HA mutation classifier leaves reads and RemoteApply data writes available"
     try std.testing.expectEqual(Disposition.remote_apply, classify(.POST, "/tables/docs/merge").?.disposition);
 }
 
-test "HA mutation classifier has no ambiguous non-GET result" {
+test "hot-standby mutation classifier has no ambiguous non-GET result" {
     const methods = [_]http_common.Method{ .POST, .PUT, .DELETE };
     for (methods) |method| {
         const unknown = classify(method, "/future/public/mutation") orelse return error.TestExpectedEqual;
@@ -314,7 +314,7 @@ test "HA mutation classifier has no ambiguous non-GET result" {
     }
 }
 
-test "HA public non-GET route matrix has an explicit durability disposition" {
+test "hot-standby public non-GET route matrix has an explicit durability disposition" {
     const Case = struct {
         method: http_common.Method,
         path: []const u8,

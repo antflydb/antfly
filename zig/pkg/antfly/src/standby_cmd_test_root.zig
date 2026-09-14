@@ -5,7 +5,7 @@
 // the Elastic License at https://www.antfly.io/licensing/ELv2-license.
 
 test {
-    _ = @import("cmd/ha.zig");
+    _ = @import("cmd/standby.zig");
 }
 
 /// Implementation source choices for this compilation root.

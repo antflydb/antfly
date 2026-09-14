@@ -12,11 +12,11 @@ pub const Route = enum {
     cli,
     data,
     graph_metric_maintenance,
-    ha,
     inference,
     metadata,
     serverless,
     standalone,
+    standby,
     cloud,
     completion,
     help,
@@ -68,8 +68,8 @@ pub const commands = [_]Command{
     .{ .name = "inference", .description = "Manage the inference runtime", .route = .inference, .subcommands = &inference_subcommands },
     .{ .name = "serverless", .description = "Run serverless commands", .route = .serverless, .subcommands = &serverless_subcommands },
     .{ .name = "lite", .description = "Manage embedded Antfly Lite databases", .route = .standalone, .subcommands = &lite_subcommands },
-    .{ .name = "standby", .description = "Manage hot-standby replication", .route = .ha, .subcommands = &standby_subcommands },
-    .{ .name = "ha", .description = "Manage hot-standby replication (deprecated alias for standby)", .route = .ha, .subcommands = &standby_subcommands, .hidden = true },
+    .{ .name = "standby", .description = "Manage hot-standby replication", .route = .standby, .subcommands = &standby_subcommands },
+    .{ .name = "ha", .description = "Manage hot-standby replication (deprecated alias for standby)", .route = .standby, .subcommands = &standby_subcommands, .hidden = true },
     .{ .name = "table", .description = "Manage tables", .route = .cli, .subcommands = &table_subcommands },
     .{ .name = "index", .description = "Manage indexes", .route = .cli, .subcommands = &index_subcommands },
     .{ .name = "artifact", .description = "Manage generated artifacts", .route = .cli, .subcommands = &artifact_subcommands },
@@ -231,8 +231,8 @@ test "command table drives routes and completion entries" {
     try std.testing.expectEqual(Route.cli, findCommand("table").?.route);
     try std.testing.expectEqual(Route.completion, findCommand("completion").?.route);
     try std.testing.expectEqual(Route.graph_metric_maintenance, findCommand("__graph-metric-maintenance").?.route);
-    try std.testing.expectEqual(Route.ha, findCommand("standby").?.route);
-    try std.testing.expectEqual(Route.ha, findCommand("ha").?.route);
+    try std.testing.expectEqual(Route.standby, findCommand("standby").?.route);
+    try std.testing.expectEqual(Route.standby, findCommand("ha").?.route);
     try std.testing.expect(!findCommand("standby").?.hidden);
     try std.testing.expect(findCommand("ha").?.hidden);
     try std.testing.expect(findCommand("termite") == null);

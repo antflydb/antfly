@@ -600,15 +600,16 @@ resolves the bearer token from the environment variable named by
 `ANTFLY_HA_ADMIN_TOKEN`, when one of those variables is set) and sends it to
 the typed admin routes. `ANTFLY_STANDBY_ADMIN_URL` (falling back to
 `ANTFLY_HA_ADMIN_URL`) supplies the default admin URL when no target flag is
-given. On the node itself, `antfly standby --data-dir <dir> <command>` opens the local HA state under
-`<dir>/ha/` directly and reads the log identity from the files, so no path or
+given. On the node itself, `antfly standby --data-dir <dir> <command>` opens
+the local hot-standby state under `<dir>/standby/` (or a pre-0.3 `<dir>/ha/`
+tree) directly and reads the log identity from the files, so no path or
 identity flags are needed. The `--ha-url`, `--ha-token-env`, and `--ha-*`
 identity spellings remain accepted as aliases, and the `--` separator before
 the command is optional. Do not add a raw token CLI flag; tokens should not be
 exposed through process argv.
 If the operator ever uses a CLI-backed HA admin Job for compatibility or
 pod-local workflows against an authenticated admin endpoint, it should pass
-`--ha-token-env` only when `spec.highAvailability.admin.tokenEnvVar` is
+`--admin-token-env` only when `spec.highAvailability.admin.tokenEnvVar` is
 explicitly configured and should inject that variable into the Job with
 `spec.highAvailability.admin.envFrom`. Direct operator SDK calls may continue to
 default to `ANTFLY_HA_ADMIN_TOKEN` from the operator process environment.
@@ -816,6 +817,12 @@ This release renames the surface to **`standby`**:
 | Metrics | subsystem `ha` | `standby`, dual-emitted during the deprecation window |
 | Internal replication API | `/internal/v1/ha/replication/...`, `HAIdentity`, `HAReplicationFrame`, ... | `/internal/v1/standby/replication/...`, `StandbyIdentity`, `StandbyReplicationFrame`, ...; the old prefix is served as an alias and a new standby falls back to it once when its primary still runs 0.2, so either side may be upgraded first |
 | Internal package | `storage/ha` | `storage/hot_standby` (`storage.hot_standby` in Zig; test names and build steps follow: `antfly-storage-hot-standby-test`) |
+| Server flags | `antfly standalone --ha-primary-log`, `--ha-standby-log`, `--ha-cluster-id`, ... | `--hot-standby-primary-log`, `--hot-standby-log`, `--hot-standby-cluster-id`, ...: `--ha-standby-X` becomes `--hot-standby-X` (the role segment collapses like the routes), `--ha-primary-X` becomes `--hot-standby-primary-X`, every other `--ha-X` becomes `--hot-standby-X`; the `--ha-*` spellings stay as aliases for one minor and the operator keeps generating them until its minimum server has the new ones |
+| Data directory | `<data-dir>/ha/{primary.wal,slots,standby.wal,standby-progress.wal,fence.wal}` | `<data-dir>/standby/{primary.wal,slots,log.wal,progress.wal,fence.wal}`; `antfly standby --data-dir` prefers the new tree and falls back to an existing `ha/` tree; the operator's default pod paths stay under `/antflydb/ha/` this release because changing them needs a one-shot on-disk migration (Open work) |
+| Server metrics | `antfly_ha_*` | `antfly_standby_*`, dual-emitted with the old names for one minor |
+| OpenAPI tags | `ha`, `ha-replication` ("HA Replication") | `standby`, `standby-replication` ("Hot Standby", "Hot Standby Replication") |
+| Config schemas | `HotStandbyPrimaryRoleConfig`, `HotStandbyStandbyRoleConfig` | `HotStandbyPrimaryConfig`, `HotStandbyStandbyConfig` (mirror the `hot_standby.primary` / `hot_standby.standby` keys) |
+| Command source | `cmd/ha.zig`, `antfly.ha`, test root `ha cmd` | `cmd/standby.zig`, `antfly.hot_standby`, test root `standby cmd` |
 
 `replication` was considered and rejected because it already names three
 different things in Antfly: `replication_factor` (Raft replicas of a shard),
@@ -897,21 +904,30 @@ requires on first start.
 
 ### Data directory layout
 
-`antfly standby --data-dir` and the Kubernetes operator agree on one layout under
-the data root, documented in `DATA_DIR.md`:
+`antfly standby --data-dir` reads one layout under the data root, documented
+in `DATA_DIR.md`. The directory and the file names follow the flags
+(`--hot-standby-log` is `standby/log.wal`):
 
 ```text
-<data-dir>/ha/
-  primary.wal            primary replication log
-  slots                  replication slot store
-  standby.wal            standby receive log
-  standby-progress.wal   standby durable progress
-  fence.wal              promotion fence store
+<data-dir>/standby/
+  primary.wal            primary replication log     (--hot-standby-primary-log)
+  slots                  replication slot store      (--hot-standby-primary-slots)
+  log.wal                standby receive log         (--hot-standby-log)
+  progress.wal           standby durable progress    (--hot-standby-progress)
+  fence.wal              promotion fence store       (--hot-standby-fence-wal)
 ```
 
+Nodes created before 0.3 have `ha/{primary.wal,slots,standby.wal,
+standby-progress.wal,fence.wal}`; `--data-dir` prefers the `standby/` tree and
+falls back to an existing `ha/` tree, and never creates either. The Kubernetes
+operator's default pod paths remain `/antflydb/ha/...` this release: moving
+them needs a one-shot on-disk migration on the node, which is listed under
+Open work.
+
 Role is inferred from which files exist: primary if `primary.wal` and `slots`
-are present, standby if `standby.wal` and `standby-progress.wal` are present,
-and a node that has been promoted in place may legitimately have both. The
+are present, standby if `log.wal` and `progress.wal` (or their legacy names)
+are present, and a node that has been promoted in place may legitimately have
+both. The
 former-primary log used by `rejoin rewind` is not derived because it is the
 primary log itself and opening it twice in one process would contend for the
 same lock; `rewind` runs against a stopped node with an explicit
@@ -919,34 +935,35 @@ same lock; `rewind` runs against a stopped node with an explicit
 
 ### The `hot_standby` config section
 
-`specs/openapi/antfly/config.yaml` defines `StandbyConfig`, mirrored one-to-one
-onto the `antfly standalone --ha-*` flags. The section is named `hot_standby:`;
-the deprecated `ha:` key is still read for one minor release:
+`specs/openapi/antfly/config.yaml` defines `HotStandbyConfig`, mirrored
+one-to-one onto the `antfly standalone --hot-standby-*` flags (the `--ha-*`
+spellings remain aliases for one minor release). The section is named
+`hot_standby:`; the deprecated `ha:` key is still read for one minor release:
 
 ```yaml
 hot_standby:
   admin:     { url: http://127.0.0.1:8080, token_env: ANTFLY_STANDBY_ADMIN_TOKEN }
   identity:  { cluster_id: 1, shard_id: 0, table_id: 0, timeline_id: 1, epoch: 1 }
-  primary:   { log: /antflydb/ha/primary.wal, slots: /antflydb/ha/slots, node_id: primary-a }
-  standby:   { log: ..., progress: ..., node_id: standby-a, upstream_url: http://primary:8080, slot: standby-a }
+  primary:   { log: /var/lib/antfly/standby/primary.wal, slots: /var/lib/antfly/standby/slots, node_id: primary-a }
+  standby:   { log: /var/lib/antfly/standby/log.wal, progress: /var/lib/antfly/standby/progress.wal, node_id: standby-a, upstream_url: http://primary:8080, slot: standby-a }
   sync:      { mode: remote-write, selection: any, required: 1, standbys: [standby-a], failure: block }
   retention: { max_lag_lsn: 0, max_retained_bytes: 0, max_retained_age_ns: 0 }
-  fence_wal: /antflydb/ha/fence.wal
-  former_primary_log: /antflydb/ha/primary.wal
+  fence_wal: /var/lib/antfly/standby/fence.wal
+  former_primary_log: /var/lib/antfly/standby/primary.wal
 ```
 
-`antfly standalone --config` fills any HA flag it was not given from this
+`antfly standalone --config` fills any hot-standby flag it was not given from this
 section; a flag on the command line always wins, so the operator's generated
 argument lists keep their exact meaning and the section removes repetition
 rather than changing precedence. `admin.token_env` is the same variable the
 server requires for bearer authentication and the CLI reads to authenticate, so
 the token itself never appears in configuration. The startup-gate flags used by
-seed activation (`--ha-startup-*`) are deliberately not mirrored: they are
+seed activation (`--hot-standby-startup-*`) are deliberately not mirrored: they are
 per-generation evidence the operator computes, not durable configuration.
 
 ### Fence generation allocation
 
-`POST /ha/fence` no longer requires `generation`. When the field is omitted the
+`POST /admin/v1/standby/fence` no longer requires `generation`. When the field is omitted the
 fence store allocates the next generation itself: the held receipt's generation
 plus one, or 1 when no fence exists. Two rules keep this safe:
 
@@ -969,7 +986,7 @@ generation and the append of the new receipt are one critical section.
 
 A standby's upstream was fixed at process start; the puller read it immutably
 every round and the only way to move a standby to a new primary was a pod
-restart with new flags. `POST /ha/standby/upstream` (`antfly standby follow
+restart with new flags. `POST /admin/v1/standby/upstream` (`antfly standby follow
 --upstream-url <url> --slot <name>`) replaces the upstream URL and slot a
 running standby pulls from. The request carries the identity the caller expects
 the standby to have; a mismatch is rejected with the existing `WrongTimeline`,
@@ -994,7 +1011,7 @@ primary first and only then reads the boundary:
    standby` on `--to`. Refuse unless both report the same cluster, shard,
    table, timeline, and epoch, the standby is active and not reseed-required,
    and its lag is within `--max-lag-lsn`.
-2. **Fence the old primary.** `POST /ha/fence` on the primary with
+2. **Fence the old primary.** `POST /admin/v1/standby/fence` on the primary with
    `new_timeline_id = t+1`, `new_epoch = e+1`, `required_lsn = observed_lsn =
    current_lsn`, `promoted_node_id` = the standby's node id, and `generation`
    from `--generation` or allocated by the node. The primary's write gate fails
@@ -1004,22 +1021,22 @@ primary first and only then reads the boundary:
    `--wait-timeout`). Writes that landed between preflight and the fence are
    shipped normally; nothing is lost because nothing can be written after the
    fence.
-4. **Fence and promote the standby.** `POST /ha/fence` on the standby with the
+4. **Fence and promote the standby.** `POST /admin/v1/standby/fence` on the standby with the
    same fields and the same generation as the primary's receipt (so both nodes
-   hold one fence), then `POST /ha/promotion/assess` with `required_lsn` set to
+   hold one fence), then `POST /admin/v1/standby/promotion/assess` with `required_lsn` set to
    the final LSN and `use_current_fence`, requiring mode `safe`, then
-   `POST /ha/promotion/current-fence`.
+   `POST /admin/v1/standby/promotion/current-fence`.
 5. **Assess the old primary's rejoin.** Read `fence/current` from the new
-   primary and `POST /ha/rejoin/assess` on the old one with the receipt. A
+   primary and `POST /admin/v1/standby/rejoin/assess` on the old one with the receipt. A
    quiesced switchover forks exactly at the boundary, so the verdict is
    `rewind`. The rewind itself is not executed here: the old node still owns
    its replication log while it runs in the primary role, and a log cannot be
-   opened twice in one process, so `POST /ha/rejoin/rewind` runs after the
+   opened twice in one process, so `POST /admin/v1/standby/rejoin/rewind` runs after the
    node restarts in the standby role with `former_primary_log` configured. The
    CLI reports the step as `rejoin-rewind-pending`. If the verdict is `reseed`,
-   `POST /ha/rejoin/reseed` on the new primary marks the slot immediately.
+   `POST /admin/v1/standby/rejoin/reseed` on the new primary marks the slot immediately.
 6. **Follow.** Every URL given with `--follower` receives `POST
-   /ha/standby/upstream` pointing at `--new-upstream-url` (default `--to`),
+   /admin/v1/standby/upstream` pointing at `--new-upstream-url` (default `--to`),
    with the pre-switchover identity as the precondition.
 
 Failure between steps 2 and 4 leaves the old primary fenced and read-only,
@@ -1315,7 +1332,7 @@ primary's admin URL, not the current primary; reseed scheduling/slot marking
 targets the current primary, then runs any data-replacement step through a
 pod-local helper on the node being reseeded. The
 `highAvailability.runtime.formerPrimaryLogPath` operator field is passed to
-`antfly standalone --ha-former-primary-log` on nodes that may need
+`antfly standalone --hot-standby-former-primary-log` on nodes that may need
 rewind/rejoin — for the original primary this is usually the same durable
 file as `highAvailability.runtime.primary.logPath`; after failover it becomes
 the former primary's local evidence for timeline divergence checks and
@@ -1491,6 +1508,14 @@ described in [Implementation](#implementation):
   `go/pkg/operator/docs/operations/hot-standby-ha.md`, but further work to
   make edge cases boring (for example, richer degraded-state guidance) can
   continue without changing the core contract.
+- **Operator adoption of the 0.3 spellings on pods**: the operator still
+  generates `--ha-*` server flags and the `/antflydb/ha/...` default paths for
+  the pods it manages. The flags are aliases, so they can flip whenever the
+  operator's minimum server is 0.3; the paths cannot flip without a one-shot
+  on-disk migration (`ha/` -> `standby/` with the new file names) performed by
+  the node at startup when the configured `standby/` tree is absent and the
+  `ha/` tree exists. Ship the migration in the server first, then let the
+  operator switch its defaults.
 - **Operator-planned switchover**: `antfly standby switchover` composes the planned
   sequence from typed routes, but the Kubernetes operator still plans only
   failover; a `spec`-driven planned switchover that reuses the same steps and

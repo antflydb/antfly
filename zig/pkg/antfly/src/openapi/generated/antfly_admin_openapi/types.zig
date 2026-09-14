@@ -4,7 +4,7 @@
 const std = @import("std");
 
 pub const BaseBackupManifestPathRequest = struct {
-    /// Absolute normalized pod-local path to the HA base-backup manifest.
+    /// Absolute normalized pod-local path to the hot-standby base-backup manifest.
     manifest_path: []const u8,
 };
 
@@ -376,9 +376,9 @@ pub const SeededSlotActivateRequest = struct {
 };
 
 pub const StandbyActionReceipt = struct {
-    /// Stable action correlation id derived from the acted-on HA resource and boundary values.
+    /// Stable action correlation id derived from the acted-on hot-standby resource and boundary values.
     action_id: []const u8,
-    /// Typed HA action that produced this response.
+    /// Typed hot-standby action that produced this response.
     action_kind: []const u8,
     /// Node id, slot name, manifest id, or promotion boundary acted on by this node-local endpoint.
     target: []const u8,
@@ -411,7 +411,7 @@ pub const StandbyBaseBackupFinishResponse = struct {
 };
 
 pub const StandbyBootstrapRequest = struct {
-    /// Absolute normalized pod-local path to the HA base-backup manifest.
+    /// Absolute normalized pod-local path to the hot-standby base-backup manifest.
     manifest_path: []const u8,
     /// Optional absolute normalized pod-local directory containing files referenced by the manifest.
     content_root: OpenApiOptionalNullable([]const u8) = .absent,
@@ -529,14 +529,14 @@ pub const StandbyFenceResponse = struct {
     receipt: StandbyFenceReceipt,
 };
 
-/// Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+/// Stable hot-standby node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
 pub const StandbyIdentifier = []const u8;
 
 pub const StandbyIdentity = struct {
     cluster_id: i64,
-    /// Shard identity. Use 0 for whole-instance HA scope.
+    /// Shard identity. Use 0 for whole-instance hot-standby scope.
     shard_id: i64,
-    /// Table identity. Use 0 for whole-instance HA scope.
+    /// Table identity. Use 0 for whole-instance hot-standby scope.
     table_id: i64,
     timeline_id: i64,
     epoch: i64,
@@ -563,7 +563,7 @@ pub const StandbyLeaseWatchdogProof = struct {
     max_fence_latency_ms: i64,
 };
 
-/// Stable HA node id.
+/// Stable hot-standby node id.
 pub const StandbyNodeID = []const u8;
 
 pub const StandbyOwnerJobCheckResponse = struct {

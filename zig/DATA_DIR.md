@@ -24,11 +24,11 @@ marker applies to the whole directory tree, not to an individual node mode.
     catalog.txt
     snapshots/
 
-  ha/                      (only when hot standby is configured)
+  standby/                 (only when hot standby is configured)
     primary.wal
     slots
-    standby.wal
-    standby-progress.wal
+    log.wal
+    progress.wal
     fence.wal
 ```
 
@@ -54,13 +54,18 @@ directories as standalone metadata, data, and inference nodes.
 - `data/catalog.txt` stores the data replica catalog.
 - `data/snapshots/` stores data raft snapshot transport payloads.
 
-`ha/` holds hot-standby replication state when a node runs as a primary or a
-standby: the primary replication log and slot store, the standby receive log
-and progress WAL, and the fence WAL. `antfly standalone` takes these paths
-through its `--ha-*` flags; the Kubernetes operator provisions exactly this
-layout under the data root, and `antfly standby --data-dir <data-dir>` opens
-whichever of these files exist and reads the log identity from them
-(`antfly ha` is a deprecated alias for `antfly standby`).
+`standby/` holds hot-standby replication state when a node runs as a primary
+or a standby: the primary replication log and slot store, the standby
+receive log and progress WAL, and the fence WAL. `antfly standalone` takes
+these paths through its `--hot-standby-*` flags (the `--ha-*` spellings
+remain aliases for one minor release), and `antfly standby --data-dir
+<data-dir>` opens whichever of these files exist and reads the log identity
+from them (`antfly ha` is a deprecated alias for `antfly standby`). Nodes
+created before 0.3 have this state under a legacy `ha/` tree instead
+(`ha/{primary.wal,slots,standby.wal,standby-progress.wal,fence.wal}`);
+`antfly standby --data-dir` reads either layout, preferring the canonical
+`standby/` tree when both exist. The Kubernetes operator's default pod paths
+remain under `/antflydb/ha/...` this release.
 
 Table database snapshots are a lower-level DB artifact and remain adjacent to
 the database path as `<db_path>.snapshots/<snapshot-id>/...`.

@@ -407,7 +407,7 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
             const chunk_index = chunk_receipts.items.len;
             const object_key = try generationChunkKeyAlloc(alloc, store.prefix, request.generation, idx, chunk_index);
             defer alloc.free(object_key);
-            try putImmutable(alloc, store, object_key, body, "application/vnd.antfly.ha-chunk");
+            try putImmutable(alloc, store, object_key, body, "application/vnd.antfly.hot_standby-chunk");
             const chunk_hex = try hexAlloc(alloc, &chunk_digest);
             errdefer alloc.free(chunk_hex);
             try chunk_receipts.append(alloc, .{
@@ -444,7 +444,7 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
 
     const manifest_key = try generationKeyAlloc(alloc, store.prefix, request.generation, manifest_name);
     defer alloc.free(manifest_key);
-    try putImmutable(alloc, store, manifest_key, request.manifest_bytes, "application/vnd.antfly.ha-manifest");
+    try putImmutable(alloc, store, manifest_key, request.manifest_bytes, "application/vnd.antfly.hot_standby-manifest");
 
     var file_views = try alloc.alloc(FileReceipt, owned_files.len);
     defer alloc.free(file_views);
@@ -1808,7 +1808,7 @@ test "storage.hot_standby seed artifact restores a legacy v1 single-object gener
     const complete_key = try generationKeyAlloc(alloc, store.prefix, "gen-v1-compat", complete_name);
     defer alloc.free(complete_key);
     try putImmutable(alloc, store, file_key, body, "application/octet-stream");
-    try putImmutable(alloc, store, manifest_key, manifest_bytes, "application/vnd.antfly.ha-manifest");
+    try putImmutable(alloc, store, manifest_key, manifest_bytes, "application/vnd.antfly.hot_standby-manifest");
     try putImmutable(alloc, store, complete_key, receipt_json, "application/json");
 
     var verified_remote = try verifyRemote(alloc, store, .{

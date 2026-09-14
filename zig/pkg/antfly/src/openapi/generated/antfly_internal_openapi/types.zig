@@ -34,7 +34,7 @@ pub const StandbyCreateReplicationSlotRequest = struct {
     }
 };
 
-/// Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+/// Stable hot-standby node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
 pub const StandbyIdentifier = []const u8;
 
 pub const StandbyIdentifySystemResponse = struct {

@@ -115,21 +115,21 @@ pub fn parseCreateHAReplicationSlotBody(allocator: std.mem.Allocator, body: []co
     return std.json.parseFromSlice(types.ReplicationSlotCreateRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Drop an HA replication slot
+/// Drop a hot-standby replication slot
 pub const DropHAReplicationSlotPathParams = struct {
-    /// Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
+    /// Stable standby replication slot name. Path values are percent-encoded; names must be hot-standby identifiers.
     slot_name: []const u8,
 };
 
-/// Pause an HA replication slot
+/// Pause a hot-standby replication slot
 pub const PauseHAReplicationSlotPathParams = struct {
-    /// Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
+    /// Stable standby replication slot name. Path values are percent-encoded; names must be hot-standby identifiers.
     slot_name: []const u8,
 };
 
-/// Resume an HA replication slot
+/// Resume a hot-standby replication slot
 pub const ResumeHAReplicationSlotPathParams = struct {
-    /// Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
+    /// Stable standby replication slot name. Path values are percent-encoded; names must be hot-standby identifiers.
     slot_name: []const u8,
 };
 
@@ -324,7 +324,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.startStorageVacuum(ctx);
         }
 
-        /// Begin an HA base backup and reserve its replication slot
+        /// Begin a hot-standby base backup and reserve its replication slot
         /// POST /standby/base-backups
         fn beginHABaseBackup(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.beginHABaseBackup(ctx);
@@ -342,7 +342,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.captureHASeedArtifact(ctx);
         }
 
-        /// Finish an HA base backup from a local manifest path
+        /// Finish a hot-standby base backup from a local manifest path
         /// POST /standby/base-backups/finish
         fn finishHABaseBackup(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.finishHABaseBackup(ctx);
@@ -366,13 +366,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.checkHACommit(ctx);
         }
 
-        /// Acquire a durable HA promotion fence
+        /// Acquire a durable hot-standby promotion fence
         /// POST /standby/fence
         fn acquireHAFence(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.acquireHAFence(ctx);
         }
 
-        /// Get the current durable HA promotion fence
+        /// Get the current durable hot-standby promotion fence
         /// GET /standby/fence/current
         fn getHACurrentFence(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.getHACurrentFence(ctx);
@@ -384,7 +384,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.checkHAOwnerJob(ctx);
         }
 
-        /// Get primary HA status
+        /// Get primary hot-standby status
         /// GET /standby/primary/status
         fn getHAPrimaryStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const query_params = GetHAPrimaryStatusParams{
@@ -442,40 +442,40 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.rewindHARejoin(ctx);
         }
 
-        /// List HA replication slots
+        /// List hot-standby replication slots
         /// GET /standby/replication-slots
         fn listHAReplicationSlots(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.listHAReplicationSlots(ctx);
         }
 
-        /// Create an HA replication slot
+        /// Create a hot-standby replication slot
         /// POST /standby/replication-slots
         fn createHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.createHAReplicationSlot(ctx);
         }
 
-        /// Drop an HA replication slot
+        /// Drop a hot-standby replication slot
         /// DELETE /standby/replication-slots/{slot_name}
         fn dropHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const slot_name = ctx.param("slot_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: slot_name" });
             return impl.dropHAReplicationSlot(ctx, slot_name);
         }
 
-        /// Pause an HA replication slot
+        /// Pause a hot-standby replication slot
         /// PUT /standby/replication-slots/{slot_name}/pause
         fn pauseHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const slot_name = ctx.param("slot_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: slot_name" });
             return impl.pauseHAReplicationSlot(ctx, slot_name);
         }
 
-        /// Resume an HA replication slot
+        /// Resume a hot-standby replication slot
         /// PUT /standby/replication-slots/{slot_name}/resume
         fn resumeHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const slot_name = ctx.param("slot_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: slot_name" });
             return impl.resumeHAReplicationSlot(ctx, slot_name);
         }
 
-        /// Read durable runtime-owned HA seed lifecycle receipts
+        /// Read durable runtime-owned hot-standby seed lifecycle receipts
         /// GET /standby/seed-lifecycle/receipts
         fn getHASeedLifecycleReceipts(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const query_params = GetHASeedLifecycleReceiptsParams{
@@ -486,7 +486,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.getHASeedLifecycleReceipts(ctx, query_params);
         }
 
-        /// Get standby HA status
+        /// Get standby status
         /// GET /standby/status
         fn getHAStandbyStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const query_params = GetHAStandbyStatusParams{

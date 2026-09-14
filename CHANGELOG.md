@@ -46,9 +46,25 @@ All notable changes to Antfly will be documented in this file.
   zero-value default for this release.
 - **Operator metrics** — dual-emitted under both the `ha` and `standby`
   subsystems during the deprecation window.
+- **`antfly standalone --hot-standby-*` flags** replace `--ha-*`:
+  `--ha-standby-X` becomes `--hot-standby-X` (`--hot-standby-log`,
+  `--hot-standby-progress`, ...), `--ha-primary-X` becomes
+  `--hot-standby-primary-X`, and every other `--ha-X` becomes
+  `--hot-standby-X`. The `--ha-*` spellings remain aliases for one minor
+  release; the operator keeps generating them for now.
+- **Data directory `standby/`** — `antfly standby --data-dir` now looks for
+  `standby/{primary.wal,slots,log.wal,progress.wal,fence.wal}` and falls back
+  to the pre-0.3 `ha/` tree. The operator's default pod paths stay under
+  `/antflydb/ha/` until a one-shot migration ships.
+- **Server metrics `antfly_standby_*`** — every `antfly_ha_*` series is also
+  emitted under the new name for one minor release.
+- **OpenAPI tags and config schemas** — tags `standby` / `standby-replication`;
+  `HotStandbyPrimaryConfig` / `HotStandbyStandbyConfig`.
 - **`storage/hot_standby` package** — the Zig package moved from
-  `storage/ha`; its test names and build steps are now
-  `storage.hot_standby ...` and `antfly-storage-hot-standby-*`.
+  `storage/ha`, the command source from `cmd/ha.zig` to `cmd/standby.zig`, and
+  the root alias from `antfly.ha` to `antfly.hot_standby`; test names and
+  build steps are `storage.hot_standby ...`, `standby cmd ...`, and
+  `antfly-storage-hot-standby-*`.
 - **Planned switchover** — `antfly standby switchover --to <standby>` fences the
   old primary first, waits for the standby to reach the final LSN, fences and
   promotes the standby with the same fence generation, assesses the old

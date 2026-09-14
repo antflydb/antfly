@@ -83,7 +83,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.createHAReplicationStreamingSlot(ctx);
         }
 
-        /// Pull ordered HA replication records from a slot
+        /// Pull ordered hot-standby replication records from a slot
         /// POST /standby/replication/start
         fn startHAReplication(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.startHAReplication(ctx);

@@ -340,43 +340,43 @@ pub fn renderPrimaryPrometheusAlloc(alloc: Allocator, metrics: PrimaryMetrics) !
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
-    try appendGauge(alloc, &out, "antfly_ha_primary_current_lsn", metrics.current_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_primary_slot_count", metrics.slot_count);
-    try appendGauge(alloc, &out, "antfly_ha_primary_active_slots", metrics.active_slots);
-    try appendGauge(alloc, &out, "antfly_ha_primary_reseed_required_slots", metrics.reseed_required_slots);
-    try appendGauge(alloc, &out, "antfly_ha_primary_max_write_lag_lsn", metrics.max_write_lag_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_primary_max_apply_lag_lsn", metrics.max_apply_lag_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_primary_max_safe_read_lag_lsn", metrics.max_safe_read_lag_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_primary_max_retention_lag_lsn", metrics.max_retention_lag_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_primary_retention_oldest_restart_lsn", metrics.retention_oldest_restart_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_primary_retention_retained_lsn_count", metrics.retention_retained_lsn_count);
-    try appendGauge(alloc, &out, "antfly_ha_primary_retention_retained_byte_count", metrics.retention_retained_byte_count);
-    try appendGauge(alloc, &out, "antfly_ha_primary_retention_retained_age_ns", metrics.retention_retained_age_ns);
-    try appendGauge(alloc, &out, "antfly_ha_primary_retention_active_slots", metrics.retention_active_slots);
-    try appendGauge(alloc, &out, "antfly_ha_primary_retention_reseed_recommended", metrics.retention_reseed_recommended);
-    try appendGauge(alloc, &out, "antfly_ha_primary_durability_configured", metrics.durability_configured);
-    try appendGauge(alloc, &out, "antfly_ha_primary_durability_satisfied", metrics.durability_satisfied);
-    try appendGauge(alloc, &out, "antfly_ha_primary_durability_degraded", metrics.durability_degraded);
-    try appendGauge(alloc, &out, "antfly_ha_primary_durability_status_code", metrics.durability_status_code);
-    try appendGauge(alloc, &out, "antfly_ha_primary_durability_target_lsn", metrics.durability_target_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_primary_durability_progress_lsn", metrics.durability_progress_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_primary_durability_missing_lsn_count", metrics.durability_missing_lsn_count);
-    try appendGauge(alloc, &out, "antfly_ha_primary_durability_required_count", metrics.durability_required_count);
-    try appendGauge(alloc, &out, "antfly_ha_primary_durability_satisfied_count", metrics.durability_satisfied_count);
-    try appendGauge(alloc, &out, "antfly_ha_primary_durability_candidate_count", metrics.durability_candidate_count);
+    try appendGauge(alloc, &out, "antfly_standby_primary_current_lsn", metrics.current_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_primary_slot_count", metrics.slot_count);
+    try appendGauge(alloc, &out, "antfly_standby_primary_active_slots", metrics.active_slots);
+    try appendGauge(alloc, &out, "antfly_standby_primary_reseed_required_slots", metrics.reseed_required_slots);
+    try appendGauge(alloc, &out, "antfly_standby_primary_max_write_lag_lsn", metrics.max_write_lag_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_primary_max_apply_lag_lsn", metrics.max_apply_lag_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_primary_max_safe_read_lag_lsn", metrics.max_safe_read_lag_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_primary_max_retention_lag_lsn", metrics.max_retention_lag_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_primary_retention_oldest_restart_lsn", metrics.retention_oldest_restart_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_primary_retention_retained_lsn_count", metrics.retention_retained_lsn_count);
+    try appendGauge(alloc, &out, "antfly_standby_primary_retention_retained_byte_count", metrics.retention_retained_byte_count);
+    try appendGauge(alloc, &out, "antfly_standby_primary_retention_retained_age_ns", metrics.retention_retained_age_ns);
+    try appendGauge(alloc, &out, "antfly_standby_primary_retention_active_slots", metrics.retention_active_slots);
+    try appendGauge(alloc, &out, "antfly_standby_primary_retention_reseed_recommended", metrics.retention_reseed_recommended);
+    try appendGauge(alloc, &out, "antfly_standby_primary_durability_configured", metrics.durability_configured);
+    try appendGauge(alloc, &out, "antfly_standby_primary_durability_satisfied", metrics.durability_satisfied);
+    try appendGauge(alloc, &out, "antfly_standby_primary_durability_degraded", metrics.durability_degraded);
+    try appendGauge(alloc, &out, "antfly_standby_primary_durability_status_code", metrics.durability_status_code);
+    try appendGauge(alloc, &out, "antfly_standby_primary_durability_target_lsn", metrics.durability_target_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_primary_durability_progress_lsn", metrics.durability_progress_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_primary_durability_missing_lsn_count", metrics.durability_missing_lsn_count);
+    try appendGauge(alloc, &out, "antfly_standby_primary_durability_required_count", metrics.durability_required_count);
+    try appendGauge(alloc, &out, "antfly_standby_primary_durability_satisfied_count", metrics.durability_satisfied_count);
+    try appendGauge(alloc, &out, "antfly_standby_primary_durability_candidate_count", metrics.durability_candidate_count);
 
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_active", metrics.slots, .active);
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_reseed_required", metrics.slots, .reseed_required);
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_received_lsn", metrics.slots, .received_lsn);
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_applied_lsn", metrics.slots, .applied_lsn);
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_safe_read_lsn", metrics.slots, .safe_read_lsn);
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_restart_lsn", metrics.slots, .restart_lsn);
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_write_lag_lsn", metrics.slots, .write_lag_lsn);
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_apply_lag_lsn", metrics.slots, .apply_lag_lsn);
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_safe_read_lag_lsn", metrics.slots, .safe_read_lag_lsn);
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_retention_lag_lsn", metrics.slots, .retention_lag_lsn);
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_status_code", metrics.slots, .status_code);
-    try appendSlotGauges(alloc, &out, "antfly_ha_slot_last_error", metrics.slots, .last_error);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_active", metrics.slots, .active);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_reseed_required", metrics.slots, .reseed_required);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_received_lsn", metrics.slots, .received_lsn);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_applied_lsn", metrics.slots, .applied_lsn);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_safe_read_lsn", metrics.slots, .safe_read_lsn);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_restart_lsn", metrics.slots, .restart_lsn);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_write_lag_lsn", metrics.slots, .write_lag_lsn);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_apply_lag_lsn", metrics.slots, .apply_lag_lsn);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_safe_read_lag_lsn", metrics.slots, .safe_read_lag_lsn);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_retention_lag_lsn", metrics.slots, .retention_lag_lsn);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_status_code", metrics.slots, .status_code);
+    try appendSlotGauges(alloc, &out, "antfly_standby_slot_last_error", metrics.slots, .last_error);
 
     return try out.toOwnedSlice(alloc);
 }
@@ -385,16 +385,16 @@ pub fn renderStandbyPrometheusAlloc(alloc: Allocator, metrics: StandbyMetrics) !
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
-    try appendGauge(alloc, &out, "antfly_ha_standby_received_lsn", metrics.received_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_standby_applied_lsn", metrics.applied_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_standby_safe_read_lsn", metrics.safe_read_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_standby_upstream_configured", metrics.upstream_configured);
-    try appendGauge(alloc, &out, "antfly_ha_standby_write_lag_lsn", metrics.write_lag_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_standby_receive_lag_lsn", metrics.receive_lag_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_standby_apply_lag_lsn", metrics.apply_lag_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_standby_unapplied_lsn_count", metrics.unapplied_lsn_count);
-    try appendGauge(alloc, &out, "antfly_ha_standby_caught_up_to_received", metrics.caught_up_to_received);
-    try appendGauge(alloc, &out, "antfly_ha_standby_can_serve_safe_reads", metrics.can_serve_safe_reads);
+    try appendStandbyRoleGauge(alloc, &out, "antfly_standby_received_lsn", metrics.received_lsn);
+    try appendStandbyRoleGauge(alloc, &out, "antfly_standby_applied_lsn", metrics.applied_lsn);
+    try appendStandbyRoleGauge(alloc, &out, "antfly_standby_safe_read_lsn", metrics.safe_read_lsn);
+    try appendStandbyRoleGauge(alloc, &out, "antfly_standby_upstream_configured", metrics.upstream_configured);
+    try appendStandbyRoleGauge(alloc, &out, "antfly_standby_write_lag_lsn", metrics.write_lag_lsn);
+    try appendStandbyRoleGauge(alloc, &out, "antfly_standby_receive_lag_lsn", metrics.receive_lag_lsn);
+    try appendStandbyRoleGauge(alloc, &out, "antfly_standby_apply_lag_lsn", metrics.apply_lag_lsn);
+    try appendStandbyRoleGauge(alloc, &out, "antfly_standby_unapplied_lsn_count", metrics.unapplied_lsn_count);
+    try appendStandbyRoleGauge(alloc, &out, "antfly_standby_caught_up_to_received", metrics.caught_up_to_received);
+    try appendStandbyRoleGauge(alloc, &out, "antfly_standby_can_serve_safe_reads", metrics.can_serve_safe_reads);
 
     return try out.toOwnedSlice(alloc);
 }
@@ -403,18 +403,18 @@ pub fn renderPromotionPrometheusAlloc(alloc: Allocator, metrics: PromotionMetric
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
-    try appendGauge(alloc, &out, "antfly_ha_promotion_required_lsn", metrics.required_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_promotion_received_lsn", metrics.received_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_promotion_applied_lsn", metrics.applied_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_promotion_has_required_lsn", metrics.has_required_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_promotion_caught_up_to_received", metrics.caught_up_to_received);
-    try appendGauge(alloc, &out, "antfly_ha_promotion_fencing_confirmed", metrics.fencing_confirmed);
-    try appendGauge(alloc, &out, "antfly_ha_promotion_force", metrics.force);
-    try appendGauge(alloc, &out, "antfly_ha_promotion_data_loss_possible", metrics.data_loss_possible);
-    try appendGauge(alloc, &out, "antfly_ha_promotion_safe", metrics.safe);
-    try appendGauge(alloc, &out, "antfly_ha_promotion_requires_fencing", metrics.requires_fencing);
-    try appendGauge(alloc, &out, "antfly_ha_promotion_requires_force", metrics.requires_force);
-    try appendGauge(alloc, &out, "antfly_ha_promotion_can_promote", metrics.can_promote);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_required_lsn", metrics.required_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_received_lsn", metrics.received_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_applied_lsn", metrics.applied_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_has_required_lsn", metrics.has_required_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_caught_up_to_received", metrics.caught_up_to_received);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_fencing_confirmed", metrics.fencing_confirmed);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_force", metrics.force);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_data_loss_possible", metrics.data_loss_possible);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_safe", metrics.safe);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_requires_fencing", metrics.requires_fencing);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_requires_force", metrics.requires_force);
+    try appendGauge(alloc, &out, "antfly_standby_promotion_can_promote", metrics.can_promote);
 
     return try out.toOwnedSlice(alloc);
 }
@@ -423,23 +423,23 @@ pub fn renderRejoinPrometheusAlloc(alloc: Allocator, metrics: RejoinMetrics) ![]
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_action_code", metrics.action_code);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_reason_code", metrics.reason_code);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_rejected_unfenced", metrics.rejected_unfenced);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_already_current", metrics.already_current);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_can_rewind", metrics.can_rewind);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_requires_reseed", metrics.requires_reseed);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_target_timeline_id", metrics.target_timeline_id);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_target_epoch", metrics.target_epoch);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_parent_cluster_id", metrics.parent_cluster_id);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_parent_shard_id", metrics.parent_shard_id);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_parent_table_id", metrics.parent_table_id);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_parent_timeline_id", metrics.parent_timeline_id);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_parent_epoch", metrics.parent_epoch);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_fork_lsn", metrics.fork_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_former_last_lsn", metrics.former_last_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_retained_from_lsn", metrics.retained_from_lsn);
-    try appendGauge(alloc, &out, "antfly_ha_rejoin_data_loss_discarded", metrics.data_loss_discarded);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_action_code", metrics.action_code);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_reason_code", metrics.reason_code);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_rejected_unfenced", metrics.rejected_unfenced);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_already_current", metrics.already_current);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_can_rewind", metrics.can_rewind);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_requires_reseed", metrics.requires_reseed);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_target_timeline_id", metrics.target_timeline_id);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_target_epoch", metrics.target_epoch);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_parent_cluster_id", metrics.parent_cluster_id);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_parent_shard_id", metrics.parent_shard_id);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_parent_table_id", metrics.parent_table_id);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_parent_timeline_id", metrics.parent_timeline_id);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_parent_epoch", metrics.parent_epoch);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_fork_lsn", metrics.fork_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_former_last_lsn", metrics.former_last_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_retained_from_lsn", metrics.retained_from_lsn);
+    try appendGauge(alloc, &out, "antfly_standby_rejoin_data_loss_discarded", metrics.data_loss_discarded);
 
     return try out.toOwnedSlice(alloc);
 }
@@ -459,8 +459,56 @@ const SlotMetricField = enum {
     last_error,
 };
 
+/// Canonical metric names passed to `appendGauge`/`appendSlotGauges` all use
+/// this prefix. The legacy `antfly_ha_...` spelling is derived from it by a
+/// straight prefix swap (see `HOT_STANDBY.md` "Naming" > "Server metrics") so
+/// there is exactly one table of names to maintain.
+const canonical_prefix = "antfly_standby_";
+const legacy_prefix = "antfly_ha_";
+/// Bound on `legacy_prefix ++ <suffix>`; longest current suffix is well under
+/// this, generous headroom is cheap on the stack.
+const legacy_name_buf_len = 128;
+
+/// Standby-role series dropped the role segment when the prefix became
+/// `antfly_standby_` (the same collapse as `/standby/status`), so their legacy
+/// spelling re-inserts it: `antfly_standby_write_lag_lsn` was
+/// `antfly_ha_standby_write_lag_lsn`.
+const LegacyRole = enum { plain, standby_role };
+
+fn legacyName(buf: []u8, canonical_name: []const u8, role: LegacyRole) []const u8 {
+    std.debug.assert(std.mem.startsWith(u8, canonical_name, canonical_prefix));
+    const suffix = canonical_name[canonical_prefix.len..];
+    return switch (role) {
+        .plain => std.fmt.bufPrint(buf, "{s}{s}", .{ legacy_prefix, suffix }) catch unreachable,
+        .standby_role => std.fmt.bufPrint(buf, "{s}standby_{s}", .{ legacy_prefix, suffix }) catch unreachable,
+    };
+}
+
 fn appendGauge(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: u64) !void {
-    try appendMetricHeader(alloc, out, name);
+    try appendGaugeWithLegacyRole(alloc, out, name, value, .plain);
+}
+
+/// For series rendered by the standby role (`renderStandbyPrometheusAlloc`).
+fn appendStandbyRoleGauge(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: u64) !void {
+    try appendGaugeWithLegacyRole(alloc, out, name, value, .standby_role);
+}
+
+fn appendGaugeWithLegacyRole(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: u64, role: LegacyRole) !void {
+    try appendGaugeSeries(alloc, out, name, null, value);
+
+    var legacy_buf: [legacy_name_buf_len]u8 = undefined;
+    const legacy = legacyName(&legacy_buf, name, role);
+    try appendGaugeSeries(alloc, out, legacy, name, value);
+}
+
+fn appendGaugeSeries(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    name: []const u8,
+    deprecated_alias_of: ?[]const u8,
+    value: u64,
+) !void {
+    try appendMetricHeader(alloc, out, name, deprecated_alias_of);
     try appendMetricName(alloc, out, name);
     try out.append(alloc, ' ');
     try appendU64(alloc, out, value);
@@ -474,7 +522,22 @@ fn appendSlotGauges(
     slots: []const SlotMetrics,
     field: SlotMetricField,
 ) !void {
-    try appendMetricHeader(alloc, out, name);
+    try appendSlotGaugeSeries(alloc, out, name, null, slots, field);
+
+    var legacy_buf: [legacy_name_buf_len]u8 = undefined;
+    const legacy = legacyName(&legacy_buf, name, .plain);
+    try appendSlotGaugeSeries(alloc, out, legacy, name, slots, field);
+}
+
+fn appendSlotGaugeSeries(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    name: []const u8,
+    deprecated_alias_of: ?[]const u8,
+    slots: []const SlotMetrics,
+    field: SlotMetricField,
+) !void {
+    try appendMetricHeader(alloc, out, name, deprecated_alias_of);
     for (slots) |slot| {
         try appendMetricName(alloc, out, name);
         try out.appendSlice(alloc, "{slot=\"");
@@ -485,7 +548,19 @@ fn appendSlotGauges(
     }
 }
 
-fn appendMetricHeader(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8) !void {
+fn appendMetricHeader(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    name: []const u8,
+    deprecated_alias_of: ?[]const u8,
+) !void {
+    if (deprecated_alias_of) |canonical| {
+        try out.appendSlice(alloc, "# HELP ");
+        try out.appendSlice(alloc, name);
+        try out.appendSlice(alloc, " (deprecated alias of ");
+        try out.appendSlice(alloc, canonical);
+        try out.appendSlice(alloc, ")\n");
+    }
     try out.appendSlice(alloc, "# TYPE ");
     try out.appendSlice(alloc, name);
     try out.appendSlice(alloc, " gauge\n");
@@ -771,16 +846,34 @@ test "storage.hot_standby metrics renders prometheus text" {
 
     const primary_text = try renderPrimaryPrometheusAlloc(alloc, primary);
     defer alloc.free(primary_text);
+    try expectContains(primary_text, "# TYPE antfly_standby_primary_current_lsn gauge\n");
+    try expectContains(primary_text, "antfly_standby_primary_current_lsn 20\n");
+    try expectContains(primary_text, "antfly_standby_primary_durability_satisfied 1\n");
+    try expectContains(primary_text, "antfly_standby_primary_durability_progress_lsn 20\n");
+    try expectContains(primary_text, "antfly_standby_primary_durability_missing_lsn_count 0\n");
+    try expectContains(primary_text, "antfly_standby_primary_retention_retained_age_ns 3000\n");
+    try expectContains(primary_text, "# TYPE antfly_standby_slot_apply_lag_lsn gauge\n");
+    try expectContains(primary_text, "antfly_standby_slot_apply_lag_lsn{slot=\"standby\\\"a\\\\b\\nc\"} 3\n");
+    try expectContains(primary_text, "antfly_standby_slot_safe_read_lag_lsn{slot=\"standby\\\"a\\\\b\\nc\"} 4\n");
+    try expectContains(primary_text, "antfly_standby_slot_last_error{slot=\"standby\\\"a\\\\b\\nc\"} 0\n");
+
+    // The legacy `antfly_ha_...` spellings must still be emitted, with a HELP
+    // line marking them as deprecated aliases, and must come after their
+    // canonical `antfly_standby_...` counterparts.
+    try expectContains(primary_text, "# HELP antfly_ha_primary_current_lsn (deprecated alias of antfly_standby_primary_current_lsn)\n");
     try expectContains(primary_text, "# TYPE antfly_ha_primary_current_lsn gauge\n");
     try expectContains(primary_text, "antfly_ha_primary_current_lsn 20\n");
     try expectContains(primary_text, "antfly_ha_primary_durability_satisfied 1\n");
     try expectContains(primary_text, "antfly_ha_primary_durability_progress_lsn 20\n");
     try expectContains(primary_text, "antfly_ha_primary_durability_missing_lsn_count 0\n");
     try expectContains(primary_text, "antfly_ha_primary_retention_retained_age_ns 3000\n");
+    try expectContains(primary_text, "# HELP antfly_ha_slot_apply_lag_lsn (deprecated alias of antfly_standby_slot_apply_lag_lsn)\n");
     try expectContains(primary_text, "# TYPE antfly_ha_slot_apply_lag_lsn gauge\n");
     try expectContains(primary_text, "antfly_ha_slot_apply_lag_lsn{slot=\"standby\\\"a\\\\b\\nc\"} 3\n");
     try expectContains(primary_text, "antfly_ha_slot_safe_read_lag_lsn{slot=\"standby\\\"a\\\\b\\nc\"} 4\n");
     try expectContains(primary_text, "antfly_ha_slot_last_error{slot=\"standby\\\"a\\\\b\\nc\"} 0\n");
+    try expectBefore(primary_text, "antfly_standby_primary_current_lsn 20\n", "antfly_ha_primary_current_lsn 20\n");
+    try expectBefore(primary_text, "antfly_standby_slot_apply_lag_lsn{slot=\"standby\\\"a\\\\b\\nc\"} 3\n", "antfly_ha_slot_apply_lag_lsn{slot=\"standby\\\"a\\\\b\\nc\"} 3\n");
 
     const standby_text = try renderStandbyPrometheusAlloc(alloc, .{
         .received_lsn = 12,
@@ -795,8 +888,12 @@ test "storage.hot_standby metrics renders prometheus text" {
         .can_serve_safe_reads = 1,
     });
     defer alloc.free(standby_text);
+    try expectContains(standby_text, "antfly_standby_write_lag_lsn 4\n");
+    try expectContains(standby_text, "antfly_standby_can_serve_safe_reads 1\n");
+    try expectContains(standby_text, "# HELP antfly_ha_standby_write_lag_lsn (deprecated alias of antfly_standby_write_lag_lsn)\n");
     try expectContains(standby_text, "antfly_ha_standby_write_lag_lsn 4\n");
     try expectContains(standby_text, "antfly_ha_standby_can_serve_safe_reads 1\n");
+    try expectBefore(standby_text, "antfly_standby_write_lag_lsn 4\n", "antfly_ha_standby_write_lag_lsn 4\n");
 
     const promotion_text = try renderPromotionPrometheusAlloc(alloc, .{
         .required_lsn = 14,
@@ -813,8 +910,12 @@ test "storage.hot_standby metrics renders prometheus text" {
         .can_promote = 0,
     });
     defer alloc.free(promotion_text);
+    try expectContains(promotion_text, "antfly_standby_promotion_requires_force 1\n");
+    try expectContains(promotion_text, "antfly_standby_promotion_can_promote 0\n");
+    try expectContains(promotion_text, "# HELP antfly_ha_promotion_requires_force (deprecated alias of antfly_standby_promotion_requires_force)\n");
     try expectContains(promotion_text, "antfly_ha_promotion_requires_force 1\n");
     try expectContains(promotion_text, "antfly_ha_promotion_can_promote 0\n");
+    try expectBefore(promotion_text, "antfly_standby_promotion_requires_force 1\n", "antfly_ha_promotion_requires_force 1\n");
 
     const rejoin_text = try renderRejoinPrometheusAlloc(alloc, .{
         .action_code = @intFromEnum(RejoinActionCode.rewind),
@@ -836,13 +937,151 @@ test "storage.hot_standby metrics renders prometheus text" {
         .data_loss_discarded = 1,
     });
     defer alloc.free(rejoin_text);
+    try expectContains(rejoin_text, "antfly_standby_rejoin_action_code 2\n");
+    try expectContains(rejoin_text, "antfly_standby_rejoin_reason_code 2\n");
+    try expectContains(rejoin_text, "antfly_standby_rejoin_can_rewind 1\n");
+    try expectContains(rejoin_text, "antfly_standby_rejoin_requires_reseed 0\n");
+    try expectContains(rejoin_text, "antfly_standby_rejoin_data_loss_discarded 1\n");
+    try expectContains(rejoin_text, "# HELP antfly_ha_rejoin_action_code (deprecated alias of antfly_standby_rejoin_action_code)\n");
     try expectContains(rejoin_text, "antfly_ha_rejoin_action_code 2\n");
     try expectContains(rejoin_text, "antfly_ha_rejoin_reason_code 2\n");
     try expectContains(rejoin_text, "antfly_ha_rejoin_can_rewind 1\n");
     try expectContains(rejoin_text, "antfly_ha_rejoin_requires_reseed 0\n");
     try expectContains(rejoin_text, "antfly_ha_rejoin_data_loss_discarded 1\n");
+    try expectBefore(rejoin_text, "antfly_standby_rejoin_action_code 2\n", "antfly_ha_rejoin_action_code 2\n");
+}
+
+test "storage.hot_standby metrics dual-emits one legacy series per canonical series" {
+    const alloc = std.testing.allocator;
+
+    var slots = [_]SlotMetrics{
+        .{
+            .name = "standby-a",
+            .active = 1,
+            .reseed_required = 0,
+            .received_lsn = 18,
+            .applied_lsn = 17,
+            .safe_read_lsn = 16,
+            .restart_lsn = 8,
+            .write_lag_lsn = 2,
+            .apply_lag_lsn = 3,
+            .safe_read_lag_lsn = 4,
+            .retention_lag_lsn = 12,
+            .status_code = @intFromEnum(SlotStatusCode.healthy),
+            .last_error = 0,
+        },
+    };
+    const primary = PrimaryMetrics{
+        .current_lsn = 20,
+        .slot_count = 1,
+        .active_slots = 1,
+        .reseed_required_slots = 0,
+        .max_write_lag_lsn = 2,
+        .max_apply_lag_lsn = 3,
+        .max_safe_read_lag_lsn = 4,
+        .max_retention_lag_lsn = 12,
+        .retention_oldest_restart_lsn = 8,
+        .retention_retained_lsn_count = 12,
+        .retention_retained_byte_count = 4096,
+        .retention_retained_age_ns = 3000,
+        .retention_active_slots = 1,
+        .retention_reseed_recommended = 0,
+        .durability_configured = 1,
+        .durability_satisfied = 1,
+        .durability_degraded = 0,
+        .durability_status_code = @intFromEnum(DurabilityStatusCode.satisfied),
+        .durability_target_lsn = 20,
+        .durability_progress_lsn = 20,
+        .durability_missing_lsn_count = 0,
+        .durability_required_count = 1,
+        .durability_satisfied_count = 1,
+        .durability_candidate_count = 1,
+        .slots = slots[0..],
+    };
+    const primary_text = try renderPrimaryPrometheusAlloc(alloc, primary);
+    defer alloc.free(primary_text);
+    try std.testing.expectEqual(countOccurrences(primary_text, "# TYPE antfly_standby_"), countOccurrences(primary_text, "# TYPE antfly_ha_"));
+
+    const standby_text = try renderStandbyPrometheusAlloc(alloc, .{
+        .received_lsn = 12,
+        .applied_lsn = 10,
+        .safe_read_lsn = 10,
+        .upstream_configured = 1,
+        .write_lag_lsn = 4,
+        .receive_lag_lsn = 4,
+        .apply_lag_lsn = 2,
+        .unapplied_lsn_count = 2,
+        .caught_up_to_received = 0,
+        .can_serve_safe_reads = 1,
+    });
+    defer alloc.free(standby_text);
+    try std.testing.expectEqual(countOccurrences(standby_text, "# TYPE antfly_standby_"), countOccurrences(standby_text, "# TYPE antfly_ha_"));
+
+    const promotion_text = try renderPromotionPrometheusAlloc(alloc, .{
+        .required_lsn = 14,
+        .received_lsn = 12,
+        .applied_lsn = 10,
+        .has_required_lsn = 0,
+        .caught_up_to_received = 0,
+        .fencing_confirmed = 1,
+        .force = 0,
+        .data_loss_possible = 1,
+        .safe = 0,
+        .requires_fencing = 0,
+        .requires_force = 1,
+        .can_promote = 0,
+    });
+    defer alloc.free(promotion_text);
+    try std.testing.expectEqual(countOccurrences(promotion_text, "# TYPE antfly_standby_"), countOccurrences(promotion_text, "# TYPE antfly_ha_"));
+
+    const rejoin_text = try renderRejoinPrometheusAlloc(alloc, .{
+        .action_code = @intFromEnum(RejoinActionCode.rewind),
+        .reason_code = @intFromEnum(RejoinReasonCode.parent_timeline_retained),
+        .rejected_unfenced = 0,
+        .already_current = 0,
+        .can_rewind = 1,
+        .requires_reseed = 0,
+        .target_timeline_id = 5,
+        .target_epoch = 7,
+        .parent_cluster_id = 100,
+        .parent_shard_id = 10,
+        .parent_table_id = 20,
+        .parent_timeline_id = 4,
+        .parent_epoch = 6,
+        .fork_lsn = 12,
+        .former_last_lsn = 13,
+        .retained_from_lsn = 8,
+        .data_loss_discarded = 1,
+    });
+    defer alloc.free(rejoin_text);
+    try std.testing.expectEqual(countOccurrences(rejoin_text, "# TYPE antfly_standby_"), countOccurrences(rejoin_text, "# TYPE antfly_ha_"));
+
+    // Sanity: at least one series was actually checked on each side (guards
+    // against a vacuously-true 0 == 0 if rendering regresses to emitting
+    // nothing).
+    try std.testing.expect(countOccurrences(primary_text, "# TYPE antfly_standby_") > 0);
+    try std.testing.expect(countOccurrences(standby_text, "# TYPE antfly_standby_") > 0);
+    try std.testing.expect(countOccurrences(promotion_text, "# TYPE antfly_standby_") > 0);
+    try std.testing.expect(countOccurrences(rejoin_text, "# TYPE antfly_standby_") > 0);
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
+
+/// Asserts `first` appears in `haystack` at a lower byte offset than `second`.
+fn expectBefore(haystack: []const u8, first: []const u8, second: []const u8) !void {
+    const first_idx = std.mem.indexOf(u8, haystack, first) orelse return error.TestExpectedContains;
+    const second_idx = std.mem.indexOf(u8, haystack, second) orelse return error.TestExpectedContains;
+    try std.testing.expect(first_idx < second_idx);
+}
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |idx| {
+        count += 1;
+        pos = idx + needle.len;
+    }
+    return count;
 }

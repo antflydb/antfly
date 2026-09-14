@@ -381,7 +381,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
             .status = false,
             .severity = .info,
             .reason = "Disabled",
-            .message = "HA hot standby mode is disabled",
+            .message = "Hot-standby mode is disabled",
         });
         return .{
             .actions = try actions.toOwnedSlice(alloc),

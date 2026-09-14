@@ -78,7 +78,7 @@ fn mainImpl(init: std.process.Init) !void {
         // route and land in the same runtime unit; the entrypoint always
         // prints help using the `standby` spelling regardless of which name
         // was invoked.
-        .ha => return runRuntimeUnit(.ha, subcommand, init, &args),
+        .standby => return runRuntimeUnit(.standby, subcommand, init, &args),
         .inference => {
             var worker_lifetime = inference_process_supervisor.WorkerLifetime{};
             defer worker_lifetime.deinit(init.io);
@@ -98,12 +98,12 @@ fn mainImpl(init: std.process.Init) !void {
     }
 }
 
-const RuntimeRole = enum { cli, data, graph_metric_maintenance, ha, inference, metadata, serverless, standalone };
+const RuntimeRole = enum { cli, data, graph_metric_maintenance, inference, metadata, serverless, standalone, standby };
 
 extern fn antfly_runtime_cli(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_graph_metric_maintenance(context: *const runtime_bridge.Context) callconv(.c) c_int;
-extern fn antfly_runtime_ha(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_standby(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
@@ -141,7 +141,7 @@ pub fn runRuntimeUnit(
         .cli => antfly_runtime_cli(&context),
         .data => antfly_runtime_data(&context),
         .graph_metric_maintenance => antfly_runtime_graph_metric_maintenance(&context),
-        .ha => antfly_runtime_ha(&context),
+        .standby => antfly_runtime_standby(&context),
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),
         .serverless => antfly_runtime_serverless(&context),

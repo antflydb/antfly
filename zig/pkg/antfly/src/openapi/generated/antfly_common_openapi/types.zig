@@ -1057,8 +1057,8 @@ pub const HotStandbyAdminConfig = struct {
 pub const HotStandbyConfig = struct {
     admin: ?HotStandbyAdminConfig = null,
     identity: ?HotStandbyIdentityConfig = null,
-    primary: ?HotStandbyPrimaryRoleConfig = null,
-    standby: ?HotStandbyStandbyRoleConfig = null,
+    primary: ?HotStandbyPrimaryConfig = null,
+    standby: ?HotStandbyStandbyConfig = null,
     sync: ?HotStandbySyncConfig = null,
     retention: ?HotStandbyRetentionConfig = null,
     /// Durable promotion fence WAL path (`--ha-fence-wal`).
@@ -1181,7 +1181,7 @@ pub const HotStandbyIdentityConfig = struct {
 };
 
 /// Primary-role state. Setting `log` and `slots` enables the primary hot-standby role.
-pub const HotStandbyPrimaryRoleConfig = struct {
+pub const HotStandbyPrimaryConfig = struct {
     /// Replication log path (`--ha-primary-log`).
     log: ?[]const u8 = null,
     /// Replication slot store path (`--ha-primary-slots`).
@@ -1272,7 +1272,7 @@ pub const HotStandbyRetentionConfig = struct {
 };
 
 /// Standby-role state. Setting `log` and `progress` enables the standby hot-standby role.
-pub const HotStandbyStandbyRoleConfig = struct {
+pub const HotStandbyStandbyConfig = struct {
     /// Received replication log path (`--ha-standby-log`).
     log: ?[]const u8 = null,
     /// Durable receive/apply progress WAL path (`--ha-standby-progress`).

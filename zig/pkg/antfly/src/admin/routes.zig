@@ -63,7 +63,7 @@ pub const standby_rejoin_rewind = standby ++ "/rejoin/rewind";
 pub const standby_rejoin_reseed = standby ++ "/rejoin/reseed";
 
 // Deprecated aliases, remove after 0.4. These keep pre-rename callers
-// (including files outside this rename's scope, e.g. `cmd/ha.zig`) compiling
+// (including files outside this rename's scope, e.g. `cmd/standby.zig`) compiling
 // unchanged; they resolve to the same canonical strings as the `standby_*`
 // constants above, NOT to `/admin/v1/ha/...` literals.
 pub const ha = standby;
@@ -335,7 +335,7 @@ test "admin routes match generated OpenAPI HA operations" {
 }
 
 test "admin routes own HA admin path literals consumed by Zig runtime code" {
-    try expectNoHardCodedHAAdminPath("../cmd/ha.zig", @embedFile("../cmd/ha.zig"));
+    try expectNoHardCodedHAAdminPath("../cmd/standby.zig", @embedFile("../cmd/standby.zig"));
     try expectNoHardCodedHAAdminPath("../storage/hot_standby/admin_exec.zig", @embedFile("../storage/hot_standby/admin_exec.zig"));
     try expectNoHardCodedHAAdminPath("../storage/hot_standby/http_admin.zig", @embedFile("../storage/hot_standby/http_admin.zig"));
     try expectNoHardCodedHAAdminPath("../storage/hot_standby/http_client.zig", @embedFile("../storage/hot_standby/http_client.zig"));

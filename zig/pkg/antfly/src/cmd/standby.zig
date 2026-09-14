@@ -21,7 +21,7 @@ const storage_source_options = @import("storage_source_options");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const admin_api = antfly.admin;
-const ha = antfly.ha;
+const ha = antfly.hot_standby;
 const ha_validation = ha.validation;
 const http_common = antfly.common.http.http_common;
 const control_only_storage_sources = storage_source_options.control_only;
@@ -1874,10 +1874,23 @@ fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArg
     };
 }
 
-/// Layout of hot-standby state under a standalone data directory. This is the
-/// layout the Kubernetes operator provisions; `antfly standalone` accepts the
-/// same paths through its `--ha-*` flags.
+/// Canonical layout of hot-standby state under a standalone data directory.
+/// `--data-dir` derivation (see `applyDataDir`) prefers this tree per role
+/// and falls back to `legacy_data_dir_layout` when the canonical files for
+/// that role are absent. The Kubernetes operator still provisions the
+/// legacy `ha/` tree this release; `antfly standalone` accepts explicit
+/// paths through its `--ha-*` flags regardless of which tree they live in.
 pub const data_dir_layout = struct {
+    pub const primary_log = "standby/primary.wal";
+    pub const primary_slots = "standby/slots";
+    pub const standby_log = "standby/log.wal";
+    pub const standby_progress = "standby/progress.wal";
+    pub const fence_wal = "standby/fence.wal";
+};
+
+/// Pre-0.3 data directory layout. `--data-dir` still recognises it, per
+/// role, when the canonical files under `data_dir_layout` are absent.
+pub const legacy_data_dir_layout = struct {
     pub const primary_log = "ha/primary.wal";
     pub const primary_slots = "ha/slots";
     pub const standby_log = "ha/standby.wal";
@@ -1894,11 +1907,15 @@ fn joinDataDirPath(alloc: std.mem.Allocator, data_dir: []const u8, relative: []c
     return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ data_dir, relative });
 }
 
-/// Resolves `--data-dir` into local handles and identity. Only state that
-/// already exists under `<data-dir>/ha/` is used; this never creates files.
-/// Explicit path and identity flags take precedence over derived values.
-/// Identity is read from the standby progress WAL when a standby is present,
-/// otherwise from the newest primary replication record.
+/// Resolves `--data-dir` into local handles and identity. Per role (primary,
+/// standby, fence), state that already exists under the canonical
+/// `<data-dir>/standby/` tree is preferred; when the canonical files for a
+/// role are absent, the legacy `<data-dir>/ha/` tree is used if its files
+/// exist for that role. If both trees exist for a role, the canonical tree
+/// wins and no error is raised. This never creates files. Explicit path and
+/// identity flags take precedence over derived values. Identity is read from
+/// the standby progress WAL when a standby is present, otherwise from the
+/// newest primary replication record.
 fn applyDataDir(alloc: std.mem.Allocator, io: std.Io, options: *LocalOptions) !void {
     const data_dir = options.data_dir orelse return;
     if (options.remote_url != null or options.remote_token_env != null) return error.HaRemoteCannotUseLocalHandles;
@@ -1912,6 +1929,14 @@ fn applyDataDir(alloc: std.mem.Allocator, io: std.Io, options: *LocalOptions) !v
             options.primary_log = primary_log;
             options.primary_slots = primary_slots;
             found_any = true;
+        } else {
+            const legacy_primary_log = try joinDataDirPath(alloc, data_dir, legacy_data_dir_layout.primary_log);
+            const legacy_primary_slots = try joinDataDirPath(alloc, data_dir, legacy_data_dir_layout.primary_slots);
+            if (pathExists(io, legacy_primary_log) and pathExists(io, legacy_primary_slots)) {
+                options.primary_log = legacy_primary_log;
+                options.primary_slots = legacy_primary_slots;
+                found_any = true;
+            }
         }
     }
     if (options.standby_log == null and options.standby_progress == null) {
@@ -1921,6 +1946,14 @@ fn applyDataDir(alloc: std.mem.Allocator, io: std.Io, options: *LocalOptions) !v
             options.standby_log = standby_log;
             options.standby_progress = standby_progress;
             found_any = true;
+        } else {
+            const legacy_standby_log = try joinDataDirPath(alloc, data_dir, legacy_data_dir_layout.standby_log);
+            const legacy_standby_progress = try joinDataDirPath(alloc, data_dir, legacy_data_dir_layout.standby_progress);
+            if (pathExists(io, legacy_standby_log) and pathExists(io, legacy_standby_progress)) {
+                options.standby_log = legacy_standby_log;
+                options.standby_progress = legacy_standby_progress;
+                found_any = true;
+            }
         }
     }
     if (options.fence_wal == null) {
@@ -1928,6 +1961,12 @@ fn applyDataDir(alloc: std.mem.Allocator, io: std.Io, options: *LocalOptions) !v
         if (pathExists(io, fence_wal)) {
             options.fence_wal = fence_wal;
             found_any = true;
+        } else {
+            const legacy_fence_wal = try joinDataDirPath(alloc, data_dir, legacy_data_dir_layout.fence_wal);
+            if (pathExists(io, legacy_fence_wal)) {
+                options.fence_wal = legacy_fence_wal;
+                found_any = true;
+            }
         }
     }
     if (!found_any) return error.HADataDirNoHAState;
@@ -2181,10 +2220,13 @@ fn printUsage(argv0: []const u8) void {
         \\removed in a future minor release.
         \\
         \\Target (pick one):
-        \\  --data-dir DIR            Open the node's local HA state under DIR/ha/
-        \\                            (primary.wal, slots, standby.wal,
-        \\                            standby-progress.wal, fence.wal). Paths and
-        \\                            identity are read from the files that exist.
+        \\  --data-dir DIR            Open the node's local HA state under DIR/standby/
+        \\                            (primary.wal, slots, log.wal, progress.wal,
+        \\                            fence.wal), falling back to a legacy DIR/ha/
+        \\                            tree (primary.wal, slots, standby.wal,
+        \\                            standby-progress.wal, fence.wal) when present.
+        \\                            Paths and identity are read from the files
+        \\                            that exist.
         \\  --admin-url URL           Send the command to a running node's HA admin
         \\                            endpoint. Defaults to $ANTFLY_STANDBY_ADMIN_URL,
         \\                            falling back to $ANTFLY_HA_ADMIN_URL.
@@ -2236,7 +2278,7 @@ fn printUsage(argv0: []const u8) void {
     , .{ argv0, argv0, argv0, argv0, argv0, argv0 });
 }
 
-test "ha cmd parses local handles before admin command" {
+test "standby cmd parses local handles before admin command" {
     const alloc = std.testing.allocator;
     var parsed = try parseLocalArgs(alloc, &.{
         "--primary-log",     "/tmp/p.wal",
@@ -2264,7 +2306,7 @@ test "ha cmd parses local handles before admin command" {
     try std.testing.expectEqual(@as(u64, 30), identity.table_id);
 }
 
-test "ha cmd local handles default shard and table identity to whole instance" {
+test "standby cmd local handles default shard and table identity to whole instance" {
     const alloc = std.testing.allocator;
     var parsed = try parseLocalArgs(alloc, &.{
         "--primary-log",    "/tmp/p.wal",
@@ -2296,7 +2338,7 @@ test "ha cmd local handles default shard and table identity to whole instance" {
     try std.testing.expectEqual(@as(u64, 2), standby_identity.epoch);
 }
 
-test "ha cmd artifact parses offline seed activation target and identity" {
+test "standby cmd artifact parses offline seed activation target and identity" {
     const alloc = std.testing.allocator;
     var options = try parseArtifactArgs(alloc, &.{
         "activate",
@@ -2350,7 +2392,7 @@ test "ha cmd artifact parses offline seed activation target and identity" {
     try std.testing.expectEqual(@as(u64, 9), options.target_replica_id.?);
 }
 
-test "ha cmd artifact accepts portable publish and restore topology pvc binding" {
+test "standby cmd artifact accepts portable publish and restore topology pvc binding" {
     const alloc = std.testing.allocator;
     const binding_args = [_][]const u8{
         "--topology-id",         "topology-a",
@@ -2390,7 +2432,7 @@ test "ha cmd artifact accepts portable publish and restore topology pvc binding"
     try std.testing.expect((try restore.binding.finish()) != null);
 }
 
-test "ha cmd artifact requires capture receipt digest chain flags" {
+test "standby cmd artifact requires capture receipt digest chain flags" {
     const alloc = std.testing.allocator;
     var options = try parseArtifactArgs(alloc, &.{
         "publish",
@@ -2433,7 +2475,7 @@ test "ha cmd artifact requires capture receipt digest chain flags" {
     );
 }
 
-test "ha cmd artifact parses lifecycle-gated source and target generation gc actions" {
+test "standby cmd artifact parses lifecycle-gated source and target generation gc actions" {
     const alloc = std.testing.allocator;
     var source = try parseArtifactArgs(alloc, &.{
         "gc-source",
@@ -2474,7 +2516,7 @@ test "ha cmd artifact parses lifecycle-gated source and target generation gc act
     try std.testing.expectEqual(@as(usize, 1), target.protected_generations.len);
 }
 
-test "ha cmd artifact parses exact controller-authorized seed prefix deletion" {
+test "standby cmd artifact parses exact controller-authorized seed prefix deletion" {
     const alloc = std.testing.allocator;
     var options = try parseArtifactArgs(alloc, &.{
         "delete-prefix",
@@ -2517,7 +2559,7 @@ test "ha cmd artifact parses exact controller-authorized seed prefix deletion" {
     }));
 }
 
-test "ha cmd artifact rejects flags that the selected action would ignore" {
+test "standby cmd artifact rejects flags that the selected action would ignore" {
     const alloc = std.testing.allocator;
 
     try std.testing.expectError(error.SeedArtifactFlagNotAllowedForAction, parseArtifactArgs(alloc, &.{
@@ -2548,7 +2590,7 @@ test "ha cmd artifact rejects flags that the selected action would ignore" {
     }));
 }
 
-test "ha cmd artifact rejects duplicate single-valued flags" {
+test "standby cmd artifact rejects duplicate single-valued flags" {
     const alloc = std.testing.allocator;
 
     try std.testing.expectError(error.DuplicateSeedArtifactFlag, parseArtifactArgs(alloc, &.{
@@ -2567,7 +2609,7 @@ test "ha cmd artifact rejects duplicate single-valued flags" {
     }));
 }
 
-test "ha cmd parses remote admin URL before command" {
+test "standby cmd parses remote admin URL before command" {
     const alloc = std.testing.allocator;
     var parsed = try parseLocalArgs(alloc, &.{
         "--ha-url",       "http://127.0.0.1:8081",
@@ -2585,7 +2627,7 @@ test "ha cmd parses remote admin URL before command" {
     try std.testing.expectEqualStrings("primary", parsed.command_args[2]);
 }
 
-test "ha cmd validates remote bearer token env name" {
+test "standby cmd validates remote bearer token env name" {
     const alloc = std.testing.allocator;
 
     try std.testing.expect((try resolveRemoteBearerToken(alloc, .{})) == null);
@@ -2602,7 +2644,7 @@ test "ha cmd validates remote bearer token env name" {
     }));
 }
 
-test "ha cmd classifies HA strings before field-specific validation" {
+test "standby cmd classifies HA strings before field-specific validation" {
     try std.testing.expectEqual(ha_validation.HAStringValidation.missing, ha_validation.classifyHAString(null));
     try std.testing.expectEqual(ha_validation.HAStringValidation.missing, ha_validation.classifyHAString(""));
     try std.testing.expectEqual(ha_validation.HAStringValidation.missing, ha_validation.classifyHAString(" \t\r\n"));
@@ -2611,7 +2653,7 @@ test "ha cmd classifies HA strings before field-specific validation" {
     try std.testing.expectEqual(ha_validation.HAStringValidation.ok, ha_validation.classifyHAString("primary-a"));
 }
 
-test "ha cmd rejects padded or invalid HA local option strings" {
+test "standby cmd rejects padded or invalid HA local option strings" {
     const alloc = std.testing.allocator;
 
     try std.testing.expectError(error.HAAdminURLInvalid, parseLocalArgs(alloc, &.{ "--ha-url", " http://127.0.0.1:8081", "--", "status", "primary" }));
@@ -2630,7 +2672,7 @@ test "ha cmd rejects padded or invalid HA local option strings" {
     try std.testing.expectError(error.HAStandbyNodeIdInvalid, parseLocalArgs(alloc, &.{ "--standby-node-id", " standby-a", "--", "status", "standby" }));
 }
 
-test "ha cmd rejects raw bearer token argv flags" {
+test "standby cmd rejects raw bearer token argv flags" {
     const alloc = std.testing.allocator;
 
     try std.testing.expectError(error.HAAdminRawTokenFlagUnsupported, parseLocalArgs(alloc, &.{
@@ -2653,7 +2695,7 @@ test "ha cmd rejects raw bearer token argv flags" {
     }));
 }
 
-test "ha cmd remote commands prefer typed admin routes" {
+test "standby cmd remote commands prefer typed admin routes" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "remote-typed");
     defer paths.deinit(alloc);
@@ -3021,7 +3063,7 @@ test "ha cmd remote commands prefer typed admin routes" {
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_reseed);
 }
 
-test "ha cmd remote sends bearer token to authenticated admin route" {
+test "standby cmd remote sends bearer token to authenticated admin route" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "remote-auth");
     defer paths.deinit(alloc);
@@ -3057,7 +3099,7 @@ test "ha cmd remote sends bearer token to authenticated admin route" {
     try std.testing.expectEqualStrings("Bearer secret-token", recorder.last_authorization.?);
 }
 
-test "ha cmd remote direct promotion uses typed admin route" {
+test "standby cmd remote direct promotion uses typed admin route" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "remote-direct-promote");
     defer paths.deinit(alloc);
@@ -3110,7 +3152,7 @@ test "ha cmd remote direct promotion uses typed admin route" {
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_promotion);
 }
 
-test "ha cmd remote rejects legacy command fallback for production admin operations" {
+test "standby cmd remote rejects legacy command fallback for production admin operations" {
     const alloc = std.testing.allocator;
     var executor = RejectingExecutor{};
 
@@ -3131,7 +3173,7 @@ test "ha cmd remote rejects legacy command fallback for production admin operati
     try std.testing.expect(!executor.called);
 }
 
-test "ha cmd remote keeps command endpoint for replication compatibility operations" {
+test "standby cmd remote keeps command endpoint for replication compatibility operations" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "remote-compat-command");
     defer paths.deinit(alloc);
@@ -3154,7 +3196,7 @@ test "ha cmd remote keeps command endpoint for replication compatibility operati
     try expectContains(recorder.last_uri.?, ha.http_admin.Routes.command);
 }
 
-test "ha cmd renders typed JSON responses as dotted table fields" {
+test "standby cmd renders typed JSON responses as dotted table fields" {
     const alloc = std.testing.allocator;
     const table = try renderJsonTableAlloc(alloc,
         \\{"schema_version":1,"slot":{"slot_name":"standby-a","active":true,"restart_lsn":4},"empty":[]}
@@ -3168,7 +3210,7 @@ test "ha cmd renders typed JSON responses as dotted table fields" {
     try expectContains(table, "empty=[]\n");
 }
 
-test "ha cmd keeps promotion identity flags in admin command" {
+test "standby cmd keeps promotion identity flags in admin command" {
     const alloc = std.testing.allocator;
     var parsed = try parseLocalArgs(alloc, &.{
         "--fence-wal", "/tmp/fence.wal",
@@ -3184,7 +3226,7 @@ test "ha cmd keeps promotion identity flags in admin command" {
     try std.testing.expectEqualStrings("--cluster-id", parsed.command_args[1]);
 }
 
-test "ha cmd streams local primary WAL into durable standby state" {
+test "standby cmd streams local primary WAL into durable standby state" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "stream-command");
     defer paths.deinit(alloc);
@@ -3252,7 +3294,7 @@ test "ha cmd streams local primary WAL into durable standby state" {
     }
 }
 
-test "ha cmd accepts unprefixed target and identity flag spellings" {
+test "standby cmd accepts unprefixed target and identity flag spellings" {
     const alloc = std.testing.allocator;
 
     var remote = try parseLocalArgs(alloc, &.{
@@ -3267,8 +3309,8 @@ test "ha cmd accepts unprefixed target and identity flag spellings" {
     try std.testing.expectEqualStrings("status", remote.command_args[0]);
 
     var local = try parseLocalArgs(alloc, &.{
-        "--primary-log",   "/var/lib/antfly/ha/primary.wal",
-        "--primary-slots", "/var/lib/antfly/ha/slots",
+        "--primary-log",   "/var/lib/antfly/standby/primary.wal",
+        "--primary-slots", "/var/lib/antfly/standby/slots",
         "--cluster-id",    "10",
         "--shard-id",      "20",
         "--table-id",      "30",
@@ -3288,7 +3330,7 @@ test "ha cmd accepts unprefixed target and identity flag spellings" {
     try std.testing.expectEqualStrings("list", local.command_args[1]);
 }
 
-test "ha cmd keeps admin command flags after the verb regardless of separator" {
+test "standby cmd keeps admin command flags after the verb regardless of separator" {
     const alloc = std.testing.allocator;
 
     var with_separator = try parseLocalArgs(alloc, &.{ "--fence-wal", "/tmp/fence.wal", "--", "fence", "acquire", "--epoch", "3" });
@@ -3305,7 +3347,7 @@ test "ha cmd keeps admin command flags after the verb regardless of separator" {
     }
 }
 
-test "ha cmd rejects unprefixed raw token flags" {
+test "standby cmd rejects unprefixed raw token flags" {
     const alloc = std.testing.allocator;
 
     try std.testing.expectError(error.HAAdminRawTokenFlagUnsupported, parseLocalArgs(alloc, &.{
@@ -3320,7 +3362,7 @@ test "ha cmd rejects unprefixed raw token flags" {
     }));
 }
 
-test "ha cmd parses and validates the data dir target" {
+test "standby cmd parses and validates the data dir target" {
     const alloc = std.testing.allocator;
 
     var parsed = try parseLocalArgs(alloc, &.{ "--data-dir", "/var/lib/antfly", "status", "primary" });
@@ -3353,7 +3395,7 @@ const TestEnv = struct {
     }
 };
 
-test "ha cmd defaults admin url and token env from the environment" {
+test "standby cmd defaults admin url and token env from the environment" {
     const env = TestEnv{ .url = "http://127.0.0.1:8081", .token = "secret" };
 
     var bare = LocalOptions{};
@@ -3366,7 +3408,7 @@ test "ha cmd defaults admin url and token env from the environment" {
     try std.testing.expectEqualStrings("http://127.0.0.1:9000", explicit_env_name.remote_url.?);
     try std.testing.expectEqualStrings("OTHER_TOKEN", explicit_env_name.remote_token_env.?);
 
-    var local = LocalOptions{ .primary_log = "/var/lib/antfly/ha/primary.wal" };
+    var local = LocalOptions{ .primary_log = "/var/lib/antfly/standby/primary.wal" };
     try applyEnvironmentDefaults(&local, env.lookup());
     try std.testing.expect(local.remote_url == null);
     try std.testing.expect(local.remote_token_env == null);
@@ -3405,7 +3447,7 @@ test "ha cmd defaults admin url and token env from the environment" {
     try std.testing.expectEqualStrings(default_admin_token_env, preferred.remote_token_env.?);
 }
 
-test "ha cmd applies the config file ha section as a target" {
+test "standby cmd applies the config file ha section as a target" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
@@ -3417,12 +3459,12 @@ test "ha cmd applies the config file ha section as a target" {
     defer std.Io.Dir.cwd().deleteFile(io, local_path) catch {};
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = remote_path, .data =
         \\{"ha":{"admin":{"url":"http://127.0.0.1:8081","token_env":"ANTFLY_HA_ADMIN_TOKEN"},
-        \\ "primary":{"log":"/var/lib/antfly/ha/primary.wal","slots":"/var/lib/antfly/ha/slots"}}}
+        \\ "primary":{"log":"/var/lib/antfly/standby/primary.wal","slots":"/var/lib/antfly/standby/slots"}}}
     });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = local_path, .data =
         \\{"ha":{"identity":{"cluster_id":10,"shard_id":20,"table_id":30,"timeline_id":1,"epoch":2},
-        \\ "primary":{"log":"/var/lib/antfly/ha/primary.wal","slots":"/var/lib/antfly/ha/slots","node_id":"primary-a"},
-        \\ "fence_wal":"/var/lib/antfly/ha/fence.wal"}}
+        \\ "primary":{"log":"/var/lib/antfly/standby/primary.wal","slots":"/var/lib/antfly/standby/slots","node_id":"primary-a"},
+        \\ "fence_wal":"/var/lib/antfly/standby/fence.wal"}}
     });
 
     // admin.url wins over local paths when nothing else picked a target.
@@ -3440,9 +3482,9 @@ test "ha cmd applies the config file ha section as a target" {
         var cfg = (try applyConfigDefaults(alloc, io, &options)).?;
         defer cfg.deinit();
         try std.testing.expect(options.remote_url == null);
-        try std.testing.expectEqualStrings("/var/lib/antfly/ha/primary.wal", options.primary_log.?);
+        try std.testing.expectEqualStrings("/var/lib/antfly/standby/primary.wal", options.primary_log.?);
         try std.testing.expectEqualStrings("primary-a", options.primary_node_id.?);
-        try std.testing.expectEqualStrings("/var/lib/antfly/ha/fence.wal", options.fence_wal.?);
+        try std.testing.expectEqualStrings("/var/lib/antfly/standby/fence.wal", options.fence_wal.?);
         const identity = try options.primaryIdentity();
         try std.testing.expectEqual(@as(u64, 10), identity.cluster_id);
         try std.testing.expectEqual(@as(u64, 20), identity.shard_id);
@@ -3476,7 +3518,7 @@ test "ha cmd applies the config file ha section as a target" {
     try std.testing.expectError(error.HAConfigPathInvalid, parseLocalArgs(alloc, &.{ "--config", " cfg.json", "status", "primary" }));
 }
 
-test "ha cmd derives local handles and identity from the data dir" {
+test "standby cmd derives local handles and identity from the data dir" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
@@ -3543,6 +3585,93 @@ test "ha cmd derives local handles and identity from the data dir" {
         try std.testing.expectEqual(@as(u64, 20), options.identity.shard_id.?);
     }
 
+    // A legacy `ha/` tree (pre-0.3) is used when the canonical `standby/`
+    // tree is absent.
+    {
+        const legacy_dir = try allocPrintPath(alloc, "data-dir", "legacy", nonce);
+        defer alloc.free(legacy_dir);
+        std.Io.Dir.cwd().deleteTree(io, legacy_dir) catch {};
+        defer std.Io.Dir.cwd().deleteTree(io, legacy_dir) catch {};
+        const legacy_primary_log = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ legacy_dir, legacy_data_dir_layout.primary_log });
+        defer alloc.free(legacy_primary_log);
+        const legacy_primary_slots = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ legacy_dir, legacy_data_dir_layout.primary_slots });
+        defer alloc.free(legacy_primary_slots);
+        try runArgv(alloc, io, &.{
+            "--primary-log",   legacy_primary_log,
+            "--primary-slots", legacy_primary_slots,
+            "--cluster-id",    "11",
+            "--shard-id",      "21",
+            "--table-id",      "31",
+            "--timeline-id",   "1",
+            "--epoch",         "2",
+            "--table",         "commit",
+            "append",          "--payload",
+            "one",             "--sync-mode",
+            "async",
+        });
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var options = LocalOptions{ .data_dir = legacy_dir };
+        try applyDataDir(arena.allocator(), io, &options);
+        try std.testing.expectEqualStrings(legacy_primary_log, options.primary_log.?);
+        try std.testing.expectEqualStrings(legacy_primary_slots, options.primary_slots.?);
+        const identity = try options.primaryIdentity();
+        try std.testing.expectEqual(@as(u64, 11), identity.cluster_id);
+    }
+
+    // When both the canonical `standby/` tree and a legacy `ha/` tree exist,
+    // the canonical tree wins and no error is raised.
+    {
+        const both_dir = try allocPrintPath(alloc, "data-dir", "both", nonce);
+        defer alloc.free(both_dir);
+        std.Io.Dir.cwd().deleteTree(io, both_dir) catch {};
+        defer std.Io.Dir.cwd().deleteTree(io, both_dir) catch {};
+        const canonical_primary_log = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ both_dir, data_dir_layout.primary_log });
+        defer alloc.free(canonical_primary_log);
+        const canonical_primary_slots = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ both_dir, data_dir_layout.primary_slots });
+        defer alloc.free(canonical_primary_slots);
+        try runArgv(alloc, io, &.{
+            "--primary-log",   canonical_primary_log,
+            "--primary-slots", canonical_primary_slots,
+            "--cluster-id",    "12",
+            "--shard-id",      "22",
+            "--table-id",      "32",
+            "--timeline-id",   "1",
+            "--epoch",         "2",
+            "--table",         "commit",
+            "append",          "--payload",
+            "one",             "--sync-mode",
+            "async",
+        });
+        const legacy_primary_log = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ both_dir, legacy_data_dir_layout.primary_log });
+        defer alloc.free(legacy_primary_log);
+        const legacy_primary_slots = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ both_dir, legacy_data_dir_layout.primary_slots });
+        defer alloc.free(legacy_primary_slots);
+        try runArgv(alloc, io, &.{
+            "--primary-log",   legacy_primary_log,
+            "--primary-slots", legacy_primary_slots,
+            "--cluster-id",    "13",
+            "--shard-id",      "23",
+            "--table-id",      "33",
+            "--timeline-id",   "1",
+            "--epoch",         "2",
+            "--table",         "commit",
+            "append",          "--payload",
+            "one",             "--sync-mode",
+            "async",
+        });
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var options = LocalOptions{ .data_dir = both_dir };
+        try applyDataDir(arena.allocator(), io, &options);
+        try std.testing.expectEqualStrings(canonical_primary_log, options.primary_log.?);
+        try std.testing.expectEqualStrings(canonical_primary_slots, options.primary_slots.?);
+        const identity = try options.primaryIdentity();
+        try std.testing.expectEqual(@as(u64, 12), identity.cluster_id);
+    }
+
     // The whole command works end to end with just the data dir.
     {
         var captured: std.Io.Writer.Allocating = .init(alloc);
@@ -3562,7 +3691,7 @@ test "ha cmd derives local handles and identity from the data dir" {
     }
 }
 
-test "ha cmd parses switchover options" {
+test "standby cmd parses switchover options" {
     const alloc = std.testing.allocator;
     var options = try parseSwitchoverArgs(alloc, &.{
         "--to",           "http://standby-a:8080",
@@ -3593,7 +3722,7 @@ test "ha cmd parses switchover options" {
     try std.testing.expectError(error.HAAdminURLInvalid, parseSwitchoverArgs(alloc, &.{ "--to", "standby-a:8080" }));
 }
 
-test "ha cmd switchover requires a remote target" {
+test "standby cmd switchover requires a remote target" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.SwitchoverRequiresAdminApi, runArgv(alloc, std.testing.io, &.{
         "--fence-wal", "/tmp/fence.wal", "switchover", "--to", "http://standby:8080",
@@ -3643,7 +3772,7 @@ const FakeFollowerHook = struct {
     }
 };
 
-test "ha cmd switchover fences promotes rejoins and repoints followers" {
+test "standby cmd switchover fences promotes rejoins and repoints followers" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     const primary_paths = try testPaths(alloc, "switchover-primary");
@@ -3776,7 +3905,7 @@ test "ha cmd switchover fences promotes rejoins and repoints followers" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"error\"") == null);
 }
 
-test "ha cmd compiles" {
+test "standby cmd compiles" {
     _ = run;
     _ = runFromIterator;
     _ = runArgv;

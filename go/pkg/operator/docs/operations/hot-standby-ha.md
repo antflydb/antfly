@@ -1,4 +1,4 @@
-# Hot-Standby HA
+# Hot Standby
 
 This runbook covers operator-managed Postgres-style hot standby for Antfly
 clusters running in Standalone mode. It is separate from the Raft metadata HA path:
@@ -71,7 +71,7 @@ When Antfly pods use `spec.highAvailability.runtime.adminTokenSecretRef`, set
 `optional: false` or omit `optional` so Kubernetes fails pod startup if the
 token Secret is missing. This field is a pod/Job `SecretKeySelector`; the
 operator does not read the Secret value from the Kubernetes API. Operator status
-probes and typed HA admin actions still require the token to be injected into
+probes and typed hot-standby admin actions still require the token to be injected into
 the operator pod through `spec.highAvailability.admin.tokenEnvVar`. Use
 `spec.standalone.envFrom` only when the same Secret is already being injected for
 other runtime configuration.
