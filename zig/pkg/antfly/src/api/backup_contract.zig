@@ -20,6 +20,16 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 const platform_time = @import("antfly_platform").time;
 
 pub const format_version: u32 = 2;
+
+pub fn validateArtifactRelativePath(path: []const u8) !void {
+    if (path.len == 0 or path.len > 4096 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, '\\') != null or std.mem.indexOfScalar(u8, path, 0) != null) {
+        return error.InvalidBackupArtifactPath;
+    }
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidBackupArtifactPath;
+    }
+}
 pub const backup_fence_metadata_group_id_header = "X-Antfly-Backup-Metadata-Group-Id";
 pub const backup_fence_metadata_incarnation_header = "X-Antfly-Backup-Metadata-Incarnation";
 pub const backup_fence_table_id_header = "X-Antfly-Backup-Table-Id";
@@ -37,9 +47,9 @@ pub fn sealedHandleForGroup(handles: []const SealedHandle, group_id: u64) !?Seal
     return error.InvalidBackupFence;
 }
 
-pub fn parseBackupCohortFenceHeader(value: ?[]const u8) !?@import("../storage/db/relational_integrity_topology.zig").Fence {
+pub fn parseBackupCohortFenceHeader(value: ?[]const u8) !?@import("../storage/db/relational_integrity_topology_contract.zig").Fence {
     const raw = value orelse return null;
-    const Fence = @import("../storage/db/relational_integrity_topology.zig").Fence;
+    const Fence = @import("../storage/db/relational_integrity_topology_contract.zig").Fence;
     const Encoded = @typeInfo(@typeInfo(@TypeOf(Fence.encode)).@"fn".return_type.?).error_union.payload;
     var bytes: Encoded = undefined;
     if (raw.len != bytes.len * 2) return error.InvalidBackupFence;
@@ -219,7 +229,7 @@ pub const TableBackupPlan = struct {
     target_group_id: ?u64 = null,
     /// Private common-cut authorization. It is checked under the native
     /// snapshot lock, not merely observed by the distributed coordinator.
-    relational_cohort_fence: ?@import("../storage/db/relational_integrity_topology.zig").Fence = null,
+    relational_cohort_fence: ?@import("../storage/db/relational_integrity_topology_contract.zig").Fence = null,
     sealed_handles: []const SealedHandle = &.{},
     /// Borrowed cooperative cancellation for capture, hashing, and local
     /// materialization. Durable publication still reports ambiguity according

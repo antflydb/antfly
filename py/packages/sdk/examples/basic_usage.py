@@ -2,6 +2,7 @@
 """Basic usage example for Antfly SDK."""
 
 from typing import cast
+
 from antfly import AntflyClient
 from antfly.client_generated.types import Unset
 

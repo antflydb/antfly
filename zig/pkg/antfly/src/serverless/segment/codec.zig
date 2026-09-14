@@ -80,11 +80,13 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) ![]segment_types.Entry {
             @intFromEnum(api_types.MutationKind.delete) => .delete,
             else => return error.InvalidSegment,
         };
+        const doc_id = try alloc.dupe(u8, bytes[cursor .. cursor + doc_id_len]);
+        errdefer alloc.free(doc_id);
         entries[idx] = .{
             .lsn = lsn,
             .timestamp_ns = timestamp_ns,
             .kind = kind,
-            .doc_id = try alloc.dupe(u8, bytes[cursor .. cursor + doc_id_len]),
+            .doc_id = doc_id,
             .body = if (body_len == 0) null else try alloc.dupe(u8, bytes[cursor + doc_id_len .. cursor + doc_id_len + body_len]),
         };
         initialized += 1;

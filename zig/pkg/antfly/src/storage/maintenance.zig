@@ -42,6 +42,9 @@ pub const Status = struct {
 
 pub const Result = struct {
     valid: ?bool = null,
+    /// Machine-readable issue identifier with static lifetime. Maintenance
+    /// coordinators retain results after the source call returns, and compiled
+    /// storage boundaries may expose this slice as borrowed ABI memory.
     issue: ?[]const u8 = null,
     file_size: ?u64 = null,
     valid_prefix_size: ?u64 = null,

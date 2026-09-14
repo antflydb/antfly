@@ -73,7 +73,7 @@ under Build It vary.
 
 4. **`## Build It`**, with numbered h3 steps (`### 1. Create the Help Table`). Each
    step ends in something runnable with visible output. Real commands against
-   `http://localhost:8080`, real JSON, no `{{PLACEHOLDER}}` blocks. Use `<Tabs>` for CLI
+   `http://127.0.0.1:8080`, real JSON, no `{{PLACEHOLDER}}` blocks. Use `<Tabs>` for CLI
    and cURL where both exist. Step headings are imperative. Reference material a step
    needs (per-provider setup, for instance) goes in an unnumbered h3 after the steps.
 
@@ -149,11 +149,12 @@ break silently. The recurring traps:
 - The models the Quickstart installs, and so the ones every guide should use: text
   embedding `Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1`, reranking
   `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0`, images and audio
-  `antflydb/clipclap`, generation `ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0`. Pull refs
-  carry the `hf:` prefix. `dimension` is probed, not passed.
+  `antflydb/clipclap`, generation `ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0`. The
+  `hf:` prefix on pull refs is optional (the registry strips it if present).
+  `dimension` is probed, not passed.
 - Retrieval-agent generation runs via `steps.generation` and accepts providers
-  `gemini`, `vertex`, `openai`, `ollama`, `antfly` only; responses are JSON unless
-  `stream: true`.
+  `gemini`, `vertex`, `openai`, `ollama`, `antfly` only; `stream` defaults to
+  `true`, so responses are SSE unless `stream: false`.
 - `semantic_search` requires `indexes: [...]`; omitting it is an HTTP 422.
 - `sync_level: "full_index"` for read-after-write vector queries.
 - Model refs are owner-qualified; a bare name is rejected.

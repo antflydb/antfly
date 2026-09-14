@@ -33,7 +33,7 @@ const list_models = @import("../inference/list_models.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
-const runtime_memory_abi = @import("../runtime_memory_abi.zig");
+const runtime_memory_abi = @import("runtime_memory_abi");
 const backups_api = @import("backups.zig");
 
 const Allocator = std.mem.Allocator;

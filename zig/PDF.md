@@ -1,85 +1,5 @@
 # Bounded document preparation and multimodal inference
 
-## September 2026 render-control verification
-
-### Follow-up: precommit sharing and image-row decoding
-
-Precommit document extraction now uses the shared PDF window scheduler through
-an invocation-owned execution session. It borrows immutable provider/backend
-handles but owns its mutable scheduling, recovery and progress state; it never
-installs a scheduler on the live replay runtime. Compatible reader/generator
-consumers borrow the same page buffers and retain independent typed outputs.
-The publication sink differs: replay uses fenced private durable rows, whereas
-precommit uses node-admitted local result staging (64 MiB hard limit) and the
-existing atomic primary/artifact commit. Staging pressure declines optional
-sharing and preserves the ordinary bounded execution path. No page rasters
-survive their consumer window. Source-fingerprint changes invalidate staged
-results; forced reprocessing and unchanged-state checks stay with precommit's
-ordinary publication path. Reuse binds to full source SHA-256, not the shortened
-telemetry fingerprint. Terminal partial batches can share; a consumer that
-declined an earlier nonterminal window stays disabled. Page-vector replay
-checkpoints are not used by this precommit text-result sink.
-
-The native image decoder has a pull-based row path for 8-bit DeviceGray/RGB/CMYK
-images with raw or single-Flate streams, including TIFF/PNG predictors, color
-keys, and same-size 8-bit soft masks with optional Matte correction. Color and
-mask streams advance together into native-resolution RGBA. PDF bytes are
-borrowed; owned decryption input, inflate history, predictor rows and RGBA are
-charged to the existing image-tree allocator and aggregate render grant.
-There is no full decompressed sample plane or full RGBA soft-mask allocation.
-The 64 MiB materialized-stream ceiling remains in force for general streams
-and individual rows; geometry bounds cumulative image work. Truncated or
-surplus samples, invalid checksums, and cancellation stop decoding. The final
-native RGBA result must still fit the hard image working-set limit.
-
-Other codecs, color spaces, packed samples, predictor layouts and differently
-sized masks retain their existing guarded paths; this is not a relaxation of
-their limits or an automatic reduction in DPI. The formerly rejected academic
-page has rendered at requested 150 DPI under the unchanged 256 MiB scratch cap;
-the final full service run passes all 51 pages with no OCR failures. Two-consumer
-precommit and replay probes each render nine pages exactly once, with equal
-retained text/geometry and complete vector coverage for both consumers. Tests
-also cover terminal-tail sharing and declined-prefix isolation. See
-`scripts/bench/pdf/RESULTS-2026-09-09-STREAMING.md` for final qualification.
-
-The initial source-build ablation exposed two admission defects: reserving every
-lane's 128 MiB decode ceiling made parallel rendering impossible under the
-default 256 MiB renderer cap, and speculative partial grants below that ceiling
-were incorrectly returned as page failures before launching a worker.
-
-The revised design separates hard decode limits from scheduling estimates.
-Raster/fork estimates and measured per-document worker peaks choose concurrency;
-every allocation still passes through the admitted, shared physical-memory cap.
-Underestimated parallel work retries only failed identities serially, even when
-no extra grant is available. Successful page buffers retain their owners.
-
-Speculative windows carry bounded retry metadata for scratch-pressure failures.
-After the prior window's consumers finish and release its grant, the coordinator
-acquires fresh scratch admission and retries only those failed pages once. The
-same mechanism serves OCR/generation and visual embedding. It preserves page
-geometry, deadlines/cancellation and output credit, retains no invocation-local
-callback pointers, and does not retry deterministic decode-limit violations.
-Foreground failures do not create another speculative replay cycle.
-
-Source tests and production qualification must verify these changes separately.
-The 51-page corpus also includes an approximately 98.7 MB decoded image that
-exceeds the unchanged 64 MiB materialized-stream ceiling. The image-row path
-above addresses that input without relaxing benchmark gates or reducing DPI.
-See `scripts/bench/pdf/` for the retained
-failed experiments, render-control matrix and multi-consumer qualification.
-
-Final Metal qualification at production source `29dd963a4` confirms four actual
-render workers under the unchanged 256 MiB cap. Two durable-replay consumers
-share nine physical page renders (rather than eighteen), retain identical text
-and geometry, and publish 25 vectors each without an inference-worker restart.
-The larger cohort's prefetch-dependent administration failures are fixed; only
-the independently identified oversized decoded stream remains rejected.
-These profiled checks establish correctness/reuse, not an elapsed-time ratio.
-The separate, unprofiled nine-page comparison against pinned main `98d911a88`
-passes all 12 quality-matched trials: warm elapsed is 8.826 s versus 6.574 s
-(25.5% lower, 1.342× throughput). Host load remains uncontrolled; see
-`scripts/bench/pdf/RESULTS-2026-09-08-RENDER.md` for controls and limitations.
-
 ## Implementation status
 
 Status: bounded document preparation, indexed reader execution, multimodal
@@ -3958,7 +3878,11 @@ The implementation must preserve the following invariants:
 12. Reported peak render concurrency is measured from workers actually
     executing, not from the planned wave width.
 
-## Target pipeline
+## Document preparation pipeline
+
+This section walks the live pipeline stage by stage, from page inspection
+through persisted results. It reflects the implementation described in
+[Component implementation notes](#component-implementation-notes) above.
 
 ### 1. Inspect the document and select OCR candidates
 
@@ -4155,9 +4079,10 @@ min(requested concurrency,
     pages remaining in the active OCR window)
 ```
 
-Start with a default concurrency of one, not the machine CPU count.
-Concurrency greater than one must remain disabled until the immutable document
-and task-local context split is complete.
+Default concurrency is one, not the machine CPU count. Concurrency greater
+than one is available now that the immutable document and task-local context
+split is complete, and operators can raise it up to the hard-capped maximum
+of eight.
 
 The renderer should initially schedule pages in document order. More complex
 size-aware scheduling is possible later, but it increases reorder-buffer
@@ -4779,113 +4704,100 @@ resolved generator exposes a genuinely fused image-message batch. The generic
 envelope and media ABI do not by themselves make serial projector/session calls
 a native batch.
 
-## Implementation status and follow-ups
+## Component implementation notes
 
-### Phase 0: Baseline and parity coverage
+Production plumbing for bounded document preparation and the opt-in
+real-model gate are complete. Release environments still own recurring
+model-parity and performance-baseline work; see
+[Open work](#open-work) for what remains there. The rest of this section
+describes, component by component, the behavior that has shipped.
 
-Status: production plumbing and the opt-in real-model gate are complete;
-release environments still own model parity and performance baselines.
+### Unified OCR batching policy
 
-- Add end-to-end metrics for parse, render, handoff, and Florence execution.
-- Add native Florence batch-versus-serial parity tests.
-- Add a representative scanned PDF benchmark with 1, 4, 8, and 16 pages.
-- Record current parse count, peak memory, render time, OCR time, and total
-  throughput.
+The document OCR default is eight, up from four, where resource defaults
+permit it. The document and Florence caps remain independently
+operator-controlled, with profiling of actual batch and internal chunk
+behavior. Item and byte caps are retained alongside an aggregate
+rendered-pixel cap, and the prior serial provider fallback behavior is
+preserved.
 
-### Phase 1: Unify OCR batching policy
+### Batch-render ABI with serial execution
 
-Status: complete.
+Batch rendering is an in-process `zig/lib/pdf` boundary; the obsolete
+enrichment-compute ABI is not reintroduced. The streaming multi-page render
+ABI and indexed page results parse once per batch-render document operation,
+using `max_parallel_pages = 1` with the current renderer. Enrichment runtime
+callers use this path, and the existing single-page API remains available
+alongside the batch API for compatibility. This removes repeated per-page
+parsing without making thread-safety claims.
 
-- Change the document OCR default from four to eight where resource defaults
-  permit it.
-- Keep the document and Florence caps independently operator-controlled and
-  profile actual batch and internal chunk behavior.
-- Retain item and byte caps and add an aggregate rendered-pixel cap.
-- Preserve current serial provider fallback behavior.
+Model configuration describes what executes; `InferenceExecutionContext`
+describes where it executes. The context carries the default Antfly
+endpoint, shared capability cache/I/O ownership, and trusted source routing.
+Task adapters may consume this context but may not synthesize their own
+localhost, cache, or tenant-routing policy.
 
-### Phase 2: Batch-render ABI with serial execution
+### Immutable document and controlled concurrency
 
-Status: complete as an in-process `zig/lib/pdf` boundary; the obsolete
-enrichment-compute ABI is not reintroduced.
+Document-local concurrency plus global resource-manager byte admission are
+complete. Parallelism defaults to one and is operator-capped at eight.
 
-- Add the streaming multi-page render ABI and indexed page results.
-- Parse once per batch-render document operation.
-- Implement it with `max_parallel_pages = 1` using the current renderer.
-- Migrate enrichment runtime callers.
-- Keep the existing single-page API alongside the batch API for compatibility.
+Parsed immutable PDF state is split from mutable page render contexts; lazy
+mutable caches move to task-local state or are frozen before workers start.
+Global resource-manager byte admission plus a per-document worker cap governs
+concurrency, backed by private freeing budgeted allocators per task and
+cancellation/join/concurrency stress coverage. One stable coordinator
+persists across streaming OCR flushes, composing wave-local cancellation
+with the external deadline and reporting measured rather than planned
+concurrency.
 
-This phase removes repeated per-page parsing without making thread-safety
-claims.
-- Model configuration describes what executes; `InferenceExecutionContext`
-  describes where it executes. The context carries the default Antfly
-  endpoint, shared capability cache/I/O ownership, and trusted source routing.
-  Task adapters may consume this context but may not synthesize their own
-  localhost, cache, or tenant-routing policy.
+Native and transient output memory reserve as one owned split, reclaiming
+before partial fallback, atomically transferring output credit to a
+dedicated window-scoped invocation allocator, partitioning partial native
+grants into decode/raster budgets, and recomputing available render bytes
+before each window; the complete composite lease releases before planning
+the next window. Encoded output downsizes within each worker before
+retaining a completed page. Immutable document metadata is borrowed into
+wave-local worker forks, reusing one fixed backend-runtime worker lane
+across documents and waves; mutable page state remains thread-confined and
+reusable scratch resets with a strict retention cap after every job.
 
-### Phase 3: Immutable document and controlled concurrency
+The native Zig allocator ceiling and the CoreGraphics framework allowance
+are treated as separate guarantees: compatibility pages are serialized and
+RSS-qualified because framework-private allocations cannot be intercepted by
+`BudgetedAllocator`.
 
-Status: complete for document-local concurrency plus global resource-manager
-byte admission. Parallelism defaults to one and is operator-capped at eight.
+### Binary local media handoff
 
-- Split parsed immutable PDF state from mutable page render contexts.
-- Move lazy mutable caches to task-local state or freeze them before workers
-  start.
-- Use global resource-manager byte admission plus a per-document worker cap.
-- Add private freeing budgeted allocators per task.
-- Enable operator-capped concurrency, defaulting to one.
-- Add cancellation, join, and concurrency stress tests.
-- Keep one stable coordinator across streaming OCR flushes, compose
-  wave-local cancellation with the external deadline, and report measured
-  rather than planned concurrency.
-- Reserve native and transient output memory as one owned split, reclaim before
-  partial fallback, atomically transfer output credit to a dedicated
-  window-scoped invocation allocator, partition partial native grants into
-  decode/raster budgets, and recompute available render bytes before each
-  window. Release the complete composite lease before planning the next window.
-- Downsize encoded output within each worker before retaining a completed page.
-- Borrow immutable document metadata into wave-local worker forks and reuse one
-  fixed backend-runtime worker lane across documents and waves; mutable page
-  state remains thread-confined and reusable scratch is reset with a strict
-  retention cap after every job.
-- Treat the native Zig allocator ceiling and the CoreGraphics framework
-  allowance as separate guarantees. Compatibility pages are serialized and
-  RSS-qualified because framework-private allocations cannot be intercepted by
-  `BudgetedAllocator`.
+Operation-neutral borrowed binary segments across reader, generator, and
+embedder standalone runtime calls are complete, with data-URI fallback at
+unsupported provider boundaries. The internal asset producer request carries
+trusted binary media through a direct encoded-image batch reader entry
+point. Generator media placeholders and embedding binary parts reconstruct
+from the same borrowed attachment array with strict redundant-count
+validation. Direct encoded media is treated as already resident so admission
+does not add a fictitious second download allocation. Base64/data-URI
+serialization is removed from local PDF OCR, while serialization adapters
+remain for remote providers.
 
-### Phase 4: Binary local media handoff
+### Render/OCR pipeline overlap
 
-Status: complete, including operation-neutral borrowed binary segments across
-reader, generator, and embedder standalone runtime calls, with data-URI
-fallback at unsupported provider boundaries.
-
-- Extend the internal asset producer request with trusted binary media.
-- Add a direct encoded-image batch reader entry point.
-- Reconstruct generator media placeholders and embedding binary parts from the
-  same borrowed attachment array with strict redundant-count validation.
-- Treat direct encoded media as already resident so admission does not add a
-  fictitious second download allocation.
-- Remove base64/data-URI serialization from local PDF OCR.
-- Keep serialization adapters for remote providers.
-
-### Phase 5: Render/OCR pipeline overlap
-
-Status: complete for PDF OCR and durable visual embedding. The active window
+Complete for PDF OCR and durable visual embedding. The active window
 releases its scratch and output credit as soon as its consumer finishes. At
 most one speculative window may acquire a second composite lease against the
 still-live first lease; inability to admit the combined peak falls back to
 synchronous preparation after release. Cancellation and every exit path join
 the speculative task before destroying its document session.
 
-- Keep prefetch operator-controlled and hard-cap it at one window.
-- Keep every live render and invocation byte under a composite reservation.
-- Join speculative rendering before tearing down its document session or
-  buffers.
-- Compare end-to-end throughput and peak memory against the non-overlapped
-  implementation.
+Prefetch stays operator-controlled and hard-capped at one window, every live
+render and invocation byte stays under a composite reservation, and
+speculative rendering joins before tearing down its document session or
+buffers. End-to-end throughput and peak memory are measured against the
+non-overlapped implementation.
 
-### Phase 6: Optional decoded-image handoff
+### Optional decoded-image handoff
 
-Status: complete for linked native Florence reads and linked visual embedders.
+Complete for linked native Florence reads and linked visual embedders.
 Bounded direct-to-batch-tensor preprocessing uses the backend runtime's lazy
 inference lane, deterministic output slices, direct RGBA consumption for
 Florence and ClipClap-class embedders, and direct baseline-JPEG
@@ -4898,29 +4810,25 @@ bicubic, allocate from a caller-backed, synchronized wave budget. That budget
 grows only between joined waves, reduces worker width before rejecting valid
 input, and maps terminal exhaustion to the same explicit preprocessing byte
 limit as encoded-image decoding. Borrowed-page preprocessing therefore has no
-unadmitted per-worker scratch allocator escape.
+unadmitted per-worker scratch allocator escape. The decoded pixel format and
+ownership/admission contract stay narrow and append-only until another
+executor demonstrates a need for additional pixel formats, and encoded-image
+fallback is preserved for other reader families. Realized encode/decode
+reduction and copy cost are measured on the production corpus.
 
-- Measure the realized encode/decode reduction and copy cost on the production
-  corpus.
-- Keep the decoded pixel format and ownership/admission contract narrow and
-  append-only until another executor demonstrates a need for additional pixel
-  formats.
-- Preserve encoded-image fallback for other reader families.
+### PDF inspection and render preparation fusion
 
-### Phase 7: Fuse PDF inspection and render preparation if needed
-
-Status: complete within one pending document group. A credential-scoped source
-cache owns the download and one prepared reader, lends immutable metadata to
+Complete within one pending document group. A credential-scoped source cache
+owns the download and one prepared reader, lends immutable metadata to
 task-private render forks, and retains idle preparation for page-image
 embedding to reuse unless process pressure requires eviction. A bounded
 attempt spool prevents publication from walking the PDF again; neutral page
-text records let compatible consumers avoid repeating text inspection.
-
-- Reuse one preparation per credential-scoped source and decode envelope in a
-  pending document group; permit recomputation after pressure eviction.
-- Keep the prepared handle document-group-scoped, never process-global.
-- Replay resolved typed units from bounded attempt storage, then clean that
-  private keyspace.
+text records let compatible consumers avoid repeating text inspection. One
+preparation is reused per credential-scoped source and decode envelope in a
+pending document group, with recomputation permitted after pressure
+eviction; the prepared handle stays document-group-scoped, never
+process-global. Resolved typed units replay from bounded attempt storage,
+and that private keyspace is cleaned afterward.
 
 ## Acceptance criteria
 
@@ -5348,7 +5256,115 @@ and validate outputs against that contract. Device-resident execution and this
 branch qualification remain unimplemented; existing resident hooks alone do not
 provide independent cache ownership and device-domain KV admission.
 
-## Open decisions
+## History and verification notes
+
+This section retains dated verification evidence for specific hardening work.
+It is a record of what was checked and when, not part of the ongoing design
+narrative above.
+
+### September 2026 render-control verification
+
+#### Follow-up: precommit sharing and image-row decoding
+
+Precommit document extraction now uses the shared PDF window scheduler through
+an invocation-owned execution session. It borrows immutable provider/backend
+handles but owns its mutable scheduling, recovery and progress state; it never
+installs a scheduler on the live replay runtime. Compatible reader/generator
+consumers borrow the same page buffers and retain independent typed outputs.
+The publication sink differs: replay uses fenced private durable rows, whereas
+precommit uses node-admitted local result staging (64 MiB hard limit) and the
+existing atomic primary/artifact commit. Staging pressure declines optional
+sharing and preserves the ordinary bounded execution path. No page rasters
+survive their consumer window. Source-fingerprint changes invalidate staged
+results; forced reprocessing and unchanged-state checks stay with precommit's
+ordinary publication path. Reuse binds to full source SHA-256, not the shortened
+telemetry fingerprint. Terminal partial batches can share; a consumer that
+declined an earlier nonterminal window stays disabled. Page-vector replay
+checkpoints are not used by this precommit text-result sink.
+
+The native image decoder has a pull-based row path for 8-bit DeviceGray/RGB/CMYK
+images with raw or single-Flate streams, including TIFF/PNG predictors, color
+keys, and same-size 8-bit soft masks with optional Matte correction. Color and
+mask streams advance together into native-resolution RGBA. PDF bytes are
+borrowed; owned decryption input, inflate history, predictor rows and RGBA are
+charged to the existing image-tree allocator and aggregate render grant.
+There is no full decompressed sample plane or full RGBA soft-mask allocation.
+The 64 MiB materialized-stream ceiling remains in force for general streams
+and individual rows; geometry bounds cumulative image work. Truncated or
+surplus samples, invalid checksums, and cancellation stop decoding. The final
+native RGBA result must still fit the hard image working-set limit.
+
+Other codecs, color spaces, packed samples, predictor layouts and differently
+sized masks retain their existing guarded paths; this is not a relaxation of
+their limits or an automatic reduction in DPI. The formerly rejected academic
+page has rendered at requested 150 DPI under the unchanged 256 MiB scratch cap;
+the final full service run passes all 51 pages with no OCR failures. Two-consumer
+precommit and replay probes each render nine pages exactly once, with equal
+retained text/geometry and complete vector coverage for both consumers. Tests
+also cover terminal-tail sharing and declined-prefix isolation. See
+`scripts/bench/pdf/RESULTS-2026-09-09-STREAMING.md` for final qualification.
+
+The initial source-build ablation exposed two admission defects: reserving every
+lane's 128 MiB decode ceiling made parallel rendering impossible under the
+default 256 MiB renderer cap, and speculative partial grants below that ceiling
+were incorrectly returned as page failures before launching a worker.
+
+The revised design separates hard decode limits from scheduling estimates.
+Raster/fork estimates and measured per-document worker peaks choose concurrency;
+every allocation still passes through the admitted, shared physical-memory cap.
+Underestimated parallel work retries only failed identities serially, even when
+no extra grant is available. Successful page buffers retain their owners.
+
+Speculative windows carry bounded retry metadata for scratch-pressure failures.
+After the prior window's consumers finish and release its grant, the coordinator
+acquires fresh scratch admission and retries only those failed pages once. The
+same mechanism serves OCR/generation and visual embedding. It preserves page
+geometry, deadlines/cancellation and output credit, retains no invocation-local
+callback pointers, and does not retry deterministic decode-limit violations.
+Foreground failures do not create another speculative replay cycle.
+
+Source tests and production qualification must verify these changes separately.
+The 51-page corpus also includes an approximately 98.7 MB decoded image that
+exceeds the unchanged 64 MiB materialized-stream ceiling. The image-row path
+above addresses that input without relaxing benchmark gates or reducing DPI.
+See `scripts/bench/pdf/` for the retained
+failed experiments, render-control matrix and multi-consumer qualification.
+
+Final Metal qualification at production source `29dd963a4` confirms four actual
+render workers under the unchanged 256 MiB cap. Two durable-replay consumers
+share nine physical page renders (rather than eighteen), retain identical text
+and geometry, and publish 25 vectors each without an inference-worker restart.
+The larger cohort's prefetch-dependent administration failures are fixed; only
+the independently identified oversized decoded stream remains rejected.
+These profiled checks establish correctness/reuse, not an elapsed-time ratio.
+The separate, unprofiled nine-page comparison against pinned main `98d911a88`
+passes all 12 quality-matched trials: warm elapsed is 8.826 s versus 6.574 s
+(25.5% lower, 1.342× throughput). Host load remains uncontrolled; see
+`scripts/bench/pdf/RESULTS-2026-09-08-RENDER.md` for controls and limitations.
+
+## Open work
+
+This section collects the genuinely unresolved design questions and the
+release-environment work that has not shipped yet, so the rest of this
+document can describe the pipeline as it exists.
+
+### Baseline and parity coverage owed by release environments
+
+Production plumbing for document preparation and the opt-in real-model gate
+are complete (see [Component implementation notes](#component-implementation-notes)),
+but release environments still own recurring model-parity and
+performance-baseline work rather than one-time implementation tasks:
+
+- End-to-end metrics for parse, render, handoff, and Florence execution.
+- Native Florence batch-versus-serial parity tests running against production
+  model artifacts in CI.
+- A representative scanned PDF benchmark with 1, 4, 8, and 16 pages, with
+  recorded parse count, peak memory, render time, OCR time, and total
+  throughput published as thresholds.
+
+This overlaps with the qualification work already called out under
+[Acceptance criteria](#acceptance-criteria); both describe the same
+outstanding release-environment ownership rather than an architectural gap.
 
 ### Execution-path qualification and admission recovery
 

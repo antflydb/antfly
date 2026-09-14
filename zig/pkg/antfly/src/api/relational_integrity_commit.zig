@@ -345,7 +345,7 @@ const Builder = struct {
         return self.bindingPlanFiltered(table, with_unique, with_foreign, null);
     }
 
-    fn bindingPlanFiltered(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool, retirement: ?@import("../storage/db/relational_integrity_retirement.zig").Progress) !planner.Plan {
+    fn bindingPlanFiltered(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool, retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Progress) !planner.Plan {
         const unique_defs = if (with_unique) table.uniques else &.{};
         const foreign_defs = if (with_foreign) table.foreign else &.{};
         var uniques = std.ArrayList(planner.UniqueBinding).empty;
@@ -384,7 +384,7 @@ const Builder = struct {
 
     fn outputIndex(self: *Builder, table_name: []const u8, version: u32) !usize {
         const loaded = try self.load(table_name);
-        const generation_set = @import("../storage/db/relational_integrity_activation.zig").generationSet(loaded.catalog);
+        const generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(loaded.catalog);
         for (self.output.items, 0..) |*table, i| if (std.mem.eql(u8, table.table_name, table_name)) {
             if (table.relational_schema_version) |old| if (old != version) return error.PreparedGenerationChanged;
             table.relational_schema_version = version;
@@ -534,7 +534,7 @@ pub fn ensureUniqueCoverage(alloc: Allocator, source: reads.TableReadSource, met
 }
 
 fn ensureUniqueCoverageControlled(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, table_names: []const []const u8, request_control: RequestContext) !void {
-    const activation = @import("../storage/db/relational_integrity_activation.zig");
+    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .control = try boundedControl(request_control) };
@@ -621,14 +621,14 @@ pub fn prepareRepair(alloc: Allocator, source: reads.TableReadSource, metadata: 
 /// Backfill writes only globally routed derived claims/references, never the
 /// primary rows. Source versions remain real read-only 2PC participants. The
 /// caller enlists its owner-bound activation checkpoint in this SAME decision.
-pub fn prepareRetirementPage(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, progress: @import("../storage/db/relational_integrity_retirement.zig").Progress, request: RequestContext) !Prepared {
+pub fn prepareRetirementPage(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, progress: @import("../storage/db/relational_integrity_retirement_contract.zig").Progress, request: RequestContext) !Prepared {
     if (rows.len > 128 or (progress.phase != .foreign_keys and progress.phase != .unique)) return error.InvalidConstraintRetirement;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .control = try boundedControl(request) };
     defer builder.deinit();
     const table = try builder.load(table_name);
-    if (table.view.version() != progress.schema_version or !std.mem.eql(u8, &@import("../storage/db/relational_integrity_activation.zig").generationSet(table.catalog), &progress.generation_set)) return error.ConstraintRetirementChanged;
+    if (table.view.version() != progress.schema_version or !std.mem.eql(u8, &@import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog), &progress.generation_set)) return error.ConstraintRetirementChanged;
     const row_table_index = try builder.outputIndex(table_name, table.view.version());
     var plan = try builder.bindingPlanFiltered(table, progress.phase == .unique, progress.phase == .foreign_keys, progress);
     defer plan.deinit();
@@ -736,7 +736,7 @@ fn testCatalogEnvelope(alloc: Allocator, table_id: u64, json: []const u8) ![]u8 
 
 test "distributed txn global unique coverage checks every owner and rejects stale incomplete proofs" {
     const alloc = std.testing.allocator;
-    const activation = @import("../storage/db/relational_integrity_activation.zig");
+    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;

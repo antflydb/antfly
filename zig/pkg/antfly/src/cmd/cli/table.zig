@@ -389,7 +389,7 @@ test "table create sends the exact quickstart inline index through the HTTP clie
     var server = try httpx.TestServer.start(alloc, io, &.{.{
         .method = .POST,
         .path = "/db/v1/tables/wikipedia",
-        .respond = .{ .body = "{}" },
+        .respond = .{ .body = "{\"name\":\"wikipedia\",\"indexes\":{},\"shards\":{}}" },
         .assert_request = Assert.request,
     }});
     defer server.deinit();

@@ -17,17 +17,19 @@ pub fn ApiResponse(comptime T: type) type {
             if (self.err_body) |b| self.allocator.free(b);
         }
 
-        pub fn fromResponse(allocator: std.mem.Allocator, resp: *httpx.Response) @This() {
+        pub fn fromResponse(allocator: std.mem.Allocator, resp: *httpx.Response) !@This() {
             defer resp.deinit();
             if (resp.ok()) {
+                if (resp.status.code == 204 or resp.status.code == 205) return .{ .status_code = resp.status.code, .allocator = allocator };
                 if (resp.body) |body| {
-                    const parsed = std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always }) catch {
-                        return .{ .status_code = resp.status.code, .allocator = allocator };
+                    const parsed = std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+                        return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidApiResponse;
                     };
                     return .{ .status_code = resp.status.code, .data = parsed, .allocator = allocator };
                 }
+                return error.InvalidApiResponse;
             }
-            return .{ .status_code = resp.status.code, .err_body = if (resp.body) |b| (allocator.dupe(u8, b) catch null) else null, .allocator = allocator };
+            return .{ .status_code = resp.status.code, .err_body = if (resp.body) |b| try allocator.dupe(u8, b) else null, .allocator = allocator };
         }
     };
 }
@@ -1357,6 +1359,23 @@ pub const Client = struct {
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
+    /// Execute a graph metric operational action
+    /// POST /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}
+    pub fn executeGraphMetricAction(self: *@This(), table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !ApiResponse(types.GraphMetricActionResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const encoded_metric_name = try httpx.PercentEncoding.encode(self.allocator, metric_name);
+        defer self.allocator.free(encoded_metric_name);
+        const encoded_action = try httpx.PercentEncoding.encode(self.allocator, action);
+        defer self.allocator.free(encoded_action);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/graph-metrics/{s}:{s}", .{ self.base_url, encoded_table_name, encoded_index_name, encoded_metric_name, encoded_action });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
     /// POST /db/v1/tables/{tableName}/merge
     pub fn linearMerge(self: *@This(), table_name: []const u8, body: types.LinearMergeRequest) !ApiResponse(types.LinearMergeResult) {
@@ -1381,6 +1400,19 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.StatefulQueryResponses).fromResponse(self.allocator, &resp);
+    }
+
+    /// Start a durable index control job
+    /// POST /db/v1/tables/{tableName}/repair/control-jobs
+    pub fn startTableRepairControlJob(self: *@This(), table_name: []const u8, body: types.TableRepairControlJobStartRequest) !ApiResponse(types.TableRepairJob) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/control-jobs", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.TableRepairJob).fromResponse(self.allocator, &resp);
     }
 
     /// List table repair issues

@@ -14,9 +14,10 @@
 
 //! Authoritative storage-test discovery surface.
 //!
-//! Every storage source containing a test declaration is imported exactly once
-//! here. The bounded shard builds compile this manifest through root.zig and
-//! select disjoint test-name prefixes. The accompanying audit rejects missing,
+//! Storage sources containing tests are imported exactly once here, except
+//! dedicated ABI suites declared by build/storage_owner_tests.zig. The bounded
+//! shard builds compile this manifest through root.zig and select disjoint
+//! test-name prefixes. The accompanying audit rejects missing,
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
@@ -28,6 +29,8 @@ comptime {
     _ = @import("db/relational_index_jobs.zig");
     _ = @import("db/relational_constraint_jobs.zig");
     _ = @import("db/relational_integrity.zig");
+    _ = @import("db/relational_integrity_contract.zig");
+    _ = @import("db/relational_transition_contract.zig");
     _ = @import("db/relational_integrity_catalog.zig");
     _ = @import("db/relational_integrity_integration_test.zig");
     _ = @import("db/relational_integrity_range.zig");
@@ -38,6 +41,8 @@ comptime {
     _ = @import("db/relational_index_gc.zig");
     _ = @import("db/relational_predicate.zig");
     _ = @import("admission_waiter.zig");
+    _ = @import("coordinated_ttl.zig");
+    _ = @import("restore_owner.zig");
     _ = @import("artifact_payload.zig");
     _ = @import("dense_work_admission.zig");
     _ = @import("maintenance_signal.zig");
@@ -55,8 +60,10 @@ comptime {
     _ = @import("backup_bundle_io.zig");
     _ = @import("backup_repository.zig");
     _ = @import("coverage_identity.zig");
+    _ = @import("data_raft_projection_wire.zig");
     _ = @import("db_split_vopr.zig");
     _ = @import("db/aggregations.zig");
+    _ = @import("db/aggregations_contract.zig");
     _ = @import("db/algebraic/adaptive.zig");
     _ = @import("db/algebraic/algebra.zig");
     _ = @import("db/algebraic/cylinder.zig");
@@ -64,6 +71,7 @@ comptime {
     _ = @import("db/algebraic/fact.zig");
     _ = @import("db/algebraic/hll.zig");
     _ = @import("db/algebraic/index.zig");
+    _ = @import("db/algebraic/index_config.zig");
     _ = @import("db/algebraic/ir.zig");
     _ = @import("db/algebraic/join.zig");
     _ = @import("db/algebraic/law.zig");
@@ -124,17 +132,20 @@ comptime {
     _ = @import("db/enrichment/enrichment_worker.zig");
     _ = @import("db/enrichment/utf8_text.zig");
     _ = @import("db/generation_lifecycle.zig");
+    _ = @import("db/graph_runtime.zig");
     _ = @import("db/graph_asset_state.zig");
     _ = @import("db/graph_edge_contender.zig");
     _ = @import("db/graph_state_name.zig");
     _ = @import("db/lease.zig");
+    _ = @import("db/maintenance/graph_metric_runtime.zig");
     _ = @import("db/maintenance/sparse_compaction_runtime.zig");
     _ = @import("db/maintenance/transaction_runtime.zig");
     _ = @import("db/maintenance/ttl_runtime.zig");
-    _ = @import("db/merge_state.zig");
+    _ = @import("db/merge_contract.zig");
     _ = @import("db/mod.zig");
     _ = @import("db/native_backup.zig");
     _ = @import("db/ownership.zig");
+    _ = @import("db/planning_bindings.zig");
     _ = @import("db/planning_stats.zig");
     _ = @import("db/promotion_runtime.zig");
     _ = @import("db/publication.zig");
@@ -144,6 +155,7 @@ comptime {
     _ = @import("db/query/relational_projection.zig");
     _ = @import("db/query/result_shape.zig");
     _ = @import("db/query/search_exec.zig");
+    _ = @import("db/query/structured_filter_validation.zig");
     _ = @import("db/query_metrics.zig");
     _ = @import("db/range_state.zig");
     _ = @import("db/relational_columns.zig");
@@ -157,6 +169,7 @@ comptime {
     _ = @import("db/snapshot_admission.zig");
     _ = @import("db/template_remote_stub.zig");
     _ = @import("db/template_stub.zig");
+    _ = @import("db/text_memory_stats.zig");
     _ = @import("db/transform.zig");
     _ = @import("db/typed_doc_values_coverage.zig");
     _ = @import("db/types.zig");
@@ -165,53 +178,58 @@ comptime {
     _ = @import("enrichment.zig");
     _ = @import("filesystem_capacity.zig");
     _ = @import("generation_publication.zig");
-    _ = @import("ha/admin.zig");
-    _ = @import("ha/admin_cli.zig");
-    _ = @import("ha/admin_exec.zig");
-    _ = @import("ha/backup_manifest.zig");
-    _ = @import("ha/bootstrap.zig");
-    _ = @import("ha/chaos.zig");
-    _ = @import("ha/commit_gate.zig");
-    _ = @import("ha/compat.zig");
-    _ = @import("ha/effects.zig");
-    _ = @import("ha/fencing.zig");
-    _ = @import("ha/http_admin.zig");
-    _ = @import("ha/http_client.zig");
-    _ = @import("ha/http_internal.zig");
-    _ = @import("ha/http_operation.zig");
-    _ = @import("ha/http_replication_client.zig");
-    _ = @import("ha/kubernetes_lease_watchdog.zig");
-    _ = @import("ha/lifecycle_receipt_inventory_test.zig");
-    _ = @import("ha/local_generation_gc.zig");
-    _ = @import("ha/metadata_effect_chunks.zig");
-    _ = @import("ha/metrics.zig");
-    _ = @import("ha/mod.zig");
-    _ = @import("ha/mutation_barrier.zig");
-    _ = @import("ha/mutation_inventory.zig");
-    _ = @import("ha/operator.zig");
-    _ = @import("ha/owner_job_gate.zig");
-    _ = @import("ha/primary.zig");
-    _ = @import("ha/public_gate_state.zig");
-    _ = @import("ha/read_gate.zig");
-    _ = @import("ha/rejoin.zig");
-    _ = @import("ha/replication_api.zig");
-    _ = @import("ha/replication_log.zig");
-    _ = @import("ha/replication_record.zig");
-    _ = @import("ha/seed_activation.zig");
-    _ = @import("ha/seed_artifact.zig");
-    _ = @import("ha/seed_capture.zig");
-    _ = @import("ha/seed_namespace_control.zig");
-    _ = @import("ha/seed_prefix_cleanup_test.zig");
-    _ = @import("ha/session.zig");
-    _ = @import("ha/slot_store.zig");
-    _ = @import("ha/standby.zig");
-    _ = @import("ha/status.zig");
-    _ = @import("ha/validation.zig");
-    _ = @import("ha/vopr.zig");
-    _ = @import("ha/write_gate.zig");
+    _ = @import("hot_standby/admin.zig");
+    _ = @import("hot_standby/admin_cli.zig");
+    _ = @import("hot_standby/admin_exec.zig");
+    _ = @import("hot_standby/backup_manifest.zig");
+    _ = @import("hot_standby/bootstrap.zig");
+    _ = @import("hot_standby/chaos.zig");
+    _ = @import("hot_standby/commit_gate.zig");
+    _ = @import("hot_standby/compat.zig");
+    _ = @import("hot_standby/effects.zig");
+    _ = @import("hot_standby/fencing.zig");
+    _ = @import("hot_standby/http_admin.zig");
+    _ = @import("hot_standby/http_client.zig");
+    _ = @import("hot_standby/http_internal.zig");
+    _ = @import("hot_standby/http_operation.zig");
+    _ = @import("hot_standby/http_replication_client.zig");
+    _ = @import("hot_standby/kubernetes_lease_watchdog.zig");
+    _ = @import("hot_standby/layout.zig");
+    _ = @import("hot_standby/lifecycle_receipt_inventory_test.zig");
+    _ = @import("hot_standby/local_generation_gc.zig");
+    _ = @import("hot_standby/metadata_effect_chunks.zig");
+    _ = @import("hot_standby/replay_floor.zig");
+    _ = @import("hot_standby/restore_terminal_ledger.zig");
+    _ = @import("hot_standby/metrics.zig");
+    _ = @import("hot_standby/mod.zig");
+    _ = @import("hot_standby/mutation_barrier.zig");
+    _ = @import("hot_standby/mutation_inventory.zig");
+    _ = @import("hot_standby/operator.zig");
+    _ = @import("hot_standby/owner_job_gate.zig");
+    _ = @import("hot_standby/primary.zig");
+    _ = @import("hot_standby/public_gate_state.zig");
+    _ = @import("hot_standby/read_gate.zig");
+    _ = @import("hot_standby/rejoin.zig");
+    _ = @import("hot_standby/replication_api.zig");
+    _ = @import("hot_standby/replication_log.zig");
+    _ = @import("hot_standby/replication_record.zig");
+    _ = @import("hot_standby/seed_activation.zig");
+    _ = @import("hot_standby/seed_artifact.zig");
+    _ = @import("hot_standby/seed_capture.zig");
+    _ = @import("hot_standby/seed_namespace_control.zig");
+    _ = @import("hot_standby/seed_prefix_cleanup_test.zig");
+    _ = @import("hot_standby/session.zig");
+    _ = @import("hot_standby/slot_store.zig");
+    _ = @import("hot_standby/standby.zig");
+    _ = @import("hot_standby/status.zig");
+    _ = @import("hot_standby/validation.zig");
+    _ = @import("hot_standby/vopr.zig");
+    _ = @import("hot_standby/write_gate.zig");
     _ = @import("hbc_adapter.zig");
     _ = @import("hierarchy_navigation.zig");
     _ = @import("internal_keys.zig");
+    _ = @import("kernel_owner_client.zig");
+    _ = @import("kernel_wal_wire.zig");
     _ = @import("index_manager_vopr.zig");
     _ = @import("lite/backend.zig");
     _ = @import("lite/bridge.zig");
@@ -223,6 +241,7 @@ comptime {
     _ = @import("lite/native.zig");
     _ = @import("lite/paths.zig");
     _ = @import("lite/restore_staging.zig");
+    _ = @import("local_write.zig");
     _ = @import("lmdb.zig");
     _ = @import("lmdb_backend.zig");
     _ = @import("lmdb_vopr.zig");
@@ -250,6 +269,7 @@ comptime {
     _ = @import("lsm_backend/manifest_set.zig");
     _ = @import("lsm_backend/manifest_replay.zig");
     _ = @import("lsm_backend/obsolete_ledger.zig");
+    _ = @import("lsm_backend/physical_usage_test.zig");
     _ = @import("lsm_backend/repository.zig");
     _ = @import("lsm_backend/run_directory.zig");
     _ = @import("lsm_backend/run_store.zig");

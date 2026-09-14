@@ -15,6 +15,7 @@
 pub const types = @import("types.zig");
 pub const client = @import("client.zig");
 pub const filesystem = @import("filesystem.zig");
+pub const durable_directory = @import("durable_directory.zig");
 pub const memory = @import("memory.zig");
 pub const s3 = @import("s3.zig");
 pub const gcs = @import("gcs.zig");

@@ -145,7 +145,7 @@ Run a single node with Docker Compose, with the public API on port 8080 and data
 services:
   antfly:
     image: ghcr.io/antflydb/antfly:latest
-    command: ["standalone", "--host", "0.0.0.0"]
+    command: ["standalone", "--host", "0.0.0.0", "--data-dir", "/antflydb"]
     ports:
       - "8080:8080" # Public API
     volumes:

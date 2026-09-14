@@ -10,7 +10,7 @@ const std = @import("std");
 const vopr = @import("vopr");
 const data_format = @import("../common/data_format.zig");
 const fs_paths = @import("../common/fs_paths.zig");
-const storage_ha = @import("../storage/ha/mod.zig");
+const storage_ha = @import("../storage/hot_standby/mod.zig");
 const head_coordination = @import("../serverless/head_coordination.zig");
 const external_codec = @import("../serverless/external_source/codec.zig");
 const external_types = @import("../serverless/external_source/types.zig");
@@ -68,7 +68,7 @@ pub const Scenario = struct {
     };
 
     const Mode = enum {
-        storage_ha_v1_golden,
+        storage_hot_standby_v1_golden,
         data_dir_legacy_rejected,
         data_dir_future_rejected,
         data_dir_crash_then_forward,
@@ -104,7 +104,7 @@ pub const Scenario = struct {
 
         fn run(self: *State, mode: Mode) !void {
             switch (mode) {
-                .storage_ha_v1_golden => try storage_ha.compat.validateV1Fixtures(self.allocator),
+                .storage_hot_standby_v1_golden => try storage_ha.compat.validateV1Fixtures(self.allocator),
                 .data_dir_legacy_rejected => try self.legacyDataDirRejected(),
                 .data_dir_future_rejected => try self.futureDataDirRejected(),
                 .data_dir_crash_then_forward => try self.crashDataDirMigration(),
@@ -253,7 +253,7 @@ pub const Scenario = struct {
             .id = id,
             .name = mode_name,
             .kind = switch (mode) {
-                .storage_ha_v1_golden, .serverless_legacy_head_forward, .serverless_inventory_v14_forward, .serverless_manifest_v12_forward => .maintenance,
+                .storage_hot_standby_v1_golden, .serverless_legacy_head_forward, .serverless_inventory_v14_forward, .serverless_manifest_v12_forward => .maintenance,
                 else => .fault,
             },
         });

@@ -1,9 +1,9 @@
-# Antfly inference NVIDIA Inference Plan
+# CUDA Backend
 
-## Goal
+## Overview
 
-Support inference on NVIDIA GPUs while preserving Antfly inference's current portability
-model:
+The CUDA backend supports inference on NVIDIA GPUs while preserving Antfly
+inference's portability model:
 
 - A normal Antfly inference build does not require the CUDA toolkit.
 - A normal Antfly inference container does not ship CUDA runtime libraries, cuBLAS,
@@ -202,7 +202,7 @@ Use this layout:
 Build flags:
 
 - `-Dcuda=true`: compile CUDA backend Zig code and embed checked-in artifacts.
-- `-Dcuda=false`: default until the backend is mature.
+- `-Dcuda=false`: current default; the backend is not yet enabled by default (see Open work).
 - `-Dcuda-artifacts=portable`: embed the checked-in portable PTX only.
 - `-Dcuda-artifacts=fatbin`: embed the checked-in multi-arch fatbin. This is
   the default.
@@ -349,38 +349,14 @@ Current CUDA behavior:
   `ANTFLY_CUDA_DISABLE_TURBOQUANT_KV=1` fall back to the existing non-compressed
   path.
 
-Status checked on 2026-06-21 on an NVIDIA L4 (`sm_89`) with CUDA Toolkit 13.2
-and driver R580:
-
-- `zig build -Dcuda=true`, `regen-cuda-artifacts.sh --check --all`,
-  `antfly-inference cuda-info --smoke`, and `zig build test -Dcuda=true` pass.
-- `polar4` is a production-candidate opt-in compressed-K/compressed-V path. It
-  stays fully resident on CUDA with zero host attention fallback in the E2B and
-  12B Q4 checks below.
-- `turbo3` is functional and resident, but remains experimental. It is slower
-  than `polar4` on the current L4 decode workloads and can change output quality
-  more aggressively.
-- `polar4` is not the CUDA default yet. Deterministic 12B Q4 f32/polar4 output
-  matched in the 32-token raw check, but E2B f32/polar4 output diverged. Promote
-  only after an explicit quality/parity acceptance gate, not just the runtime
-  gate.
-
-Measured L4 results from `/tmp/antfly-cuda-turboquant-prod`:
-
-| Workload | Cache | Tokens | Load | Warm TTFT | Cold TTFT | Decode tok/s | CUDA KV status |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| E2B Korean summary | f32 | 128 | 8.56s | 0.30s | 8.86s | 17.11 | 4480/4480 device KV successes |
-| E2B Korean summary | polar4 | 128 | 8.43s | 0.30s | 8.73s | 16.70 | 1920 compressed-V writes, 4480 reads |
-| 12B Q4 Korean summary | f32 | 40 | 17.01s | 2.01s | 19.02s | 8.67 | 1968/1968 device KV successes |
-| 12B Q4 Korean summary | polar4 | 30 | 17.10s | 1.98s | 19.08s | 8.66 | 1488 compressed-V writes, 1488 reads |
-| 12B Q4 raw repeat 1 | polar4 | 32 | 17.09s | 0.63s | 17.71s | 9.16 | zero fallback |
-| 12B Q4 raw repeat 2 | polar4 | 32 | 17.02s | 0.63s | 17.65s | 9.06 | zero fallback |
-| 12B Q4 raw repeat 3 | polar4 | 32 | 16.82s | 0.63s | 17.45s | 9.04 | zero fallback |
-
-The current performance win is memory residency and lower metadata overhead, not
-higher tok/s. The block-table upload cache reduced E2B 16-token `polar4`
-block-table uploads to 30, and the longer 128-token E2B `polar4` stress run used
-135 uploads while completing 4480 device-KV reads with zero fallback.
+`polar4` is a production-candidate opt-in compressed-K/compressed-V path with
+zero host attention fallback on the workloads checked so far. It is not the
+CUDA default yet: 12B Q4 f32/polar4 output matched deterministically in a
+32-token raw check, but E2B f32/polar4 output diverged, so promotion needs an
+explicit quality/parity acceptance gate, not just the runtime gate (see
+History and Evidence for the dated measurement run). `turbo3` is functional
+and resident but remains experimental — it is slower than `polar4` on L4
+decode workloads and can change output quality more aggressively.
 
 User-facing E2B CUDA smoke from the repository root:
 
@@ -520,22 +496,19 @@ CUDA session creation now uses explicit capability profiles:
 `antfly inference cuda-info --smoke` prints the loaded artifact's profile
 capability booleans before running kernel smokes. Production validation should
 require the relevant profile to be `true` before running real model fixtures.
-## Quantization Priorities
+## Quantization Coverage
 
-The minimum useful GGUF set is:
+The CUDA backend covers, in order of priority:
 
 1. `Q8_0`: simplest correctness anchor; useful for activation-like data.
 2. `Q4_0`: common legacy 4-bit format and simple 32-value blocks.
 3. `Q4_K`: common modern GGUF target and the first K-quant proof.
-
-Then broaden:
-
 4. `Q5_K`, `Q6_K`, `Q8_K`.
 5. `Q4_1`, `Q5_0`, `Q5_1`, `Q8_1`.
-6. `Q2_K`, `Q3_K`, `IQ4_NL`, `IQ4_XS`, `I2_S`, `Q1_0` as target models
-   require them.
-7. `MXFP4`, `NVFP4`, `TQ1_0`, `TQ2_0`, and other newer formats only after
-   their CPU references and model demand are clear.
+6. `Q2_K`, `Q3_K`, `Q1_0`.
+
+`IQ4_NL`, `IQ4_XS`, `I2_S`, `MXFP4`, `NVFP4`, `TQ1_0`, and `TQ2_0` are not yet
+covered (see Open work).
 
 Every CUDA-supported format needs:
 
@@ -619,105 +592,60 @@ Only after generic kernels work:
 Architecture-specific kernels are optional accelerators. They must fall back to
 portable `compute_75` PTX.
 
-## Integration Phases
+## Backend Implementation
 
-### Phase 0: Build And Backend Plumbing
+### Build and backend plumbing
 
-- Keep `-Dcuda` and `-Dcuda-artifacts` wired to checked-in artifacts only.
-- Add `cuda` to graph/backend contracts:
-  - `BackendKind.cuda`
-  - `TensorStorageClass.cuda_buffer`
-  - partition/runtime parsing for `"cuda"`
-- Add `cuda` to session backend ordering, CLI choices, and explicit
-  `--backend cuda` validation.
-- Keep default `auto` order unchanged until CUDA passes real smoke tests.
+`-Dcuda` and `-Dcuda-artifacts` wire to checked-in artifacts only (no `nvcc`
+in normal builds). `cuda` is a first-class graph/backend contract:
+`BackendKind.cuda`, `TensorStorageClass.cuda_buffer`, and partition/runtime
+parsing for `"cuda"`. `cuda` is one of the session backend ordering options,
+CLI choices, and `--backend cuda` is validated explicitly. The default `auto`
+order does not include CUDA.
 
-### Phase 1: Capability Probe
+### Capability probe
 
-- Implement `CudaDriver` dynamic loader.
-- Add an internal smoke probe that prints driver version, selected
-  device, compute capability, total memory if available, and artifact mode.
-- Test no-CUDA machines: probe returns unavailable without crashing.
-- Test CUDA machines: probe succeeds without CUDA toolkit in the container.
+`CudaDriver` is a dynamic loader (`dlopen("libcuda.so.1")`, driver-API symbol
+resolution). `antfly-inference cuda-info --smoke` reports driver version,
+selected device, compute capability, memory, and artifact mode. On machines
+without CUDA the probe reports unavailable without crashing; on CUDA machines
+it succeeds without a CUDA toolkit in the container.
 
-### Phase 2: Buffers And Kernel Launch
+### Buffers and kernel launch
 
-- Implement device allocation, free, H2D/D2H/D2D copies, stream sync, and module
-  loading.
-- Embed one tiny PTX kernel such as fill or vector add.
-- Capture CUDA JIT info/error logs during module loading so PTX problems are
-  visible on the first NVIDIA-box run.
-- Add skipped/fallback-safe tests for host copy, kernel launch, and output
-  parity.
+Device allocation, free, H2D/D2H/D2D copies, stream sync, and module loading
+are implemented (`src/ops/cuda/context.zig`, `buffer.zig`, `kernels.zig`).
+Module loading captures CUDA JIT info/error logs so PTX problems are visible
+on the first NVIDIA-box run.
 
-### Phase 3: Dense Linear Correctness
+### Dense linear correctness
 
-- Implement basic f32 `linearNoBias` and `linear` for dense weights.
-- Return CUDA tensors from `fromFloat32Shape` and copy back through
-  `toFloat32`.
-- Route only explicit `--backend cuda` to this path.
-- Compare small/medium shapes against native CPU.
+Dense f32 `linearNoBias`/`linear` route through `--backend cuda` explicitly,
+returning CUDA tensors from `fromFloat32Shape` and copying back through
+`toFloat32`. Optional cuBLASLt f16/bf16 matmul dispatch
+(`src/ops/cuda/dense_lt.zig`, `cublaslt.zig`) covers eligible dense weights.
 
-### Phase 4: Quantized Linear MVP
+### Quantized linear
 
-- Implement CUDA tensor storage for host-packed GGUF weight bytes.
-- Implement `Q8_0` and `Q4_0` `mul_mv`.
-- Route through `quant_matmul.plan(...)`.
-- Add counters for planned operator, actual operator, format, row bucket, and
-  fallback reason.
-- Add synthetic tests and one real GGUF smoke where CUDA quantized matmul is
-  observed.
+CUDA tensor storage holds host-packed GGUF weight bytes. `Q8_0`, `Q4_0`, and
+`Q4_K` linears run as CUDA kernels, routed through the shared
+`quant_matmul.plan(...)` row-bucket planner, with counters for planned
+operator, actual operator, format, row bucket, and fallback reason. Quantized
+weights stay resident on device across tokens, with prepared linear slots for
+QKV, output projection, FFN gate/up/down, and LM head. CPU fallback applies
+per unsupported format/operator rather than per whole model. `Q5_K`, `Q6_K`,
+and `Q8_K` are also supported; RMSNorm, RoPE, softmax, and attention run on
+device using the same shared `mul_mv`/`mul_mv_ext`/`mul_mm` operator
+vocabulary as Metal and native.
 
-### Phase 5: First Production GGUF Path
+### XLA/PJRT NVIDIA lane
 
-- Implement `Q4_K` `mul_mv`.
-- Keep quantized weights resident on device across tokens.
-- Add prepared linear slots for decoder runtime requests:
-  - QKV
-  - output projection
-  - FFN gate/up/down
-  - LM head
-- Add CPU fallback per unsupported format/operator, not per whole model when
-  possible.
-- Validate fixed-token generation on L4 and T4.
-
-### Phase 6: Broader Format And Operator Coverage
-
-- Add `Q5_K`, `Q6_K`, `Q8_K`.
-- Add `mul_mv_ext` for small batches.
-- Add `mul_mm` for prefill.
-- Add RMSNorm, RoPE, softmax, and attention only after quantized linears are
-  stable and measured.
-
-### Phase 7: XLA/PJRT NVIDIA Lane
-
-- Keep `--backend xla` as PJRT, with CUDA GPU plugin supplied externally.
-- Document required environment variables:
-  - `ANTFLY_INFERENCE_XLA_PLUGIN`
-  - `ANTFLY_INFERENCE_PJRT_PLUGIN`
-  - `PJRT_PLUGIN_PATH`
-  - `PJRT_PLUGIN`
-- Use XLA first for dense/static graph models and compiled artifact workflows.
-- Do not use XLA as the default GGUF path unless a model is exported to dense
-  graph artifacts and fits memory.
-- Revisit XLA custom calls only after native CUDA kernels exist and there is a
-  concrete need to run them inside compiled graph partitions.
-
-### Phase 8: GKE Container Validation
-
-- Build one Linux image with CUDA backend compiled in and no CUDA runtime
-  libraries included.
-- Deploy on GKE L4 first.
-- Validate that `libcuda.so.1` comes from the NVIDIA driver mount.
-- Run:
-  - no-CUDA startup fallback
-  - CUDA smoke probe
-  - dense linear parity smoke
-  - `Q8_0`, `Q4_0`, `Q4_K` synthetic parity
-  - real GGUF generation with CUDA counters
-- Repeat on T4, then A100/H100.
-
-## XLA/PJRT Capability Plan
+`--backend xla` maps to PJRT, with the CUDA GPU plugin supplied externally.
+Required environment variables: `ANTFLY_INFERENCE_XLA_PLUGIN`,
+`ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, `PJRT_PLUGIN`. `-Dpjrt=true`
+is a real build option (`build.zig`'s `pjrt` option), and requesting
+`--backend xla` without PJRT enabled fails with a clear `error.BackendUnavailable`
+rather than falling through silently.
 
 Use PJRT for:
 
@@ -733,14 +661,18 @@ Do not use PJRT for:
 - the first quantized decoder runtime
 - dependency-free CUDA deployment
 
-Concrete PJRT work:
+### GKE container validation
 
-- Make `-Dpjrt=true` a real configurable build option if it is intended for
-  NVIDIA deployments; today `build.zig` hardcodes `enable_pjrt` false.
-- Add NVIDIA-specific docs for `ANTFLY_INFERENCE_XLA_PLUGIN`/`PJRT_PLUGIN_PATH`.
-- Add a dense graph smoke on a CUDA PJRT plugin once available.
-- Add a clear error when `--backend xla` is requested without a plugin.
-- Keep PJRT artifacts and native CUDA artifacts separate in manifests.
+The Linux CUDA build compiles the backend in with no CUDA runtime libraries
+included, and `libcuda.so.1` is expected to come from the NVIDIA driver
+mount. This has been validated on GKE L4 (see History and Evidence):
+no-CUDA startup fallback, CUDA smoke probe, dense linear parity,
+`Q8_0`/`Q4_0`/`Q4_K` synthetic parity, and real GGUF generation with CUDA
+counters all pass. Validation on T4, A100, and H100 GKE nodes is open (see
+Open work), along with remaining PJRT-lane polish (NVIDIA-specific docs for
+`ANTFLY_INFERENCE_XLA_PLUGIN`/`PJRT_PLUGIN_PATH`, a dense-graph smoke on an
+actual CUDA PJRT plugin, and keeping PJRT artifacts separate from native CUDA
+artifacts in manifests).
 
 ## Testing Matrix
 
@@ -847,9 +779,9 @@ Fallback defaults are intentionally strict:
 
 ## Acceptance Criteria
 
-CUDA is minimally useful when:
+CUDA meets its minimal-usefulness bar:
 
-- `termite` starts on machines without CUDA and behaves as before.
+- `antfly-inference` starts on machines without CUDA and behaves as before.
 - The same binary starts on a GKE L4 node and reports CUDA availability when
   requested.
 - The container image contains no CUDA runtime, cuBLAS, cuDNN, TensorRT, ONNX
@@ -860,14 +792,60 @@ CUDA is minimally useful when:
 - XLA/PJRT remains independently usable for dense compiled graph inference when
   a PJRT plugin is supplied.
 
-## Open Questions
+## History and Evidence
 
-- Which GGUF model defines first acceptance: small deterministic fixture,
-  a common 7B Q4_K model, or both?
+Status checked on 2026-06-21 on an NVIDIA L4 (`sm_89`) with CUDA Toolkit 13.2
+and driver R580:
+
+- `zig build -Dcuda=true`, `regen-cuda-artifacts.sh --check --all`,
+  `antfly-inference cuda-info --smoke`, and `zig build test -Dcuda=true` pass.
+- `polar4` stays fully resident on CUDA with zero host attention fallback in
+  the E2B and 12B Q4 checks below.
+- `turbo3` is functional and resident, but slower than `polar4` on the L4
+  decode workloads tested.
+- Deterministic 12B Q4 f32/polar4 output matched in a 32-token raw check, but
+  E2B f32/polar4 output diverged.
+
+Measured L4 results from `/tmp/antfly-cuda-turboquant-prod`:
+
+| Workload | Cache | Tokens | Load | Warm TTFT | Cold TTFT | Decode tok/s | CUDA KV status |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| E2B Korean summary | f32 | 128 | 8.56s | 0.30s | 8.86s | 17.11 | 4480/4480 device KV successes |
+| E2B Korean summary | polar4 | 128 | 8.43s | 0.30s | 8.73s | 16.70 | 1920 compressed-V writes, 4480 reads |
+| 12B Q4 Korean summary | f32 | 40 | 17.01s | 2.01s | 19.02s | 8.67 | 1968/1968 device KV successes |
+| 12B Q4 Korean summary | polar4 | 30 | 17.10s | 1.98s | 19.08s | 8.66 | 1488 compressed-V writes, 1488 reads |
+| 12B Q4 raw repeat 1 | polar4 | 32 | 17.09s | 0.63s | 17.71s | 9.16 | zero fallback |
+| 12B Q4 raw repeat 2 | polar4 | 32 | 17.02s | 0.63s | 17.65s | 9.06 | zero fallback |
+| 12B Q4 raw repeat 3 | polar4 | 32 | 16.82s | 0.63s | 17.45s | 9.04 | zero fallback |
+
+The measured win at this stage was memory residency and lower metadata
+overhead, not higher tok/s. The block-table upload cache reduced E2B
+16-token `polar4` block-table uploads to 30, and the longer 128-token E2B
+`polar4` stress run used 135 uploads while completing 4480 device-KV reads
+with zero fallback.
+
+## Open work
+
+- Promote `-Dcuda=true` to the default `auto` backend order once broader
+  hardware validation lands.
+- Promote `polar4` KV to the CUDA default after an explicit quality/parity
+  acceptance gate (E2B f32/polar4 output currently diverges).
+- `turbo3` KV remains experimental; needs a faster or higher-quality path
+  before it is a default candidate.
+- GKE container validation on T4, A100, and H100 has not been run (only L4
+  is confirmed).
+- `IQ4_NL`, `IQ4_XS`, `I2_S`, `MXFP4`, `NVFP4`, `TQ1_0`, and `TQ2_0` GGUF
+  formats are not yet covered by CUDA kernels.
+- Remaining PJRT-lane polish: NVIDIA-specific docs for
+  `ANTFLY_INFERENCE_XLA_PLUGIN`/`PJRT_PLUGIN_PATH`, a dense-graph smoke on an
+  actual CUDA PJRT plugin, and keeping PJRT artifacts separate from native
+  CUDA artifacts in manifests.
+- Which GGUF model defines first acceptance: small deterministic fixture, a
+  common 7B Q4_K model, or both?
 - Should release builds ship only portable PTX at first, or PTX plus L4/T4
   cubins once CI can generate them?
-- How aggressive should per-op fallback be before the cost of CPU/GPU transfers
-  makes whole-layer fallback preferable?
+- How aggressive should per-op fallback be before the cost of CPU/GPU
+  transfers makes whole-layer fallback preferable?
 - Should CUDA direct sessions load before or after Metal in `auto` when
   running on multi-platform developer machines?
 - When should CUDA graph launch be introduced for decoder token loops?

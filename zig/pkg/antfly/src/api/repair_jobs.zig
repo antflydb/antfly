@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const docstore_mod = @import("../storage/docstore.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 
@@ -78,6 +78,9 @@ pub const JobPhase = enum {
 
 pub const StartRequest = struct {
     target: []const u8 = "artifact",
+    /// Durable control intent; absent for ordinary repair/rebuild jobs.
+    control: ?db_mod.types.IndexRepairControl = null,
+    repair_id: ?[]const u8 = null,
     kind: ?db_mod.types.ArtifactRepairKind = null,
     index: ?[]const u8 = null,
     cursor: ?[]const u8 = null,
@@ -93,6 +96,9 @@ pub const JobState = struct {
     phase: []const u8,
     repair_status: []const u8,
     target: []const u8,
+    /// Durable control intent; absent for ordinary repair/rebuild jobs.
+    control: ?db_mod.types.IndexRepairControl = null,
+    repair_id: ?[]const u8 = null,
     kind: ?db_mod.types.ArtifactRepairKind = null,
     index: ?[]const u8 = null,
     cursor: ?[]const u8 = null,
@@ -114,7 +120,7 @@ pub const BeginAdvanceResult = struct {
 };
 
 pub const Store = struct {
-    const PendingCancelEntry = struct {
+    const PendingMaintenanceEntry = struct {
         previous_job_id: ?u64 = null,
         next_job_id: ?u64 = null,
     };
@@ -127,14 +133,14 @@ pub const Store = struct {
     next_job_id: u64 = 1,
     last_durable_cleanup_ms: u64 = 0,
     durable_cleanup_cursor: ?[]u8 = null,
-    pending_cancel_jobs: std.AutoHashMapUnmanaged(u64, PendingCancelEntry) = .empty,
-    pending_cancel_head: ?u64 = null,
-    pending_cancel_tail: ?u64 = null,
+    pending_maintenance_jobs: std.AutoHashMapUnmanaged(u64, PendingMaintenanceEntry) = .empty,
+    pending_maintenance_head: ?u64 = null,
+    pending_maintenance_tail: ?u64 = null,
     /// Process-local round-robin cursor. Durable job state remains the source
     /// of truth; rebuilding the FIFO after restart may reset this cursor
     /// without losing work. Advancing it after every inspection prevents a
-    /// backed-off head window from starving later runnable cancellations.
-    pending_cancel_scan_cursor: ?u64 = null,
+    /// backed-off head window from starving later runnable maintenance.
+    pending_maintenance_scan_cursor: ?u64 = null,
     /// Corrupt maintenance records are isolated from the active scheduler
     /// namespace instead of preventing the primary API server from starting.
     /// The durable quarantine is intentionally operator-visible but is not a
@@ -152,7 +158,7 @@ pub const Store = struct {
         var it = self.jobs.iterator();
         while (it.next()) |entry| self.alloc.free(entry.value_ptr.*);
         self.jobs.deinit(self.alloc);
-        self.pending_cancel_jobs.deinit(self.alloc);
+        self.pending_maintenance_jobs.deinit(self.alloc);
         if (self.durable_cleanup_cursor) |cursor| self.alloc.free(cursor);
         if (self.opened_store) |store| {
             store.deinit();
@@ -161,91 +167,91 @@ pub const Store = struct {
         self.* = undefined;
     }
 
-    fn enqueuePendingCancelLocked(self: *Store, job_id: u64) !bool {
-        if (self.pending_cancel_jobs.contains(job_id)) return false;
-        try self.pending_cancel_jobs.put(self.alloc, job_id, .{ .previous_job_id = self.pending_cancel_tail });
-        if (self.pending_cancel_tail) |tail| {
-            self.pending_cancel_jobs.getPtr(tail).?.next_job_id = job_id;
+    fn enqueuePendingMaintenanceLocked(self: *Store, job_id: u64) !bool {
+        if (self.pending_maintenance_jobs.contains(job_id)) return false;
+        try self.pending_maintenance_jobs.put(self.alloc, job_id, .{ .previous_job_id = self.pending_maintenance_tail });
+        if (self.pending_maintenance_tail) |tail| {
+            self.pending_maintenance_jobs.getPtr(tail).?.next_job_id = job_id;
         } else {
-            self.pending_cancel_head = job_id;
+            self.pending_maintenance_head = job_id;
         }
-        self.pending_cancel_tail = job_id;
+        self.pending_maintenance_tail = job_id;
         return true;
     }
 
-    fn removePendingCancelLocked(self: *Store, job_id: u64) void {
-        const removed = self.pending_cancel_jobs.get(job_id) orelse return;
-        const removed_scan_cursor = self.pending_cancel_scan_cursor == job_id;
+    fn removePendingMaintenanceLocked(self: *Store, job_id: u64) void {
+        const removed = self.pending_maintenance_jobs.get(job_id) orelse return;
+        const removed_scan_cursor = self.pending_maintenance_scan_cursor == job_id;
         if (removed.previous_job_id) |previous| {
-            self.pending_cancel_jobs.getPtr(previous).?.next_job_id = removed.next_job_id;
+            self.pending_maintenance_jobs.getPtr(previous).?.next_job_id = removed.next_job_id;
         } else {
-            self.pending_cancel_head = removed.next_job_id;
+            self.pending_maintenance_head = removed.next_job_id;
         }
         if (removed.next_job_id) |next| {
-            self.pending_cancel_jobs.getPtr(next).?.previous_job_id = removed.previous_job_id;
+            self.pending_maintenance_jobs.getPtr(next).?.previous_job_id = removed.previous_job_id;
         } else {
-            self.pending_cancel_tail = removed.previous_job_id;
+            self.pending_maintenance_tail = removed.previous_job_id;
         }
-        _ = self.pending_cancel_jobs.remove(job_id);
+        _ = self.pending_maintenance_jobs.remove(job_id);
         if (removed_scan_cursor) {
-            self.pending_cancel_scan_cursor = removed.next_job_id orelse self.pending_cancel_head;
+            self.pending_maintenance_scan_cursor = removed.next_job_id orelse self.pending_maintenance_head;
         }
-        if (self.pending_cancel_jobs.count() == 0) self.pending_cancel_scan_cursor = null;
+        if (self.pending_maintenance_jobs.count() == 0) self.pending_maintenance_scan_cursor = null;
     }
 
-    /// Returns the next runnable durable cancellation without consuming it.
+    /// Returns the next runnable durable control or cancellation without consuming it.
     /// Inspection is round-robin within the bounded FIFO window; `beginAdvance`
     /// removes the entry atomically with the queued-to-running transition, so
     /// supervisor and explicit advances may race safely.
-    pub fn nextPendingDurableCancelAlloc(self: *Store, alloc: std.mem.Allocator) !?[]u8 {
+    pub fn nextPendingMaintenanceAlloc(self: *Store, alloc: std.mem.Allocator) !?[]u8 {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const now_ms = nowMillis();
-        if (self.pending_cancel_jobs.count() == 0) {
-            self.pending_cancel_scan_cursor = null;
+        if (self.pending_maintenance_jobs.count() == 0) {
+            self.pending_maintenance_scan_cursor = null;
             return null;
         }
-        var job_id_opt = if (self.pending_cancel_scan_cursor) |cursor|
-            if (self.pending_cancel_jobs.contains(cursor)) cursor else self.pending_cancel_head
+        var job_id_opt = if (self.pending_maintenance_scan_cursor) |cursor|
+            if (self.pending_maintenance_jobs.contains(cursor)) cursor else self.pending_maintenance_head
         else
-            self.pending_cancel_head;
+            self.pending_maintenance_head;
         var inspected: usize = 0;
-        const inspect_limit = @min(self.pending_cancel_jobs.count(), pending_cancel_scan_limit);
+        const inspect_limit = @min(self.pending_maintenance_jobs.count(), pending_maintenance_scan_limit);
         while (job_id_opt) |job_id| {
             if (inspected >= inspect_limit) break;
             inspected += 1;
-            const next_job_id = if (self.pending_cancel_jobs.get(job_id)) |entry|
-                entry.next_job_id orelse self.pending_cancel_head
+            const next_job_id = if (self.pending_maintenance_jobs.get(job_id)) |entry|
+                entry.next_job_id orelse self.pending_maintenance_head
             else
-                self.pending_cancel_head;
+                self.pending_maintenance_head;
             const encoded = (try self.loadJobLocked(job_id)) orelse {
-                self.removePendingCancelLocked(job_id);
+                self.removePendingMaintenanceLocked(job_id);
                 job_id_opt = if (next_job_id) |next|
-                    if (self.pending_cancel_jobs.contains(next)) next else self.pending_cancel_head
+                    if (self.pending_maintenance_jobs.contains(next)) next else self.pending_maintenance_head
                 else
-                    self.pending_cancel_head;
+                    self.pending_maintenance_head;
                 continue;
             };
             var parsed = std.json.parseFromSlice(JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-                self.removePendingCancelLocked(job_id);
+                self.removePendingMaintenanceLocked(job_id);
                 job_id_opt = if (next_job_id) |next|
-                    if (self.pending_cancel_jobs.contains(next)) next else self.pending_cancel_head
+                    if (self.pending_maintenance_jobs.contains(next)) next else self.pending_maintenance_head
                 else
-                    self.pending_cancel_head;
+                    self.pending_maintenance_head;
                 continue;
             };
             defer parsed.deinit();
-            if (!requiresDurableCancel(parsed.value) or
+            if (!requiresAutomaticAdvance(parsed.value) or
                 !std.mem.eql(u8, parsed.value.phase, phaseString(.queued)))
             {
-                self.removePendingCancelLocked(job_id);
+                self.removePendingMaintenanceLocked(job_id);
                 job_id_opt = if (next_job_id) |next|
-                    if (self.pending_cancel_jobs.contains(next)) next else self.pending_cancel_head
+                    if (self.pending_maintenance_jobs.contains(next)) next else self.pending_maintenance_head
                 else
-                    self.pending_cancel_head;
+                    self.pending_maintenance_head;
                 continue;
             }
-            self.pending_cancel_scan_cursor = next_job_id;
+            self.pending_maintenance_scan_cursor = next_job_id;
             if (parsed.value.next_retry_at_millis > now_ms) {
                 job_id_opt = next_job_id;
                 continue;
@@ -277,6 +283,7 @@ pub const Store = struct {
         table_name: []const u8,
         req: StartRequest,
     ) ![]u8 {
+        try validateStartRequest(req);
         const now_ms = nowMillis();
         const reserved = self.reserveJobId();
         const limit = if (req.limit == 0) @as(u32, 100) else req.limit;
@@ -287,6 +294,8 @@ pub const Store = struct {
             .phase = phaseString(.queued),
             .repair_status = repairStatusForPhase(.queued, false, false),
             .target = req.target,
+            .control = req.control,
+            .repair_id = req.repair_id,
             .kind = req.kind,
             .index = req.index,
             .cursor = req.cursor,
@@ -346,6 +355,8 @@ pub const Store = struct {
                 .phase = phaseString(.queued),
                 .repair_status = repairStatusForPhase(.queued, true, true),
                 .target = current.target,
+                .control = current.control,
+                .repair_id = current.repair_id,
                 .kind = current.kind,
                 .index = current.index,
                 .cursor = null,
@@ -359,8 +370,6 @@ pub const Store = struct {
                 .expires_at_millis = now_ms + self.retentionMillis(),
             });
             errdefer alloc.free(encoded);
-            const enqueued = try self.enqueuePendingCancelLocked(current.job_id);
-            errdefer if (enqueued) self.removePendingCancelLocked(current.job_id);
             try self.storeEncodedLocked(current.job_id, encoded, null);
             return encoded;
         }
@@ -373,6 +382,8 @@ pub const Store = struct {
             .phase = phaseString(phase),
             .repair_status = repairStatusForPhase(phase, previous.result.has_more, previous.result.debt_remaining),
             .target = previous.target,
+            .control = previous.control,
+            .repair_id = previous.repair_id,
             .kind = previous.kind,
             .index = previous.index,
             .cursor = previous.cursor,
@@ -410,15 +421,17 @@ pub const Store = struct {
             return try alloc.dupe(u8, current_encoded);
         }
 
-        const durable_cancel = current.cancel_requested and
-            std.mem.eql(u8, current.target, "index") and current.index != null;
+        const durable_cancel = requiresDurableCancel(current);
+        const phase: JobPhase = if (current.cancel_requested and !durable_cancel) .cancelled else .queued;
         const encoded = try encodeState(alloc, .{
             .job_id = current.job_id,
             .attempt_id = current.attempt_id,
             .table_name = current.table_name,
-            .phase = phaseString(.queued),
-            .repair_status = repairStatusForPhase(.queued, true, true),
+            .phase = phaseString(phase),
+            .repair_status = repairStatusForPhase(phase, true, true),
             .target = current.target,
+            .control = current.control,
+            .repair_id = current.repair_id,
             .kind = current.kind,
             .index = current.index,
             .cursor = current.cursor,
@@ -433,8 +446,6 @@ pub const Store = struct {
             .expires_at_millis = now_ms + self.retentionMillis(),
         });
         errdefer alloc.free(encoded);
-        const enqueued = if (durable_cancel) try self.enqueuePendingCancelLocked(current.job_id) else false;
-        errdefer if (enqueued) self.removePendingCancelLocked(current.job_id);
         try self.storeEncodedLocked(current.job_id, encoded, null);
         return encoded;
     }
@@ -468,12 +479,18 @@ pub const Store = struct {
         total.debt_remaining = pass.debt_remaining;
         total.next_cursor = pass.next_cursor;
 
-        const retryable_in_progress = pass.in_progress != 0 and pass.failed == 0 and pass.unsupported == 0 and pass.missing_source_docs == 0;
+        const retryable_in_progress = previous.control == null and pass.in_progress != 0 and pass.failed == 0 and pass.unsupported == 0 and pass.missing_source_docs == 0;
+        // A successful pause/cancel intentionally leaves repair debt. Job
+        // completion describes the control traversal, not index readiness.
+        const failed_debt = if (previous.control != null)
+            pass.failed != 0 or pass.unsupported != 0 or pass.missing_source_docs != 0
+        else
+            pass.debt_remaining;
         const phase: JobPhase = if (previous.cancel_requested)
             .cancelled
         else if (pass.has_more or retryable_in_progress)
             .queued
-        else if (pass.debt_remaining)
+        else if (failed_debt)
             .failed
         else
             .succeeded;
@@ -497,6 +514,8 @@ pub const Store = struct {
                 .phase = phaseString(.queued),
                 .repair_status = repairStatusForPhase(.queued, true, true),
                 .target = current.target,
+                .control = current.control,
+                .repair_id = current.repair_id,
                 .kind = current.kind,
                 .index = current.index,
                 .cursor = null,
@@ -510,8 +529,6 @@ pub const Store = struct {
                 .expires_at_millis = now_ms + self.retentionMillis(),
             });
             errdefer alloc.free(encoded);
-            const enqueued = try self.enqueuePendingCancelLocked(current.job_id);
-            errdefer if (enqueued) self.removePendingCancelLocked(current.job_id);
             try self.storeEncodedLocked(current.job_id, encoded, null);
             return encoded;
         }
@@ -526,6 +543,8 @@ pub const Store = struct {
             .phase = phaseString(final_phase),
             .repair_status = repairStatusForPhase(final_phase, pass.has_more, pass.debt_remaining),
             .target = previous.target,
+            .control = previous.control,
+            .repair_id = previous.repair_id,
             .kind = previous.kind,
             .index = previous.index,
             .cursor = pass.next_cursor,
@@ -581,6 +600,8 @@ pub const Store = struct {
             .phase = phaseString(.running),
             .repair_status = repairStatusForPhase(.running, current.result.has_more, current.result.debt_remaining),
             .target = current.target,
+            .control = current.control,
+            .repair_id = current.repair_id,
             .kind = current.kind,
             .index = current.index,
             .cursor = current.cursor,
@@ -596,7 +617,6 @@ pub const Store = struct {
         });
         errdefer alloc.free(encoded);
         try self.storeEncodedLocked(current.job_id, encoded, null);
-        self.removePendingCancelLocked(current.job_id);
         return .{ .encoded = encoded, .started = true };
     }
 
@@ -624,6 +644,8 @@ pub const Store = struct {
             .phase = current.phase,
             .repair_status = current.repair_status,
             .target = current.target,
+            .control = current.control,
+            .repair_id = current.repair_id,
             .kind = current.kind,
             .index = current.index,
             .cursor = current.cursor,
@@ -653,7 +675,7 @@ pub const Store = struct {
         if (!std.mem.eql(u8, current.table_name, expected.table_name)) return error.NotFound;
         if (current.cancel_requested) return try alloc.dupe(u8, current_encoded);
 
-        const durable_cancel = std.mem.eql(u8, current.target, "index") and current.index != null;
+        const durable_cancel = current.control == null and std.mem.eql(u8, current.target, "index") and current.index != null;
         const phase: JobPhase = if (std.mem.eql(u8, current.phase, phaseString(.running)))
             .running
         else if (durable_cancel)
@@ -667,6 +689,8 @@ pub const Store = struct {
             .phase = phaseString(phase),
             .repair_status = repairStatusForPhase(phase, current.result.has_more, current.result.debt_remaining),
             .target = current.target,
+            .control = current.control,
+            .repair_id = current.repair_id,
             .kind = current.kind,
             .index = current.index,
             // Cancellation must revisit the whole table. Groups before the
@@ -682,11 +706,6 @@ pub const Store = struct {
             .expires_at_millis = now_ms + self.retentionMillis(),
         });
         errdefer alloc.free(encoded);
-        const enqueued = if (durable_cancel and phase == .queued)
-            try self.enqueuePendingCancelLocked(current.job_id)
-        else
-            false;
-        errdefer if (enqueued) self.removePendingCancelLocked(current.job_id);
         try self.storeEncodedLocked(current.job_id, encoded, null);
         return encoded;
     }
@@ -725,6 +744,8 @@ pub const Store = struct {
             .phase = phaseString(phase),
             .repair_status = repairStatusForPhase(phase, pass.has_more, pass.has_more),
             .target = current.target,
+            .control = current.control,
+            .repair_id = current.repair_id,
             .kind = current.kind,
             .index = current.index,
             .cursor = pass.next_cursor,
@@ -738,14 +759,7 @@ pub const Store = struct {
             .expires_at_millis = now_ms + self.retentionMillis(),
         });
         errdefer alloc.free(encoded);
-        if (pass.has_more) {
-            const enqueued = try self.enqueuePendingCancelLocked(current.job_id);
-            errdefer if (enqueued) self.removePendingCancelLocked(current.job_id);
-            try self.storeEncodedLocked(current.job_id, encoded, null);
-        } else {
-            try self.storeEncodedLocked(current.job_id, encoded, null);
-            self.removePendingCancelLocked(current.job_id);
-        }
+        try self.storeEncodedLocked(current.job_id, encoded, null);
         return encoded;
     }
 
@@ -801,7 +815,7 @@ pub const Store = struct {
             if (self.opened_store) |opened| opened.docstore.putBatch(&.{}, durable_delete_keys.items) catch {};
         }
         for (expired.items) |job_id| {
-            self.removePendingCancelLocked(job_id);
+            self.removePendingMaintenanceLocked(job_id);
             if (self.jobs.fetchRemove(job_id)) |removed| self.alloc.free(removed.value);
         }
     }
@@ -863,6 +877,9 @@ pub const Store = struct {
         // state. Once the store write succeeds, publishing the matching cache
         // value cannot fail and leave scheduler metadata out of sync.
         if (!self.jobs.contains(job_id)) try self.jobs.ensureUnusedCapacity(self.alloc, 1);
+        const queue_job = requiresAutomaticAdvance(parsed.value) and std.mem.eql(u8, parsed.value.phase, phaseString(.queued));
+        const enqueued = if (queue_job) try self.enqueuePendingMaintenanceLocked(job_id) else false;
+        errdefer if (enqueued) self.removePendingMaintenanceLocked(job_id);
         if (self.opened_store) |opened| {
             const key = try jobKey(self.alloc, job_id);
             defer self.alloc.free(key);
@@ -890,6 +907,7 @@ pub const Store = struct {
                 try opened.docstore.putBatch(writes[0..write_count], &.{active_key});
             }
         }
+        if (!queue_job) self.removePendingMaintenanceLocked(job_id);
         if (self.jobs.fetchPutAssumeCapacity(job_id, owned)) |old| self.alloc.free(old.value);
     }
 
@@ -975,6 +993,8 @@ pub const Store = struct {
                     .phase = phaseString(recovered_phase),
                     .repair_status = repairStatusForPhase(recovered_phase, parsed.value.result.has_more, parsed.value.result.debt_remaining),
                     .target = parsed.value.target,
+                    .control = parsed.value.control,
+                    .repair_id = parsed.value.repair_id,
                     .kind = parsed.value.kind,
                     .index = parsed.value.index,
                     // A cancellation traversal always restarts from the first
@@ -1017,9 +1037,9 @@ pub const Store = struct {
                 defer self.alloc.free(active_key);
                 try opened.docstore.putBatch(&.{}, &.{active_key});
             }
-            if (durable_cancel) {
-                const enqueued = try self.enqueuePendingCancelLocked(parsed.value.job_id);
-                errdefer if (enqueued) self.removePendingCancelLocked(parsed.value.job_id);
+            if (requiresAutomaticAdvance(parsed.value)) {
+                const enqueued = try self.enqueuePendingMaintenanceLocked(parsed.value.job_id);
+                errdefer if (enqueued) self.removePendingMaintenanceLocked(parsed.value.job_id);
             }
             if (try self.jobs.fetchPut(self.alloc, parsed.value.job_id, cached)) |old| self.alloc.free(old.value);
             recovered_max_job_id = @max(recovered_max_job_id, parsed.value.job_id);
@@ -1065,6 +1085,8 @@ pub const Store = struct {
             .phase = phaseString(.cancelled),
             .repair_status = repairStatusForPhase(.cancelled, current.result.has_more, current.result.debt_remaining),
             .target = current.target,
+            .control = current.control,
+            .repair_id = current.repair_id,
             .kind = current.kind,
             .index = current.index,
             .cursor = current.cursor,
@@ -1086,7 +1108,7 @@ pub const Store = struct {
 const running_lease_timeout_ms: u64 = 300_000;
 const retry_base_ms: u64 = 250;
 const retry_max_ms: u64 = 30 * std.time.ms_per_s;
-const pending_cancel_scan_limit: usize = 64;
+const pending_maintenance_scan_limit: usize = 64;
 
 fn retryDelayMs(job_id: u64, attempt_id: u64) u64 {
     const shift: u6 = @intCast(@min(attempt_id, 16));
@@ -1132,6 +1154,7 @@ fn validateJobState(state: JobState) !void {
     {
         return error.InvalidRepairJobState;
     }
+    validateStartRequest(.{ .target = state.target, .index = state.index, .kind = state.kind, .limit = state.limit, .force = state.force, .control = state.control, .repair_id = state.repair_id }) catch return error.InvalidRepairJobState;
     const phase = jobPhaseFromString(state.phase) orelse return error.InvalidRepairJobState;
     if (std.meta.stringToEnum(db_mod.types.RepairTarget, state.target) == null) {
         return error.InvalidRepairJobState;
@@ -1159,10 +1182,29 @@ pub fn isTerminalPhase(phase: []const u8) bool {
 }
 
 pub fn requiresDurableCancel(state: JobState) bool {
-    return state.cancel_requested and
+    return state.control == null and state.cancel_requested and
         std.mem.eql(u8, state.target, "index") and
         state.index != null and
         !isTerminalPhase(state.phase);
+}
+
+/// Only durable controls and cancellation obligations are automatically advanced.
+/// Ordinary repair jobs retain their existing explicit-advance contract.
+pub fn requiresAutomaticAdvance(state: JobState) bool {
+    return requiresDurableCancel(state) or
+        (state.control != null and !state.cancel_requested and !isTerminalPhase(state.phase));
+}
+
+pub fn validateStartRequest(req: StartRequest) !void {
+    if (std.meta.stringToEnum(db_mod.types.RepairTarget, req.target) == null or req.limit == 0)
+        return error.InvalidArgument;
+    if (req.control != null) {
+        if (!std.mem.eql(u8, req.target, "index") or req.index == null or req.index.?.len == 0 or req.kind != null or req.force)
+            return error.InvalidArgument;
+    } else if (req.repair_id != null) return error.InvalidArgument;
+    if (req.repair_id) |raw| {
+        _ = std.fmt.parseInt(u128, raw, 10) catch return error.InvalidArgument;
+    }
 }
 
 pub fn repairStatusForPhase(phase: JobPhase, has_more: bool, debt_remaining: bool) []const u8 {
@@ -1430,7 +1472,7 @@ test "durable cancellation retries transient failures with backoff" {
     defer parsed_queued.deinit();
     try std.testing.expectEqualStrings("queued", parsed_queued.value.phase);
     try std.testing.expect(parsed_queued.value.next_retry_at_millis > parsed_queued.value.last_updated_at_millis);
-    try std.testing.expect((try store.nextPendingDurableCancelAlloc(alloc)) == null);
+    try std.testing.expect((try store.nextPendingMaintenanceAlloc(alloc)) == null);
     const early = try store.beginAdvance(alloc, parsed_queued.value);
     defer alloc.free(early.encoded);
     try std.testing.expect(!early.started);
@@ -1442,7 +1484,7 @@ test "durable cancellation scan rotates past a backed off head window" {
     defer store.deinit();
 
     var runnable_job_id: u64 = 0;
-    for (0..pending_cancel_scan_limit + 1) |idx| {
+    for (0..pending_maintenance_scan_limit + 1) |idx| {
         const started = try store.startJob(alloc, "docs", .{
             .target = "index",
             .index = "semantic",
@@ -1455,7 +1497,7 @@ test "durable cancellation scan rotates past a backed off head window" {
         defer alloc.free(cancelling);
         var parsed_cancelling = try std.json.parseFromSlice(JobState, alloc, cancelling, .{ .ignore_unknown_fields = true });
         defer parsed_cancelling.deinit();
-        if (idx == pending_cancel_scan_limit) {
+        if (idx == pending_maintenance_scan_limit) {
             runnable_job_id = parsed_cancelling.value.job_id;
             continue;
         }
@@ -1468,6 +1510,8 @@ test "durable cancellation scan rotates past a backed off head window" {
             .phase = current.phase,
             .repair_status = current.repair_status,
             .target = current.target,
+            .control = current.control,
+            .repair_id = current.repair_id,
             .kind = current.kind,
             .index = current.index,
             .cursor = current.cursor,
@@ -1488,8 +1532,8 @@ test "durable cancellation scan rotates past a backed off head window" {
     // The first bounded inspection sees only delayed work and leaves its
     // cursor immediately after that window. The next inspection must select
     // the runnable tail instead of rescanning the same head entries.
-    try std.testing.expect((try store.nextPendingDurableCancelAlloc(alloc)) == null);
-    const pending = (try store.nextPendingDurableCancelAlloc(alloc)).?;
+    try std.testing.expect((try store.nextPendingMaintenanceAlloc(alloc)) == null);
+    const pending = (try store.nextPendingMaintenanceAlloc(alloc)).?;
     defer alloc.free(pending);
     var parsed_pending = try std.json.parseFromSlice(JobState, alloc, pending, .{ .ignore_unknown_fields = true });
     defer parsed_pending.deinit();
@@ -1515,14 +1559,14 @@ test "named index repair cancellation remains nonterminal until durable controls
     try std.testing.expectEqualStrings("queued", parsed_cancelling.value.phase);
     try std.testing.expectEqual(@as(?[]const u8, null), parsed_cancelling.value.cursor);
     try std.testing.expect(requiresDurableCancel(parsed_cancelling.value));
-    const first_pending = (try store.nextPendingDurableCancelAlloc(alloc)).?;
+    const first_pending = (try store.nextPendingMaintenanceAlloc(alloc)).?;
     defer alloc.free(first_pending);
 
     const first_begin = try store.beginAdvance(alloc, parsed_cancelling.value);
     defer alloc.free(first_begin.encoded);
     var parsed_first = try std.json.parseFromSlice(JobState, alloc, first_begin.encoded, .{ .ignore_unknown_fields = true });
     defer parsed_first.deinit();
-    try std.testing.expect((try store.nextPendingDurableCancelAlloc(alloc)) == null);
+    try std.testing.expect((try store.nextPendingMaintenanceAlloc(alloc)) == null);
     var first_pass = db_mod.types.ArtifactRepairResult{
         .scanned = 64,
         .groups_scanned = 64,
@@ -1537,7 +1581,7 @@ test "named index repair cancellation remains nonterminal until durable controls
     defer parsed_continuing.deinit();
     try std.testing.expectEqualStrings("queued", parsed_continuing.value.phase);
     try std.testing.expectEqualStrings("group:65", parsed_continuing.value.cursor.?);
-    const continuing_pending = (try store.nextPendingDurableCancelAlloc(alloc)).?;
+    const continuing_pending = (try store.nextPendingMaintenanceAlloc(alloc)).?;
     defer alloc.free(continuing_pending);
 
     const second_begin = try store.beginAdvance(alloc, parsed_continuing.value);
@@ -1629,7 +1673,7 @@ test "named index repair cancellation restarts its durable traversal after job s
         try std.testing.expect(parsed.value.cursor == null);
         try std.testing.expect(!parsed.value.force);
         try std.testing.expect(requiresDurableCancel(parsed.value));
-        const pending = (try store.nextPendingDurableCancelAlloc(alloc)).?;
+        const pending = (try store.nextPendingMaintenanceAlloc(alloc)).?;
         defer alloc.free(pending);
 
         const terminal = (try store.loadJobAlloc(alloc, terminal_job_id)) orelse return error.TestUnexpectedResult;
@@ -1814,4 +1858,113 @@ test "table repair job cleanup pages durable expired jobs" {
     const final_remaining = try store.opened_store.?.docstore.scanPrefix(alloc, job_key_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, final_remaining);
     try std.testing.expectEqual(@as(usize, 0), final_remaining.len);
+}
+
+test "durable index controls preserve cursor fence and intent across interrupted recovery" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]db_mod.types.IndexRepairControl{ .pause_automatic, .resume_automatic, .cancel_current_attempt }) |control| {
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, @tagName(control) });
+        defer alloc.free(path);
+        var interrupted: ?[]u8 = null;
+        defer if (interrupted) |bytes| alloc.free(bytes);
+        {
+            var store = Store.init(alloc, .{});
+            defer store.deinit();
+            try attachOpenedTestStore(&store, alloc, path);
+            const started = try store.startJob(alloc, "docs", .{ .target = "index", .index = "dense", .control = control, .repair_id = "17" });
+            defer alloc.free(started);
+            const queued_json = (try store.nextPendingMaintenanceAlloc(alloc)).?;
+            defer alloc.free(queued_json);
+            var queued = try std.json.parseFromSlice(JobState, alloc, queued_json, .{});
+            defer queued.deinit();
+            const begin = try store.beginAdvance(alloc, queued.value);
+            defer alloc.free(begin.encoded);
+            var running = try std.json.parseFromSlice(JobState, alloc, begin.encoded, .{});
+            defer running.deinit();
+            var cursor = "64:".*;
+            const completed = try store.recordPass(alloc, running.value, .{ .scanned = 64, .groups_scanned = 64, .controls_applied = 64, .has_more = true, .debt_remaining = true, .next_cursor = &cursor });
+            defer alloc.free(completed);
+            var next = try std.json.parseFromSlice(JobState, alloc, completed, .{});
+            defer next.deinit();
+            const second = try store.beginAdvance(alloc, next.value);
+            interrupted = second.encoded;
+            // Stop with the second page in flight; recovery must reissue its
+            // exact intent, rather than restart at group zero or perform repair.
+        }
+        {
+            var store = Store.init(alloc, .{});
+            defer store.deinit();
+            try attachOpenedTestStore(&store, alloc, path);
+            var total_groups: u64 = 64;
+            while (try store.nextPendingMaintenanceAlloc(alloc)) |queued_json| {
+                defer alloc.free(queued_json);
+                var queued = try std.json.parseFromSlice(JobState, alloc, queued_json, .{});
+                defer queued.deinit();
+                try std.testing.expectEqual(control, queued.value.control.?);
+                try std.testing.expectEqualStrings("17", queued.value.repair_id.?);
+                const expected_cursor = try std.fmt.allocPrint(alloc, "{d}:", .{total_groups});
+                defer alloc.free(expected_cursor);
+                try std.testing.expectEqualStrings(expected_cursor, queued.value.cursor.?);
+                const begin = try store.beginAdvance(alloc, queued.value);
+                defer alloc.free(begin.encoded);
+                var running = try std.json.parseFromSlice(JobState, alloc, begin.encoded, .{});
+                defer running.deinit();
+                if (total_groups == 64) {
+                    var old = try std.json.parseFromSlice(JobState, alloc, interrupted.?, .{});
+                    defer old.deinit();
+                    const stale = try store.recordPass(alloc, old.value, .{ .scanned = 999 });
+                    defer alloc.free(stale);
+                    try std.testing.expectEqualStrings(begin.encoded, stale);
+                }
+                const count = @min(@as(u64, 64), 130 - total_groups);
+                total_groups += count;
+                const cursor = if (total_groups < 130) try std.fmt.allocPrint(alloc, "{d}:", .{total_groups}) else null;
+                defer if (cursor) |bytes| alloc.free(bytes);
+                const result = try store.recordPass(alloc, running.value, .{ .scanned = count, .groups_scanned = count, .controls_applied = count, .has_more = cursor != null, .debt_remaining = true, .next_cursor = cursor });
+                defer alloc.free(result);
+                var state = try std.json.parseFromSlice(JobState, alloc, result, .{});
+                defer state.deinit();
+                if (total_groups == 130) {
+                    try std.testing.expectEqualStrings("succeeded", state.value.phase);
+                    try std.testing.expectEqual(@as(u64, 130), state.value.result.controls_applied);
+                }
+            }
+            try std.testing.expectEqual(@as(u64, 130), total_groups);
+        }
+    }
+}
+
+test "cancelling a control traversal stops without issuing inverse controls" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |retry_failure| {
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        const encoded = try store.startJob(alloc, "docs", .{ .target = "index", .index = "dense", .control = .resume_automatic, .repair_id = "17", .cursor = "64:" });
+        defer alloc.free(encoded);
+        var queued = try std.json.parseFromSlice(JobState, alloc, encoded, .{});
+        defer queued.deinit();
+        const begun = try store.beginAdvance(alloc, queued.value);
+        defer alloc.free(begun.encoded);
+        var running = try std.json.parseFromSlice(JobState, alloc, begun.encoded, .{});
+        defer running.deinit();
+        const cancelled = try store.requestCancel(alloc, running.value);
+        defer alloc.free(cancelled);
+        var next_cursor = "128:".*;
+        const stopped = if (retry_failure)
+            try store.recordRetryableFailure(alloc, running.value, "RepairOwnershipLost")
+        else
+            try store.recordPass(alloc, running.value, .{ .controls_applied = 64, .has_more = true, .next_cursor = &next_cursor, .debt_remaining = true, .in_progress = 1 });
+        defer alloc.free(stopped);
+        var final = try std.json.parseFromSlice(JobState, alloc, stopped, .{});
+        defer final.deinit();
+        try std.testing.expectEqualStrings("cancelled", final.value.phase);
+        try std.testing.expectEqual(db_mod.types.IndexRepairControl.resume_automatic, final.value.control.?);
+        try std.testing.expect(!requiresDurableCancel(final.value));
+        try std.testing.expect((try store.nextPendingMaintenanceAlloc(alloc)) == null);
+        const stale = try store.beginAdvance(alloc, running.value);
+        defer alloc.free(stale.encoded);
+        try std.testing.expect(!stale.started);
+    }
 }

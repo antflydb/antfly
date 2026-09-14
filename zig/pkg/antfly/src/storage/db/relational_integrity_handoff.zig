@@ -22,62 +22,21 @@ const catalog = @import("relational_integrity_catalog.zig");
 const activation = @import("relational_integrity_activation.zig");
 const docstore = @import("../docstore.zig");
 const Allocator = std.mem.Allocator;
-pub const manifest_key = "\x00\x00__metadata__:relational_integrity_handoff_manifest";
-pub const progress_key = "\x00\x00__metadata__:relational_integrity_handoff_progress";
-pub const prune_key = "\x00\x00__metadata__:relational_integrity_handoff_prune";
-pub const max_records = 256;
-// Binary records use numeric-array JSON on the private transport. Keep the
-// encoded control comfortably below the existing HTTP/journal frame limit.
-pub const max_bytes = 1024 * 1024;
+pub const manifest_key = @import("relational_integrity_handoff_contract.zig").manifest_key;
+pub const progress_key = @import("relational_integrity_handoff_contract.zig").progress_key;
+pub const prune_key = @import("relational_integrity_handoff_contract.zig").prune_key;
+pub const max_records = @import("relational_integrity_handoff_contract.zig").max_records;
+pub const max_bytes = @import("relational_integrity_handoff_contract.zig").max_bytes;
 
-pub const Manifest = struct {
-    source: topology.Fence,
-    destination: topology.Fence,
-    lower: []const u8,
-    upper: []const u8,
-    source_range_start: []const u8,
-    source_range_end: []const u8,
-    catalog_bytes: []const u8,
-    activation_bytes: []const u8,
-    primary_sequence: u64,
-    /// Immutable lower bound on primary-copy attempts for this frozen source.
-    /// The ordinary merge receipt fences each later elected-leader attempt;
-    /// every attempt still reads the same quiesced data and routed metadata.
-    merge_copy_attempt: @import("types.zig").MergeCopyAttempt = .{},
-};
-pub const Record = struct { key: []const u8, value: []const u8 };
-pub const Page = struct {
-    sequence: u64,
-    previous_digest: integrity.Digest,
-    after: []const u8,
-    next_cursor: []const u8,
-    records: []const Record,
-    exhausted: bool,
-};
-pub const Command = union(enum) { begin: Manifest, page: Page, finish: struct { sequence: u64, digest: integrity.Digest } };
-pub const Progress = struct {
-    manifest_digest: integrity.Digest,
-    sequence: u64 = 0,
-    digest: integrity.Digest = @splat(0),
-    cursor: []const u8 = "",
-    exhausted: bool = false,
-    ready: bool = false,
-    verification_cursor: []const u8 = "",
-};
+pub const Manifest = @import("relational_integrity_handoff_contract.zig").Manifest;
+pub const Record = @import("relational_integrity_handoff_contract.zig").Record;
+pub const Page = @import("relational_integrity_handoff_contract.zig").Page;
+pub const Command = @import("relational_integrity_handoff_contract.zig").Command;
+pub const Progress = @import("relational_integrity_handoff_contract.zig").Progress;
 
-pub fn encode(alloc: Allocator, value: anytype) ![]u8 {
-    var output: std.Io.Writer.Allocating = .init(alloc);
-    errdefer output.deinit();
-    var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
-    try @import("relational_integrity_json.zig").write(value, &stream);
-    return output.toOwnedSlice();
-}
+pub const encode = @import("relational_integrity_handoff_contract.zig").encode;
 
-fn hash(bytes: []const u8) integrity.Digest {
-    var result: integrity.Digest = undefined;
-    std.crypto.hash.Blake3.hash(bytes, &result, .{});
-    return result;
-}
+const hash = @import("relational_integrity_handoff_contract.zig").hash;
 
 fn optional(txn: anytype, key: []const u8) !?[]const u8 {
     return txn.get(key) catch |err| {
@@ -409,7 +368,7 @@ pub fn admitMergeRequest(alloc: Allocator, txn: anytype, req: @import("types.zig
     return true;
 }
 
-pub const PruneProgress = struct { fence: topology.Fence, lower: []const u8, upper: []const u8, cursor: []const u8 = "", complete: bool = false };
+pub const PruneProgress = @import("relational_integrity_handoff_contract.zig").PruneProgress;
 
 /// Post-cutover cleanup is an ordinary bounded Raft maintenance command. It
 /// deletes only physically retained metadata outside the *current* logical

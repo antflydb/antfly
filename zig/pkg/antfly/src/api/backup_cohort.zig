@@ -41,7 +41,7 @@ test "relational backup cohort pin cancellation survives absent live catalog and
     var source_open = true;
     defer if (source_open) source.close();
     const identity = try source.relationalTopologyIdentity();
-    const fence: @import("../storage/db/relational_integrity_topology.zig").Fence = .{ .transition_id = 92, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 31, .peer_group_id = 31, .role = .backup_snapshot, .namespace = namespace, .catalog_digest = identity.catalog_digest };
+    const fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .transition_id = 92, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 31, .peer_group_id = 31, .role = .backup_snapshot, .namespace = namespace, .catalog_digest = identity.catalog_digest };
     try source.batch(.{ .relational_topology = .{ .fence = fence, .action = .begin } });
     source.close();
     source_open = false;
@@ -68,8 +68,8 @@ test "relational backup cohort topology HA split cutover preserves binary range 
 fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void {
     const std = @import("std");
     const db = @import("../storage/db/mod.zig");
-    const ha = @import("../storage/ha/primary.zig");
-    const topology = @import("../storage/db/relational_integrity_topology.zig");
+    const ha = @import("../storage/hot_standby/primary.zig");
+    const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -129,7 +129,7 @@ fn testTopologyHAControls(comptime replicated: bool, comptime split: bool) !void
     if (split) {
         try std.testing.expectEqualSlices(u8, "\x80", source.getRange().end);
         try std.testing.expectEqualSlices(u8, "\x80", target.getRange().end);
-        const activation = @import("../storage/db/relational_integrity_activation.zig");
+        const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
         const source_coverage = (try source.core.getStoreValue(a, activation.key)).?;
         const target_coverage = (try target.core.getStoreValue(a, activation.key)).?;
         try std.testing.expectEqualSlices(u8, source_coverage, target_coverage);

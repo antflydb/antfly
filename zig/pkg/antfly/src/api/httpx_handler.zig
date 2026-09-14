@@ -46,7 +46,7 @@ const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
-const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
+const ha_mutation_inventory = @import("../storage/hot_standby/mutation_inventory.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const connections_api = @import("connections.zig");
@@ -59,8 +59,8 @@ const stored_destination_authorization = @import("stored_destination_authorizati
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
 const table_index_config = @import("table_index_config.zig");
-const table_reads = if (builtin.is_test) @import("table_reads.zig") else @import("table_read_source.zig");
-const table_writes = @import("table_writes.zig");
+const table_reads = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_reads else @import("table_read_source.zig");
+const table_writes = @import("table_write_source.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const transactions_api = @import("transactions.zig");
 const distributed_txn = @import("distributed_txn.zig");
@@ -87,7 +87,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const casbin = @import("antfly_casbin");
 const builtin = @import("builtin");
 
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 const routes = @import("http_routes.zig").Routes;
@@ -310,15 +310,21 @@ test "gzip request completes with combined encoded and decoded budget" {
 fn requiresInternalServicePrincipal(path: []const u8) bool {
     const in_internal_namespace = std.mem.eql(u8, path, internal_routes.base) or
         std.mem.startsWith(u8, path, internal_routes.base ++ "/");
-    const ha_exempt = std.mem.eql(u8, path, internal_routes.ha) or
-        std.mem.startsWith(u8, path, internal_routes.ha ++ "/");
-    return in_internal_namespace and !ha_exempt;
+    // Hot-standby replication authenticates with its own bearer token; the
+    // legacy `/internal/v1/ha` spelling stays exempt for one minor release.
+    const standby_exempt = std.mem.eql(u8, path, internal_routes.standby) or
+        std.mem.startsWith(u8, path, internal_routes.standby ++ "/") or
+        std.mem.eql(u8, path, internal_routes.legacy_standby) or
+        std.mem.startsWith(u8, path, internal_routes.legacy_standby ++ "/");
+    return in_internal_namespace and !standby_exempt;
 }
 
-test "internal namespace requires a service principal except HA" {
+test "internal namespace requires a service principal except hot standby" {
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1"));
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1/capabilities"));
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1/future-operation"));
+    try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/standby"));
+    try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/standby/replication/start"));
     try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/ha"));
     try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/ha/replication/start"));
     try std.testing.expect(!requiresInternalServicePrincipal("/tables/internal/v1"));
@@ -1041,7 +1047,14 @@ pub const AntflyApiHandler = struct {
         try server.post(routes.agents_v1_extensions_prefix ++ "*", extension_agent_handler);
         try server.put(routes.agents_v1_extensions_prefix ++ "*", extension_agent_handler);
 
-        const ha_admin_paths = [_][]const u8{ admin_routes.ha, admin_routes.ha ++ "/*" };
+        // Canonical `/admin/v1/standby` and the pre-0.3 `/admin/v1/ha` alias;
+        // the hot-standby handler normalises the path before dispatch.
+        const ha_admin_paths = [_][]const u8{
+            admin_routes.standby,
+            admin_routes.standby ++ "/*",
+            admin_routes.legacy_standby_prefix,
+            admin_routes.legacy_standby_prefix ++ "/*",
+        };
         const ha_handler = httpx.Handler.bind(self, haRoute);
         inline for (ha_admin_paths) |path| {
             try server.get(path, ha_handler);
@@ -1056,7 +1069,12 @@ pub const AntflyApiHandler = struct {
         try self.registerRaftAdminRoutes(server);
         try server.delete(admin_routes.maintenance_jobs_prefix ++ "*", httpx.Handler.bind(self, cancelStorageMaintenanceJob));
 
-        const ha_internal_paths = [_][]const u8{ internal_routes.ha, internal_routes.ha ++ "/*" };
+        const ha_internal_paths = [_][]const u8{
+            internal_routes.standby,
+            internal_routes.standby ++ "/*",
+            internal_routes.legacy_standby,
+            internal_routes.legacy_standby ++ "/*",
+        };
         inline for (ha_internal_paths) |path| {
             try server.get(path, ha_handler);
             try server.post(path, ha_handler);
@@ -1093,6 +1111,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.graph_expand_suffix, httpx.Handler.bind(self, internalGraphExpand));
         try server.post(table_prefix ++ routes.graph_hydrate_suffix, httpx.Handler.bind(self, internalGraphHydrate));
         try server.post(table_prefix ++ routes.graph_edges_suffix, httpx.Handler.bind(self, internalGraphEdges));
+        try server.post(table_prefix ++ routes.graph_metric_maintenance_suffix, httpx.Handler.bind(self, internalGraphMetricMaintenance));
         try server.post(table_prefix ++ routes.text_stats_suffix, httpx.Handler.bind(self, internalTextStats));
         try server.post(table_prefix ++ routes.algebraic_partials_suffix, httpx.Handler.bind(self, internalAlgebraicPartials));
         try server.post(table_prefix ++ routes.routed_batch_suffix, httpx.Handler.bind(self, internalGroupRoutedBatch));
@@ -1928,6 +1947,14 @@ pub const AntflyApiHandler = struct {
     /// this is only the shared wire projection at the `httpx` boundary.
     fn sharedInternalHttpErrorSpec(err: anyerror) ?InternalHttpErrorSpec {
         return switch (err) {
+            error.IndexGenerationMismatch => .{
+                .status = 409,
+                .message = "IndexGenerationMismatch",
+            },
+            error.GenerationTransitionActive => .{
+                .status = 503,
+                .message = "GenerationTransitionActive",
+            },
             error.DocIdentityNamespaceMismatch => .{
                 .status = 409,
                 .message = "doc identity namespace mismatch",
@@ -1940,7 +1967,7 @@ pub const AntflyApiHandler = struct {
         };
     }
 
-    fn internalGroupErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error) !httpx.Response {
+    fn internalGroupErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (err == error.RestoreStagingInProgress) return textResponse(ctx, 503, "RestoreStagingInProgress");
         if (@import("relational_integrity_errors.zig").classify(err)) |reason| return textResponse(ctx, 409, @errorName(reason));
         if (sharedInternalHttpErrorSpec(err)) |spec|
@@ -2924,6 +2951,22 @@ pub const AntflyApiHandler = struct {
         const encoded = try distributed_graph.encodeGraphEdgesResponse(ctx.allocator, result);
         defer ctx.allocator.free(encoded);
         return jsonResponse(ctx, 200, encoded);
+    }
+
+    fn internalGraphMetricMaintenance(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        try operationContext(ctx, null).ensureActive();
+        const writes = self.api_server.table_writes orelse return textResponse(ctx, 404, "not found");
+        const body = (try ctx.body()) orelse "";
+        const json = (writes.graphMetricMaintenanceGroupLocal(ctx.allocator, params.group_id, params.table_name, body) catch |err| switch (err) {
+            error.InvalidGraphMetricRuntimeConfig, error.InvalidGraphMetricBuildWorker, error.InvalidGraphMetricAction => return textResponse(ctx, 400, @errorName(err)),
+            error.UnknownGroup, error.NotFound => return textResponse(ctx, 404, "not found"),
+            error.ReadOnly, error.StorageUnavailable => return textResponse(ctx, 503, @errorName(err)),
+            else => return internalGroupErrorResponse(ctx, err),
+        }) orelse return textResponse(ctx, 404, "not found");
+        defer ctx.allocator.free(json);
+        return jsonResponse(ctx, 200, json);
     }
 
     fn internalTextStats(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -5112,7 +5155,7 @@ pub const AntflyApiHandler = struct {
         defer create_req.deinit(alloc);
         if (!(try foreignKeyParentsAllowed(alloc, authenticated_identity, tables_api.effectiveSchemaJson(create_req.schema_json))))
             return jsonErrorResponse(ctx, 403, "foreign key declarations require admin permission on every referenced parent table");
-        const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+        const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
             alloc,
             create_req.indexes_json orelse tables_api.default_indexes_json,
             .{
@@ -6238,6 +6281,20 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
     }
 
+    pub fn startTableRepairControlJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (ctx.request.uri.query) |query| {
+            if (query.len != 0) return textResponse(ctx, 400, "repair job requests use json body");
+        }
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const body_data = (try ctx.body()) orelse "";
+        var response = try self.api_server.handlePublicStartTableRepairControlJob(decoded_table_name, body_data);
+        return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
     pub fn getTableRepairJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -6405,6 +6462,27 @@ pub const AntflyApiHandler = struct {
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
         var resp = try public_table_http.handleTableDeleteIndex(ctx.allocator, decoded_table_name, decoded_index_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn executeGraphMetricAction(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_index_name);
+        const decoded_metric_name = (try decodePathParamOrBadRequest(ctx, metric_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_metric_name);
+        var resp = try public_table_http.handleTableGraphMetricAction(ctx.allocator, decoded_table_name, decoded_index_name, decoded_metric_name, action, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -7503,6 +7581,12 @@ const SchemaReconcileWriteSource = struct {
 };
 
 test "typed internal HTTP errors preserve conflict semantics" {
+    const transition = AntflyApiHandler.sharedInternalHttpErrorSpec(error.GenerationTransitionActive).?;
+    try std.testing.expectEqual(@as(u16, 503), transition.status);
+    try std.testing.expectEqualStrings("GenerationTransitionActive", transition.message);
+    const stale_index = AntflyApiHandler.sharedInternalHttpErrorSpec(error.IndexGenerationMismatch).?;
+    try std.testing.expectEqual(@as(u16, 409), stale_index.status);
+    try std.testing.expectEqualStrings("IndexGenerationMismatch", stale_index.message);
     const spec = AntflyApiHandler.sharedInternalHttpErrorSpec(error.DocIdentityNamespaceMismatch).?;
     try std.testing.expectEqual(@as(u16, 409), spec.status);
     try std.testing.expectEqualStrings("doc identity namespace mismatch", spec.message);
@@ -8703,6 +8787,14 @@ test "httpx storage maintenance routes call typed operations directly" {
     try std.testing.expectEqual(@as(u16, 200), status_response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, status_response.body.?, "\"engine\":\"lite\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_response.body.?, "\"vacuum\":true") != null);
+
+    // Exercise generated public routing/admission on a node without writes.
+    // Table-admin permission for this route is checked in the API owner tests.
+    const control_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/repair/control-jobs", .{base_url});
+    defer alloc.free(control_url);
+    var control_unsupported = try requestWithRetry(&client, client_io.io(), .POST, control_url, "{\"index\":\"dense\",\"control\":\"pause_automatic\"}", null, 20);
+    defer control_unsupported.deinit();
+    try std.testing.expectEqual(@as(u16, 405), control_unsupported.status.code);
 
     const check_url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, admin_routes.maintenance_check });
     defer alloc.free(check_url);

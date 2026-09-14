@@ -17,6 +17,7 @@ const AntflyRootImports = @import("imports.zig").AntflyRootImports;
 
 pub fn configureModule(
     b: *std.Build,
+    storage_boundary: @import("storage_boundary.zig").Modules,
     mod: *std.Build.Module,
     build_options: *std.Build.Step.Options,
     lite_options: *std.Build.Module,
@@ -44,6 +45,7 @@ pub fn configureModule(
     handlebars_mod: *std.Build.Module,
     add_snowball_module: *const fn (*std.Build, *std.Build.Module) void,
 ) void {
+    storage_boundary.configure(mod, false, false);
     mod.addOptions("build_options", build_options);
     mod.addImport("antfly_lite_options", lite_options);
     mod.addImport("lmdb_engine", lmdb_engine_mod);
@@ -175,7 +177,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .target = target,
         .optimize = optimize,
     });
-    @call(.auto, configureEmbeddedModule, .{ b, embedded_support_mod } ++ embedded_deps ++ .{addSnowballModule});
+    @call(.auto, configureEmbeddedModule, .{ b, antfly_imports.storage_boundary, embedded_support_mod } ++ embedded_deps ++ .{addSnowballModule});
     embedded_support_mod.addImport("antfly_scraping", scraping_mod);
     embedded_support_mod.addImport("antfly_resolver", resolver_mod);
     embedded_support_mod.addImport("antfly_matcher", matcher_mod);
@@ -267,6 +269,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = optimize,
         .pic = true,
     });
+    antfly_imports.storage_boundary.configure(capi_mod, false, false);
+    capi_mod.addImport("antfly_source_root", capi_root_mod);
+    const capi_options = b.addOptions();
+    capi_options.addOption(bool, "linked_storage", false);
+    capi_mod.addOptions("capi_build_options", capi_options);
     capi_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("antfly_vector", vector_mod);
     capi_mod.addImport("structlog", structlog_mod);

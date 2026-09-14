@@ -20,7 +20,7 @@
 const std = @import("std");
 const error_abi = @import("runtime_error_abi.zig");
 const http_abi = @import("runtime_http_abi.zig");
-const memory_abi = @import("runtime_memory_abi.zig");
+const memory_abi = @import("runtime_memory_abi");
 
 pub const abi_version: u32 = 3;
 pub const Status = error_abi.Status;

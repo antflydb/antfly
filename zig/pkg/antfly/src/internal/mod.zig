@@ -15,15 +15,24 @@
 pub const openapi = @import("antfly_internal_openapi");
 pub const routes = @import("routes.zig");
 
-pub const HAIdentifySystemResponse = openapi.HAIdentifySystemResponse;
-pub const HACreateReplicationSlotRequest = openapi.HACreateReplicationSlotRequest;
-pub const HAReplicationSlotResponse = openapi.HAReplicationSlotResponse;
-pub const HAStartReplicationRequest = openapi.HAStartReplicationRequest;
-pub const HAStartReplicationResponse = openapi.HAStartReplicationResponse;
-pub const HAStandbyStatusUpdateRequest = openapi.HAStandbyStatusUpdateRequest;
-pub const HAStandbyStatusUpdateResponse = openapi.HAStandbyStatusUpdateResponse;
+pub const StandbyIdentifySystemResponse = openapi.StandbyIdentifySystemResponse;
+pub const StandbyCreateReplicationSlotRequest = openapi.StandbyCreateReplicationSlotRequest;
+pub const StandbyReplicationSlotResponse = openapi.StandbyReplicationSlotResponse;
+pub const StandbyStartReplicationRequest = openapi.StandbyStartReplicationRequest;
+pub const StandbyStartReplicationResponse = openapi.StandbyStartReplicationResponse;
+pub const StandbyStatusUpdateRequest = openapi.StandbyStatusUpdateRequest;
+pub const StandbyStatusUpdateResponse = openapi.StandbyStatusUpdateResponse;
 
 test {
     _ = openapi;
     _ = routes;
 }
+
+// Deprecated aliases, remove after 0.4.
+pub const HAIdentifySystemResponse = StandbyIdentifySystemResponse;
+pub const HACreateReplicationSlotRequest = StandbyCreateReplicationSlotRequest;
+pub const HAReplicationSlotResponse = StandbyReplicationSlotResponse;
+pub const HAStartReplicationRequest = StandbyStartReplicationRequest;
+pub const HAStartReplicationResponse = StandbyStartReplicationResponse;
+pub const HAStandbyStatusUpdateRequest = StandbyStatusUpdateRequest;
+pub const HAStandbyStatusUpdateResponse = StandbyStatusUpdateResponse;

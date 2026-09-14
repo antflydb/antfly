@@ -19,7 +19,7 @@ const std = @import("std");
 const reads = @import("table_reads.zig");
 const writes = @import("table_writes.zig");
 const planner = @import("relational_integrity_commit.zig");
-const activation = @import("../storage/db/relational_integrity_activation.zig");
+const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
 const records = @import("../common/topology_records.zig");
 const contract = @import("distributed_txn_contract.zig");
 const Allocator = std.mem.Allocator;
@@ -178,7 +178,7 @@ fn recordFailure(alloc: Allocator, writer: writes.TableWriteSource, table: []con
 test "distributed txn activation worker adapts pages and atomically publishes native claims and failure state" {
     const db_mod = @import("../storage/db/db.zig");
     const types = @import("../storage/db/types.zig");
-    const integrity = @import("../storage/db/relational_integrity.zig");
+    const integrity = @import("../storage/db/relational_integrity_contract.zig");
     const catalog = @import("../storage/db/relational_integrity_catalog.zig");
     const tuples = @import("../storage/db/relational_index_keys.zig");
     const read_gate = @import("../raft/read_gate.zig");

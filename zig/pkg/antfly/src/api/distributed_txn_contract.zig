@@ -48,9 +48,9 @@ pub const TableCommitRequest = struct {
     transforms: []const db_types.DocumentTransform = &.{},
     predicates: []const db_types.TransactionVersionPredicate = &.{},
     integrity: []const db_types.TransactionIntegrityOperation = &.{},
-    integrity_commands: []const @import("../storage/db/relational_integrity.zig").Command = &.{},
-    relational_activation: ?@import("../storage/db/relational_integrity_activation.zig").Command = null,
-    relational_retirement: ?@import("../storage/db/relational_integrity_retirement.zig").Command = null,
+    integrity_commands: []const @import("../storage/db/relational_integrity_contract.zig").Command = &.{},
+    relational_activation: ?@import("../storage/db/relational_integrity_activation_contract.zig").Command = null,
+    relational_retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Command = null,
 };
 
 pub const CommitConflict = struct {

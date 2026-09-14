@@ -3826,15 +3826,7 @@ fn ensureManifestSize(encoded: []const u8, max_bytes: usize) !void {
     if (encoded.len > max_bytes) return error.BackupManifestTooLarge;
 }
 
-pub fn validateArtifactRelativePath(path: []const u8) !void {
-    if (path.len == 0 or path.len > 4096 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, '\\') != null or std.mem.indexOfScalar(u8, path, 0) != null) {
-        return error.InvalidBackupArtifactPath;
-    }
-    var components = std.mem.splitScalar(u8, path, '/');
-    while (components.next()) |component| {
-        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidBackupArtifactPath;
-    }
-}
+pub const validateArtifactRelativePath = @import("backup_contract.zig").validateArtifactRelativePath;
 
 fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []const u8, location: []const u8, shared_io: ?std.Io) ![]u8 {
     const uri_path = try parseFileLocation(location);
@@ -15939,6 +15931,25 @@ test "backup location parsing requires absolute file uri" {
     try std.testing.expectEqualStrings("/tmp/antfly-backup", try parseFileLocation("file:///tmp/antfly-backup"));
     try std.testing.expectError(error.UnsupportedBackupLocation, parseFileLocation("s3://bucket/path"));
     try std.testing.expectError(error.InvalidBackupLocation, parseFileLocation("file://relative"));
+}
+
+test "authorized filesystem location returns canonical ancestor for no-follow traversal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "canonical", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "canonical", "alias", .{ .is_directory = true });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const alias_location = try std.fmt.allocPrint(alloc, "file://{s}/alias/new-backup", .{root});
+    defer alloc.free(alias_location);
+    const expected = try std.fmt.allocPrint(alloc, "{s}/canonical/new-backup", .{root});
+    defer alloc.free(expected);
+
+    const resolved = try resolveFilesystemLocationAlloc(alloc, "/", alias_location, std.testing.io);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings(expected, resolved);
 }
 
 test "restore source identities are bounded and canonical" {

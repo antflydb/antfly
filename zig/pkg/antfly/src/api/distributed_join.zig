@@ -30,7 +30,7 @@ const tables_api = @import("tables.zig");
 const platform_time = @import("antfly_platform").time;
 const table_catalog = @import("table_catalog.zig");
 const platform_clock = @import("antfly_platform").clock;
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const raft_mod = @import("../raft/mod.zig");
 const public_table_http = @import("public_table_http.zig");
 const join_model = @import("join_model.zig");
@@ -6944,7 +6944,7 @@ test "distributed join apply context cancels a linear non-equality merge" {
     const ctx = JoinContext{
         .ptr = &state,
         .vtable = undefined,
-        .cancellation = &cancellation,
+        .cancellation = .fromAtomic(&cancellation),
     };
 
     try std.testing.expectError(

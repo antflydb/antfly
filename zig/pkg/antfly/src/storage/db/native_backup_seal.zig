@@ -131,21 +131,8 @@ pub fn exportedBytes(alloc: Allocator, io: std.Io, root: []const u8, handle: Han
     return parsed.value.bytes;
 }
 
-pub const Handle = struct {
-    fence: topology.Fence,
-    digest: [32]u8,
-    pub fn jsonStringify(self: Handle, stream: anytype) !void {
-        try json.write(self, stream);
-    }
-};
-pub const Request = union(enum) {
-    seal: struct { id: []const u8, fence: topology.Fence },
-    release: Handle,
-    cancel: topology.Fence,
-    pub fn jsonStringify(self: Request, stream: anytype) !void {
-        try json.write(self, stream);
-    }
-};
+pub const Handle = @import("native_backup_seal_contract.zig").Handle;
+pub const Request = @import("native_backup_seal_contract.zig").Request;
 pub const File = struct { path: []const u8, size: u64, inode: u64, mtime_ns: i128 };
 pub const Manifest = struct {
     version: u32 = 1,

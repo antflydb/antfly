@@ -23,6 +23,7 @@ const traversal_mod = @import("traversal.zig");
 const node_identity = @import("node_identity.zig");
 const work_budget_diagnostic = @import("work_budget_diagnostic.zig");
 const work_budget_mod = @import("work_budget.zig");
+const edge_stream = @import("edge_stream.zig");
 
 pub const max_pattern_steps: usize = 64;
 pub const max_pattern_hops: u32 = 64;
@@ -645,6 +646,11 @@ pub fn matchPattern(
 ) ![]PatternMatch {
     const GraphIndexEdgeReader = struct {
         graph_index: *graph_mod.GraphIndex,
+
+        pub fn openPatternEdgeStream(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, _: bool) !edge_stream.Stream {
+            if (table != null) return edge_stream.Stream.empty(a);
+            return edge_stream.openGraph(a, self.graph_index, key, kinds, direction);
+        }
 
         pub fn getEdges(
             self: @This(),
@@ -1294,35 +1300,118 @@ fn streamReachableNodes(
             try work_budget.consumeNode();
             if (frontier.hops >= max_hops) continue;
 
-            const edges = try getEdgesForBudget(
-                alloc,
-                edge_reader,
-                if (traversal.incoming_source) |source| source.table else frontier.table,
-                frontier.key,
-                edge.types,
-                edge.direction,
-                work_budget,
-                traversal.incoming_source != null,
-            );
-            defer edge_reader.freeEdges(alloc, edges);
-            if (stats) |active| {
-                active.adjacency_reads += 1;
-                active.adjacency_edges += edges.len;
-            }
-            try consumeMaterializedEdges(work_budget, edges);
+            var edge_pages = if (comptime @hasDecl(@TypeOf(edge_reader), "openPatternEdgeStream"))
+                try edge_reader.openPatternEdgeStream(alloc, if (traversal.incoming_source) |source| source.table else frontier.table, frontier.key, edge.types, edge.direction, traversal.incoming_source != null)
+            else blk: {
+                const owned = try getEdgesForBudget(
+                    alloc,
+                    edge_reader,
+                    if (traversal.incoming_source) |source| source.table else frontier.table,
+                    frontier.key,
+                    edge.types,
+                    edge.direction,
+                    work_budget,
+                    traversal.incoming_source != null,
+                );
+                errdefer edge_reader.freeEdges(alloc, owned);
+                break :blk try edge_stream.Stream.fromOwned(alloc, edge_reader, owned);
+            };
+            defer edge_pages.deinit();
+            while (!observer.full()) {
+                const edges = try edge_pages.nextBudget(work_budget, edge_stream.batch_records) orelse break;
+                defer edge_reader.freeEdges(alloc, edges);
+                if (stats) |active| {
+                    active.adjacency_reads += 1;
+                    active.adjacency_edges += edges.len;
+                }
+                try consumeMaterializedEdges(work_budget, edges);
 
-            const admitted_edges = if (node_admission) |admission| blk: {
-                const edge_mask = try alloc.alloc(bool, edges.len);
-                @memset(edge_mask, false);
-                errdefer alloc.free(edge_mask);
-                var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
-                defer candidate_indexes.deinit(alloc);
-                var candidate_nodes = std.ArrayListUnmanaged(NodeRef).empty;
-                defer candidate_nodes.deinit(alloc);
-                try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
-                try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
+                const admitted_edges = if (node_admission) |admission| blk: {
+                    const edge_mask = try alloc.alloc(bool, edges.len);
+                    @memset(edge_mask, false);
+                    errdefer alloc.free(edge_mask);
+                    var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
+                    defer candidate_indexes.deinit(alloc);
+                    var candidate_nodes = std.ArrayListUnmanaged(NodeRef).empty;
+                    defer candidate_nodes.deinit(alloc);
+                    try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
+                    try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
+                    for (edges, 0..) |graph_edge, edge_index| {
+                        if (!edgeMatches(graph_edge, edge)) continue;
+                        const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
+                        const target_table = resolvedEdgeTargetTable(
+                            edge_reader,
+                            frontier.table,
+                            graph_edge,
+                            target_key,
+                            traversal,
+                        );
+                        if (shouldRejectPathRevisit(
+                            frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
+                            .{ .table = target_table, .key = target_key },
+                            target_nodes,
+                            target_required,
+                            fixed_single_hop,
+                        )) continue;
+                        candidate_indexes.appendAssumeCapacity(edge_index);
+                        candidate_nodes.appendAssumeCapacity(.{
+                            .key = target_key,
+                            .table = target_table,
+                            .external = std.mem.eql(u8, target_key, graph_edge.target) and
+                                (admission.external_targets or
+                                    target_table != null),
+                        });
+                    }
+                    const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
+                    defer alloc.free(candidate_mask);
+                    for (candidate_indexes.items, candidate_mask) |edge_index, allowed| {
+                        edge_mask[edge_index] = allowed;
+                    }
+                    break :blk edge_mask;
+                } else null;
+                defer if (admitted_edges) |mask| alloc.free(mask);
+
+                const filtered_edges = if (nodeFilterActive(node_filter)) blk: {
+                    const edge_mask = try alloc.alloc(bool, edges.len);
+                    @memset(edge_mask, false);
+                    errdefer alloc.free(edge_mask);
+                    var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
+                    defer candidate_indexes.deinit(alloc);
+                    var candidate_nodes = std.ArrayListUnmanaged(node_identity.Ref).empty;
+                    defer candidate_nodes.deinit(alloc);
+                    for (edges, 0..) |graph_edge, edge_index| {
+                        if (admitted_edges) |mask| {
+                            if (!mask[edge_index]) continue;
+                        } else if (!edgeMatches(graph_edge, edge)) continue;
+                        const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
+                        const target_table = resolvedEdgeTargetTable(
+                            edge_reader,
+                            frontier.table,
+                            graph_edge,
+                            target_key,
+                            traversal,
+                        );
+                        if (shouldRejectPathRevisit(
+                            frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
+                            .{ .table = target_table, .key = target_key },
+                            target_nodes,
+                            target_required,
+                            fixed_single_hop,
+                        )) continue;
+                        const new_hops = frontier.hops + 1;
+                        if (new_hops < min_hops or
+                            !targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, target_required)) continue;
+                        try candidate_indexes.append(alloc, edge_index);
+                        try candidate_nodes.append(alloc, .{ .table = target_table, .key = target_key });
+                    }
+                    const decisions = try evaluateNodeFiltersAlloc(alloc, candidate_nodes.items, node_filter, evaluator);
+                    defer alloc.free(decisions);
+                    for (candidate_indexes.items, decisions) |edge_index, allowed| edge_mask[edge_index] = allowed;
+                    break :blk edge_mask;
+                } else null;
+                defer if (filtered_edges) |mask| alloc.free(mask);
+
                 for (edges, 0..) |graph_edge, edge_index| {
-                    if (!edgeMatches(graph_edge, edge)) continue;
                     const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
                     const target_table = resolvedEdgeTargetTable(
                         edge_reader,
@@ -1331,138 +1420,65 @@ fn streamReachableNodes(
                         target_key,
                         traversal,
                     );
-                    if (shouldRejectPathRevisit(
-                        frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
+                    const revisits_path = frontierContainsNode(
+                        frontier.*,
                         .{ .table = target_table, .key = target_key },
-                        target_nodes,
-                        target_required,
-                        fixed_single_hop,
-                    )) continue;
-                    candidate_indexes.appendAssumeCapacity(edge_index);
-                    candidate_nodes.appendAssumeCapacity(.{
-                        .key = target_key,
-                        .table = target_table,
-                        .external = std.mem.eql(u8, target_key, graph_edge.target) and
-                            (admission.external_targets or
-                                target_table != null),
-                    });
-                }
-                const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
-                defer alloc.free(candidate_mask);
-                for (candidate_indexes.items, candidate_mask) |edge_index, allowed| {
-                    edge_mask[edge_index] = allowed;
-                }
-                break :blk edge_mask;
-            } else null;
-            defer if (admitted_edges) |mask| alloc.free(mask);
-
-            const filtered_edges = if (nodeFilterActive(node_filter)) blk: {
-                const edge_mask = try alloc.alloc(bool, edges.len);
-                @memset(edge_mask, false);
-                errdefer alloc.free(edge_mask);
-                var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
-                defer candidate_indexes.deinit(alloc);
-                var candidate_nodes = std.ArrayListUnmanaged(node_identity.Ref).empty;
-                defer candidate_nodes.deinit(alloc);
-                for (edges, 0..) |graph_edge, edge_index| {
+                    );
                     if (admitted_edges) |mask| {
                         if (!mask[edge_index]) continue;
-                    } else if (!edgeMatches(graph_edge, edge)) continue;
-                    const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                    const target_table = resolvedEdgeTargetTable(
-                        edge_reader,
-                        frontier.table,
-                        graph_edge,
-                        target_key,
-                        traversal,
-                    );
-                    if (shouldRejectPathRevisit(
-                        frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
-                        .{ .table = target_table, .key = target_key },
-                        target_nodes,
-                        target_required,
-                        fixed_single_hop,
-                    )) continue;
+                    } else {
+                        if (!edgeMatches(graph_edge, edge)) continue;
+                        if (shouldRejectPathRevisit(
+                            revisits_path,
+                            .{ .table = target_table, .key = target_key },
+                            target_nodes,
+                            target_required,
+                            fixed_single_hop,
+                        )) continue;
+                    }
                     const new_hops = frontier.hops + 1;
-                    if (new_hops < min_hops or
-                        !targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, target_required)) continue;
-                    try candidate_indexes.append(alloc, edge_index);
-                    try candidate_nodes.append(alloc, .{ .table = target_table, .key = target_key });
-                }
-                const decisions = try evaluateNodeFiltersAlloc(alloc, candidate_nodes.items, node_filter, evaluator);
-                defer alloc.free(decisions);
-                for (candidate_indexes.items, decisions) |edge_index, allowed| edge_mask[edge_index] = allowed;
-                break :blk edge_mask;
-            } else null;
-            defer if (filtered_edges) |mask| alloc.free(mask);
+                    const new_path = if (include_paths)
+                        try appendPathEdge(alloc, frontier.path, graph_edge, frontier.key, target_key, edge.direction)
+                    else
+                        @constCast((&[_]paths_mod.PathEdge{})[0..]);
+                    var new_path_owned = true;
+                    errdefer if (new_path_owned) freePathEdges(alloc, new_path);
 
-            for (edges, 0..) |graph_edge, edge_index| {
-                const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                const target_table = resolvedEdgeTargetTable(
-                    edge_reader,
-                    frontier.table,
-                    graph_edge,
-                    target_key,
-                    traversal,
-                );
-                const revisits_path = frontierContainsNode(
-                    frontier.*,
-                    .{ .table = target_table, .key = target_key },
-                );
-                if (admitted_edges) |mask| {
-                    if (!mask[edge_index]) continue;
-                } else {
-                    if (!edgeMatches(graph_edge, edge)) continue;
-                    if (shouldRejectPathRevisit(
-                        revisits_path,
-                        .{ .table = target_table, .key = target_key },
-                        target_nodes,
-                        target_required,
-                        fixed_single_hop,
-                    )) continue;
-                }
-                const new_hops = frontier.hops + 1;
-                const new_path = if (include_paths)
-                    try appendPathEdge(alloc, frontier.path, graph_edge, frontier.key, target_key, edge.direction)
-                else
-                    @constCast((&[_]paths_mod.PathEdge{})[0..]);
-                var new_path_owned = true;
-                errdefer if (new_path_owned) freePathEdges(alloc, new_path);
+                    if (new_hops >= min_hops and
+                        targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, target_required) and
+                        (if (filtered_edges) |mask| mask[edge_index] else true))
+                    {
+                        try observer.observe(
+                            .{ .key = target_key, .table = target_table },
+                            new_hops,
+                            new_path,
+                        );
+                        if (observer.full()) {
+                            freePathEdges(alloc, new_path);
+                            new_path_owned = false;
+                            break;
+                        }
+                    }
 
-                if (new_hops >= min_hops and
-                    targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, target_required) and
-                    (if (filtered_edges) |mask| mask[edge_index] else true))
-                {
-                    try observer.observe(
-                        .{ .key = target_key, .table = target_table },
-                        new_hops,
-                        new_path,
-                    );
-                    if (observer.full()) {
+                    // A repeated node is permitted only to materialize an explicit
+                    // cycle-closing target. Do not expand it into non-simple paths.
+                    if (new_hops < max_hops and !revisits_path) {
+                        var next_item = try initFrontier(
+                            &ancestry,
+                            target_key,
+                            target_table,
+                            new_path,
+                            frontier.ancestry,
+                            new_hops,
+                        );
+                        new_path_owned = false;
+                        errdefer next_item.deinit(alloc);
+                        try work_budget.checkIntermediateStates(next.items.len + 1, max_intermediate_states);
+                        try next.append(alloc, next_item);
+                    } else {
                         freePathEdges(alloc, new_path);
                         new_path_owned = false;
-                        break;
                     }
-                }
-
-                // A repeated node is permitted only to materialize an explicit
-                // cycle-closing target. Do not expand it into non-simple paths.
-                if (new_hops < max_hops and !revisits_path) {
-                    var next_item = try initFrontier(
-                        &ancestry,
-                        target_key,
-                        target_table,
-                        new_path,
-                        frontier.ancestry,
-                        new_hops,
-                    );
-                    new_path_owned = false;
-                    errdefer next_item.deinit(alloc);
-                    try work_budget.checkIntermediateStates(next.items.len + 1, max_intermediate_states);
-                    try next.append(alloc, next_item);
-                } else {
-                    freePathEdges(alloc, new_path);
-                    new_path_owned = false;
                 }
             }
             if (observer.full()) break;
@@ -1690,6 +1706,11 @@ pub fn matchConjunctivePattern(
 ) ![]PatternMatch {
     const Reader = struct {
         graph_index: *graph_mod.GraphIndex,
+
+        pub fn openPatternEdgeStream(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, _: bool) !edge_stream.Stream {
+            if (table != null) return edge_stream.Stream.empty(a);
+            return edge_stream.openGraph(a, self.graph_index, key, kinds, direction);
+        }
 
         pub fn getEdges(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
             if (table != null) return try a.alloc(graph_mod.Edge, 0);
@@ -2149,6 +2170,11 @@ pub fn aggregateConjunctivePattern(
 ) ![]CountAggregateResult {
     const Reader = struct {
         graph_index: *graph_mod.GraphIndex,
+
+        pub fn openPatternEdgeStream(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, _: bool) !edge_stream.Stream {
+            if (table != null) return edge_stream.Stream.empty(a);
+            return edge_stream.openGraph(a, self.graph_index, key, kinds, direction);
+        }
 
         pub fn getEdges(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
             if (table != null) return try a.alloc(graph_mod.Edge, 0);
@@ -5303,7 +5329,7 @@ test "conjunctive cycle canonicalizes an explicit source table on return" {
     };
     const nodes = [_]MatchNode{
         .{ .alias = "source" },
-        .{ .alias = "entity" },
+        .{ .alias = "entity", .table = "entities" },
     };
     const edges = [_]MatchEdge{
         .{ .from = "source", .to = "entity", .step = .{ .types = &.{"external"} } },

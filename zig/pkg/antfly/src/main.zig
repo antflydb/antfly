@@ -73,7 +73,11 @@ fn mainImpl(init: std.process.Init) !void {
     switch (command.route) {
         .cli => return runRuntimeUnit(.cli, subcommand, init, &args),
         .data => return runRuntimeUnit(.data, subcommand, init, &args),
-        .ha => return runRuntimeUnit(.ha, subcommand, init, &args),
+        // `standby` (visible) and `ha` (hidden, deprecated alias) share this
+        // route and land in the same runtime unit; the entrypoint always
+        // prints help using the `standby` spelling regardless of which name
+        // was invoked.
+        .standby => return runRuntimeUnit(.standby, subcommand, init, &args),
         .inference => {
             var worker_lifetime = inference_process_supervisor.WorkerLifetime{};
             defer worker_lifetime.deinit(init.io);
@@ -93,15 +97,17 @@ fn mainImpl(init: std.process.Init) !void {
     }
 }
 
-const RuntimeRole = enum { cli, data, ha, inference, metadata, serverless, standalone };
+const RuntimeRole = enum { cli, data, inference, metadata, serverless, standalone, standby };
 
 extern fn antfly_runtime_cli(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
-extern fn antfly_runtime_ha(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_standby(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_standalone_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
 
 pub fn runRuntimeUnit(
     comptime role: RuntimeRole,
@@ -132,11 +138,17 @@ pub fn runRuntimeUnit(
     const code = switch (role) {
         .cli => antfly_runtime_cli(&context),
         .data => antfly_runtime_data(&context),
-        .ha => antfly_runtime_ha(&context),
+        .standby => antfly_runtime_standby(&context),
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),
         .serverless => antfly_runtime_serverless(&context),
-        .standalone => antfly_runtime_standalone(&context),
+        .standalone => if (std.mem.eql(u8, command, "lite"))
+            if (argument_views.items.len > 0 and std.mem.eql(u8, argument_views.items[0].slice(), "serve"))
+                antfly_runtime_standalone_lite(&context)
+            else
+                antfly_runtime_lite(&context)
+        else
+            antfly_runtime_standalone(&context),
     };
     if (code != 0) std.process.exit(@intCast(code));
 }

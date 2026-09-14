@@ -10,7 +10,7 @@ package main
 import (
     "context"
     "fmt"
-    "github.com/antflydb/anteval/eval"
+    "github.com/antflydb/antfly/go/pkg/evalaf/eval"
 )
 
 func main() {

@@ -10,7 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
-const db_mod = @import("../storage/db/db.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const db_types = @import("../storage/db/types.zig");
 const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
@@ -18,7 +18,7 @@ const text_merge_runtime = @import("../storage/db/maintenance/text_merge_runtime
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
-const Fixture = struct {
+pub const Fixture = struct {
     allocator: std.mem.Allocator,
     tmp: std.testing.TmpDir,
     root: [:0]u8,
@@ -30,7 +30,7 @@ const Fixture = struct {
     repair_storage: *lsm_backend.MemoryStorage,
     db: db_mod.DB,
 
-    fn init(allocator: std.mem.Allocator) !Fixture {
+    pub fn init(allocator: std.mem.Allocator) !Fixture {
         var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) physical index bytes are an explicit differential boundary
         errdefer tmp.cleanup();
         const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator); // vopr-audit: allow(host_filesystem) physical index bytes are an explicit differential boundary
@@ -83,7 +83,7 @@ const Fixture = struct {
         };
     }
 
-    fn deinit(self: *Fixture) void {
+    pub fn deinit(self: *Fixture) void {
         self.db.close();
         self.repair_storage.deinit();
         self.allocator.destroy(self.repair_storage);

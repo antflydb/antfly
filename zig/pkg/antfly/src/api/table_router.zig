@@ -393,321 +393,333 @@ fn containsNodeId(node_ids: []const u64, node_id: u64) bool {
     return false;
 }
 
-test "resolve group route allows stale reads on local active replica" {
-    const FakeCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        test "resolve group route allows stale reads on local active replica" {
+            const FakeCatalog = struct {
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
+                            .{ .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
+                            .{ .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 } },
+                        })[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
-        }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
-                    .{ .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
-                    .{ .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 } },
-                })[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            const FakeRouter = struct {
+                fn iface() HostedGroupRouter {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .local_node_id = localNodeId,
+                            .local_status = localStatus,
+                            .group_leader_node_id = groupLeaderNodeId,
+                            .node_status = nodeStatus,
+                            .node_base_uri = nodeBaseUri,
+                        },
+                    };
+                }
+
+                fn localNodeId(_: *anyopaque) u64 {
+                    return 1;
+                }
+
+                fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+                    return .active;
+                }
+
+                fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+                    return 2;
+                }
+
+                fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+                    return if (node_id == 1 or node_id == 2) .active else .absent;
+                }
+
+                fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+                    return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+                }
             };
+
+            var route = (try resolveGroupRoute(std.testing.allocator, FakeCatalog.iface(), FakeRouter.iface(), 77, .any_active)).?;
+            defer route.deinit(std.testing.allocator);
+            try std.testing.expect(route == .local);
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
+        test "resolve group route prefers leader for strong reads and writes" {
+            const FakeCatalog = struct {
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                        },
+                    };
+                }
 
-    const FakeRouter = struct {
-        fn iface() HostedGroupRouter {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .local_node_id = localNodeId,
-                    .local_status = localStatus,
-                    .group_leader_node_id = groupLeaderNodeId,
-                    .node_status = nodeStatus,
-                    .node_base_uri = nodeBaseUri,
-                },
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
+                            .{ .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
+                            .{ .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 } },
+                        })[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
-        }
 
-        fn localNodeId(_: *anyopaque) u64 {
-            return 1;
-        }
+            const FakeRouter = struct {
+                fn iface() HostedGroupRouter {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .local_node_id = localNodeId,
+                            .local_status = localStatus,
+                            .group_leader_node_id = groupLeaderNodeId,
+                            .node_status = nodeStatus,
+                            .node_base_uri = nodeBaseUri,
+                        },
+                    };
+                }
 
-        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
-            return .active;
-        }
+                fn localNodeId(_: *anyopaque) u64 {
+                    return 1;
+                }
 
-        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
-            return 2;
-        }
+                fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+                    return .active;
+                }
 
-        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
-            return if (node_id == 1 or node_id == 2) .active else .absent;
-        }
+                fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+                    return 2;
+                }
 
-        fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
-            return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
-        }
-    };
+                fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+                    return if (node_id == 1 or node_id == 2) .active else .absent;
+                }
 
-    var route = (try resolveGroupRoute(std.testing.allocator, FakeCatalog.iface(), FakeRouter.iface(), 77, .any_active)).?;
-    defer route.deinit(std.testing.allocator);
-    try std.testing.expect(route == .local);
-}
-
-test "resolve group route prefers leader for strong reads and writes" {
-    const FakeCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
+                fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+                    return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+                }
             };
-        }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
-                    .{ .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
-                    .{ .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 } },
-                })[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    const FakeRouter = struct {
-        fn iface() HostedGroupRouter {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .local_node_id = localNodeId,
-                    .local_status = localStatus,
-                    .group_leader_node_id = groupLeaderNodeId,
-                    .node_status = nodeStatus,
-                    .node_base_uri = nodeBaseUri,
-                },
-            };
-        }
-
-        fn localNodeId(_: *anyopaque) u64 {
-            return 1;
-        }
-
-        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
-            return .active;
-        }
-
-        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
-            return 2;
-        }
-
-        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
-            return if (node_id == 1 or node_id == 2) .active else .absent;
-        }
-
-        fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
-            return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
-        }
-    };
-
-    var route = (try resolveGroupRoute(std.testing.allocator, FakeCatalog.iface(), FakeRouter.iface(), 77, .prefer_leader)).?;
-    defer route.deinit(std.testing.allocator);
-    switch (route) {
-        .local => return error.TestExpectedRemoteLeaderRoute,
-        .remote => |remote| try std.testing.expectEqual(@as(u64, 2), remote.node_id),
-    }
-}
-
-test "resolve group routes uses one router-owned snapshot callback for fanout" {
-    const State = struct {
-        batch_calls: usize = 0,
-        scalar_calls: usize = 0,
-        omit_last_route: bool = false,
-
-        fn localNodeId(_: *anyopaque) u64 {
-            return 1;
-        }
-
-        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
-            return .absent;
-        }
-
-        fn nodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.scalar_calls += 1;
-            return try std.fmt.allocPrint(alloc, "http://scalar-{d}", .{node_id});
-        }
-
-        fn resolveRoutes(
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_ids: []const u64,
-            policy: RoutePolicy,
-        ) !?[]GroupRoute {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.batch_calls += 1;
-            try std.testing.expectEqual(RoutePolicy.prefer_leader, policy);
-            const route_count = group_ids.len - @intFromBool(self.omit_last_route and group_ids.len != 0);
-            const routes = try alloc.alloc(GroupRoute, route_count);
-            var initialized: usize = 0;
-            errdefer {
-                for (routes[0..initialized]) |*route| route.deinit(alloc);
-                alloc.free(routes);
+            var route = (try resolveGroupRoute(std.testing.allocator, FakeCatalog.iface(), FakeRouter.iface(), 77, .prefer_leader)).?;
+            defer route.deinit(std.testing.allocator);
+            switch (route) {
+                .local => return error.TestExpectedRemoteLeaderRoute,
+                .remote => |remote| try std.testing.expectEqual(@as(u64, 2), remote.node_id),
             }
-            for (group_ids[0..route_count], 0..) |group_id, index| {
-                routes[index] = .{ .remote = .{
-                    .node_id = group_id + 100,
-                    .base_uri = try std.fmt.allocPrint(alloc, "http://group-{d}", .{group_id}),
-                } };
-                initialized += 1;
+        }
+
+        test "resolve group routes uses one router-owned snapshot callback for fanout" {
+            const State = struct {
+                batch_calls: usize = 0,
+                scalar_calls: usize = 0,
+                omit_last_route: bool = false,
+
+                fn localNodeId(_: *anyopaque) u64 {
+                    return 1;
+                }
+
+                fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+                    return .absent;
+                }
+
+                fn nodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.scalar_calls += 1;
+                    return try std.fmt.allocPrint(alloc, "http://scalar-{d}", .{node_id});
+                }
+
+                fn resolveRoutes(
+                    ptr: *anyopaque,
+                    alloc: std.mem.Allocator,
+                    group_ids: []const u64,
+                    policy: RoutePolicy,
+                ) !?[]GroupRoute {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.batch_calls += 1;
+                    try std.testing.expectEqual(RoutePolicy.prefer_leader, policy);
+                    const route_count = group_ids.len - @intFromBool(self.omit_last_route and group_ids.len != 0);
+                    const routes = try alloc.alloc(GroupRoute, route_count);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (routes[0..initialized]) |*route| route.deinit(alloc);
+                        alloc.free(routes);
+                    }
+                    for (group_ids[0..route_count], 0..) |group_id, index| {
+                        routes[index] = .{ .remote = .{
+                            .node_id = group_id + 100,
+                            .base_uri = try std.fmt.allocPrint(alloc, "http://group-{d}", .{group_id}),
+                        } };
+                        initialized += 1;
+                    }
+                    return routes;
+                }
+            };
+
+            var state = State{};
+            const router: HostedGroupRouter = .{
+                .ptr = &state,
+                .vtable = &.{
+                    .local_node_id = State.localNodeId,
+                    .local_status = State.localStatus,
+                    .node_base_uri = State.nodeBaseUri,
+                    .resolve_group_routes = State.resolveRoutes,
+                },
+            };
+            const unused_catalog: table_catalog.CatalogSource = undefined;
+            const routes = (try resolveGroupRoutes(
+                std.testing.allocator,
+                unused_catalog,
+                router,
+                &.{ 7, 9, 11 },
+                .prefer_leader,
+            )).?;
+            defer freeGroupRoutes(std.testing.allocator, routes);
+            try std.testing.expectEqual(@as(usize, 1), state.batch_calls);
+            try std.testing.expectEqual(@as(usize, 0), state.scalar_calls);
+            try std.testing.expectEqual(@as(u64, 107), routes[0].remote.node_id);
+            try std.testing.expectEqualStrings("http://group-11", routes[2].remote.base_uri);
+
+            state.omit_last_route = true;
+            try std.testing.expectError(
+                error.InvalidGroupRouteBatch,
+                resolveGroupRoutes(std.testing.allocator, unused_catalog, router, &.{ 7, 9, 11 }, .prefer_leader),
+            );
+            try std.testing.expectEqual(@as(usize, 2), state.batch_calls);
+        }
+
+        test "catalog backed router routes metadata-owned writes to placement leader api url" {
+            const FakeCatalog = struct {
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{
+                            .{ .store_id = 10, .node_id = 1, .api_url = "http://node-1", .role = "data", .health_class = "healthy", .live = true },
+                            .{ .store_id = 20, .node_id = 2, .api_url = "http://node-2", .role = "data", .health_class = "healthy", .live = true },
+                        })[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
+                            .{ .store_id = 10, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
+                            .{ .store_id = 20, .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 } },
+                        })[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                        .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{
+                            .{ .group_id = 77, .leader_known = true, .leader_store_id = 20 },
+                        })[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+
+            var catalog_router = CatalogBackedGroupRouter.init(FakeCatalog.iface(), 0);
+            var route = (try resolveGroupRoute(std.testing.allocator, FakeCatalog.iface(), catalog_router.router(), 77, .prefer_leader)).?;
+            defer route.deinit(std.testing.allocator);
+            switch (route) {
+                .local => return error.TestExpectedRemoteLeaderRoute,
+                .remote => |remote| {
+                    try std.testing.expectEqual(@as(u64, 2), remote.node_id);
+                    try std.testing.expectEqualStrings("http://node-2", remote.base_uri);
+                },
             }
-            return routes;
         }
-    };
 
-    var state = State{};
-    const router: HostedGroupRouter = .{
-        .ptr = &state,
-        .vtable = &.{
-            .local_node_id = State.localNodeId,
-            .local_status = State.localStatus,
-            .node_base_uri = State.nodeBaseUri,
-            .resolve_group_routes = State.resolveRoutes,
-        },
-    };
-    const unused_catalog: table_catalog.CatalogSource = undefined;
-    const routes = (try resolveGroupRoutes(
-        std.testing.allocator,
-        unused_catalog,
-        router,
-        &.{ 7, 9, 11 },
-        .prefer_leader,
-    )).?;
-    defer freeGroupRoutes(std.testing.allocator, routes);
-    try std.testing.expectEqual(@as(usize, 1), state.batch_calls);
-    try std.testing.expectEqual(@as(usize, 0), state.scalar_calls);
-    try std.testing.expectEqual(@as(u64, 107), routes[0].remote.node_id);
-    try std.testing.expectEqualStrings("http://group-11", routes[2].remote.base_uri);
+        test "catalog backed router skips non-serving relocation placements" {
+            const FakeCatalog = struct {
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                        },
+                    };
+                }
 
-    state.omit_last_route = true;
-    try std.testing.expectError(
-        error.InvalidGroupRouteBatch,
-        resolveGroupRoutes(std.testing.allocator, unused_catalog, router, &.{ 7, 9, 11 }, .prefer_leader),
-    );
-    try std.testing.expectEqual(@as(usize, 2), state.batch_calls);
-}
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{
+                            .{ .store_id = 10, .node_id = 1, .api_url = "http://node-1", .role = "data", .health_class = "healthy", .live = true },
+                            .{ .store_id = 20, .node_id = 2, .api_url = "http://node-2", .role = "data", .health_class = "healthy", .live = true },
+                        })[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
+                            .{ .store_id = 10, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 }, .serving_state = .serving },
+                            .{ .store_id = 20, .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 }, .serving_state = .bootstrapping },
+                        })[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                        .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{
+                            .{ .group_id = 77, .leader_known = true, .leader_store_id = 20 },
+                        })[0..]),
+                    };
+                }
 
-test "catalog backed router routes metadata-owned writes to placement leader api url" {
-    const FakeCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+
+            var catalog_router = CatalogBackedGroupRouter.init(FakeCatalog.iface(), 0);
+            try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, catalog_router.router().nodeStatus(2, 77).?);
+            var route = (try resolveGroupRoute(std.testing.allocator, FakeCatalog.iface(), catalog_router.router(), 77, .prefer_leader)).?;
+            defer route.deinit(std.testing.allocator);
+            switch (route) {
+                .local => return error.TestExpectedRemoteServingRoute,
+                .remote => |remote| {
+                    try std.testing.expectEqual(@as(u64, 1), remote.node_id);
+                    try std.testing.expectEqualStrings("http://node-1", remote.base_uri);
                 },
-            };
+            }
         }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{
-                    .{ .store_id = 10, .node_id = 1, .api_url = "http://node-1", .role = "data", .health_class = "healthy", .live = true },
-                    .{ .store_id = 20, .node_id = 2, .api_url = "http://node-2", .role = "data", .health_class = "healthy", .live = true },
-                })[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
-                    .{ .store_id = 10, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
-                    .{ .store_id = 20, .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 } },
-                })[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{
-                    .{ .group_id = 77, .leader_known = true, .leader_store_id = 20 },
-                })[0..]),
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
-
-    var catalog_router = CatalogBackedGroupRouter.init(FakeCatalog.iface(), 0);
-    var route = (try resolveGroupRoute(std.testing.allocator, FakeCatalog.iface(), catalog_router.router(), 77, .prefer_leader)).?;
-    defer route.deinit(std.testing.allocator);
-    switch (route) {
-        .local => return error.TestExpectedRemoteLeaderRoute,
-        .remote => |remote| {
-            try std.testing.expectEqual(@as(u64, 2), remote.node_id);
-            try std.testing.expectEqualStrings("http://node-2", remote.base_uri);
-        },
-    }
+    return Suite;
 }
-
-test "catalog backed router skips non-serving relocation placements" {
-    const FakeCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{
-                    .{ .store_id = 10, .node_id = 1, .api_url = "http://node-1", .role = "data", .health_class = "healthy", .live = true },
-                    .{ .store_id = 20, .node_id = 2, .api_url = "http://node-2", .role = "data", .health_class = "healthy", .live = true },
-                })[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
-                    .{ .store_id = 10, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 }, .serving_state = .serving },
-                    .{ .store_id = 20, .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 }, .serving_state = .bootstrapping },
-                })[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{
-                    .{ .group_id = 77, .leader_known = true, .leader_store_id = 20 },
-                })[0..]),
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var catalog_router = CatalogBackedGroupRouter.init(FakeCatalog.iface(), 0);
-    try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, catalog_router.router().nodeStatus(2, 77).?);
-    var route = (try resolveGroupRoute(std.testing.allocator, FakeCatalog.iface(), catalog_router.router(), 77, .prefer_leader)).?;
-    defer route.deinit(std.testing.allocator);
-    switch (route) {
-        .local => return error.TestExpectedRemoteServingRoute,
-        .remote => |remote| {
-            try std.testing.expectEqual(@as(u64, 1), remote.node_id);
-            try std.testing.expectEqualStrings("http://node-1", remote.base_uri);
-        },
-    }
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

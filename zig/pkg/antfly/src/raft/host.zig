@@ -2656,7 +2656,7 @@ test "host restores through an explicitly authorized bootstrap owner" {
         }
     };
 
-    const db_mod = @import("../storage/db/mod.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
     const backups_api = @import("../api/backups.zig");
 
     var tmp = std.testing.tmpDir(.{});
@@ -2823,7 +2823,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
         }
     };
 
-    const db_mod = @import("../storage/db/mod.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
     const backups_api = @import("../api/backups.zig");
     const storage_mod = @import("storage/catalog.zig");
 

@@ -1,14 +1,14 @@
 # Antfly React Components
 
-`@antfly/components` is a React component library for building search interfaces with Antfly. It provides declarative components for search boxes, facets, results, pagination, and query building. The library is unstyled by design, allowing developers full control over presentation.
+`@antfly/components` is a React component library for building search interfaces with Antfly. It provides declarative components for query boxes, autosuggest, facets, results, pagination, answers, and chat. It ships a baseline stylesheet (`@antfly/components/styles`) with stable `react-af-*` class names that consumers can override.
 
 ## Testing
 
 - Uses Vitest with jsdom for testing React components
 - Uses Mock Service Worker (MSW) for mocking API requests in tests
-- Tests are located alongside component files (e.g., `SearchBox.test.tsx`)
+- Tests are located alongside component files (e.g., `Autosuggest.test.tsx`)
 - Test setup is in `vitest.setup.ts`
-- Run specific test file: `vitest src/SearchBox.test.tsx`
+- Run specific test file: `vitest src/Autosuggest.test.tsx`
 - Run specific test: `vitest -t "test name pattern"`
 - Run tests with UI: `vitest --ui`
 - Run tests in watch mode: `vitest` (no arguments)
@@ -23,10 +23,10 @@ The library uses a **centralized state system** via React Context:
 - **`SharedContextProvider.tsx`**: Provides the context to components
 - **`Antfly.tsx`**: Root component that initializes the context with a reducer
 
-All components (SearchBox, Facet, Results, etc.) register themselves as **widgets** in the shared state. The `Listener` component coordinates queries by:
+All components (QueryBox, Facet, Results, etc.) register themselves as **widgets** in the shared state. The `Listener` component coordinates queries by:
 1. Collecting widget configurations
 2. Building queries from widget state
-3. Executing multi-query requests via `msearch()`
+3. Executing multi-query requests via `multiquery()`
 4. Distributing results back to widgets
 
 ### Widget System
@@ -36,7 +36,7 @@ Each interactive component is a "widget" that registers in `SharedState.widgets`
 - `needsQuery`: Whether it needs query results
 - `needsConfiguration`: Whether it contributes to the query
 - `isFacet`: Whether it's a facet component
-- `rootQuery`: Whether it's a root query widget (SearchBox, RAGBox, AnswerBox)
+- `rootQuery`: Whether it's a root query widget (QueryBox, Autosuggest)
 - `isAutosuggest`: Whether it's an autosuggest widget (for isolation)
 - `wantResults`: Whether it wants full results
 - `wantFacets`: Whether it wants facet data
@@ -72,24 +72,24 @@ The library uses Antfly's query DSL (match, conjuncts, disjuncts) and communicat
 
 ### Search Components
 - **Antfly**: Root provider component that initializes client and context
-- **SearchBox**: Text search input with debouncing
-- **Autosuggest**: Search box with autocomplete suggestions (can be standalone or nested in SearchBox/RAGBox/AnswerBox)
+- **QueryBox**: Text search input with debouncing; the root query widget for search and Retrieval Agent queries
+- **Autosuggest**: Search box with autocomplete suggestions (standalone or nested in QueryBox), with `AutosuggestResults` and `AutosuggestFacets` for composable dropdowns
 - **Facet**: Faceted navigation with term aggregations
-- **Results**: Render search results with customizable item rendering
+- **Results**: Render search results with customizable item rendering (`itemsPerPage`)
 - **Pagination**: Page navigation controls
-- **ActiveFilters**: Display and remove active filters
+- **ActiveFilters**: Display and remove active filters (`items` prop)
 
-### RAG/AI Components
-- **RAGBox**: Search input for retrieval-augmented generation queries (can contain Autosuggest)
-- **RAGResults**: Display RAG results with streaming summary support
-- **AnswerBox**: Legacy-named search input for Retrieval Agent queries (can contain Autosuggest)
-- **AnswerResults**: Legacy-named Retrieval Agent results component with streaming reasoning and answers
-- **AnswerFeedback**: Collect user ratings and comments on AI-generated answers (see `docs/feedback.md`)
+### Answer and Chat Components
+- **AnswerResults**: Retrieval Agent results with streaming reasoning, answers, citations, and an optional `generator`
+- **AnswerFeedback**: Collect user ratings and comments on AI-generated answers
+- **ChatBar**, **ChatInput**, **ChatMessages**: Multi-turn chat over the Retrieval Agent, coordinated through `ChatContext`
 
 ### Hooks
 - **useSearchHistory**: Manage search history with localStorage persistence (max results configurable, 0 to disable)
 - **useAnswerStream**: Stream Retrieval Agent responses with state management (answer, reasoning, classification, hits, follow-up questions)
-- **useCitations**: Parse and render citations in RAG and Retrieval Agent responses (supports `[resource_id X]` and `[X]` formats)
+- **useChatStream**: Stream multi-turn chat responses
+- **useCitations**: Parse and render citations in Retrieval Agent responses (supports `[doc_id X]` and `[X]` formats)
+- **useSharedContext**, **useAnswerResultsContext**, **useAutosuggestContext**, **useChatContext**: Access the shared widget state and per-feature contexts
 
 ### Internal Components
 - **Listener**: Internal component that coordinates queries (not typically used directly)
@@ -101,25 +101,15 @@ The library depends on `@antfly/sdk` (from `ts/` directory) which provides:
 - `AntflyClient`: HTTP client for Antfly API
 - Type definitions for queries and responses
 - Multi-query support via `multiquery()`
-- Streaming support for RAG and the Retrieval Agent
+- Streaming support for the Retrieval Agent
 
 Client initialization happens in `Antfly` component via `initializeAntflyClient()`. The client is stored as a singleton accessible via `getAntflyClient()`.
 
-### Streaming RAG and Retrieval Agent
+### Streaming the Retrieval Agent
 
-The library provides `streamRAG()` and the legacy-named `streamAnswer()` utility (in `utils.ts`) for streaming responses:
+The library provides the `streamAnswer()` utility (in `utils.ts`) for streaming Retrieval Agent responses:
 
 ```typescript
-// RAG streaming
-streamRAG(url, tableName, request, headers, {
-  onHit: (hit) => { /* handle search hit */ },
-  onSummary: (chunk) => { /* handle summary chunk */ },
-  onComplete: () => { /* handle completion */ },
-  onError: (error) => { /* handle error */ },
-  onRAGResult: (result) => { /* handle non-streaming result */ }
-});
-
-// Retrieval Agent streaming
 streamAnswer(url, request, headers, {
   onClassification: (data) => { /* handle query classification */ },
   onHit: (hit) => { /* handle search hit */ },
@@ -130,22 +120,25 @@ streamAnswer(url, request, headers, {
 });
 ```
 
-Both functions return an `AbortController` for canceling streams.
+It returns an `AbortController` for canceling the stream. `useAnswerStream` and `useChatStream` wrap it for component use.
 
 ## Build Output
 
-The library is built as both ES modules and UMD:
-- `dist/main.js`: ES module format
-- `dist/main.umd.cjs`: UMD format for legacy usage
-- `types/`: TypeScript declaration files
+The library is built as ES modules and CommonJS:
+- `dist/main.js`: ES module format (`import`)
+- `dist/main.cjs`: CommonJS format (`require`)
+- `dist/index.d.ts`: TypeScript declarations
+- `dist/components.css`: baseline stylesheet, exported as `@antfly/components/styles`
+- `./adapters` subpath export for framework adapters
 
-React, React DOM, and react/jsx-runtime are peer dependencies (not bundled).
+React, React DOM, and `@antfly/sdk` are peer dependencies (not bundled).
 
 ## Publishing
 
-Published to npm as `@antfly/components`. The package includes:
+Published to npm as `@antfly/components` through the monorepo's tag-triggered
+workflow (`ts/antfly/components/v<semver>`). The package includes:
 - Main entry: `dist/main.js`
-- Types entry: `types/index.d.ts`
+- Types entry: `dist/index.d.ts`
 - Source maps for debugging
 
 ## Component Development Workflow
@@ -153,9 +146,9 @@ Published to npm as `@antfly/components`. The package includes:
 1. Create component in `src/` with corresponding `.test.tsx` file
 2. Add component to `src/index.ts` exports
 3. Create story in `stories/` for documentation
-4. Run `npm run storybook` to develop interactively
-5. Run tests with `npm test`
-6. Lint and type-check before committing
+4. Run `pnpm storybook` to develop interactively
+5. Run tests with `pnpm test`
+6. Run `pnpm lint` and `pnpm typecheck` before committing
 
 ## Important Architecture Patterns
 
@@ -164,7 +157,7 @@ Published to npm as `@antfly/components`. The package includes:
 The `Listener` component (src/Listener.tsx:154-193) implements widget isolation to prevent query interference:
 
 - **Autosuggest widgets** are completely isolated - they only see their own queries
-- **Root query widgets** (SearchBox, RAGBox, AnswerBox) exclude other root queries but include facet filters
+- **Root query widgets** (QueryBox, and Autosuggest when standalone) exclude other root queries but include facet filters
 - **Facet widgets** see all non-autosuggest queries
 
 This prevents autocomplete dropdowns from affecting main search results and vice versa.

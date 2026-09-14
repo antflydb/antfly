@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const test_runtime_support = if (builtin.is_test) @import("http_test_runtime.zig") else struct {};
 const platform = @import("antfly_platform");
 const build_options = @import("build_options");
+const storage_source_options = @import("storage_source_options");
 const openapi_specs = @import("antfly_openapi_specs");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
@@ -65,12 +66,12 @@ const db_mod = struct {
     // The production API runtime only consumes the focused declarations below.
     // A handful of tests still construct the concrete storage DB directly;
     // keep that dependency test-only so it cannot rejoin the API codegen unit.
-    pub const DB = if (builtin.is_test) @import("../storage/db/db.zig").DB else struct {};
+    pub const DB = if (builtin.is_test) @import("antfly_source_root").antfly_sources.physical_db.DB else struct {};
     pub const backfill_state = if (builtin.is_test) @import("../storage/db/backfill_state.zig") else struct {};
     pub const types = @import("../storage/db/types.zig");
     pub const RuntimePreflightSummary = @import("../storage/db/runtime_preflight.zig").RuntimePreflightSummary;
     pub const background_runtime = @import("../storage/background_runtime.zig");
-    pub const aggregations = @import("../storage/db/aggregations.zig");
+    pub const aggregations = @import("../storage/db/aggregations_contract.zig");
     pub const SortRejectionDiagnostic = db_query_search.SortRejectionDiagnostic;
 
     pub const resetLastSortRejectionDiagnostic = db_query_search.resetLastSortRejectionDiagnostic;
@@ -80,18 +81,18 @@ const db_mod = struct {
 };
 const graph_mod = @import("../graph/graph.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
-const db_query_search = @import("../storage/db/query/search_exec.zig");
+const db_query_search = @import("../storage/db/runtime_preflight.zig");
 const reranking_runtime = @import("../reranking/mod.zig");
 const storage_schema = @import("../storage/schema.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");
 const tables_api = @import("tables.zig");
-const table_reads = if (builtin.is_test) @import("table_reads.zig") else @import("table_read_source.zig");
+const table_reads = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_reads else @import("table_read_source.zig");
 const table_router = @import("table_router.zig");
-const table_writes = if (builtin.is_test) @import("table_writes.zig") else @import("table_write_source.zig");
+const table_writes = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_writes else @import("table_write_source.zig");
 const table_index_config = @import("table_index_config.zig");
-const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
-const ha_http_operation = @import("../storage/ha/http_operation.zig");
+const ha_mutation_inventory = @import("../storage/hot_standby/mutation_inventory.zig");
+const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
@@ -1363,7 +1364,7 @@ pub const AuthenticatedIdentity = struct {
 pub const StatusSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
-    standalone_ha: ?@import("standalone_ha.zig").Port = null,
+    standalone_hot_standby: ?@import("standalone_hot_standby.zig").Port = null,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
     /// Routing is carried as one complete capability. Admin-only sources leave
     /// it null; production constructors never assemble it from independent
@@ -4200,12 +4201,12 @@ pub const ApiHttpServer = struct {
         };
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
-        // Durable named-index cancellation is correctness work, not a client
-        // polling obligation. Advance at most one queued pass per supervisor
+        // Durable index controls and cancellation are server-owned work.
+        // Advance at most one queued pass per supervisor
         // tick; the repair-job FIFO and BackendRuntime maintenance queue keep
         // this O(1), bounded, and fair with other maintenance.
-        self.resumePendingDurableRepairCancellationOnce() catch |err| {
-            std.log.warn("failed to resume durable table repair cancellation err={s}", .{@errorName(err)});
+        self.resumePendingDurableRepairMaintenanceOnce() catch |err| {
+            std.log.warn("failed to resume durable table repair maintenance err={s}", .{@errorName(err)});
         };
         self.join_job_store.cleanupExpiredJoinJobs();
         self.artifact_reprocess_job_store.cleanupExpiredJobs();
@@ -4387,13 +4388,13 @@ pub const ApiHttpServer = struct {
         }
     }
 
-    fn resumePendingDurableRepairCancellationOnce(self: *ApiHttpServer) !void {
+    fn resumePendingDurableRepairMaintenanceOnce(self: *ApiHttpServer) !void {
         if (self.table_writes == null) return;
-        const encoded = (try self.repair_job_store.nextPendingDurableCancelAlloc(self.alloc)) orelse return;
+        const encoded = (try self.repair_job_store.nextPendingMaintenanceAlloc(self.alloc)) orelse return;
         defer self.alloc.free(encoded);
         var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        try self.continueDurableRepairCancellation(parsed.value.table_name, encoded);
+        try self.continueDurableRepairMaintenance(parsed.value.table_name, encoded);
     }
 
     const SessionMaintenanceWork = struct {
@@ -5196,16 +5197,17 @@ pub const ApiHttpServer = struct {
         return .{ .items = try items.toOwnedSlice(self.alloc) };
     }
 
-    fn indexHasDenseVisibilityFacts(item: db_mod.types.DBIndexStats) bool {
-        return item.doc_count > 0 or item.term_count > 0 or item.edge_count > 0 or item.node_count > 0 or item.root_node > 0;
-    }
-
     fn runtimeStatusNeedsDenseVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
         if (status.stats.repair_degraded or status.stats.repair_issue_count != 0) return false;
         const has_primary_facts = status.stats.doc_identity.live_ordinals != 0 or status.stats.doc_count != 0;
         for (status.stats.indexes) |item| {
             if (item.kind != .dense_vector) continue;
-            if (indexHasDenseVisibilityFacts(item)) continue;
+            // A newly created HBC index has a structural root/node before it
+            // contains any documents. Those topology counters do not prove
+            // that a retained read snapshot includes a later write. Require
+            // document or replay progress before allowing it to suppress the
+            // resident writer refresh.
+            if (item.doc_count != 0) continue;
             if (item.replay_applied_sequence != 0 or item.replay_target_sequence != 0) continue;
             if (has_primary_facts) return true;
             return status.metadata.source == .live_writer_publish;
@@ -5214,6 +5216,11 @@ pub const ApiHttpServer = struct {
     }
 
     fn runtimeStatusNeedsOwnerSnapshot(status: runtime_status.LocalTableRuntimeStatus) bool {
+        // Synthetic configuration can carry conservative repair/backfill
+        // placeholders so public status remains fail-closed. Those fields are
+        // not runtime facts and must never suppress an explicit writer
+        // refresh after restart.
+        if (status.metadata.source == .synthetic_config) return status.stats.indexes.len != 0;
         if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
         if (runtime_status.statusHasRuntimeFacts(status)) return false;
         if (status.metadata.source == .live_writer_publish) return false;
@@ -5261,6 +5268,15 @@ pub const ApiHttpServer = struct {
                 std.mem.eql(u8, index.index_repair_phase, "terminal"))
             {
                 return false;
+            }
+            // A retained query snapshot can already contain every visible
+            // vector while still lacking the writer's per-source publication
+            // observation and enrichment metrics. Public readiness derives
+            // `source_observation_incomplete` from these counters, so refresh
+            // the requested index until each configured source has at least
+            // one authoritative observation.
+            for (index.source_replay) |source| {
+                if (source.observation_count == 0) return true;
             }
             // Refresh only for an incomplete proof attached to the requested
             // index. Table-level degradation may belong to another index, and
@@ -5622,6 +5638,7 @@ pub const ApiHttpServer = struct {
                 .doc_count = index.doc_count,
                 .term_count = index.term_count,
                 .edge_count = index.edge_count,
+                .graph_counts_pending = index.graph_counts_pending,
                 .node_count = index.node_count,
                 .root_node = index.root_node,
                 .publication_target_count = index.publication_target_count,
@@ -11211,6 +11228,7 @@ pub const ApiHttpServer = struct {
                 .execute_table_get_index = executePublicTableGetIndex,
                 .execute_table_create_index = executePublicTableCreateIndex,
                 .execute_table_delete_index = executePublicTableDeleteIndex,
+                .execute_table_graph_metric_action = executePublicTableGraphMetricAction,
                 .execute_put_artifact_enrichment = executePublicPutArtifactEnrichment,
                 .execute_delete_artifact_enrichment = executePublicDeleteArtifactEnrichment,
                 .execute_list_artifact_enrichments = executePublicListArtifactEnrichments,
@@ -11500,6 +11518,9 @@ pub const ApiHttpServer = struct {
             => return error.StorageReadTemporarilyUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
@@ -11690,6 +11711,9 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
+                error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+                error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+                error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -11752,9 +11776,15 @@ pub const ApiHttpServer = struct {
         try ensureRequestDeadline(request_deadline_ns);
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
-            error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
+            // Foreign-source capability validation is part of the public
+            // request contract. Keep its historical 400 classification;
+            // exact-sort rejection is already carried by its distinct error.
+            error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded,
@@ -11849,6 +11879,9 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -12582,10 +12615,28 @@ pub const ApiHttpServer = struct {
         const start_ns = retryMonotonicNs(retry_io);
         const retry_deadline_ns = retryDeadlineFromNative(retry_io, req.execution_deadline_ns);
         var attempts: u32 = 0;
+        var index_generation_retries: u8 = 0;
         while (true) : (attempts += 1) {
             try ensureRequestActive(req.cancellation);
             if (retryDeadlineExpired(retry_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
+                error.IndexGenerationMismatch => {
+                    // Release the failed query's entire snapshot before one
+                    // fresh attempt. Never retry just a reverse-edge probe:
+                    // its base scan and cached negative routes share identity.
+                    // Cap expensive graph replay independently of time-based
+                    // storage retries; ongoing reconciliation is a retryable
+                    // readiness response, not an internal failure or a loop.
+                    try ensureRequestActive(req.cancellation);
+                    const now_ns = retryMonotonicNs(retry_io);
+                    if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.Timeout;
+                    if (index_generation_retries != 0) return error.IndexRebuilding;
+                    index_generation_retries += 1;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return error.IndexRebuilding;
+                    if (sleep_ns == 0) return error.Timeout;
+                    try sleepNsCancellable(retry_io, sleep_ns, req.cancellation);
+                    continue;
+                },
                 // FileNotFound surfaces when a read-only replica open races
                 // with the writer reclaiming obsolete LSM runs; reopening
                 // picks up a fresh manifest. TableReadChurn: the read cache
@@ -12594,6 +12645,7 @@ pub const ApiHttpServer = struct {
                 error.EndOfStream,
                 error.FileNotFound,
                 error.TableReadChurn,
+                error.GenerationTransitionActive,
                 error.IdentityReadGenerationChanged,
                 error.TopologyChanged,
                 => {
@@ -12601,7 +12653,7 @@ pub const ApiHttpServer = struct {
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
                     const now_ns = retryMonotonicNs(retry_io);
                     if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.Timeout;
-                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return if (err == error.GenerationTransitionActive) error.StorageReadTemporarilyUnavailable else err;
                     if (sleep_ns == 0) return error.Timeout;
                     try sleepNsCancellable(retry_io, sleep_ns, req.cancellation);
                     continue;
@@ -14030,6 +14082,43 @@ pub const ApiHttpServer = struct {
         }) orelse error.MethodNotAllowed;
     }
 
+    fn executePublicTableGraphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+        request: api_operation.RequestContext,
+    ) public_table_http.TableApi.ExecuteGraphMetricActionError![]u8 {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
+        const source = self.table_writes orelse return error.MethodNotAllowed;
+        var status = (source.graphMetricActionWithCancellation(alloc, table_name, index_name, metric_name, action, request.cancellation) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.HAReadOnlyStandby,
+            error.HAPromotedStandbyRequiresPrimaryOpen,
+            error.HAFencedPrimary,
+            => return error.NotLeader,
+            error.TableTransitionActive,
+            error.TableGenerationChanged,
+            error.GraphMetricDisabled,
+            error.GraphMetricStatusConflict,
+            error.GraphMetricActionPartialOutcome,
+            => return error.Conflict,
+            error.LeaderUnavailable, error.UnknownGroup => return error.NotLeader,
+            error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded, error.BackendRuntimeShuttingDown => return error.Backpressured,
+            error.InvalidGraphMetricAction => return error.InvalidGraphMetricAction,
+            error.TableNotFound, error.IndexNotFound, error.MetricNotReady => return error.NotFound,
+            else => {
+                std.log.err("public graph metric action failed table={s} index={s} metric={s} action={s} err={}", .{ table_name, index_name, metric_name, action, err });
+                return error.InternalFailure;
+            },
+        }) orelse return error.NotFound;
+        defer status.deinit(alloc);
+        return indexes_api.encodeGraphMetricStatusResponse(alloc, status) catch return error.InternalFailure;
+    }
+
     fn executePublicClusterBackupList(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -14378,6 +14467,7 @@ pub const ApiHttpServer = struct {
             operation_control.ensureActive() catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.Timeout => return error.DeadlineExceeded,
+                else => return trace.internal(err),
             };
             if (lease_heartbeat.lost.load(.acquire))
                 return trace.internal(error.BackupAttemptLeaseLost);
@@ -14478,6 +14568,7 @@ pub const ApiHttpServer = struct {
             operation_control.ensureActive() catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.Timeout => return error.DeadlineExceeded,
+                else => return trace.internal(err),
             };
             // Close the last renewal/publication race. If another process took
             // an expired lease, this conditional renewal fences publication.
@@ -14502,6 +14593,7 @@ pub const ApiHttpServer = struct {
             operation_control.ensureActive() catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.Timeout => return error.DeadlineExceeded,
+                else => return trace.internal(err),
             };
             cluster_cleanup_safe = false;
             backups_api.writeClusterManifestToLocationWithIoAndCancellation(
@@ -15613,7 +15705,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn haCoordinatedRestoreAvailable(self: *const ApiHttpServer) bool {
-        return self.source.standalone_ha != null and self.cfg.restore_execution_guard != null and self.restore_job_store.replicated != null;
+        return self.source.standalone_hot_standby != null and self.cfg.restore_execution_guard != null and self.restore_job_store.replicated != null;
     }
 
     fn restoreExecutionPermitted(self: *ApiHttpServer) bool {
@@ -16206,6 +16298,21 @@ pub const ApiHttpServer = struct {
             error.UnsupportedFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .unsupported),
             error.UnsupportedExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .unsupported),
             error.UnsupportedExactSort => try contextualUnsupportedExactSortResponse(self.alloc),
+            error.GraphMetricGlobalMaterializationRequired => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricGlobalMaterializationRequiredBody(self.alloc),
+                false,
+            ),
+            error.GraphMetricMaterializationRejected => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricMaterializationRejectedBody(self.alloc),
+                false,
+            ),
+            error.GraphMetricQueryBudgetExceeded => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricQueryBudgetExceededBody(self.alloc),
+                false,
+            ),
             error.UnsupportedQueryRequest => if (queryBodyHasSortPageControls(self.alloc, body))
                 try contextualUnsupportedExactSortResponse(self.alloc)
             else
@@ -16562,16 +16669,27 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicStartTableRepairJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        return self.startTableMaintenanceJob(table_name, body, false);
+    }
+
+    pub fn handlePublicStartTableRepairControlJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        return self.startTableMaintenanceJob(table_name, body, true);
+    }
+
+    fn startTableMaintenanceJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8, control_job: bool) !public_table_http.OwnedResponse {
         if (self.table_writes == null) return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         var parsed = std.json.parseFromSlice(repair_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
             return try publicOperationTextResponse(self.alloc, 400, "invalid repair job request");
         };
         defer parsed.deinit();
-        if (std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) == null) return try publicOperationTextResponse(self.alloc, 400, "invalid repair target");
-        if (parsed.value.limit == 0) return try publicOperationTextResponse(self.alloc, 400, "invalid limit");
+        if (control_job != (parsed.value.control != null)) return try publicOperationTextResponse(self.alloc, 400, "use the matching repair or control job endpoint");
+        if (control_job) parsed.value.target = "index";
+        repair_jobs.validateStartRequest(parsed.value) catch return try publicOperationTextResponse(self.alloc, 400, "invalid repair job request");
 
         const encoded = try self.repair_job_store.startJob(self.alloc, table_name, .{
             .target = parsed.value.target,
+            .control = parsed.value.control,
+            .repair_id = parsed.value.repair_id,
             .kind = parsed.value.kind,
             .index = parsed.value.index,
             .cursor = parsed.value.cursor,
@@ -16700,8 +16818,8 @@ pub const ApiHttpServer = struct {
                 return err;
             };
             defer work.server.alloc.free(updated);
-            work.server.continueDurableRepairCancellation(work.table_name, updated) catch |err| {
-                std.log.warn("failed to continue durable table repair cancellation table={s} err={s}", .{ work.table_name, @errorName(err) });
+            work.server.continueDurableRepairMaintenance(work.table_name, updated) catch |err| {
+                std.log.warn("failed to continue durable table repair maintenance table={s} err={s}", .{ work.table_name, @errorName(err) });
             };
         }
 
@@ -16851,10 +16969,10 @@ pub const ApiHttpServer = struct {
         return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, running_encoded);
     }
 
-    fn continueDurableRepairCancellation(self: *ApiHttpServer, table_name: []const u8, encoded: []const u8) !void {
+    fn continueDurableRepairMaintenance(self: *ApiHttpServer, table_name: []const u8, encoded: []const u8) !void {
         var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        if (!repair_jobs.requiresDurableCancel(parsed.value) or
+        if (!repair_jobs.requiresAutomaticAdvance(parsed.value) or
             !std.mem.eql(u8, parsed.value.phase, repair_jobs.phaseString(.queued))) return;
 
         const begin = try self.repair_job_store.beginAdvance(self.alloc, parsed.value);
@@ -16905,6 +17023,8 @@ pub const ApiHttpServer = struct {
         };
         var result = (source.repairArtifactIssuesControlled(self.alloc, table_name, .{
             .target = target,
+            .control = running_state.control,
+            .repair_id = if (running_state.repair_id) |raw| try std.fmt.parseInt(u128, raw, 10) else null,
             .artifact_kind = running_state.kind,
             .index_name = running_state.index,
             .limit = running_state.limit,
@@ -16922,7 +17042,7 @@ pub const ApiHttpServer = struct {
             error.Canceled => {
                 return try self.repair_job_store.markPhase(self.alloc, running_state, .cancelled, "cancel_requested");
             },
-            error.InvalidArgument => {
+            error.InvalidArgument, error.StaleIndexRepairControl => {
                 return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
             },
             error.NotFound => {
@@ -17195,7 +17315,7 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
         if (self.haMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted())
-            return try contextualJsonErrorResponse(self.alloc, 503, "HA restore authority is not ready");
+            return try contextualJsonErrorResponse(self.alloc, 503, "hot-standby restore authority is not ready");
         const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer parsed.deinit();
         backups_api.validateBackupId(parsed.value.backup_id) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup id");
@@ -17246,7 +17366,7 @@ pub const ApiHttpServer = struct {
         };
         defer manifest.deinit(self.alloc);
         if (self.haMutationPolicy().failover_safe_mutations_only and source_kind != .cluster_cohort)
-            return try contextualJsonErrorResponse(self.alloc, 409, "historical independent snapshots are not certified for HA restore; select a dependency-complete cohort");
+            return try contextualJsonErrorResponse(self.alloc, 409, "historical independent snapshots are not certified for hot-standby restore; select a dependency-complete cohort");
         if (source_kind == .cluster_cohort) {
             @import("restore_staging_driver.zig").validateSelection(self.alloc, &.{.{ .source_table_id = manifest.table_id, .manifest = &manifest }}) catch |err| return try contextualJsonErrorResponse(self.alloc, 409, if (err == error.RestoreDependencyMissing)
                 "this table has foreign-key dependencies; use cluster restore with the complete dependency set from the same backup"
@@ -17330,7 +17450,7 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
         if (self.haMutationPolicy().failover_safe_mutations_only and !self.restoreExecutionPermitted())
-            return try contextualJsonErrorResponse(self.alloc, 503, "HA restore metadata authority is not ready");
+            return try contextualJsonErrorResponse(self.alloc, 503, "hot-standby restore metadata authority is not ready");
         var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer backups_api.freeClusterRestoreRequest(self.alloc, &req);
         const connection = req.connection orelse return try contextualJsonErrorResponse(self.alloc, 400, "restore requires a named external_io connection");
@@ -17354,7 +17474,7 @@ pub const ApiHttpServer = struct {
                 return try contextualJsonErrorResponse(self.alloc, 400, "invalid cluster backup manifest");
             defer manifest.deinit(self.alloc);
             if (manifest.cohort_json.len == 0)
-                return try contextualJsonErrorResponse(self.alloc, 422, "HA restore requires a dependency-complete native cluster cohort");
+                return try contextualJsonErrorResponse(self.alloc, 422, "hot-standby restore requires a dependency-complete native cluster cohort");
         }
 
         if (authenticated_identity) |identity| {
@@ -17698,7 +17818,7 @@ pub const ApiHttpServer = struct {
         if (state.phase != .running or state.attempt_id != begin.attempt_id)
             return error.CorruptRestoreJobStore;
         if (self.haMutationPolicy().failover_safe_mutations_only and state.scope != .cluster and state.source_kind != .cluster_cohort) {
-            const failed = try self.restore_job_store.fail(self.alloc, state, "HA restore requires a dependency-complete native cluster cohort");
+            const failed = try self.restore_job_store.fail(self.alloc, state, "hot-standby restore requires a dependency-complete native cluster cohort");
             self.alloc.free(failed);
             return;
         }
@@ -20998,7 +21118,9 @@ pub fn requiresAdminPermission(path: []const u8) bool {
 }
 
 fn isHaAdminPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, admin_routes.ha) or std.mem.startsWith(u8, path, admin_routes.ha ++ "/");
+    // Canonical `/admin/v1/standby` plus the pre-0.3 `/admin/v1/ha` alias.
+    return std.mem.eql(u8, path, admin_routes.standby) or std.mem.startsWith(u8, path, admin_routes.standby ++ "/") or
+        std.mem.eql(u8, path, admin_routes.legacy_standby_prefix) or std.mem.startsWith(u8, path, admin_routes.legacy_standby_prefix ++ "/");
 }
 
 fn isStorageMaintenancePath(path: []const u8) bool {
@@ -21021,7 +21143,8 @@ fn storageRuntimeStatus(status: @import("../storage/maintenance.zig").Status) me
 }
 
 fn isHaInternalPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, internal_api_routes.ha) or std.mem.startsWith(u8, path, internal_api_routes.ha ++ "/");
+    return std.mem.eql(u8, path, internal_api_routes.standby) or std.mem.startsWith(u8, path, internal_api_routes.standby ++ "/") or
+        std.mem.eql(u8, path, internal_api_routes.legacy_standby) or std.mem.startsWith(u8, path, internal_api_routes.legacy_standby ++ "/");
 }
 
 fn isExtensionPath(path: []const u8) bool {
@@ -21110,7 +21233,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         .POST => .admin,
         .GET, .PUT, .DELETE => return null,
     });
-    if (routes.Routes.matchTableRepairJobs(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+    if (routes.Routes.matchTableRepairJobs(path) orelse routes.Routes.matchTableRepairControlJobs(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
         .POST => .admin,
         .GET, .PUT, .DELETE => return null,
     });
@@ -21143,6 +21266,10 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchTableBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
     if (routes.Routes.matchTableMerge(path)) |merge| return try tablePermission(alloc, merge.table_name, .write);
     if (routes.Routes.matchTableSchema(path)) |schema| return try tablePermission(alloc, schema.table_name, .admin);
+    if (routes.Routes.matchTableGraphMetricAction(path)) |metric_action| return switch (method) {
+        .POST => try tablePermission(alloc, metric_action.table_name, .admin),
+        .GET, .PUT, .DELETE => null,
+    };
     if (routes.Routes.matchTableIndexes(path)) |indexes| return try tablePermission(alloc, indexes.table_name, switch (method) {
         .GET => .read,
         .POST => .admin,
@@ -21304,6 +21431,38 @@ test "inference connection invocation requires inference write permission" {
         std.testing.allocator,
         .POST,
         "/connections/local-inference/inference/generate/extra",
+    )) == null);
+}
+
+test "graph metric operational actions require table admin permission" {
+    const alloc = std.testing.allocator;
+    const required = (try requiredPermissionForRequest(
+        alloc,
+        .POST,
+        "/tables/docs%20archive/indexes/graph_idx/graph-metrics/pagerank:delete",
+    )).?;
+    defer required.deinit(alloc);
+    try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+    try std.testing.expectEqualStrings("docs archive", required.resource);
+    try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+
+    const reader_permissions = [_]usermgr.Permission{.{
+        .resource_type = .table,
+        .resource = @constCast("docs archive"),
+        .type = .read,
+    }};
+    try std.testing.expect(!permissionsAllow(&reader_permissions, required.resource_type, required.resource, required.permission_type));
+
+    const admin_permissions = [_]usermgr.Permission{.{
+        .resource_type = .table,
+        .resource = @constCast("docs archive"),
+        .type = .admin,
+    }};
+    try std.testing.expect(permissionsAllow(&admin_permissions, required.resource_type, required.resource, required.permission_type));
+    try std.testing.expect((try requiredPermissionForRequest(
+        alloc,
+        .GET,
+        "/tables/docs%20archive/indexes/graph_idx/graph-metrics/pagerank:delete",
     )) == null);
 }
 
@@ -21832,6 +21991,71 @@ test "api maintenance resumes recovered durable named index cancellation without
     var parsed_finished = try std.json.parseFromSlice(repair_jobs.JobState, alloc, finished, .{ .ignore_unknown_fields = true });
     defer parsed_finished.deinit();
     try std.testing.expectEqualStrings("cancelled", parsed_finished.value.phase);
+}
+
+test "api maintenance advances durable control pages and stops on stale repair fences" {
+    const alloc = std.testing.allocator;
+    const permission = (try requiredPermissionForRequest(alloc, .POST, "/tables/docs/repair/control-jobs")).?;
+    defer permission.deinit(alloc);
+    try std.testing.expectEqual(usermgr.PermissionType.admin, permission.permission_type);
+    const Source = struct {
+        groups: usize = 0,
+        expected: db_mod.types.IndexRepairControl,
+        stale: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+        fn repair(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, req: db_mod.types.ArtifactRepairRunRequest, _: db_mod.types.ArtifactRepairRunOptions) anyerror!?db_mod.types.ArtifactRepairResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.expected, req.control.?);
+            try std.testing.expectEqual(@as(u128, 17), req.repair_id.?);
+            if (self.stale) return error.StaleIndexRepairControl;
+            const start = if (req.cursor) |raw| try std.fmt.parseInt(usize, raw[0 .. raw.len - 1], 10) else 0;
+            try std.testing.expectEqual(self.groups, start);
+            const count = @min(@as(usize, 64), 130 - start);
+            self.groups += count;
+            return .{ .scanned = count, .groups_scanned = count, .controls_applied = count, .has_more = self.groups < 130, .debt_remaining = true, .in_progress = 1, .next_cursor = if (self.groups < 130) try std.fmt.allocPrint(a, "{d}:", .{self.groups}) else null };
+        }
+    };
+    for ([_]db_mod.types.IndexRepairControl{ .pause_automatic, .resume_automatic, .cancel_current_attempt }) |control| {
+        var source = Source{ .expected = control };
+        var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Source.status } }, null, .{ .ptr = &source, .vtable = &.{ .batch = Source.batch, .repair_artifact_issues_controlled = Source.repair } });
+        defer server.deinit();
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .index = "dense", .control = control, .repair_id = "17" }, .{});
+        defer alloc.free(body);
+        var wrong_endpoint = try server.handlePublicStartTableRepairJob("docs", body);
+        defer wrong_endpoint.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), wrong_endpoint.status);
+        try std.testing.expectEqual(@as(usize, 0), source.groups);
+        var missing_control = try server.handlePublicStartTableRepairControlJob("docs", "{\"index\":\"dense\"}");
+        defer missing_control.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), missing_control.status);
+        var response = try server.handlePublicStartTableRepairControlJob("docs", body);
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), response.status);
+        var first = try std.json.parseFromSlice(repair_jobs.JobState, alloc, response.body, .{});
+        defer first.deinit();
+        try std.testing.expectEqualStrings("64:", first.value.cursor.?);
+        try server.runSessionMaintenanceOnce();
+        try server.runSessionMaintenanceOnce();
+        try std.testing.expectEqual(@as(usize, 130), source.groups);
+        const final_json = (try server.repair_job_store.loadJobAlloc(alloc, first.value.job_id)).?;
+        defer alloc.free(final_json);
+        var final = try std.json.parseFromSlice(repair_jobs.JobState, alloc, final_json, .{});
+        defer final.deinit();
+        try std.testing.expectEqualStrings("succeeded", final.value.phase);
+        source.stale = true;
+        var stale = try server.handlePublicStartTableRepairControlJob("docs", body);
+        defer stale.deinit(alloc);
+        var failed = try std.json.parseFromSlice(repair_jobs.JobState, alloc, stale.body, .{});
+        defer failed.deinit();
+        try std.testing.expectEqualStrings("failed", failed.value.phase);
+        try std.testing.expectEqualStrings("StaleIndexRepairControl", failed.value.last_error.?);
+        try std.testing.expect((try server.repair_job_store.nextPendingMaintenanceAlloc(alloc)) == null);
+    }
 }
 
 fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
@@ -24404,6 +24628,7 @@ test "api http unsupported count ordered page response exposes stable sort reaso
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
+        message: []const u8,
         reason: []const u8,
         sort_rejection_reason: []const u8,
         sort_rejection_detail: []const u8,
@@ -24413,6 +24638,7 @@ test "api http unsupported count ordered page response exposes stable sort reaso
 
     try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
     try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.reason);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_reason);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_detail);
@@ -24869,6 +25095,57 @@ test "api http retries identity generation and topology churn from a fresh query
     defer topology_response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2), reads.attempts);
     try std.testing.expectEqualStrings("{\"responses\":[]}", topology_response.json);
+    reads.attempts = 0;
+    reads.transient = error.GenerationTransitionActive;
+    var transition_response = (try ApiHttpServer.queryWithTransientReadRetry(std.testing.allocator, null, reads.source(), "docs", .{}, .read_index, .none)).?;
+    defer transition_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+}
+
+test "api http index generation retry refreshes once and preserves readiness cancellation and deadlines" {
+    const FakeReads = struct {
+        attempts: usize = 0,
+        fail_count: usize = 1,
+        cancel: ?*std.atomic.Value(bool) = null,
+        cancel_at: usize = 1,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (self.cancel) |cancel| if (self.attempts == self.cancel_at) cancel.store(true, .release);
+            if (self.attempts <= self.fail_count) return error.IndexGenerationMismatch;
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var reads = FakeReads{};
+    var response = (try ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{}, .read_index, .none)).?;
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), reads.attempts);
+
+    reads = .{ .fail_count = 100 };
+    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{}, .read_index, .none));
+    try std.testing.expectEqual(@as(usize, 2), reads.attempts);
+
+    for ([_]usize{ 1, 2 }) |cancel_at| {
+        var canceled = std.atomic.Value(bool).init(false);
+        reads = .{ .fail_count = 100, .cancel = &canceled, .cancel_at = cancel_at };
+        try std.testing.expectError(error.Cancelled, ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{ .cancellation = CancellationToken.fromAtomic(&canceled) }, .read_index, .none));
+        try std.testing.expectEqual(cancel_at, reads.attempts);
+    }
+
+    reads = .{};
+    try std.testing.expectError(error.Timeout, ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{ .execution_deadline_ns = 0 }, .read_index, .none));
+    try std.testing.expectEqual(@as(usize, 0), reads.attempts);
 }
 
 test "api http maps missing physical index only for rebuilding lifecycle" {
@@ -29180,9 +29457,16 @@ test "typed HA route operation dispatches admin and internal executors" {
     try std.testing.expectEqualStrings(internal_api_routes.ha_replication_status, internal_exec.last_uri.?);
     try std.testing.expectEqualStrings("{\"slot_name\":\"standby-a\"}", internal_exec.last_body.?);
 
-    var missing = try executeHaRouteForTest(&server, .get, admin_routes.ha, null, "");
+    var missing = try executeHaRouteForTest(&server, .get, admin_routes.standby, null, "");
     defer missing.deinit();
     try std.testing.expectEqual(@as(u16, 401), missing.status);
+    try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
+
+    // The pre-0.3 prefix reaches the same gate: unauthenticated is 401, not
+    // an unrouted 404.
+    var legacy_missing = try executeHaRouteForTest(&server, .get, admin_routes.legacy_standby_prefix ++ "/primary/status", null, "");
+    defer legacy_missing.deinit();
+    try std.testing.expectEqual(@as(u16, 401), legacy_missing.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
 }
 
@@ -40127,6 +40411,8 @@ test "api index status refreshes synthetic configured index status from write so
     const synthetic_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "vec",
         .kind = .dense_vector,
+        .repair_degraded = true,
+        .repair_summary_ready = false,
     }};
     const synthetic_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 10,
@@ -40134,6 +40420,7 @@ test "api index status refreshes synthetic configured index status from write so
         .stats = .{
             .index_count = synthetic_indexes.len,
             .indexes = @constCast(synthetic_indexes[0..]),
+            .repair_degraded = true,
         },
     }};
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(synthetic_statuses[0..]));
@@ -40151,6 +40438,53 @@ test "api index status refreshes synthetic configured index status from write so
         },
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(live_statuses[0..]));
+
+    // An empty dense index already owns an HBC root node. That structural
+    // topology must not make a retained pre-write snapshot authoritative when
+    // it has no document or replay progress.
+    const structural_dense_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "vec",
+        .kind = .dense_vector,
+        .node_count = 1,
+        .root_node = 1,
+    }};
+    const structural_dense_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .index_count = structural_dense_indexes.len,
+            .indexes = @constCast(structural_dense_indexes[0..]),
+        },
+    }};
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(structural_dense_statuses[0..]));
+
+    const incomplete_source_replay = [_]db_mod.types.IndexSourceReplayStatus{.{
+        .artifact_name = "chunk_embedding",
+        .published_sequence = 3,
+        .target_sequence = 3,
+        .observation_count = 0,
+    }};
+    const source_incomplete_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "vec",
+        .kind = .dense_vector,
+        .doc_count = 2,
+        .coverage_summary_ready = true,
+        .repair_summary_ready = true,
+        .source_replay = @constCast(incomplete_source_replay[0..]),
+    }};
+    const source_incomplete_status = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 2,
+            .index_count = source_incomplete_indexes.len,
+            .indexes = @constCast(source_incomplete_indexes[0..]),
+        },
+    };
+    try std.testing.expect(ApiHttpServer.runtimeStatusTargetNeedsOwnerSnapshot(
+        source_incomplete_status,
+        .{ .name = "vec", .identity = null },
+    ));
 }
 
 test "api index status refreshes writer when read snapshot omits requested index" {

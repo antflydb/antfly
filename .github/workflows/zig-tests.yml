@@ -330,6 +330,10 @@ jobs:
     # produce the watchdog stack dump instead of an opaque GitHub cancellation.
     timeout-minutes: 120
     env:
+      # ARC heavy pods have a 24 GiB limit but inject a 20 GiB default.
+      # Admit the 22 GiB storage compile while leaving 2 GiB for the runner
+      # and build driver. Keep this scoped to the heavy build jobs.
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
@@ -385,10 +389,10 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
-      - name: Compile consolidated storage benchmark contracts
+      - name: Compile consolidated storage and graph benchmark contracts
         if: needs.changes.outputs.zig_tests == 'true'
         working-directory: zig
-        run: zig build antfly-storage-bench -Doptimize=Debug
+        run: zig build antfly-storage-bench antfly-graph-bench -Doptimize=Debug
 
       # Keep inexpensive tooling checks beside the normal unit gate. The
       # isolated compilation/cache matrix runs in zig-full / build-cache.
@@ -400,6 +404,8 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
+          tools/test_audit_test_selection.py
+          tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
@@ -449,19 +455,20 @@ jobs:
         run: python3 scripts/packaging/test_reproducible_tar.py
 
       # ARC may expose the shared node's memory total when the runner cgroup is
-      # unlimited. Cap the aggregate scheduler budget at 20 GiB so concurrent
+      # unlimited. Cap the aggregate scheduler budget at 22 GiB so concurrent
       # test runtimes cannot overcommit the runner while still admitting the
-      # largest individual compile step, which reserves 20 GiB. The patched
-      # 0.16 runner correctly reserves each ready step's max_rss claim as it
-      # wakes it.
+      # largest individual compile step, which reserves 22 GiB. The explicit
+      # heavy-job budget above leaves 2 GiB of pod headroom. The patched 0.16
+      # runner correctly reserves each ready step's max_rss claim as it wakes it.
       - name: Configure bounded parallel unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         id: cpus
         run: |
+          lscpu
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
-          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss --max-rss-cap 21474836480)" >> "$GITHUB_OUTPUT"
+          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss --max-rss-cap 23622320128)" >> "$GITHUB_OUTPUT"
           zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p')"
           patched_runner="${RUNNER_TEMP}/zig-build-runner-maxrss.zig"
           python3 zig/tools/patch_zig_0_16_build_runner_maxrss.py \
@@ -574,7 +581,7 @@ jobs:
 
           (
             set +e
-            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}" 2>&1 | tee -a "$unit_log"
+            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }} --summary all" 2>&1 | tee -a "$unit_log"
             exit "${PIPESTATUS[0]}"
           ) &
           unit_pid="$!"
@@ -583,7 +590,10 @@ jobs:
             # 15 minutes on the x86_64 ARC runner. Keep the idle watchdog below
             # the independent hard limit without killing an active cold build.
             idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-1800}"
-            hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-3600}"
+            # PR #716's DB-core execution started 52 minutes into the combined
+            # build/test step and was still progressing at the old 60m limit.
+            # Allow 90m total, retaining the 30m idle and 120m outer job limits.
+            hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-5400}"
             start_epoch="$(date +%s)"
             last_progress_epoch="$start_epoch"
             last_mtime=0
@@ -655,6 +665,8 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 120
     env:
+      # Same 22 GiB build budget / 2 GiB runner headroom as zig-base-tests.
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
@@ -702,6 +714,8 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
+          tools/test_audit_test_selection.py
+          tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
@@ -714,14 +728,14 @@ jobs:
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
       # Keep normal build-step parallelism while bounding aggregate compiler
-      # memory to the pod's cgroup budget.
+      # memory to the pod's cgroup budget and the 22 GiB largest-step claim.
       - name: Configure bounded parallel heavy tests
         id: cpus
         run: |
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
-          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss --max-rss-cap 21474836480)" >> "$GITHUB_OUTPUT"
+          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss --max-rss-cap 23622320128)" >> "$GITHUB_OUTPUT"
           zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p')"
           patched_runner="${RUNNER_TEMP}/zig-build-runner-maxrss.zig"
           python3 zig/tools/patch_zig_0_16_build_runner_maxrss.py \
@@ -732,7 +746,7 @@ jobs:
       - name: Run library, Antfly, and inference unit tests
         run: |
           set +e
-          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
+          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }} --summary all"
           status="$?"
           if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
             echo "::group::unit failure cgroup memory"
@@ -768,6 +782,8 @@ jobs:
           ANTFLY_TLA_TRACE_VALIDATE: "true"
         run: scripts/ci/zig-tla-verify.sh
 
+      # Includes index-maintenance and index-ownership replay campaigns. The
+      # fixed maintenance seed is already part of the zig-base unit aggregate.
       - name: Run Zig VOPR tests
         working-directory: zig
         run: >-
@@ -777,6 +793,8 @@ jobs:
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
+      # Includes complete graph owner coverage and the native maintenance fixture;
+      # no graph-specific CLI or promotion matrix is built here.
       - name: Run Zig integration tests
         working-directory: zig
         run: >-
@@ -811,6 +829,7 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 60
     env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
@@ -842,7 +861,19 @@ jobs:
       # Verbose output identifies the individual checks in the CI log.
       - name: Test runtime compilation and cache contracts
         working-directory: zig
-        run: python3 -u -m unittest -v tools/test_runtime_cache.py
+        run: python3 -u -m unittest -v tools/test_runtime_cache.py tools/test_linked_tests.py
+
+      - name: Verify physical storage compilation ownership
+        working-directory: zig
+        run: python3 -u tools/check_storage_compilation.py --report storage-compilation.json
+
+      - name: Upload storage compilation measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: storage-compilation
+          path: zig/storage-compilation.json
+          if-no-files-found: ignore
 
   zig-base:
     name: zig-base
@@ -902,6 +933,9 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
+      # Override ARC's 20 GiB default: storage reserves 22 GiB. The 24 GiB
+      # pod still has 2 GiB outside the aggregate compiler reservation.
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       ANTFLY_CI_TRACE: "1"
@@ -1114,6 +1148,7 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       # Keep production optimization while preserving runtime-safety checks and

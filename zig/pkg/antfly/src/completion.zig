@@ -7,15 +7,16 @@
 //     https://www.antfly.io/licensing/ELv2-license
 
 const std = @import("std");
+const maintenance = @import("maintenance_commands.zig");
 
 pub const Route = enum {
     cli,
     data,
-    ha,
     inference,
     metadata,
     serverless,
     standalone,
+    standby,
     cloud,
     completion,
     help,
@@ -27,10 +28,13 @@ pub const Command = struct {
     description: []const u8,
     route: Route,
     subcommands: []const []const u8 = &.{},
+    hidden: bool = false,
 };
 
 const table_subcommands = [_][]const u8{ "create", "drop", "list", "get" };
-const artifact_subcommands = [_][]const u8{ "list", "get", "put", "delete", "reprocess", "job" };
+const index_subcommands = [_][]const u8{ "create", "drop", "list", "get", "wait", "maintenance" };
+const standby_subcommands = [_][]const u8{ "status", "slot", "seed", "fence", "promote", "rejoin", "follow", "switchover", "stream", "commit", "artifact" };
+const artifact_subcommands = [_][]const u8{ "list", "get", "put", "delete", "reprocess", "job", "maintenance" };
 const agents_subcommands = [_][]const u8{ "retrieval", "query-builder" };
 const auth_subcommands = [_][]const u8{ "me", "users", "permissions", "roles", "row-filters", "subjects", "api-keys" };
 const inference_subcommands = [_][]const u8{
@@ -62,9 +66,10 @@ pub const commands = [_]Command{
     .{ .name = "inference", .description = "Manage the inference runtime", .route = .inference, .subcommands = &inference_subcommands },
     .{ .name = "serverless", .description = "Run serverless commands", .route = .serverless, .subcommands = &serverless_subcommands },
     .{ .name = "lite", .description = "Manage embedded Antfly Lite databases", .route = .standalone, .subcommands = &lite_subcommands },
-    .{ .name = "ha", .description = "Manage local hot-standby HA", .route = .ha },
+    .{ .name = "standby", .description = "Manage hot-standby replication", .route = .standby, .subcommands = &standby_subcommands },
+    .{ .name = "ha", .description = "Manage hot-standby replication (deprecated alias for standby)", .route = .standby, .subcommands = &standby_subcommands, .hidden = true },
     .{ .name = "table", .description = "Manage tables", .route = .cli, .subcommands = &table_subcommands },
-    .{ .name = "index", .description = "Manage indexes", .route = .cli, .subcommands = &table_subcommands },
+    .{ .name = "index", .description = "Manage indexes", .route = .cli, .subcommands = &index_subcommands },
     .{ .name = "artifact", .description = "Manage generated artifacts", .route = .cli, .subcommands = &artifact_subcommands },
     .{ .name = "query", .description = "Query table data", .route = .cli },
     .{ .name = "lookup", .description = "Look up a document by key", .route = .cli },
@@ -111,9 +116,12 @@ pub fn write(shell: Shell, writer: *std.Io.Writer) !void {
 }
 
 fn writeCommandNames(writer: *std.Io.Writer, command_list: []const Command) !void {
-    for (command_list, 0..) |command, index| {
-        if (index != 0) try writer.writeByte(' ');
+    var written: usize = 0;
+    for (command_list) |command| {
+        if (command.hidden) continue;
+        if (written != 0) try writer.writeByte(' ');
         try writer.writeAll(command.name);
+        written += 1;
     }
 }
 
@@ -121,6 +129,21 @@ fn writeSubcommandNames(writer: *std.Io.Writer, subcommands: []const []const u8)
     for (subcommands, 0..) |subcommand, index| {
         if (index != 0) try writer.writeByte(' ');
         try writer.writeAll(subcommand);
+    }
+}
+
+fn hasMaintenance(command: Command) bool {
+    return std.mem.eql(u8, command.name, "index") or std.mem.eql(u8, command.name, "artifact");
+}
+
+fn writeMaintenanceActions(writer: *std.Io.Writer, command: Command, descriptions: bool) !void {
+    for (maintenance.actions) |action| {
+        if (std.mem.eql(u8, command.name, "artifact") and !action.artifact) continue;
+        if (descriptions) {
+            try writer.print("'{s}:{s}' ", .{ @tagName(action.action), action.text(if (std.mem.eql(u8, command.name, "artifact")) .artifact else .index) });
+        } else {
+            try writer.print("{s} ", .{@tagName(action.action)});
+        }
     }
 }
 
@@ -143,7 +166,16 @@ fn writeBash(writer: *std.Io.Writer) !void {
     );
     try writer.writeByte('\n');
     for (commands) |command| {
+        if (command.hidden) continue;
         if (command.subcommands.len == 0) continue;
+        if (hasMaintenance(command)) {
+            try writer.print("    {s}) if [[ ${{COMP_WORDS[2]}} == maintenance ]]; then COMPREPLY=($(compgen -W \"", .{command.name});
+            try writeMaintenanceActions(writer, command, false);
+            try writer.writeAll("\" -- \"$cur\")); else COMPREPLY=($(compgen -W \"");
+            try writeSubcommandNames(writer, command.subcommands);
+            try writer.writeAll("\" -- \"$cur\")); fi ;;\n");
+            continue;
+        }
         try writer.print("    {s}) COMPREPLY=($(compgen -W \"", .{command.name});
         try writeSubcommandNames(writer, command.subcommands);
         try writer.writeAll("\" -- \"$cur\")) ;;\n");
@@ -167,6 +199,7 @@ fn writeZsh(writer: *std.Io.Writer) !void {
     );
     try writer.writeByte('\n');
     for (commands) |command| {
+        if (command.hidden) continue;
         try writer.print("    '{s}:{s}'\n", .{ command.name, command.description });
     }
     try writer.writeAll(
@@ -180,7 +213,16 @@ fn writeZsh(writer: *std.Io.Writer) !void {
     );
     try writer.writeByte('\n');
     for (commands) |command| {
+        if (command.hidden) continue;
         if (command.subcommands.len == 0) continue;
+        if (hasMaintenance(command)) {
+            try writer.print("    {s}) if [[ $words[3] == maintenance ]]; then subcommands=(", .{command.name});
+            try writeMaintenanceActions(writer, command, true);
+            try writer.writeAll("); else subcommands=(");
+            try writeSubcommandNames(writer, command.subcommands);
+            try writer.writeAll("); fi ;;\n");
+            continue;
+        }
         try writer.print("    {s}) subcommands=(", .{command.name});
         try writeSubcommandNames(writer, command.subcommands);
         try writer.writeAll(") ;;\n");
@@ -204,9 +246,18 @@ fn writeFish(writer: *std.Io.Writer) !void {
         \\
     );
     for (commands) |command| {
+        if (command.hidden) continue;
         try writer.print("complete -c antfly -n '__fish_use_subcommand' -a '{s}' -d '{s}'\n", .{ command.name, command.description });
         if (command.subcommands.len == 0) continue;
-        try writer.print("complete -c antfly -n '__fish_seen_subcommand_from {s}' -a '", .{command.name});
+        if (hasMaintenance(command)) {
+            for (maintenance.actions) |action| {
+                if (std.mem.eql(u8, command.name, "artifact") and !action.artifact) continue;
+                try writer.print("complete -c antfly -n '__fish_seen_subcommand_from {s}; and __fish_seen_subcommand_from maintenance' -a '{s}' -d '{s}'\n", .{ command.name, @tagName(action.action), action.text(if (std.mem.eql(u8, command.name, "artifact")) .artifact else .index) });
+            }
+            try writer.print("complete -c antfly -n '__fish_seen_subcommand_from {s}; and not __fish_seen_subcommand_from maintenance' -a '", .{command.name});
+        } else {
+            try writer.print("complete -c antfly -n '__fish_seen_subcommand_from {s}' -a '", .{command.name});
+        }
         try writeSubcommandNames(writer, command.subcommands);
         try writer.writeAll("'\n");
     }
@@ -216,7 +267,23 @@ test "command table drives routes and completion entries" {
     try std.testing.expectEqual(Route.standalone, findCommand("swarm").?.route);
     try std.testing.expectEqual(Route.cli, findCommand("table").?.route);
     try std.testing.expectEqual(Route.completion, findCommand("completion").?.route);
+    try std.testing.expectEqual(Route.standby, findCommand("standby").?.route);
+    try std.testing.expectEqual(Route.standby, findCommand("ha").?.route);
+    try std.testing.expect(!findCommand("standby").?.hidden);
+    try std.testing.expect(findCommand("ha").?.hidden);
     try std.testing.expect(findCommand("termite") == null);
+}
+
+test "completion output omits hidden commands" {
+    inline for (std.meta.tags(Shell)) |shell| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try write(shell, &output.writer);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "__graph-metric-maintenance") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "__maintenance-worker") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "graph-metric-maintenance") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "standby") != null);
+    }
 }
 
 test "zsh completion contains nested inference and completion commands" {
@@ -225,4 +292,15 @@ test "zsh completion contains nested inference and completion commands" {
     try write(.zsh, &output.writer);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "inference) subcommands=(run embed classify") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "completion) subcommands=(bash zsh fish)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "else subcommands=(create drop list get wait maintenance)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "standby) subcommands=(status slot seed fence promote rejoin follow switchover stream commit artifact)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "'standby:Manage hot-standby replication'") != null);
+}
+
+test "zsh completion hides the deprecated ha alias" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try write(.zsh, &output.writer);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "'ha:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "ha) subcommands=(") == null);
 }

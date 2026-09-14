@@ -1,4 +1,4 @@
-# Hot-Standby HA
+# Hot Standby
 
 This runbook covers operator-managed Postgres-style hot standby for Antfly
 clusters running in Standalone mode. It is separate from the Raft metadata HA path:
@@ -11,9 +11,22 @@ Use the typed admin API for normal automation:
 
 | Surface | Use |
 |---------|-----|
-| `/admin/v1/ha` | Operator and SDK control-plane actions |
-| `antfly ha ...` | Human and break-glass commands, plus pod-local helpers |
+| `/admin/v1/standby` | Operator and SDK control-plane actions |
+| `antfly standby ...` | Human and break-glass commands, plus pod-local helpers |
 | `/internal/v1` | Runtime-to-runtime replication traffic only |
+
+The old `/admin/v1/ha` paths and the `antfly ha` command name still work as
+aliases for one minor release. The Kubernetes operator negotiates the spelling
+per server (`--standby-admin-path-style=auto`, the default): it sends the
+`/admin/v1/standby` path first and, if a node answers with an unrouted 404,
+retries the old spelling once and remembers the answer for that node's URL.
+Mixed-version clusters therefore keep working through a rolling upgrade, and
+nothing has to be flipped when 0.3 becomes the minimum server. `legacy` and
+`canonical` force one spelling for troubleshooting. The operator reads its
+own token from `ANTFLY_STANDBY_ADMIN_TOKEN`, falling back to
+`ANTFLY_HA_ADMIN_TOKEN`; the variable injected into managed pods keeps its
+`ANTFLY_HA_ADMIN_TOKEN` default (`spec.highAvailability.admin.tokenEnvVar`),
+since renaming it would roll every cluster.
 
 The Kubernetes operator lives in `go/pkg/operator` and should use the Go SDK
 admin wrapper generated from `specs/openapi/antfly/admin.yaml`. It should not
@@ -45,25 +58,56 @@ Automatic failover additionally requires a supported fencing authority, a
 primary-route selector, a promotion target with safe-read progress, and admin
 URLs for every node the operator may promote, demote, rewind, or reseed.
 
+### Data layout on the pod volume
+
+Default runtime paths live under `/antflydb/standby/` (`primary.wal`, `slots`,
+`log.wal`, `progress.wal`, `fence.wal`, `seed-captures/`,
+`standby-generations/`). Clusters created before 0.3 have the same files under
+`/antflydb/ha/` with `standby.wal` and `standby-progress.wal`. The operator
+records which layout it renders in `status.haStatus.dataLayout` (`ha` or
+`standby`) and never moves it back; the pod template's
+`antfly.io/hot-standby-data-layout` annotation carries the same value and is
+what the operator trusts if a status write was lost. New clusters start on
+`standby`; a cluster counts as new only when it has neither a StatefulSet nor
+a surviving volume claim. An existing cluster, or a surviving volume, stays on
+`ha` until the operator's admin client has
+negotiated the 0.3 `/admin/v1/standby` paths with one of its nodes, which
+proves the nodes run a server that can migrate; the operator then flips the
+status, emits a `HotStandbyLayoutStandby` event, and the next pod rollout
+carries the new paths. On
+that start each node renames `ha/` to `standby/` once (everything inside moves
+with it) and renames the two standby files; nothing is deleted or overwritten.
+Explicit `spec.highAvailability.runtime.*Path` values are rendered as given
+and never migrated. Do not switch a cluster to explicit `/antflydb/standby/`
+paths by hand while it still runs a 0.2 image: a 0.2 server has no migration
+and would start empty at the new paths.
+
 ## Admin Token Handling
 
-Prefer `ANTFLY_HA_ADMIN_TOKEN` for both the operator and Antfly pods.
-Kubernetes should inject it from a Secret into process environments; the
-operator does not need broad Secret read permissions just to call the HA admin
-API.
+Inject the token from a Secret into process environments; the operator does
+not need broad Secret read permissions just to call the admin API. The
+operator itself reads `ANTFLY_STANDBY_ADMIN_TOKEN`, falling back to
+`ANTFLY_HA_ADMIN_TOKEN`. Antfly pods keep `ANTFLY_HA_ADMIN_TOKEN` as the
+default injected name (`spec.highAvailability.admin.tokenEnvVar` overrides it),
+and the server accepts whatever name it is told, so the two sides can differ.
 
 When Antfly pods use `spec.highAvailability.runtime.adminTokenSecretRef`, set
 `optional: false` or omit `optional` so Kubernetes fails pod startup if the
 token Secret is missing. This field is a pod/Job `SecretKeySelector`; the
 operator does not read the Secret value from the Kubernetes API. Operator status
-probes and typed HA admin actions still require the token to be injected into
+probes and typed hot-standby admin actions still require the token to be injected into
 the operator pod through `spec.highAvailability.admin.tokenEnvVar`. Use
 `spec.standalone.envFrom` only when the same Secret is already being injected for
 other runtime configuration.
 
-When using CLI commands, pass `--ha-token-env ANTFLY_HA_ADMIN_TOKEN`. Do not
-put raw tokens in command-line flags because argv can be exposed through process
-inspection and job history.
+When using CLI commands against a running node, pass `--admin-url <url>`; the
+token is read from `ANTFLY_STANDBY_ADMIN_TOKEN` (falling back to the deprecated
+`ANTFLY_HA_ADMIN_TOKEN`) when one of those variables is set, or from the
+variable named by `--admin-token-env`. On the node itself,
+`antfly standby --data-dir /antflydb status primary` opens the local HA state without
+any path or identity flags. Do not put raw tokens in command-line flags because
+argv can be exposed through process inspection and job history. The older
+`--ha-url` and `--ha-token-env` spellings still work.
 
 ## Daily Checks
 
@@ -273,7 +317,9 @@ identity/digest index prevents old identities from being reused after history
 truncation.
 
 Controllers read the authenticated, read-only endpoint
-`GET /admin/v1/ha/seed-lifecycle/receipts`. The required `kind` query is
+`GET /admin/v1/standby/seed-lifecycle/receipts` (the old
+`/admin/v1/ha/seed-lifecycle/receipts` path is served as an alias). The
+required `kind` query is
 `capture` or `activation`; `after` is an exclusive durable WAL cursor and
 `limit` is between 1 and 1000. Responses include `first_cursor`, `end_cursor`,
 `next_cursor`, `history_truncated`, `gap`, and `has_more`. A `gap` means the
@@ -306,6 +352,68 @@ assessment, standby promotion, primary-route update, and former-primary repair.
 Safe promotion and forced lossy promotion must produce distinct receipts. A
 forced promotion should be treated as an explicit RPO decision, not as the
 default failure path.
+
+## Planned Switchover
+
+Use a planned switchover when the primary is healthy and you want to move the
+primary role to a standby for maintenance, a node replacement, or a zone move.
+The operator's automatic promotion path is failover only and stays out of the
+way while the primary is reachable, so a planned change is driven from the CLI:
+
+```bash
+antfly standby --admin-url http://primary-a:8080 switchover \
+  --to http://standby-a:8080 \
+  --follower http://standby-b:8080 \
+  --wait-timeout 60s
+```
+
+The command runs the sequence described in `zig/HOT_STANDBY.md` under
+"switchover": preflight both nodes without writing, fence the old primary so
+writes stop, wait for the standby to reach the primary's final LSN, fence and
+promote the standby with the same fence generation, run the former-primary
+rejoin assessment (rewind is reported as pending until the old node restarts as
+a standby; reseed is applied immediately), and repoint each `--follower` at the
+new primary.
+Every step prints its typed receipt; add `--json` to capture them for the change
+record and `--dry-run` to stop after preflight.
+
+Fence generation: with Kubernetes Lease fencing, pass `--generation` with the
+Lease's current transition value. Without a Lease authority, omit it and the
+primary allocates the next generation; the CLI reuses that generation when it
+fences the standby so both nodes hold one fence.
+
+If the command fails after the primary was fenced, the old primary is read-only
+and no data was lost. Either rerun the switchover once the standby has caught
+up, or promote with `force` as an explicit RPO decision. After a successful
+switchover, roll the former primary's pod into the standby role (the operator
+does this from `spec.highAvailability.runtime.standby`) with
+`former_primary_log` configured, then run `antfly standby rejoin rewind` against it;
+a running primary owns its log, so the rewind cannot happen before the restart.
+
+### Repointing a standby
+
+A standby can be moved to a different primary without a restart:
+
+```bash
+antfly standby --admin-url http://standby-b:8080 follow \
+  --upstream-url http://standby-a:8080 --slot standby-b \
+  --cluster-id 1 --timeline-id 3 --epoch 3
+```
+
+The identity flags are a precondition: the request is rejected with a 409 if
+the standby's current timeline or epoch differs, so a stale runbook step cannot
+repoint a node that has since been promoted or reseeded. Repeating the same
+request is a no-op (`changed: false`).
+
+### Using the config file
+
+`antfly standby --config /etc/antfly/config.json` reads the server's
+`hot_standby` section (the deprecated `ha` section is still read). When it
+names `hot_standby.admin.url` the command targets that endpoint and reads the
+token from the variable in `hot_standby.admin.token_env`; otherwise the
+section's paths and identity are used as local handles. On a node with the
+standard layout, `antfly standby --data-dir /antflydb status primary` needs no
+flags at all.
 
 ## Former Primary Return
 
@@ -373,5 +481,5 @@ rewound a former primary, or required reseed.
 
 ## Related Design
 
-See `zig/HA.md` for the storage and control-plane design, including the
+See `zig/HOT_STANDBY.md` for the storage and control-plane design, including the
 production readiness and Postgres-parity checklist.

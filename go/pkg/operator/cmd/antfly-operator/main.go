@@ -56,6 +56,7 @@ func main() {
 	var enableInferenceControllers bool
 	var inferenceAntflyImage string
 	var clusterDomain string
+	var standbyAdminPathStyle string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -69,6 +70,8 @@ func main() {
 		"Default Zig Antfly image for InferencePool pods. The image must provide the /antfly inference runtime contract.")
 	flag.StringVar(&clusterDomain, "cluster-domain", controllers.DefaultClusterDomain,
 		"Kubernetes DNS cluster domain used for internal Service and StatefulSet pod addresses.")
+	flag.StringVar(&standbyAdminPathStyle, "standby-admin-path-style", "auto",
+		"Spelling of the hot-standby admin API the operator calls: auto negotiates per server (recommended), legacy forces the pre-0.3 paths, canonical forces the 0.3 paths.")
 	opts := zap.Options{
 		Development: false,
 		TimeEncoder: zapcore.RFC3339TimeEncoder,
@@ -122,8 +125,14 @@ func main() {
 	// Create AutoScaler
 	autoScaler := controllers.NewAutoScaler(mgr.GetClient(), k8sClient, mgr.GetClient())
 
+	adminPathStyle, err := controllers.ParseStandbyAdminPathStyle(standbyAdminPathStyle)
+	if err != nil {
+		setupLog.Error(err, "invalid --standby-admin-path-style")
+		os.Exit(1)
+	}
 	if err = (&controllers.AntflyClusterReconciler{
 		Client:                mgr.GetClient(),
+		StandbyAdminPathStyle: adminPathStyle,
 		BoundaryReader:        mgr.GetAPIReader(),
 		Scheme:                mgr.GetScheme(),
 		AutoScaler:            autoScaler,

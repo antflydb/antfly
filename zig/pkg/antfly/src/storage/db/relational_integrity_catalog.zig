@@ -17,7 +17,7 @@
 //! monotonically increasing allocation counter prevents drop/readd from
 //! reviving old globally routed claims or child references.
 const std = @import("std");
-const integrity = @import("relational_integrity.zig");
+const integrity = @import("relational_integrity_contract.zig");
 const Allocator = std.mem.Allocator;
 pub const key = "\x00\x00__metadata__:relational_integrity_catalog";
 pub const max_definitions = 1024;

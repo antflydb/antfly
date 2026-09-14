@@ -22,3 +22,6 @@ test {
     _ = @import("api/table_reads.zig");
     _ = @import("api/relational_constraint_status.zig");
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

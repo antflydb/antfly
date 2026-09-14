@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const planning_bindings = @import("planning_bindings.zig");
 const query_search = @import("query/search_exec.zig");
 const distributed_stats = @import("../../search/distributed_stats.zig");
 const types = @import("types.zig");
@@ -222,10 +223,15 @@ fn collectTextIndexEstimatesAlloc(
         items.deinit(alloc);
     }
 
-    if (query_search.requestBindsRootTextIndex(req)) {
-        var estimate = try collector.resolveTextIndexEstimate(alloc, req.index_name, req) orelse return error.IndexNotFound;
-        errdefer estimate.deinit(alloc);
-        try appendUniqueTextIndexEstimate(alloc, &items, &estimate);
+    const primary_requirement = planning_bindings.primaryTextIndexRequirement(req);
+    if (primary_requirement != .none) {
+        if (try collector.resolveTextIndexEstimate(alloc, req.index_name, req)) |resolved| {
+            var estimate = resolved;
+            errdefer estimate.deinit(alloc);
+            try appendUniqueTextIndexEstimate(alloc, &items, &estimate);
+        } else if (primary_requirement == .required) {
+            return error.IndexNotFound;
+        }
     }
     for (req.full_text_queries) |query| {
         var estimate = try collector.resolveTextIndexEstimate(alloc, query.index_name, req) orelse return error.IndexNotFound;

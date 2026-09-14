@@ -1588,6 +1588,49 @@ pub const BackupRequest = struct {
     }
 };
 
+/// Additive details for a committed batch that needs operator action. The open string code is forward-compatible with older SDKs; clients should treat unknown codes as non-retryable when `retryable` is false.
+pub const BatchCommittedFailure = struct {
+    /// Stable machine-readable failure code, such as `graph_metric_materialization_rejected`.
+    code: []const u8,
+    /// Actionable operator guidance.
+    message: []const u8,
+    /// Optional stable reason within the failure category, such as `build_budget_exceeded`.
+    reason: ?[]const u8 = null,
+    /// Whether replaying the document mutation is safe. Committed repair outcomes are false.
+    retryable: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "code", "code", false },
+        .{ "message", "message", false },
+        .{ "reason", "reason", true },
+        .{ "retryable", "retryable", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("code");
+        try jw.write(self.code);
+        try jw.objectField("message");
+        try jw.write(self.message);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        try jw.objectField("retryable");
+        try jw.write(self.retryable);
+        try jw.endObject();
+    }
+};
+
 /// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
 pub const BatchRequest = struct {
     /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
@@ -1637,7 +1680,7 @@ pub const BatchRequest = struct {
 };
 
 pub const BatchResponse = struct {
-    /// Durable commit outcome. `committed_pending` means requested visibility or participant propagation is still completing. `committed_repair_required` means the primary write committed, but a terminal enrichment failure needs operator repair and will not be retried indefinitely.
+    /// Durable commit outcome. `committed_pending` means requested visibility or participant propagation is still completing. `committed_repair_required` means the primary write committed, but a terminal background materialization failure needs operator repair and will not be retried indefinitely. Inspect `failure` when present; retrying the document write is unnecessary.
     status: ?[]const u8 = null,
     /// Number of documents successfully inserted
     inserted: ?i64 = null,
@@ -1645,6 +1688,7 @@ pub const BatchResponse = struct {
     deleted: ?i64 = null,
     /// Number of documents successfully transformed
     transformed: ?i64 = null,
+    failure: ?BatchCommittedFailure = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -1652,6 +1696,7 @@ pub const BatchResponse = struct {
         .{ "inserted", "inserted", true },
         .{ "deleted", "deleted", true },
         .{ "transformed", "transformed", true },
+        .{ "failure", "failure", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1678,6 +1723,10 @@ pub const BatchResponse = struct {
         }
         if (self.transformed) |value| {
             try jw.objectField("transformed");
+            try jw.write(value);
+        }
+        if (self.failure) |value| {
+            try jw.objectField("failure");
             try jw.write(value);
         }
         try jw.endObject();
@@ -4365,6 +4414,10 @@ pub const GlobalStatefulQueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied.
+    graph_metric: ?antfly_indexes_openapi.GraphMetricQuery = null,
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes.
+    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?antfly_indexes_openapi.GraphQueries = null,
@@ -4410,6 +4463,8 @@ pub const GlobalStatefulQueryRequest = struct {
         .{ "count", "count", true },
         .{ "profile", "profile", true },
         .{ "reranker", "reranker", false },
+        .{ "graph_metric", "graph_metric", false },
+        .{ "graph_metric_rerank", "graph_metric_rerank", false },
         .{ "analyses", "analyses", true },
         .{ "graph_queries", "graph_queries", false },
         .{ "document_renderer", "document_renderer", true },
@@ -4542,6 +4597,20 @@ pub const GlobalStatefulQueryRequest = struct {
             try jw.objectField("reranker");
             try jw.write(@as(?u8, null));
         }
+        if (self.graph_metric) |value| {
+            try jw.objectField("graph_metric");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("graph_metric");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.graph_metric_rerank) |value| {
+            try jw.objectField("graph_metric_rerank");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("graph_metric_rerank");
+            try jw.write(@as(?u8, null));
+        }
         if (self.analyses) |value| {
             try jw.objectField("analyses");
             try jw.write(value);
@@ -4615,6 +4684,137 @@ pub const GraphMatchOperationLimitExceededError = struct {
     maximum: i64,
     /// Named MATCH operations supplied by the request.
     actual: i64,
+};
+
+pub const GraphMetricActionResponse = struct {
+    status: antfly_indexes_openapi.GraphMetricStatus,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "status", "status", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.endObject();
+    }
+};
+
+pub const GraphMetricProfile = struct {
+    /// Name of the graph query or graph metric query that used the metric.
+    query_name: []const u8,
+    /// Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`.
+    source: []const u8,
+    /// Graph index that owns the metric.
+    index_name: []const u8,
+    /// Graph metric name within the index.
+    metric_name: []const u8,
+    /// Effective freshness mode requested for this metric use.
+    freshness: []const u8,
+    /// Published generation and freshness status observed by the query.
+    status: antfly_indexes_openapi.GraphMetricStatus,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "query_name", "query_name", false },
+        .{ "source", "source", false },
+        .{ "index_name", "index_name", false },
+        .{ "metric_name", "metric_name", false },
+        .{ "freshness", "freshness", false },
+        .{ "status", "status", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("query_name");
+        try jw.write(self.query_name);
+        try jw.objectField("source");
+        try jw.write(self.source);
+        try jw.objectField("index_name");
+        try jw.write(self.index_name);
+        try jw.objectField("metric_name");
+        try jw.write(self.metric_name);
+        try jw.objectField("freshness");
+        try jw.write(self.freshness);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.endObject();
+    }
+};
+
+pub const GraphMetricRerankScoreDetails = struct {
+    /// Graph index that provided the metric score.
+    index_name: []const u8,
+    /// Graph metric used as a score feature.
+    metric_name: []const u8,
+    /// Hit score before graph metric rerank composition.
+    base_score: f64,
+    /// Weight applied to the base score.
+    base_weight: f64,
+    /// Published metric score for this hit, or null when the hit was missing from the metric generation.
+    metric_score: OpenApiOptionalNullable(f64) = .absent,
+    /// Metric feature value used in the formula after applying missing_score fallback if needed.
+    metric_score_used: f64,
+    /// Weight applied to the metric score feature.
+    metric_weight: f64,
+    /// True when metric_score was missing and the request's missing_score fallback was used.
+    missing_score_used: bool,
+    /// Final hit score after graph metric rerank composition.
+    final_score: f64,
+    /// Published graph metric score generation used for this hit.
+    published_generation: i64,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index_name");
+        try jw.write(self.index_name);
+        try jw.objectField("metric_name");
+        try jw.write(self.metric_name);
+        try jw.objectField("base_score");
+        try jw.write(self.base_score);
+        try jw.objectField("base_weight");
+        try jw.write(self.base_weight);
+        switch (self.metric_score) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("metric_score");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("metric_score");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("metric_score_used");
+        try jw.write(self.metric_score_used);
+        try jw.objectField("metric_weight");
+        try jw.write(self.metric_weight);
+        try jw.objectField("missing_score_used");
+        try jw.write(self.missing_score_used);
+        try jw.objectField("final_score");
+        try jw.write(self.final_score);
+        try jw.objectField("published_generation");
+        try jw.write(self.published_generation);
+        try jw.endObject();
+    }
 };
 
 pub const GraphPathWeightDomainError = struct {
@@ -7164,6 +7364,8 @@ pub const QueryHit = struct {
     _distance: ?f32 = null,
     /// Scores partitioned by index when using RRF search.
     _index_scores: ?std.json.ArrayHashMap(f64) = null,
+    /// Optional score provenance for ranking features applied to this hit.
+    _score_details: ?QueryScoreDetails = null,
     _source: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. V0.2-compatible implicit rollup requests continue to use the deprecated `chunks` field instead of `matches`.
     hierarchy: ?QueryHitHierarchy = null,
@@ -7176,6 +7378,7 @@ pub const QueryHit = struct {
         .{ "_score", "_score", false },
         .{ "_distance", "_distance", true },
         .{ "_index_scores", "_index_scores", true },
+        .{ "_score_details", "_score_details", true },
         .{ "_source", "_source", true },
         .{ "hierarchy", "hierarchy", true },
         .{ "_sort", "_sort", true },
@@ -7201,6 +7404,10 @@ pub const QueryHit = struct {
         }
         if (self._index_scores) |value| {
             try jw.objectField("_index_scores");
+            try jw.write(value);
+        }
+        if (self._score_details) |value| {
+            try jw.objectField("_score_details");
             try jw.write(value);
         }
         if (self._source) |value| {
@@ -7439,6 +7646,8 @@ pub const QueryProfile = struct {
     reranker: ?RerankerProfile = null,
     /// Result merge statistics (present for hybrid search).
     merge: ?MergeProfile = null,
+    /// Graph metric freshness and generation details for metric-aware query work.
+    graph_metrics: ?[]const GraphMetricProfile = null,
     /// Sort execution statistics (present when the query used ordered page options and profiling was enabled).
     sort: ?SortProfile = null,
 
@@ -7448,6 +7657,7 @@ pub const QueryProfile = struct {
         .{ "join", "join", true },
         .{ "reranker", "reranker", true },
         .{ "merge", "merge", true },
+        .{ "graph_metrics", "graph_metrics", true },
         .{ "sort", "sort", true },
     };
 
@@ -7475,6 +7685,10 @@ pub const QueryProfile = struct {
         }
         if (self.merge) |value| {
             try jw.objectField("merge");
+            try jw.write(value);
+        }
+        if (self.graph_metrics) |value| {
+            try jw.objectField("graph_metrics");
             try jw.write(value);
         }
         if (self.sort) |value| {
@@ -7539,6 +7753,10 @@ pub const QueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied.
+    graph_metric: ?antfly_indexes_openapi.GraphMetricQuery = null,
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes.
+    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?antfly_indexes_openapi.GraphQueries = null,
@@ -7580,6 +7798,8 @@ pub const QueryRequest = struct {
         .{ "count", "count", true },
         .{ "profile", "profile", true },
         .{ "reranker", "reranker", false },
+        .{ "graph_metric", "graph_metric", false },
+        .{ "graph_metric_rerank", "graph_metric_rerank", false },
         .{ "analyses", "analyses", true },
         .{ "graph_queries", "graph_queries", false },
         .{ "document_renderer", "document_renderer", true },
@@ -7712,6 +7932,20 @@ pub const QueryRequest = struct {
             try jw.objectField("reranker");
             try jw.write(@as(?u8, null));
         }
+        if (self.graph_metric) |value| {
+            try jw.objectField("graph_metric");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("graph_metric");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.graph_metric_rerank) |value| {
+            try jw.objectField("graph_metric_rerank");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("graph_metric_rerank");
+            try jw.write(@as(?u8, null));
+        }
         if (self.analyses) |value| {
             try jw.objectField("analyses");
             try jw.write(value);
@@ -7780,6 +8014,8 @@ pub const QueryResult = struct {
     aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
     /// Analysis results like PCA and t-SNE per index embeddings.
     analyses: ?std.json.ArrayHashMap(AnalysesResult) = null,
+    /// Results from direct graph metric reads.
+    graph_metric_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphMetricResult) = null,
     /// Detailed execution profile (present when `profile: true` in request).
     profile: ?std.json.Value = null,
     /// Duration of the query in milliseconds.
@@ -7797,6 +8033,7 @@ pub const QueryResult = struct {
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
         .{ "analyses", "analyses", true },
+        .{ "graph_metric_results", "graph_metric_results", true },
         .{ "profile", "profile", true },
         .{ "took", "took", false },
         .{ "status", "status", false },
@@ -7825,6 +8062,10 @@ pub const QueryResult = struct {
         }
         if (self.analyses) |value| {
             try jw.objectField("analyses");
+            try jw.write(value);
+        }
+        if (self.graph_metric_results) |value| {
+            try jw.objectField("graph_metric_results");
             try jw.write(value);
         }
         if (self.profile) |value| {
@@ -7861,6 +8102,8 @@ pub const QueryResultBase = struct {
     aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
     /// Analysis results like PCA and t-SNE per index embeddings.
     analyses: ?std.json.ArrayHashMap(AnalysesResult) = null,
+    /// Results from direct graph metric reads.
+    graph_metric_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphMetricResult) = null,
     /// Detailed execution profile (present when `profile: true` in request).
     profile: ?std.json.Value = null,
     /// Duration of the query in milliseconds.
@@ -7877,6 +8120,7 @@ pub const QueryResultBase = struct {
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
         .{ "analyses", "analyses", true },
+        .{ "graph_metric_results", "graph_metric_results", true },
         .{ "profile", "profile", true },
         .{ "took", "took", false },
         .{ "status", "status", false },
@@ -7906,6 +8150,10 @@ pub const QueryResultBase = struct {
             try jw.objectField("analyses");
             try jw.write(value);
         }
+        if (self.graph_metric_results) |value| {
+            try jw.objectField("graph_metric_results");
+            try jw.write(value);
+        }
         if (self.profile) |value| {
             try jw.objectField("profile");
             try jw.write(value);
@@ -7920,6 +8168,34 @@ pub const QueryResultBase = struct {
         }
         if (self.table) |value| {
             try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Optional score provenance for ranking features that changed the final hit score.
+pub const QueryScoreDetails = struct {
+    /// Score contribution from an explicit graph_metric_rerank request.
+    graph_metric_rerank: ?GraphMetricRerankScoreDetails = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "graph_metric_rerank", "graph_metric_rerank", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.graph_metric_rerank) |value| {
+            try jw.objectField("graph_metric_rerank");
             try jw.write(value);
         }
         try jw.endObject();
@@ -9927,6 +10203,10 @@ pub const RetrievalQueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied.
+    graph_metric: ?antfly_indexes_openapi.GraphMetricQuery = null,
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes.
+    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?antfly_indexes_openapi.GraphQueries = null,
@@ -9970,6 +10250,8 @@ pub const RetrievalQueryRequest = struct {
         .{ "count", "count", true },
         .{ "profile", "profile", true },
         .{ "reranker", "reranker", false },
+        .{ "graph_metric", "graph_metric", false },
+        .{ "graph_metric_rerank", "graph_metric_rerank", false },
         .{ "analyses", "analyses", true },
         .{ "graph_queries", "graph_queries", false },
         .{ "document_renderer", "document_renderer", true },
@@ -10101,6 +10383,20 @@ pub const RetrievalQueryRequest = struct {
             try jw.write(value);
         } else if (jw.options.emit_null_optional_fields) {
             try jw.objectField("reranker");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.graph_metric) |value| {
+            try jw.objectField("graph_metric");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("graph_metric");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.graph_metric_rerank) |value| {
+            try jw.objectField("graph_metric_rerank");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("graph_metric_rerank");
             try jw.write(@as(?u8, null));
         }
         if (self.analyses) |value| {
@@ -10994,6 +11290,10 @@ pub const StatefulQueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied.
+    graph_metric: ?antfly_indexes_openapi.GraphMetricQuery = null,
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes.
+    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?antfly_indexes_openapi.GraphQueries = null,
@@ -11039,6 +11339,8 @@ pub const StatefulQueryRequest = struct {
         .{ "count", "count", true },
         .{ "profile", "profile", true },
         .{ "reranker", "reranker", false },
+        .{ "graph_metric", "graph_metric", false },
+        .{ "graph_metric_rerank", "graph_metric_rerank", false },
         .{ "analyses", "analyses", true },
         .{ "graph_queries", "graph_queries", false },
         .{ "document_renderer", "document_renderer", true },
@@ -11173,6 +11475,20 @@ pub const StatefulQueryRequest = struct {
             try jw.objectField("reranker");
             try jw.write(@as(?u8, null));
         }
+        if (self.graph_metric) |value| {
+            try jw.objectField("graph_metric");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("graph_metric");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.graph_metric_rerank) |value| {
+            try jw.objectField("graph_metric_rerank");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("graph_metric_rerank");
+            try jw.write(@as(?u8, null));
+        }
         if (self.analyses) |value| {
             try jw.objectField("analyses");
             try jw.write(value);
@@ -11249,6 +11565,8 @@ pub const StatefulQueryResult = struct {
     aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
     /// Analysis results like PCA and t-SNE per index embeddings.
     analyses: ?std.json.ArrayHashMap(AnalysesResult) = null,
+    /// Results from direct graph metric reads.
+    graph_metric_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphMetricResult) = null,
     /// Detailed execution profile (present when `profile: true` in request).
     profile: ?std.json.Value = null,
     /// Duration of the query in milliseconds.
@@ -11266,6 +11584,7 @@ pub const StatefulQueryResult = struct {
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
         .{ "analyses", "analyses", true },
+        .{ "graph_metric_results", "graph_metric_results", true },
         .{ "profile", "profile", true },
         .{ "took", "took", false },
         .{ "status", "status", false },
@@ -11294,6 +11613,10 @@ pub const StatefulQueryResult = struct {
         }
         if (self.analyses) |value| {
             try jw.objectField("analyses");
+            try jw.write(value);
+        }
+        if (self.graph_metric_results) |value| {
+            try jw.objectField("graph_metric_results");
             try jw.write(value);
         }
         if (self.profile) |value| {
@@ -11742,6 +12065,64 @@ pub const TableMigration = struct {
     }
 };
 
+/// Starts a durable named-index control traversal. The server advances every bounded pass, including after restart. Use the repair job status and cancellation endpoints to inspect or stop the traversal.
+pub const TableRepairControlJobStartRequest = struct {
+    /// Index to control across the table.
+    index: []const u8,
+    /// Durable named-index control applied in bounded server-owned passes across every table group.
+    control: []const u8,
+    /// Decimal repair attempt fence, preserved across every pass. A stale fence fails the control job.
+    repair_id: ?[]const u8 = null,
+    /// Opaque continuation cursor from a prior bounded control response.
+    cursor: ?[]const u8 = null,
+    limit: ?i64 = null,
+    /// Attempt the first bounded pass immediately. Remaining passes always run server-side.
+    advance: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "control", "control", false },
+        .{ "repair_id", "repair_id", true },
+        .{ "cursor", "cursor", true },
+        .{ "limit", "limit", true },
+        .{ "advance", "advance", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("control");
+        try jw.write(self.control);
+        if (self.repair_id) |value| {
+            try jw.objectField("repair_id");
+            try jw.write(value);
+        }
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.advance) |value| {
+            try jw.objectField("advance");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status.
 pub const TableRepairIssue = struct {
     artifact_kind: ArtifactRepairKind,
@@ -11950,6 +12331,10 @@ pub const TableRepairJob = struct {
     kind: ?ArtifactRepairKind = null,
     /// Index name when the job is restricted to one index.
     index: ?[]const u8 = null,
+    /// Durable named-index control applied in bounded server-owned passes across every table group.
+    control: ?[]const u8 = null,
+    /// Decimal repair attempt fence, preserved across every pass. A stale fence fails the control job.
+    repair_id: ?[]const u8 = null,
     /// Opaque continuation cursor for the next bounded repair pass.
     cursor: OpenApiOptionalNullable([]const u8) = .absent,
     /// Effective per-pass repair limit.
@@ -11959,8 +12344,10 @@ pub const TableRepairJob = struct {
     result: TableRepairRunResult,
     /// Last stable job-level error code.
     last_error: OpenApiOptionalNullable([]const u8) = .absent,
-    /// Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes.
+    /// Whether cancellation is pending. For a named-index repair/rebuild job, cancellation durably pauses the matching repair in every group. Cancelling a control job stops remaining passes without undoing controls already applied.
     cancel_requested: bool,
+    /// Unix epoch milliseconds when a deferred pass may next run; zero means immediately eligible.
+    next_retry_at_millis: ?i64 = null,
     /// Unix epoch milliseconds when the job was created.
     created_at_millis: i64,
     /// Unix epoch milliseconds when the job state was last updated.
@@ -11978,12 +12365,15 @@ pub const TableRepairJob = struct {
         .{ "target", "target", false },
         .{ "kind", "kind", true },
         .{ "index", "index", true },
+        .{ "control", "control", true },
+        .{ "repair_id", "repair_id", true },
         .{ "cursor", "cursor", false },
         .{ "limit", "limit", false },
         .{ "force", "force", false },
         .{ "result", "result", false },
         .{ "last_error", "last_error", false },
         .{ "cancel_requested", "cancel_requested", false },
+        .{ "next_retry_at_millis", "next_retry_at_millis", true },
         .{ "created_at_millis", "created_at_millis", false },
         .{ "last_updated_at_millis", "last_updated_at_millis", false },
         .{ "expires_at_millis", "expires_at_millis", false },
@@ -12019,6 +12409,14 @@ pub const TableRepairJob = struct {
             try jw.objectField("index");
             try jw.write(value);
         }
+        if (self.control) |value| {
+            try jw.objectField("control");
+            try jw.write(value);
+        }
+        if (self.repair_id) |value| {
+            try jw.objectField("repair_id");
+            try jw.write(value);
+        }
         switch (self.cursor) {
             .absent => {},
             .null_value => {
@@ -12049,6 +12447,10 @@ pub const TableRepairJob = struct {
         }
         try jw.objectField("cancel_requested");
         try jw.write(self.cancel_requested);
+        if (self.next_retry_at_millis) |value| {
+            try jw.objectField("next_retry_at_millis");
+            try jw.write(value);
+        }
         try jw.objectField("created_at_millis");
         try jw.write(self.created_at_millis);
         try jw.objectField("last_updated_at_millis");
@@ -12167,7 +12569,7 @@ pub const TableRepairRunResult = struct {
     controls_applied: i64,
     /// Effective repair limit.
     limit: i64,
-    /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
+    /// Opaque cursor for the next artifact repair pass when has_more is true. Named-index operations may return a continuation cursor when table groups remain.
     next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
     /// Whether another repair scan page is available via next_cursor.
     has_more: bool,

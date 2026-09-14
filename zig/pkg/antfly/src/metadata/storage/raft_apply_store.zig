@@ -33,25 +33,14 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
 const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
+const apply_contract = @import("raft_apply_contract.zig");
 const platform_time = @import("antfly_platform").time;
 const restore_staging = @import("../restore_staging.zig");
 
-pub const AppliedMetadataBatch = struct {
-    commit_index: u64,
-    entries_bytes: []const u8,
-};
+pub const AppliedMetadataBatch = apply_contract.AppliedMetadataBatch;
 
-pub const CatalogProjectionSnapshot = struct {
-    metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
-    catalog_revision: u64,
-    tables: []metadata.TableRecord,
-    ranges: []metadata.RangeRecord,
-};
-
-pub const CatalogCursor = struct {
-    metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
-    revision: u64,
-};
+pub const CatalogProjectionSnapshot = apply_contract.CatalogProjectionSnapshot;
+pub const CatalogCursor = apply_contract.CatalogCursor;
 
 fn catalogProjectionDeadline(deadline_ns: ?u64, deadline_io: ?@import("../../runtime_io_abi.zig").Borrow) !void {
     if (deadline_ns) |deadline| {
@@ -89,6 +78,7 @@ pub const ExtensionLifecycleDelta = struct {
     remove_extension_dependencies: []const ExtensionDependencyKey = &.{},
 };
 
+pub const TableTransitionFence = apply_contract.TableTransitionFence;
 /// Exact predecessor wire shape for transition tag 40. Semantic preconditions
 /// must never be smuggled into this JSON object: predecessor binaries ignore
 /// unknown fields, which would let replicas make different apply decisions.
@@ -107,46 +97,8 @@ pub const ExtensionLifecycleTablePrecondition = struct {
     definition_fingerprint: metadata_table_manager.TableDefinitionFingerprint,
 };
 
-pub const TableTransitionFence = struct {
-    generation: u64 = 0,
-    active_count: u32 = 0,
-    range_membership: topology_protocol.RangeMembershipAccumulator = .{},
-
-    pub fn active(self: @This()) bool {
-        return self.active_count != 0;
-    }
-
-    pub fn membership(self: @This(), table_id: u64) topology_protocol.RangeMembership {
-        return self.range_membership.finish(table_id);
-    }
-};
-
-pub const TableRestoreAdmission = struct {
-    /// Fence value the create command must compare at apply time.
-    expected_transition_generation: u64,
-    /// Stable generation used to derive this incarnation's physical groups.
-    /// After a successful create the fence advances, so exact retries use the
-    /// predecessor generation rather than accidentally deriving new groups.
-    incarnation_generation: u64,
-    already_applied: bool,
-};
-
-pub const TableDropProjection = struct {
-    table: metadata.TableRecord,
-    fence: TableTransitionFence,
-    extension_owned: bool,
-    /// Exact range ids covered by `fence.range_membership` in the same read
-    /// transaction. The mutation keeps the compact proof on the Raft log;
-    /// callers retain these ids only as the post-commit storage cleanup
-    /// contract.
-    range_group_ids: []u64,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.range_group_ids);
-        metadata_table_manager.freeTable(alloc, self.table);
-        self.* = undefined;
-    }
-};
+pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
+pub const TableDropProjection = apply_contract.TableDropProjection;
 
 const derived_catalog_index_version = "3";
 
@@ -2602,80 +2554,17 @@ pub const RaftApplyStoreConfig = struct {
     flush_threshold: usize = 64,
 };
 
-pub const ProjectionSignalKind = enum {
-    metadata_incarnation,
-    table,
-    range,
-    store,
-    placement_intent,
-    reconcile_lease,
-    shuffle_join_lease,
-    split_transition,
-    merge_transition,
-    schema_progress,
-    restore_progress,
-    restore_job,
-    replication_source_status,
-};
-
-pub const ProjectionSignal = struct {
-    kind: ProjectionSignalKind,
-    metadata_group_id: u64,
-    table_name: ?[]const u8 = null,
-    table_id: u64 = 0,
-    group_id: u64 = 0,
-    store_id: u64 = 0,
-    node_id: u64 = 0,
-};
-
-pub const ProjectionListener = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-    /// When set, the apply store brackets the durable commit and synchronous
-    /// notification for matching projection changes with this listener's
-    /// barrier callbacks. Correctness-sensitive consumers use this to
-    /// serialize a short external publication step with the authoritative
-    /// projection commit; ordinary listeners remain notification-only.
-    commit_barrier_kind: ?ProjectionSignalKind = null,
-
-    pub const VTable = struct {
-        on_projection_signal: *const fn (ptr: *anyopaque, signal: ProjectionSignal) void,
-        before_projection_commit: ?*const fn (ptr: *anyopaque) void = null,
-        after_projection_commit: ?*const fn (ptr: *anyopaque) void = null,
-    };
-
-    pub fn onProjectionSignal(self: ProjectionListener, signal: ProjectionSignal) void {
-        self.vtable.on_projection_signal(self.ptr, signal);
-    }
-
-    fn beginCommitBarrier(self: ProjectionListener) void {
-        if (self.vtable.before_projection_commit) |begin| begin(self.ptr);
-    }
-
-    fn endCommitBarrier(self: ProjectionListener) void {
-        if (self.vtable.after_projection_commit) |end| end(self.ptr);
-    }
-
-    fn validate(self: ProjectionListener) !void {
-        const configured = self.commit_barrier_kind != null;
-        if ((self.vtable.before_projection_commit != null) != configured or
-            (self.vtable.after_projection_commit != null) != configured)
-            return error.InvalidProjectionCommitBarrier;
-    }
-};
-
-pub const CommittedKeySignal = struct {
-    metadata_group_id: u64,
-    key: []const u8,
-};
+pub const ProjectionSignalKind = apply_contract.ProjectionSignalKind;
+pub const ProjectionSignal = apply_contract.ProjectionSignal;
+pub const ProjectionListener = apply_contract.ProjectionListener;
+pub const CommittedKeySignal = apply_contract.CommittedKeySignal;
+pub const CommittedKeyListener = apply_contract.CommittedKeyListener;
 
 /// Stable ownership token for one atomically registered projection/key
 /// listener pair. The token is process-local and deliberately opaque to
 /// callers; teardown uses it to detach exactly the pair it owns while the
 /// apply store is still alive.
-pub const LifecycleListenerRegistration = struct {
-    id: u64,
-};
+pub const LifecycleListenerRegistration = @import("raft_apply_contract.zig").LifecycleListenerRegistration;
 
 const RegisteredProjectionListener = struct {
     registration_id: ?u64 = null,
@@ -2707,21 +2596,6 @@ fn lockLifecycleDetachApplyMutex(mutex: *std.Io.Mutex, io: std.Io) void {
     }
     mutex.lockUncancelable(io);
 }
-
-pub const CommittedKeyListener = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        matches_key: *const fn (ptr: *anyopaque, signal: CommittedKeySignal) bool,
-        on_committed_key: *const fn (ptr: *anyopaque, signal: CommittedKeySignal) void,
-    };
-
-    pub fn onCommittedKey(self: CommittedKeyListener, signal: CommittedKeySignal) void {
-        if (!self.vtable.matches_key(self.ptr, signal)) return;
-        self.vtable.on_committed_key(self.ptr, signal);
-    }
-};
 
 pub const CommittedTransitionDelta = union(enum) {
     upsert_split: metadata.SplitTransitionRecord,
@@ -2906,7 +2780,7 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
     const checkpoint = try std.fs.path.join(scratch, &.{ root, "checkpoint.bin" });
     const log_path = try std.fmt.allocPrintSentinel(scratch, "{s}/ha.log", .{root}, 0);
     const slots_path = try std.fmt.allocPrintSentinel(scratch, "{s}/slots", .{root}, 0);
-    const primary_mod = @import("../../storage/ha/primary.zig");
+    const primary_mod = @import("../../storage/hot_standby/primary.zig");
     var primary = try primary_mod.Primary.open(alloc, log_path.ptr, slots_path.ptr, .{ .cluster_id = 7, .shard_id = 0, .table_id = 0, .timeline_id = 1, .epoch = 1 }, .{});
     defer primary.close();
     var target = try RaftApplyStore.init(alloc, .{ .root_dir = target_root });
@@ -2984,7 +2858,7 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
 test "standalone metadata chunked HA resumes large effects through checkpoint without partial visibility" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-    const chunks = @import("../../storage/ha/metadata_effect_chunks.zig");
+    const chunks = @import("../../storage/hot_standby/metadata_effect_chunks.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -2999,7 +2873,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
     const checkpoint = try std.fs.path.join(scratch, &.{ root, "checkpoint.bin" });
     const log_path = try std.fmt.allocPrintSentinel(scratch, "{s}/ha.log", .{root}, 0);
     const slots_path = try std.fmt.allocPrintSentinel(scratch, "{s}/slots", .{root}, 0);
-    const primary_mod = @import("../../storage/ha/primary.zig");
+    const primary_mod = @import("../../storage/hot_standby/primary.zig");
     var primary = try primary_mod.Primary.open(alloc, log_path.ptr, slots_path.ptr, .{ .cluster_id = 7, .shard_id = 0, .table_id = 0, .timeline_id = 1, .epoch = 1 }, .{});
     defer primary.close();
     const key = "\x00\x00__api_restore_jobs__:0000000000000009";
@@ -3038,7 +2912,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
         while (lsn <= 3) : (lsn += 1) {
             var entry = (try primary.log.entryAt(alloc, lsn)).?;
             defer entry.deinit(alloc);
-            try std.testing.expect(entry.record.payload.len + @import("../../storage/ha/replication_record.zig").header_size <= 1024 * 1024);
+            try std.testing.expect(entry.record.payload.len + @import("../../storage/hot_standby/replication_record.zig").header_size <= 1024 * 1024);
             try target.applyHARecord(entry.record);
             try target.applyHARecord(entry.record);
             try std.testing.expect((try target.loadStandaloneCatalog(alloc)) == null);
@@ -3155,8 +3029,9 @@ pub const RaftApplyStore = struct {
     next_lifecycle_listener_registration_id: u64 = 1,
     apply_mutex: std.Io.Mutex = .init,
     active_outcome: ?*CommittedApplyOutcome = null,
-    ha_gate: ?@import("../../storage/db/db.zig").HAWriteGate = null,
-    ha_mirror: ?@import("../../storage/db/db.zig").HAAsyncEffectMirror = null,
+    ha_gate: ?@import("../../storage/db/ha_contract.zig").WriteGate = null,
+    ha_mirror: ?@import("../../storage/db/ha_contract.zig").AsyncEffectMirror = null,
+    ha_port: ?@import("../../storage/metadata_ha_port.zig").Port = null,
 
     const OwnedBatch = struct {
         commit_index: u64,
@@ -3222,8 +3097,8 @@ pub const RaftApplyStore = struct {
 
     const standalone_catalog_key = "\x00\x00__metadata__:standalone_catalog";
     const standalone_revision_key = "\x00\x00__metadata__:standalone_revision";
-    const metadata_ha = @import("../../storage/ha/metadata_effects.zig");
-    const metadata_chunks = @import("../../storage/ha/metadata_effect_chunks.zig");
+    const metadata_ha = @import("../../storage/hot_standby/metadata_effects.zig");
+    const metadata_chunks = @import("../../storage/hot_standby/metadata_effect_chunks.zig");
     const metadata_pending_key = metadata_ha.prefix ++ "pending";
     const metadata_chunk_prefix = metadata_ha.prefix ++ "chunk:";
 
@@ -3277,31 +3152,52 @@ pub const RaftApplyStore = struct {
 
     /// The embedding owns the shared HA mutation lease BEFORE its catalog
     /// mutex. Do not recursively acquire the writer-preferring seed barrier.
-    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("../../storage/db/db.zig").HAWriteGate, mirror: ?@import("../../storage/db/db.zig").HAAsyncEffectMirror) !void {
+    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("../../storage/db/ha_contract.zig").WriteGate, mirror: ?@import("../../storage/db/ha_contract.zig").AsyncEffectMirror) !void {
         if (!self.apply_mutex.tryLock()) return error.MetadataHABindingBusy;
         defer self.apply_mutex.unlock(self.io_impl.io());
         self.ha_gate = gate;
         self.ha_mirror = mirror;
+        self.ha_port = null;
     }
 
-    fn lockHATransition(self: *RaftApplyStore) void {
+    pub fn bindHAPort(self: *RaftApplyStore, port: ?@import("../../storage/metadata_ha_port.zig").Port) !void {
+        if (!self.apply_mutex.tryLock()) return error.MetadataHABindingBusy;
+        defer self.apply_mutex.unlock(self.io_impl.io());
+        self.ha_port = port;
+        self.ha_gate = null;
+        self.ha_mirror = null;
+    }
+
+    fn hasHAMirror(self: *const RaftApplyStore) bool {
+        return self.ha_mirror != null or (if (self.ha_port) |port| port.has_mirror else false);
+    }
+
+    fn lockHATransition(self: *RaftApplyStore) !void {
+        if (self.ha_port) |port| return port.lock();
         if (self.ha_mirror) |mirror| if (mirror.transition_mutex) |mutex| {
             @import("antfly_platform").sync.lockYieldingIo(mutex, self.io_impl.io());
         };
     }
     fn unlockHATransition(self: *RaftApplyStore) void {
+        if (self.ha_port) |port| return port.unlock();
         if (self.ha_mirror) |mirror| if (mirror.transition_mutex) |mutex| mutex.unlock();
     }
     fn checkHA(self: *RaftApplyStore) !void {
+        if (self.ha_port) |port| return port.check();
         if (self.ha_gate) |gate| try gate.check();
     }
 
     fn stageStandaloneHA(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, capture: *@import("../../storage/txn_mutation_capture.zig").Capture, group_id: u64) !void {
         txn.mutation_capture = null;
-        const mirror = self.ha_mirror orelse return;
+        if (!self.hasHAMirror()) return;
+        const identity: @import("../../storage/metadata_ha_port.zig").Identity = if (self.ha_port) |port| try port.identity() else .{
+            .next_lsn = self.ha_mirror.?.primary.nextLsn(),
+            .timeline_id = self.ha_mirror.?.primary.identity.timeline_id,
+            .epoch = self.ha_mirror.?.primary.identity.epoch,
+        };
         var source: [16]u8 = undefined;
         const pending = if (try stagingGet(txn, metadata_pending_key)) |bytes| try MetadataPending.decode(bytes) else null;
-        if (pending) |value| if (mirror.primary.identity.epoch <= value.epoch) return error.MetadataHAIncompleteEffect;
+        if (pending) |value| if (identity.epoch <= value.epoch) return error.MetadataHAIncompleteEffect;
         if (try stagingGet(txn, metadata_ha.source_key)) |bytes| {
             if (bytes.len != 16) return error.InvalidMetadataHAEffect;
             source = bytes[0..16].*;
@@ -3322,9 +3218,9 @@ pub const RaftApplyStore = struct {
         if (pending) |value| try clearMetadataPending(txn, value);
         const outbox = try self.alloc.alloc(u8, payload.len + 24);
         defer self.alloc.free(outbox);
-        std.mem.writeInt(u64, outbox[0..8], mirror.primary.nextLsn(), .little);
-        std.mem.writeInt(u64, outbox[8..16], mirror.primary.identity.timeline_id, .little);
-        std.mem.writeInt(u64, outbox[16..24], mirror.primary.identity.epoch, .little);
+        std.mem.writeInt(u64, outbox[0..8], identity.next_lsn, .little);
+        std.mem.writeInt(u64, outbox[8..16], identity.timeline_id, .little);
+        std.mem.writeInt(u64, outbox[16..24], identity.epoch, .little);
         @memcpy(outbox[24..], payload);
         var sequence_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &sequence_bytes, sequence, .little);
@@ -3345,10 +3241,23 @@ pub const RaftApplyStore = struct {
         };
         defer self.alloc.free(raw);
         if (raw.len < 24) return error.InvalidMetadataHAEffect;
+        if (self.ha_port) |port| {
+            _ = try metadata_ha.Decoder.init(raw[24..]);
+            try port.publishAndLock(raw);
+            defer port.unlock();
+            var txn = try self.store.beginWriteTxn();
+            var committed = false;
+            defer if (!committed) txn.abort();
+            try txn.delete(metadata_ha.outbox_key);
+            try txn.commit();
+            committed = true;
+            try self.store.sync(true);
+            return;
+        }
         const mirror = self.ha_mirror orelse return error.MetadataHAOutboxPending;
         _ = try metadata_ha.Decoder.init(raw[24..]);
         const descriptor = try metadata_chunks.Descriptor.fromEffect(raw[24..]);
-        self.lockHATransition();
+        try self.lockHATransition();
         var transition_locked = true;
         defer if (transition_locked) self.unlockHATransition();
         const gate = if (self.ha_gate) |value| value.pinned() else null;
@@ -3364,7 +3273,7 @@ pub const RaftApplyStore = struct {
             const end = @min(raw.len - 24, offset + metadata_chunks.max_chunk_payload_bytes);
             const frame = try metadata_chunks.encodeFrame(self.alloc, descriptor, index, raw[24..][offset..end]);
             defer self.alloc.free(frame);
-            self.lockHATransition();
+            try self.lockHATransition();
             transition_locked = true;
             if (gate) |value| try value.check();
             const prior = if (same_timeline) try mirror.primary.findMatchingRecordFrom(search_from, .metadata_mutation, frame, 0, 0) else null;
@@ -3376,12 +3285,12 @@ pub const RaftApplyStore = struct {
         transition_locked = false;
         if (mirror.sync_policy.mode != .async) {
             if (mirror.sync_wait_fn) |wait| try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.primary, lsn, mirror.sync_policy);
-            const decision = try @import("../../storage/ha/commit_gate.zig").evaluate(mirror.primary, lsn, mirror.sync_policy);
+            const decision = try @import("../../storage/hot_standby/commit_gate.zig").evaluate(mirror.primary, lsn, mirror.sync_policy);
             if (!decision.shouldAcknowledge()) return error.HASyncCommitWouldBlock;
         }
         // A remote acknowledgment can outlive the role generation that
         // appended it. Retain the outbox if that authority changed.
-        self.lockHATransition();
+        try self.lockHATransition();
         transition_locked = true;
         if (gate) |value| try value.check();
         var txn = try self.store.beginWriteTxn();
@@ -3399,11 +3308,11 @@ pub const RaftApplyStore = struct {
         try self.flushHAOutboxLocked();
     }
 
-    pub fn applyHARecord(self: *RaftApplyStore, record: @import("../../storage/ha/replication_record.zig").RecordView) !void {
+    pub fn applyHARecord(self: *RaftApplyStore, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
         return self.applyHAChunk(record);
     }
 
-    fn metadataReplayReceipt(txn: *docstore.DocStore.Txn, record: @import("../../storage/ha/replication_record.zig").RecordView) !void {
+    fn metadataReplayReceipt(txn: *docstore.DocStore.Txn, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
         if (try stagingGet(txn, metadata_ha.replay_key)) |previous| {
             if (previous.len != 40) return error.InvalidMetadataHAEffect;
             if (std.mem.readInt(u64, previous[0..8], .little) != record.cluster_id) return error.MetadataHASourceChanged;
@@ -3423,7 +3332,7 @@ pub const RaftApplyStore = struct {
         try txn.delete(metadata_pending_key);
     }
 
-    fn applyHAChunk(self: *RaftApplyStore, record: @import("../../storage/ha/replication_record.zig").RecordView) !void {
+    fn applyHAChunk(self: *RaftApplyStore, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
         if (record.kind != .metadata_mutation or record.payload_codec != .binary or record.table_id != 0 or record.shard_id != 0) return error.InvalidMetadataHAEffect;
         const frame = try metadata_chunks.decodeFrame(record.payload);
         const descriptor = frame.descriptor;
@@ -3617,7 +3526,7 @@ pub const RaftApplyStore = struct {
         const marker = "\x00\x00__metadata__:standalone_restore_jobs_migrated";
         self.apply_mutex.lockUncancelable(self.io_impl.io());
         defer self.apply_mutex.unlock(self.io_impl.io());
-        if (self.ha_mirror != null) return error.MetadataHAMigrationAfterBinding;
+        if (self.hasHAMirror()) return error.MetadataHAMigrationAfterBinding;
         var outcome = CommittedApplyOutcome{ .alloc = self.alloc, .collect_transition_deltas = false };
         defer outcome.deinit();
         std.debug.assert(self.active_outcome == null);
@@ -3673,7 +3582,7 @@ pub const RaftApplyStore = struct {
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
         try self.flushHAOutboxLocked();
-        self.lockHATransition();
+        try self.lockHATransition();
         var transition_locked = true;
         defer if (transition_locked) self.unlockHATransition();
         try self.checkHA();
@@ -3687,7 +3596,7 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginWriteTxn();
         var committed = false;
         defer if (!committed) txn.abort();
-        if (self.ha_mirror != null) txn.mutation_capture = &capture;
+        if (self.hasHAMirror()) txn.mutation_capture = &capture;
         try self.applyTransitionCommandTxn(&txn, group_id, command);
         try advanceStandaloneRevision(&txn);
         try self.stageStandaloneHA(&txn, &capture, group_id);
@@ -3703,7 +3612,7 @@ pub const RaftApplyStore = struct {
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
         try self.flushHAOutboxLocked();
-        self.lockHATransition();
+        try self.lockHATransition();
         var transition_locked = true;
         defer if (transition_locked) self.unlockHATransition();
         try self.checkHA();
@@ -3717,7 +3626,7 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginWriteTxn();
         var committed = false;
         defer if (!committed) txn.abort();
-        if (self.ha_mirror != null) txn.mutation_capture = &capture;
+        if (self.hasHAMirror()) txn.mutation_capture = &capture;
         _ = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
         const bootstrap = try stagingGet(&txn, standalone_catalog_key) == null;
         if (!bootstrap) {
@@ -3992,10 +3901,13 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn listPlacementIntents(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]raft_reconciler.PlacementIntent {
+        // The in-memory placement projection is updated while a committed
+        // batch holds apply_mutex. Clone it under the same lock so background
+        // snapshot readers cannot copy an intent while apply frees/replaces
+        // its owned bootstrap strings.
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-
         try self.ensurePlacementIntentsLoaded(alloc, group_id);
 
         var count: usize = 0;
@@ -4064,7 +3976,6 @@ pub const RaftApplyStore = struct {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-
         try self.ensurePlacementIntentsLoaded(alloc, metadata_group_id);
 
         var count: usize = 0;
@@ -11568,10 +11479,14 @@ fn appendRuntimeIndexStatusRecordBody(
         try out.append(alloc, @intFromEnum(record.dense_native_storage_phase));
     }
     if (version >= runtime_status_protocol.framed_index_status_record_version) {
-        // Extension payload is a sequence of {field_id:u16, length:u32,
-        // value:[length]u8}. No extensions are emitted yet; reserving the
-        // framed area now makes subsequent additions independently skippable.
-        try appendInt(alloc, out, u32, 0);
+        // Optional field 1: graph counts are physical upper bounds while
+        // ownership retirement is pending. Old readers skip the extension.
+        try appendInt(alloc, out, u32, if (record.graph_counts_pending) 7 else 0);
+        if (record.graph_counts_pending) {
+            try appendInt(alloc, out, u16, 1);
+            try appendInt(alloc, out, u32, 1);
+            try out.append(alloc, 1);
+        }
     }
 }
 
@@ -11734,6 +11649,7 @@ fn readRuntimeIndexStatusRecordBody(
         break :blk std.enums.fromInt(metadata.DenseNativeStoragePhase, value) orelse
             return error.InvalidMetadataTransitionEncoding;
     } else .legacy;
+    var graph_counts_pending = false;
     if (version >= runtime_status_protocol.framed_index_status_record_version) {
         const extensions_len = try readInt(encoded, pos, u32);
         const extensions_end = std.math.add(usize, pos.*, extensions_len) catch
@@ -11749,6 +11665,10 @@ fn readRuntimeIndexStatusRecordBody(
             if (field_id == 0 or field_end > extensions_end or seen.contains(field_id))
                 return error.InvalidMetadataTransitionEncoding;
             try seen.put(alloc, field_id, {});
+            if (field_id == 1) {
+                if (field_len != 1 or encoded[pos.*] > 1) return error.InvalidMetadataTransitionEncoding;
+                graph_counts_pending = encoded[pos.*] == 1;
+            }
             pos.* = field_end;
         }
     }
@@ -11759,6 +11679,7 @@ fn readRuntimeIndexStatusRecordBody(
         .doc_count = doc_count,
         .term_count = term_count,
         .edge_count = edge_count,
+        .graph_counts_pending = graph_counts_pending,
         .node_count = node_count,
         .root_node = root_node,
         .publication_target_count = publication_target_count,
@@ -18501,6 +18422,27 @@ test "metadata runtime index status codec rejects unreleased profiles" {
         error.InvalidMetadataTransitionEncoding,
         readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, 10),
     );
+}
+
+test "metadata runtime index status graph count uncertainty survives framed persistence" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try appendRuntimeIndexStatusRecord(alloc, &encoded, .{
+        .name = "graph",
+        .kind = "graph",
+        .edge_count = 12,
+        .graph_counts_pending = true,
+    }, runtime_status_protocol.current_record_version);
+    var pos: usize = 0;
+    const decoded = try readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, runtime_status_protocol.current_record_version);
+    defer metadata_table_manager.freeRuntimeIndexStatusReport(alloc, decoded);
+    try std.testing.expect(decoded.graph_counts_pending);
+    try std.testing.expectEqual(@as(u64, 12), decoded.edge_count);
+    try std.testing.expectEqual(encoded.items.len, pos);
+    encoded.items[encoded.items.len - 1] = 2;
+    pos = 0;
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, runtime_status_protocol.current_record_version));
 }
 
 test "metadata runtime index status current profile preserves source failures" {

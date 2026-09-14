@@ -1,5 +1,7 @@
 # Metadata VOPR Determinism Audit
 
+Status: complete; retained as a record.
+
 This is the preserved Phase 0 baseline inventory for the first metadata world:
 `metadata/vopr_harness.zig`, including its `raft/vopr_harness.zig` transport.
 The table records the risks as originally audited; the resolution summary below

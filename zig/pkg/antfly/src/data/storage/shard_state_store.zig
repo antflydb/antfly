@@ -40,21 +40,8 @@ pub const AppliedSplitState = struct {
     original_range_end: []const u8,
 };
 
-pub const MergeSourcePhase = enum(u8) {
-    accepting = 1,
-    finalized = 2,
-    rolled_back = 3,
-};
-
-/// Durable donor-side range-merge fence. `applied_index` is the exact Raft
-/// index of the lifecycle command, and therefore the receiver watermark that
-/// must be covered before metadata can retire a finalized donor.
-pub const AppliedMergeSourceState = struct {
-    transition_id: u64,
-    receiver_group_id: u64,
-    phase: MergeSourcePhase,
-    applied_index: u64,
-};
+pub const MergeSourcePhase = @import("../../storage/data_raft_projection_wire.zig").MergeSourcePhase;
+pub const AppliedMergeSourceState = @import("../../storage/data_raft_projection_wire.zig").AppliedMergeSourceState;
 
 pub const SplitHandoff = struct {
     byte_range: AppliedDataRange,
@@ -2141,6 +2128,43 @@ test "paged authoritative reconciliation removes stale out-of-range documents be
     const marker = try projected.get(alloc, marker_key);
     defer alloc.free(marker);
     try std.testing.expectEqualStrings("complete", marker);
+}
+
+test "paged authoritative reconciliation projects schema-bound relational rows across epochs" {
+    const alloc = std.testing.allocator;
+    const schema_mod = @import("../../storage/schema.zig");
+    const relational = @import("../../storage/db/relational_store.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/relational-projection-source", .{tmp.sub_path}, 0);
+    defer alloc.free(source_path);
+    var source = try docstore.DocStore.open(alloc, source_path.ptr, .{});
+    defer source.close();
+    const projected_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/relational-projection-target", .{tmp.sub_path}, 0);
+    defer alloc.free(projected_path);
+    var projected = try docstore.DocStore.open(alloc, projected_path.ptr, .{});
+    defer projected.close();
+    for ([_]u32{ 1, 2, 1 }, [_][]const u8{ "doc:a", "doc:b", "doc:c" }) |version, key| {
+        const schema: schema_mod.TableSchema = .{ .version = version, .storage_mode = .relational, .relational_columns = &.{.{ .name = "id", .path = "id", .column_type = .string, .required = true }} };
+        const schema_key = try schema_mod.schemaVersionKeyAlloc(alloc, version);
+        defer alloc.free(schema_key);
+        const schema_bytes = try schema_mod.serializeSchema(alloc, schema);
+        defer alloc.free(schema_bytes);
+        try source.put(schema_key, schema_bytes);
+        const row_key = try relational.keyAlloc(alloc, key);
+        defer alloc.free(row_key);
+        const encoded = try relational.encodeValueForSchemaAlloc(alloc, "{\"id\":\"kept\"}", schema);
+        defer alloc.free(encoded);
+        try source.put(row_key, encoded);
+    }
+    for (0..2) |_| try reconcileAuthoritativeGroupDocumentsPaged(&projected, &source, alloc, 61, .{ .start = "doc:a", .end = "doc:z" }, &.{}, 1, 1);
+    const rows = try groupState(&projected, alloc, 61);
+    defer freeGroupStateEntries(alloc, rows);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    for (rows, [_][]const u8{ "doc:a", "doc:b", "doc:c" }) |row, key| {
+        try std.testing.expectEqualStrings(key, row.key);
+        try std.testing.expectEqualStrings("{\"id\":\"kept\"}", row.value);
+    }
 }
 
 test "paged authoritative reconciliation is allocation-failure safe" {

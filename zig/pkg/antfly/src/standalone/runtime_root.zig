@@ -17,10 +17,10 @@
 pub const admin = @import("../admin/mod.zig");
 pub const common = @import("../common/mod.zig");
 pub const data = @import("../data/mod.zig");
-pub const db = @import("../storage/db/mod.zig");
+pub const db = @import("../storage/db/selected_root.zig").db;
 pub const extensions = @import("../extensions/mod.zig");
 pub const extracting = @import("antfly_extracting");
-pub const ha = @import("../storage/ha/mod.zig");
+pub const hot_standby = @import("../storage/hot_standby/mod.zig");
 pub const inference = @import("../inference/mod.zig");
 pub const inference_runtime = @import("../inference_runtime/runtime.zig");
 pub const internal = @import("../internal/mod.zig");

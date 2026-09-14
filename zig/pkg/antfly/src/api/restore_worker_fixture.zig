@@ -114,7 +114,7 @@ const Fixture = struct {
             self.validations += 1;
         }
         var apply: Apply = .{ .fixture = self, .index = i };
-        const result = try owner_api.executeResident(alloc, self.dbs[i], .{ .io = std.testing.io, .runtime = self.runtime, .location_options = .{ .filesystem_io = std.testing.io, .node_config = self.node_config }, .cache_path = self.cache_paths[i], .proposer = .{ .ptr = &apply, .propose = Apply.propose } }, request, context);
+        const result = try @import("../storage/restore_owner.zig").executeResident(alloc, self.dbs[i], .{ .io = std.testing.io, .runtime = self.runtime, .location_options = .{ .filesystem_io = std.testing.io, .node_config = self.node_config }, .cache_path = self.cache_paths[i], .proposer = .{ .ptr = &apply, .propose = Apply.propose } }, request, context);
         if (request.action == .import_page) self.imports += 1;
         if (request.action == .publish) self.publications += 1;
         const fault_bit: u8 = switch (request.action) {
@@ -180,7 +180,7 @@ const Fixture = struct {
         self.sequence += 1;
         return try distributed.executeMultiTableCommit(alloc, self.private_catalog.?.source(), .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status } }, @splat(self.sequence), @as(u64, self.sequence) * 1000, @as(u64, self.sequence) * 1000 + 1, requests, sync, null);
     }
-    fn bind(ptr: *anyopaque, catalog: *catalog_mod.Catalog) !catalog_mod.ValidationPort.SourcePair {
+    fn bind(ptr: *anyopaque, _: ?*anyopaque, catalog: *catalog_mod.Catalog) !catalog_mod.ValidationPort.SourcePair {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.private_catalog = catalog;
         return .{ .reader = .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } }, .writer = .{ .ptr = self, .vtable = &.{ .batch = batch, .commit_batch_with_cancellation = commit } } };

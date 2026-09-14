@@ -131,7 +131,7 @@ enum ordinals must never become persisted tags.
   index nor needs retired schemas. Relational merge-document pagination now
   returns canonical logical rows instead of skipping AROW entries.
 - Schema declarations compile before metadata acceptance and flow through the
-  existing atomic public-schema/HA publication path. Introducing an index,
+  existing atomic public-schema/hot-standby publication path. Introducing an index,
   not only changing an already-indexed schema, fences durable transaction
   leases. Ordinary batches cannot overwrite definition, progress, or retirement
   metadata. Ready-generation writes reject missing reverse state for existing
@@ -221,8 +221,8 @@ activation status endpoint.
 - [x] Wire the catalog/controller into DBCore startup, schema changes, and
       prepared restore publication; preserve definitions in portable manifests.
 - [x] Persist/recover mutable progress separately; declarative definitions use
-      the existing public-schema HA payload and atomic schema/index commit.
-- [ ] Add explicit relational-definition HA failover/replay integration tests
+      the existing public-schema hot-standby payload and atomic schema/index commit.
+- [ ] Add explicit relational-definition hot-standby failover/replay integration tests
       and distributed readiness/admin status aggregation.
 - [x] Validate both the published plan snapshot and current schema in the actual
       DB mutation path when consuming prepared effects.
@@ -234,7 +234,7 @@ activation status endpoint.
       Local DB split, portable restore, and local readiness/retry are covered;
       distributed transition replay and owner-coordination still need audit.
 - [x] Commit primary rows, old/new index effects, unique claims, catalog changes,
-      and HA/outbox records atomically across normal writes and transaction replay.
+      and hot-standby/outbox records atomically across normal writes and transaction replay.
 - [x] Enforce named typed scalar CHECKs and add bounded local coverage/retry.
 - [ ] Implement covering payloads, deterministic expression/partial indexes,
       composite uniqueness/null policies, defaults/generated values, and richer
@@ -338,7 +338,7 @@ Explicit boundaries still matter:
   restore and global activation barrier. The independent table endpoints adapt
   to that same engine only when a certified cohort proves the complete selected
   dependency set; unrelated historical snapshots remain rejected.
-- Coherent HA seed replica materialization has a distinct internal entry point
+- Coherent hot-standby seed replica materialization has a distinct internal entry point
   after topology validation and requires exact durable namespace identity.
   It does not enable independently restoring historical table backups.
 - Distributed topology verification must check the real routed claim/reference
@@ -366,7 +366,7 @@ release-verification matrix.
 
 ## Verification
 
-The FK extension's final focused runs pass 50 native storage/transaction/HA
+The FK extension's final focused runs pass 50 native storage/transaction/hot-standby
 tests, 34 coordinator/activation/security tests, 10 public row/status tests,
 two actual HTTP row/DDL authorization tests, and two authoritative metadata
 constraint tests, with no test leaks. The root regression suite also passed

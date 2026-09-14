@@ -4,6 +4,58 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-12: combined unit build/test budget terminates progressing DB-core (#716)
+
+[The Linux unit job](https://github.com/antflydb/antfly/actions/runs/34714680318/job/103609868433)
+started its combined build/test step at 19:49:03 UTC, but DB-core execution only
+started at 20:41:19. The hard watchdog terminated the step at 20:49:05 after
+3,602 seconds. The remaining partition advanced from test 512 to 539 in the
+last 45 seconds; the category partition had already passed. No assertion
+failures or OOM kills were reported. The physical-usage tests and original
+physical-churn benchmark passed, including both GC configurations.
+
+Increase the combined hard limit from 60 to 90 minutes while preserving the
+30-minute idle watchdog and 120-minute outer job limit. The build-tooling
+contract tests check these defaults and their ordering. This gives cold builds
+execution headroom; it does not establish that a future run will complete or
+replace future work on phase-specific budgets and per-partition progress.
+
+## 2026-09-12: physical-churn measurement races obsolete-file deletion (#503)
+
+[PR #503's Linux unit job](https://github.com/antflydb/antfly/actions/runs/34672950333/job/103497870209)
+failed only `relational columnar production LSM physical churn benchmark` with
+`FileNotFound`; its DB-core partition reported 1,140 passes, five skips, one
+failure and no leaks. Build-budget checks passed and the cgroup recorded no OOM
+kills. The original log does not identify the throwing filesystem call, and an
+isolated unmodified local run passed both GC configurations.
+
+The old size helper walked mutable active/obsolete inventories without a lock
+or ownership lease and required every obsolete file to exist. Obsolete cleanup
+intentionally unlinks off-lock before retiring its ledger entry, so even taking
+the writer mutex around that helper would not make this contract sound.
+
+The follow-up uses the backend-owned physical usage observer described in
+[LSM version publication](../docs/design/lsm-version-publication.md#physical-usage-observation).
+A deterministic storage hook forces capture, obsolete unlink, live-ledger
+replacement and stat in that order. Separate checks preserve errors for missing
+active files and denied I/O, force compaction while active SSTs are pinned, and
+verify reclamation after the observer releases its pins. Tests also cover WAL
+accounting, duplicate active/obsolete membership, overflow and allocation-failure
+cleanup. This reproduces and closes the measurement race without claiming that
+the original untraced CI failure proves the same throwing call.
+
+Validation on the follow-up: the focused physical-usage, ledger-reclamation and
+expired-obsolete cleanup suite passed 10 tests with one existing ReleaseFast-only
+benchmark skipped and no leaks. The original production physical-churn test
+passed three consecutive local runs (six GC scenarios: 0% and 50% per run).
+These are native Debug correctness checks, not a throughput improvement claim.
+
+```sh
+cd zig
+zig build lsm-backend-test -- --test-filter 'lsm physical usage' --test-filter 'ledger reclamation' --test-filter 'lsm backend removes expired obsolete'
+zig build antfly-storage-db-test -- --test-filter 'relational columnar production LSM physical churn benchmark'
+```
+
 ## 2026-09-11: main merge retains observation proofs for delayed notifications (#694)
 
 Merging `aefe3bad4` exposed an interaction between the PR's redundant-notification

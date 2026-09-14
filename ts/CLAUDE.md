@@ -1,20 +1,26 @@
-# antfly-ts — Agent Notes
+# ts/ — Agent Notes
 
-## What this repo is
+## What this directory is
 
-TypeScript monorepo for every Antfly frontend surface: the public SDK, unstyled
-search primitives, the shared design system, and the Antfarm dashboard. All
-published packages ship through this repo's CI and tag-triggered npm releases.
+TypeScript workspace for every Antfly frontend surface: the public SDK, unstyled
+search primitives, the shared design system, the graph widgets, the npm CLI
+wrappers, and the Antfarm dashboard. All published packages ship through the
+monorepo's CI and tag-triggered npm releases.
 
 ## Layout
 
 ```
-packages/sdk/           → @antfly/sdk (TS client for the joined public API)
+packages/sdk/            → @antfly/sdk (TS client for the joined public API)
 packages/components/     → @antfly/components (unstyled search primitives:
-                           Autosuggest, AnswerBar, SearchBar)
+                           QueryBox, Autosuggest, Facet, Results, AnswerResults,
+                           ChatBar, plus streaming hooks)
 packages/design-system/  → @antfly/design-system (shadcn/ui-based shared
                            component library: primitives, compound patterns,
                            brand/marketing blocks, OKLCH tokens, Aeonik)
+packages/graph/          → @antfly/graph (graph visualization widgets)
+packages/cli/            → @antfly/cli (npm wrapper that installs the antfly
+                           binary) with platform packages cli-darwin-arm64,
+                           cli-linux-arm64, cli-linux-x64
 apps/antfarm/            → dashboard (consumes sdk + components)
 apps/playground/         → design-system gallery (unpublished; used by
                            library authors to dogfood new primitives)
@@ -77,7 +83,8 @@ Add primitives with `pnpm dlx shadcn@latest add <name>` from inside
 
 ## What does NOT belong here
 
-- Antfly backend code — that's in the parent `antfly/` Go module
+- Antfly backend code — that's the Zig runtime under `zig/pkg/antfly` and
+  `zig/pkg/inference`
 - App-specific widgets (Shopify, dashboard-specific chrome) — they live with
   their app
 - shadcn CLI registry distribution — v1 of the design system is

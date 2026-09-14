@@ -26,6 +26,8 @@ const external_source_manifest = @import("external_source_manifest.zig");
 
 pub const PublishOptions = struct {
     artifact_name: []const u8 = &.{},
+    previous_artifacts: []const @import("../manifest/artifact_ref.zig").ArtifactRef = &.{},
+    cancellation: @import("../../common/cancellation.zig").CancellationToken = .none,
 };
 
 pub const PublishResult = struct {
@@ -44,13 +46,39 @@ pub fn publishInventoryAlloc(
     inventory: external_source.Inventory,
     options: PublishOptions,
 ) !PublishResult {
+    const authority = artifacts.upload_scope orelse return error.ExternalInventoryPublicationScopeRequired;
+    try authority.validate();
+    try options.cancellation.check();
+    var operation_artifacts = artifacts.*;
+    operation_artifacts.allocator = alloc;
     try binding.validateReadOnlyMvp();
     try inventory.validate();
 
     const encoded = try external_source_codec.encodeAlloc(alloc, inventory);
     defer alloc.free(encoded);
 
-    var metadata = try artifacts.put(encoded);
+    // Only the pinned current source may supply reusable identities. Never
+    // reconstruct an old global content ID from its checksum: retired attempts
+    // may still be undergoing collection while this publication commits.
+    var metadata = reuse: {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+        const checksum = std.fmt.bytesToHex(digest, .lower);
+        for (options.previous_artifacts) |prior| {
+            if (prior.kind != .external_base_source or prior.byte_len != encoded.len or !std.mem.eql(u8, prior.checksum, &checksum)) continue;
+            const prior_scope = (try artifact_store.uploadScopeFromArtifactId(prior.artifact_id)) orelse continue;
+            if (!std.mem.eql(u8, &prior_scope.domain, &authority.domain)) continue;
+            try options.cancellation.check();
+            artifacts.verifyContentWithCancellationUsingAllocator(alloc, prior.artifact_id, prior.byte_len, prior.checksum, options.cancellation) catch |err| switch (err) {
+                error.FileNotFound, error.ArtifactNotFound, error.InvalidArtifactId, error.ArtifactIntegrityMismatch => continue,
+                else => return err,
+            };
+            const id = try alloc.dupe(u8, prior.artifact_id);
+            errdefer alloc.free(id);
+            break :reuse artifact_store.ArtifactMetadata{ .artifact_id = id, .byte_len = prior.byte_len, .checksum = try alloc.dupe(u8, prior.checksum) };
+        }
+        break :reuse try operation_artifacts.putWithCancellation(encoded, options.cancellation);
+    };
     defer metadata.deinit(alloc);
 
     return .{
@@ -68,113 +96,16 @@ pub fn publishInventoryAlloc(
     };
 }
 
-const MemoryArtifactStore = struct {
-    alloc: Allocator,
-    bytes: ?[]u8 = null,
-
-    fn init(alloc: Allocator) MemoryArtifactStore {
-        return .{ .alloc = alloc };
-    }
-
-    fn deinit(self: *MemoryArtifactStore) void {
-        if (self.bytes) |bytes| self.alloc.free(bytes);
-        self.* = undefined;
-    }
-
-    fn artifactStore(self: *MemoryArtifactStore) artifact_store.ArtifactStore {
-        return .{
-            .allocator = self.alloc,
-            .ptr = self,
-            .vtable = &vtable,
-        };
-    }
-
-    fn put(self: *MemoryArtifactStore, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
-        if (self.bytes) |bytes| self.alloc.free(bytes);
-        self.bytes = try self.alloc.dupe(u8, contents);
-        return .{
-            .artifact_id = try alloc.dupe(u8, "mem:external-files"),
-            .byte_len = @intCast(contents.len),
-            .checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{contents.len}),
-        };
-    }
-
-    fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
-        if (!std.mem.eql(u8, artifact_id, "mem:external-files")) return error.ArtifactNotFound;
-        const bytes = self.bytes orelse return error.ArtifactNotFound;
-        return try alloc.dupe(u8, bytes);
-    }
-
-    fn getRangeAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
-        const bytes = try self.getAlloc(alloc, artifact_id);
-        defer alloc.free(bytes);
-        if (offset > bytes.len) return error.InvalidRange;
-        const start: usize = @intCast(offset);
-        const end = @min(bytes.len, start + len);
-        return try alloc.dupe(u8, bytes[start..end]);
-    }
-
-    fn stat(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
-        const bytes = try self.getAlloc(alloc, artifact_id);
-        defer alloc.free(bytes);
-        return .{
-            .artifact_id = try alloc.dupe(u8, "mem:external-files"),
-            .byte_len = @intCast(bytes.len),
-            .checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{bytes.len}),
-        };
-    }
-
-    fn delete(self: *MemoryArtifactStore, artifact_id: []const u8) !void {
-        if (!std.mem.eql(u8, artifact_id, "mem:external-files")) return error.ArtifactNotFound;
-        if (self.bytes) |bytes| self.alloc.free(bytes);
-        self.bytes = null;
-    }
-
-    const vtable: artifact_store.ArtifactStore.VTable = .{
-        .deinit = erasedDeinit,
-        .put = erasedPut,
-        .get_alloc = erasedGetAlloc,
-        .get_range_alloc = erasedGetRangeAlloc,
-        .stat = erasedStat,
-        .delete = erasedDelete,
-    };
-
-    fn erasedDeinit(_: Allocator, ptr: *anyopaque) void {
-        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
-        self.deinit();
-    }
-
-    fn erasedPut(ptr: *anyopaque, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
-        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
-        return try self.put(alloc, contents);
-    }
-
-    fn erasedGetAlloc(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8) ![]u8 {
-        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
-        return try self.getAlloc(alloc, artifact_id);
-    }
-
-    fn erasedGetRangeAlloc(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
-        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
-        return try self.getRangeAlloc(alloc, artifact_id, offset, len);
-    }
-
-    fn erasedStat(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
-        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
-        return try self.stat(alloc, artifact_id);
-    }
-
-    fn erasedDelete(ptr: *anyopaque, artifact_id: []const u8) !void {
-        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
-        try self.delete(artifact_id);
-    }
-};
-
-test "external source publisher writes inventory artifact and returns manifest plan" {
+test "serverless external source publisher writes inventory artifact and returns manifest plan" {
     const alloc = std.testing.allocator;
-    var memory = MemoryArtifactStore.init(alloc);
-    var artifacts = memory.artifactStore();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/publish", .{tmp.sub_path});
+    defer alloc.free(path);
+    var fs = try @import("../artifacts/fs_store.zig").FsStore.init(alloc, path);
+    var artifacts = fs.artifactStore();
     defer artifacts.deinit();
+    artifacts.upload_scope = .{ .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain("events"), .attempt = @splat(1) };
 
     var inventory = external_source.Inventory{
         .format = .iceberg,
@@ -208,8 +139,8 @@ test "external source publisher writes inventory artifact and returns manifest p
     try std.testing.expectEqual(@as(usize, 1), result.plan.artifacts.len);
     const artifact = result.plan.artifacts[0];
     try std.testing.expectEqualStrings("events.external-files", artifact.name);
-    try std.testing.expectEqualStrings("mem:external-files", artifact.artifact_id);
-    try std.testing.expectEqualStrings("mem:external-files", result.plan.base_source.external_iceberg.file_inventory_artifact.?);
+    try std.testing.expectEqual(artifacts.upload_scope.?, (try artifact_store.uploadScopeFromArtifactId(artifact.artifact_id)).?);
+    try std.testing.expectEqualStrings(artifact.artifact_id, result.plan.base_source.external_iceberg.file_inventory_artifact.?);
     try std.testing.expectEqualStrings("12", result.plan.base_source.external_iceberg.snapshot_id);
 
     const encoded = try artifacts.getAlloc(artifact.artifact_id);
@@ -220,4 +151,49 @@ test "external source publisher writes inventory artifact and returns manifest p
     try std.testing.expectEqualStrings("events", decoded.source_id);
     try std.testing.expectEqualStrings("12", decoded.snapshot_id);
     try std.testing.expectEqualStrings("data/a.parquet", decoded.files[0].file_id);
+}
+
+test "serverless external inventory X Y X publication survives a delayed retired inventory sweep" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/inventories", .{tmp.sub_path});
+    defer a.free(path);
+    var fs = try @import("../artifacts/fs_store.zig").FsStore.init(a, path);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    const domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain("events");
+    var inventory = external_source.Inventory{
+        .format = .iceberg,
+        .source_id = @constCast("events"),
+        .source_uri = @constCast("s3://bucket/events"),
+        .snapshot_id = @constCast("X"),
+        .schema_fingerprint = @constCast("schema:1"),
+        .files = &.{},
+    };
+    const binding = catalog_binding.Binding{ .table_id = "events", .format = .iceberg, .source_uri = "s3://bucket/events", .snapshot_mode = .current, .schema_fingerprint = "schema:1" };
+    artifacts.upload_scope = .{ .domain = domain, .attempt = @splat(1) };
+    var old_x = try publishInventoryAlloc(a, &artifacts, binding, inventory, .{});
+    defer old_x.deinit(a);
+    inventory.snapshot_id = @constCast("Y");
+    artifacts.upload_scope = .{ .domain = domain, .attempt = @splat(2) };
+    var current_y = try publishInventoryAlloc(a, &artifacts, binding, inventory, .{ .previous_artifacts = old_x.plan.artifacts });
+    defer current_y.deinit(a);
+    // A collector has already selected old X from obsolete HEAD history.
+    // Publication now restores the exact same inventory bytes after its fence.
+    inventory.snapshot_id = @constCast("X");
+    artifacts.upload_scope = .{ .domain = domain, .attempt = @splat(3) };
+    var new_x = try publishInventoryAlloc(a, &artifacts, binding, inventory, .{ .previous_artifacts = current_y.plan.artifacts });
+    defer new_x.deinit(a);
+    try std.testing.expectEqualStrings(old_x.plan.artifacts[0].checksum, new_x.plan.artifacts[0].checksum);
+    try std.testing.expect(!std.mem.eql(u8, old_x.plan.artifacts[0].artifact_id, new_x.plan.artifacts[0].artifact_id));
+    try artifacts.delete(old_x.plan.artifacts[0].artifact_id);
+    var retained = try artifacts.stat(new_x.plan.artifacts[0].artifact_id);
+    defer retained.deinit(a);
+    // A later unchanged publication preserves source identity instead of
+    // creating a fresh scoped inventory and an endless metadata republish.
+    artifacts.upload_scope = .{ .domain = domain, .attempt = @splat(4) };
+    var unchanged = try publishInventoryAlloc(a, &artifacts, binding, inventory, .{ .previous_artifacts = new_x.plan.artifacts });
+    defer unchanged.deinit(a);
+    try std.testing.expectEqualStrings(new_x.plan.artifacts[0].artifact_id, unchanged.plan.artifacts[0].artifact_id);
 }

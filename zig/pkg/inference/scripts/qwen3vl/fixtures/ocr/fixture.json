@@ -1,0 +1,105 @@
+{
+  "schema": "antfly.qwen3vl.ocr_endpoint_fixture.v1",
+  "renderer": {
+    "pillow": "12.1.0",
+    "font_sha256": "525979822591a3447cfc49d943d6f7683508e25543407871c0ed8fed05fd2bd9"
+  },
+  "cases": [
+    {
+      "id": "sparse",
+      "images": [
+        {
+          "path": "sparse.png",
+          "sha256": "b9f66db73a555f3e341a2848781f818b31f4f5deb7c06f2b6ceb13c9ca972f62"
+        }
+      ],
+      "max_tokens": 128,
+      "source_size": [
+        384,
+        256
+      ],
+      "source_text": "ANTFLY\nOrder 1042\n3 notebooks\nTotal: 18.00"
+    },
+    {
+      "id": "portrait",
+      "images": [
+        {
+          "path": "portrait.png",
+          "sha256": "18626e15dfff080b3f0147427ca50eabdd862ff1e171923193e321d86a252db1"
+        }
+      ],
+      "max_tokens": 512,
+      "source_size": [
+        768,
+        1024
+      ],
+      "source_text": "WAREHOUSE RECEIPT\nDate: September 7, 2026\nReference: AF-2026-1042\n\nItems received\n12 blue notebooks\n8 black pens\n4 document folders\n\nDelivery instructions\nUse the north entrance.\nPlace cartons on shelf B-12.\nCheck the packing list.\nReport missing items today.\n\nReceived by: Taylor Reed\nStatus: Complete"
+    },
+    {
+      "id": "landscape_table",
+      "images": [
+        {
+          "path": "landscape_table.png",
+          "sha256": "fa1992243c507ae5e78512061e61cce23fd84a12fed7eb95c100eabc470980ba"
+        }
+      ],
+      "max_tokens": 512,
+      "source_size": [
+        960,
+        640
+      ],
+      "source_text": "INVENTORY REPORT\nLocation: North warehouse\n\nItem                 Units     Shelf\nNotebooks            12        B-12\nPens                  8        A-04\nFolders               4        C-07\nLabels               30        A-02\n\nTotal units: 54\nChecked: September 7, 2026"
+    },
+    {
+      "id": "screenshot",
+      "images": [
+        {
+          "path": "screenshot.png",
+          "sha256": "16c31de1a4ce70c221a05c344ba56e0480476aa77559e6880ef16a616203776a"
+        }
+      ],
+      "max_tokens": 256,
+      "source_size": [
+        640,
+        384
+      ],
+      "source_text": "Search settings\nCollection: product_manuals\nEmbedding model: Qwen3\n\nDocuments indexed: 1,024\nPending updates: 0\nStatus: Ready"
+    },
+    {
+      "id": "serial_2_pages",
+      "images": [
+        {
+          "path": "sparse.png",
+          "sha256": "b9f66db73a555f3e341a2848781f818b31f4f5deb7c06f2b6ceb13c9ca972f62"
+        },
+        {
+          "path": "portrait.png",
+          "sha256": "18626e15dfff080b3f0147427ca50eabdd862ff1e171923193e321d86a252db1"
+        }
+      ],
+      "max_tokens": 512
+    },
+    {
+      "id": "serial_4_pages",
+      "images": [
+        {
+          "path": "sparse.png",
+          "sha256": "b9f66db73a555f3e341a2848781f818b31f4f5deb7c06f2b6ceb13c9ca972f62"
+        },
+        {
+          "path": "portrait.png",
+          "sha256": "18626e15dfff080b3f0147427ca50eabdd862ff1e171923193e321d86a252db1"
+        },
+        {
+          "path": "landscape_table.png",
+          "sha256": "fa1992243c507ae5e78512061e61cce23fd84a12fed7eb95c100eabc470980ba"
+        },
+        {
+          "path": "screenshot.png",
+          "sha256": "16c31de1a4ce70c221a05c344ba56e0480476aa77559e6880ef16a616203776a"
+        }
+      ],
+      "max_tokens": 512
+    }
+  ]
+}

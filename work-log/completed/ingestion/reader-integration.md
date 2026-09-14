@@ -6,7 +6,7 @@ The epstein example (`examples/epstein/main.go`) implements OCR support ad-hoc u
 
 ## Design Summary
 
-- **`libaf/reading/reader.go`** — Reader interface: `Read(ctx, []ai.BinaryContent, *ReadOptions) ([]string, error)` + `Close() error`. Includes `ReadPages` convenience helper and `FallbackReader` compositor.
+- **`go/pkg/docsaf/reading/reader.go`** — Reader interface: `Read(ctx, []BinaryContent, *ReadOptions) ([]string, error)` + `Close() error`. Includes `ReadPages` convenience helper and `FallbackReader` compositor.
 - **Termite implementations** — `NewReader` (wraps `/read` for OCR models like TrOCR, Florence-2) and `NewGeneratorReader` (wraps `/generate` for vision LLMs like Gemma3). Both satisfy Reader.
 - **`docsaf/pdf.go`** — PDFProcessor gets optional `OCR reading.Reader` field. Renders pages to PNG when text extraction quality is poor, calls Reader.
 - **`docsaf/image.go`** — New ImageProcessor that delegates to Reader for image files from any source.
@@ -16,18 +16,17 @@ The epstein example (`examples/epstein/main.go`) implements OCR support ad-hoc u
 
 ### Step 1: Create `libaf/reading/reader.go`
 
-New file at `antfly-go/libaf/reading/reader.go`:
+New file at `go/pkg/docsaf/reading/reader.go`:
 
 ```go
 package reading
 
 import (
     "context"
-    "github.com/antflydb/antfly-go/libaf/ai"
 )
 
 type Reader interface {
-    Read(ctx context.Context, pages []ai.BinaryContent, opts *ReadOptions) ([]string, error)
+    Read(ctx context.Context, pages []BinaryContent, opts *ReadOptions) ([]string, error)
     Close() error
 }
 
@@ -37,9 +36,9 @@ type ReadOptions struct {
 }
 
 func ReadPages(ctx context.Context, r Reader, pages [][]byte, mimeType string, opts *ReadOptions) ([]string, error) {
-    contents := make([]ai.BinaryContent, len(pages))
+    contents := make([]BinaryContent, len(pages))
     for i, p := range pages {
-        contents[i] = ai.BinaryContent{MIMEType: mimeType, Data: p}
+        contents[i] = BinaryContent{MIMEType: mimeType, Data: p}
     }
     return r.Read(ctx, contents, opts)
 }
@@ -55,7 +54,7 @@ type FallbackReader struct {
 }
 
 func NewFallbackReader(readers ...Reader) *FallbackReader
-func (f *FallbackReader) Read(ctx context.Context, pages []ai.BinaryContent, opts *ReadOptions) ([]string, error)
+func (f *FallbackReader) Read(ctx context.Context, pages []BinaryContent, opts *ReadOptions) ([]string, error)
 func (f *FallbackReader) Close() error
 ```
 
@@ -69,7 +68,7 @@ Location TBD — either `libaf/reading/termite/` or alongside Termite client. Tw
 Key files to reference:
 - Termite client: `termite/pkg/client/` — `ReadImagesWithResponse()`, `GenerateContentWithResponse()`
 - Epstein OCR impl: `examples/epstein/main.go:92-242` — `ProcessPage()`, `ReadPageWithPrompt()`, `GeneratePageWithPrompt()`
-- Content parts: `libaf/ai/content.go` — `BinaryContent`, `TextContent`
+- Content parts: `go/pkg/docsaf/reading/content.go` — `BinaryContent`, `TextContent`
 
 ### Step 4: Create `docsaf/ocr_quality.go`
 
@@ -136,28 +135,28 @@ Add dependencies:
 
 ## Verification
 
-1. `cd antfly-go/libaf && go build ./reading/...` — reading package compiles
-2. `cd antfly-go/libaf && go test ./reading/...` — unit tests pass
-3. `cd antfly-go/docsaf && go test ./...` — all docsaf tests pass including new OCR quality and image processor tests
+1. `cd go/pkg/docsaf && go build ./reading/...` — reading package compiles
+2. `cd go/pkg/docsaf && go test ./reading/...` — unit tests pass
+3. `cd go/pkg/docsaf && go test ./...` — all docsaf tests pass including new OCR quality and image processor tests
 4. Manual: run epstein example refactored to use `reading.NewFallbackReader` instead of ad-hoc OCR client — verify same behavior
 
 ## Files to Create
 
-- `antfly-go/libaf/reading/reader.go`
-- `antfly-go/libaf/reading/fallback.go`
-- `antfly-go/libaf/reading/reader_test.go`
-- `antfly-go/docsaf/ocr_quality.go`
-- `antfly-go/docsaf/ocr_quality_test.go`
-- `antfly-go/docsaf/image.go`
-- `antfly-go/docsaf/image_test.go`
+- `go/pkg/docsaf/reading/reader.go`
+- `go/pkg/docsaf/reading/fallback.go`
+- `go/pkg/docsaf/reading/reader_test.go`
+- `go/pkg/docsaf/ocr_quality.go`
+- `go/pkg/docsaf/ocr_quality_test.go`
+- `go/pkg/docsaf/image.go`
+- `go/pkg/docsaf/image_test.go`
 
 ## Files to Modify
 
-- `antfly-go/docsaf/pdf.go` — add OCR fallback fields and logic
-- `antfly-go/docsaf/pdf_test.go` — add OCR fallback tests
-- `antfly-go/docsaf/registry.go` — ImageProcessor registration
-- `antfly-go/docsaf/go.mod` — new dependencies
-- `antfly-go/libaf/go.mod` — if reading/ needs new deps (unlikely)
+- `go/pkg/docsaf/pdf.go` — add OCR fallback fields and logic
+- `go/pkg/docsaf/pdf_test.go` — add OCR fallback tests
+- `go/pkg/docsaf/registry.go` — ImageProcessor registration
+- `go/pkg/docsaf/go.mod` — new dependencies
+- `go/pkg/docsaf/go.mod` — if reading/ needs new deps (unlikely)
 
 ## Termite implementation files (TBD on exact location)
 

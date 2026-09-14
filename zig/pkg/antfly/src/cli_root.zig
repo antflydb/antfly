@@ -21,19 +21,23 @@ pub const build_options = @import("build_options");
 pub const admin = @import("admin/mod.zig");
 pub const common = @import("common/mod.zig");
 pub const data = @import("data/mod.zig");
+pub const graph = @import("graph/graph.zig");
+pub const graph_query = @import("graph/query.zig");
 pub const metadata = @import("metadata/mod.zig");
 pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
 pub const serverless = @import("serverless/mod.zig");
 
-pub const ha = @import("storage/ha/mod.zig");
-pub const db = @import("storage/db/mod.zig");
+pub const hot_standby = @import("storage/hot_standby/mod.zig");
+pub const db = @import("storage/db/selected_root.zig").db;
 pub const lite = @import("storage/lite/mod.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
 pub const backup_bundle = @import("storage/backup_bundle.zig");
 pub const backup_bundle_io = @import("storage/backup_bundle_io.zig");
 pub const backup_repository = @import("storage/backup_repository.zig");
 pub const portable_backup = @import("storage/portable_backup.zig");
+pub const lmdb_engine = @import("lmdb_engine");
+pub const platform_clock = @import("antfly_platform").clock;
 pub const platform_time = @import("antfly_platform").time;
 
 // usermgr/storage_imports.zig depends back on these through antfly_root.

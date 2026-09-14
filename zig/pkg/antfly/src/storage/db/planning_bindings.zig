@@ -37,28 +37,65 @@ pub fn validateSearchRequestBindings(
     }
 }
 
+pub const PrimaryTextIndexRequirement = enum {
+    none,
+    optional,
+    required,
+};
+
+pub fn primaryTextIndexRequirement(req: types.SearchRequest) PrimaryTextIndexRequirement {
+    if (req.filter_query_json.len > 0 or
+        req.exclusion_query_json.len > 0 or
+        (!query_search.isDefaultMatchAll(req.query) and query_search.isTextQuery(req.query)))
+    {
+        return .required;
+    }
+    if (req.full_text) |query| return switch (query) {
+        .match_all, .match_none => if (req.index_name != null) .required else .optional,
+        else => .required,
+    };
+    return .none;
+}
+
+test "preflight treats unbound full-text match sentinels as optional" {
+    try std.testing.expectEqual(PrimaryTextIndexRequirement.optional, primaryTextIndexRequirement(.{
+        .full_text = .{ .match_all = {} },
+    }));
+    try std.testing.expectEqual(PrimaryTextIndexRequirement.optional, primaryTextIndexRequirement(.{
+        .full_text = .{ .match_none = {} },
+    }));
+    try std.testing.expectEqual(PrimaryTextIndexRequirement.required, primaryTextIndexRequirement(.{
+        .index_name = "explicit_text",
+        .full_text = .{ .match_all = {} },
+    }));
+    try std.testing.expectEqual(PrimaryTextIndexRequirement.none, primaryTextIndexRequirement(.{}));
+}
+
 fn validateTextBindings(
     core: *db_core.DBCore,
     alloc: Allocator,
     req: types.SearchRequest,
 ) !void {
-    const needs_primary_text_index = query_search.requestBindsRootTextIndex(req);
-    if (needs_primary_text_index) {
-        const entry = core.textIndexEntry(req.index_name) orelse return error.IndexNotFound;
-        {
-            entry.lockAnalysisShared();
-            defer entry.unlockAnalysisShared();
-            if (req.full_text) |full_text| {
-                try validateTextQueryAgainstIndex(entry, full_text);
-            }
-            if (!query_search.isDefaultMatchAll(req.query) and query_search.isTextQuery(req.query)) {
-                try validateTopLevelQueryAgainstTextIndex(entry, req.query);
-            }
-            if (req.filter_query_json.len > 0) {
-                try validateTextQueryJsonAgainstIndex(alloc, entry, req.filter_query_json);
-            }
-            if (req.exclusion_query_json.len > 0) {
-                try validateTextQueryJsonAgainstIndex(alloc, entry, req.exclusion_query_json);
+    const requirement = primaryTextIndexRequirement(req);
+    if (requirement != .none) {
+        const primary_entry = core.textIndexEntry(req.index_name);
+        if (requirement == .required and primary_entry == null) return error.IndexNotFound;
+        if (primary_entry) |entry| {
+            {
+                entry.lockAnalysisShared();
+                defer entry.unlockAnalysisShared();
+                if (req.full_text) |full_text| {
+                    try validateTextQueryAgainstIndex(entry, full_text);
+                }
+                if (!query_search.isDefaultMatchAll(req.query) and query_search.isTextQuery(req.query)) {
+                    try validateTopLevelQueryAgainstTextIndex(entry, req.query);
+                }
+                if (req.filter_query_json.len > 0) {
+                    try validateTextQueryJsonAgainstIndex(alloc, entry, req.filter_query_json);
+                }
+                if (req.exclusion_query_json.len > 0) {
+                    try validateTextQueryJsonAgainstIndex(alloc, entry, req.exclusion_query_json);
+                }
             }
         }
     }

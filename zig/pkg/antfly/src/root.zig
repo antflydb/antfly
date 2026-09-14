@@ -168,6 +168,7 @@ pub const asset_producer_runtime = @import("asset_producer_runtime.zig");
 
 // Storage backends
 pub const platform_clock = @import("antfly_platform").clock;
+pub const platform_sync = @import("antfly_platform").sync;
 pub const platform_time = @import("antfly_platform").time;
 pub const storage_backend = @import("storage/backend_types.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
@@ -192,8 +193,8 @@ pub const lmdb_engine = @import("lmdb_engine");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const posting_segment_store = @import("storage/posting_segment_store.zig");
 pub const vector_block_store = @import("storage/vector_block_store.zig");
-pub const ha = @import("storage/ha/mod.zig");
-pub const ha_vopr = @import("storage/ha/vopr.zig");
+pub const hot_standby = @import("storage/hot_standby/mod.zig");
+pub const ha_vopr = @import("storage/hot_standby/vopr.zig");
 pub const wal = @import("storage/wal.zig");
 pub const wal_vopr = @import("storage/wal_vopr.zig");
 pub const persistent = @import("storage/persistent.zig");
@@ -212,11 +213,13 @@ pub const ttl = @import("storage/ttl.zig");
 pub const transactions = @import("storage/transactions.zig");
 pub const transaction_vopr = @import("storage/transaction_vopr.zig");
 pub const schema = @import("storage/schema.zig");
-pub const db = @import("storage/db/mod.zig");
+pub const db = @import("antfly_source_root").antfly_sources.selected_db;
 pub const index_manager_vopr = @import("storage/index_manager_vopr.zig");
 pub const db_split_vopr = @import("storage/db_split_vopr.zig");
 
 test {
+    _ = @import("vopr/index_maintenance.zig");
+    _ = @import("cmd/serverless.zig");
     // Storage shard builds compile this authoritative discovery root and then
     // select disjoint test-name prefixes. Keep it unconditional in test mode:
     // an unimported test file must fail the pre-build audit, never disappear.
@@ -359,7 +362,7 @@ test {
     _ = lmdb_vopr;
     _ = lmdb_engine;
     _ = hbc;
-    _ = ha;
+    _ = hot_standby;
     _ = ha_vopr;
     _ = wal;
     _ = wal_vopr;
@@ -422,3 +425,6 @@ test {
     _ = index_manager_vopr;
     _ = db_split_vopr;
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

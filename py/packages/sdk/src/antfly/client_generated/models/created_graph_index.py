@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.created_enrichment_config import CreatedEnrichmentConfig
     from ..models.created_graph_artifact_producer_config import CreatedGraphArtifactProducerConfig
     from ..models.created_graph_artifact_source_config import CreatedGraphArtifactSourceConfig
+    from ..models.created_graph_index_config_metrics import CreatedGraphIndexConfigMetrics
     from ..models.created_provider_config import CreatedProviderConfig
     from ..models.edge_type_config import EdgeTypeConfig
     from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
@@ -33,6 +34,7 @@ class CreatedGraphIndex:
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[CreatedEnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required
             by this index.
+        metrics (CreatedGraphIndexConfigMetrics | Unset):
         summarizer (CreatedProviderConfig | Unset): Credential-free provider configuration returned after index
             creation. Only non-secret provider settings are represented.
         template (str | Unset):
@@ -53,6 +55,7 @@ class CreatedGraphIndex:
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
+    metrics: CreatedGraphIndexConfigMetrics | Unset = UNSET
     summarizer: CreatedProviderConfig | Unset = UNSET
     template: str | Unset = UNSET
     edge_types: list[EdgeTypeConfig] | Unset = UNSET
@@ -78,6 +81,10 @@ class CreatedGraphIndex:
             for enrichments_item_data in self.enrichments:
                 enrichments_item = enrichments_item_data.to_dict()
                 enrichments.append(enrichments_item)
+
+        metrics: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.metrics, Unset):
+            metrics = self.metrics.to_dict()
 
         summarizer: dict[str, Any] | Unset = UNSET
         if not isinstance(self.summarizer, Unset):
@@ -130,6 +137,8 @@ class CreatedGraphIndex:
             field_dict["version"] = version
         if enrichments is not UNSET:
             field_dict["enrichments"] = enrichments
+        if metrics is not UNSET:
+            field_dict["metrics"] = metrics
         if summarizer is not UNSET:
             field_dict["summarizer"] = summarizer
         if template is not UNSET:
@@ -154,6 +163,7 @@ class CreatedGraphIndex:
         from ..models.created_enrichment_config import CreatedEnrichmentConfig
         from ..models.created_graph_artifact_producer_config import CreatedGraphArtifactProducerConfig
         from ..models.created_graph_artifact_source_config import CreatedGraphArtifactSourceConfig
+        from ..models.created_graph_index_config_metrics import CreatedGraphIndexConfigMetrics
         from ..models.created_provider_config import CreatedProviderConfig
         from ..models.edge_type_config import EdgeTypeConfig
         from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
@@ -176,6 +186,13 @@ class CreatedGraphIndex:
                 enrichments_item = CreatedEnrichmentConfig.from_dict(enrichments_item_data)
 
                 enrichments.append(enrichments_item)
+
+        _metrics = d.pop("metrics", UNSET)
+        metrics: CreatedGraphIndexConfigMetrics | Unset
+        if isinstance(_metrics, Unset):
+            metrics = UNSET
+        else:
+            metrics = CreatedGraphIndexConfigMetrics.from_dict(_metrics)
 
         _summarizer = d.pop("summarizer", UNSET)
         summarizer: CreatedProviderConfig | Unset
@@ -235,6 +252,7 @@ class CreatedGraphIndex:
             description=description,
             version=version,
             enrichments=enrichments,
+            metrics=metrics,
             summarizer=summarizer,
             template=template,
             edge_types=edge_types,

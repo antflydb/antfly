@@ -34,6 +34,18 @@ pub const RemoteStore = struct {
     }
 };
 
+test "serverless object manifest candidate deletion is preserved by remote file adapter" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "candidate-remote");
+    defer cleanupTmp(path);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{std.mem.span(path)});
+    defer std.testing.allocator.free(uri);
+    var remote = try RemoteStore.init(std.testing.allocator, uri);
+    var store = remote.manifestStore();
+    defer store.deinit();
+    try manifest_store.testRetiredCandidateRecreation(&store);
+}
+
 test "remote manifest store opens shared fs backend from file uri" {
     var path_buf: [256]u8 = undefined;
     const path = tmpPath(&path_buf, "manifest-remote");

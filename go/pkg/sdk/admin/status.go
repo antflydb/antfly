@@ -6,25 +6,25 @@ import (
 	"strings"
 )
 
-type haAdminStatusJSON struct {
+type standbyAdminStatusJSON struct {
 	SchemaVersion uint32 `json:"schema_version"`
 	Result        struct {
-		PrimaryStatus *haPrimaryStatusJSON `json:"primary_status,omitempty"`
-		StandbyStatus *haStandbyStatusJSON `json:"standby_status,omitempty"`
+		PrimaryStatus *standbyPrimaryStatusJSON `json:"primary_status,omitempty"`
+		StandbyStatus *standbyStatusJSON        `json:"standby_status,omitempty"`
 	} `json:"result"`
 }
 
-type haPrimaryStatusEnvelopeJSON struct {
-	SchemaVersion uint32               `json:"schema_version"`
-	Snapshot      *haPrimaryStatusJSON `json:"snapshot,omitempty"`
+type standbyPrimaryStatusEnvelopeJSON struct {
+	SchemaVersion uint32                    `json:"schema_version"`
+	Snapshot      *standbyPrimaryStatusJSON `json:"snapshot,omitempty"`
 }
 
-type haStandbyStatusEnvelopeJSON struct {
-	SchemaVersion uint32               `json:"schema_version"`
-	Snapshot      *haStandbyStatusJSON `json:"snapshot,omitempty"`
+type standbyStatusEnvelopeJSON struct {
+	SchemaVersion uint32             `json:"schema_version"`
+	Snapshot      *standbyStatusJSON `json:"snapshot,omitempty"`
 }
 
-type haAdminIdentityJSON struct {
+type standbyAdminIdentityJSON struct {
 	ClusterID  *uint64 `json:"cluster_id"`
 	ShardID    *uint64 `json:"shard_id"`
 	TableID    *uint64 `json:"table_id"`
@@ -32,18 +32,18 @@ type haAdminIdentityJSON struct {
 	Epoch      *uint64 `json:"epoch"`
 }
 
-type haPrimaryStatusJSON struct {
-	Role          string                  `json:"role"`
-	NodeID        string                  `json:"node_id"`
-	Identity      haAdminIdentityJSON     `json:"identity"`
-	CurrentLSN    *uint64                 `json:"current_lsn"`
-	Retention     *haRetentionStatusJSON  `json:"retention"`
-	Durability    *haDurabilityStatusJSON `json:"durability,omitempty"`
-	Slots         *[]haSlotStatusJSON     `json:"slots"`
-	LeaseWatchdog *HALeaseWatchdogProof   `json:"lease_watchdog,omitempty"`
+type standbyPrimaryStatusJSON struct {
+	Role          string                       `json:"role"`
+	NodeID        string                       `json:"node_id"`
+	Identity      standbyAdminIdentityJSON     `json:"identity"`
+	CurrentLSN    *uint64                      `json:"current_lsn"`
+	Retention     *standbyRetentionStatusJSON  `json:"retention"`
+	Durability    *standbyDurabilityStatusJSON `json:"durability,omitempty"`
+	Slots         *[]standbySlotStatusJSON     `json:"slots"`
+	LeaseWatchdog *StandbyLeaseWatchdogProof   `json:"lease_watchdog,omitempty"`
 }
 
-type haRetentionStatusJSON struct {
+type standbyRetentionStatusJSON struct {
 	PrimaryLSN        *uint64 `json:"primary_lsn"`
 	OldestRestartLSN  *uint64 `json:"oldest_restart_lsn"`
 	RetainedLSNCount  *uint64 `json:"retained_lsn_count"`
@@ -53,7 +53,7 @@ type haRetentionStatusJSON struct {
 	ReseedRecommended *uint64 `json:"reseed_recommended"`
 }
 
-type haSlotStatusJSON struct {
+type standbySlotStatusJSON struct {
 	Name            string  `json:"name"`
 	TimelineID      *uint64 `json:"timeline_id"`
 	Active          *bool   `json:"active"`
@@ -70,7 +70,7 @@ type haSlotStatusJSON struct {
 	LastError       *string `json:"last_error"`
 }
 
-type haDurabilityStatusJSON struct {
+type standbyDurabilityStatusJSON struct {
 	Status          string  `json:"status"`
 	Mode            string  `json:"mode"`
 	Selection       string  `json:"selection"`
@@ -82,46 +82,46 @@ type haDurabilityStatusJSON struct {
 	CandidateCount  *uint64 `json:"candidate_count"`
 }
 
-type haStandbyStatusJSON struct {
-	Role                     string                `json:"role"`
-	NodeID                   string                `json:"node_id"`
-	Identity                 haAdminIdentityJSON   `json:"identity"`
-	ReceivedLSN              *uint64               `json:"received_lsn"`
-	AppliedLSN               *uint64               `json:"applied_lsn"`
-	SafeReadLSN              *uint64               `json:"safe_read_lsn"`
-	UpstreamLSN              *uint64               `json:"upstream_lsn"`
-	WriteLagLSN              *uint64               `json:"write_lag_lsn"`
-	ReceiveLagLSN            *uint64               `json:"receive_lag_lsn"`
-	ApplyLagLSN              *uint64               `json:"apply_lag_lsn"`
-	LastError                *string               `json:"last_error"`
-	LastAttemptNs            *uint64               `json:"last_attempt_ns"`
-	LastSuccessNs            *uint64               `json:"last_success_ns"`
-	ReplicationFailuresTotal *uint64               `json:"replication_failures_total"`
-	UnappliedLSNCount        *uint64               `json:"unapplied_lsn_count"`
-	CaughtUpToReceived       *bool                 `json:"caught_up_to_received"`
-	CanServeSafeReads        *bool                 `json:"can_serve_safe_reads"`
-	LeaseWatchdog            *HALeaseWatchdogProof `json:"lease_watchdog,omitempty"`
+type standbyStatusJSON struct {
+	Role                     string                     `json:"role"`
+	NodeID                   string                     `json:"node_id"`
+	Identity                 standbyAdminIdentityJSON   `json:"identity"`
+	ReceivedLSN              *uint64                    `json:"received_lsn"`
+	AppliedLSN               *uint64                    `json:"applied_lsn"`
+	SafeReadLSN              *uint64                    `json:"safe_read_lsn"`
+	UpstreamLSN              *uint64                    `json:"upstream_lsn"`
+	WriteLagLSN              *uint64                    `json:"write_lag_lsn"`
+	ReceiveLagLSN            *uint64                    `json:"receive_lag_lsn"`
+	ApplyLagLSN              *uint64                    `json:"apply_lag_lsn"`
+	LastError                *string                    `json:"last_error"`
+	LastAttemptNs            *uint64                    `json:"last_attempt_ns"`
+	LastSuccessNs            *uint64                    `json:"last_success_ns"`
+	ReplicationFailuresTotal *uint64                    `json:"replication_failures_total"`
+	UnappliedLSNCount        *uint64                    `json:"unapplied_lsn_count"`
+	CaughtUpToReceived       *bool                      `json:"caught_up_to_received"`
+	CanServeSafeReads        *bool                      `json:"can_serve_safe_reads"`
+	LeaseWatchdog            *StandbyLeaseWatchdogProof `json:"lease_watchdog,omitempty"`
 }
 
-type ParsedHAPrimaryStatus struct {
-	Response      HAPrimaryStatusResponse
+type ParsedStandbyPrimaryStatus struct {
+	Response      StandbyPrimaryStatusResponse
 	HasDurability bool
 }
 
-type ParsedHAStandbyStatus = HAStandbyStatusResponse
+type ParsedStandbyStatus = StandbyStatusResponse
 
-// ParseHAPrimaryStatus validates a primary status body and returns the
+// ParseStandbyPrimaryStatus validates a primary status body and returns the
 // generated OpenAPI response model. It accepts the current /admin/v1 shape and
 // the older CLI compatibility envelope used by existing operator tests.
-func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
-	var direct haPrimaryStatusEnvelopeJSON
+func ParseStandbyPrimaryStatus(raw []byte) (*ParsedStandbyPrimaryStatus, error) {
+	var direct standbyPrimaryStatusEnvelopeJSON
 	if err := json.Unmarshal(raw, &direct); err != nil {
 		return nil, err
 	}
 	snapshot := direct.Snapshot
 	schemaVersion := direct.SchemaVersion
 	if snapshot == nil {
-		var doc haAdminStatusJSON
+		var doc standbyAdminStatusJSON
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			return nil, err
 		}
@@ -134,46 +134,46 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 	if snapshot == nil {
 		return nil, fmt.Errorf("missing primary status snapshot")
 	}
-	if strings.TrimSpace(snapshot.Role) != string(HAPrimarySnapshotRolePrimary) {
+	if strings.TrimSpace(snapshot.Role) != string(StandbyPrimarySnapshotRolePrimary) {
 		return nil, fmt.Errorf("invalid primary status role")
 	}
 	nodeID := snapshot.NodeID
-	if !validHAIdentifier(nodeID) {
+	if !validStandbyIdentifier(nodeID) {
 		return nil, fmt.Errorf("invalid primary status node_id %q", snapshot.NodeID)
 	}
-	if !haAdminIdentityJSONComplete(snapshot.Identity) {
+	if !standbyAdminIdentityJSONComplete(snapshot.Identity) {
 		return nil, fmt.Errorf("missing primary status identity")
 	}
 	if snapshot.CurrentLSN == nil {
 		return nil, fmt.Errorf("missing current_lsn")
 	}
-	if !haRetentionStatusJSONComplete(snapshot.Retention) {
+	if !standbyRetentionStatusJSONComplete(snapshot.Retention) {
 		return nil, fmt.Errorf("missing retention snapshot fields")
 	}
 	if snapshot.Slots == nil {
 		return nil, fmt.Errorf("missing slot snapshots")
 	}
-	if err := haRetentionStatusJSONConsistent(*snapshot.CurrentLSN, snapshot.Retention, len(*snapshot.Slots)); err != nil {
+	if err := standbyRetentionStatusJSONConsistent(*snapshot.CurrentLSN, snapshot.Retention, len(*snapshot.Slots)); err != nil {
 		return nil, err
 	}
-	parsed := &ParsedHAPrimaryStatus{
+	parsed := &ParsedStandbyPrimaryStatus{
 		HasDurability: snapshot.Durability != nil,
-		Response: HAPrimaryStatusResponse{
+		Response: StandbyPrimaryStatusResponse{
 			SchemaVersion: schemaVersion,
-			Snapshot: HAPrimarySnapshot{
+			Snapshot: StandbyPrimarySnapshot{
 				CurrentLsn: *snapshot.CurrentLSN,
-				Identity:   haIdentityFromStatusJSON(snapshot.Identity),
+				Identity:   standbyIdentityFromStatusJSON(snapshot.Identity),
 				NodeId:     nodeID,
-				Retention: HARetentionSnapshot{
-					PrimaryLsn:        haUint64StatusValue(snapshot.Retention.PrimaryLSN),
-					OldestRestartLsn:  haUint64StatusValue(snapshot.Retention.OldestRestartLSN),
-					RetainedLsnCount:  haUint64StatusValue(snapshot.Retention.RetainedLSNCount),
-					RetainedByteCount: haUint64StatusValue(snapshot.Retention.RetainedByteCount),
-					RetainedAgeNs:     haUint64StatusValue(snapshot.Retention.RetainedAgeNS),
-					ActiveSlots:       haUint64StatusValue(snapshot.Retention.ActiveSlots),
-					ReseedRecommended: haUint64StatusValue(snapshot.Retention.ReseedRecommended),
+				Retention: StandbyRetentionSnapshot{
+					PrimaryLsn:        standbyUint64StatusValue(snapshot.Retention.PrimaryLSN),
+					OldestRestartLsn:  standbyUint64StatusValue(snapshot.Retention.OldestRestartLSN),
+					RetainedLsnCount:  standbyUint64StatusValue(snapshot.Retention.RetainedLSNCount),
+					RetainedByteCount: standbyUint64StatusValue(snapshot.Retention.RetainedByteCount),
+					RetainedAgeNs:     standbyUint64StatusValue(snapshot.Retention.RetainedAgeNS),
+					ActiveSlots:       standbyUint64StatusValue(snapshot.Retention.ActiveSlots),
+					ReseedRecommended: standbyUint64StatusValue(snapshot.Retention.ReseedRecommended),
 				},
-				Role: HAPrimarySnapshotRolePrimary,
+				Role: StandbyPrimarySnapshotRolePrimary,
 			},
 		},
 	}
@@ -181,70 +181,70 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 		parsed.Response.Snapshot.LeaseWatchdog = *snapshot.LeaseWatchdog
 	}
 	for _, slot := range *snapshot.Slots {
-		if !haSlotStatusJSONComplete(slot) {
+		if !standbySlotStatusJSONComplete(slot) {
 			return nil, fmt.Errorf("missing slot snapshot fields")
 		}
-		if err := haSlotStatusJSONConsistent(*snapshot.CurrentLSN, slot); err != nil {
+		if err := standbySlotStatusJSONConsistent(*snapshot.CurrentLSN, slot); err != nil {
 			return nil, err
 		}
 		lastError := ""
 		if slot.LastError != nil {
 			lastError = strings.TrimSpace(*slot.LastError)
 		}
-		parsed.Response.Snapshot.Slots = append(parsed.Response.Snapshot.Slots, HASlotSnapshot{
+		parsed.Response.Snapshot.Slots = append(parsed.Response.Snapshot.Slots, StandbySlotSnapshot{
 			Name:            slot.Name,
-			TimelineId:      haUint64StatusValue(slot.TimelineID),
-			Active:          haBoolStatusValue(slot.Active),
-			ReseedRequired:  haBoolStatusValue(slot.ReseedRequired),
-			RestartLsn:      haUint64StatusValue(slot.RestartLSN),
-			ReceivedLsn:     haUint64StatusValue(slot.ReceivedLSN),
-			AppliedLsn:      haUint64StatusValue(slot.AppliedLSN),
-			SafeReadLsn:     haUint64StatusValue(slot.SafeReadLSN),
-			WriteLagLsn:     haUint64StatusValue(slot.WriteLagLSN),
-			ApplyLagLsn:     haUint64StatusValue(slot.ApplyLagLSN),
-			SafeReadLagLsn:  haUint64StatusValue(slot.SafeReadLagLSN),
-			RetentionLagLsn: haUint64StatusValue(slot.RetentionLagLSN),
-			Status:          HASlotSnapshotStatus(strings.TrimSpace(slot.Status)),
+			TimelineId:      standbyUint64StatusValue(slot.TimelineID),
+			Active:          standbyBoolStatusValue(slot.Active),
+			ReseedRequired:  standbyBoolStatusValue(slot.ReseedRequired),
+			RestartLsn:      standbyUint64StatusValue(slot.RestartLSN),
+			ReceivedLsn:     standbyUint64StatusValue(slot.ReceivedLSN),
+			AppliedLsn:      standbyUint64StatusValue(slot.AppliedLSN),
+			SafeReadLsn:     standbyUint64StatusValue(slot.SafeReadLSN),
+			WriteLagLsn:     standbyUint64StatusValue(slot.WriteLagLSN),
+			ApplyLagLsn:     standbyUint64StatusValue(slot.ApplyLagLSN),
+			SafeReadLagLsn:  standbyUint64StatusValue(slot.SafeReadLagLSN),
+			RetentionLagLsn: standbyUint64StatusValue(slot.RetentionLagLSN),
+			Status:          StandbySlotSnapshotStatus(strings.TrimSpace(slot.Status)),
 			LastError:       lastError,
 		})
 	}
 	if snapshot.Durability != nil {
-		if !haDurabilityStatusJSONComplete(*snapshot.Durability) {
+		if !standbyDurabilityStatusJSONComplete(*snapshot.Durability) {
 			return nil, fmt.Errorf("missing durability status fields")
 		}
-		if err := haDurabilityStatusJSONConsistent(*snapshot.Durability); err != nil {
+		if err := standbyDurabilityStatusJSONConsistent(*snapshot.Durability); err != nil {
 			return nil, err
 		}
-		parsed.Response.Snapshot.Durability = HADurabilityDecision{
-			Status:          HADurabilityDecisionStatus(strings.TrimSpace(snapshot.Durability.Status)),
-			Mode:            HADurabilityDecisionMode(strings.TrimSpace(snapshot.Durability.Mode)),
-			Selection:       HADurabilityDecisionSelection(strings.TrimSpace(snapshot.Durability.Selection)),
-			TargetLsn:       haUint64StatusValue(snapshot.Durability.TargetLSN),
-			ProgressLsn:     haUint64StatusValue(snapshot.Durability.ProgressLSN),
-			MissingLsnCount: haUint64StatusValue(snapshot.Durability.MissingLSNCount),
-			SatisfiedCount:  haUint64StatusValue(snapshot.Durability.SatisfiedCount),
-			RequiredCount:   haUint64StatusValue(snapshot.Durability.RequiredCount),
-			CandidateCount:  haUint64StatusValue(snapshot.Durability.CandidateCount),
+		parsed.Response.Snapshot.Durability = StandbyDurabilityDecision{
+			Status:          StandbyDurabilityDecisionStatus(strings.TrimSpace(snapshot.Durability.Status)),
+			Mode:            StandbyDurabilityDecisionMode(strings.TrimSpace(snapshot.Durability.Mode)),
+			Selection:       StandbyDurabilityDecisionSelection(strings.TrimSpace(snapshot.Durability.Selection)),
+			TargetLsn:       standbyUint64StatusValue(snapshot.Durability.TargetLSN),
+			ProgressLsn:     standbyUint64StatusValue(snapshot.Durability.ProgressLSN),
+			MissingLsnCount: standbyUint64StatusValue(snapshot.Durability.MissingLSNCount),
+			SatisfiedCount:  standbyUint64StatusValue(snapshot.Durability.SatisfiedCount),
+			RequiredCount:   standbyUint64StatusValue(snapshot.Durability.RequiredCount),
+			CandidateCount:  standbyUint64StatusValue(snapshot.Durability.CandidateCount),
 		}
 	}
-	if err := ValidateHAPrimaryStatusResponse(parsed.Response); err != nil {
+	if err := ValidateStandbyPrimaryStatusResponse(parsed.Response); err != nil {
 		return nil, err
 	}
 	return parsed, nil
 }
 
-// ParseHAStandbyStatus validates a standby status body and returns the
+// ParseStandbyStatus validates a standby status body and returns the
 // generated OpenAPI response model. It accepts the current /admin/v1 shape and
 // the older CLI compatibility envelope used by existing operator tests.
-func ParseHAStandbyStatus(raw []byte) (*ParsedHAStandbyStatus, error) {
-	var direct haStandbyStatusEnvelopeJSON
+func ParseStandbyStatus(raw []byte) (*ParsedStandbyStatus, error) {
+	var direct standbyStatusEnvelopeJSON
 	if err := json.Unmarshal(raw, &direct); err != nil {
 		return nil, err
 	}
 	snapshot := direct.Snapshot
 	schemaVersion := direct.SchemaVersion
 	if snapshot == nil {
-		var doc haAdminStatusJSON
+		var doc standbyAdminStatusJSON
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			return nil, err
 		}
@@ -257,75 +257,75 @@ func ParseHAStandbyStatus(raw []byte) (*ParsedHAStandbyStatus, error) {
 	if snapshot == nil {
 		return nil, fmt.Errorf("missing standby status snapshot")
 	}
-	if strings.TrimSpace(snapshot.Role) != string(HAStandbySnapshotRoleStandby) {
+	if strings.TrimSpace(snapshot.Role) != string(StandbySnapshotRoleStandby) {
 		return nil, fmt.Errorf("invalid standby status role")
 	}
 	nodeID := snapshot.NodeID
-	if !validHAIdentifier(nodeID) {
+	if !validStandbyIdentifier(nodeID) {
 		return nil, fmt.Errorf("invalid standby status node_id %q", snapshot.NodeID)
 	}
-	if !haAdminIdentityJSONComplete(snapshot.Identity) {
+	if !standbyAdminIdentityJSONComplete(snapshot.Identity) {
 		return nil, fmt.Errorf("missing standby status identity")
 	}
-	if !haStandbyStatusJSONComplete(snapshot) {
+	if !standbyStatusJSONComplete(snapshot) {
 		return nil, fmt.Errorf("missing standby status fields")
 	}
-	if err := haStandbyStatusJSONConsistent(snapshot); err != nil {
+	if err := standbyStatusJSONConsistent(snapshot); err != nil {
 		return nil, err
 	}
-	response := &HAStandbyStatusResponse{
+	response := &StandbyStatusResponse{
 		SchemaVersion: schemaVersion,
-		Snapshot: HAStandbySnapshot{
-			Role:                     HAStandbySnapshotRoleStandby,
+		Snapshot: StandbySnapshot{
+			Role:                     StandbySnapshotRoleStandby,
 			NodeId:                   nodeID,
-			Identity:                 haIdentityFromStatusJSON(snapshot.Identity),
-			ReceivedLsn:              haUint64StatusValue(snapshot.ReceivedLSN),
-			AppliedLsn:               haUint64StatusValue(snapshot.AppliedLSN),
-			SafeReadLsn:              haUint64StatusValue(snapshot.SafeReadLSN),
-			UpstreamLsn:              haUint64StatusValue(snapshot.UpstreamLSN),
-			WriteLagLsn:              haUint64StatusValue(snapshot.WriteLagLSN),
-			ReceiveLagLsn:            haUint64StatusValue(snapshot.ReceiveLagLSN),
-			ApplyLagLsn:              haUint64StatusValue(snapshot.ApplyLagLSN),
-			LastError:                haStringStatusValue(snapshot.LastError),
-			LastAttemptNs:            haUint64StatusValue(snapshot.LastAttemptNs),
-			LastSuccessNs:            haUint64StatusValue(snapshot.LastSuccessNs),
-			ReplicationFailuresTotal: haUint64StatusValue(snapshot.ReplicationFailuresTotal),
-			UnappliedLsnCount:        haUint64StatusValue(snapshot.UnappliedLSNCount),
-			CaughtUpToReceived:       haBoolStatusValue(snapshot.CaughtUpToReceived),
-			CanServeSafeReads:        haBoolStatusValue(snapshot.CanServeSafeReads),
+			Identity:                 standbyIdentityFromStatusJSON(snapshot.Identity),
+			ReceivedLsn:              standbyUint64StatusValue(snapshot.ReceivedLSN),
+			AppliedLsn:               standbyUint64StatusValue(snapshot.AppliedLSN),
+			SafeReadLsn:              standbyUint64StatusValue(snapshot.SafeReadLSN),
+			UpstreamLsn:              standbyUint64StatusValue(snapshot.UpstreamLSN),
+			WriteLagLsn:              standbyUint64StatusValue(snapshot.WriteLagLSN),
+			ReceiveLagLsn:            standbyUint64StatusValue(snapshot.ReceiveLagLSN),
+			ApplyLagLsn:              standbyUint64StatusValue(snapshot.ApplyLagLSN),
+			LastError:                standbyStringStatusValue(snapshot.LastError),
+			LastAttemptNs:            standbyUint64StatusValue(snapshot.LastAttemptNs),
+			LastSuccessNs:            standbyUint64StatusValue(snapshot.LastSuccessNs),
+			ReplicationFailuresTotal: standbyUint64StatusValue(snapshot.ReplicationFailuresTotal),
+			UnappliedLsnCount:        standbyUint64StatusValue(snapshot.UnappliedLSNCount),
+			CaughtUpToReceived:       standbyBoolStatusValue(snapshot.CaughtUpToReceived),
+			CanServeSafeReads:        standbyBoolStatusValue(snapshot.CanServeSafeReads),
 		},
 	}
 	if snapshot.LeaseWatchdog != nil {
 		response.Snapshot.LeaseWatchdog = *snapshot.LeaseWatchdog
 	}
-	if err := ValidateHAStandbyStatusResponse(*response); err != nil {
+	if err := ValidateStandbyStatusResponse(*response); err != nil {
 		return nil, err
 	}
 	return response, nil
 }
 
-func haIdentityFromStatusJSON(identity haAdminIdentityJSON) HAIdentity {
-	return HAIdentity{
-		ClusterId:  haUint64StatusValue(identity.ClusterID),
-		ShardId:    haUint64StatusValue(identity.ShardID),
-		TableId:    haUint64StatusValue(identity.TableID),
-		TimelineId: haUint64StatusValue(identity.TimelineID),
-		Epoch:      haUint64StatusValue(identity.Epoch),
+func standbyIdentityFromStatusJSON(identity standbyAdminIdentityJSON) StandbyIdentity {
+	return StandbyIdentity{
+		ClusterId:  standbyUint64StatusValue(identity.ClusterID),
+		ShardId:    standbyUint64StatusValue(identity.ShardID),
+		TableId:    standbyUint64StatusValue(identity.TableID),
+		TimelineId: standbyUint64StatusValue(identity.TimelineID),
+		Epoch:      standbyUint64StatusValue(identity.Epoch),
 	}
 }
 
-func haAdminIdentityJSONComplete(identity haAdminIdentityJSON) bool {
+func standbyAdminIdentityJSONComplete(identity standbyAdminIdentityJSON) bool {
 	return identity.ClusterID != nil &&
-		haUint64StatusValue(identity.ClusterID) > 0 &&
+		standbyUint64StatusValue(identity.ClusterID) > 0 &&
 		identity.ShardID != nil &&
 		identity.TableID != nil &&
 		identity.TimelineID != nil &&
-		haUint64StatusValue(identity.TimelineID) > 0 &&
+		standbyUint64StatusValue(identity.TimelineID) > 0 &&
 		identity.Epoch != nil &&
-		haUint64StatusValue(identity.Epoch) > 0
+		standbyUint64StatusValue(identity.Epoch) > 0
 }
 
-func haRetentionStatusJSONComplete(retention *haRetentionStatusJSON) bool {
+func standbyRetentionStatusJSONComplete(retention *standbyRetentionStatusJSON) bool {
 	return retention != nil &&
 		retention.PrimaryLSN != nil &&
 		retention.OldestRestartLSN != nil &&
@@ -336,54 +336,54 @@ func haRetentionStatusJSONComplete(retention *haRetentionStatusJSON) bool {
 		retention.ReseedRecommended != nil
 }
 
-func ValidateHAPrimaryStatusResponseEvidence(raw []byte) error {
-	var direct haPrimaryStatusEnvelopeJSON
+func ValidateStandbyPrimaryStatusResponseEvidence(raw []byte) error {
+	var direct standbyPrimaryStatusEnvelopeJSON
 	if err := json.Unmarshal(raw, &direct); err != nil {
 		return err
 	}
 	if direct.Snapshot == nil {
 		return fmt.Errorf("missing primary status snapshot field evidence")
 	}
-	if !haAdminIdentityJSONComplete(direct.Snapshot.Identity) {
+	if !standbyAdminIdentityJSONComplete(direct.Snapshot.Identity) {
 		return fmt.Errorf("missing primary status identity field evidence")
 	}
 	if direct.Snapshot.CurrentLSN == nil {
 		return fmt.Errorf("missing primary status current_lsn field evidence")
 	}
-	if !haRetentionStatusJSONComplete(direct.Snapshot.Retention) {
+	if !standbyRetentionStatusJSONComplete(direct.Snapshot.Retention) {
 		return fmt.Errorf("missing primary status retention field evidence")
 	}
 	if direct.Snapshot.Slots == nil {
 		return fmt.Errorf("missing primary status slots field evidence")
 	}
 	for i, slot := range *direct.Snapshot.Slots {
-		if !haSlotStatusJSONComplete(slot) {
+		if !standbySlotStatusJSONComplete(slot) {
 			return fmt.Errorf("missing primary status slot field evidence at index %d", i)
 		}
 	}
-	if direct.Snapshot.Durability != nil && !haDurabilityStatusJSONComplete(*direct.Snapshot.Durability) {
+	if direct.Snapshot.Durability != nil && !standbyDurabilityStatusJSONComplete(*direct.Snapshot.Durability) {
 		return fmt.Errorf("missing primary status durability field evidence")
 	}
 	return nil
 }
 
-func validateDirectHAPrimaryStatusEvidence(raw []byte) error {
-	var direct haPrimaryStatusEnvelopeJSON
+func validateDirectStandbyPrimaryStatusEvidence(raw []byte) error {
+	var direct standbyPrimaryStatusEnvelopeJSON
 	if err := json.Unmarshal(raw, &direct); err != nil {
 		return err
 	}
 	if direct.Snapshot == nil {
 		return nil
 	}
-	return ValidateHAPrimaryStatusResponseEvidence(raw)
+	return ValidateStandbyPrimaryStatusResponseEvidence(raw)
 }
 
-func haRetentionStatusJSONConsistent(currentLSN uint64, retention *haRetentionStatusJSON, slotCount int) error {
-	primaryLSN := haUint64StatusValue(retention.PrimaryLSN)
-	oldestRestartLSN := haUint64StatusValue(retention.OldestRestartLSN)
-	retainedLSNCount := haUint64StatusValue(retention.RetainedLSNCount)
-	activeSlots := haUint64StatusValue(retention.ActiveSlots)
-	reseedRecommended := haUint64StatusValue(retention.ReseedRecommended)
+func standbyRetentionStatusJSONConsistent(currentLSN uint64, retention *standbyRetentionStatusJSON, slotCount int) error {
+	primaryLSN := standbyUint64StatusValue(retention.PrimaryLSN)
+	oldestRestartLSN := standbyUint64StatusValue(retention.OldestRestartLSN)
+	retainedLSNCount := standbyUint64StatusValue(retention.RetainedLSNCount)
+	activeSlots := standbyUint64StatusValue(retention.ActiveSlots)
+	reseedRecommended := standbyUint64StatusValue(retention.ReseedRecommended)
 
 	if primaryLSN != currentLSN {
 		return fmt.Errorf("primary retention snapshot inconsistent: primary_lsn=%d current_lsn=%d", primaryLSN, currentLSN)
@@ -391,7 +391,7 @@ func haRetentionStatusJSONConsistent(currentLSN uint64, retention *haRetentionSt
 	if oldestRestartLSN > primaryLSN {
 		return fmt.Errorf("primary retention snapshot inconsistent: oldest_restart_lsn=%d primary_lsn=%d", oldestRestartLSN, primaryLSN)
 	}
-	if !haRetainedLSNCountConsistent(primaryLSN, oldestRestartLSN, retainedLSNCount, slotCount) {
+	if !standbyRetainedLSNCountConsistent(primaryLSN, oldestRestartLSN, retainedLSNCount, slotCount) {
 		return fmt.Errorf("primary retention snapshot inconsistent: retained_lsn_count=%d expected=%d", retainedLSNCount, primaryLSN-oldestRestartLSN)
 	}
 	if activeSlots > uint64(slotCount) {
@@ -403,10 +403,10 @@ func haRetentionStatusJSONConsistent(currentLSN uint64, retention *haRetentionSt
 	return nil
 }
 
-func haSlotStatusJSONComplete(slot haSlotStatusJSON) bool {
-	return validHAIdentifier(slot.Name) &&
+func standbySlotStatusJSONComplete(slot standbySlotStatusJSON) bool {
+	return validStandbyIdentifier(slot.Name) &&
 		slot.TimelineID != nil &&
-		haUint64StatusValue(slot.TimelineID) > 0 &&
+		standbyUint64StatusValue(slot.TimelineID) > 0 &&
 		slot.Active != nil &&
 		slot.ReseedRequired != nil &&
 		slot.RestartLSN != nil &&
@@ -417,19 +417,19 @@ func haSlotStatusJSONComplete(slot haSlotStatusJSON) bool {
 		slot.ApplyLagLSN != nil &&
 		slot.SafeReadLagLSN != nil &&
 		slot.RetentionLagLSN != nil &&
-		haSlotStatusJSONValid(slot.Status)
+		standbySlotStatusJSONValid(slot.Status)
 }
 
-func haSlotStatusJSONConsistent(currentLSN uint64, slot haSlotStatusJSON) error {
+func standbySlotStatusJSONConsistent(currentLSN uint64, slot standbySlotStatusJSON) error {
 	name := slot.Name
-	restartLSN := haUint64StatusValue(slot.RestartLSN)
-	receivedLSN := haUint64StatusValue(slot.ReceivedLSN)
-	appliedLSN := haUint64StatusValue(slot.AppliedLSN)
-	safeReadLSN := haUint64StatusValue(slot.SafeReadLSN)
-	writeLagLSN := haUint64StatusValue(slot.WriteLagLSN)
-	applyLagLSN := haUint64StatusValue(slot.ApplyLagLSN)
-	safeReadLagLSN := haUint64StatusValue(slot.SafeReadLagLSN)
-	retentionLagLSN := haUint64StatusValue(slot.RetentionLagLSN)
+	restartLSN := standbyUint64StatusValue(slot.RestartLSN)
+	receivedLSN := standbyUint64StatusValue(slot.ReceivedLSN)
+	appliedLSN := standbyUint64StatusValue(slot.AppliedLSN)
+	safeReadLSN := standbyUint64StatusValue(slot.SafeReadLSN)
+	writeLagLSN := standbyUint64StatusValue(slot.WriteLagLSN)
+	applyLagLSN := standbyUint64StatusValue(slot.ApplyLagLSN)
+	safeReadLagLSN := standbyUint64StatusValue(slot.SafeReadLagLSN)
+	retentionLagLSN := standbyUint64StatusValue(slot.RetentionLagLSN)
 
 	if restartLSN > currentLSN || receivedLSN > currentLSN {
 		return fmt.Errorf("slot %s snapshot inconsistent: progress exceeds primary_lsn", name)
@@ -440,25 +440,25 @@ func haSlotStatusJSONConsistent(currentLSN uint64, slot haSlotStatusJSON) error 
 	if safeReadLSN > appliedLSN {
 		return fmt.Errorf("slot %s snapshot inconsistent: safe_read_lsn=%d applied_lsn=%d", name, safeReadLSN, appliedLSN)
 	}
-	if writeLagLSN != haSaturatingSub(currentLSN, receivedLSN) {
-		return fmt.Errorf("slot %s snapshot inconsistent: write_lag_lsn=%d expected=%d", name, writeLagLSN, haSaturatingSub(currentLSN, receivedLSN))
+	if writeLagLSN != standbySaturatingSub(currentLSN, receivedLSN) {
+		return fmt.Errorf("slot %s snapshot inconsistent: write_lag_lsn=%d expected=%d", name, writeLagLSN, standbySaturatingSub(currentLSN, receivedLSN))
 	}
-	if applyLagLSN != haSaturatingSub(currentLSN, appliedLSN) {
-		return fmt.Errorf("slot %s snapshot inconsistent: apply_lag_lsn=%d expected=%d", name, applyLagLSN, haSaturatingSub(currentLSN, appliedLSN))
+	if applyLagLSN != standbySaturatingSub(currentLSN, appliedLSN) {
+		return fmt.Errorf("slot %s snapshot inconsistent: apply_lag_lsn=%d expected=%d", name, applyLagLSN, standbySaturatingSub(currentLSN, appliedLSN))
 	}
-	if safeReadLagLSN != haSaturatingSub(currentLSN, safeReadLSN) {
-		return fmt.Errorf("slot %s snapshot inconsistent: safe_read_lag_lsn=%d expected=%d", name, safeReadLagLSN, haSaturatingSub(currentLSN, safeReadLSN))
+	if safeReadLagLSN != standbySaturatingSub(currentLSN, safeReadLSN) {
+		return fmt.Errorf("slot %s snapshot inconsistent: safe_read_lag_lsn=%d expected=%d", name, safeReadLagLSN, standbySaturatingSub(currentLSN, safeReadLSN))
 	}
-	if retentionLagLSN != haSaturatingSub(currentLSN, restartLSN) {
-		return fmt.Errorf("slot %s snapshot inconsistent: retention_lag_lsn=%d expected=%d", name, retentionLagLSN, haSaturatingSub(currentLSN, restartLSN))
+	if retentionLagLSN != standbySaturatingSub(currentLSN, restartLSN) {
+		return fmt.Errorf("slot %s snapshot inconsistent: retention_lag_lsn=%d expected=%d", name, retentionLagLSN, standbySaturatingSub(currentLSN, restartLSN))
 	}
 	return nil
 }
 
-func haDurabilityStatusJSONComplete(durability haDurabilityStatusJSON) bool {
-	return haDurabilityDecisionStatusJSONValid(durability.Status) &&
-		haDurabilityModeJSONValid(durability.Mode) &&
-		haStandbySelectionJSONValid(durability.Selection) &&
+func standbyDurabilityStatusJSONComplete(durability standbyDurabilityStatusJSON) bool {
+	return standbyDurabilityDecisionStatusJSONValid(durability.Status) &&
+		standbyDurabilityModeJSONValid(durability.Mode) &&
+		standbySelectionJSONValid(durability.Selection) &&
 		durability.TargetLSN != nil &&
 		durability.ProgressLSN != nil &&
 		durability.MissingLSNCount != nil &&
@@ -467,13 +467,13 @@ func haDurabilityStatusJSONComplete(durability haDurabilityStatusJSON) bool {
 		durability.CandidateCount != nil
 }
 
-func haDurabilityStatusJSONConsistent(durability haDurabilityStatusJSON) error {
-	targetLSN := haUint64StatusValue(durability.TargetLSN)
-	progressLSN := haUint64StatusValue(durability.ProgressLSN)
-	missingLSNCount := haUint64StatusValue(durability.MissingLSNCount)
-	satisfiedCount := haUint64StatusValue(durability.SatisfiedCount)
-	requiredCount := haUint64StatusValue(durability.RequiredCount)
-	candidateCount := haUint64StatusValue(durability.CandidateCount)
+func standbyDurabilityStatusJSONConsistent(durability standbyDurabilityStatusJSON) error {
+	targetLSN := standbyUint64StatusValue(durability.TargetLSN)
+	progressLSN := standbyUint64StatusValue(durability.ProgressLSN)
+	missingLSNCount := standbyUint64StatusValue(durability.MissingLSNCount)
+	satisfiedCount := standbyUint64StatusValue(durability.SatisfiedCount)
+	requiredCount := standbyUint64StatusValue(durability.RequiredCount)
+	candidateCount := standbyUint64StatusValue(durability.CandidateCount)
 
 	if progressLSN > targetLSN {
 		return fmt.Errorf("durability status inconsistent: progress_lsn=%d target_lsn=%d", progressLSN, targetLSN)
@@ -484,49 +484,49 @@ func haDurabilityStatusJSONConsistent(durability haDurabilityStatusJSON) error {
 	if satisfiedCount > candidateCount {
 		return fmt.Errorf("durability status inconsistent: satisfied_count=%d candidate_count=%d", satisfiedCount, candidateCount)
 	}
-	if HADurabilityDecisionStatus(strings.TrimSpace(durability.Status)) == HADurabilityStatusSatisfied && satisfiedCount < requiredCount {
+	if StandbyDurabilityDecisionStatus(strings.TrimSpace(durability.Status)) == StandbyDurabilityStatusSatisfied && satisfiedCount < requiredCount {
 		return fmt.Errorf("durability status inconsistent: satisfied_count=%d required_count=%d", satisfiedCount, requiredCount)
 	}
 	return nil
 }
 
-func haSlotStatusJSONValid(status string) bool {
-	switch HASlotSnapshotStatus(strings.TrimSpace(status)) {
-	case HASlotSnapshotStatusHealthy, HASlotSnapshotStatusLagging, HASlotSnapshotStatusReseedRequired:
+func standbySlotStatusJSONValid(status string) bool {
+	switch StandbySlotSnapshotStatus(strings.TrimSpace(status)) {
+	case StandbySlotSnapshotStatusHealthy, StandbySlotSnapshotStatusLagging, StandbySlotSnapshotStatusReseedRequired:
 		return true
 	default:
 		return false
 	}
 }
 
-func haDurabilityDecisionStatusJSONValid(status string) bool {
-	switch HADurabilityDecisionStatus(strings.TrimSpace(status)) {
-	case HADurabilityStatusSatisfied, HADurabilityStatusWouldBlock, HADurabilityStatusFailClosed, HADurabilityStatusDegradedToAsync:
+func standbyDurabilityDecisionStatusJSONValid(status string) bool {
+	switch StandbyDurabilityDecisionStatus(strings.TrimSpace(status)) {
+	case StandbyDurabilityStatusSatisfied, StandbyDurabilityStatusWouldBlock, StandbyDurabilityStatusFailClosed, StandbyDurabilityStatusDegradedToAsync:
 		return true
 	default:
 		return false
 	}
 }
 
-func haDurabilityModeJSONValid(mode string) bool {
-	switch HADurabilityDecisionMode(strings.TrimSpace(mode)) {
-	case HADurabilityModeAsync, HADurabilityModeRemoteWrite, HADurabilityModeRemoteApply:
+func standbyDurabilityModeJSONValid(mode string) bool {
+	switch StandbyDurabilityDecisionMode(strings.TrimSpace(mode)) {
+	case StandbyDurabilityModeAsync, StandbyDurabilityModeRemoteWrite, StandbyDurabilityModeRemoteApply:
 		return true
 	default:
 		return false
 	}
 }
 
-func haStandbySelectionJSONValid(selection string) bool {
-	switch HADurabilityDecisionSelection(strings.TrimSpace(selection)) {
-	case HADurabilitySelectionAny, HADurabilitySelectionFirst, HADurabilitySelectionAll:
+func standbySelectionJSONValid(selection string) bool {
+	switch StandbyDurabilityDecisionSelection(strings.TrimSpace(selection)) {
+	case StandbyDurabilitySelectionAny, StandbyDurabilitySelectionFirst, StandbyDurabilitySelectionAll:
 		return true
 	default:
 		return false
 	}
 }
 
-func haStandbyStatusJSONComplete(snapshot *haStandbyStatusJSON) bool {
+func standbyStatusJSONComplete(snapshot *standbyStatusJSON) bool {
 	return snapshot != nil &&
 		snapshot.ReceivedLSN != nil &&
 		snapshot.AppliedLSN != nil &&
@@ -536,41 +536,41 @@ func haStandbyStatusJSONComplete(snapshot *haStandbyStatusJSON) bool {
 		snapshot.CanServeSafeReads != nil
 }
 
-func ValidateHAStandbyStatusResponseEvidence(raw []byte) error {
-	var direct haStandbyStatusEnvelopeJSON
+func ValidateStandbyStatusResponseEvidence(raw []byte) error {
+	var direct standbyStatusEnvelopeJSON
 	if err := json.Unmarshal(raw, &direct); err != nil {
 		return err
 	}
 	if direct.Snapshot == nil {
 		return fmt.Errorf("missing standby status snapshot field evidence")
 	}
-	if !haAdminIdentityJSONComplete(direct.Snapshot.Identity) {
+	if !standbyAdminIdentityJSONComplete(direct.Snapshot.Identity) {
 		return fmt.Errorf("missing standby status identity field evidence")
 	}
-	if !haStandbyStatusJSONComplete(direct.Snapshot) {
+	if !standbyStatusJSONComplete(direct.Snapshot) {
 		return fmt.Errorf("missing standby status progress field evidence")
 	}
 	return nil
 }
 
-func validateDirectHAStandbyStatusEvidence(raw []byte) error {
-	var direct haStandbyStatusEnvelopeJSON
+func validateDirectStandbyStatusEvidence(raw []byte) error {
+	var direct standbyStatusEnvelopeJSON
 	if err := json.Unmarshal(raw, &direct); err != nil {
 		return err
 	}
 	if direct.Snapshot == nil {
 		return nil
 	}
-	return ValidateHAStandbyStatusResponseEvidence(raw)
+	return ValidateStandbyStatusResponseEvidence(raw)
 }
 
-func haStandbyStatusJSONConsistent(snapshot *haStandbyStatusJSON) error {
-	receivedLSN := haUint64StatusValue(snapshot.ReceivedLSN)
-	appliedLSN := haUint64StatusValue(snapshot.AppliedLSN)
-	safeReadLSN := haUint64StatusValue(snapshot.SafeReadLSN)
-	unappliedLSNCount := haUint64StatusValue(snapshot.UnappliedLSNCount)
-	caughtUpToReceived := haBoolStatusValue(snapshot.CaughtUpToReceived)
-	canServeSafeReads := haBoolStatusValue(snapshot.CanServeSafeReads)
+func standbyStatusJSONConsistent(snapshot *standbyStatusJSON) error {
+	receivedLSN := standbyUint64StatusValue(snapshot.ReceivedLSN)
+	appliedLSN := standbyUint64StatusValue(snapshot.AppliedLSN)
+	safeReadLSN := standbyUint64StatusValue(snapshot.SafeReadLSN)
+	unappliedLSNCount := standbyUint64StatusValue(snapshot.UnappliedLSNCount)
+	caughtUpToReceived := standbyBoolStatusValue(snapshot.CaughtUpToReceived)
+	canServeSafeReads := standbyBoolStatusValue(snapshot.CanServeSafeReads)
 
 	if appliedLSN > receivedLSN {
 		return fmt.Errorf("standby status inconsistent: applied_lsn=%d received_lsn=%d", appliedLSN, receivedLSN)
@@ -588,39 +588,39 @@ func haStandbyStatusJSONConsistent(snapshot *haStandbyStatusJSON) error {
 		return fmt.Errorf("standby status inconsistent: can_serve_safe_reads=%t expected=%t", canServeSafeReads, safeReadLSN <= appliedLSN)
 	}
 	if snapshot.UpstreamLSN != nil {
-		upstreamLSN := haUint64StatusValue(snapshot.UpstreamLSN)
-		if snapshot.WriteLagLSN != nil && haUint64StatusValue(snapshot.WriteLagLSN) != haSaturatingSub(upstreamLSN, receivedLSN) {
-			return fmt.Errorf("standby status inconsistent: write_lag_lsn=%d expected=%d", haUint64StatusValue(snapshot.WriteLagLSN), haSaturatingSub(upstreamLSN, receivedLSN))
+		upstreamLSN := standbyUint64StatusValue(snapshot.UpstreamLSN)
+		if snapshot.WriteLagLSN != nil && standbyUint64StatusValue(snapshot.WriteLagLSN) != standbySaturatingSub(upstreamLSN, receivedLSN) {
+			return fmt.Errorf("standby status inconsistent: write_lag_lsn=%d expected=%d", standbyUint64StatusValue(snapshot.WriteLagLSN), standbySaturatingSub(upstreamLSN, receivedLSN))
 		}
-		if snapshot.ReceiveLagLSN != nil && haUint64StatusValue(snapshot.ReceiveLagLSN) != haSaturatingSub(upstreamLSN, receivedLSN) {
-			return fmt.Errorf("standby status inconsistent: receive_lag_lsn=%d expected=%d", haUint64StatusValue(snapshot.ReceiveLagLSN), haSaturatingSub(upstreamLSN, receivedLSN))
+		if snapshot.ReceiveLagLSN != nil && standbyUint64StatusValue(snapshot.ReceiveLagLSN) != standbySaturatingSub(upstreamLSN, receivedLSN) {
+			return fmt.Errorf("standby status inconsistent: receive_lag_lsn=%d expected=%d", standbyUint64StatusValue(snapshot.ReceiveLagLSN), standbySaturatingSub(upstreamLSN, receivedLSN))
 		}
-		if snapshot.ApplyLagLSN != nil && haUint64StatusValue(snapshot.ApplyLagLSN) != haSaturatingSub(upstreamLSN, appliedLSN) {
-			return fmt.Errorf("standby status inconsistent: apply_lag_lsn=%d expected=%d", haUint64StatusValue(snapshot.ApplyLagLSN), haSaturatingSub(upstreamLSN, appliedLSN))
+		if snapshot.ApplyLagLSN != nil && standbyUint64StatusValue(snapshot.ApplyLagLSN) != standbySaturatingSub(upstreamLSN, appliedLSN) {
+			return fmt.Errorf("standby status inconsistent: apply_lag_lsn=%d expected=%d", standbyUint64StatusValue(snapshot.ApplyLagLSN), standbySaturatingSub(upstreamLSN, appliedLSN))
 		}
 	}
 	return nil
 }
 
-func haUint64StatusValue(value *uint64) uint64 {
+func standbyUint64StatusValue(value *uint64) uint64 {
 	if value == nil {
 		return 0
 	}
 	return *value
 }
 
-func haBoolStatusValue(value *bool) bool {
+func standbyBoolStatusValue(value *bool) bool {
 	return value != nil && *value
 }
 
-func haStringStatusValue(value *string) string {
+func standbyStringStatusValue(value *string) string {
 	if value == nil {
 		return ""
 	}
 	return strings.TrimSpace(*value)
 }
 
-func haSaturatingSub(a, b uint64) uint64 {
+func standbySaturatingSub(a, b uint64) uint64 {
 	if b >= a {
 		return 0
 	}

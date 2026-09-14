@@ -1,7 +1,7 @@
 {
   "schema": "antfly.qwen3_embedding.benchmark_fixture.v2",
   "model_sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
-  "expanded_cases_sha256": "9e0b463d9ecb82826c3809fffb43b8000bf798b457ef34e0271321d0977a898e",
+  "expanded_cases_sha256": "b46615509d252a0eb99072480ba2abca6c4f994f240b064508c485b3d16e1ba6",
   "tokenizer": {
     "implementation": "llama-tokenize and llama-server /tokenize",
     "build_commit": "660b1b4bd",
@@ -9,10 +9,14 @@
     "add_bos": false,
     "add_eos": true,
     "cache_neutral": "Each equal-length case has a distinct first token; strict runs consume each case once.",
-    "endpoint_contract": "Use the GGUF default add_eos=true. Expanded token sequences include the final EOS; Antfly usage reports raw text tokens (-1 per input), while llama.cpp reports model tokens."
+    "endpoint_contract": "Use the GGUF default add_eos=true. Expanded token sequences include the final EOS; Antfly usage reports raw text tokens (-1 per input), while llama.cpp reports model tokens.",
+    "verification": {
+      "implementation": "Hugging Face tokenizers; every expanded case including EOS",
+      "tokenizer_json_sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"
+    }
   },
   "recipe": {
-    "token_counts": [511, 2551],
+    "token_counts": [20, 256, 511, 2551, 4096, 8192],
     "continuation": {
       "text": " token",
       "token_id": 3950

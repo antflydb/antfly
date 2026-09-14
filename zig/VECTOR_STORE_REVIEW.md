@@ -1,9 +1,12 @@
 # Vector store correctness and design review — 2026-09-08
 
-The subsequent [memory and bookkeeping investigation](../.benchmark-results/vector-structural-refined/README.md)
+> Paths under `.benchmark-results/` refer to local benchmark output that is not tracked in git.
+
+
+The subsequent memory and bookkeeping investigation (`.benchmark-results/vector-structural-refined/README.md`)
 did not reproduce extra catalog heap or mapped-file retention. A WAL-membership
 prototype passed lifecycle checks but did not establish an overall 50K win. The
-current [deferred-inventory and recovery revision](../.benchmark-results/vector-structural-recovery/README.md)
+current deferred-inventory and recovery revision (`.benchmark-results/vector-structural-recovery/README.md`)
 instead avoids eager occurrence-map construction when a validated receipt already
 provides physical totals. Its 37 source checks pass with receipts enabled.
 Timeout investigation reproduced competing startup reconstruction while durable
@@ -14,7 +17,7 @@ now pass on the pinned release. The scale results below include a separate memor
 failure; both default and explicit ANN settings use native storage.
 
 
-The subsequent [source publication memory fix](../.benchmark-results/vector-source-memory-fix/README.md)
+The subsequent source publication memory fix (`.benchmark-results/vector-source-memory-fix/README.md`)
 reproduces the suspected OOM as a source-budget rejection of a second WAL-sized
 allocation during GC preparation. Full and selective GC now prepare readers and
 inventory before publication, reuse the committed WAL suffix, and preserve the
@@ -26,7 +29,7 @@ That revision passes fresh 50K ABBA and its lifecycle checks, but the second
 1M candidate logs one maintenance OOM and is excluded. A same-binary diagnostic
 identifies a separate 77,594,648-byte mark-map allocation with 332,745,026 live
 bytes against the 402,653,184-byte source slice. The
-[mark-workspace follow-up](../.benchmark-results/vector-source-memory-admission/README.md)
+mark-workspace follow-up (`.benchmark-results/vector-source-memory-admission/README.md`)
 admits the map and source leases against the resident ANN snapshot before map
 allocation. Rejected setup releases its temporary snapshots and retries later;
 backing allocation and I/O failures still propagate. Its regression verifies
@@ -51,7 +54,7 @@ memory demand. Maximum sampled source WAL is 48.05 MiB in all four 1M arms.
 These periodic samples are not exact peaks. The second 1M control lacks a
 complete churn-stage source-counter interval; its lock/inventory breakdown is
 unavailable, not zero. See the
-[qualified results](../.benchmark-results/vector-source-memory-admission/RESULTS.md).
+qualified results (`.benchmark-results/vector-source-memory-admission/RESULTS.md`).
 Both arms contain the fixes: this is not a pre-fix/post-fix timing comparison,
 a comparison against `primary_lsm`, or qualification of other deployment modes.
 The frozen source/harness/binary hashes verify. Qualification excludes unrelated
@@ -88,8 +91,8 @@ collection before the errors, but the failing allocation is not identified.
 Next, reproduce memory admission/collection scratch pressure with allocation
 evidence, fix it while preserving publication and recovery fences, then rerun
 fresh 1M ABBA. No defaults change. See the
-[full results](../.benchmark-results/vector-structural-selected/RESULTS.md) and
-[memory-failure evidence](../.benchmark-results/vector-structural-selected/MEMORY_FAILURE.md).
+full results (`.benchmark-results/vector-structural-selected/RESULTS.md`) and
+memory-failure evidence (`.benchmark-results/vector-structural-selected/MEMORY_FAILURE.md`).
 
 Implementation follow-up: the first three opportunities below are now optional
 experiments under `.benchmark-results/vector-structural/`. Its `README.md`,
@@ -105,7 +108,7 @@ increased mixed RSS; incremental inventory reduced publication lock time while
 increasing bookkeeping cost and reducing mixed query throughput. Independent
 scanning showed no overall benefit. All switches remain experimental, with no
 combined subset or new 1M qualification. The full
-[results and next investigations](../.benchmark-results/vector-structural/RESULTS.md)
+results and next investigations (`.benchmark-results/vector-structural/RESULTS.md`)
 supersede the initial performance priorities below.
 
 The ownership shape remains useful: primary transactions own artifact-version
@@ -122,7 +125,7 @@ were changed or run for this review. The previous measured revision passed 61
 storage checks, five API checks, 12 timed 50K arms, and 12 reclamation clones.
 The subsequent planning-failure fix passed 30 source checks with ownership off
 and on; its binary was not benchmarked again. See
-[the measurement record](../.benchmark-results/vector-progress-dedup/RESULTS.md).
+the measurement record (`.benchmark-results/vector-progress-dedup/RESULTS.md`).
 
 ## Correctness boundaries to preserve and review further
 

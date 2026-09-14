@@ -281,6 +281,29 @@ That is a different feature with a much larger correctness surface.
 - Resolve transforms once per key against the effective pending state for that key.
 - Avoid unnecessary copying for borrowed writes/deletes; only own transformed outputs.
 
+## Linear Merge (Range-Based External Sync)
+
+The linear merge endpoint gives external sources -- a foreign database, a REST
+API, anything that can emit sorted records -- a stateless way to progressively
+sync a table without either side keeping session state. Each request carries a
+page of records plus `last_merged_id`, the cursor from the previous page (empty
+on the first request). The server scans its own key range from that cursor up
+to the highest ID in the page, upserts records whose content hash differs from
+what is stored, and deletes any key in that scanned range that is present in
+storage but absent from the incoming page; it then returns `next_cursor` (the
+highest ID processed) for the client to pass back as `last_merged_id` on the
+next page. Because the delete decision is scoped to exactly the range covered
+by one page, retrying a page after a failure recomputes the same upserts and
+the same deletions from the same range, so repeating a page is idempotent
+rather than compounding.
+
+One page's key range can span more than one shard. When that happens, the
+server processes only the portion of the page up to the shard boundary rather
+than silently completing a merge that only covered part of the requested
+range; the client keeps paging with the returned cursor until the input is
+exhausted, so a boundary crossing costs an extra round trip rather than a
+correctness gap.
+
 ## Measurement
 
 We want a lightweight bench that isolates the coalescing win without the full replay/catch-up

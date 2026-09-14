@@ -42,6 +42,11 @@ pub fn write(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
             try stream.endArray();
         },
         .optional => if (value) |payload| try write(payload, stream) else try stream.write(null),
+        .void => {
+            // std.json's canonical tagged-union representation for void.
+            try stream.beginObject();
+            try stream.endObject();
+        },
         .@"enum" => try stream.write(@tagName(value)),
         else => try stream.write(value),
     }

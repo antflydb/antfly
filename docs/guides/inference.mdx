@@ -18,7 +18,7 @@ tags: [inference, embeddings, reranking, models]
 - Why is my index stuck with pending enrichments?
 </Questions>
 
-Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, transcription, reading, and generation models (text generation from text, image, and audio prompts) in the same process as the database, so index enrichers and query processors call it without a network hop and nothing leaves the machine. It executes optimized ONNX and native GGUF artifacts without external API dependencies. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
+Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, transcription, reading, and generation models (text generation from text, image, and audio prompts) in the same process as the database, so index enrichers and query processors call it without a network hop and nothing leaves the machine. It executes model artifacts through native (CPU/Metal/CUDA), ONNX, and `ortgenai` backends without external API dependencies. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
 
 Pull a model, then embed a sentence through the running engine:
 
@@ -75,21 +75,20 @@ explicit artifact reference (for example, `owner/model:gguf:Q4_K`) before
 resolution. Conflicts between preferences and already-qualified references are
 rejected rather than silently selecting another installed artifact.
 
-This config support is for the next runtime release; v0.2.1 requires explicit
-model CLI flags. The operator continues passing those flags so its fix can be
-released independently of the runtime update.
-For that compatibility, the operator resolves nested model overrides into the
-flat config spelling before emitting JSON or CLI arguments. It writes default
-model kinds (`generator` when omitted in `spec.config.preload`) and normalized
-artifact references into both outputs. Remaining non-model nested settings are
-preserved with the client URL field required by the legacy schema; admission
-settings and flat per-model policies remain intact.
-Config-only per-model policies require the new runtime; releasing the operator
-does not add those capabilities to v0.2.1.
+The runtime reads this config directly. The operator additionally emits
+equivalent `--models-dir`, `--ml-dir`, `--max-loaded-models`, and one
+`--preload-model` flag per preload entry, so a pod still running an older
+runtime binary that predates config-file model policies keeps working during
+a rolling upgrade. The operator resolves nested model overrides into the flat
+config spelling before emitting JSON or CLI arguments, writes default model
+kinds (`generator` when omitted in `spec.config.preload`) and normalized
+artifact references into both outputs, and preserves remaining non-model
+nested settings alongside the client URL field required by the legacy schema;
+admission settings and flat per-model policies remain intact.
 
 For operator-generated eager preloads (the default loading strategy), specify a
 recognized task such as `tasks: [embed]` or `tasks: [generate]` on each model.
-The v0.2.1 warm CLI needs a model kind; an omitted or unrecognized task hint
+The warm CLI needs a model kind; an omitted or unrecognized task hint
 does not imply a generator. The operator reports a configuration validation
 failure before creating or updating the workload when that kind is ambiguous.
 Alternatively, supply `spec.config.preload` with an explicit `kind`, or use
@@ -123,7 +122,7 @@ Verified starting points, one per job:
 | Generation | `ggml-org/gemma-4-E4B-it-GGUF` |
 | Transcription | `openai/whisper-tiny` |
 | Reading and OCR | `antflydb/Florence-2-base` |
-| Extraction | `antflydb/gliner2-base-v1:gguf:Q4_K` |
+| Extraction | `antflydb/gliner2-base-v1` |
 
 See what is installed:
 

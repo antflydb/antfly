@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Backend-neutral deterministic fault wrapper for object-store protocols.
 //! The wrapper is deliberately independent of Antfly and VOPR: a scheduler,
@@ -16,6 +27,7 @@ pub const Client = struct {
     allocator: Allocator,
     backing: client_mod.Client,
     next_put: PutFault = .none,
+    put_filter: ?struct { ptr: *anyopaque, matches: *const fn (*anyopaque, []const u8, []const u8, []const u8) bool } = null,
     next_get: GetFault = .none,
     hidden_bucket: ?[]u8 = null,
     hidden_key: ?[]u8 = null,
@@ -96,6 +108,7 @@ pub const Client = struct {
     /// while committed backing data and provider-side visibility state remain.
     pub fn resetClientAfterCrash(self: *Client) void {
         self.next_put = .none;
+        self.put_filter = null;
         self.next_get = .none;
     }
 
@@ -161,6 +174,11 @@ pub const Client = struct {
     ) !types.PutResult {
         const self: *Client = @ptrCast(@alignCast(ptr));
         self.put_attempts +|= 1;
+        if (self.put_filter) |filter| {
+            if (!filter.matches(filter.ptr, bucket, key, body))
+                return self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options);
+            self.put_filter = null;
+        }
         return switch (self.takePutFault()) {
             .none => self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options),
             .fail_before => |err| err,

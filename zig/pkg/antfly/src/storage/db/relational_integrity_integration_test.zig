@@ -20,7 +20,7 @@ const tuples = @import("relational_index_keys.zig");
 fn applyRestoreReplica(db: *db_mod.DB, request: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
     if (!ha) return db.batchRaftReplicatedApply(request, .{ .term = 1, .index = index });
     const alloc = std.testing.allocator;
-    const payload = try @import("../ha/effects.zig").encodeBatchMutationRequestAlloc(alloc, request);
+    const payload = try @import("../hot_standby/effects.zig").encodeBatchMutationRequestAlloc(alloc, request);
     defer alloc.free(payload);
     try db.applyHAReplicationRecord(.{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index, .previous_lsn = index - 1, .payload = payload });
 }
@@ -50,8 +50,8 @@ test "relational integrity restore follower repairs projection and CHECK debt be
     var source = try db_mod.DB.open(alloc, source_path, source_options);
     defer source.close();
     for ([_]bool{ false, true }, 0..) |ha, attempt| {
-        var gate: @import("../ha/public_gate_state.zig").State = .{};
-        gate.role.store(@intFromEnum(@import("../ha/public_gate_state.zig").Role.standby), .release);
+        var gate: @import("../hot_standby/public_gate_state.zig").State = .{};
+        gate.role.store(@intFromEnum(@import("../hot_standby/public_gate_state.zig").Role.standby), .release);
         const path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/lag-{d}", .{ tmp.sub_path, attempt });
         const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .open_mode = .writer_no_replay, .start_optional_runtimes = false, .start_index_workers = false };
         var target = try db_mod.DB.open(alloc, path, options);
@@ -350,8 +350,8 @@ fn generationSet(db: *db_mod.DB) ![32]u8 {
 test "relational integrity scoped two phase resolution mirrors binary claims through HA" {
     const alloc = std.testing.allocator;
     const restore = @import("restore_staging.zig");
-    const primary_mod = @import("../ha/primary.zig");
-    const effects = @import("../ha/effects.zig");
+    const primary_mod = @import("../hot_standby/primary.zig");
+    const effects = @import("../hot_standby/effects.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -428,8 +428,8 @@ test "relational integrity scoped two phase resolution mirrors binary claims thr
 
 test "relational integrity live two phase HA replay preserves rows and binary claim reference effects" {
     const alloc = std.testing.allocator;
-    const primary_mod = @import("../ha/primary.zig");
-    const effects = @import("../ha/effects.zig");
+    const primary_mod = @import("../hot_standby/primary.zig");
+    const effects = @import("../hot_standby/effects.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -896,7 +896,7 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
     const destination_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/destination", .{tmp.sub_path});
-    var primary: @import("../ha/primary.zig").Primary = if (ha) try @import("../ha/primary.zig").Primary.open(alloc, try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-log", .{tmp.sub_path}, 0), try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-slots", .{tmp.sub_path}, 0), .{ .cluster_id = 901, .timeline_id = 1, .epoch = 1 }, .{}) else undefined;
+    var primary: @import("../hot_standby/primary.zig").Primary = if (ha) try @import("../hot_standby/primary.zig").Primary.open(alloc, try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-log", .{tmp.sub_path}, 0), try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-slots", .{tmp.sub_path}, 0), .{ .cluster_id = 901, .timeline_id = 1, .epoch = 1 }, .{}) else undefined;
     defer if (ha) primary.close();
     const source_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 901 }, .primary_backend = .{ .lsm = .{} } };
     const destination_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 902 }, .primary_backend = .{ .lsm = .{} }, .ha_async_batch_mirror = if (ha) .{ .primary = &primary } else null, .ha_write_gate = if (ha) .{ .primary = &primary } else null };
@@ -1028,7 +1028,7 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
     if (ha) try verifyMergeHAReplay(&primary, replay_start, &standby, imported.?, retained.?, true);
 }
 
-fn verifyMergeHAReplay(primary: *@import("../ha/primary.zig").Primary, start_lsn: u64, standby: *db_mod.DB, imported: integrity.Address, retained: integrity.Address, rollback: bool) !void {
+fn verifyMergeHAReplay(primary: *@import("../hot_standby/primary.zig").Primary, start_lsn: u64, standby: *db_mod.DB, imported: integrity.Address, retained: integrity.Address, rollback: bool) !void {
     var lsn = start_lsn;
     while (lsn <= primary.lastLsn()) : (lsn += 1) {
         var entry = (try primary.log.entryAt(std.testing.allocator, lsn)) orelse return error.TestUnexpectedResult;

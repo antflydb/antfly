@@ -386,6 +386,18 @@ pub const DropIndexPathParams = struct {
     index_name: []const u8,
 };
 
+/// Execute a graph metric operational action
+pub const ExecuteGraphMetricActionPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the graph index
+    index_name: []const u8,
+    /// Name of the configured graph metric
+    metric_name: []const u8,
+    /// Operational action to apply to the graph metric materialization
+    action: []const u8,
+};
+
 /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 pub const LinearMergePathParams = struct {
     /// Name of the table
@@ -406,6 +418,17 @@ pub const QueryTablePathParams = struct {
 /// Parse the JSON request body for queryTable.
 pub fn parseQueryTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StatefulQueryRequest) {
     return std.json.parseFromSlice(types.StatefulQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Start a durable index control job
+pub const StartTableRepairControlJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for startTableRepairControlJob.
+pub fn parseStartTableRepairControlJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TableRepairControlJobStartRequest) {
+    return std.json.parseFromSlice(types.TableRepairControlJobStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// List table repair issues
@@ -661,8 +684,10 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/control-jobs", .operation_id = "startTableRepairControlJob", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/issues", .operation_id = "listTableRepairIssues", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs", .operation_id = "startTableRepairJob", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/repair/jobs/{jobId}", .operation_id = "getTableRepairJob", .request_body = .none, .streaming_response = false },
@@ -746,8 +771,10 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "getIndex")) @compileError("ServerRouter: Impl missing required method 'getIndex'");
         if (!@hasDecl(Impl, "createIndex")) @compileError("ServerRouter: Impl missing required method 'createIndex'");
         if (!@hasDecl(Impl, "dropIndex")) @compileError("ServerRouter: Impl missing required method 'dropIndex'");
+        if (!@hasDecl(Impl, "executeGraphMetricAction")) @compileError("ServerRouter: Impl missing required method 'executeGraphMetricAction'");
         if (!@hasDecl(Impl, "linearMerge")) @compileError("ServerRouter: Impl missing required method 'linearMerge'");
         if (!@hasDecl(Impl, "queryTable")) @compileError("ServerRouter: Impl missing required method 'queryTable'");
+        if (!@hasDecl(Impl, "startTableRepairControlJob")) @compileError("ServerRouter: Impl missing required method 'startTableRepairControlJob'");
         if (!@hasDecl(Impl, "listTableRepairIssues")) @compileError("ServerRouter: Impl missing required method 'listTableRepairIssues'");
         if (!@hasDecl(Impl, "startTableRepairJob")) @compileError("ServerRouter: Impl missing required method 'startTableRepairJob'");
         if (!@hasDecl(Impl, "getTableRepairJob")) @compileError("ServerRouter: Impl missing required method 'getTableRepairJob'");
@@ -829,8 +856,10 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, getIndex));
             try server.post("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createIndex));
             try server.delete("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, dropIndex));
+            try server.post("/tables/:tableName/indexes/:indexName/graph-metrics/:metricName::action", httpx.Handler.bind(self.impl, executeGraphMetricAction));
             try server.post("/tables/:tableName/merge", httpx.Handler.bind(self.impl, linearMerge));
             try server.post("/tables/:tableName/query", httpx.Handler.bind(self.impl, queryTable));
+            try server.post("/tables/:tableName/repair/control-jobs", httpx.Handler.bind(self.impl, startTableRepairControlJob));
             try server.post("/tables/:tableName/repair/issues", httpx.Handler.bind(self.impl, listTableRepairIssues));
             try server.post("/tables/:tableName/repair/jobs", httpx.Handler.bind(self.impl, startTableRepairJob));
             try server.get("/tables/:tableName/repair/jobs/:jobId", httpx.Handler.bind(self.impl, getTableRepairJob));
@@ -1216,6 +1245,16 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.dropIndex(ctx, table_name, index_name);
         }
 
+        /// Execute a graph metric operational action
+        /// POST /tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}
+        fn executeGraphMetricAction(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
+            const metric_name = ctx.param("metricName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: metricName" });
+            const action = ctx.param("action") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: action" });
+            return impl.executeGraphMetricAction(ctx, table_name, index_name, metric_name, action);
+        }
+
         /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
         /// POST /tables/{tableName}/merge
         fn linearMerge(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1228,6 +1267,13 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn queryTable(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.queryTable(ctx, table_name);
+        }
+
+        /// Start a durable index control job
+        /// POST /tables/{tableName}/repair/control-jobs
+        fn startTableRepairControlJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.startTableRepairControlJob(ctx, table_name);
         }
 
         /// List table repair issues
@@ -1451,8 +1497,10 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn startTableRepairControlJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn listTableRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response

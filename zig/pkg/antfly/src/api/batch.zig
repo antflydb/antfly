@@ -13,28 +13,42 @@
 // limitations.
 
 const std = @import("std");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
+const ant_json = @import("antfly-json");
 const document_mapper = @import("../storage/db/document_mapper.zig");
 const public_limits = @import("public_limits.zig");
+
+pub const BatchFailure = struct {
+    code: []const u8,
+    message: []const u8,
+    reason: ?[]const u8 = null,
+    retryable: bool,
+};
 
 pub const BatchResult = struct {
     status: []const u8 = "committed",
     inserted: u32,
     deleted: u32,
     transformed: u32 = 0,
+    /// Additive details for a durable commit that needs operator action. Keep
+    /// the stable status vocabulary so older strict-enum SDKs can still parse
+    /// the committed response and safely avoid replaying the mutation.
+    failure: ?BatchFailure = null,
 };
 
 pub const OwnedBatchRequest = struct {
     writes: []db_mod.types.BatchWrite = &.{},
     deletes: [][]const u8 = &.{},
     transforms: []db_mod.types.DocumentTransform = &.{},
+    graph_writes: []db_mod.types.GraphEdgeWrite = &.{},
+    graph_deletes: []db_mod.types.GraphEdgeDelete = &.{},
     predicates: []db_mod.types.TransactionVersionPredicate = &.{},
     integrity: []const db_mod.types.TransactionIntegrityOperation = &.{},
-    integrity_commands: ?std.json.Parsed([]const @import("../storage/db/relational_integrity.zig").Command) = null,
-    relational_activation: ?std.json.Parsed(@import("../storage/db/relational_integrity_activation.zig").Command) = null,
-    relational_retirement: ?std.json.Parsed(@import("../storage/db/relational_integrity_retirement.zig").Command) = null,
-    relational_topology: ?std.json.Parsed(@import("../storage/db/relational_integrity_topology.zig").Command) = null,
-    restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging.zig").Control) = null,
+    integrity_commands: ?std.json.Parsed([]const @import("../storage/db/relational_integrity_contract.zig").Command) = null,
+    relational_activation: ?std.json.Parsed(@import("../storage/db/relational_integrity_activation_contract.zig").Command) = null,
+    relational_retirement: ?std.json.Parsed(@import("../storage/db/relational_integrity_retirement_contract.zig").Command) = null,
+    relational_topology: ?std.json.Parsed(@import("../storage/db/relational_integrity_topology_contract.zig").Command) = null,
+    restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
     transaction_participants: [][]const u8 = &.{},
     split_checkpoint_range_start: ?[]u8 = null,
     split_checkpoint_range_end: ?[]u8 = null,
@@ -69,6 +83,8 @@ pub const OwnedBatchRequest = struct {
             if (transform.operations.len > 0) alloc.free(transform.operations);
         }
         if (self.transforms.len > 0) alloc.free(self.transforms);
+        freeGraphWrites(alloc, self.graph_writes);
+        freeGraphDeletes(alloc, self.graph_deletes);
         for (self.predicates) |predicate| alloc.free(@constCast(predicate.key));
         if (self.predicates.len > 0) alloc.free(self.predicates);
         for (self.transaction_participants) |participant| alloc.free(participant);
@@ -95,6 +111,12 @@ pub const OwnedBatchRequest = struct {
     pub fn resultWithStatus(self: OwnedBatchRequest, status: []const u8) BatchResult {
         var result_value = self.result();
         result_value.status = status;
+        return result_value;
+    }
+
+    pub fn resultWithFailure(self: OwnedBatchRequest, failure: BatchFailure) BatchResult {
+        var result_value = self.resultWithStatus("committed_repair_required");
+        result_value.failure = failure;
         return result_value;
     }
 };
@@ -170,27 +192,27 @@ fn parseBatchRequestWithOptions(
     errdefer @import("relational_integrity_wire.zig").free(alloc, integrity);
     var integrity_commands = if (root.get("_integrity_commands")) |value| commands: {
         if (!allow_internal) return error.InvalidBatchRequest;
-        break :commands @as(?std.json.Parsed([]const @import("../storage/db/relational_integrity.zig").Command), try @import("relational_integrity_wire.zig").parseCommands(alloc, value));
+        break :commands @as(?std.json.Parsed([]const @import("../storage/db/relational_integrity_contract.zig").Command), try @import("relational_integrity_wire.zig").parseCommands(alloc, value));
     } else null;
     errdefer if (integrity_commands) |*commands| commands.deinit();
     var relational_activation = if (root.get("_relational_activation")) |value| activation: {
         if (!allow_internal) return error.InvalidBatchRequest;
-        break :activation @as(?std.json.Parsed(@import("../storage/db/relational_integrity_activation.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_activation.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
+        break :activation @as(?std.json.Parsed(@import("../storage/db/relational_integrity_activation_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_activation_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (relational_activation) |*activation| activation.deinit();
     var relational_retirement = if (root.get("_relational_retirement")) |value| retirement: {
         if (!allow_internal) return error.InvalidBatchRequest;
-        break :retirement @as(?std.json.Parsed(@import("../storage/db/relational_integrity_retirement.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_retirement.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
+        break :retirement @as(?std.json.Parsed(@import("../storage/db/relational_integrity_retirement_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_retirement_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (relational_retirement) |*retirement| retirement.deinit();
     var relational_topology = if (root.get("_relational_topology")) |value| topology: {
         if (!allow_internal) return error.InvalidBatchRequest;
-        break :topology @as(?std.json.Parsed(@import("../storage/db/relational_integrity_topology.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_topology.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
+        break :topology @as(?std.json.Parsed(@import("../storage/db/relational_integrity_topology_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_topology_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (relational_topology) |*topology| topology.deinit();
     var restore_staging = if (root.get("_restore_staging")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
-        break :control @as(?std.json.Parsed(@import("../storage/db/restore_staging.zig").Control), try std.json.parseFromValue(@import("../storage/db/restore_staging.zig").Control, alloc, value, .{ .allocate = .alloc_always }));
+        break :control @as(?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control), try std.json.parseFromValue(@import("../storage/db/restore_staging_contract.zig").Control, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (restore_staging) |*control| control.deinit();
     const relational_schema_version: ?u32 = if (root.get("_relational_schema_version")) |value| blk: {
@@ -209,6 +231,25 @@ fn parseBatchRequestWithOptions(
         if (!allow_internal) return error.InvalidBatchRequest;
         break :blk try @import("relational_integrity_wire.zig").parseGenerationSet(value);
     } else null;
+    const graph_writes: []db_mod.types.GraphEdgeWrite = graph_writes: {
+        const value = root.get("_graph_writes") orelse break :graph_writes &.{};
+        if (!allow_internal) return error.InvalidBatchRequest;
+        if (value == .null) break :graph_writes &.{};
+        const parsed_graph_writes = try parseGraphWrites(alloc, value);
+        errdefer freeGraphWrites(alloc, parsed_graph_writes);
+        break :graph_writes parsed_graph_writes;
+    };
+    errdefer freeGraphWrites(alloc, graph_writes);
+
+    const graph_deletes: []db_mod.types.GraphEdgeDelete = graph_deletes: {
+        const value = root.get("_graph_deletes") orelse break :graph_deletes &.{};
+        if (!allow_internal) return error.InvalidBatchRequest;
+        if (value == .null) break :graph_deletes &.{};
+        const parsed_graph_deletes = try parseGraphDeletes(alloc, value);
+        errdefer freeGraphDeletes(alloc, parsed_graph_deletes);
+        break :graph_deletes parsed_graph_deletes;
+    };
+    errdefer freeGraphDeletes(alloc, graph_deletes);
 
     const predicates: []db_mod.types.TransactionVersionPredicate = predicates: {
         const value = root.get("_predicates") orelse break :predicates &.{};
@@ -258,6 +299,12 @@ fn parseBatchRequestWithOptions(
         const value = root.get("_timestamp_ns") orelse break :timestamp 0;
         if (!allow_internal) return error.InvalidBatchRequest;
         break :timestamp try parseInternalU64(value);
+    };
+
+    const reject_graph_transform_projections = reject: {
+        const value = root.get("_reject_graph_transform_projections") orelse break :reject false;
+        if (!allow_internal or value != .bool) return error.InvalidBatchRequest;
+        break :reject value.bool;
     };
 
     var checkpoint_start: ?[]u8 = null;
@@ -599,6 +646,7 @@ fn parseBatchRequestWithOptions(
 
     if ((split_transition != null or merge_source_transition != null) and
         (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or
+            graph_writes.len != 0 or graph_deletes.len != 0 or
             predicates.len != 0 or split_checkpoint != null or split_replication != null or merge_replication != null or
             split_transition != null and merge_source_transition != null or
             merge_checkpoint != null or transaction != null))
@@ -624,6 +672,7 @@ fn parseBatchRequestWithOptions(
     };
     if (split_checkpoint != null and split_checkpoint.?.kind == .source_ack and
         (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or
+            graph_writes.len != 0 or graph_deletes.len != 0 or
             split_replication != null))
     {
         return error.InvalidBatchRequest;
@@ -655,6 +704,8 @@ fn parseBatchRequestWithOptions(
         .writes = writes,
         .deletes = deletes,
         .transforms = transforms,
+        .graph_writes = graph_writes,
+        .graph_deletes = graph_deletes,
         .predicates = predicates,
         .integrity = integrity,
         .integrity_commands = integrity_commands,
@@ -685,9 +736,12 @@ fn parseBatchRequestWithOptions(
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
+            .graph_writes = graph_writes,
+            .graph_deletes = graph_deletes,
             .predicates = predicates,
             .timestamp_ns = timestamp_ns,
             .sync_level = sync_level,
+            .reject_graph_transform_projections = reject_graph_transform_projections,
             .split_checkpoint = split_checkpoint,
             .split_replication = split_replication,
             .merge_replication = merge_replication,
@@ -701,12 +755,7 @@ fn parseBatchRequestWithOptions(
 }
 
 pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{{\"status\":{f},\"inserted\":{d},\"deleted\":{d},\"transformed\":{d}}}", .{
-        std.json.fmt(result.status, .{}),
-        result.inserted,
-        result.deleted,
-        result.transformed,
-    });
+    return try ant_json.valueAlloc(alloc, result, .{ .emit_null_optional_fields = false });
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
@@ -717,11 +766,12 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
     if (req.relational_activation != null and (req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (req.relational_retirement != null and (req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
     try db_mod.types.validateMergeArtifacts(req);
-    if (req.graph_writes.len > 0 or req.graph_deletes.len > 0 or (req.predicates.len > 0 and req.transaction == null)) {
+    if (req.predicates.len > 0 and req.transaction == null) {
         return error.UnsupportedBatchRequestEncoding;
     }
     if ((req.split_transition != null or req.merge_source_transition != null) and
         (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
             req.predicates.len != 0 or req.split_checkpoint != null or req.split_replication != null or req.merge_replication != null or
             req.split_transition != null and req.merge_source_transition != null or
             req.merge_checkpoint != null or req.transaction != null))
@@ -787,7 +837,7 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             for (transform.operations, 0..) |op, op_index| {
                 if (op_index != 0) try writer.writeByte(',');
                 try writer.print("{{\"op\":{f},\"path\":{f}", .{
-                    std.json.fmt(db_mod.transform.transformOpText(op.op), .{}),
+                    std.json.fmt(db_mod.types.transformOpText(op.op), .{}),
                     std.json.fmt(op.path, .{}),
                 });
                 if (op.value_json) |value_json| {
@@ -854,6 +904,36 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         try writer.writeAll(",\"_integrity\":");
         try writer.writeAll(encoded_integrity.items);
     }
+    if (req.graph_writes.len > 0) {
+        try writer.writeAll(",\"_graph_writes\":[");
+        for (req.graph_writes, 0..) |write, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f},\"weight\":{d},\"created_at\":\"{d}\",\"updated_at\":\"{d}\",\"metadata_json\":{f}}}", .{
+                std.json.fmt(write.index_name, .{}),
+                std.json.fmt(write.source, .{}),
+                std.json.fmt(write.target, .{}),
+                std.json.fmt(write.edge_type, .{}),
+                write.weight,
+                write.created_at,
+                write.updated_at,
+                std.json.fmt(write.metadata_json, .{}),
+            });
+        }
+        try writer.writeByte(']');
+    }
+    if (req.graph_deletes.len > 0) {
+        try writer.writeAll(",\"_graph_deletes\":[");
+        for (req.graph_deletes, 0..) |delete, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f}}}", .{
+                std.json.fmt(delete.index_name, .{}),
+                std.json.fmt(delete.source, .{}),
+                std.json.fmt(delete.target, .{}),
+                std.json.fmt(delete.edge_type, .{}),
+            });
+        }
+        try writer.writeByte(']');
+    }
     if (req.predicates.len > 0) {
         try writer.writeAll(",\"_predicates\":[");
         for (req.predicates, 0..) |predicate, i| {
@@ -918,6 +998,12 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             transition.destination_group_id,
             std.json.fmt(transition.split_key, .{}),
         });
+    }
+    if (req.timestamp_ns != 0) {
+        try writer.print(",\"_timestamp_ns\":\"{d}\"", .{req.timestamp_ns});
+    }
+    if (req.reject_graph_transform_projections) {
+        try writer.writeAll(",\"_reject_graph_transform_projections\":true");
     }
     if (req.merge_source_transition) |transition| {
         try writer.print(",\"_merge_source_transition\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"receiver_group_id\":\"{d}\"}}", .{
@@ -988,9 +1074,6 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             },
         }
         try writer.writeByte('}');
-    }
-    if (req.timestamp_ns != 0) {
-        try writer.print(",\"_timestamp_ns\":\"{d}\"", .{req.timestamp_ns});
     }
     try writer.print(",\"sync_level\":\"{s}\"}}", .{syncLevelName(req.sync_level)});
     return try out.toOwnedSlice();
@@ -1069,13 +1152,102 @@ fn parseDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
     return deletes;
 }
 
+fn requiredObjectString(object: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const value = object.get(name) orelse return error.InvalidBatchRequest;
+    if (value != .string) return error.InvalidBatchRequest;
+    return value.string;
+}
+
+fn optionalObjectU64(object: std.json.ObjectMap, name: []const u8) !u64 {
+    const value = object.get(name) orelse return 0;
+    return try parseInternalU64(value);
+}
+
+fn optionalObjectF64(object: std.json.ObjectMap, name: []const u8, default: f64) !f64 {
+    const value = object.get(name) orelse return default;
+    return switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .number_string, .string => |text| std.fmt.parseFloat(f64, text) catch error.InvalidBatchRequest,
+        else => error.InvalidBatchRequest,
+    };
+}
+
+fn parseGraphWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.GraphEdgeWrite {
+    if (value != .array) return error.InvalidBatchRequest;
+    const writes = try alloc.alloc(db_mod.types.GraphEdgeWrite, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeGraphWriteElements(alloc, writes[0..initialized]);
+        alloc.free(writes);
+    }
+    for (value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidBatchRequest;
+        const metadata_json = if (item.object.get("metadata_json")) |metadata| blk: {
+            if (metadata != .string) return error.InvalidBatchRequest;
+            break :blk metadata.string;
+        } else "";
+        const index_name = try alloc.dupe(u8, try requiredObjectString(item.object, "index_name"));
+        errdefer alloc.free(index_name);
+        const source = try alloc.dupe(u8, try requiredObjectString(item.object, "source"));
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, try requiredObjectString(item.object, "target"));
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, try requiredObjectString(item.object, "edge_type"));
+        errdefer alloc.free(edge_type);
+        const owned_metadata_json = try alloc.dupe(u8, metadata_json);
+        errdefer alloc.free(owned_metadata_json);
+        writes[i] = .{
+            .index_name = index_name,
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+            .weight = try optionalObjectF64(item.object, "weight", 1.0),
+            .created_at = try optionalObjectU64(item.object, "created_at"),
+            .updated_at = try optionalObjectU64(item.object, "updated_at"),
+            .metadata_json = owned_metadata_json,
+        };
+        initialized += 1;
+    }
+    return writes;
+}
+
+fn parseGraphDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.GraphEdgeDelete {
+    if (value != .array) return error.InvalidBatchRequest;
+    const deletes = try alloc.alloc(db_mod.types.GraphEdgeDelete, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeGraphDeleteElements(alloc, deletes[0..initialized]);
+        alloc.free(deletes);
+    }
+    for (value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidBatchRequest;
+        const index_name = try alloc.dupe(u8, try requiredObjectString(item.object, "index_name"));
+        errdefer alloc.free(index_name);
+        const source = try alloc.dupe(u8, try requiredObjectString(item.object, "source"));
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, try requiredObjectString(item.object, "target"));
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, try requiredObjectString(item.object, "edge_type"));
+        errdefer alloc.free(edge_type);
+        deletes[i] = .{
+            .index_name = index_name,
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+        };
+        initialized += 1;
+    }
+    return deletes;
+}
+
 fn parseTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.DocumentTransform {
     if (value != .array) return error.InvalidBatchRequest;
     const values = value.array.items;
     const transforms = try alloc.alloc(db_mod.types.DocumentTransform, values.len);
     var initialized: usize = 0;
     errdefer {
-        freeTransforms(alloc, transforms[0..initialized]);
+        freeTransformElements(alloc, transforms[0..initialized]);
         alloc.free(transforms);
     }
 
@@ -1178,9 +1350,43 @@ fn freeDeletes(alloc: std.mem.Allocator, deletes: [][]const u8) void {
 }
 
 fn freeTransforms(alloc: std.mem.Allocator, transforms: []db_mod.types.DocumentTransform) void {
+    freeTransformElements(alloc, transforms);
+    if (transforms.len > 0) alloc.free(transforms);
+}
+
+fn freeTransformElements(alloc: std.mem.Allocator, transforms: []db_mod.types.DocumentTransform) void {
     for (transforms) |transform| {
         alloc.free(@constCast(transform.key));
         freeTransformOps(alloc, transform.operations);
+    }
+}
+
+fn freeGraphWrites(alloc: std.mem.Allocator, writes: []db_mod.types.GraphEdgeWrite) void {
+    freeGraphWriteElements(alloc, writes);
+    if (writes.len > 0) alloc.free(writes);
+}
+
+fn freeGraphWriteElements(alloc: std.mem.Allocator, writes: []db_mod.types.GraphEdgeWrite) void {
+    for (writes) |write| {
+        alloc.free(@constCast(write.index_name));
+        alloc.free(@constCast(write.source));
+        alloc.free(@constCast(write.target));
+        alloc.free(@constCast(write.edge_type));
+        alloc.free(@constCast(write.metadata_json));
+    }
+}
+
+fn freeGraphDeletes(alloc: std.mem.Allocator, deletes: []db_mod.types.GraphEdgeDelete) void {
+    freeGraphDeleteElements(alloc, deletes);
+    if (deletes.len > 0) alloc.free(deletes);
+}
+
+fn freeGraphDeleteElements(alloc: std.mem.Allocator, deletes: []db_mod.types.GraphEdgeDelete) void {
+    for (deletes) |delete| {
+        alloc.free(@constCast(delete.index_name));
+        alloc.free(@constCast(delete.source));
+        alloc.free(@constCast(delete.target));
+        alloc.free(@constCast(delete.edge_type));
     }
 }
 
@@ -1196,513 +1402,657 @@ fn freeTransformOpElements(alloc: std.mem.Allocator, ops: []const db_mod.types.T
     }
 }
 
-test "internal batch integrity commands and schema fences round trip without public injection" {
-    const alloc = std.testing.allocator;
-    const integrity_mod = @import("../storage/db/relational_integrity.zig");
-    const address = try integrity_mod.Address.init(@splat(7), "binary\x00\xfftuple");
-    const command: integrity_mod.Command = .{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "key\x00\xff" } } };
-    const encoded = try encodeBatchRequest(alloc, .{
-        .relational_schema_version = 17,
-        .relational_integrity_generation_set = [_]u8{5} ** 32,
-        .integrity_commands = &.{command},
-        .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 1 } },
-    });
-    defer alloc.free(encoded);
-    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
-    var parsed = try parseInternalBatchRequest(alloc, encoded);
-    defer parsed.deinit(alloc);
-    try std.testing.expectEqual(@as(?u32, 17), parsed.req.relational_schema_version);
-    try std.testing.expectEqual(@as(?[32]u8, [_]u8{5} ** 32), parsed.req.relational_integrity_generation_set);
-    try std.testing.expectEqualSlices(u8, &address.routing, &parsed.req.integrity_commands[0].address.routing);
-    try std.testing.expectEqualStrings("key\x00\xff", parsed.req.integrity_commands[0].operation.release.parent_key);
-}
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        test "internal batch integrity commands and schema fences round trip without public injection" {
+            const alloc = std.testing.allocator;
+            const integrity_mod = @import("../storage/db/relational_integrity_contract.zig");
+            const address = try integrity_mod.Address.init(@splat(7), "binary\x00\xfftuple");
+            const command: integrity_mod.Command = .{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "key\x00\xff" } } };
+            const encoded = try encodeBatchRequest(alloc, .{
+                .relational_schema_version = 17,
+                .relational_integrity_generation_set = [_]u8{5} ** 32,
+                .integrity_commands = &.{command},
+                .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 1 } },
+            });
+            defer alloc.free(encoded);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+            var parsed = try parseInternalBatchRequest(alloc, encoded);
+            defer parsed.deinit(alloc);
+            try std.testing.expectEqual(@as(?u32, 17), parsed.req.relational_schema_version);
+            try std.testing.expectEqual(@as(?[32]u8, [_]u8{5} ** 32), parsed.req.relational_integrity_generation_set);
+            try std.testing.expectEqualSlices(u8, &address.routing, &parsed.req.integrity_commands[0].address.routing);
+            try std.testing.expectEqualStrings("key\x00\xff", parsed.req.integrity_commands[0].operation.release.parent_key);
+        }
 
-test "internal batch topology control preserves binary fences and refuses public injection" {
-    const alloc = std.testing.allocator;
-    const topology = @import("../storage/db/relational_integrity_topology.zig");
-    const fence: topology.Fence = .{
-        .transition_id = std.math.maxInt(u64),
-        .admission_epoch = 1,
-        .attempt = 2,
-        .owner_group_id = 301,
-        .peer_group_id = 301,
-        .role = .backup_snapshot,
-        .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 },
-        .catalog_digest = @splat(255),
+        test "internal batch topology control preserves binary fences and refuses public injection" {
+            const alloc = std.testing.allocator;
+            const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+            const fence: topology.Fence = .{
+                .transition_id = std.math.maxInt(u64),
+                .admission_epoch = 1,
+                .attempt = 2,
+                .owner_group_id = 301,
+                .peer_group_id = 301,
+                .role = .backup_snapshot,
+                .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 },
+                .catalog_digest = @splat(255),
+            };
+            const encoded = try encodeBatchRequest(alloc, .{ .relational_topology = .{ .fence = fence, .action = .begin } });
+            defer alloc.free(encoded);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+            var parsed = try parseInternalBatchRequest(alloc, encoded);
+            defer parsed.deinit(alloc);
+            try std.testing.expect(fence.eql(parsed.req.relational_topology.?.fence));
+            try std.testing.expectEqual(.begin, parsed.req.relational_topology.?.action);
+            try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{
+                .relational_topology = .{ .fence = fence, .action = .release },
+                .deletes = &.{"user-row"},
+            }));
+        }
+
+        test "distributed txn public batch rejects isolated coordinator generation evidence spoof" {
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, "{\"_relational_repair\":true}"));
+            const alloc = std.testing.allocator;
+            const encoded = try @import("relational_integrity_wire.zig").encodeGenerationSet(alloc, [_]u8{7} ** 32);
+            defer alloc.free(encoded);
+            const body = try std.fmt.allocPrint(alloc, "{{\"_relational_integrity_generation_set\":{s}}}", .{encoded});
+            defer alloc.free(body);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, body));
+            var internal = try parseInternalBatchRequest(alloc, body);
+            defer internal.deinit(alloc);
+            try std.testing.expectEqual(@as(?[32]u8, [_]u8{7} ** 32), internal.req.relational_integrity_generation_set);
+        }
+
+        test "internal batch parser owns binary staged restore controls and rejects public injection" {
+            const alloc = std.testing.allocator;
+            const encoded = try encodeBatchRequest(alloc, .{ .restore_staging = .{ .import_page = .{
+                .expected = @splat(201),
+                .next = &.{ 0, 255, 128, 1 },
+                .scope = @splat(222),
+                .timestamps = &.{.{ .key = &.{ 0, 255, 127 }, .timestamp = 9_007_199_254_740_993 }},
+            } } });
+            defer alloc.free(encoded);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+            var parsed = try parseInternalBatchRequest(alloc, encoded);
+            defer parsed.deinit(alloc);
+            const page = parsed.req.restore_staging.?.import_page;
+            try std.testing.expectEqualSlices(u8, &.{ 0, 255, 128, 1 }, page.next);
+            try std.testing.expectEqualSlices(u8, &.{ 0, 255, 127 }, page.timestamps[0].key);
+            try std.testing.expectEqual(@as(u64, 9_007_199_254_740_993), page.timestamps[0].timestamp);
+        }
+
+        test "distributed txn internal batch codec round trips replicated transaction phases" {
+            const alloc = std.testing.allocator;
+            const txn_id: db_mod.types.TxnId = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+            const encoded = try encodeBatchRequest(alloc, .{
+                .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+                .predicates = &.{.{ .key = "doc:a", .expected_version = 41, .expected_content_digest = @splat(7) }},
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 7 } },
+            });
+            defer alloc.free(encoded);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+
+            var decoded = try parseInternalBatchRequest(alloc, encoded);
+            defer decoded.deinit(alloc);
+            const prepare = switch (decoded.req.transaction orelse return error.TestExpectedEqual) {
+                .prepare => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(txn_id, prepare.txn_id);
+            try std.testing.expectEqual(@as(u64, 7), prepare.topology_epoch);
+            try std.testing.expectEqual(@as(usize, 1), decoded.req.writes.len);
+            try std.testing.expectEqual(@as(u64, 41), decoded.req.predicates[0].expected_version);
+            try std.testing.expectEqual([_]u8{7} ** 32, decoded.req.predicates[0].expected_content_digest.?);
+
+            const begin_encoded = try encodeBatchRequest(alloc, .{
+                .transaction = .{ .begin = .{
+                    .txn_id = txn_id,
+                    .begin_timestamp = 42,
+                    .created_at_ns = 43,
+                    .topology_epoch = 7,
+                    .retain_terminal = true,
+                    .participants = &.{"table2:4:docs:group:7"},
+                } },
+            });
+            defer alloc.free(begin_encoded);
+            var begin_decoded = try parseInternalBatchRequest(alloc, begin_encoded);
+            defer begin_decoded.deinit(alloc);
+            const begin = switch (begin_decoded.req.transaction.?) {
+                .begin => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expect(begin.retain_terminal);
+            try std.testing.expectEqualStrings("table2:4:docs:group:7", begin.participants[0]);
+
+            const ack_encoded = try encodeBatchRequest(alloc, .{
+                .transaction = .{ .acknowledge = .{
+                    .txn_id = txn_id,
+                    .participant = "table2:4:docs:group:8",
+                } },
+            });
+            defer alloc.free(ack_encoded);
+            var ack_decoded = try parseInternalBatchRequest(alloc, ack_encoded);
+            defer ack_decoded.deinit(alloc);
+            const ack = switch (ack_decoded.req.transaction.?) {
+                .acknowledge => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqualStrings("table2:4:docs:group:8", ack.participant);
+
+            const cleanup_encoded = try encodeBatchRequest(alloc, .{
+                .transaction = .{ .cleanup = .{
+                    .txn_id = txn_id,
+                    .cutoff_timestamp = 100,
+                    .retained_cutoff_timestamp = 50,
+                } },
+            });
+            defer alloc.free(cleanup_encoded);
+            var cleanup_decoded = try parseInternalBatchRequest(alloc, cleanup_encoded);
+            defer cleanup_decoded.deinit(alloc);
+            const cleanup = switch (cleanup_decoded.req.transaction.?) {
+                .cleanup => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(@as(u64, 100), cleanup.cutoff_timestamp);
+            try std.testing.expectEqual(@as(u64, 50), cleanup.retained_cutoff_timestamp);
+        }
+
+        test "batch parser accepts inserts and deletes" {
+            var owned = try parseBatchRequest(std.testing.allocator,
+                \\{"inserts":{"doc:a":{"title":"alpha"}},"deletes":["doc:b"]}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 1), owned.writes.len);
+            try std.testing.expectEqual(@as(usize, 1), owned.deletes.len);
+        }
+
+        test "public batch parser rejects non-object documents while internal replay remains opaque" {
+            const alloc = std.testing.allocator;
+            inline for (.{
+                \\{"inserts":{"doc:a":"text"}}
+                ,
+                \\{"inserts":{"doc:a":42}}
+                ,
+                \\{"inserts":{"doc:a":[1,2]}}
+                ,
+                \\{"inserts":{"doc:a":null}}
+                ,
+            }) |body| {
+                try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, body));
+            }
+
+            var replay = try parseInternalBatchRequest(alloc,
+                \\{"inserts":{"doc:a":"legacy durable value"}}
+            );
+            defer replay.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), replay.writes.len);
+            try std.testing.expectEqualStrings("\"legacy durable value\"", replay.writes[0].value);
+        }
+
+        test "batch parser preserves oversized value errors" {
+            const body =
+                \\{"inserts":{"doc:a":{"raw_payload":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
+            ;
+            try std.testing.expectError(error.ValueTooLong, parseBatchRequestWithOptions(std.testing.allocator, body, .{ .allocate = .alloc_always, .max_value_len = 64 }, false));
+        }
+
+        test "internal batch parser owns and round trips split checkpoint" {
+            const body =
+                \\{"inserts":{},"deletes":[],"_split_checkpoint":{"kind":"destination_complete","transition_id":40,"attempt_epoch":1,"source_group_id":41,"destination_group_id":42,"range_start":"doc:m","range_end":"doc:z","delta_sequence":7}}
+            ;
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, body));
+
+            var owned = try parseInternalBatchRequest(std.testing.allocator, body);
+            defer owned.deinit(std.testing.allocator);
+            const checkpoint = owned.req.split_checkpoint orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(db_mod.types.SplitReplicationCheckpoint.Kind.destination_complete, checkpoint.kind);
+            try std.testing.expectEqual(@as(u64, 40), checkpoint.transition_id);
+            try std.testing.expectEqual(@as(u64, 41), checkpoint.source_group_id);
+            try std.testing.expectEqual(@as(u64, 42), checkpoint.destination_group_id);
+            try std.testing.expectEqualStrings("doc:m", checkpoint.range_start);
+            try std.testing.expectEqualStrings("doc:z", checkpoint.range_end);
+            try std.testing.expectEqual(@as(u64, 7), checkpoint.delta_sequence);
+
+            const encoded = try encodeBatchRequest(std.testing.allocator, owned.req);
+            defer std.testing.allocator.free(encoded);
+            var reparsed = try parseInternalBatchRequest(std.testing.allocator, encoded);
+            defer reparsed.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u64, 7), reparsed.req.split_checkpoint.?.delta_sequence);
+        }
+
+        test "internal batch parser owns and round trips graph mutations" {
+            const alloc = std.testing.allocator;
+            const request: db_mod.types.BatchRequest = .{
+                .graph_writes = &.{.{
+                    .index_name = "relations_graph",
+                    .source = "doc:a",
+                    .target = "doc:b",
+                    .edge_type = "mentions",
+                    .weight = 0.75,
+                    .created_at = 11,
+                    .updated_at = 12,
+                    .metadata_json = "{\"target_table\":\"entities\"}",
+                }},
+                .graph_deletes = &.{.{
+                    .index_name = "relations_graph",
+                    .source = "doc:c",
+                    .target = "doc:d",
+                    .edge_type = "mentions",
+                }},
+            };
+            const encoded = try encodeBatchRequest(alloc, request);
+            defer alloc.free(encoded);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+
+            var parsed = try parseInternalBatchRequest(alloc, encoded);
+            defer parsed.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.graph_writes.len);
+            try std.testing.expectEqualStrings("relations_graph", parsed.req.graph_writes[0].index_name);
+            try std.testing.expectEqualStrings("doc:b", parsed.req.graph_writes[0].target);
+            try std.testing.expectEqual(@as(f64, 0.75), parsed.req.graph_writes[0].weight);
+            try std.testing.expectEqual(@as(u64, 11), parsed.req.graph_writes[0].created_at);
+            try std.testing.expectEqualStrings("{\"target_table\":\"entities\"}", parsed.req.graph_writes[0].metadata_json);
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.graph_deletes.len);
+            try std.testing.expectEqualStrings("doc:d", parsed.req.graph_deletes[0].target);
+        }
+
+        test "internal batch parser requires source acknowledgements to be metadata-only" {
+            const mixed =
+                \\{"inserts":{"doc:m":{}},"_split_checkpoint":{"kind":"source_ack","transition_id":40,"attempt_epoch":1,"source_group_id":41,"destination_group_id":42,"delta_sequence":7}}
+            ;
+            try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(std.testing.allocator, mixed));
+            try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(std.testing.allocator, .{
+                .writes = &.{.{ .key = "doc:m", .value = "{}" }},
+                .split_checkpoint = .{
+                    .kind = .source_ack,
+                    .transition_id = 40,
+                    .attempt_epoch = 1,
+                    .source_group_id = 41,
+                    .destination_group_id = 42,
+                    .delta_sequence = 7,
+                },
+            }));
+        }
+
+        test "internal batch codec preserves timestamps and rejects public injection" {
+            const alloc = std.testing.allocator;
+            const encoded = try encodeBatchRequest(alloc, .{
+                .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+                .timestamp_ns = std.math.maxInt(u64),
+            });
+            defer alloc.free(encoded);
+
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+            var decoded = try parseInternalBatchRequest(alloc, encoded);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqual(std.math.maxInt(u64), decoded.req.timestamp_ns);
+
+            try std.testing.expectError(
+                error.InvalidBatchRequest,
+                parseBatchRequest(alloc,
+                    \\{"inserts":{},"_timestamp_ns":"123"}
+                ),
+            );
+        }
+
+        test "internal batch codec preserves graph transform projection rejection" {
+            const alloc = std.testing.allocator;
+            const encoded = try encodeBatchRequest(alloc, .{
+                .transforms = &.{.{
+                    .key = "doc:a",
+                    .operations = &.{.{
+                        .op = .push,
+                        .path = "$._edges.graph_idx.knows",
+                        .value_json = "{\"target\":\"doc:b\"}",
+                    }},
+                }},
+                .reject_graph_transform_projections = true,
+            });
+            defer alloc.free(encoded);
+
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+            var decoded = try parseInternalBatchRequest(alloc, encoded);
+            defer decoded.deinit(alloc);
+            try std.testing.expect(decoded.req.reject_graph_transform_projections);
+        }
+
+        test "internal batch parser rejects public split replication identity" {
+            const body =
+                \\{"inserts":{"doc:m":{}},"_split_replication":{"transition_id":40,"attempt_epoch":1,"source_group_id":41,"destination_group_id":42,"namespace_table_id":7,"namespace_shard_id":41,"namespace_range_id":4100,"operation":"bootstrap_chunk","sequence":0}}
+            ;
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, body));
+
+            var owned = try parseInternalBatchRequest(std.testing.allocator, body);
+            defer owned.deinit(std.testing.allocator);
+            const replication = owned.req.split_replication orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(@as(u64, 40), replication.transition_id);
+            try std.testing.expectEqual(@as(u64, 1), replication.attempt_epoch);
+            try std.testing.expectEqual(@as(u64, 41), replication.source_group_id);
+            try std.testing.expectEqual(@as(u64, 42), replication.destination_group_id);
+            try std.testing.expectEqual(@as(u64, 4100), replication.identity_namespace.range_id);
+        }
+
+        test "internal batch split identity round trips the full u64 id space" {
+            const max = std.math.maxInt(u64);
+            const encoded = try encodeBatchRequest(std.testing.allocator, .{
+                .writes = &.{.{ .key = "doc:m", .value = "{}" }},
+                .split_replication = .{
+                    .transition_id = max - 5,
+                    .attempt_epoch = 1,
+                    .source_group_id = max - 4,
+                    .destination_group_id = max - 3,
+                    .identity_namespace = .{
+                        .table_id = max,
+                        .shard_id = max - 1,
+                        .range_id = max - 2,
+                    },
+                    .operation = .delta,
+                    .sequence = max - 6,
+                    .previous_sequence = max - 7,
+                },
+            });
+            defer std.testing.allocator.free(encoded);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"namespace_table_id\":\"18446744073709551615\"") != null);
+
+            var parsed = try parseInternalBatchRequest(std.testing.allocator, encoded);
+            defer parsed.deinit(std.testing.allocator);
+            const replication = parsed.req.split_replication orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(max - 5, replication.transition_id);
+            try std.testing.expectEqual(max - 4, replication.source_group_id);
+            try std.testing.expectEqual(max - 3, replication.destination_group_id);
+            try std.testing.expectEqual(max, replication.identity_namespace.table_id);
+            try std.testing.expectEqual(max - 1, replication.identity_namespace.shard_id);
+            try std.testing.expectEqual(max - 2, replication.identity_namespace.range_id);
+            try std.testing.expectEqual(max - 6, replication.sequence);
+            try std.testing.expectEqual(max - 7, replication.previous_sequence.?);
+        }
+
+        test "internal batch parser rejects invalid split delta predecessor fences" {
+            const non_delta =
+                \\{"_split_replication":{"transition_id":1,"attempt_epoch":1,"source_group_id":2,"destination_group_id":3,"namespace_table_id":4,"namespace_shard_id":5,"namespace_range_id":6,"operation":"bootstrap","sequence":7,"previous_sequence":6}}
+            ;
+            try std.testing.expectError(
+                error.InvalidBatchRequest,
+                parseInternalBatchRequest(std.testing.allocator, non_delta),
+            );
+            const non_monotonic =
+                \\{"_split_replication":{"transition_id":1,"attempt_epoch":1,"source_group_id":2,"destination_group_id":3,"namespace_table_id":4,"namespace_shard_id":5,"namespace_range_id":6,"operation":"delta","sequence":7,"previous_sequence":7}}
+            ;
+            try std.testing.expectError(
+                error.InvalidBatchRequest,
+                parseInternalBatchRequest(std.testing.allocator, non_monotonic),
+            );
+        }
+
+        test "internal batch parser owns and round trips split transition" {
+            const body =
+                \\{"_split_transition":{"kind":"start","transition_id":40,"attempt_epoch":1,"destination_group_id":42,"split_key":"doc:m"}}
+            ;
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, body));
+
+            var owned = try parseInternalBatchRequest(std.testing.allocator, body);
+            defer owned.deinit(std.testing.allocator);
+            const transition = owned.req.split_transition orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(db_mod.types.SplitTransitionMutation.Kind.start, transition.kind);
+            try std.testing.expectEqual(@as(u64, 40), transition.transition_id);
+            try std.testing.expectEqual(@as(u64, 1), transition.attempt_epoch);
+            try std.testing.expectEqual(@as(u64, 42), transition.destination_group_id);
+            try std.testing.expectEqualStrings("doc:m", transition.split_key);
+
+            const encoded = try encodeBatchRequest(std.testing.allocator, owned.req);
+            defer std.testing.allocator.free(encoded);
+            var reparsed = try parseInternalBatchRequest(std.testing.allocator, encoded);
+            defer reparsed.deinit(std.testing.allocator);
+            try std.testing.expectEqual(db_mod.types.SplitTransitionMutation.Kind.start, reparsed.req.split_transition.?.kind);
+        }
+
+        test "internal batch codec round trips replicated transaction phases" {
+            const alloc = std.testing.allocator;
+            const txn_id: db_mod.types.TxnId = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+            const encoded = try encodeBatchRequest(alloc, .{
+                .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+                .predicates = &.{.{ .key = "doc:a", .expected_version = 41 }},
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 7 } },
+            });
+            defer alloc.free(encoded);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+
+            var decoded = try parseInternalBatchRequest(alloc, encoded);
+            defer decoded.deinit(alloc);
+            const prepare = switch (decoded.req.transaction orelse return error.TestExpectedEqual) {
+                .prepare => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(txn_id, prepare.txn_id);
+            try std.testing.expectEqual(@as(u64, 7), prepare.topology_epoch);
+            try std.testing.expectEqual(@as(usize, 1), decoded.req.writes.len);
+            try std.testing.expectEqual(@as(u64, 41), decoded.req.predicates[0].expected_version);
+
+            const begin_encoded = try encodeBatchRequest(alloc, .{
+                .transaction = .{ .begin = .{
+                    .txn_id = txn_id,
+                    .begin_timestamp = 42,
+                    .created_at_ns = 43,
+                    .topology_epoch = 7,
+                    .retain_terminal = true,
+                    .participants = &.{"table2:4:docs:group:7"},
+                } },
+            });
+            defer alloc.free(begin_encoded);
+            var begin_decoded = try parseInternalBatchRequest(alloc, begin_encoded);
+            defer begin_decoded.deinit(alloc);
+            const begin = switch (begin_decoded.req.transaction.?) {
+                .begin => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expect(begin.retain_terminal);
+            try std.testing.expectEqualStrings("table2:4:docs:group:7", begin.participants[0]);
+
+            const ack_encoded = try encodeBatchRequest(alloc, .{
+                .transaction = .{ .acknowledge = .{
+                    .txn_id = txn_id,
+                    .participant = "table2:4:docs:group:8",
+                } },
+            });
+            defer alloc.free(ack_encoded);
+            var ack_decoded = try parseInternalBatchRequest(alloc, ack_encoded);
+            defer ack_decoded.deinit(alloc);
+            const ack = switch (ack_decoded.req.transaction.?) {
+                .acknowledge => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqualStrings("table2:4:docs:group:8", ack.participant);
+
+            const cleanup_encoded = try encodeBatchRequest(alloc, .{
+                .transaction = .{ .cleanup = .{
+                    .txn_id = txn_id,
+                    .cutoff_timestamp = 100,
+                    .retained_cutoff_timestamp = 50,
+                } },
+            });
+            defer alloc.free(cleanup_encoded);
+            var cleanup_decoded = try parseInternalBatchRequest(alloc, cleanup_encoded);
+            defer cleanup_decoded.deinit(alloc);
+            const cleanup = switch (cleanup_decoded.req.transaction.?) {
+                .cleanup => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(@as(u64, 100), cleanup.cutoff_timestamp);
+            try std.testing.expectEqual(@as(u64, 50), cleanup.retained_cutoff_timestamp);
+        }
+
+        test "internal batch parser rejects mixed split transition commands" {
+            const body =
+                \\{"inserts":{"doc:m":{}},"_split_transition":{"kind":"prepare","transition_id":40,"attempt_epoch":1,"destination_group_id":42,"split_key":"doc:m"}}
+            ;
+            try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(std.testing.allocator, body));
+            try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(std.testing.allocator, .{
+                .writes = &.{.{ .key = "doc:m", .value = "{}" }},
+                .split_transition = .{
+                    .kind = .prepare,
+                    .transition_id = 40,
+                    .attempt_epoch = 1,
+                    .destination_group_id = 42,
+                    .split_key = "doc:m",
+                },
+            }));
+        }
+
+        test "batch parser accepts raw payload value under public request cap" {
+            const alloc = std.testing.allocator;
+            const payload = try alloc.alloc(u8, 6 * 1024 * 1024);
+            defer alloc.free(payload);
+            @memset(payload, 'x');
+
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            const writer = &out.writer;
+
+            try writer.writeAll("{\"inserts\":{\"doc:a\":{\"raw_payload\":\"");
+            try writer.writeAll(payload);
+            try writer.writeAll("\"}}}");
+
+            var owned = try parseBatchRequest(alloc, out.written());
+            defer owned.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.writes.len);
+            try std.testing.expect(std.mem.indexOf(u8, owned.writes[0].value, "\"raw_payload\"") != null);
+        }
+
+        test "batch parser rejects removed aknn sync level" {
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator,
+                \\{"inserts":{"doc:a":{"title":"alpha"}},"sync_level":"aknn"}
+            ));
+        }
+
+        test "batch parser accepts transforms" {
+            var owned = try parseBatchRequest(std.testing.allocator,
+                \\{"transforms":[{"key":"doc:a","operations":[{"op":"$min","path":"priority","value":2},{"op":"$max","path":"version","value":3},{"op":"$set","path":"status","value":"updated"}],"upsert":true}]}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 1), owned.transforms.len);
+            try std.testing.expect(owned.transforms[0].upsert);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.min, owned.transforms[0].operations[0].op);
+            try std.testing.expectEqualStrings("priority", owned.transforms[0].operations[0].path);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.max, owned.transforms[0].operations[1].op);
+        }
+
+        test "batch parser accepts supported Go transform op spelling" {
+            var owned = try parseBatchRequest(std.testing.allocator,
+                \\{"transforms":[{"key":"doc:a","operations":[{"op":"$addToSet","path":"tags","value":"zig"},{"op":"$setOnInsert","path":"created_at","value":"now"}]}]}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 1), owned.transforms.len);
+            try std.testing.expectEqual(@as(usize, 2), owned.transforms[0].operations.len);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.add_to_set, owned.transforms[0].operations[0].op);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.set_on_insert, owned.transforms[0].operations[1].op);
+        }
+
+        test "batch parser accepts push for graph edge arrays" {
+            var owned = try parseBatchRequest(std.testing.allocator,
+                \\{"transforms":[{"key":"doc:a","operations":[{"op":"$push","path":"edges","value":{"to":"doc:b"}}]}]}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.push, owned.transforms[0].operations[0].op);
+        }
+
+        test "batch parser accepts pull for exact array values" {
+            var owned = try parseBatchRequest(std.testing.allocator,
+                \\{"transforms":[{"key":"doc:a","operations":[{"op":"$pull","path":"edges","value":{"target":"doc:b"}}]}]}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.pull, owned.transforms[0].operations[0].op);
+        }
+
+        test "batch parser rejects every recognized but unsupported transform operator" {
+            const unsupported = [_][]const u8{
+                "$pop",
+                "$mul",
+                "$currentDate",
+                "$rename",
+            };
+            for (unsupported) |op| {
+                const body = try std.fmt.allocPrint(
+                    std.testing.allocator,
+                    "{{\"transforms\":[{{\"key\":\"doc:missing\",\"operations\":[{{\"op\":\"{s}\",\"path\":\"field\",\"value\":1}}]}}]}}",
+                    .{op},
+                );
+                defer std.testing.allocator.free(body);
+                try std.testing.expectError(
+                    error.InvalidBatchRequest,
+                    parseBatchRequest(std.testing.allocator, body),
+                );
+            }
+        }
+
+        test "batch parser safely rejects unsupported transform after initialized operations" {
+            const body =
+                \\{"transforms":[{"key":"doc:missing","operations":[{"op":"$set","path":"ready","value":true},{"op":"$pop","path":"items","value":1}]}]}
+            ;
+            for (0..32) |_| {
+                try std.testing.expectError(
+                    error.InvalidBatchRequest,
+                    parseBatchRequest(std.testing.allocator, body),
+                );
+            }
+        }
+
+        test "batch parser preserves packed embeddings for mapper extraction" {
+            var owned = try parseBatchRequest(std.testing.allocator,
+                \\{"inserts":{"doc:a":{"title":"alpha","_embeddings":{"dense_idx":"AACAPwAAAEAAAEBA","sparse_idx":{"packed_indices":"AQAAAAUAAAA=","packed_values":"AAAAPwAAQD8="}}}}}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            var extracted = try document_mapper.extractWrite(std.testing.allocator, owned.writes[0].key, owned.writes[0].value);
+            defer extracted.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 1), extracted.dense_embeddings.len);
+            try std.testing.expectEqual(@as(usize, 1), extracted.sparse_embeddings.len);
+            try std.testing.expect(extracted.cleaned_value != null);
+            try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "\"title\":\"alpha\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "_embeddings") == null);
+        }
+
+        test "batch parser accepts compact vdbbench-shaped embeddings batch" {
+            const alloc = std.testing.allocator;
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            const writer = &out.writer;
+
+            try writer.writeAll("{\"inserts\":{");
+            for (0..500) |i| {
+                if (i != 0) try writer.writeByte(',');
+                try writer.print(
+                    "\"key:{d}\":{{\"id\":{d},\"metadata\":{{\"source\":\"vdbbench\",\"ordinal\":{d}}},\"vec_data\":[0.1,0.2,0.3],\"_embeddings\":{{\"vec\":[0.1,0.2,0.3]}}}}",
+                    .{ i, i, i },
+                );
+            }
+            try writer.writeAll("},\"sync_level\":\"write\"}");
+
+            var owned = try parseBatchRequest(alloc, out.written());
+            defer owned.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 500), owned.writes.len);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, owned.req.sync_level);
+
+            var extracted = try document_mapper.extractWrite(alloc, owned.writes[0].key, owned.writes[0].value);
+            defer extracted.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), extracted.dense_embeddings.len);
+            try std.testing.expectEqualStrings("vec", extracted.dense_embeddings[0].index_name);
+            try std.testing.expectEqual(@as(usize, 3), extracted.dense_embeddings[0].vector.len);
+            try std.testing.expect(extracted.cleaned_value != null);
+            try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "\"vec_data\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "_embeddings") == null);
+        }
     };
-    const encoded = try encodeBatchRequest(alloc, .{ .relational_topology = .{ .fence = fence, .action = .begin } });
-    defer alloc.free(encoded);
-    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
-    var parsed = try parseInternalBatchRequest(alloc, encoded);
-    defer parsed.deinit(alloc);
-    try std.testing.expect(fence.eql(parsed.req.relational_topology.?.fence));
-    try std.testing.expectEqual(.begin, parsed.req.relational_topology.?.action);
-    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{
-        .relational_topology = .{ .fence = fence, .action = .release },
-        .deletes = &.{"user-row"},
-    }));
+    return Suite;
 }
-
-test "distributed txn public batch rejects isolated coordinator generation evidence spoof" {
-    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, "{\"_relational_repair\":true}"));
-    const alloc = std.testing.allocator;
-    const encoded = try @import("relational_integrity_wire.zig").encodeGenerationSet(alloc, [_]u8{7} ** 32);
-    defer alloc.free(encoded);
-    const body = try std.fmt.allocPrint(alloc, "{{\"_relational_integrity_generation_set\":{s}}}", .{encoded});
-    defer alloc.free(body);
-    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, body));
-    var internal = try parseInternalBatchRequest(alloc, body);
-    defer internal.deinit(alloc);
-    try std.testing.expectEqual(@as(?[32]u8, [_]u8{7} ** 32), internal.req.relational_integrity_generation_set);
-}
-
-test "batch parser accepts inserts and deletes" {
-    var owned = try parseBatchRequest(std.testing.allocator,
-        \\{"inserts":{"doc:a":{"title":"alpha"}},"deletes":["doc:b"]}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), owned.writes.len);
-    try std.testing.expectEqual(@as(usize, 1), owned.deletes.len);
-}
-
-test "public batch parser rejects non-object documents while internal replay remains opaque" {
-    const alloc = std.testing.allocator;
-    inline for (.{
-        \\{"inserts":{"doc:a":"text"}}
-        ,
-        \\{"inserts":{"doc:a":42}}
-        ,
-        \\{"inserts":{"doc:a":[1,2]}}
-        ,
-        \\{"inserts":{"doc:a":null}}
-        ,
-    }) |body| {
-        try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, body));
-    }
-
-    var replay = try parseInternalBatchRequest(alloc,
-        \\{"inserts":{"doc:a":"legacy durable value"}}
-    );
-    defer replay.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), replay.writes.len);
-    try std.testing.expectEqualStrings("\"legacy durable value\"", replay.writes[0].value);
-}
-
-test "batch parser preserves oversized value errors" {
-    const body =
-        \\{"inserts":{"doc:a":{"raw_payload":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
-    ;
-    try std.testing.expectError(error.ValueTooLong, parseBatchRequestWithOptions(std.testing.allocator, body, .{ .allocate = .alloc_always, .max_value_len = 64 }, false));
-}
-
-test "internal batch parser owns binary staged restore controls and rejects public injection" {
-    const alloc = std.testing.allocator;
-    const encoded = try encodeBatchRequest(alloc, .{ .restore_staging = .{ .import_page = .{
-        .expected = @splat(201),
-        .next = &.{ 0, 255, 128, 1 },
-        .scope = @splat(222),
-        .timestamps = &.{.{ .key = &.{ 0, 255, 127 }, .timestamp = 9_007_199_254_740_993 }},
-    } } });
-    defer alloc.free(encoded);
-    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
-    var parsed = try parseInternalBatchRequest(alloc, encoded);
-    defer parsed.deinit(alloc);
-    const page = parsed.req.restore_staging.?.import_page;
-    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 128, 1 }, page.next);
-    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 127 }, page.timestamps[0].key);
-    try std.testing.expectEqual(@as(u64, 9_007_199_254_740_993), page.timestamps[0].timestamp);
-}
-
-test "internal batch parser owns and round trips split checkpoint" {
-    const body =
-        \\{"inserts":{},"deletes":[],"_split_checkpoint":{"kind":"destination_complete","transition_id":40,"attempt_epoch":1,"source_group_id":41,"destination_group_id":42,"range_start":"doc:m","range_end":"doc:z","delta_sequence":7}}
-    ;
-    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, body));
-
-    var owned = try parseInternalBatchRequest(std.testing.allocator, body);
-    defer owned.deinit(std.testing.allocator);
-    const checkpoint = owned.req.split_checkpoint orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(db_mod.types.SplitReplicationCheckpoint.Kind.destination_complete, checkpoint.kind);
-    try std.testing.expectEqual(@as(u64, 40), checkpoint.transition_id);
-    try std.testing.expectEqual(@as(u64, 41), checkpoint.source_group_id);
-    try std.testing.expectEqual(@as(u64, 42), checkpoint.destination_group_id);
-    try std.testing.expectEqualStrings("doc:m", checkpoint.range_start);
-    try std.testing.expectEqualStrings("doc:z", checkpoint.range_end);
-    try std.testing.expectEqual(@as(u64, 7), checkpoint.delta_sequence);
-
-    const encoded = try encodeBatchRequest(std.testing.allocator, owned.req);
-    defer std.testing.allocator.free(encoded);
-    var reparsed = try parseInternalBatchRequest(std.testing.allocator, encoded);
-    defer reparsed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 7), reparsed.req.split_checkpoint.?.delta_sequence);
-}
-
-test "internal batch parser requires source acknowledgements to be metadata-only" {
-    const mixed =
-        \\{"inserts":{"doc:m":{}},"_split_checkpoint":{"kind":"source_ack","transition_id":40,"attempt_epoch":1,"source_group_id":41,"destination_group_id":42,"delta_sequence":7}}
-    ;
-    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(std.testing.allocator, mixed));
-    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(std.testing.allocator, .{
-        .writes = &.{.{ .key = "doc:m", .value = "{}" }},
-        .split_checkpoint = .{
-            .kind = .source_ack,
-            .transition_id = 40,
-            .attempt_epoch = 1,
-            .source_group_id = 41,
-            .destination_group_id = 42,
-            .delta_sequence = 7,
-        },
-    }));
-}
-
-test "internal batch codec preserves timestamps and rejects public injection" {
-    const alloc = std.testing.allocator;
-    const encoded = try encodeBatchRequest(alloc, .{
-        .writes = &.{.{ .key = "doc:a", .value = "{}" }},
-        .timestamp_ns = std.math.maxInt(u64),
-    });
-    defer alloc.free(encoded);
-
-    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
-    var decoded = try parseInternalBatchRequest(alloc, encoded);
-    defer decoded.deinit(alloc);
-    try std.testing.expectEqual(std.math.maxInt(u64), decoded.req.timestamp_ns);
-
-    try std.testing.expectError(
-        error.InvalidBatchRequest,
-        parseBatchRequest(alloc,
-            \\{"inserts":{},"_timestamp_ns":"123"}
-        ),
-    );
-}
-
-test "internal batch parser rejects public split replication identity" {
-    const body =
-        \\{"inserts":{"doc:m":{}},"_split_replication":{"transition_id":40,"attempt_epoch":1,"source_group_id":41,"destination_group_id":42,"namespace_table_id":7,"namespace_shard_id":41,"namespace_range_id":4100,"operation":"bootstrap_chunk","sequence":0}}
-    ;
-    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, body));
-
-    var owned = try parseInternalBatchRequest(std.testing.allocator, body);
-    defer owned.deinit(std.testing.allocator);
-    const replication = owned.req.split_replication orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 40), replication.transition_id);
-    try std.testing.expectEqual(@as(u64, 1), replication.attempt_epoch);
-    try std.testing.expectEqual(@as(u64, 41), replication.source_group_id);
-    try std.testing.expectEqual(@as(u64, 42), replication.destination_group_id);
-    try std.testing.expectEqual(@as(u64, 4100), replication.identity_namespace.range_id);
-}
-
-test "internal batch split identity round trips the full u64 id space" {
-    const max = std.math.maxInt(u64);
-    const encoded = try encodeBatchRequest(std.testing.allocator, .{
-        .writes = &.{.{ .key = "doc:m", .value = "{}" }},
-        .split_replication = .{
-            .transition_id = max - 5,
-            .attempt_epoch = 1,
-            .source_group_id = max - 4,
-            .destination_group_id = max - 3,
-            .identity_namespace = .{
-                .table_id = max,
-                .shard_id = max - 1,
-                .range_id = max - 2,
-            },
-            .operation = .delta,
-            .sequence = max - 6,
-            .previous_sequence = max - 7,
-        },
-    });
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"namespace_table_id\":\"18446744073709551615\"") != null);
-
-    var parsed = try parseInternalBatchRequest(std.testing.allocator, encoded);
-    defer parsed.deinit(std.testing.allocator);
-    const replication = parsed.req.split_replication orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(max - 5, replication.transition_id);
-    try std.testing.expectEqual(max - 4, replication.source_group_id);
-    try std.testing.expectEqual(max - 3, replication.destination_group_id);
-    try std.testing.expectEqual(max, replication.identity_namespace.table_id);
-    try std.testing.expectEqual(max - 1, replication.identity_namespace.shard_id);
-    try std.testing.expectEqual(max - 2, replication.identity_namespace.range_id);
-    try std.testing.expectEqual(max - 6, replication.sequence);
-    try std.testing.expectEqual(max - 7, replication.previous_sequence.?);
-}
-
-test "internal batch parser rejects invalid split delta predecessor fences" {
-    const non_delta =
-        \\{"_split_replication":{"transition_id":1,"attempt_epoch":1,"source_group_id":2,"destination_group_id":3,"namespace_table_id":4,"namespace_shard_id":5,"namespace_range_id":6,"operation":"bootstrap","sequence":7,"previous_sequence":6}}
-    ;
-    try std.testing.expectError(
-        error.InvalidBatchRequest,
-        parseInternalBatchRequest(std.testing.allocator, non_delta),
-    );
-    const non_monotonic =
-        \\{"_split_replication":{"transition_id":1,"attempt_epoch":1,"source_group_id":2,"destination_group_id":3,"namespace_table_id":4,"namespace_shard_id":5,"namespace_range_id":6,"operation":"delta","sequence":7,"previous_sequence":7}}
-    ;
-    try std.testing.expectError(
-        error.InvalidBatchRequest,
-        parseInternalBatchRequest(std.testing.allocator, non_monotonic),
-    );
-}
-
-test "internal batch parser owns and round trips split transition" {
-    const body =
-        \\{"_split_transition":{"kind":"start","transition_id":40,"attempt_epoch":1,"destination_group_id":42,"split_key":"doc:m"}}
-    ;
-    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, body));
-
-    var owned = try parseInternalBatchRequest(std.testing.allocator, body);
-    defer owned.deinit(std.testing.allocator);
-    const transition = owned.req.split_transition orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(db_mod.types.SplitTransitionMutation.Kind.start, transition.kind);
-    try std.testing.expectEqual(@as(u64, 40), transition.transition_id);
-    try std.testing.expectEqual(@as(u64, 1), transition.attempt_epoch);
-    try std.testing.expectEqual(@as(u64, 42), transition.destination_group_id);
-    try std.testing.expectEqualStrings("doc:m", transition.split_key);
-
-    const encoded = try encodeBatchRequest(std.testing.allocator, owned.req);
-    defer std.testing.allocator.free(encoded);
-    var reparsed = try parseInternalBatchRequest(std.testing.allocator, encoded);
-    defer reparsed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(db_mod.types.SplitTransitionMutation.Kind.start, reparsed.req.split_transition.?.kind);
-}
-
-test "distributed txn internal batch codec round trips replicated transaction phases" {
-    const alloc = std.testing.allocator;
-    const txn_id: db_mod.types.TxnId = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
-    const encoded = try encodeBatchRequest(alloc, .{
-        .writes = &.{.{ .key = "doc:a", .value = "{}" }},
-        .predicates = &.{.{ .key = "doc:a", .expected_version = 41, .expected_content_digest = @splat(7) }},
-        .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 7 } },
-    });
-    defer alloc.free(encoded);
-    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
-
-    var decoded = try parseInternalBatchRequest(alloc, encoded);
-    defer decoded.deinit(alloc);
-    const prepare = switch (decoded.req.transaction orelse return error.TestExpectedEqual) {
-        .prepare => |value| value,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqual(txn_id, prepare.txn_id);
-    try std.testing.expectEqual(@as(u64, 7), prepare.topology_epoch);
-    try std.testing.expectEqual(@as(usize, 1), decoded.req.writes.len);
-    try std.testing.expectEqual(@as(u64, 41), decoded.req.predicates[0].expected_version);
-    try std.testing.expectEqual([_]u8{7} ** 32, decoded.req.predicates[0].expected_content_digest.?);
-
-    const begin_encoded = try encodeBatchRequest(alloc, .{
-        .transaction = .{ .begin = .{
-            .txn_id = txn_id,
-            .begin_timestamp = 42,
-            .created_at_ns = 43,
-            .topology_epoch = 7,
-            .retain_terminal = true,
-            .participants = &.{"table2:4:docs:group:7"},
-        } },
-    });
-    defer alloc.free(begin_encoded);
-    var begin_decoded = try parseInternalBatchRequest(alloc, begin_encoded);
-    defer begin_decoded.deinit(alloc);
-    const begin = switch (begin_decoded.req.transaction.?) {
-        .begin => |value| value,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expect(begin.retain_terminal);
-    try std.testing.expectEqualStrings("table2:4:docs:group:7", begin.participants[0]);
-
-    const ack_encoded = try encodeBatchRequest(alloc, .{
-        .transaction = .{ .acknowledge = .{
-            .txn_id = txn_id,
-            .participant = "table2:4:docs:group:8",
-        } },
-    });
-    defer alloc.free(ack_encoded);
-    var ack_decoded = try parseInternalBatchRequest(alloc, ack_encoded);
-    defer ack_decoded.deinit(alloc);
-    const ack = switch (ack_decoded.req.transaction.?) {
-        .acknowledge => |value| value,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqualStrings("table2:4:docs:group:8", ack.participant);
-
-    const cleanup_encoded = try encodeBatchRequest(alloc, .{
-        .transaction = .{ .cleanup = .{
-            .txn_id = txn_id,
-            .cutoff_timestamp = 100,
-            .retained_cutoff_timestamp = 50,
-        } },
-    });
-    defer alloc.free(cleanup_encoded);
-    var cleanup_decoded = try parseInternalBatchRequest(alloc, cleanup_encoded);
-    defer cleanup_decoded.deinit(alloc);
-    const cleanup = switch (cleanup_decoded.req.transaction.?) {
-        .cleanup => |value| value,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqual(@as(u64, 100), cleanup.cutoff_timestamp);
-    try std.testing.expectEqual(@as(u64, 50), cleanup.retained_cutoff_timestamp);
-}
-
-test "internal batch parser rejects mixed split transition commands" {
-    const body =
-        \\{"inserts":{"doc:m":{}},"_split_transition":{"kind":"prepare","transition_id":40,"attempt_epoch":1,"destination_group_id":42,"split_key":"doc:m"}}
-    ;
-    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(std.testing.allocator, body));
-    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(std.testing.allocator, .{
-        .writes = &.{.{ .key = "doc:m", .value = "{}" }},
-        .split_transition = .{
-            .kind = .prepare,
-            .transition_id = 40,
-            .attempt_epoch = 1,
-            .destination_group_id = 42,
-            .split_key = "doc:m",
-        },
-    }));
-}
-
-test "batch parser accepts raw payload value under public request cap" {
-    const alloc = std.testing.allocator;
-    const payload = try alloc.alloc(u8, 6 * 1024 * 1024);
-    defer alloc.free(payload);
-    @memset(payload, 'x');
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    const writer = &out.writer;
-
-    try writer.writeAll("{\"inserts\":{\"doc:a\":{\"raw_payload\":\"");
-    try writer.writeAll(payload);
-    try writer.writeAll("\"}}}");
-
-    var owned = try parseBatchRequest(alloc, out.written());
-    defer owned.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.writes.len);
-    try std.testing.expect(std.mem.indexOf(u8, owned.writes[0].value, "\"raw_payload\"") != null);
-}
-
-test "batch parser rejects removed aknn sync level" {
-    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator,
-        \\{"inserts":{"doc:a":{"title":"alpha"}},"sync_level":"aknn"}
-    ));
-}
-
-test "batch parser accepts transforms" {
-    var owned = try parseBatchRequest(std.testing.allocator,
-        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$min","path":"priority","value":2},{"op":"$max","path":"version","value":3},{"op":"$set","path":"status","value":"updated"}],"upsert":true}]}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), owned.transforms.len);
-    try std.testing.expect(owned.transforms[0].upsert);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.min, owned.transforms[0].operations[0].op);
-    try std.testing.expectEqualStrings("priority", owned.transforms[0].operations[0].path);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.max, owned.transforms[0].operations[1].op);
-}
-
-test "batch parser accepts supported Go transform op spelling" {
-    var owned = try parseBatchRequest(std.testing.allocator,
-        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$addToSet","path":"tags","value":"zig"},{"op":"$setOnInsert","path":"created_at","value":"now"}]}]}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), owned.transforms.len);
-    try std.testing.expectEqual(@as(usize, 2), owned.transforms[0].operations.len);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.add_to_set, owned.transforms[0].operations[0].op);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.set_on_insert, owned.transforms[0].operations[1].op);
-}
-
-test "batch parser accepts push for graph edge arrays" {
-    var owned = try parseBatchRequest(std.testing.allocator,
-        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$push","path":"edges","value":{"to":"doc:b"}}]}]}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.push, owned.transforms[0].operations[0].op);
-}
-
-test "batch parser accepts pull for exact array values" {
-    var owned = try parseBatchRequest(std.testing.allocator,
-        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$pull","path":"edges","value":{"target":"doc:b"}}]}]}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.pull, owned.transforms[0].operations[0].op);
-}
-
-test "batch parser rejects every recognized but unsupported transform operator" {
-    const unsupported = [_][]const u8{
-        "$pop",
-        "$mul",
-        "$currentDate",
-        "$rename",
-    };
-    for (unsupported) |op| {
-        const body = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "{{\"transforms\":[{{\"key\":\"doc:missing\",\"operations\":[{{\"op\":\"{s}\",\"path\":\"field\",\"value\":1}}]}}]}}",
-            .{op},
-        );
-        defer std.testing.allocator.free(body);
-        try std.testing.expectError(
-            error.InvalidBatchRequest,
-            parseBatchRequest(std.testing.allocator, body),
-        );
-    }
-}
-
-test "batch parser safely rejects unsupported transform after initialized operations" {
-    const body =
-        \\{"transforms":[{"key":"doc:missing","operations":[{"op":"$set","path":"ready","value":true},{"op":"$pop","path":"items","value":1}]}]}
-    ;
-    for (0..32) |_| {
-        try std.testing.expectError(
-            error.InvalidBatchRequest,
-            parseBatchRequest(std.testing.allocator, body),
-        );
-    }
-}
-
-test "batch parser preserves packed embeddings for mapper extraction" {
-    var owned = try parseBatchRequest(std.testing.allocator,
-        \\{"inserts":{"doc:a":{"title":"alpha","_embeddings":{"dense_idx":"AACAPwAAAEAAAEBA","sparse_idx":{"packed_indices":"AQAAAAUAAAA=","packed_values":"AAAAPwAAQD8="}}}}}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    var extracted = try document_mapper.extractWrite(std.testing.allocator, owned.writes[0].key, owned.writes[0].value);
-    defer extracted.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), extracted.dense_embeddings.len);
-    try std.testing.expectEqual(@as(usize, 1), extracted.sparse_embeddings.len);
-    try std.testing.expect(extracted.cleaned_value != null);
-    try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "\"title\":\"alpha\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "_embeddings") == null);
-}
-
-test "batch parser accepts compact vdbbench-shaped embeddings batch" {
-    const alloc = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    const writer = &out.writer;
-
-    try writer.writeAll("{\"inserts\":{");
-    for (0..500) |i| {
-        if (i != 0) try writer.writeByte(',');
-        try writer.print(
-            "\"key:{d}\":{{\"id\":{d},\"metadata\":{{\"source\":\"vdbbench\",\"ordinal\":{d}}},\"vec_data\":[0.1,0.2,0.3],\"_embeddings\":{{\"vec\":[0.1,0.2,0.3]}}}}",
-            .{ i, i, i },
-        );
-    }
-    try writer.writeAll("},\"sync_level\":\"write\"}");
-
-    var owned = try parseBatchRequest(alloc, out.written());
-    defer owned.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 500), owned.writes.len);
-    try std.testing.expectEqual(db_mod.types.SyncLevel.write, owned.req.sync_level);
-
-    var extracted = try document_mapper.extractWrite(alloc, owned.writes[0].key, owned.writes[0].value);
-    defer extracted.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), extracted.dense_embeddings.len);
-    try std.testing.expectEqualStrings("vec", extracted.dense_embeddings[0].index_name);
-    try std.testing.expectEqual(@as(usize, 3), extracted.dense_embeddings[0].vector.len);
-    try std.testing.expect(extracted.cleaned_value != null);
-    try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "\"vec_data\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, extracted.cleaned_value.?, "_embeddings") == null);
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

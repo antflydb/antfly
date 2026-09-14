@@ -66,6 +66,43 @@ pub const RunOwner = struct {
 };
 
 pub const Run = struct {
+    /// Immutable memory runs own their state and routing metadata together.
+    /// Readers pin this generation rather than duplicating every key/value.
+    const SharedMemory = struct {
+        refs: std.atomic.Value(usize) = .init(1),
+        allocator: Allocator,
+        run: Run,
+    };
+
+    pub fn shareMemory(self: *Run, allocator: Allocator) !void {
+        std.debug.assert(self.path == null and self.state != null and self.shared_memory == null);
+        const shared = try allocator.create(SharedMemory);
+        shared.* = .{ .allocator = allocator, .run = self.* };
+        self.shared_memory = shared;
+    }
+
+    pub fn retainMemory(self: Run) ?Run {
+        const shared = self.shared_memory orelse return null;
+        _ = shared.refs.fetchAdd(1, .monotonic);
+        var pinned = self;
+        // This pin owns only immutable memory, not the writer's physical run
+        // header or unpublished-output cleanup authority.
+        pinned.owner = null;
+        pinned.output_ticket = null;
+        return pinned;
+    }
+
+    pub fn releaseMemory(self: *Run) bool {
+        const shared = self.shared_memory orelse return false;
+        self.shared_memory = null;
+        if (shared.refs.fetchSub(1, .acq_rel) == 1) {
+            const allocator = shared.allocator;
+            shared.run.deinit(allocator);
+            allocator.destroy(shared);
+        }
+        self.state = null;
+        return true;
+    }
     owner: ?*RunOwner = null,
     output_ticket: ?*@import("output_cleanup.zig").Ticket = null,
     id: u64,
@@ -97,11 +134,16 @@ pub const Run = struct {
     version_ref_pinned: bool = false,
     shared_read_version: bool = false,
     state: ?state_mod.State,
+    shared_memory: ?*SharedMemory = null,
 
     pub fn deinit(self: *Run, allocator: Allocator) void {
         if (self.owner) |owner| {
             self.* = .{ .id = self.id, .level = self.level, .size_bytes = 0, .path = null, .smallest_namespace_name = null, .smallest_key = &.{}, .largest_namespace_name = null, .largest_key = &.{}, .entry_count = 0, .bloom_filter = null, .state = null, .owns_metadata = false, .owns_bloom_filter = false };
             owner.release(allocator);
+            return;
+        }
+        if (self.releaseMemory()) {
+            self.* = undefined;
             return;
         }
         if (self.output_ticket) |ticket| ticket.abandon();
@@ -211,6 +253,7 @@ pub const Run = struct {
 };
 
 pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
+    if (source.retainMemory()) |pinned| return pinned;
     var metadata_owned = true;
     const smallest_namespace_name = if (source.smallest_namespace_name) |name| try allocator.dupe(u8, name) else null;
     errdefer if (metadata_owned) if (smallest_namespace_name) |name| allocator.free(name);
@@ -256,6 +299,7 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
 }
 
 pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
+    if (source.retainMemory()) |pinned| return pinned;
     var metadata_owned = true;
     const smallest_namespace_name = if (source.smallest_namespace_name) |name| try allocator.dupe(u8, name) else null;
     errdefer if (metadata_owned) if (smallest_namespace_name) |name| allocator.free(name);
@@ -2050,6 +2094,45 @@ const WrittenTableFile = struct {
     size_bytes: u64,
     compression_stats: lsm_table_file.CompressionStats,
 };
+
+test "repository immutable memory pins outlive owner without copying state or metadata" {
+    const Runner = struct {
+        fn check(allocator: Allocator) !void {
+            var run = Run{
+                .id = 1,
+                .level = 0,
+                .size_bytes = 1,
+                .path = null,
+                .smallest_namespace_name = null,
+                .smallest_key = &.{},
+                .largest_namespace_name = null,
+                .largest_key = &.{},
+                .entry_count = 1,
+                .bloom_filter = null,
+                .state = .{},
+            };
+            var owner_active = true;
+            defer if (owner_active) run.deinit(allocator);
+            run.smallest_key = try allocator.dupe(u8, "key");
+            run.largest_key = try allocator.dupe(u8, "key");
+            try run.state.?.entries.ensureTotalCapacity(allocator, 1);
+            run.state.?.entries.appendAssumeCapacity(try state_mod.initEntry(allocator, .{}, "key", "value", false));
+            try run.shareMemory(allocator);
+            var reader = try cloneRunSnapshot(allocator, run);
+            defer reader.deinit(allocator);
+            var compactor = try cloneRunCompactionSnapshot(allocator, run);
+            defer compactor.deinit(allocator);
+            try std.testing.expectEqual(run.state.?.entries.items.ptr, reader.state.?.entries.items.ptr);
+            try std.testing.expectEqual(run.smallest_key.ptr, compactor.smallest_key.ptr);
+            run.deinit(allocator);
+            owner_active = false;
+            try std.testing.expectEqualStrings("value", try reader.state.?.get(.{}, "key"));
+            try std.testing.expectEqualStrings("key", compactor.smallest_key);
+            try std.testing.expectEqualStrings("value", try compactor.state.?.get(.{}, "key"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.check, .{});
+}
 
 test "repository manifest persist omits run bloom filters" {
     const allocator = std.testing.allocator;

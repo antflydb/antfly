@@ -1,5 +1,8 @@
 # Separate Vector Store: Intended Design
 
+> Paths under `.benchmark-results/` refer to local benchmark output that is not tracked in git.
+
+
 Status: experimental implementation, repeated 50K/1M measurements completed, 2026-09-09. The table setting,
 reference-based source payload path, recovery/reader guards, and initial
 reclamation/accounting are implemented in this worktree. Recovery qualification
@@ -27,7 +30,7 @@ can use stale classifications. All-live verification skips density work unless a
 post-cut preparation prevents the fast path. Final copy planning uses direct
 reader indices, but copy-set construction and sorting still run under the lock.
 
-The [qualification ledger](../.benchmark-results/vector-store-planning-targets-v2/RESULTS.md)
+The qualification ledger (`.benchmark-results/vector-store-planning-targets-v2/RESULTS.md`)
 records eight fresh 50K arms, separately comparing the planner and sparse policy
 in A/B then B/A order. Source/native tests in default and combined modes, 13 cache
 tests, 10 API checks, eight reclamation checks and four independent inventories
@@ -46,7 +49,7 @@ Sparse-only fallback still allows extra copying during foreground work when only
 sparse garbage exists. Separate foreground and idle copy budgets remain future
 work. Copy-set construction and sorting also remain locked.
 
-A [matched-input cleanup check](../.benchmark-results/vector-store-planning-targets-v2/matched-planning/RESULTS.md)
+A matched-input cleanup check (`.benchmark-results/vector-store-planning-targets-v2/matched-planning/RESULTS.md`)
 holds 64 MiB sparse batching constant and changes only bounded planning. Four
 clones of the same saved database retain exactly 50,000 payloads and copy exactly
 15,490,108 bytes in two collections. Median paired source-lock time falls 16.9%,
@@ -65,7 +68,7 @@ ANN metadata admission. CLOCK removal already swap-compacts its slots, but
 insertion still scanned the full array for holes. That obsolete scan is removed
 in the common control/candidate baseline. The sampled control and its cold
 restart result remain diagnostic evidence, excluded from the fresh comparison.
-A separate [same-data cache replay](../.benchmark-results/vector-store-planning-targets-v2/cache-replay/RESULTS.md)
+A separate same-data cache replay (`.benchmark-results/vector-store-planning-targets-v2/cache-replay/RESULTS.md`)
 compares the old and corrected binaries in ABBA order: mean query latency falls
 about 65% with identical hits, scores and distances. Each process receives ten
 warmup queries followed by 100 measured queries; this is not an OS-cache-flushed
@@ -91,7 +94,7 @@ Copy steps retain their independent byte budget. Planning admission failure
 releases the cut for retry; old snapshots and post-cut writes retain their
 existing protection. Neither setting changes durable formats or defaults.
 
-The [qualification ledger](../.benchmark-results/vector-store-marking-targets/README.md)
+The qualification ledger (`.benchmark-results/vector-store-marking-targets/README.md`)
 tracks separate locator-versus-bitmap, compact-shape-versus-hash, and sparse-batch
 comparisons. All twelve fresh 50K workload/reclamation arms and six independent
 candidate inventories passed. Median paired changes are:
@@ -109,7 +112,7 @@ physical footprint rises in both pairs (4.8% and 56.2%). The unbatched debt cont
 need 407/356 seconds to reclaim after churn, versus 2.4/2.5 seconds for the batched
 candidates. These runs finish with different layouts.
 
-A separate [matched-layout ABBA check](../.benchmark-results/vector-store-marking-targets/matched-sparse/RESULTS.md)
+A separate matched-layout ABBA check (`.benchmark-results/vector-store-marking-targets/matched-sparse/RESULTS.md`)
 clones the same saved sparse database for every arm and changes only the batch
 target. Controls take 336/338 seconds and 56 collections; batching takes 8.8/9.8
 seconds and two collections. Mark rows fall from 11.56 million to 461,014, with
@@ -156,7 +159,7 @@ segment bitmap marking with a bounded WAL fallback, and a provisional small-tabl
 inventory cutoff. None changes defaults. The cutoff is a candidate to measure,
 not an established optimal crossover. Explicit collection, full sync, payload
 ownership, old-reader leases, WAL bounds and memory admission remain intact.
-See the [implementation and qualification ledger](../.benchmark-results/vector-store-cost-recovery/README.md)
+See the implementation and qualification ledger (`.benchmark-results/vector-store-cost-recovery/README.md`)
 for settings, safety boundaries, validation and the independent A/B matrix.
 
 The isolated 50K ABBA runs passed all 16 workload/reclamation gates and eight
@@ -216,7 +219,7 @@ queued WAL deltas at installation without eager foreground map updates remains
 a separate hypothesis. The cutoff still needs a matched-dimension size sweep
 before selecting a crossover; neither is an implemented or qualified new win.
 Full per-arm results and limitations are in the
-[measurement report](../.benchmark-results/vector-store-cost-recovery/RESULTS.md).
+measurement report (`.benchmark-results/vector-store-cost-recovery/RESULTS.md`).
 
 ## Lifecycle fixes and isolated qualification
 
@@ -598,7 +601,7 @@ versus 7.19/9.53 s for controls, with different starting layouts/debt. These are
 lifecycle results, not identical-input GC microbenchmarks. No defaults change.
 Profile shared-catalog residency and inventory WAL/map costs, then qualify a
 selected subset against the stronger locked row-bounded baseline before 1M.
-See [the complete measurement record](../.benchmark-results/vector-structural/RESULTS.md).
+See the complete measurement record (`.benchmark-results/vector-structural/RESULTS.md`).
 
 The memory investigation is recorded under
 `.benchmark-results/vector-structural-refined/`. Identical-data memory-map
@@ -611,7 +614,7 @@ establish an overall performance win. That prototype remains in its frozen
 experiment snapshot and is excluded from the current implementation.
 
 
-The subsequent [source publication memory fix](../.benchmark-results/vector-source-memory-fix/README.md)
+The subsequent source publication memory fix (`.benchmark-results/vector-source-memory-fix/README.md`)
 reproduces the suspected OOM as a source-budget rejection of a second WAL-sized
 allocation during GC preparation. Full and selective GC now prepare readers and
 inventory before publication, reuse the committed WAL suffix, and preserve the
@@ -623,7 +626,7 @@ That revision passes fresh 50K ABBA and its lifecycle checks, but the second
 1M candidate logs one maintenance OOM and is excluded. A same-binary diagnostic
 identifies a separate 77,594,648-byte mark-map allocation with 332,745,026 live
 bytes against the 402,653,184-byte source slice. The
-[mark-workspace follow-up](../.benchmark-results/vector-source-memory-admission/README.md)
+mark-workspace follow-up (`.benchmark-results/vector-source-memory-admission/README.md`)
 admits the map and source leases against the resident ANN snapshot before map
 allocation. Rejected setup releases its temporary snapshots and retries later;
 backing allocation and I/O failures still propagate. Its regression verifies
@@ -648,7 +651,7 @@ memory demand. Maximum sampled source WAL is 48.05 MiB in all four 1M arms.
 These periodic samples are not exact peaks. The second 1M control lacks a
 complete churn-stage source-counter interval; its lock/inventory breakdown is
 unavailable, not zero. See the
-[qualified results](../.benchmark-results/vector-source-memory-admission/RESULTS.md).
+qualified results (`.benchmark-results/vector-source-memory-admission/RESULTS.md`).
 Both arms contain the fixes: this is not a pre-fix/post-fix timing comparison,
 a comparison against `primary_lsm`, or qualification of other deployment modes.
 The frozen source/harness/binary hashes verify. Qualification excludes unrelated
@@ -685,8 +688,8 @@ collection before the errors, but the failing allocation is not identified.
 Next, reproduce memory admission/collection scratch pressure with allocation
 evidence, fix it while preserving publication and recovery fences, then rerun
 fresh 1M ABBA. No defaults change. See the
-[full results](../.benchmark-results/vector-structural-selected/RESULTS.md) and
-[memory-failure evidence](../.benchmark-results/vector-structural-selected/MEMORY_FAILURE.md).
+full results (`.benchmark-results/vector-structural-selected/RESULTS.md`) and
+memory-failure evidence (`.benchmark-results/vector-structural-selected/MEMORY_FAILURE.md`).
 
 The current refinement is under `.benchmark-results/vector-structural-recovery/`.
 `ANTFLY_SOURCE_VECTOR_LAZY_INVENTORY=1` lets an incremental-inventory store use
@@ -704,7 +707,7 @@ zero. Durable generation-repair ownership now excludes that reconstruction;
 independent rebuild chunks retain their existing capture coverage. Five focused
 checks pass, including restart and both model generations. The saved failed
 database, capacity simulation, source patch and qualification receipts are in
-[the recovery record](../.benchmark-results/vector-structural-recovery/README.md).
+the recovery record (`.benchmark-results/vector-structural-recovery/README.md`).
 The pinned release passes both five-case public API suites, saved-database
 recovery with update/delete and two further restarts, and both controlled
 capacity/restart/resume cases without another write. The isolated and combined
@@ -879,8 +882,8 @@ Ratios are candidate/control; lower readiness and memory ratios are favorable.
 These are small shared-host measurements with only two pairs, not production
 qualification. Detailed per-arm timings, counters, failed-query diagnostics,
 and executable/script hashes are retained in
-[`RESULTS.md`](../.benchmark-results/vector-next-experiments/RESULTS.md) and
-[`small/summary.json`](../.benchmark-results/vector-next-experiments/small/summary.json).
+`RESULTS.md` (`.benchmark-results/vector-next-experiments/RESULTS.md`) and
+`small/summary.json` (`.benchmark-results/vector-next-experiments/small/summary.json`).
 The combined 50K diagnostic is complete under `scale/`; 1M qualification
 remains gated on recovery/availability failures and the observed regressions.
 
@@ -921,8 +924,8 @@ main-table payloads after updates, deletes, restoration, and restart.
 Keep the controls opt-in. Fix and regress the ANN restart mismatch and the
 ready-to-repair availability transition before 1M or promotion. Full metrics
 and failed gates are preserved in
-[`scale/Performance1536D50K-comparison.json`](../.benchmark-results/vector-next-experiments/scale/Performance1536D50K-comparison.json)
-(`qualified: false`) and the [experiment report](../.benchmark-results/vector-next-experiments/RESULTS.md).
+`scale/Performance1536D50K-comparison.json` (`.benchmark-results/vector-next-experiments/scale/Performance1536D50K-comparison.json`)
+(`qualified: false`) and the experiment report (`.benchmark-results/vector-next-experiments/RESULTS.md`).
 
 ## Experimental implementation
 

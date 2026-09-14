@@ -22,7 +22,7 @@ const schema = @import("../schema/mod.zig");
 const reads = @import("table_read_source.zig");
 const operation = @import("operation.zig");
 const catalog_mod = @import("../storage/db/relational_integrity_catalog.zig");
-const activation = @import("../storage/db/relational_integrity_activation.zig");
+const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
 const types = @import("../storage/db/types.zig");
 
 pub fn collect(alloc: std.mem.Allocator, source: anytype, reader: reads.TableReadSource, name: []const u8, request: operation.RequestContext) ![]u8 {

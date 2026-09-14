@@ -24,7 +24,7 @@ const reads = if (@import("builtin").is_test) @import("table_reads.zig") else @i
 const writes = if (@import("builtin").is_test) @import("table_writes.zig") else @import("table_write_source.zig");
 const router_api = @import("table_router.zig");
 const catalog_api = @import("table_catalog.zig");
-const topology = @import("../storage/db/relational_integrity_topology.zig");
+const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
 const identity = @import("../storage/db/doc_identity.zig");
 const seal = @import("../storage/db/native_backup_seal.zig");
 

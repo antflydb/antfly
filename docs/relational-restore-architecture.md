@@ -171,18 +171,18 @@ can finish from local verified state even if the repository becomes unavailable.
 
 Index readiness is replica-local. A leader's replicated validation receipt
 does not prove that a recovering follower has rebuilt its CHECK coverage or
-physical indexes. Followers and HA standbys advance bounded reconstruction
+physical indexes. Followers and hot standbys advance bounded reconstruction
 slices before accepting that receipt. Catch-up defers apply without advancing
 the applied index, rejecting a valid command, or poisoning the replica.
 
-## HA ownership and canceled generations
+## Hot standby ownership and canceled generations
 
-An authenticated HA begin record carries the immutable hidden-owner descriptor.
+An authenticated hot standby begin record carries the immutable hidden-owner descriptor.
 The receiver durably records that descriptor before acknowledging replay, so
 owners created after its seed remain discoverable in a subsequent seed.
 Descriptor/schema inventory is bounded by active owners, not historical jobs.
 
-Cancellation writes a compact terminal proof before the global HA replay
+Cancellation writes a compact terminal proof before the global hot standby replay
 receipt advances. Subsequent seeds stream those proofs in an authenticated
 artifact with fixed-size buffers, independently of the active topology. The
 proof permits an exact repeated cancellation without reopening a deleted DB,
@@ -190,7 +190,7 @@ while rejecting late imports or an unrelated incarnation. Full descriptors are
 then retired, and physical roots use the existing replica-retirement journal
 and generation cleanup machinery after resident reader/writer leases drain.
 
-Compact terminal proofs are reclaimed behind a durable contiguous HA replay
+Compact terminal proofs are reclaimed behind a durable contiguous hot standby replay
 floor, not an advisory WAL-retention observation. Each bounded maintenance step
 first proves that the exact canceled root and registry descriptor were retired,
 then atomically deletes eligible proofs and advances its scan cursor. The floor
@@ -202,6 +202,18 @@ their proofs until physical retirement is established.
 
 ## Current implementation boundary
 
+The compiled storage owner owns hidden native databases, source decoding, and
+physical validation. Control code exchanges pure versioned contracts and keeps
+Raft proposals outside owner leases: prepare a bounded mutation, commit through
+the existing replicated path, then observe the durable result. Lookup and scan
+contracts preserve typed-row options and exact snapshot digests. Coordinated
+TTL transfers bounded owned observations to the existing background job lane;
+its native callback never reenters the writer cache.
+
+Source modules use `storage/hot_standby` and the standalone coordination port is
+`standalone_hot_standby`. Released compatibility aliases and durable record
+identifiers remain unchanged; this is not a storage-format migration.
+
 Filesystem standalone uses the same indexed metadata transactions, cohort and
 staging records, and replicated restore-job persistence as distributed metadata;
 it does not require data Raft or maintain a second restore scheduler. Existing
@@ -209,13 +221,13 @@ local restore jobs migrate atomically into that authority. Local hidden-owner
 imports pass through the normal durable batch path and the same validation and
 publication barriers.
 
-For HA standalone, incremental metadata effects and a durable outbox accompany
+For standalone hot standby, incremental metadata effects and a durable outbox accompany
 catalog, lifecycle, and user-job commits. Seed checkpoints include the complete
 private metadata state, not only public table descriptions. Mutation leases are
 acquired before the local catalog lock; promotion rehydrates jobs under the new
-HA epoch before dispatch. Coordinated native and portable backup publication
+hot standby epoch before dispatch. Coordinated native and portable backup publication
 pins that primary epoch through capture, writer heartbeats, and repository
-publication. Freeze/release/cancel controls share the normal durable HA effects
+publication. Freeze/release/cancel controls share the normal durable hot standby effects
 path. Cancellation releases every replicated write fence before attempting
 replica-local pin reclamation, so an unavailable capture node cannot leave live
 writes frozen. Pins remain bound to the original capture store: missing pins
@@ -230,15 +242,15 @@ The table restore route submits the same durable staging job with one explicit
 selection and fresh-generation overwrite. A table with outgoing foreign-key
 dependencies requires cluster restore with the complete dependency set from the
 same cohort; a live same-named parent is never substituted. Uncertified
-historical independent snapshots still cannot enter the HA restore path.
+historical independent snapshots still cannot enter the hot standby restore path.
 
-Large metadata effects use authenticated frames whose complete HA envelope is
+Large metadata effects use authenticated frames whose complete hot standby envelope is
 at most 1 MiB. The receiver checkpoints contiguous verified chunks in its
 indexed metadata store; these uncommitted chunks are included in subsequent
 seeds. Final decoding streams one frame/key/value at a time into one atomic
 transaction and verifies both the canonical effect checksum and full transfer
 digest before publication. A prefix never exposes part of a schema, reservation,
-or job update. Duplicate frames are idempotent, and a newer HA epoch may replace
+or job update. Duplicate frames are idempotent, and a newer hot standby epoch may replace
 only an uncommitted transfer. This preserves the ordinary bounded HTTP fetch
 budget without narrowing legitimate multi-table plan admission.
 
@@ -256,7 +268,7 @@ failure only after cleanup. A 129-owner regression verifies bounded scheduler
 progress beyond one slice and cancellation after metadata publication.
 Native seal restart/export and metadata overwrite tests cover their additional
 boundaries. Standalone regressions exercise mixed document/relational restore
-without data Raft, canceled-owner recovery after restart, and HA-policy-enabled
+without data Raft, canceled-owner recovery after restart, and hot standby-policy-enabled
 restore with native owner effects and replayed metadata/user-job publication.
 A full multi-node backup-to-restore fault matrix
 remains a release-verification requirement; component tests are not a claim that
@@ -266,7 +278,7 @@ unselected cohort tables. Portable constrained export carries the exact sealed
 cohort proof and rebuilds claims in the fresh target; unrelated independent
 historical snapshots do not acquire a common-cut guarantee retroactively.
 
-The public standalone HA regression additionally performs an actual HTTP table
+The public standalone hot-standby regression additionally performs an actual HTTP table
 backup, changes the live row, then restores through the same replicated user-job
 and staged-generation machinery. It verifies a fresh table identity and the
 snapshot's original row. Native and portable worker cases preserve active/read

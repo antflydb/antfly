@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ha_contract = @import("ha_contract.zig");
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const ant_json = @import("antfly-json");
 const vector_mod = @import("antfly_vector").vector;
@@ -83,16 +84,16 @@ test {
 }
 
 const change_journal_mod = @import("derived/change_journal.zig");
-const ha_effects_mod = @import("../ha/effects.zig");
-const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
-const ha_fencing_mod = @import("../ha/fencing.zig");
-const ha_mutation_barrier_mod = @import("../ha/mutation_barrier.zig");
-const ha_primary_mod = @import("../ha/primary.zig");
-const ha_public_gate_state_mod = @import("../ha/public_gate_state.zig");
-const ha_replication_record_mod = @import("../ha/replication_record.zig");
-const ha_session_mod = @import("../ha/session.zig");
-const ha_standby_mod = @import("../ha/standby.zig");
-const ha_write_gate_mod = @import("../ha/write_gate.zig");
+const ha_effects_mod = @import("../hot_standby/effects.zig");
+const ha_commit_gate_mod = @import("../hot_standby/commit_gate.zig");
+const ha_fencing_mod = @import("../hot_standby/fencing.zig");
+const ha_mutation_barrier_mod = @import("../hot_standby/mutation_barrier.zig");
+const ha_primary_mod = @import("../hot_standby/primary.zig");
+const ha_public_gate_state_mod = @import("../hot_standby/public_gate_state.zig");
+const ha_replication_record_mod = @import("../hot_standby/replication_record.zig");
+const ha_session_mod = @import("../hot_standby/session.zig");
+const ha_standby_mod = @import("../hot_standby/standby.zig");
+const ha_write_gate_mod = @import("../hot_standby/write_gate.zig");
 const replay_stream_mod = @import("derived/replay_stream.zig");
 const derived_types = @import("derived/derived_types.zig");
 const derived_worker = @import("derived/derived_worker.zig");
@@ -110,6 +111,11 @@ const embedder_mod = @import("enrichment/embedder.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
 const inference_work = @import("../../inference/work.zig");
 const document_extraction_mod = @import("enrichment/document_extraction.zig");
+const runtime_failure_abi = @import("runtime_failure_abi");
+const document_extraction_client = if (!builtin.is_test and build_options.linked_storage)
+    @import("enrichment/document_extraction_client.zig")
+else
+    struct {};
 const document_unit_fingerprint = @import("enrichment/document_unit_fingerprint.zig");
 const portable_backup = @import("../portable_backup.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
@@ -247,6 +253,7 @@ const scraping = if (builtin.os.tag == .freestanding or build_options.bench_mini
 else
     @import("antfly_scraping");
 const graph_mod = @import("../../graph/graph.zig");
+const graph_metric_rerank = @import("../../graph/metric_rerank.zig");
 const NodeAdmission = @import("../../graph/node_admission.zig").NodeAdmission;
 const GraphNodeRef = @import("../../graph/node_admission.zig").NodeRef;
 const traversal_mod = @import("../../graph/traversal.zig");
@@ -292,6 +299,7 @@ pub const coordinated_ttl = @import("../coordinated_ttl.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
+const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
 const transform_mod = @import("transform.zig");
 const sim_fixture = @import("../sim_fixture.zig");
 const storage_sim = @import("../sim_runtime.zig");
@@ -577,6 +585,13 @@ pub const OpenOptions = struct {
         }
     };
 
+    pub const GraphMetricIdleMaintenanceMode = enum {
+        legacy,
+        planned,
+        auto,
+        degree_canary,
+    };
+
     table_storage: ?table_storage_mod.Settings = null,
     open_mode: OpenOptions.OpenMode = .writer,
     /// An authenticated restore decoder needs rows and schema layouts, never
@@ -644,6 +659,11 @@ pub const OpenOptions = struct {
     transaction_recovery: transaction_runtime_mod.Config = .{},
     text_merge: text_merge_runtime_mod.Config = .{},
     sparse_compaction: sparse_compaction_runtime_mod.Config = .{},
+    graph_metric_maintenance: graph_metric_runtime_mod.Config = .{},
+    graph_metric_idle_maintenance: GraphMetricIdleMaintenanceMode = .auto,
+    graph_metric_idle_planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions = .{},
+    graph_metric_idle_auto_options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions = .{},
+    graph_metric_idle_degree_canary_options: index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions = .{},
     /// Optional cross-shard candidate source for entity resolution blocking,
     /// injected by the serving layer (see `api/distributed_candidate_source.zig`).
     /// Null means local-only blocking against the worker's own store. Must
@@ -773,36 +793,8 @@ test "uninstalled enrichment config releases owned chunk provider routing" {
     try std.testing.expect(cfg.chunk_provider == null);
 }
 
-pub const HAAsyncEffectMirror = struct {
-    primary: *ha_primary_mod.Primary,
-    /// Shared across every DB/catalog writer owned by one HA runtime. Mutations
-    /// hold a shared lease from before their first persistent side effect until
-    /// WAL publication and the sync durability decision finish. Seed capture
-    /// takes the exclusive lease before choosing its checkpoint.
-    mutation_barrier: ?*HAMutationBarrier = null,
-    /// Serializes the final client-write gate check, HA WAL append, and sync
-    /// acknowledgement with a node-local promotion fence. When configured,
-    /// every acknowledged write is wholly before or wholly after the frozen
-    /// former-primary boundary.
-    transition_mutex: ?*std.atomic.Mutex = null,
-    last_lsn: ?*std.atomic.Value(u64) = null,
-    failure_count: ?*std.atomic.Value(u64) = null,
-    sync_policy: ha_primary_mod.SyncPolicy = .{},
-    sync_wait_ctx: ?*anyopaque = null,
-    sync_wait_fn: ?HASyncWaitFn = null,
-    last_gate_lsn: ?*std.atomic.Value(u64) = null,
-    last_gate_action: ?*std.atomic.Value(u8) = null,
-    sync_reject_count: ?*std.atomic.Value(u64) = null,
-    sync_wait_count: ?*std.atomic.Value(u64) = null,
-    sync_degraded_count: ?*std.atomic.Value(u64) = null,
-};
-
-pub const HASyncWaitFn = *const fn (
-    ctx: *anyopaque,
-    primary: *ha_primary_mod.Primary,
-    target_lsn: u64,
-    policy: ha_primary_mod.SyncPolicy,
-) anyerror!void;
+pub const HAAsyncEffectMirror = ha_contract.AsyncEffectMirror;
+pub const HASyncWaitFn = ha_contract.SyncWaitFn;
 
 pub const HAProgressPollFn = *const fn (
     ctx: *anyopaque,
@@ -962,52 +954,10 @@ fn haSyncPolicyIncludesStandby(policy: ha_primary_mod.SyncPolicy, slot_name: []c
     return false;
 }
 
-pub const HAAsyncBatchMirror = HAAsyncEffectMirror;
-pub const HAAsyncMetadataMirror = HAAsyncEffectMirror;
-
-pub const SharedHAWriteGate = struct {
-    state: *const ha_public_gate_state_mod.State,
-    /// Sources track the live role. DB instances pin the generation they opened
-    /// with so a promotion cannot pair old runtime hooks with the new primary.
-    generation: ?u64 = null,
-};
-
-pub const HAWriteGate = union(enum) {
-    primary: *ha_primary_mod.Primary,
-    fenced_primary: ha_write_gate_mod.FencedPrimary,
-    standby: *ha_standby_mod.Standby,
-    shared: SharedHAWriteGate,
-
-    pub fn check(self: HAWriteGate) !void {
-        switch (self) {
-            .shared => |shared| return try shared.state.checkWrite(shared.generation),
-            else => {},
-        }
-
-        const decision = switch (self) {
-            .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
-            .fenced_primary => |fenced| try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{}),
-            .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
-            .shared => unreachable,
-        };
-        switch (decision.action) {
-            .allow_write => {},
-            .reject_read_only_standby => return error.HAReadOnlyStandby,
-            .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
-            .reject_fenced_primary => return error.HAFencedPrimary,
-        }
-    }
-
-    pub fn pinned(self: HAWriteGate) HAWriteGate {
-        return switch (self) {
-            .shared => |shared| .{ .shared = .{
-                .state = shared.state,
-                .generation = shared.generation orelse shared.state.currentGeneration(),
-            } },
-            else => self,
-        };
-    }
-};
+pub const HAAsyncBatchMirror = ha_contract.AsyncBatchMirror;
+pub const HAAsyncMetadataMirror = ha_contract.AsyncMetadataMirror;
+pub const SharedHAWriteGate = ha_contract.SharedWriteGate;
+pub const HAWriteGate = ha_contract.WriteGate;
 
 fn haWriteGateIsStandby(gate: ?HAWriteGate) bool {
     const configured = gate orelse return false;
@@ -1058,6 +1008,19 @@ pub const DocumentArtifactChildRangeDispatcher = struct {
 
     fn applyDispatch(self: DocumentArtifactChildRangeDispatcher, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
         return try self.apply(self.ptr, alloc, dispatch);
+    }
+};
+
+/// Synchronous handoff of the exact durable derived replay payload produced by
+/// one committed batch. An empty payload means the batch intentionally elided
+/// derived replay, but the observer is still invoked so it can publish the
+/// corresponding coarse mutation record.
+pub const CommittedBatchEffectsObserver = struct {
+    ptr: *anyopaque,
+    apply: *const fn (ptr: *anyopaque, replay_payload: []const u8) anyerror!void,
+
+    fn observe(self: CommittedBatchEffectsObserver, replay_payload: []const u8) !void {
+        return try self.apply(self.ptr, replay_payload);
     }
 };
 
@@ -1114,26 +1077,7 @@ pub const IndexRepairVisibility = struct {
     action_required: bool = false,
 };
 
-/// Exact durable identity affected by a source-target advance. Names are
-/// borrowed for the synchronous callback. An empty slice with
-/// `target_scope_known = false` means the producer could not prove scope and
-/// consumers must conservatively fence the whole group.
-pub const IndexTargetVisibility = struct {
-    pub const ServingSetEffect = enum {
-        /// This commit may add or replace members, but cannot remove a
-        /// previously searchable member from this exact incarnation.
-        additive_only,
-        /// This commit contains a delete, overwrite, or another mutation
-        /// whose authoritative projection may have lower cardinality.
-        may_reduce,
-    };
-
-    index_name: []const u8,
-    kind: types.IndexKind,
-    incarnation: u64,
-    config_hash: u64,
-    serving_set_effect: ServingSetEffect = .may_reduce,
-};
+pub const IndexTargetVisibility = types.IndexTargetVisibility;
 
 pub const QueryVisibilityEvent = struct {
     change: QueryVisibilityChange,
@@ -2964,6 +2908,7 @@ const BatchExecutionOptions = struct {
     wait_for_sync_level: bool = true,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
+    committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
     bypass_ha_write_gate: bool = false,
     ha_applied_lsn_marker: ?u64 = null,
     raft_applied_entry_marker: ?RaftAppliedEntryIdentity = null,
@@ -2976,10 +2921,7 @@ const BatchExecutionOptions = struct {
     visibility_cancellation: types.CancellationToken = .none,
 };
 
-pub const RaftAppliedEntryIdentity = struct {
-    term: u64,
-    index: u64,
-};
+pub const RaftAppliedEntryIdentity = types.RaftAppliedEntryIdentity;
 
 const raft_applied_entry_value_len = 2 * @sizeOf(u64);
 
@@ -5160,6 +5102,10 @@ pub const DB = struct {
     executor: *derived_executor_mod.Executor,
     start_index_workers: bool,
     optional_runtime_workers_enabled: bool,
+    graph_metric_idle_maintenance: OpenOptions.GraphMetricIdleMaintenanceMode,
+    graph_metric_idle_planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
+    graph_metric_idle_auto_options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions,
+    graph_metric_idle_degree_canary_options: index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions,
     resolver_workers_enabled: bool,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
@@ -5204,6 +5150,7 @@ pub const DB = struct {
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
+    graph_metric_runtime: ?*graph_metric_runtime_mod.GraphMetricRuntime,
     portable_runtime_activation_attempts: AtomicU64 = AtomicU64.init(0),
     // Serializes the stop/load/start lifecycle without coupling worker joins
     // to the apply lock. Public and background retries may race otherwise.
@@ -5222,7 +5169,10 @@ pub const DB = struct {
     // quarantined indexes recover or the DB closes.
     quarantine_retry_thread: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
     quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    quarantine_retry_start_address_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    // DB pointers are borrowed by independently compiled runtime units. Keep
+    // the physical layout identical in test and production artifacts even
+    // though only tests observe this diagnostic value.
+    quarantine_retry_start_address_for_test: usize = 0,
     artifact_repair_metadata_future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
     artifact_repair_metadata_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     relational_columns_building: std.atomic.Value(bool) = .init(false),
@@ -5262,7 +5212,7 @@ pub const DB = struct {
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
     shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
     graph_restore_parse_cache: ?GraphRestoreParseCache = null,
-    graph_restore_parse_count_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    graph_restore_parse_count_for_test: usize = 0,
 
     const IndexRepairDiscoveryObservationTestHook = struct {
         ptr: *anyopaque,
@@ -6128,6 +6078,10 @@ pub const DB = struct {
                 .executor = executor,
                 .start_index_workers = start_index_workers,
                 .optional_runtime_workers_enabled = false,
+                .graph_metric_idle_maintenance = opts.graph_metric_idle_maintenance,
+                .graph_metric_idle_planned_options = opts.graph_metric_idle_planned_options,
+                .graph_metric_idle_auto_options = opts.graph_metric_idle_auto_options,
+                .graph_metric_idle_degree_canary_options = opts.graph_metric_idle_degree_canary_options,
                 .resolver_workers_enabled = opts.start_resolver_workers,
                 .secret_store = opts.secret_store,
                 .remote_content = opts.remote_content,
@@ -6149,6 +6103,7 @@ pub const DB = struct {
                 .transaction_runtime = null,
                 .text_merge_runtime = null,
                 .sparse_compaction_runtime = null,
+                .graph_metric_runtime = null,
                 .shadow = null,
             };
             core_owner_transferred = true;
@@ -7109,10 +7064,12 @@ pub const DB = struct {
         const should_start_replacement = replacement_can_run and options.start_replacement;
         const previous_desired = self.async_context.enrichment_desired_running.swap(false, .acq_rel);
         var stopped_existing_runtime = false;
+        var previous_telemetry: ?types.EnrichmentStats = null;
         lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
         if (self.async_context.enrichment_runtime) |runtime| {
             stopped_existing_runtime = runtime.isStarted();
             runtime.stop();
+            previous_telemetry = runtime.stats();
         }
         self.async_context.enrichment_lifecycle_mutex.unlock();
         errdefer if (stopped_existing_runtime) {
@@ -7129,6 +7086,7 @@ pub const DB = struct {
             // a terminal request that the old worker parks concurrently.
             const replacement = detached.?.runtime.?;
             try replacement.reloadDurableState();
+            if (previous_telemetry) |telemetry| replacement.inheritProcessTelemetry(telemetry);
             try mergeEnrichmentTerminalFailureEnvelope(self.core.batchExecutionResources().store, replacement);
             if (self.core.hasGeneratedEnrichmentTargets()) {
                 const target_sequence = self.core.nextEnrichmentSequence();
@@ -7381,6 +7339,23 @@ pub const DB = struct {
         self.async_context.sparse_compaction_runtime = runtime;
     }
 
+    fn initOptionalGraphMetricRuntime(self: *DB, cfg: graph_metric_runtime_mod.Config) !void {
+        if (!self.start_index_workers or !cfg.enabled) return;
+        const resources = self.core.asyncResources();
+        const runtime = try self.runtime_alloc.create(graph_metric_runtime_mod.GraphMetricRuntime);
+        errdefer self.runtime_alloc.destroy(runtime);
+        runtime.* = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            self.runtime_alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            self.backend_runtime,
+            cfg,
+        );
+        errdefer runtime.deinit();
+        self.graph_metric_runtime = runtime;
+    }
+
     fn initOptionalRuntimes(self: *DB, opts: *OpenOptions) !void {
         // Created before enrichment so the enrichment append context can notify
         // it when extraction artifacts land.
@@ -7408,6 +7383,7 @@ pub const DB = struct {
         }
         try self.initOptionalTextMergeRuntime(opts.text_merge);
         try self.initOptionalSparseCompactionRuntime(opts.sparse_compaction);
+        try self.initOptionalGraphMetricRuntime(opts.graph_metric_maintenance);
     }
 
     fn startOptionalRuntimes(self: *DB) !void {
@@ -7423,6 +7399,7 @@ pub const DB = struct {
         }
         if (self.text_merge_runtime) |runtime| try runtime.start();
         if (self.sparse_compaction_runtime) |runtime| try runtime.start();
+        if (self.graph_metric_runtime) |runtime| try runtime.start();
     }
 
     /// Publish non-joining shutdown to optional workers before a borrowed
@@ -7620,6 +7597,10 @@ pub const DB = struct {
         }
         if (self.sparse_compaction_runtime) |runtime| {
             self.async_context.sparse_compaction_runtime = null;
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+        }
+        if (self.graph_metric_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
@@ -8615,6 +8596,27 @@ pub const DB = struct {
         }
     }
 
+    pub fn batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(
+        self: *DB,
+        req: types.BatchRequest,
+        dispatcher: ?DocumentArtifactChildRangeDispatcher,
+        observer: CommittedBatchEffectsObserver,
+    ) anyerror!void {
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, .{
+                .document_child_range_dispatcher = dispatcher,
+                .committed_batch_effects_observer = observer,
+            });
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, .{
+                .document_child_range_dispatcher = dispatcher,
+                .committed_batch_effects_observer = observer,
+            });
+        }
+    }
+
     fn projectedBatchLsmAdmissionBytes(req: types.BatchRequest) u64 {
         var payload_bytes: u64 = 0;
         var operations: u64 = 0;
@@ -8754,12 +8756,15 @@ pub const DB = struct {
         if (try self.raftEntryAlreadyApplied(identity)) return;
         var apply_req = req;
         apply_req.sync_level = .write;
-        try self.batchInternal(apply_req, null, .{
+        self.batchInternal(apply_req, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
             .bypass_ha_write_gate = !mirror_scoped_restore,
             .raft_applied_entry_marker = identity,
-        });
+        }) catch |err| switch (err) {
+            error.GraphMaintenanceInProgress => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
     }
 
     pub fn failNextRestoreProjectionApplyForTest() void {
@@ -8803,6 +8808,17 @@ pub const DB = struct {
         const range: types.ByteRange = .{ .start = start, .end = end };
         const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, range);
         defer self.alloc.free(range_value);
+        // Publish graph source ownership before acknowledging the transition.
+        // Physical retirement is a durable maintenance task, not Raft apply
+        // work. Reverse reads use the same source fence; old metric jobs are
+        // invalidated before they can publish against the narrowed range.
+        self.core.index_manager.fenceGraphSplitRange(transition.split_key, current.end) catch |err| switch (err) {
+            // A previous split's cleanup is bounded background work. Keep
+            // this committed entry pending, not a fatal Raft apply failure.
+            error.GraphMaintenanceInProgress => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (builtin.is_test and graph_mod.test_abort_ownership_before_range_commit) return error.TestInjectedBackfillFailure;
         var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
         var ha_marker_buf: [ha_applied_lsn_value_len]u8 = undefined;
         var outbox_value: ?[]u8 = null;
@@ -10903,6 +10919,7 @@ pub const DB = struct {
                 try store_writes.append(self.alloc, .{ .key = @import("relational_integrity_activation.zig").key, .value = coverage });
             }
         }
+        if (persisted_range) |range| try self.core.index_manager.validateRangeTransition(range);
         try appendDenseArtifactCounterMutations(
             self.alloc,
             self.core.store,
@@ -11040,6 +11057,9 @@ pub const DB = struct {
             } else if (durable_ha_replay_payload) |payload| {
                 deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&ha_ctx, payload));
             } else if (append_derived_replay and !scoped_restore_ha) deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&ha_ctx, replay_payload));
+        }
+        if (opts.committed_batch_effects_observer) |observer| {
+            try observer.observe(if (append_derived_replay) replay_payload else "");
         }
         if (pending_identity_visibility_summary) |summary| {
             self.core.identity_visibility.summary = summary;
@@ -15191,19 +15211,7 @@ pub const DB = struct {
     /// Authoritative owner wake decision. A tagged state prevents `0` from
     /// ambiguously meaning both "run now" and "nothing runnable" at scheduler
     /// boundaries.
-    pub const IndexRepairWake = union(enum) {
-        immediate,
-        at_realtime_ms: u64,
-        parked,
-        empty,
-
-        pub fn retryAtMs(self: @This()) u64 {
-            return switch (self) {
-                .at_realtime_ms => |deadline| deadline,
-                .immediate, .parked, .empty => 0,
-            };
-        }
-    };
+    pub const IndexRepairWake = types.IndexRepairWake;
 
     pub const IndexRepairIntentSummary = struct {
         runnable: usize = 0,
@@ -24344,6 +24352,26 @@ pub const DB = struct {
         return try restoreRuntimeRepairNeededForPath(self.alloc, self.core.path);
     }
 
+    /// Restore's first repair owner can prove a generation only while its
+    /// index objects remain open. Publication needs the stronger proof that a
+    /// fresh owner can load the files it left behind. When that reopen
+    /// rediscovers dense generation or watermark debt, reset the durable
+    /// restore state so the fresh owner reconstructs the candidate before it
+    /// can be sealed.
+    pub fn prepareRestoreDurabilityRetryIfNeeded(self: *DB, alloc: Allocator) !bool {
+        if (self.core.index_manager.hasLoadFailures()) return error.RestoreIndexLoadIncomplete;
+        const retry_needed = try self.hasPendingDenseArtifactRebuild(alloc) or
+            try self.denseArtifactWatermarkRepairNeeded(alloc) or
+            self.core.index_manager.hasRepairUnavailableIndexes();
+        if (!retry_needed) return false;
+        if (self.backend_runtime.io()) |io| {
+            try markRestoreRuntimeRepairNeededWithIo(alloc, io, self.core.path);
+        } else {
+            try markRestoreRuntimeRepairNeeded(alloc, self.core.path);
+        }
+        return true;
+    }
+
     fn updateRestoreRuntimeRepairPhaseWithIo(
         self: *DB,
         alloc: Allocator,
@@ -26092,12 +26120,7 @@ pub const DB = struct {
         if (!isMetadataKey(key)) try self.core.validateKeyOwnership(key);
     }
 
-    pub const RelationalTopologyIdentity = struct {
-        namespace: doc_identity.Namespace,
-        catalog_digest: [32]u8,
-        next_epoch: u64,
-        backup_seal_supported: bool = false,
-    };
+    pub const RelationalTopologyIdentity = @import("relational_integrity_topology_contract.zig").Identity;
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct { mode: enum { identity, status, completed, handoff_progress, handoff_manifest, prune_progress } }, alloc, request_json, .{});
@@ -28958,6 +28981,7 @@ pub const DB = struct {
             .promotion = self.promotionStageStats(),
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
             .repair_metadata_rebuild_pending = self.artifactRepairMetadataRebuildPending(),
+            .graph_metric = self.core.index_manager.graphMetricPlannedWorkStats() catch .{},
         };
     }
 
@@ -29266,10 +29290,18 @@ pub const DB = struct {
             const next_target = self.core.nextDerivedSequence();
             if (next_target <= stable_target) {
                 try waitForManagedIndexesApplied(self, sequence, index_names);
+                if (self.syncTargetsIncludeGraph(index_names)) _ = try self.runGraphMetricMaintenanceForIdle();
                 return;
             }
             stable_target = next_target;
         }
+    }
+
+    fn syncTargetsIncludeGraph(self: *DB, index_names: []const []const u8) bool {
+        for (index_names) |index_name| {
+            if (self.core.graphIndex(index_name) != null) return true;
+        }
+        return false;
     }
 
     pub fn waitForCurrentSyncLevel(self: *DB, sync_level: types.SyncLevel) !void {
@@ -29365,6 +29397,13 @@ pub const DB = struct {
         progress_hook: ReplayProgressHook,
     ) !void {
         try replayPendingDerivedBatches(self, progress_ctx, progress_hook, .{});
+    }
+
+    /// Appends internal derived work without exposing the DB's batch execution
+    /// context. Runtime partitions use this boundary while retaining the normal
+    /// write gate, locking, backlog accounting, and HA mirroring semantics.
+    pub fn derivedAsyncAppendDerivedBatchRecord(self: *DB, derived_batch: derived_types.DerivedBatch) !u64 {
+        return try appendDerivedBatchRecord(self, derived_batch);
     }
 
     const run_until_idle_max_replay_rounds: usize = 16;
@@ -29526,7 +29565,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
 
-        var more = false;
+        var more = try self.core.index_manager.runGraphOwnershipCleanupStep();
         more = (try self.rebuildArtifactRepairSummaryIfMissing(self.alloc)) or more;
         more = (try self.rebuildArtifactRepairKindIndexIfMissing(self.alloc)) or more;
         if (self.source_vectors) |source| {
@@ -29587,7 +29626,9 @@ pub const DB = struct {
     fn artifactRepairMetadataWorkerStep(self: *DB) ?u64 {
         if (self.artifact_repair_metadata_stop.load(.acquire)) return null;
         self.runIndependentMaintenancePass();
-        const active = (platform_time.monotonicNs() >= self.artifact_metadata_retry_after_ns and self.artifactRepairMetadataRebuildPending()) or
+        const artifact_active = self.artifact_repair_metadata_pending or
+            (if (self.source_vectors) |source| source.collectionPending() else false);
+        const active = (platform_time.monotonicNs() >= self.artifact_metadata_retry_after_ns and artifact_active) or
             (self.relational_index_maintenance_pending.load(.acquire) and platform_time.monotonicNs() >= self.relational_index_retry_after_ns.load(.acquire)) or
             (self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire));
         const scan_pause = if (self.source_vectors) |source| source.activeScanPauseNs() else null;
@@ -29942,10 +29983,10 @@ pub const DB = struct {
             // is due. State survives scheduler yields, not a pinned thread.
             if (now >= self.artifact_repair_metadata_due_ns or !source.continueScanWithoutApply()) {
                 self.artifact_repair_metadata_due_ns = now +| artifact_repair_metadata_active_poll_ns;
-                _ = try self.runArtifactRepairMetadataMaintenanceAfterScan();
+                self.artifact_repair_metadata_pending = try self.runArtifactRepairMetadataMaintenanceAfterScan();
             }
         } else {
-            _ = try self.runArtifactRepairMetadataMaintenancePass();
+            self.artifact_repair_metadata_pending = try self.runArtifactRepairMetadataMaintenancePass();
         }
     }
 
@@ -30053,6 +30094,7 @@ pub const DB = struct {
         // boundary: besides posting repair it advances tree-link repair,
         // posting checkpoints, and quiescent vector-block publication.
         _ = try self.runDensePostingMaintenanceForIdle();
+        _ = try self.runGraphMetricMaintenanceForIdle();
         _ = try self.drainDensePostingMaintenanceForIdle();
         // This is a caller-proven stable writer boundary. Publish the native
         // exact-vector generation here rather than depending on a later live
@@ -30069,6 +30111,336 @@ pub const DB = struct {
         _ = try finalizeCoveredDenseProjectionCheckpointsIfIdle(self.async_context);
         try self.saveAllLiveIndexStatusSnapshots(self.alloc);
         _ = try self.runLsmMaintenanceUntilIdle();
+    }
+
+    pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        while (true) {
+            lockApply(self);
+            const more = self.core.index_manager.runGraphOwnershipCleanupStep() catch |err| {
+                self.core.unlockApply();
+                return err;
+            };
+            self.core.unlockApply();
+            if (!more) break;
+        }
+        // Planned maintenance uses the same catalog pins and transaction
+        // fences as background workers. Never hold the ingest lock while
+        // draining graph computation; graph writes may supersede a build.
+        switch (self.graph_metric_idle_maintenance) {
+            .auto => return self.runGraphMetricPlannedAutoMaintenanceForIdle(),
+            .planned => return self.drainGraphMetricPlannedIdle(),
+            else => {},
+        }
+        lockApply(self);
+        defer self.core.unlockApply();
+        return switch (self.graph_metric_idle_maintenance) {
+            .legacy => try self.core.index_manager.runGraphMetricMaintenance(),
+            .planned, .auto => unreachable,
+            .degree_canary => try self.runGraphMetricDegreeCanaryMaintenanceForIdleLocked(),
+        };
+    }
+
+    fn graphMetricPlannedProgress(result: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult) usize {
+        return result.planning_steps + result.builds_started + result.pages_completed + result.phases_advanced + result.published;
+    }
+
+    fn drainGraphMetricPlannedIdle(self: *DB) !usize {
+        const result = try self.core.index_manager.runGraphMetricPlannedMaintenance(self.graph_metric_idle_planned_options);
+        if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
+        return graphMetricPlannedProgress(result);
+    }
+
+    fn runGraphMetricPlannedAutoMaintenanceForIdle(self: *DB) !usize {
+        const result = try self.core.index_manager.runGraphMetricPlannedAutoMaintenance(
+            self.graph_metric_idle_planned_options,
+            self.graph_metric_idle_auto_options,
+        );
+        if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
+        const progressed = graphMetricPlannedProgress(result);
+        const after = try self.core.index_manager.graphMetricPlannedAutoIdleDecision(self.graph_metric_idle_auto_options);
+        if (!after.shouldRunPlanned() and after.ineligible_queued != 0) {
+            // Admission caps must not silently select unlimited local compute.
+            return error.RunUntilIdleDidNotConverge;
+        }
+        return progressed;
+    }
+
+    fn runGraphMetricDegreeCanaryMaintenanceForIdleLocked(self: *DB) !usize {
+        const decision = try self.core.index_manager.graphMetricDegreeCanaryDecision(self.graph_metric_idle_degree_canary_options);
+        if (decision.shouldRunPlanned()) return try self.drainGraphMetricPlannedIdle();
+        if (decision.active_degree_builds != 0 or decision.blocked_active_non_degree != 0) {
+            return error.RunUntilIdleDidNotConverge;
+        }
+        return try self.core.index_manager.runGraphMetricMaintenance();
+    }
+
+    pub fn runGraphMetricPlannedMaintenanceForIdle(
+        self: *DB,
+        options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
+    ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedMaintenance(options);
+    }
+
+    const GraphMetricServiceMaintenanceAction = enum { tick, status, release };
+
+    const GraphMetricServiceMaintenanceRequest = struct {
+        action: GraphMetricServiceMaintenanceAction = .tick,
+        role: graph_metric_runtime_mod.Role,
+        runtime_id: []const u8,
+        owner_id: []const u8,
+        lease_owned: bool = false,
+        lease_ttl_ms: u64 = 30_000,
+        worker_id: ?[]const u8 = null,
+        worker_ids: ?[]const []const u8 = null,
+        start_background_builds: bool = true,
+        max_rounds: usize = 1,
+        max_metrics_per_round: usize = 8,
+        max_pages_per_round: usize = 1,
+        preserve_lease_after_tick: bool = false,
+        now_ms: ?u64 = null,
+    };
+
+    pub fn runGraphMetricServiceMaintenanceJsonAlloc(self: *DB, alloc: Allocator, body: []const u8) ![]u8 {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var parsed = std.json.parseFromSlice(GraphMetricServiceMaintenanceRequest, alloc, if (body.len == 0) "{}" else body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return error.InvalidGraphMetricRuntimeConfig;
+        defer parsed.deinit();
+
+        var manual_clock = platform_clock.ManualClock{};
+        if (parsed.value.now_ms) |now_ms| manual_clock.setRealtimeNs(now_ms *| std.time.ns_per_ms);
+        const resources = self.core.asyncResources();
+        var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            self.backend_runtime,
+            .{
+                .enabled = true,
+                .start_background_loop = false,
+                .role = parsed.value.role,
+                .runtime_id = parsed.value.runtime_id,
+                .lease_owned = parsed.value.lease_owned,
+                .owner_id = parsed.value.owner_id,
+                .lease_ttl_ms = parsed.value.lease_ttl_ms,
+                .coordinator_start_background_builds = parsed.value.start_background_builds,
+                .planned_options = .{
+                    .worker_id = parsed.value.worker_id orelse "",
+                    .worker_ids = parsed.value.worker_ids orelse &.{},
+                    .max_rounds = parsed.value.max_rounds,
+                    .max_metrics_per_round = parsed.value.max_metrics_per_round,
+                    .max_pages_per_round = parsed.value.max_pages_per_round,
+                },
+                .clock = if (parsed.value.now_ms != null) manual_clock.clock() else platform_clock.Clock.real(),
+            },
+        );
+        var preserve_lease = false;
+        defer if (preserve_lease) runtime.deinitPreserveLease() else runtime.deinit();
+
+        if (parsed.value.action == .release) {
+            const released = try runtime.ownership.releaseHeldLease();
+            var current_lease = try runtime.ownership.loadLease(alloc);
+            defer if (current_lease) |*lease| lease_mod.deinitRecord(alloc, lease);
+            var runtime_stats = runtime.stats();
+            runtime_stats.shutdown = true;
+            return try std.json.Stringify.valueAlloc(alloc, .{
+                .released = released,
+                .lease_owner_id_hash = if (current_lease) |lease| graph_metric_runtime_mod.identityHash(lease.owner_id) else 0,
+                .lease_expires_at_ms = if (current_lease) |lease| lease.expires_at_ms else 0,
+                .stats = runtime_stats,
+            }, .{ .emit_null_optional_fields = false });
+        }
+
+        const result: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult = if (parsed.value.action == .tick) try runtime.runOnceDetailed() else .{};
+        const runtime_stats = runtime.stats();
+        preserve_lease = parsed.value.preserve_lease_after_tick and parsed.value.lease_owned and parsed.value.action == .tick and runtime_stats.has_lease;
+        return try std.json.Stringify.valueAlloc(alloc, .{
+            .result = result,
+            .stats = runtime_stats,
+        }, .{ .emit_null_optional_fields = false });
+    }
+
+    pub fn refreshGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.enableGraphMetric(metric_name);
+        var status = try entry.index.runGraphMetric(metric_name);
+        defer status.deinit(entry.index.alloc);
+        const cloned = try cloneGraphMetricStatusFromGraph(alloc, status);
+        if (self.graph_metric_runtime) |runtime| runtime.notify();
+        return cloned;
+    }
+
+    pub fn rebuildGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.enableGraphMetric(metric_name);
+        var status = try entry.index.runGraphMetric(metric_name);
+        defer status.deinit(entry.index.alloc);
+        const cloned = try cloneGraphMetricStatusFromGraph(alloc, status);
+        if (self.graph_metric_runtime) |runtime| runtime.notify();
+        return cloned;
+    }
+
+    /// Durably enqueue metric work and return immediately. Public control-plane
+    /// actions use this path so request latency is independent of graph size;
+    /// the bounded maintenance runtime performs and checkpoints the build.
+    pub fn scheduleGraphMetricBuild(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        metric_name: []const u8,
+        force: bool,
+    ) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const owned_status = blk: {
+            lockApply(self);
+            defer self.core.unlockApply();
+            const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+            var current = try entry.index.graphMetricStatus(metric_name);
+            defer current.deinit(entry.index.alloc);
+            if (current.state == .disabled) {
+                try entry.index.enableGraphMetric(metric_name);
+                current.deinit(entry.index.alloc);
+                current = try entry.index.graphMetricStatus(metric_name);
+            }
+            if (!force and current.state == .fresh) {
+                break :blk try cloneGraphMetricStatusFromGraph(alloc, current);
+            }
+            const target_generation = @max(current.edge_generation, current.target_edge_generation);
+            // Force means "build another immutable score epoch", not
+            // "unpublish first". Repeated requests remain idempotent while a
+            // build is active, and readers keep the verified prior epoch until
+            // the new pointer is atomically published.
+            var scheduled = entry.index.queueGraphMetricBuild(metric_name, target_generation) catch |err| switch (err) {
+                // A newer edge snapshot may be queued while the prior bounded
+                // build is still active. Treat repeated control-plane actions
+                // as accepted and expose the active/queued generations in the
+                // returned status instead of turning a safe retry into a 500.
+                error.GraphMetricBuildAlreadyRunning => break :blk try cloneGraphMetricStatusFromGraph(alloc, current),
+                else => return err,
+            };
+            defer scheduled.deinit(self.core.index_manager.alloc);
+            break :blk try cloneGraphMetricStatusFromGraph(alloc, scheduled);
+        };
+        if (self.graph_metric_runtime) |runtime| runtime.notify();
+        return owned_status;
+    }
+
+    pub fn deleteGraphMetricMaterialization(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.deleteGraphMetricMaterialization(metric_name);
+        var status = try entry.index.graphMetricStatus(metric_name);
+        defer status.deinit(entry.index.alloc);
+        const cloned = try cloneGraphMetricStatusFromGraph(alloc, status);
+        if (self.graph_metric_runtime) |runtime| runtime.notify();
+        return cloned;
+    }
+
+    pub fn pauseGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        var status = try entry.index.pauseGraphMetricMaintenance(metric_name);
+        defer status.deinit(entry.index.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn resumeGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        var status = try entry.index.resumeGraphMetricMaintenance(metric_name);
+        defer status.deinit(entry.index.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn ensureGraphMetricPlannedBuild(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        metric_name: []const u8,
+        target_generation: u64,
+    ) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStep(self: *DB, index_name: []const u8, metric_name: []const u8, worker_id: []const u8) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedWorkerPageStep(index_name, metric_name, worker_id);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStepAt(self: *DB, index_name: []const u8, metric_name: []const u8, worker_id: []const u8, now_ms: u64) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedWorkerPageStepAt(index_name, metric_name, worker_id, now_ms);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStep(self: *DB, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedCoordinatorStep(index_name, metric_name);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStepAt(self: *DB, index_name: []const u8, metric_name: []const u8, now_ms: u64) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedCoordinatorStepAt(index_name, metric_name, now_ms);
+    }
+
+    pub fn failGraphMetricPlannedBuild(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8, err: anyerror) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.failGraphMetricPlannedBuild(index_name, metric_name, err);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn runGraphMetricPlannedDrain(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8, target_generation: u64, options: graph_mod.GraphIndex.GraphMetricPlannedDrainOptions) !types.GraphMetricStatus {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.runGraphMetricPlannedDrain(index_name, metric_name, target_generation, options);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorSweep(self: *DB, options: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepOptions) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        // Planned graph work is generation-fenced and storage-transactional.
+        // IndexManager pins catalog lifetime without blocking foreground apply.
+        return try self.core.index_manager.runGraphMetricPlannedCoordinatorSweep(options);
+    }
+
+    pub fn runGraphMetricPlannedWorkerSweep(self: *DB, options: index_manager_mod.IndexManager.GraphMetricPlannedWorkerSweepOptions) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        return try self.core.index_manager.runGraphMetricPlannedWorkerSweep(options);
     }
 
     pub fn runUntilIdle(self: *DB) !void {
@@ -30211,13 +30583,7 @@ pub const DB = struct {
         return (try self.publishVectorBlockBasesOnlineReported(options)).published;
     }
 
-    pub const NativePublicationResult = struct {
-        published: usize = 0,
-        /// No attempt was made because another owner holds an admission lane.
-        /// This is neither completed work nor evidence of zero progress.
-        busy: bool = false,
-        deferred: bool = false,
-    };
+    pub const NativePublicationResult = types.NativePublicationResult;
 
     pub fn publishVectorBlockBasesOnlineReported(self: *DB, options: index_manager_mod.IndexManager.OnlineVectorBlockPublicationOptions) !NativePublicationResult {
         var catalog_lease = self.tryAcquireIndexCatalogReadLease() orelse return .{ .busy = true };
@@ -31757,6 +32123,12 @@ pub const DB = struct {
         completed_with_progress,
     };
 
+    fn restoreOwnsDenseArtifactIntent(trigger: index_repair_state.Trigger) bool {
+        return trigger == .artifact_counter_missing or
+            trigger == .artifact_coverage_mismatch or
+            trigger == .projection_generation_invalid;
+    }
+
     fn completeRestoreDenseArtifactRepairs(self: *DB, alloc: Allocator) !RestoreDenseArtifactCompletion {
         var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
             error.FileNotFound, error.DurableIndexRepairStateUnavailable => return .complete,
@@ -31764,14 +32136,17 @@ pub const DB = struct {
         };
         defer state.deinit(alloc);
 
+        // `rebuild_replayed_artifacts` reconstructed the private restore root
+        // from its final logical artifacts. Recount them here so a restored
+        // repair-required checkpoint can be retired only from exact source
+        // and active-generation coverage, never from a stale counter alone.
+        var exact_target_counts = try self.collectDenseArtifactTargetCounts(alloc, null);
+        defer exact_target_counts.deinit(alloc);
+
         // Validate every durable intent before changing counters or removing
         // any intent. A pending proof error must be observably mutation-free.
         for (state.entries.items) |entry| {
-            if (entry.intent.trigger != .artifact_counter_missing and
-                entry.intent.trigger != .artifact_coverage_mismatch)
-            {
-                continue;
-            }
+            if (!restoreOwnsDenseArtifactIntent(entry.intent.trigger)) continue;
             const cfg = self.core.index_manager.get(entry.intent.index_name) orelse
                 return error.RestoreDenseIndexProofIncomplete;
             if (cfg.kind != .dense_vector or
@@ -31803,11 +32178,7 @@ pub const DB = struct {
         // all pending exits side-effect free and avoids partially publishing a
         // multi-index restore proof.
         for (state.entries.items) |entry| {
-            if (entry.intent.trigger != .artifact_counter_missing and
-                entry.intent.trigger != .artifact_coverage_mismatch)
-            {
-                continue;
-            }
+            if (!restoreOwnsDenseArtifactIntent(entry.intent.trigger)) continue;
             const cfg = self.core.index_manager.get(entry.intent.index_name) orelse unreachable;
             const expected = (try loadDenseArtifactTargetCounter(alloc, self.core.store, cfg.name)) orelse
                 return error.RestoreDenseCounterProofIncomplete;
@@ -31826,20 +32197,62 @@ pub const DB = struct {
             );
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
             if (applied < target or
-                checkpoint.status != .clean or
+                (entry.intent.trigger != .projection_generation_invalid and checkpoint.status != .clean) or
                 checkpoint.applied_sequence < target or
                 checkpoint.config_hash != entry.intent.config_hash)
             {
                 return error.RestoreDenseCheckpointIncomplete;
             }
+
+            if (entry.intent.trigger == .projection_generation_invalid) {
+                var exact_expected: ?u64 = null;
+                for (self.core.index_manager.dense_indexes.items, 0..) |*dense_entry, dense_index_idx| {
+                    if (!std.mem.eql(u8, dense_entry.config.name, cfg.name)) continue;
+                    exact_expected = exact_target_counts.per_target_index.get(dense_index_idx) orelse 0;
+                    break;
+                }
+                if (exact_expected == null or exact_expected.? != expected) {
+                    return error.RestoreDenseCounterProofIncomplete;
+                }
+                if (@hasDecl(@typeInfo(@TypeOf(dense.index)).pointer.child, "validateStoredStructure")) {
+                    dense.index.validateStoredStructure(alloc) catch
+                        return error.RestoreDenseIndexProofIncomplete;
+                }
+                if (checkpoint.status == .degraded) return error.RestoreDenseCheckpointIncomplete;
+                if (entry.intent.candidate_relative_path) |candidate| {
+                    if (try self.core.index_manager.isRepairCandidateActive(cfg.name, candidate)) {
+                        return error.RestoreDenseIndexProofIncomplete;
+                    }
+                }
+            }
         }
 
         var removed_any = false;
         for (state.entries.items) |entry| {
-            if (entry.intent.trigger != .artifact_counter_missing and
-                entry.intent.trigger != .artifact_coverage_mismatch)
-            {
-                continue;
+            if (!restoreOwnsDenseArtifactIntent(entry.intent.trigger)) continue;
+            if (entry.intent.trigger == .projection_generation_invalid) {
+                const cfg = self.core.index_manager.get(entry.intent.index_name) orelse unreachable;
+                const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
+                const applied = try self.core.loadAppliedSequence(alloc, cfg.name);
+                if (checkpoint.status != .clean or checkpoint.applied_sequence != applied) {
+                    try self.core.saveProjectionCheckpoint(cfg.name, .{
+                        .applied_sequence = applied,
+                        .status = .clean,
+                        .generation = checkpoint.generation +| @intFromBool(checkpoint.status != .clean),
+                        .config_hash = entry.intent.config_hash,
+                    });
+                }
+                if (entry.intent.candidate_relative_path != null) {
+                    if (entry.intent.phase == .terminal) {
+                        try self.updateIndexRepairIntent(alloc, entry.intent.repair_id, .{
+                            .phase = .detected,
+                            .failure_streak = 0,
+                            .next_retry_at_ms = 0,
+                            .replace_last_error = true,
+                        });
+                    }
+                    try self.discardInactiveIndexRepairCandidate(alloc, entry.intent.repair_id);
+                }
             }
             // This is restore-owned metadata debt, not a shadow-generation
             // attempt, so there is no candidate phase chain to advance. All
@@ -33022,6 +33435,7 @@ pub const DB = struct {
         if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
         if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
         if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
+        types.freeGraphMetricStatuses(alloc, @constCast(item.graph_metric_status));
         if (item.algebraic_top_candidate) |candidate| {
             alloc.free(candidate.recommendation);
             alloc.free(candidate.materialization_id);
@@ -33170,14 +33584,16 @@ pub const DB = struct {
         doc_count: u64 = 0,
         term_count: u64 = 0,
         edge_count: u64 = 0,
+        graph_counts_pending: bool = false,
         node_count: u64 = 0,
         root_node: u64 = 0,
         updated_at_ns: u64 = 0,
     };
 
     const index_status_prefix = "\x00\x00__metadata__:index_status:";
-    const index_status_magic: u64 = 0x3153544154584449; // "IDXTATS1" little-endian
-    const index_status_encoded_len = 8 * 8;
+    const index_status_magic_v1: u64 = 0x3153544154584449; // "IDXTATS1" little-endian
+    const index_status_magic: u64 = 0x3253544154584449; // "IDXTATS2" little-endian
+    const index_status_encoded_len = 9 * 8;
     const index_load_failure_prefix = "\x00\x00__metadata__:index_load_failure:";
 
     fn indexStatusKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
@@ -33195,6 +33611,7 @@ pub const DB = struct {
             status_snapshot.node_count,
             status_snapshot.root_node,
             status_snapshot.updated_at_ns,
+            @as(u64, @intFromBool(status_snapshot.graph_counts_pending)),
         }) |value| {
             std.mem.writeInt(u64, out[offset..][0..8], value, .little);
             offset += 8;
@@ -33202,11 +33619,14 @@ pub const DB = struct {
     }
 
     fn decodeIndexStatusSnapshot(raw: []const u8) !IndexStatusSnapshot {
-        if (raw.len != index_status_encoded_len) return error.InvalidIndexStatusSnapshot;
+        if (raw.len != index_status_encoded_len and raw.len != 64) return error.InvalidIndexStatusSnapshot;
         var offset: usize = 0;
         const magic = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
-        if (magic != index_status_magic) return error.InvalidIndexStatusSnapshot;
+        if (!((magic == index_status_magic and raw.len == index_status_encoded_len) or
+            (magic == index_status_magic_v1 and raw.len == 64))) return error.InvalidIndexStatusSnapshot;
+        const counts_pending = if (raw.len == 64) 0 else std.mem.readInt(u64, raw[64..72], .little);
+        if (counts_pending > 1) return error.InvalidIndexStatusSnapshot;
         const kind_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
         const kind: types.IndexKind = switch (kind_raw) {
@@ -33219,6 +33639,7 @@ pub const DB = struct {
         };
         return .{
             .kind = kind,
+            .graph_counts_pending = counts_pending != 0,
             .doc_count = blk: {
                 const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
                 offset += 8;
@@ -33280,11 +33701,12 @@ pub const DB = struct {
             };
         }
         if (index_manager.graphIndex(index_name)) |entry| {
-            const graph_stats = entry.index.stats(index_manager.alloc) catch return null;
+            const graph_stats = entry.index.operationalStats();
             return .{
                 .kind = .graph,
                 .doc_count = graph_stats.node_count,
                 .edge_count = graph_stats.edge_count,
+                .graph_counts_pending = graph_stats.counts_pending,
                 .node_count = graph_stats.node_count,
                 .updated_at_ns = platform_time.monotonicNs(),
             };
@@ -33375,6 +33797,7 @@ pub const DB = struct {
         item.doc_count = status_snapshot.doc_count;
         item.term_count = status_snapshot.term_count;
         item.edge_count = status_snapshot.edge_count;
+        item.graph_counts_pending = status_snapshot.graph_counts_pending;
         item.node_count = status_snapshot.node_count;
         item.root_node = status_snapshot.root_node;
     }
@@ -33442,6 +33865,105 @@ pub const DB = struct {
         item.algebraic_graph_traversal_rejected_count = algebraic_graph.rejected_count;
         item.algebraic_graph_traversal_fallback_count = algebraic_graph.fallback_count;
         item.algebraic_graph_traversal_result_node_count = algebraic_graph.result_node_count;
+    }
+
+    fn cloneGraphMetricBuildPageStatusesFromGraph(
+        alloc: Allocator,
+        source: []const graph_mod.GraphIndex.GraphMetricBuildPageStatus,
+    ) ![]types.GraphMetricBuildPageStatus {
+        if (source.len == 0) return &.{};
+        const out = try alloc.alloc(types.GraphMetricBuildPageStatus, source.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*page| page.deinit(alloc);
+            alloc.free(out);
+        }
+        for (source, 0..) |page, i| {
+            const worker_id = if (page.worker_id.len > 0) try alloc.dupe(u8, page.worker_id) else "";
+            errdefer if (worker_id.len > 0) alloc.free(worker_id);
+            const cursor = if (page.cursor.len > 0) try alloc.dupe(u8, page.cursor) else "";
+            errdefer if (cursor.len > 0) alloc.free(cursor);
+            const last_error = if (page.last_error.len > 0) try alloc.dupe(u8, page.last_error) else "";
+            errdefer if (last_error.len > 0) alloc.free(last_error);
+            out[i] = .{
+                .phase = page.phase,
+                .iteration = page.iteration,
+                .page_id = page.page_id,
+                .state = page.state,
+                .range_kind = page.range_kind,
+                .worker_id = worker_id,
+                .lease_expires_at_ms = page.lease_expires_at_ms,
+                .attempt = page.attempt,
+                .cursor = cursor,
+                .completed_units = page.completed_units,
+                .total_units = page.total_units,
+                .last_error = last_error,
+            };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn cloneGraphMetricStatusFromGraph(
+        alloc: Allocator,
+        source: graph_mod.GraphIndex.GraphMetricStatus,
+    ) !types.GraphMetricStatus {
+        var out = types.GraphMetricStatus{
+            .name = try alloc.dupe(u8, source.name),
+            .state = source.state,
+            .phase = source.phase,
+            .metadata_version = source.metadata_version,
+            .config_fingerprint = source.config_fingerprint,
+            .maintenance_paused = source.maintenance_paused,
+            .build_queued = source.build_queued,
+            .published_generation = source.published_edge_generation,
+            .edge_generation = source.edge_generation,
+            .target_edge_generation = source.target_edge_generation,
+            .queued_generation = source.queued_generation,
+            .building_generation = source.building_generation,
+            .build_job_id = source.build_job_id,
+            .build_started_at_ms = source.build_started_at_ms,
+            .build_iteration = source.build_iteration,
+            .build_lease_expires_at_ms = source.build_lease_expires_at_ms,
+            .build_completed_units = source.build_completed_units,
+            .build_total_units = source.build_total_units,
+            .build_pages_truncated = source.build_pages_truncated,
+            .retry_count = source.retry_count,
+            .progress = source.progress,
+            .converged = source.converged,
+            .iterations_completed = source.iterations_completed,
+            .delta = source.delta,
+            .computed_at_ms = source.computed_at_ms,
+            .last_event = source.last_event,
+        };
+        errdefer out.deinit(alloc);
+        out.edge_filter = try source.edge_filter.cloneAlloc(alloc);
+        out.build_worker_id = if (source.build_worker_id.len > 0) try alloc.dupe(u8, source.build_worker_id) else "";
+        out.build_cursor = if (source.build_cursor.len > 0) try alloc.dupe(u8, source.build_cursor) else "";
+        out.last_error = if (source.last_error.len > 0) try alloc.dupe(u8, source.last_error) else "";
+        out.recent_events = if (source.recent_events.len > 0)
+            try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, source.recent_events)
+        else
+            &.{};
+        out.build_pages = try cloneGraphMetricBuildPageStatusesFromGraph(alloc, source.build_pages);
+        return out;
+    }
+
+    fn populateGraphMetricStatusStats(alloc: Allocator, item: *types.DBIndexStats, graph_index: *graph_mod.GraphIndex) !void {
+        if (graph_index.metric_configs.len == 0) return;
+        const statuses = try alloc.alloc(types.GraphMetricStatus, graph_index.metric_configs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (statuses[0..initialized]) |*status| status.deinit(alloc);
+            alloc.free(statuses);
+        }
+        for (graph_index.metric_configs, 0..) |cfg, i| {
+            var status = try graph_index.graphMetricStatus(cfg.name);
+            defer status.deinit(graph_index.alloc);
+            statuses[i] = try cloneGraphMetricStatusFromGraph(alloc, status);
+            initialized += 1;
+        }
+        item.graph_metric_status = statuses;
     }
 
     fn managedIndexAppliedSequence(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
@@ -33606,6 +34128,7 @@ pub const DB = struct {
         runtime_stats.promotion = self.promotionStageStats();
         runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
         runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
+        runtime_stats.graph_metric_runtime = self.graphMetricRuntimeStats();
 
         // Runtime-only diagnostics are optional status-plane detail and may run
         // under apply. A contended sample is not evidence that the owner went
@@ -33821,14 +34344,14 @@ pub const DB = struct {
                 },
                 .graph => {
                     if (self.core.graphIndex(item.name)) |entry| {
-                        if (entry.index.stats(self.alloc)) |graph_stats| {
-                            item.edge_count = graph_stats.edge_count;
-                            item.node_count = graph_stats.node_count;
-                            item.doc_count = graph_stats.node_count;
-                        } else |_| {}
+                        const graph_stats = entry.index.operationalStats();
+                        item.edge_count = graph_stats.edge_count;
+                        item.node_count = graph_stats.node_count;
+                        item.doc_count = graph_stats.node_count;
+                        item.graph_counts_pending = graph_stats.counts_pending;
                         applyGraphAlgebraicRuntimeStats(item, &entry.index);
                     }
-                    visible_doc_count = @max(visible_doc_count, item.doc_count);
+                    if (!item.graph_counts_pending) visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
                 .algebraic => {
                     if (self.core.index_manager.algebraicIndex(item.name)) |entry| {
@@ -33922,6 +34445,69 @@ pub const DB = struct {
         defer self.core.unlockApplyShared();
         self.overlayRuntimeStatusLifecycleFromSnapshot(runtime_stats);
         try self.overlayRuntimeStatusIndexesLocked(stats_alloc, runtime_stats);
+    }
+
+    pub fn graphMetricRuntimeStats(self: *DB) types.GraphMetricRuntimeStats {
+        const runtime = self.graph_metric_runtime orelse return .{};
+        const runtime_snapshot = runtime.stats();
+        const total = runtime_snapshot.total_result;
+        const last = runtime_snapshot.last_result;
+        return .{
+            .enabled = runtime_snapshot.enabled,
+            .role = switch (runtime_snapshot.role) {
+                .combined => .combined,
+                .coordinator => .coordinator,
+                .worker => .worker,
+                .worker_pool => .worker_pool,
+            },
+            .runtime_id_hash = runtime_snapshot.runtime_id_hash,
+            .owner_id_hash = runtime_snapshot.owner_id_hash,
+            .lease_key_hash = runtime_snapshot.lease_key_hash,
+            .worker_id_hash = runtime_snapshot.worker_id_hash,
+            .worker_count = @intCast(runtime_snapshot.worker_count),
+            .lease_owned = runtime_snapshot.lease_owned,
+            .has_lease = runtime_snapshot.has_lease,
+            .acquisition_count = runtime_snapshot.acquisition_count,
+            .takeover_count = runtime_snapshot.takeover_count,
+            .lease_acquire_failures = runtime_snapshot.lease_acquire_failures,
+            .lost_leases = runtime_snapshot.lost_leases,
+            .last_acquired_ms = runtime_snapshot.last_acquired_ms,
+            .lease_expires_at_ms = runtime_snapshot.lease_expires_at_ms,
+            .lease_renew_after_ms = runtime_snapshot.lease_renew_after_ms,
+            .renewal_count = runtime_snapshot.renewal_count,
+            .started = runtime_snapshot.started,
+            .shutdown = runtime_snapshot.shutdown,
+            .notified = runtime_snapshot.notified,
+            .ticks_started = runtime_snapshot.ticks_started,
+            .ticks_completed = runtime_snapshot.ticks_completed,
+            .durable_progress_ticks = runtime_snapshot.durable_progress_ticks,
+            .idle_ticks = runtime_snapshot.idle_ticks,
+            .error_ticks = runtime_snapshot.error_ticks,
+            .last_error_name = runtime_snapshot.last_error_name,
+            .total_metrics_scanned = @intCast(total.metrics_scanned),
+            .total_active_builds = @intCast(total.active_builds),
+            .total_builds_started = @intCast(total.builds_started),
+            .total_worker_steps = @intCast(total.worker_steps),
+            .total_coordinator_steps = @intCast(total.coordinator_steps),
+            .total_retired_input_records = @intCast(total.retired_input_records),
+            .total_pages_claimed = @intCast(total.pages_claimed),
+            .total_pages_completed = @intCast(total.pages_completed),
+            .total_phases_advanced = @intCast(total.phases_advanced),
+            .total_published = @intCast(total.published),
+            .total_failed_builds = @intCast(total.failed_builds),
+            .last_metrics_scanned = @intCast(last.metrics_scanned),
+            .last_active_builds = @intCast(last.active_builds),
+            .last_builds_started = @intCast(last.builds_started),
+            .last_worker_steps = @intCast(last.worker_steps),
+            .last_coordinator_steps = @intCast(last.coordinator_steps),
+            .last_retired_input_records = @intCast(last.retired_input_records),
+            .last_pages_claimed = @intCast(last.pages_claimed),
+            .last_pages_completed = @intCast(last.pages_completed),
+            .last_phases_advanced = @intCast(last.phases_advanced),
+            .last_published = @intCast(last.published),
+            .last_failed_builds = @intCast(last.failed_builds),
+            .last_budget_exhausted = last.budget_exhausted,
+        };
     }
 
     pub fn stats(self: *DB, alloc: Allocator) !types.DBStats {
@@ -35317,18 +35903,17 @@ pub const DB = struct {
                 },
                 .graph => {
                     if (self.core.graphIndex(cfg.name)) |entry| {
-                        graph_stats: {
-                            const graph_snapshot = entry.index.stats(alloc) catch {
-                                serving_observed = false;
-                                break :graph_stats;
-                            };
+                        {
+                            const graph_snapshot = entry.index.operationalStats();
+                            item.graph_counts_pending = graph_snapshot.counts_pending;
                             item.edge_count = graph_snapshot.edge_count;
                             item.node_count = graph_snapshot.node_count;
                             item.doc_count = graph_snapshot.node_count;
                             serving_observed = true;
-                            visible_doc_count = @max(visible_doc_count, item.doc_count);
+                            if (!graph_snapshot.counts_pending) visible_doc_count = @max(visible_doc_count, item.doc_count);
                         }
                         applyGraphAlgebraicRuntimeStats(&item, &entry.index);
+                        try populateGraphMetricStatusStats(alloc, &item, &entry.index);
                     }
                 },
                 .algebraic => {
@@ -35380,6 +35965,7 @@ pub const DB = struct {
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot(),
+            .graph_metric_runtime = self.graphMetricRuntimeStats(),
             .term_doc_freq_cache_hits = term_doc_freq_cache_hits,
             .term_doc_freq_cache_misses = term_doc_freq_cache_misses,
             .async_indexing = async_indexing,
@@ -35623,6 +36209,7 @@ pub const DB = struct {
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
+            .graph_metric_runtime = self.graphMetricRuntimeStats(),
             .term_doc_freq_cache_hits = blk: {
                 var total: u64 = 0;
                 for (configs) |cfg| {
@@ -37110,18 +37697,24 @@ pub const DB = struct {
             if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &children);
             return children;
         }
-        const selection_req = types.canonicalGroupedMatchSelectionRequest(execution_req);
+        var selection_req = types.canonicalGroupedMatchSelectionRequest(execution_req);
+        if (execution_req.graph_metric_rerank) |rerank| {
+            try types.validateGraphMetricRerankWindow(rerank, execution_req.offset, execution_req.limit);
+            selection_req.offset = 0;
+            selection_req.limit = types.graphMetricRerankCandidateCount(rerank, execution_req.offset, execution_req.limit);
+        }
         if (searchRequestRequiresComposedSearch(selection_req)) {
             var composed = try self.searchComposed(alloc, selection_req, exec_ctx, dense_profile_sink);
             errdefer composed.deinit();
             try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &composed);
+            try self.applyGraphMetricRerank(&composed, execution_req);
             if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &composed);
             return composed;
         }
 
-        const has_primary = selection_req.full_text != null or selection_req.dense != null or selection_req.sparse != null or !db_query_search.isDefaultMatchAll(selection_req.query) or selection_req.graph_queries.len == 0;
+        const has_primary = selection_req.full_text != null or selection_req.dense != null or selection_req.sparse != null or !db_query_search.isDefaultMatchAll(selection_req.query) or (selection_req.graph_queries.len == 0 and selection_req.graph_metric_queries.len == 0);
 
-        var base = if (!has_primary and selection_req.graph_queries.len > 0)
+        var base = if (!has_primary and (selection_req.graph_queries.len > 0 or selection_req.graph_metric_queries.len > 0))
             try db_query_search.emptySearchResult(alloc)
         else if (selection_req.full_text) |text|
             try self.searchTextQuery(alloc, selection_req, text)
@@ -37158,6 +37751,11 @@ pub const DB = struct {
         errdefer base.deinit();
         try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &base);
 
+        if (execution_req.graph_metric_queries.len > 0) {
+            base.graph_metric_results = try self.executeGraphMetricQueries(alloc, execution_req.graph_metric_queries);
+        }
+        try self.applyGraphMetricRerank(&base, execution_req);
+
         if (execution_req.graph_queries.len == 0) {
             if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &base);
             return base;
@@ -37167,6 +37765,133 @@ pub const DB = struct {
         try self.applyGraphExpandStrategy(alloc, &base, execution_req.expand_strategy);
         if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &base);
         return base;
+    }
+
+    fn executeGraphMetricQueries(
+        self: *DB,
+        alloc: Allocator,
+        queries: []const types.NamedGraphMetricQuery,
+    ) ![]types.GraphMetricResult {
+        if (queries.len == 0) return &.{};
+        const results = try alloc.alloc(types.GraphMetricResult, queries.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| result.deinit(alloc);
+            alloc.free(results);
+        }
+        for (queries, 0..) |named, i| {
+            results[i] = try self.executeGraphMetricQuery(alloc, named);
+            initialized += 1;
+        }
+        return results;
+    }
+
+    fn applyGraphMetricRerank(self: *DB, result: *types.SearchResult, req: types.SearchRequest) !void {
+        const rerank = req.graph_metric_rerank orelse return;
+        if (req.count_only) return error.UnsupportedQueryRequest;
+        const entry = self.core.graphIndex(rerank.index_name) orelse return error.IndexNotFound;
+        const node_ids = try result.alloc.alloc([]const u8, result.hits.len);
+        defer result.alloc.free(node_ids);
+        for (result.hits, 0..) |hit, i| node_ids[i] = hit.id;
+        var score_snapshot = try entry.index.graphMetricScoreSnapshotWithPolicyAlloc(rerank.metric_name, node_ids, .{
+            .require_published = true,
+            .require_fresh = rerank.freshness == .fresh,
+        });
+        defer score_snapshot.deinit(entry.index.alloc);
+        if (score_snapshot.status.published_generation == 0) return error.MetricNotReady;
+        if (rerank.freshness == .fresh and score_snapshot.status.state != .fresh) return error.MetricStale;
+
+        var result_status = try cloneGraphMetricStatusFromGraph(result.alloc, score_snapshot.status);
+        errdefer result_status.deinit(result.alloc);
+        const selected = try graph_metric_rerank.selectPageAlloc(
+            result.alloc,
+            result.hits,
+            score_snapshot.scores,
+            .{
+                .base_weight = rerank.base_weight,
+                .metric_weight = rerank.weight,
+                .missing_score = rerank.missing_score,
+            },
+            req.offset,
+            req.limit,
+        );
+        defer result.alloc.free(selected);
+        for (selected) |selection| {
+            const hit = &result.hits[selection.original_index];
+            var details = types.GraphMetricRerankScoreDetails{
+                .index_name = try result.alloc.dupe(u8, rerank.index_name),
+                .metric_name = undefined,
+                .base_score = selection.base_score,
+                .base_weight = rerank.base_weight,
+                .metric_score = selection.metric_score,
+                .metric_score_used = selection.metric_score_used,
+                .metric_weight = rerank.weight,
+                .missing_score_used = selection.metric_score == null,
+                .final_score = selection.final_score,
+                .published_generation = score_snapshot.status.published_generation,
+            };
+            errdefer result.alloc.free(details.index_name);
+            details.metric_name = try result.alloc.dupe(u8, rerank.metric_name);
+            if (hit.score_details) |*old| old.deinit(result.alloc);
+            hit.score_details = details;
+            hit.score = selection.final_score;
+        }
+        const old_hits = result.hits;
+        const retained = try result.alloc.alloc(bool, old_hits.len);
+        defer result.alloc.free(retained);
+        const kept = try result.alloc.alloc(types.SearchHit, selected.len);
+        @memset(retained, false);
+        for (selected, 0..) |selection, i| {
+            retained[selection.original_index] = true;
+            kept[i] = old_hits[selection.original_index];
+            old_hits[selection.original_index] = undefined;
+        }
+        for (old_hits, retained) |*hit, keep| if (!keep) hit.deinit(result.alloc);
+        if (old_hits.len > 0) result.alloc.free(old_hits);
+        result.hits = kept;
+        if (result.graph_metric_rerank_status) |*old| old.deinit(result.alloc);
+        result.graph_metric_rerank_status = result_status;
+    }
+
+    fn executeGraphMetricQuery(
+        self: *DB,
+        alloc: Allocator,
+        named: types.NamedGraphMetricQuery,
+    ) !types.GraphMetricResult {
+        const entry = self.core.graphIndex(named.query.index_name) orelse return error.IndexNotFound;
+        var metric_snapshot = try entry.index.graphMetricTopKSnapshotAlloc(
+            named.query.metric_name,
+            named.query.top_k,
+        );
+        defer metric_snapshot.deinit(entry.index.alloc);
+        if (named.query.freshness == .fresh and metric_snapshot.status.state != .fresh) return error.MetricStale;
+
+        const raw_scores = metric_snapshot.scores;
+        const scores = try alloc.alloc(types.GraphMetricScore, raw_scores.len);
+        var initialized_scores: usize = 0;
+        errdefer {
+            for (scores[0..initialized_scores]) |*score| score.deinit(alloc);
+            alloc.free(scores);
+        }
+        for (raw_scores, 0..) |score, i| {
+            scores[i] = .{ .node = try alloc.dupe(u8, score.node), .score = score.score };
+            initialized_scores += 1;
+        }
+        const name = try alloc.dupe(u8, named.name);
+        errdefer alloc.free(name);
+        const index_name = try alloc.dupe(u8, named.query.index_name);
+        errdefer alloc.free(index_name);
+        const metric_name = try alloc.dupe(u8, named.query.metric_name);
+        errdefer alloc.free(metric_name);
+        var owned_status = try cloneGraphMetricStatusFromGraph(alloc, metric_snapshot.status);
+        errdefer owned_status.deinit(alloc);
+        return .{
+            .name = name,
+            .index_name = index_name,
+            .metric_name = metric_name,
+            .scores = scores,
+            .status = owned_status,
+        };
     }
 
     fn hierarchyChildrenInaccessibleParentResult(
@@ -37632,7 +38357,7 @@ pub const DB = struct {
             else => return null,
         };
         if (!db_query_search.isDefaultMatchAll(req.query)) return null;
-        if (req.graph_queries.len != 0 or req.expand_strategy != null) return null;
+        if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.expand_strategy != null) return null;
         if (req.dense != null or req.sparse != null) return null;
         if (req.dense_queries.len == 1 and req.sparse_queries.len == 0) {
             var next = req;
@@ -39784,9 +40509,23 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: []const u8,
         keys: []const []const u8,
+        expected: index_manager_mod.IndexManager.CoverageIdentity,
+        identity_read_generation: ?u64,
     ) ![]bool {
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        // Validate under the same apply lease as the reverse snapshot. A
+        // out-of-lease check can race index replacement and certify an
+        // old index's negative answers under the new incarnation's cache key.
+        if (expected.generation == 0 or expected.config_fingerprint == null)
+            return error.InvalidArgument;
+        const actual = self.core.index_manager.coverageIdentityForIndex(index_name) orelse
+            return error.IndexGenerationMismatch;
+        if (actual.generation != expected.generation or actual.config_fingerprint != expected.config_fingerprint)
+            return error.IndexGenerationMismatch;
+        // Reverse-only probes skip document hydration, but their routing
+        // cache keys still bind the source shard's document/read generation.
+        _ = try self.currentIdentityReadGenerationForRequest(identity_read_generation);
         const graph_entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         return try graph_entry.index.hasIncomingEdgesManyAlloc(alloc, keys);
     }
@@ -43393,10 +44132,12 @@ fn computeDocumentExtractionAssetRequestDerived(
         extraction_config.pdf_decode_limits.max_working_set_bytes = pdf_inspection_bytes;
         extraction_config.pdf_decode_limits.max_decoded_stream_bytes = @min(extraction_config.pdf_decode_limits.max_decoded_stream_bytes, pdf_inspection_bytes);
     }
-    var extraction = document_extraction_mod.extractDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config) catch |err| switch (err) {
+    var extraction_failure: runtime_failure_abi.FailureIdentity = .{};
+    var extraction = extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure) catch |err| switch (err) {
         error.OutOfMemory => if ((extraction_budgeted != null and extraction_budgeted.?.denied()) or pdf_inspection_reservation.limit_exceeded) return error.DocumentExtractionWorkingSetTooLarge else return err,
         else => {
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "document extraction failed", document_extraction_mod.failureStage(err, "document_extraction"), artifact_writes);
+            const exact_error_name = boundaryFailureErrorName(&extraction_failure, err);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
             return;
         },
     };
@@ -43773,24 +44514,22 @@ fn completeDocumentExtractionGeneratedText(
             var rendered_page: ?[]u8 = null;
             defer if (rendered_page) |png| alloc.free(png);
             if (std.mem.eql(u8, extraction.route_type, "pdf")) {
-                var pdf_session = document_extraction_mod.PdfRenderSession.initWithDecodeLimits(alloc, source_bytes, config.pdf_decode_limits) catch |err| {
-                    const any_err: anyerror = err;
-                    if (any_err == error.OutOfMemory) return any_err;
-                    try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, any_err);
-                    continue;
-                };
-                defer pdf_session.deinit();
-                var pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(active_runtime.syncWaitTimeoutMs());
-                pdf_session.setCancellationProbe(pdf_render_deadline.probe());
-                rendered_page = pdf_session.renderPagePngAlloc(
+                var render_failure: runtime_failure_abi.FailureIdentity = .{};
+                rendered_page = renderDocumentPdfPagePngAlloc(
                     alloc,
+                    source_bytes,
                     unit.page_number orelse 1,
                     config.ocr_render_dpi,
                     config.ocr_max_rendered_pixels,
+                    config.ocr_max_rendered_dimension,
+                    config.pdf_decode_limits.max_decoded_stream_bytes,
+                    config.pdf_decode_limits.max_working_set_bytes,
+                    active_runtime.syncWaitTimeoutMs(),
+                    &render_failure,
                 ) catch |err| {
                     const any_err: anyerror = err;
                     if (any_err == error.OutOfMemory) return any_err;
-                    try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, any_err);
+                    try markGeneratedUnitTextFailureNamed(alloc, unit, "ocr_text", .ocr, boundaryFailureErrorName(&render_failure, any_err));
                     continue;
                 };
             }
@@ -43837,6 +44576,81 @@ fn completeDocumentExtractionGeneratedText(
             try applyGeneratedUnitText(alloc, unit, produced, "transcript_text", "completed", .transcript);
         }
     }
+}
+
+fn extractDocumentDownloadedAlloc(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config: document_extraction_mod.Config,
+    config_json: []const u8,
+    raw_document_json: []const u8,
+    out_failure: *runtime_failure_abi.FailureIdentity,
+) !document_extraction_mod.Result {
+    out_failure.* = .{};
+    if (comptime !builtin.is_test and build_options.linked_storage) {
+        return document_extraction_client.extractDownloadedAllocWithLimitsWithFailure(
+            alloc,
+            downloaded,
+            source_url,
+            config_json,
+            raw_document_json,
+            config.pdf_decode_limits,
+            out_failure,
+        );
+    }
+    return document_extraction_mod.extractDownloadedAlloc(alloc, downloaded, source_url, config);
+}
+
+fn renderDocumentPdfPagePngAlloc(
+    alloc: Allocator,
+    pdf_bytes: []const u8,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+    max_decoded_stream_bytes: usize,
+    max_working_set_bytes: usize,
+    render_timeout_ms: u64,
+    out_failure: *runtime_failure_abi.FailureIdentity,
+) ![]u8 {
+    out_failure.* = .{};
+    if (comptime !builtin.is_test and build_options.linked_storage) {
+        const rendered = try document_extraction_client.renderPdfPagePngAdaptiveControlledAllocWithFailure(
+            alloc,
+            alloc,
+            pdf_bytes,
+            page_number,
+            dpi,
+            max_pixels,
+            max_dimension,
+            max_decoded_stream_bytes,
+            max_working_set_bytes,
+            render_timeout_ms,
+            out_failure,
+        );
+        return rendered.png;
+    }
+    var render_deadline = document_extraction_mod.PdfRenderDeadline.init(render_timeout_ms);
+    var session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimitsAndCancellation(
+        alloc,
+        pdf_bytes,
+        .{
+            .max_decoded_stream_bytes = max_decoded_stream_bytes,
+            .max_working_set_bytes = max_working_set_bytes,
+        },
+        render_deadline.probe(),
+    );
+    defer session.deinit();
+    // Parsing and rasterization have independent wall-clock budgets.
+    render_deadline = document_extraction_mod.PdfRenderDeadline.init(render_timeout_ms);
+    session.setCancellationProbe(render_deadline.probe());
+    const rendered = try session.renderPagePngAdaptiveAlloc(alloc, page_number, dpi, max_pixels, max_dimension);
+    return rendered.png;
+}
+
+fn boundaryFailureErrorName(failure: *const runtime_failure_abi.FailureIdentity, fallback: anyerror) []const u8 {
+    return if (failure.error_name_len > 0) failure.errorName() else @errorName(fallback);
 }
 
 const GeneratedUnitTextKind = enum { ocr, transcript };
@@ -43928,11 +44742,21 @@ fn markGeneratedUnitTextFailure(
     kind: GeneratedUnitTextKind,
     err: anyerror,
 ) !void {
+    return markGeneratedUnitTextFailureNamed(alloc, unit, method, kind, @errorName(err));
+}
+
+fn markGeneratedUnitTextFailureNamed(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    method: []const u8,
+    kind: GeneratedUnitTextKind,
+    error_name: []const u8,
+) !void {
     const failed_status = switch (kind) {
         .ocr => "failed_ocr",
         .transcript => "failed_transcription",
     };
-    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, @errorName(err) });
+    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, error_name });
     errdefer alloc.free(warning);
     const owned_text = try alloc.dupe(u8, "");
     errdefer alloc.free(owned_text);
@@ -53157,7 +53981,7 @@ test "db resolution handoff completion publishes fanout in one metadata batch" {
     }
 }
 
-test "storage.ha resolution handoff fence rejects completion after durable HA replay" {
+test "storage.hot_standby resolution handoff fence rejects completion after durable HA replay" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.heap.c_allocator;
@@ -62179,6 +63003,7 @@ fn rebaseRangeCoverageMetadata(
     byte_range: types.ByteRange,
     extra_writes: []const docstore_mod.KVPair,
 ) !void {
+    try index_manager.validateRangeTransition(byte_range);
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer writes.deinit(alloc);
     var owned_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -63178,6 +64003,10 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     try waitForSplitShadowDrainLocked(self, true);
     const replay_floor = self.core.nextDerivedAppendSequence();
 
+    // Prepare all private ownership tasks before the authoritative range can
+    // narrow. Partial preparation/failure leaves the old graph visible, and
+    // primary range adoption activates the prepared fences infallibly.
+    try self.core.index_manager.fenceGraphSplitRange(split_state.split_key, split_state.original_range_end);
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
     try markSplitOffDocumentArtifactChildRangesLocked(self, split_state, split_lower);
@@ -64193,6 +65022,32 @@ fn denseTargetCountForIndexContextWithCoverage(
     }
     const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
     const coverage_counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
+    return denseTargetCountFromCoverage(ctx, index_name, coverage, coverage_counts);
+}
+
+// Keep the explicitly pinned entry point for epoch-transition regressions.
+// Production uses readManyConsistent above to avoid a full snapshot when the
+// maintained range counter is present.
+fn denseTargetCountForIndexSnapshot(ctx: *AsyncContext, index_name: []const u8, snapshot: *docstore_mod.DocStore.Txn) !?u64 {
+    if (ctx.index_manager.denseIndex(index_name)) |entry| {
+        if (densePublicationTargetUsesArtifactCounter(entry)) {
+            return try DB.loadDenseArtifactTargetCounterFromTxn(ctx.alloc, snapshot, index_name);
+        }
+    }
+    const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
+    var counters = try DerivedCoverageCounters.load(ctx.alloc, snapshot, index_name, generation);
+    if (counters.source_total == null) {
+        counters.source_total = try range_cardinality.loadOrCountFromTxn(ctx.alloc, ctx.store, snapshot, ctx.index_manager.byte_range);
+    }
+    return denseTargetCountFromCoverage(ctx, index_name, .all_sources, counters);
+}
+
+fn denseTargetCountFromCoverage(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    coverage: DenseTargetCoverage,
+    coverage_counts: DerivedCoverageCounters,
+) !?u64 {
     const produced = coverage_counts.produced;
     const skipped = coverage_counts.skipped;
     const terminal_failed = coverage_counts.terminal_failed;
@@ -68579,6 +69434,16 @@ test "db enrichment reconfigure refreshes durable state after old worker joins" 
     try std.testing.expect(db.core.hasGeneratedEnrichmentTargets());
     try std.testing.expect(db.core.nextEnrichmentSequence() != 0);
     const original_runtime = db.enrichment_runtime.?;
+    original_runtime.embed_batches_started = 2;
+    original_runtime.embed_batches_completed = 2;
+    original_runtime.embed_items_started = 3;
+    original_runtime.embed_items_completed = 3;
+    original_runtime.last_embed_batch_items = 1;
+    original_runtime.last_embed_batch_bytes = 42;
+    original_runtime.last_embed_batch_max_bytes = 42;
+    original_runtime.last_embed_batch_completed_ms = 1234;
+    original_runtime.last_embed_batch_ns = 99;
+    original_runtime.total_embed_ns = 199;
 
     const LateOldWorkerPublish = struct {
         fn run(target_db: *DB) !void {
@@ -68615,6 +69480,14 @@ test "db enrichment reconfigure refreshes durable state after old worker joins" 
     try std.testing.expectEqual(@as(u64, 9), stats.error_count);
     try std.testing.expectEqual(@as(u64, 7), stats.retryable_error_count);
     try std.testing.expectEqual(@as(u64, 2), stats.fatal_error_count);
+    try std.testing.expectEqual(@as(u64, 2), stats.embed_batches_started);
+    try std.testing.expectEqual(@as(u64, 2), stats.embed_batches_completed);
+    try std.testing.expectEqual(@as(u64, 3), stats.embed_items_started);
+    try std.testing.expectEqual(@as(u64, 3), stats.embed_items_completed);
+    try std.testing.expectEqual(@as(u64, 42), stats.last_embed_batch_bytes);
+    try std.testing.expectEqual(@as(u64, 1234), stats.last_embed_batch_completed_ms);
+    try std.testing.expectEqual(@as(u64, 99), stats.last_embed_batch_ns);
+    try std.testing.expectEqual(@as(u64, 199), stats.total_embed_ns);
     try std.testing.expectEqual(@as(u32, 3), stats.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 0xfeed), replacement.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 2), replacement.retry_failure_count);
@@ -68877,6 +69750,21 @@ test "db transaction recovery enabled requires backend runtime io" {
             .resolve_participant_fn = TestTransactionRecoveryResolver.resolve,
         },
     }));
+}
+
+test "db graph runtime count snapshots preserve pending state and read released snapshots" {
+    var encoded: [DB.index_status_encoded_len]u8 = undefined;
+    DB.encodeIndexStatusSnapshot(.{ .kind = .graph, .edge_count = 12, .graph_counts_pending = true }, &encoded);
+    const current = try DB.decodeIndexStatusSnapshot(&encoded);
+    try std.testing.expect(current.graph_counts_pending);
+    try std.testing.expectEqual(@as(u64, 12), current.edge_count);
+    std.mem.writeInt(u64, encoded[64..72], 2, .little);
+    try std.testing.expectError(error.InvalidIndexStatusSnapshot, DB.decodeIndexStatusSnapshot(&encoded));
+    var released: [64]u8 = encoded[0..64].*;
+    std.mem.writeInt(u64, released[0..8], DB.index_status_magic_v1, .little);
+    const old = try DB.decodeIndexStatusSnapshot(&released);
+    try std.testing.expect(!old.graph_counts_pending);
+    try std.testing.expectEqual(@as(u64, 12), old.edge_count);
 }
 
 test "db default primary backend survives reopen" {
@@ -71845,18 +72733,6 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     const before = backend.snapshotWriteStats();
     var mutation_ns: [16]u64 = undefined;
     var peak_physical: u64 = 0;
-    const Size = struct {
-        fn physical(b: *lsm_backend_mod.Backend) !u64 {
-            var bytes = b.snapshotMaintenanceStats().wal_retained_bytes;
-            var cursor = b.runs.cursor();
-            while (cursor.next()) |run| if (run.path) |name| {
-                bytes += try b.storage.?.fileSize(name);
-            };
-            var obsolete_cursor = b.obsolete_paths.iterator();
-            while (obsolete_cursor.next()) |obsolete| bytes += try b.storage.?.fileSize(obsolete.path);
-            return bytes;
-        }
-    };
     for (&mutation_ns, 0..) |*ns, round| {
         var turn = std.heap.ArenaAllocator.init(alloc);
         defer turn.deinit();
@@ -71872,7 +72748,7 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
         try drainTestRelationalMaintenance(&db);
         // Checkpoint at measurement boundaries, not once per individual write.
         try backend.sync(true);
-        peak_physical = @max(peak_physical, try Size.physical(backend));
+        peak_physical = @max(peak_physical, try (try backend.measurePhysicalUsage()).totalBytes());
     }
     try std.testing.expectEqualSlices(u8, original, try pinned.get(owner_key));
     pinned.abort();
@@ -71890,12 +72766,12 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
     std.mem.sort(u64, &mutation_ns, {}, std.sort.asc(u64));
     const after = backend.snapshotWriteStats();
-    std.debug.print("\nproduction LSM physical churn: GC minimum={d}%, SST/WAL written={d}/{d}, peak/settled SST+WAL={d}/{d}, batch median/max ns={d}/{d}, live column payload={d}, projected payload bytes={d}\n", .{
+    std.debug.print("\nproduction LSM physical churn: GC minimum={d}%, SST/WAL written={d}/{d}, peak/settled tracked file bytes={d}/{d}, batch median/max ns={d}/{d}, live column payload={d}, projected payload bytes={d}\n", .{
         gc_min_percent,
         after.table_file_bytes - before.table_file_bytes,
         after.wal_append_bytes - before.wal_append_bytes,
         peak_physical,
-        try Size.physical(backend),
+        try (try backend.measurePhysicalUsage()).totalBytes(),
         mutation_ns[8],
         mutation_ns[15],
         try relational_columns.payloadStorageBytesForTest(&db, alloc),
@@ -97562,7 +98438,7 @@ test "db reopen replays pending derived embeddings from durable log" {
     try std.testing.expectEqual(appended_sequence, applied);
 }
 
-test "storage.ha db mirrors appended derived replay records into HA stream" {
+test "storage.hot_standby db mirrors appended derived replay records into HA stream" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -97626,7 +98502,7 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
     try std.testing.expectEqual(change_journal_mod.TargetHint.graph, decoded.record.target_hints[0]);
 }
 
-test "storage.ha db waits for remote apply before completing derived enrichment" {
+test "storage.hot_standby db waits for remote apply before completing derived enrichment" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -97707,7 +98583,7 @@ test "storage.ha db waits for remote apply before completing derived enrichment"
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
 }
 
-test "storage.ha db mirrors committed batch mutations into HA stream for standby apply" {
+test "storage.hot_standby db mirrors committed batch mutations into HA stream for standby apply" {
     const alloc = std.testing.allocator;
 
     var primary_db_path_tmp = try TestDirectory.init("db");
@@ -97813,7 +98689,7 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", found.json);
 }
 
-test "storage.ha seed capture barrier prevents local commit without matching wal" {
+test "storage.hot_standby seed capture barrier prevents local commit without matching wal" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.heap.c_allocator;
@@ -97882,7 +98758,7 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
     try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
 }
 
-test "storage.ha seed snapshot predrains enrichment before exclusive capture" {
+test "storage.hot_standby seed snapshot predrains enrichment before exclusive capture" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -97982,7 +98858,7 @@ test "storage.ha seed snapshot predrains enrichment before exclusive capture" {
     try std.testing.expect(snapshot_size > 0);
 }
 
-test "storage.ha fence cannot strand a local commit beyond the HA tail" {
+test "storage.hot_standby fence cannot strand a local commit beyond the HA tail" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.heap.c_allocator;
@@ -98058,7 +98934,7 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
     try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
 }
 
-test "storage.ha schema json mutation does not reacquire shared barrier behind queued capture" {
+test "storage.hot_standby schema json mutation does not reacquire shared barrier behind queued capture" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -98147,7 +99023,7 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
 }
 
-test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
+test "storage.hot_standby db evaluates sync commit gate for mirrored batch mutations" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -98210,7 +99086,7 @@ test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
     try std.testing.expectEqual(@as(u64, 1), degraded.load(.acquire));
 }
 
-test "storage.ha db block sync policy waits for standby acknowledgement" {
+test "storage.hot_standby db block sync policy waits for standby acknowledgement" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -98286,7 +99162,7 @@ test "storage.ha db block sync policy waits for standby acknowledgement" {
     try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
 }
 
-test "storage.ha synchronous waits pipeline later commits by lsn" {
+test "storage.hot_standby synchronous waits pipeline later commits by lsn" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.heap.c_allocator;
@@ -98398,7 +99274,7 @@ test "storage.ha synchronous waits pipeline later commits by lsn" {
     defer alloc.free(second_value);
 }
 
-test "storage.ha durable outbox recovery does not duplicate an appended batch" {
+test "storage.hot_standby durable outbox recovery does not duplicate an appended batch" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -98482,7 +99358,7 @@ test "storage.ha durable outbox recovery does not duplicate an appended batch" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ha_batch_outbox_key));
 }
 
-test "storage.ha durable outbox cleanup is mutation scoped" {
+test "storage.hot_standby durable outbox cleanup is mutation scoped" {
     const alloc = std.testing.allocator;
     var db_path_tmp = try TestDirectory.init("db");
     defer db_path_tmp.cleanup();
@@ -98514,7 +99390,7 @@ test "storage.ha durable outbox cleanup is mutation scoped" {
     try std.testing.expectEqualStrings("b", (try decodeDurableHAOutbox(surviving)).payload);
 }
 
-test "storage.ha db session sync wait satisfies remote apply through standby DB apply" {
+test "storage.hot_standby db session sync wait satisfies remote apply through standby DB apply" {
     const alloc = std.testing.allocator;
 
     var primary_db_path_tmp = try TestDirectory.init("db");
@@ -98615,7 +99491,7 @@ test "storage.ha db session sync wait satisfies remote apply through standby DB 
     try std.testing.expectEqualStrings("{\"title\":\"remote-apply\"}", found.json);
 }
 
-test "storage.ha db allows progress but rejects acknowledgement when fenced during remote apply wait" {
+test "storage.hot_standby db allows progress but rejects acknowledgement when fenced during remote apply wait" {
     const alloc = std.testing.allocator;
 
     var primary_db_path_tmp = try TestDirectory.init("db");
@@ -98754,7 +99630,7 @@ test "storage.ha db allows progress but rejects acknowledgement when fenced duri
     try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
 }
 
-test "storage.ha db session sync wait remote write acknowledges durable receive despite apply failure" {
+test "storage.hot_standby db session sync wait remote write acknowledges durable receive despite apply failure" {
     const alloc = std.testing.allocator;
 
     var primary_db_path_tmp = try TestDirectory.init("db");
@@ -98856,7 +99732,7 @@ test "storage.ha db session sync wait remote write acknowledges durable receive 
     try std.testing.expectEqualStrings("{\"title\":\"remote-write\"}", found.json);
 }
 
-test "storage.ha db primary progress sync wait observes reported remote apply ack" {
+test "storage.hot_standby db primary progress sync wait observes reported remote apply ack" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -98940,7 +99816,7 @@ test "storage.ha db primary progress sync wait observes reported remote apply ac
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
 }
 
-test "storage.ha primary progress sync wait fast fails without enough eligible candidates" {
+test "storage.hot_standby primary progress sync wait fast fails without enough eligible candidates" {
     const alloc = std.testing.allocator;
 
     var ha_log_path_tmp = try TestDirectory.init("db");
@@ -98990,7 +99866,7 @@ test "storage.ha primary progress sync wait fast fails without enough eligible c
     try std.testing.expectEqual(@as(usize, 1), poll.calls);
 }
 
-test "storage.ha db primary progress sync wait returns would block without reported ack" {
+test "storage.hot_standby db primary progress sync wait returns would block without reported ack" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -99052,7 +99928,7 @@ test "storage.ha db primary progress sync wait returns would block without repor
     try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
 }
 
-test "storage.ha pending acknowledgement preserves batch and replay tail order" {
+test "storage.hot_standby pending acknowledgement preserves batch and replay tail order" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -99194,7 +100070,7 @@ test "db transaction HA retry drains durable mirror outbox" {
     try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
 }
 
-test "storage.ha db primary progress sync wait survives primary restart before ack" {
+test "storage.hot_standby db primary progress sync wait survives primary restart before ack" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -99282,7 +100158,7 @@ test "storage.ha db primary progress sync wait survives primary restart before a
     }
 }
 
-test "storage.ha db block sync policy surfaces wait provider errors" {
+test "storage.hot_standby db block sync policy surfaces wait provider errors" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -99352,7 +100228,7 @@ test "storage.ha db block sync policy surfaces wait provider errors" {
     try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
 }
 
-test "storage.ha db fail-closed sync policy rejects before local batch commit" {
+test "storage.hot_standby db fail-closed sync policy rejects before local batch commit" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -99444,7 +100320,7 @@ test "db transaction recovery identity context owns schema generations" {
     try std.testing.expectEqual(@as(u32, 2), ctx.relational_schema_version);
 }
 
-test "storage.ha schema wait failure reports unknown after durable local commit" {
+test "storage.hot_standby schema wait failure reports unknown after durable local commit" {
     const alloc = std.testing.allocator;
     const public_schema_json =
         \\{"version":7,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
@@ -99527,7 +100403,7 @@ test "storage.ha schema wait failure reports unknown after durable local commit"
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
-test "storage.ha db mirrors and applies schema metadata mutation records" {
+test "storage.hot_standby db mirrors and applies schema metadata mutation records" {
     const alloc = std.testing.allocator;
     const public_schema_json =
         \\{"version":12,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","enum":["active"]}},"required":["id","status"],"additionalProperties":false}}}}
@@ -99638,7 +100514,7 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
     try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
 }
 
-test "storage.ha db applies batch mutation records through replication session callback" {
+test "storage.hot_standby db applies batch mutation records through replication session callback" {
     const alloc = std.testing.allocator;
 
     var standby_db_path_tmp = try TestDirectory.init("db");
@@ -99750,7 +100626,7 @@ test "storage.ha db applies batch mutation records through replication session c
     try std.testing.expectEqual(@as(usize, 2), replay_after_duplicates.len);
 }
 
-test "storage.ha db persists applied replication marker across reopen" {
+test "storage.hot_standby db persists applied replication marker across reopen" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -99805,7 +100681,7 @@ test "storage.ha db persists applied replication marker across reopen" {
     try std.testing.expectEqual(@as(u64, 1), replay_entries[0].sequence);
 }
 
-test "storage.ha db applies timeline switch as durable replication boundary" {
+test "storage.hot_standby db applies timeline switch as durable replication boundary" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -99842,7 +100718,7 @@ test "storage.ha db applies timeline switch as durable replication boundary" {
     try std.testing.expectEqual(@as(u64, 7), try reopened.haAppliedReplicationLsn());
 }
 
-test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {
+test "storage.hot_standby db write gate rejects client writes on standby but allows replicated apply" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -99904,7 +100780,7 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectEqualStrings("{\"title\":\"replicated\"}", found.json);
 }
 
-test "storage.ha db write gate rejects fenced former primary writes" {
+test "storage.hot_standby db write gate rejects fenced former primary writes" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -99974,7 +100850,7 @@ test "storage.ha db write gate rejects fenced former primary writes" {
     }
 }
 
-test "storage.ha db standby role suppresses mutating background runtimes" {
+test "storage.hot_standby db standby role suppresses mutating background runtimes" {
     const alloc = std.testing.allocator;
 
     var db_path_tmp = try TestDirectory.init("db");
@@ -112255,6 +113131,58 @@ test "db empty inline dense generation finalizes without scanning primary docume
     try std.testing.expectEqual(@as(u64, 4), checkpoint.generation);
 }
 
+test "db dense target coverage reads one immutable primary commit epoch" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+    const generation = db.core.index_manager.coverageGenerationForIndex("dense_idx").?;
+    var keys: [3][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    inline for (.{ "produced", "skipped", "terminal_failed" }, 0..) |outcome, i| {
+        keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, "dense_idx", generation, outcome);
+        initialized += 1;
+    }
+    var empty = try db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+    defer empty.abort();
+    var values: [4][8]u8 = undefined;
+    var writes: [4]docstore_mod.KVPair = undefined;
+    for (&writes, 0..) |*write, i| write.* = .{
+        .key = if (i == 3) &internal_keys.range_document_count_key else keys[i],
+        .value = internal_keys.encodeDerivedCoverageOutcomeCount(&values[i], if (i == 0 or i == 3) 1 else 0),
+    };
+    // Deterministically publish the first complete tuple after the target
+    // reader has acquired its view. Three independent gets could see a
+    // missing produced counter followed by newly present skipped/failed.
+    try db.core.store.putBatch(&writes, &.{});
+    try std.testing.expectEqual(@as(?u64, 0), try denseTargetCountForIndexSnapshot(db.async_context, "dense_idx", &empty));
+    try std.testing.expectEqual(@as(?u64, 1), try denseTargetCountForIndexContext(db.async_context, "dense_idx"));
+
+    var one = try db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+    defer one.abort();
+    _ = internal_keys.encodeDerivedCoverageOutcomeCount(&values[0], 2);
+    _ = internal_keys.encodeDerivedCoverageOutcomeCount(&values[3], 2);
+    try db.core.store.putBatch(&writes, &.{});
+    // Source cardinality is part of the same proof, not a second live read.
+    try std.testing.expectEqual(@as(?u64, 1), try denseTargetCountForIndexSnapshot(db.async_context, "dense_idx", &one));
+    try std.testing.expectEqual(@as(?u64, 2), try denseTargetCountForIndexContext(db.async_context, "dense_idx"));
+    try db.core.store.putBatch(&.{}, &.{keys[1]});
+    try std.testing.expectError(error.InvalidDerivedCoverageCounter, denseTargetCountForIndexContext(db.async_context, "dense_idx"));
+}
+
 test "db inline dense generation remains rebuilding until outcomes cover the live corpus" {
     const alloc = std.testing.allocator;
     var runtime = std.Io.Threaded.init(alloc, .{});
@@ -114534,6 +115462,32 @@ test "db unfiltered graph search retains algebraic execution" {
     return error.TestExpectedEqual;
 }
 
+test "db reverse graph probe rejects a deleted or replaced index incarnation" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-incarnation");
+    defer directory.cleanup();
+    const path = directory.path().ptr;
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const cfg = types.IndexConfig{ .name = "graph_idx", .kind = .graph, .config_json = "{}" };
+    try db.addIndex(cfg);
+    const previous = db.core.index_manager.coverageIdentityForIndex("graph_idx").?;
+    try std.testing.expect(try db.deleteIndex("graph_idx"));
+    // Even an empty probe must not certify a missing or replacement index.
+    try std.testing.expectError(error.IndexGenerationMismatch, db.graphHasIncomingEdgesForInternalRead(alloc, "graph_idx", &.{}, previous, null));
+    // Same-name admission waits for the retired incarnation's asynchronous
+    // artifact cleanup. Join its owner instead of racing it or sleeping.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    try db.addIndex(cfg);
+    const current = db.core.index_manager.coverageIdentityForIndex("graph_idx").?;
+    try std.testing.expect(previous.generation != current.generation);
+    try std.testing.expectEqual(previous.config_fingerprint, current.config_fingerprint);
+    try std.testing.expectError(error.IndexGenerationMismatch, db.graphHasIncomingEdgesForInternalRead(alloc, "graph_idx", &.{"absent"}, previous, null));
+    const incoming = try db.graphHasIncomingEdgesForInternalRead(alloc, "graph_idx", &.{"absent"}, current, null);
+    defer alloc.free(incoming);
+    try std.testing.expectEqualSlices(bool, &.{false}, incoming);
+}
+
 test "db graph search filters result nodes and hidden traversal intermediates" {
     const alloc = std.testing.allocator;
 
@@ -114617,10 +115571,23 @@ test "db graph search filters result nodes and hidden traversal intermediates" {
         try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "\"tenant\":\"visible\"") != null);
     }
 
+    const graph_identity = db.core.index_manager.coverageIdentityForIndex("gr_v1").?;
+    var stale_graph_identity = graph_identity;
+    stale_graph_identity.generation ^= 1;
+    try std.testing.expectError(error.IndexGenerationMismatch, db.graphHasIncomingEdgesForInternalRead(alloc, "gr_v1", &.{"n:b"}, stale_graph_identity, null));
+    stale_graph_identity = graph_identity;
+    stale_graph_identity.config_fingerprint = graph_identity.config_fingerprint.? ^ 1;
+    try std.testing.expectError(error.IndexGenerationMismatch, db.graphHasIncomingEdgesForInternalRead(alloc, "gr_v1", &.{"n:b"}, stale_graph_identity, null));
+    try std.testing.expectError(error.IndexGenerationMismatch, db.graphHasIncomingEdgesForInternalRead(alloc, "missing", &.{"n:b"}, graph_identity, null));
+    try std.testing.expectError(error.InvalidArgument, db.graphHasIncomingEdgesForInternalRead(alloc, "gr_v1", &.{"n:b"}, .{ .generation = 0, .config_fingerprint = null }, null));
+    const read_generation = try db.currentIdentityReadGenerationForRequest(null);
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.graphHasIncomingEdgesForInternalRead(alloc, "gr_v1", &.{"n:b"}, graph_identity, read_generation ^ 1));
     const incoming = try db.graphHasIncomingEdgesForInternalRead(
         alloc,
         "gr_v1",
         &.{ "n:a", "n:b", "n:c", "n:d", "n:missing" },
+        graph_identity,
+        read_generation,
     );
     defer alloc.free(incoming);
     try std.testing.expectEqualSlices(
@@ -129378,6 +130345,271 @@ test "db restore dense artifact completion keeps every intent when one proof is 
         repair_b,
         (try db.indexRepairIdForIndex(alloc, "dense_b")) orelse return error.TestUnexpectedResult,
     );
+}
+
+test "db restore dense artifact completion retires an obsolete invalid-generation shadow" {
+    const alloc = std.testing.allocator;
+    var test_directory = try TestDirectory.init("db");
+    defer test_directory.cleanup();
+    const path = test_directory.path().ptr;
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+    const repair_id = try db.ensureAutomaticDenseGenerationRepairIntent(
+        alloc,
+        cfg.*,
+        .projection_generation_invalid,
+        "dense_projection_checkpoint_repair_required",
+    );
+    const checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try db.core.saveProjectionCheckpoint(cfg.name, .{
+        .applied_sequence = checkpoint.applied_sequence,
+        .status = .repair_required,
+        .generation = checkpoint.generation,
+        .config_hash = types.indexConfigHash(cfg.*),
+    });
+
+    const shadow_base = try createUniqueRepairShadowBase(alloc, std.mem.span(path));
+    defer alloc.free(shadow_base);
+    const candidate_relative_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/indexes/{s}",
+        .{ std.fs.path.basename(shadow_base), cfg.name },
+    );
+    defer alloc.free(candidate_relative_path);
+    try db.updateIndexRepairIntent(alloc, repair_id, .{ .phase = .preflight });
+    try db.updateIndexRepairIntent(alloc, repair_id, .{
+        .phase = .building,
+        .candidate_relative_path = candidate_relative_path,
+        .replace_candidate_path = true,
+    });
+    try db.recordIndexRepairAttemptFailure(
+        alloc,
+        repair_id,
+        @errorName(error.RepairSourceCoverageIncomplete),
+        true,
+    );
+
+    try std.testing.expectEqual(
+        DB.RestoreDenseArtifactCompletion.completed_with_progress,
+        try db.completeRestoreDenseArtifactRepairs(alloc),
+    );
+    try std.testing.expect((try db.indexRepairIdForIndex(alloc, cfg.name)) == null);
+    const completed_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, completed_checkpoint.status);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, shadow_base, .{}));
+}
+
+test "db restore final artifact recount preserves an exact native generation" {
+    const alloc = std.testing.allocator;
+    var test_directory = try TestDirectory.init("db");
+    defer test_directory.cleanup();
+    const path = test_directory.path().ptr;
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    var lsm_cache = lsm_backend_mod.Cache.init(alloc, 8 * 1024 * 1024);
+    defer lsm_cache.deinit();
+    var hbc_cache = hbc_mod.Cache.init(alloc);
+    defer hbc_cache.deinit();
+    var resident_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer resident_runtime.deinit();
+    {
+        var old_live = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+            .lsm_cache = &lsm_cache,
+            .hbc_cache = &hbc_cache,
+            .backend_runtime = resident_runtime.ptr(),
+            .lsm_root_generation = 41,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer old_live.close();
+        try old_live.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+        });
+    }
+    var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(path));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var db = try DB.open(alloc, staged.path(), .{
+            .primary_backend = primary_backend,
+            .lsm_root_generation = 41,
+            .staged_generation = &staged,
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+        });
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value = "{\"body\":\"abcdefghijklmno\"}",
+            }},
+            .sync_level = .full_index,
+        });
+    }
+
+    var expected_active: u64 = 0;
+    {
+        var db = try DB.open(alloc, staged.path(), .{
+            .primary_backend = primary_backend,
+            .lsm_root_generation = 41,
+            .staged_generation = &staged,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+        const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, cfg.name);
+        defer alloc.free(counter_key);
+        try db.core.store.delete(counter_key);
+        _ = try db.ensureAutomaticDenseGenerationRepairIntent(
+            alloc,
+            cfg.*,
+            .artifact_counter_missing,
+            "dense_artifact_counter_missing",
+        );
+        const dense = db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+        expected_active = dense.index.stats().active_count;
+        try std.testing.expect(expected_active > 0);
+        // Native-v2 already has exact published coverage. Repair the missing
+        // durable counter without inventing an unowned bulk session or
+        // rebuilding the active root; the fresh owner below proves durability.
+        const repaired = try db.repairRestoreDenseArtifactCoverageFromFinalArtifacts(alloc);
+        try std.testing.expectEqual(@as(usize, 0), repaired.rebuilt);
+        try std.testing.expect(repaired.made_progress);
+        const completed_checkpoint = try db.core.loadProjectionCheckpoint(alloc, "dense_idx");
+        try std.testing.expectEqual(apply_state.ProjectionStatus.clean, completed_checkpoint.status);
+        try std.testing.expectEqual(
+            DB.RestoreDenseArtifactCompletion.completed_with_progress,
+            try db.completeRestoreDenseArtifactRepairs(alloc),
+        );
+        _ = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsOutcomeWithProgress(alloc, null, null);
+        try db.sync(true);
+        try db.syncIndexes(true);
+    }
+    try staged.seal();
+    _ = try staged.publish();
+    staged.deinit();
+    transition.deinit();
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = primary_backend,
+        .lsm_root_generation = 41,
+        .lsm_cache = &lsm_cache,
+        .hbc_cache = &hbc_cache,
+        .backend_runtime = resident_runtime.ptr(),
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    const dense = reopened.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(expected_active, dense.index.stats().active_count);
+}
+
+test "db restore durability proof retries reopen-only dense debt" {
+    const alloc = std.testing.allocator;
+    var test_directory = try TestDirectory.init("db");
+    defer test_directory.cleanup();
+    const path = test_directory.path().ptr;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+        });
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}",
+            }},
+            .sync_level = .full_index,
+        });
+        try DB.markRestorePrimaryRestoredForPathWithArtifact(
+            alloc,
+            std.mem.span(path),
+            "snap1",
+            "file:///tmp/backups",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "snapshots/snap1",
+            7001,
+        );
+        try DB.markRestoreRuntimeRepairCompleteWithIo(alloc, std.testing.io, std.mem.span(path));
+        // Leave valid native authority with a stale completion watermark.
+        // Resetting its selected directory would manufacture a corrupt root,
+        // which restore must reject rather than treat as recoverable debt.
+        const checkpoint = try db.core.loadProjectionCheckpoint(alloc, "dense_idx");
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = 0,
+            .status = .rebuilding,
+            .generation = checkpoint.generation,
+            .config_hash = checkpoint.config_hash,
+        });
+        try db.sync(true);
+        try db.syncIndexes(true);
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try std.testing.expect(try db.prepareRestoreDurabilityRetryIfNeeded(alloc));
+        var attempts: usize = 0;
+        while (try db.restoreRuntimeRepairNeeded()) : (attempts += 1) {
+            try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
+            try std.testing.expect(attempts < 16);
+        }
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    const dense = reopened.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), dense.index.stats().active_count);
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
 }
 
 test "db restore owner converges rediscovered dense projection intent" {

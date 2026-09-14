@@ -29,12 +29,22 @@ const CatchUpMergeReceiver = std.meta.fieldInfo(metadata_actions.TransitionActio
 const FinalizeMerge = std.meta.fieldInfo(metadata_actions.TransitionAction, .finalize_merge).type;
 const RollbackMerge = std.meta.fieldInfo(metadata_actions.TransitionAction, .rollback_merge).type;
 
+/// Bounded, read-only lifecycle projection. The receiving owner resolves the
+/// exact immutable table contract from this metadata transition identity;
+/// callers cannot use it to supply an arbitrary namespace or primary key.
+pub const TopologyReadRequest = struct {
+    transition_id: u64,
+    attempt_epoch: u64,
+    mode: enum { identity, status, completed, handoff_progress, handoff_manifest, prune_progress },
+};
+
 pub const ShardOperationAdapter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     context_id: u64 = 0,
 
     pub const VTable = struct {
+        topology_read: ?*const fn (ptr: *anyopaque, context_id: u64, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("../common/cancellation.zig").CancellationToken) anyerror![]u8 = null,
         observe_split: *const fn (ptr: *anyopaque, context_id: u64, record: metadata_state.SplitTransitionRecord) anyerror!metadata_state.SplitObservation,
         observe_merge: *const fn (ptr: *anyopaque, context_id: u64, record: metadata_state.MergeTransitionRecord) anyerror!metadata_state.MergeObservation,
         prepare_split_source: *const fn (ptr: *anyopaque, context_id: u64, op: PrepareSplitSource) anyerror!void,
@@ -48,6 +58,11 @@ pub const ShardOperationAdapter = struct {
         finalize_merge: *const fn (ptr: *anyopaque, context_id: u64, op: FinalizeMerge) anyerror!void,
         rollback_merge: *const fn (ptr: *anyopaque, context_id: u64, op: RollbackMerge) anyerror!void,
     };
+
+    pub fn topologyRead(self: ShardOperationAdapter, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("../common/cancellation.zig").CancellationToken) ![]u8 {
+        const callback = self.vtable.topology_read orelse return error.UnsupportedOperation;
+        return callback(self.ptr, self.context_id, alloc, group_id, table_name, request, cancellation);
+    }
 
     pub fn observeSplit(self: ShardOperationAdapter, record: metadata_state.SplitTransitionRecord) !metadata_state.SplitObservation {
         return try self.vtable.observe_split(self.ptr, self.context_id, record);
@@ -334,6 +349,7 @@ pub const OwnedShardOperationAdapter = struct {
             .ptr = state,
             .context_id = state.context_id,
             .vtable = &.{
+                .topology_read = topologyRead,
                 .observe_split = observeSplit,
                 .observe_merge = observeMerge,
                 .prepare_split_source = prepareSplitSource,
@@ -358,6 +374,12 @@ pub const OwnedShardOperationAdapter = struct {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         return try lease.state.downstream.observeSplit(record);
+    }
+
+    fn topologyRead(ptr: *anyopaque, context_id: u64, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("../common/cancellation.zig").CancellationToken) ![]u8 {
+        var lease = try acquireRegistered(ptr, context_id);
+        defer lease.deinit();
+        return lease.state.downstream.topologyRead(alloc, group_id, table_name, request, cancellation);
     }
 
     fn observeMerge(

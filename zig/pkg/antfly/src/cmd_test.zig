@@ -1,23 +1,9 @@
 // Copyright 2026 Antfly, Inc.
-//
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
-//
-//     https://www.antfly.io/licensing/ELv2-license
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// SPDX-License-Identifier: Elastic-2.0
 
-// The user-manager storage adapter deliberately resolves these through the
-// compilation root so its erased backend types retain one Zig type identity.
-pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
-pub const storage_backend_erased = @import("storage/backend_erased.zig");
-
+//! Remote CLI contracts share the product CLI dependency boundary.
+pub const antfly_sources = @import("source_owner_common.zig");
 test {
-    _ = @import("lite_cmd_test.zig");
-    _ = @import("cmd/serverless.zig");
+    _ = @import("cmd/cli/mod.zig");
+    _ = @import("cmd/cli/maintenance.zig");
 }

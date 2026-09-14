@@ -14,6 +14,13 @@ Bring Zig reader support up to Go parity for:
 This is intentionally narrower than the repo-root `TODO.md` parity sections. It
 is the working plan for `/api/read` and reader model support.
 
+**Status**: the reader layer (formerly "Phase 1") and metadata-driven reader
+dispatch (formerly "Phase 3") are implemented and described below in the
+present tense. Structured outputs, Pix2Struct, the shared multi-stage OCR
+infrastructure, PaddleOCR, Surya, and Moondream-style reading (Phases 2 and
+4-8) are still in progress; those sections keep their phase numbering,
+purpose, status, and "Still remaining" notes below.
+
 ## Current State
 
 ### Go already has
@@ -104,38 +111,26 @@ Missing or incomplete in Zig:
 
 ## Recommended Rollout
 
-## Phase 1: Introduce a Zig reader layer
+## Zig Reader Layer
 
-Purpose:
+`/api/read` is out of inline server wiring, with a stable place for
+family-specific parsing and dispatch:
 
-- get `/api/read` out of inline server wiring
-- create a stable place for family-specific parsing and future dispatch
+- a reader result type with `text`, optional `fields`, and optional `regions`
+- a reader interface / dispatch abstraction
+- the Vision2Seq reading flow lives outside `src/server/server.zig`
+- existing TrOCR/Florence behavior works through this layer
 
-Concrete work:
-
-- add a reader result type with:
-  - `text`
-  - optional `fields`
-  - optional `regions`
-- add a reader interface or equivalent dispatch abstraction
-- move current Vision2Seq reading flow out of `src/server/server.zig`
-- keep existing TrOCR/Florence behavior working through the new layer
-
-Likely Zig files:
+Zig files:
 
 - `src/server/server.zig`
-- new `src/readers/` module or equivalent
+- `src/readers/` (or equivalent)
 - `src/pipelines/reading.zig`
 
-Acceptance criteria:
-
-- `/api/read` still works for current reader models
-- server no longer owns model-family-specific reader logic
-- response encoder can emit `text` now and extend to `fields` and `regions` later without another shape rewrite
-
-Status:
-
-- done
+This meets its original acceptance bar: `/api/read` works for current reader
+models, the server does not own model-family-specific reader logic, and the
+response encoder can emit `text` now and extend to `fields`/`regions` without
+another shape rewrite.
 
 ## Phase 2: Add structured reader outputs for current Vision2Seq readers
 
@@ -182,48 +177,33 @@ Still remaining in this phase:
 
 - confirm behavior against real Donut models rather than parser-only unit coverage
 
-## Phase 3: Add metadata-driven reader dispatch
+## Metadata-Driven Reader Dispatch
 
-Purpose:
+Multi-stage OCR is unlocked without baking special cases into the server:
 
-- unlock multi-stage OCR without baking special cases into the server
+- Zig parses `termite_metadata.json` (kept separate from generic model
+  manifest parsing)
+- a detector identifies multi-stage reader directories
+- reader model loading routes between the Vision2Seq reader path and the
+  multi-stage OCR path
 
-Concrete work:
-
-- add Zig parsing for `termite_metadata.json`
-- add a detector for multi-stage reader directories
-- route reader model loading between:
-  - Vision2Seq reader path
-  - multi-stage OCR path
-- decide whether this belongs in:
-  - `src/models/manifest.zig`, or
-  - a new OCR metadata module
-
-Recommendation:
-
-- keep `termite_metadata.json` separate from generic model manifest parsing unless there is a strong reason to merge them
-
-Likely Zig files:
+Zig files:
 
 - `src/models/manifest.zig`
-- new `src/readers/multistage_metadata.zig` or equivalent
-- new reader loader/dispatch module
+- `src/readers/multistage_metadata.zig` (or equivalent)
+- the reader loader/dispatch module
 
-Acceptance criteria:
-
-- Zig can identify a multi-stage OCR model directory from metadata
-- standard Vision2Seq readers and multi-stage readers can coexist behind one read endpoint
-
-Status:
-
-- done
-
-Implemented in this pass:
+Implemented:
 
 - reader-specific parsing for `termite_metadata.json`
 - explicit detection of `multistage_ocr` model directories
 - reader loading routed between Vision2Seq and multi-stage OCR implementations
-- actual multi-stage OCR pipeline and stage loading wired behind the reader abstraction
+- the multi-stage OCR pipeline and stage loading, wired behind the reader
+  abstraction
+
+This meets its original acceptance bar: Zig identifies a multi-stage OCR
+model directory from metadata, and standard Vision2Seq readers and
+multi-stage readers coexist behind one read endpoint.
 
 ## Phase 4: Pix2Struct parity
 

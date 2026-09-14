@@ -10,12 +10,12 @@ import (
 	"testing"
 )
 
-func TestHAStatusParserAcceptsLegacyPrimaryEnvelope(t *testing.T) {
+func TestStandbyStatusParserAcceptsLegacyPrimaryEnvelope(t *testing.T) {
 	t.Parallel()
 
-	parsed, err := ParseHAPrimaryStatus([]byte(haLegacyPrimaryStatusJSON()))
+	parsed, err := ParseStandbyPrimaryStatus([]byte(standbyLegacyPrimaryStatusJSON()))
 	if err != nil {
-		t.Fatalf("ParseHAPrimaryStatus returned error: %v", err)
+		t.Fatalf("ParseStandbyPrimaryStatus returned error: %v", err)
 	}
 	snapshot := parsed.Response.Snapshot
 	if parsed.Response.SchemaVersion != 1 {
@@ -40,41 +40,41 @@ func TestHAStatusParserAcceptsLegacyPrimaryEnvelope(t *testing.T) {
 		t.Fatalf("len(Slots) = %d, want 1", got)
 	}
 	slot := snapshot.Slots[0]
-	if slot.Name != "standby-a" || slot.Status != HASlotSnapshotStatusHealthy || !slot.Active || slot.LastError != "" {
+	if slot.Name != "standby-a" || slot.Status != StandbySlotSnapshotStatusHealthy || !slot.Active || slot.LastError != "" {
 		t.Fatalf("Slot = %+v, want healthy active standby-a", slot)
 	}
-	if snapshot.Durability.Mode != HADurabilityModeRemoteWrite ||
-		snapshot.Durability.Status != HADurabilityStatusSatisfied ||
-		snapshot.Durability.Selection != HADurabilitySelectionAny {
+	if snapshot.Durability.Mode != StandbyDurabilityModeRemoteWrite ||
+		snapshot.Durability.Status != StandbyDurabilityStatusSatisfied ||
+		snapshot.Durability.Selection != StandbyDurabilitySelectionAny {
 		t.Fatalf("Durability = %+v, want satisfied remote_write any", snapshot.Durability)
 	}
 }
 
-func TestHAStatusParserAcceptsFreshPrimaryRetentionSentinel(t *testing.T) {
+func TestStandbyStatusParserAcceptsFreshPrimaryRetentionSentinel(t *testing.T) {
 	t.Parallel()
 
 	body := `{"schema_version":1,"snapshot":{"role":"primary","node_id":"primary-a","identity":{"cluster_id":5588500719990866000,"shard_id":0,"table_id":0,"timeline_id":1,"epoch":1},"current_lsn":0,"slots":[{"name":"standby-a","timeline_id":1,"active":true,"reseed_required":false,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"write_lag_lsn":0,"apply_lag_lsn":0,"safe_read_lag_lsn":0,"retention_lag_lsn":0,"status":"healthy","last_error":null}],"retention":{"primary_lsn":0,"oldest_restart_lsn":0,"retained_lsn_count":1,"retained_byte_count":0,"retained_age_ns":0,"active_slots":1,"reseed_recommended":0},"durability":null}}`
 
-	parsed, err := ParseHAPrimaryStatus([]byte(body))
+	parsed, err := ParseStandbyPrimaryStatus([]byte(body))
 	if err != nil {
-		t.Fatalf("ParseHAPrimaryStatus returned error: %v", err)
+		t.Fatalf("ParseStandbyPrimaryStatus returned error: %v", err)
 	}
 	if parsed.Response.Snapshot.Retention.RetainedLsnCount != 1 {
 		t.Fatalf("RetainedLsnCount = %d, want 1", parsed.Response.Snapshot.Retention.RetainedLsnCount)
 	}
-	if err := ValidateHAPrimaryStatusResponseEvidence([]byte(body)); err != nil {
-		t.Fatalf("ValidateHAPrimaryStatusResponseEvidence returned error: %v", err)
+	if err := ValidateStandbyPrimaryStatusResponseEvidence([]byte(body)); err != nil {
+		t.Fatalf("ValidateStandbyPrimaryStatusResponseEvidence returned error: %v", err)
 	}
-	var response HAPrimaryStatusResponse
+	var response StandbyPrimaryStatusResponse
 	if err := json.Unmarshal([]byte(body), &response); err != nil {
 		t.Fatalf("json.Unmarshal returned error: %v", err)
 	}
-	if err := ValidateHAPrimaryStatusResponse(response); err != nil {
-		t.Fatalf("ValidateHAPrimaryStatusResponse returned error: %v", err)
+	if err := ValidateStandbyPrimaryStatusResponse(response); err != nil {
+		t.Fatalf("ValidateStandbyPrimaryStatusResponse returned error: %v", err)
 	}
 }
 
-func TestHAStatusParserRejectsInvalidPrimaryFields(t *testing.T) {
+func TestStandbyStatusParserRejectsInvalidPrimaryFields(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -84,47 +84,47 @@ func TestHAStatusParserRejectsInvalidPrimaryFields(t *testing.T) {
 	}{
 		{
 			name:    "missing schema version",
-			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"schema_version":1,`, `"schema_version":0,`, 1),
+			body:    strings.Replace(standbyLegacyPrimaryStatusJSON(), `"schema_version":1,`, `"schema_version":0,`, 1),
 			wantErr: "schema_version",
 		},
 		{
 			name:    "invalid slot status",
-			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"status":"healthy"`, `"status":"catching_up"`, 1),
+			body:    strings.Replace(standbyLegacyPrimaryStatusJSON(), `"status":"healthy"`, `"status":"catching_up"`, 1),
 			wantErr: "slot",
 		},
 		{
 			name:    "invalid slot name",
-			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"name":"standby-a"`, `"name":"standby a"`, 1),
+			body:    strings.Replace(standbyLegacyPrimaryStatusJSON(), `"name":"standby-a"`, `"name":"standby a"`, 1),
 			wantErr: "slot",
 		},
 		{
 			name:    "padded slot name",
-			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"name":"standby-a"`, `"name":" standby-a"`, 1),
+			body:    strings.Replace(standbyLegacyPrimaryStatusJSON(), `"name":"standby-a"`, `"name":" standby-a"`, 1),
 			wantErr: "slot",
 		},
 		{
 			name:    "invalid durability mode",
-			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"mode":"remote_write"`, `"mode":"remote-write"`, 1),
+			body:    strings.Replace(standbyLegacyPrimaryStatusJSON(), `"mode":"remote_write"`, `"mode":"remote-write"`, 1),
 			wantErr: "durability",
 		},
 		{
 			name:    "inconsistent retention count",
-			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"retained_lsn_count":5`, `"retained_lsn_count":4`, 1),
+			body:    strings.Replace(standbyLegacyPrimaryStatusJSON(), `"retained_lsn_count":5`, `"retained_lsn_count":4`, 1),
 			wantErr: "retention",
 		},
 		{
 			name:    "missing retained age evidence",
-			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"retained_age_ns":400,`, ``, 1),
+			body:    strings.Replace(standbyLegacyPrimaryStatusJSON(), `"retained_age_ns":400,`, ``, 1),
 			wantErr: "retention",
 		},
 		{
 			name:    "slot applied beyond received",
-			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"applied_lsn":12`, `"applied_lsn":13`, 1),
+			body:    strings.Replace(standbyLegacyPrimaryStatusJSON(), `"applied_lsn":12`, `"applied_lsn":13`, 1),
 			wantErr: "slot",
 		},
 		{
 			name:    "inconsistent durability missing count",
-			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"missing_lsn_count":0`, `"missing_lsn_count":1`, 1),
+			body:    strings.Replace(standbyLegacyPrimaryStatusJSON(), `"missing_lsn_count":0`, `"missing_lsn_count":1`, 1),
 			wantErr: "durability",
 		},
 	}
@@ -133,9 +133,9 @@ func TestHAStatusParserRejectsInvalidPrimaryFields(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := ParseHAPrimaryStatus([]byte(tt.body))
+			_, err := ParseStandbyPrimaryStatus([]byte(tt.body))
 			if err == nil {
-				t.Fatalf("ParseHAPrimaryStatus returned nil error, want %q", tt.wantErr)
+				t.Fatalf("ParseStandbyPrimaryStatus returned nil error, want %q", tt.wantErr)
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("error = %q, want substring %q", err.Error(), tt.wantErr)
@@ -144,18 +144,18 @@ func TestHAStatusParserRejectsInvalidPrimaryFields(t *testing.T) {
 	}
 }
 
-func TestHAStatusParserAcceptsLegacyStandbyEnvelope(t *testing.T) {
+func TestStandbyStatusParserAcceptsLegacyStandbyEnvelope(t *testing.T) {
 	t.Parallel()
 
-	response, err := ParseHAStandbyStatus([]byte(haLegacyStandbyStatusJSON()))
+	response, err := ParseStandbyStatus([]byte(standbyLegacyStandbyStatusJSON()))
 	if err != nil {
-		t.Fatalf("ParseHAStandbyStatus returned error: %v", err)
+		t.Fatalf("ParseStandbyStatus returned error: %v", err)
 	}
 	snapshot := response.Snapshot
 	if response.SchemaVersion != 1 {
 		t.Fatalf("SchemaVersion = %d, want 1", response.SchemaVersion)
 	}
-	if snapshot.Role != HAStandbySnapshotRoleStandby {
+	if snapshot.Role != StandbySnapshotRoleStandby {
 		t.Fatalf("Role = %q, want standby", snapshot.Role)
 	}
 	if snapshot.Identity.ClusterId != 11 || snapshot.Identity.TimelineId != 44 {
@@ -172,20 +172,20 @@ func TestHAStatusParserAcceptsLegacyStandbyEnvelope(t *testing.T) {
 	}
 }
 
-func TestHAStatusParserRejectsMissingStandbySafeReadFlag(t *testing.T) {
+func TestStandbyStatusParserRejectsMissingStandbySafeReadFlag(t *testing.T) {
 	t.Parallel()
 
-	body := strings.Replace(haLegacyStandbyStatusJSON(), `"can_serve_safe_reads":true`, `"can_serve_safe_reads":null`, 1)
-	_, err := ParseHAStandbyStatus([]byte(body))
+	body := strings.Replace(standbyLegacyStandbyStatusJSON(), `"can_serve_safe_reads":true`, `"can_serve_safe_reads":null`, 1)
+	_, err := ParseStandbyStatus([]byte(body))
 	if err == nil {
-		t.Fatalf("ParseHAStandbyStatus returned nil error, want missing standby fields error")
+		t.Fatalf("ParseStandbyStatus returned nil error, want missing standby fields error")
 	}
 	if !strings.Contains(err.Error(), "standby status fields") {
 		t.Fatalf("error = %q, want standby status fields", err.Error())
 	}
 }
 
-func TestHAStatusParserRejectsInconsistentStandbyProgress(t *testing.T) {
+func TestStandbyStatusParserRejectsInconsistentStandbyProgress(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -195,17 +195,17 @@ func TestHAStatusParserRejectsInconsistentStandbyProgress(t *testing.T) {
 	}{
 		{
 			name:    "applied beyond received",
-			body:    strings.Replace(haLegacyStandbyStatusJSON(), `"applied_lsn":11`, `"applied_lsn":13`, 1),
+			body:    strings.Replace(standbyLegacyStandbyStatusJSON(), `"applied_lsn":11`, `"applied_lsn":13`, 1),
 			wantErr: "applied_lsn",
 		},
 		{
 			name:    "caught up flag lies",
-			body:    strings.Replace(haLegacyStandbyStatusJSON(), `"caught_up_to_received":false`, `"caught_up_to_received":true`, 1),
+			body:    strings.Replace(standbyLegacyStandbyStatusJSON(), `"caught_up_to_received":false`, `"caught_up_to_received":true`, 1),
 			wantErr: "caught_up_to_received",
 		},
 		{
 			name:    "upstream apply lag lies",
-			body:    strings.Replace(haLegacyStandbyStatusJSON(), `"apply_lag_lsn":1`, `"apply_lag_lsn":0`, 1),
+			body:    strings.Replace(standbyLegacyStandbyStatusJSON(), `"apply_lag_lsn":1`, `"apply_lag_lsn":0`, 1),
 			wantErr: "apply_lag_lsn",
 		},
 	}
@@ -214,9 +214,9 @@ func TestHAStatusParserRejectsInconsistentStandbyProgress(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := ParseHAStandbyStatus([]byte(tt.body))
+			_, err := ParseStandbyStatus([]byte(tt.body))
 			if err == nil {
-				t.Fatalf("ParseHAStandbyStatus returned nil error, want %q", tt.wantErr)
+				t.Fatalf("ParseStandbyStatus returned nil error, want %q", tt.wantErr)
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("error = %q, want substring %q", err.Error(), tt.wantErr)
@@ -225,7 +225,7 @@ func TestHAStatusParserRejectsInconsistentStandbyProgress(t *testing.T) {
 	}
 }
 
-func TestHAClientPrimaryStatusParsedResponseValidatesRawBody(t *testing.T) {
+func TestStandbyClientPrimaryStatusParsedResponseValidatesRawBody(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -236,13 +236,13 @@ func TestHAClientPrimaryStatusParsedResponseValidatesRawBody(t *testing.T) {
 			t.Fatalf("path = %s, want %s", r.URL.Path, HAPrimaryStatusPath)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, haLegacyPrimaryStatusJSON())
+		_, _ = fmt.Fprint(w, standbyLegacyPrimaryStatusJSON())
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	response, err := client.PrimaryStatusParsedResponse(context.Background(), nil)
 	if err != nil {
@@ -259,7 +259,7 @@ func TestHAClientPrimaryStatusParsedResponseValidatesRawBody(t *testing.T) {
 	}
 }
 
-func TestHAClientWatchdogProofUsesDedicatedAuthenticatedRoute(t *testing.T) {
+func TestStandbyClientWatchdogProofUsesDedicatedAuthenticatedRoute(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -274,9 +274,9 @@ func TestHAClientWatchdogProofUsesDedicatedAuthenticatedRoute(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	response, err := client.WithToken("test-token").WatchdogProofResponse(context.Background())
 	if err != nil {
@@ -287,7 +287,7 @@ func TestHAClientWatchdogProofUsesDedicatedAuthenticatedRoute(t *testing.T) {
 	}
 }
 
-func TestHAClientPrimaryStatusParsedResponseSanitizesGeneratedQuery(t *testing.T) {
+func TestStandbyClientPrimaryStatusParsedResponseSanitizesGeneratedQuery(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -314,17 +314,17 @@ func TestHAClientPrimaryStatusParsedResponseSanitizesGeneratedQuery(t *testing.T
 			t.Fatalf("query includes sync_required = %q, want omitted for ALL policy", query["sync_required"])
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, haLegacyPrimaryStatusJSON())
+		_, _ = fmt.Fprint(w, standbyLegacyPrimaryStatusJSON())
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
-	_, err = client.PrimaryStatusParsedResponse(context.Background(), &HAPrimaryStatusParams{
-		SyncMode:      HAPrimaryStatusSyncModeRemoteApply,
-		SyncSelection: HAPrimaryStatusSyncSelectionAll,
+	_, err = client.PrimaryStatusParsedResponse(context.Background(), &StandbyPrimaryStatusParams{
+		SyncMode:      StandbyPrimaryStatusSyncModeRemoteApply,
+		SyncSelection: StandbyPrimaryStatusSyncSelectionAll,
 		SyncRequired:  2,
 		SyncStandby:   []string{"standby-a", "standby-b"},
 	})
@@ -333,7 +333,7 @@ func TestHAClientPrimaryStatusParsedResponseSanitizesGeneratedQuery(t *testing.T
 	}
 }
 
-func TestHAClientPrimaryStatusParsedResponseOmitsEmptyAsyncSyncQuery(t *testing.T) {
+func TestStandbyClientPrimaryStatusParsedResponseOmitsEmptyAsyncSyncQuery(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -353,15 +353,15 @@ func TestHAClientPrimaryStatusParsedResponseOmitsEmptyAsyncSyncQuery(t *testing.
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, haLegacyPrimaryStatusJSON())
+		_, _ = fmt.Fprint(w, standbyLegacyPrimaryStatusJSON())
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
-	_, err = client.PrimaryStatusParsedResponse(context.Background(), &HAPrimaryStatusParams{
+	_, err = client.PrimaryStatusParsedResponse(context.Background(), &StandbyPrimaryStatusParams{
 		MaxLagLsn: 1000000,
 	})
 	if err != nil {
@@ -369,7 +369,7 @@ func TestHAClientPrimaryStatusParsedResponseOmitsEmptyAsyncSyncQuery(t *testing.
 	}
 }
 
-func TestHAClientPrimaryStatusResponseRejectsInvalidGeneratedBody(t *testing.T) {
+func TestStandbyClientPrimaryStatusResponseRejectsInvalidGeneratedBody(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -380,13 +380,13 @@ func TestHAClientPrimaryStatusResponseRejectsInvalidGeneratedBody(t *testing.T) 
 			t.Fatalf("path = %s, want %s", r.URL.Path, HAPrimaryStatusPath)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, strings.Replace(haGeneratedPrimaryStatusJSON(), `"retained_lsn_count":5`, `"retained_lsn_count":4`, 1))
+		_, _ = fmt.Fprint(w, strings.Replace(standbyGeneratedPrimaryStatusJSON(), `"retained_lsn_count":5`, `"retained_lsn_count":4`, 1))
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	_, err = client.PrimaryStatusResponse(context.Background(), nil)
 	if err == nil {
@@ -400,7 +400,7 @@ func TestHAClientPrimaryStatusResponseRejectsInvalidGeneratedBody(t *testing.T) 
 	}
 }
 
-func TestHAClientPrimaryStatusResponseRejectsMissingRequiredGeneratedField(t *testing.T) {
+func TestStandbyClientPrimaryStatusResponseRejectsMissingRequiredGeneratedField(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -411,13 +411,13 @@ func TestHAClientPrimaryStatusResponseRejectsMissingRequiredGeneratedField(t *te
 			t.Fatalf("path = %s, want %s", r.URL.Path, HAPrimaryStatusPath)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, strings.Replace(haGeneratedPrimaryStatusJSON(), `"retained_age_ns":400,`, ``, 1))
+		_, _ = fmt.Fprint(w, strings.Replace(standbyGeneratedPrimaryStatusJSON(), `"retained_age_ns":400,`, ``, 1))
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	_, err = client.PrimaryStatusResponse(context.Background(), nil)
 	if err == nil {
@@ -428,20 +428,20 @@ func TestHAClientPrimaryStatusResponseRejectsMissingRequiredGeneratedField(t *te
 	}
 }
 
-func TestValidateHAPrimaryStatusResponseEvidenceRejectsPaddedSlotName(t *testing.T) {
+func TestValidateStandbyPrimaryStatusResponseEvidenceRejectsPaddedSlotName(t *testing.T) {
 	t.Parallel()
 
-	body := strings.Replace(haGeneratedPrimaryStatusJSON(), `"name":"standby-a"`, `"name":"standby-a "`, 1)
-	err := ValidateHAPrimaryStatusResponseEvidence([]byte(body))
+	body := strings.Replace(standbyGeneratedPrimaryStatusJSON(), `"name":"standby-a"`, `"name":"standby-a "`, 1)
+	err := ValidateStandbyPrimaryStatusResponseEvidence([]byte(body))
 	if err == nil {
-		t.Fatalf("ValidateHAPrimaryStatusResponseEvidence returned nil error, want slot field evidence error")
+		t.Fatalf("ValidateStandbyPrimaryStatusResponseEvidence returned nil error, want slot field evidence error")
 	}
 	if !strings.Contains(err.Error(), "slot field evidence") {
 		t.Fatalf("error = %q, want slot field evidence", err.Error())
 	}
 }
 
-func TestHAClientStandbyStatusResponseRejectsInvalidGeneratedBody(t *testing.T) {
+func TestStandbyClientStandbyStatusResponseRejectsInvalidGeneratedBody(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -452,13 +452,13 @@ func TestHAClientStandbyStatusResponseRejectsInvalidGeneratedBody(t *testing.T) 
 			t.Fatalf("path = %s, want %s", r.URL.Path, HAStandbyStatusPath)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, strings.Replace(haGeneratedStandbyStatusJSON(), `"caught_up_to_received":false`, `"caught_up_to_received":true`, 1))
+		_, _ = fmt.Fprint(w, strings.Replace(standbyGeneratedStandbyStatusJSON(), `"caught_up_to_received":false`, `"caught_up_to_received":true`, 1))
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	_, err = client.StandbyStatusResponse(context.Background(), nil)
 	if err == nil {
@@ -472,29 +472,29 @@ func TestHAClientStandbyStatusResponseRejectsInvalidGeneratedBody(t *testing.T) 
 	}
 }
 
-func TestValidateHAStatusResponsesRejectInvalidNodeIDs(t *testing.T) {
+func TestValidateStandbyStatusResponsesRejectInvalidNodeIDs(t *testing.T) {
 	t.Parallel()
 
-	var primary HAPrimaryStatusResponse
-	if err := json.Unmarshal([]byte(haGeneratedPrimaryStatusJSON()), &primary); err != nil {
+	var primary StandbyPrimaryStatusResponse
+	if err := json.Unmarshal([]byte(standbyGeneratedPrimaryStatusJSON()), &primary); err != nil {
 		t.Fatalf("unmarshal primary status: %v", err)
 	}
 	primary.Snapshot.NodeId = "primary a"
-	if err := ValidateHAPrimaryStatusResponse(primary); err == nil || !strings.Contains(err.Error(), "invalid primary status node_id") {
+	if err := ValidateStandbyPrimaryStatusResponse(primary); err == nil || !strings.Contains(err.Error(), "invalid primary status node_id") {
 		t.Fatalf("primary status node_id error = %v, want invalid node_id", err)
 	}
 
-	var standby HAStandbyStatusResponse
-	if err := json.Unmarshal([]byte(haGeneratedStandbyStatusJSON()), &standby); err != nil {
+	var standby StandbyStatusResponse
+	if err := json.Unmarshal([]byte(standbyGeneratedStandbyStatusJSON()), &standby); err != nil {
 		t.Fatalf("unmarshal standby status: %v", err)
 	}
 	standby.Snapshot.NodeId = "standby/a"
-	if err := ValidateHAStandbyStatusResponse(standby); err == nil || !strings.Contains(err.Error(), "invalid standby status node_id") {
+	if err := ValidateStandbyStatusResponse(standby); err == nil || !strings.Contains(err.Error(), "invalid standby status node_id") {
 		t.Fatalf("standby status node_id error = %v, want invalid node_id", err)
 	}
 }
 
-func TestHAClientStandbyStatusResponseRejectsMissingRequiredGeneratedField(t *testing.T) {
+func TestStandbyClientStandbyStatusResponseRejectsMissingRequiredGeneratedField(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -505,13 +505,13 @@ func TestHAClientStandbyStatusResponseRejectsMissingRequiredGeneratedField(t *te
 			t.Fatalf("path = %s, want %s", r.URL.Path, HAStandbyStatusPath)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, strings.Replace(haGeneratedStandbyStatusJSON(), `"safe_read_lsn":11,`, ``, 1))
+		_, _ = fmt.Fprint(w, strings.Replace(standbyGeneratedStandbyStatusJSON(), `"safe_read_lsn":11,`, ``, 1))
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	_, err = client.StandbyStatusResponse(context.Background(), nil)
 	if err == nil {
@@ -522,7 +522,7 @@ func TestHAClientStandbyStatusResponseRejectsMissingRequiredGeneratedField(t *te
 	}
 }
 
-func TestHAClientStandbyStatusParsedResponseValidatesRawBody(t *testing.T) {
+func TestStandbyClientStandbyStatusParsedResponseValidatesRawBody(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -533,13 +533,13 @@ func TestHAClientStandbyStatusParsedResponseValidatesRawBody(t *testing.T) {
 			t.Fatalf("path = %s, want %s", r.URL.Path, HAStandbyStatusPath)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, haLegacyStandbyStatusJSON())
+		_, _ = fmt.Fprint(w, standbyLegacyStandbyStatusJSON())
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	response, err := client.StandbyStatusParsedResponse(context.Background(), nil)
 	if err != nil {
@@ -551,13 +551,13 @@ func TestHAClientStandbyStatusParsedResponseValidatesRawBody(t *testing.T) {
 	if len(response.Body) == 0 {
 		t.Fatalf("Body is empty, want raw response body")
 	}
-	var parsed *ParsedHAStandbyStatus = response.Value
+	var parsed = response.Value
 	if parsed.Snapshot.ReceivedLsn != 12 || parsed.Snapshot.AppliedLsn != 11 || !parsed.Snapshot.CanServeSafeReads || parsed.Snapshot.LastError != "ConnectionRefused" {
 		t.Fatalf("parsed response = %+v, want received=12 applied=11 safe reads", parsed)
 	}
 }
 
-func TestHAClientStandbyStatusParsedResponseSanitizesGeneratedQuery(t *testing.T) {
+func TestStandbyClientStandbyStatusParsedResponseSanitizesGeneratedQuery(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -572,32 +572,32 @@ func TestHAClientStandbyStatusParsedResponseSanitizesGeneratedQuery(t *testing.T
 			t.Fatalf("query includes upstream_lsn = %q, want omitted zero value", query["upstream_lsn"])
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, haLegacyStandbyStatusJSON())
+		_, _ = fmt.Fprint(w, standbyLegacyStandbyStatusJSON())
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
-	_, err = client.StandbyStatusParsedResponse(context.Background(), &HAStandbyStatusParams{})
+	_, err = client.StandbyStatusParsedResponse(context.Background(), &StandbyStatusParams{})
 	if err != nil {
 		t.Fatalf("StandbyStatusParsedResponse returned error: %v", err)
 	}
 }
 
-func TestHAClientStandbyStatusParsedResponseRejectsInvalidRawBody(t *testing.T) {
+func TestStandbyClientStandbyStatusParsedResponseRejectsInvalidRawBody(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, strings.Replace(haLegacyStandbyStatusJSON(), `"can_serve_safe_reads":true`, `"can_serve_safe_reads":null`, 1))
+		_, _ = fmt.Fprint(w, strings.Replace(standbyLegacyStandbyStatusJSON(), `"can_serve_safe_reads":true`, `"can_serve_safe_reads":null`, 1))
 	}))
 	defer server.Close()
 
-	client, err := NewHAClient(server.URL, server.Client())
+	client, err := NewStandbyClient(server.URL, server.Client())
 	if err != nil {
-		t.Fatalf("NewHAClient returned error: %v", err)
+		t.Fatalf("NewStandbyClient returned error: %v", err)
 	}
 	_, err = client.StandbyStatusParsedResponse(context.Background(), nil)
 	if err == nil {
@@ -608,7 +608,7 @@ func TestHAClientStandbyStatusParsedResponseRejectsInvalidRawBody(t *testing.T) 
 	}
 }
 
-func haGeneratedPrimaryStatusJSON() string {
+func standbyGeneratedPrimaryStatusJSON() string {
 	return `{
 		"schema_version":1,
 		"snapshot":{
@@ -662,7 +662,7 @@ func haGeneratedPrimaryStatusJSON() string {
 	}`
 }
 
-func haGeneratedStandbyStatusJSON() string {
+func standbyGeneratedStandbyStatusJSON() string {
 	return `{
 		"schema_version":1,
 		"snapshot":{
@@ -693,7 +693,7 @@ func haGeneratedStandbyStatusJSON() string {
 	}`
 }
 
-func haLegacyPrimaryStatusJSON() string {
+func standbyLegacyPrimaryStatusJSON() string {
 	return `{
 		"schema_version":1,
 		"result":{
@@ -749,7 +749,7 @@ func haLegacyPrimaryStatusJSON() string {
 	}`
 }
 
-func haLegacyStandbyStatusJSON() string {
+func standbyLegacyStandbyStatusJSON() string {
 	return `{
 		"schema_version":1,
 		"result":{

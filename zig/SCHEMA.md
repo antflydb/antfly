@@ -36,8 +36,8 @@ Table-level dynamic templates may use:
 
 The runtime schema is the source of truth for execution.
 
-It is versioned and persisted in [go/pkg/antfly/src/storage/schema.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/go/pkg/antfly/src/storage/schema.zig).
-Compilation lives in [go/pkg/antfly/src/schema/mod.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/go/pkg/antfly/src/schema/mod.zig).
+It is versioned and persisted in [go/pkg/antfly/src/storage/schema.zig](pkg/antfly/src/storage/schema.zig).
+Compilation lives in [go/pkg/antfly/src/schema/mod.zig](pkg/antfly/src/schema/mod.zig).
 
 The compiled model currently carries:
 
@@ -112,6 +112,20 @@ That means:
 - explicit fields and schema-driven dynamic rules can emit `__keyword` / `__2gram`
 - dynamic templates emit a single field at the original path
 
+## Link Fields
+
+A field marked with the `link` type is not just indexed as a keyword; at
+enrichment time its value is treated as a URL to fetch and process before the
+result is used downstream. HTML content is run through readability-style
+article extraction, PDF content is extracted to text, and image content is
+converted for use as image data.
+
+Fetching a link field's URL goes through the same security defaults as other
+remote content fetches: private and loopback IP ranges are blocked by default,
+so a link field cannot be used to reach internal services, and a single
+download is capped at 100 MB so one link field cannot exhaust the fetch
+budget.
+
 ## Resolution Order
 
 Text indexing currently resolves dynamic fields in this order:
@@ -122,7 +136,7 @@ Text indexing currently resolves dynamic fields in this order:
 4. schema-present `infer_types` fallback for opted-in open dynamic objects
 5. open `additionalProperties: true` text fallback
 
-This ordering is enforced in [go/pkg/antfly/src/storage/db/document_mapper.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/go/pkg/antfly/src/storage/db/document_mapper.zig).
+This ordering is enforced in [go/pkg/antfly/src/storage/db/document_mapper.zig](pkg/antfly/src/storage/db/document_mapper.zig).
 
 Query-time analyzer resolution now uses the same compiled runtime schema for
 explicit fields and compiled dynamic rules when a `match` or `match_phrase`
@@ -214,5 +228,5 @@ rebuilt generation commits.
 
 ## Related Docs
 
-- [TODO.md](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/TODO.md)
-- [SERVERLESS.md](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/SERVERLESS.md)
+- [TODO.md](TODO.md)
+- [SERVERLESS.md](SERVERLESS.md)

@@ -31,32 +31,7 @@ pub fn idForAttempt(job_id: u64, attempt_id: u64) !Id {
 pub const Digest = [32]u8;
 pub const max_encoded_bytes = 32 * 1024 * 1024;
 pub const max_active_attempts = 8;
-pub const ProvisioningProjection = struct {
-    tables: []records.TableRecord,
-    ranges: []records.RangeRecord,
-    /// Immutable active plans accompany private descriptors; receivers never
-    /// accept a hidden table on the authority of its name alone.
-    jobs_json: []const []const u8 = &.{},
-    pub fn jsonStringify(self: ProvisioningProjection, stream: anytype) @TypeOf(stream.*).Error!void {
-        try stream.beginObject();
-        try stream.objectField("tables");
-        try stream.write(self.tables);
-        try stream.objectField("ranges");
-        try @import("../storage/db/relational_integrity_json.zig").write(self.ranges, stream);
-        try stream.objectField("jobs_json");
-        try stream.write(self.jobs_json);
-        try stream.endObject();
-    }
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.tables) |table| tables.freeTable(alloc, table);
-        alloc.free(self.tables);
-        for (self.ranges) |range| tables.freeRange(alloc, range);
-        alloc.free(self.ranges);
-        for (self.jobs_json) |job| alloc.free(job);
-        if (self.jobs_json.len != 0) alloc.free(self.jobs_json);
-        self.* = undefined;
-    }
-};
+pub const ProvisioningProjection = @import("restore_provisioning_contract.zig").ProvisioningProjection;
 pub const ProvisioningRequest = struct { node_id: u64 };
 
 pub fn scopeProvisioningForNode(alloc: std.mem.Allocator, projection: ProvisioningProjection, node_id: u64, placements: []const @import("../raft/reconciler.zig").PlacementIntent) !ProvisioningProjection {
@@ -138,25 +113,7 @@ pub const ProvisioningSnapshot = struct {
     }
 };
 pub const State = enum { importing, validating, cutover, published, canceling, canceled };
-pub const SourceArtifact = struct {
-    target_group_id: u64,
-    source_namespace: @import("../storage/db/doc_identity.zig").Namespace,
-    format: enum { native, portable },
-    snapshot_path: []const u8,
-    artifact_size_bytes: u64,
-    artifact_sha256: [32]u8,
-    native_manifest_size_bytes: u64 = 0,
-    native_manifest_sha256: []const u8 = "",
-    cohort_seal: ?@import("../storage/db/native_backup_seal.zig").Handle = null,
-
-    pub fn digest(self: SourceArtifact, alloc: std.mem.Allocator) !Digest {
-        const encoded = try std.json.Stringify.valueAlloc(alloc, self, .{});
-        defer alloc.free(encoded);
-        var result: Digest = undefined;
-        std.crypto.hash.Blake3.hash(encoded, &result, .{});
-        return result;
-    }
-};
+pub const SourceArtifact = @import("restore_provisioning_contract.zig").SourceArtifact;
 pub const Target = struct {
     source_table_id: u64,
     table: records.TableRecord,
@@ -171,7 +128,7 @@ pub const Target = struct {
         ranges: []const records.RangeRecord,
         /// Planned before reservation, so a cancellation can tombstone even
         /// a cutover fence whose begin acknowledgement was lost.
-        fences: []const @import("../storage/db/relational_integrity_topology.zig").Fence = &.{},
+        fences: []const @import("../storage/db/relational_integrity_topology_contract.zig").Fence = &.{},
     } = null,
 };
 pub const Plan = struct {
@@ -307,7 +264,7 @@ pub const Job = struct {
 
 /// One canonical derivation shared by metadata provisioning and the restore
 /// coordinator. Hash the encoded runtime schema, not the public JSON spelling.
-pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, range: records.RangeRecord) !@import("../storage/db/restore_staging.zig").Scope {
+pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, range: records.RangeRecord) !@import("../storage/db/restore_staging_contract.zig").Scope {
     if (range.table_id != target.table.table_id) return error.InvalidRestoreStaging;
     const artifact = for (target.source_artifacts) |source| {
         if (source.target_group_id == range.group_id) break source;
@@ -327,7 +284,7 @@ pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, tar
         .source_descriptor_digest = try artifact.digest(alloc),
         .source_namespace = artifact.source_namespace,
         .target_namespace = .{ .table_id = target.table.table_id, .shard_id = tables.rangeDocIdentityShardId(range), .range_id = tables.rangeDocIdentityRangeId(range) },
-        .target_schema_digest = @import("../storage/db/restore_staging.zig").digest(encoded),
+        .target_schema_digest = @import("../storage/db/restore_staging_contract.zig").digest(encoded),
     };
 }
 

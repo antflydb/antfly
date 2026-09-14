@@ -39,7 +39,7 @@ spec:
         - --leader-elect
         - --enable-inference-controllers=true
         env:
-        - name: ANTFLY_HA_ADMIN_TOKEN
+        - name: ANTFLY_STANDBY_ADMIN_TOKEN
           valueFrom:
             secretKeyRef:
               name: antfly-ha-admin-token

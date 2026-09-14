@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
-const db_mod = @import("../db/db.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const db_core = @import("../db/core.zig");
 const db_types = @import("../db/types.zig");
 const backend_erased = @import("../backend_erased.zig");
@@ -248,6 +248,7 @@ pub const Handle = struct {
                 opts.storage = storage;
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
+                opts.index_backends.vector_block_storage = storage;
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.index_repair_checkpoint_storage = storage;
@@ -269,6 +270,7 @@ pub const Handle = struct {
                 opts.index_backends.graph_reverse_backend = .lsm;
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
+                opts.index_backends.vector_block_storage = storage;
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.index_backends.text_main_lsm_options.storage = storage;
@@ -341,6 +343,7 @@ pub const Handle = struct {
         opts.index_backends.graph_reverse_backend = .lsm;
         opts.index_backends.text_lsm_storage = storage;
         opts.index_backends.dense_lsm_storage = storage;
+        opts.index_backends.vector_block_storage = storage;
         opts.index_backends.sparse_lsm_storage = storage;
         opts.index_backends.graph_lsm_storage = storage;
         opts.index_backends.text_main_lsm_options.storage = storage;
@@ -1546,4 +1549,89 @@ test "lite backend native open requires an existing file" {
         .engine = .native_single_file,
         .read_only = true,
     }));
+}
+
+test "lite backend recovers vector crash orphans only on writer reopen" {
+    const alloc = std.testing.allocator;
+    const Connection = @import("connection.zig").Connection;
+    const VectorStore = @import("../vector_block_store.zig").Store;
+    const VectorWriter = @import("antfly_vectorindex").vector_block.Writer;
+    const root = "__antfly_lite/vector-blocks";
+    const orphan = root ++ "/block-99-0.afvb";
+    const unrelated = "__antfly_lite/tables/other/vector-blocks/block-99-0.afvb";
+    for ([_]bool{ false, true }) |published| {
+        var fixture = try @import("../../common/test_directory.zig").TestDirectory.init("recovery.aflite");
+        defer fixture.cleanup();
+        {
+            var db = try Connection.create(alloc, fixture.path(), true);
+            defer db.close();
+        }
+        var sequence: u64 = undefined;
+        {
+            var handle = try Handle.open(alloc, fixture.path(), .{});
+            defer handle.deinit();
+            var opts = db_mod.OpenOptions{};
+            try handle.configureDbOpenOptions(&opts);
+            const storage = opts.index_backends.vector_block_storage.?;
+            if (published) {
+                var blocks = try VectorStore.open(alloc, storage, root);
+                defer blocks.deinit();
+                var writer = try VectorWriter.init(alloc, 1, 0, 1, 0);
+                defer writer.deinit();
+                try writer.appendVector("artifact", 0, 1, &.{1.0});
+                const bytes = try writer.build();
+                defer alloc.free(bytes);
+                try blocks.publishGeneration(1, 0, &.{.{ .shard_id = 0, .bytes = bytes }}, true);
+            }
+            try storage.writeFileAbsolute(orphan, "orphan");
+            try storage.writeFileAbsolute(root ++ "/unmanaged", "keep");
+            try storage.writeFileAbsolute(unrelated, "keep");
+            sequence = handle.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        }
+        for ([_]db_mod.OpenOptions.OpenMode{ .query_readonly, .writer }) |mode| {
+            var db = try Connection.open(alloc, fixture.path(), mode);
+            defer db.close();
+            var opts = db_mod.OpenOptions{};
+            try db.backend.configureDbOpenOptions(&opts);
+            const storage = opts.index_backends.vector_block_storage.?;
+            if (mode == .query_readonly) {
+                try std.testing.expectEqual(sequence, db.backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+                try std.testing.expectEqual(@as(u64, 6), try storage.fileSize(orphan));
+                if (!published) try std.testing.expectError(error.FileNotFound, storage.fileSize(root ++ "/wal-1.afvw"));
+            } else {
+                try std.testing.expectError(error.FileNotFound, storage.fileSize(orphan));
+            }
+            try std.testing.expectEqual(@as(u64, 4), try storage.fileSize(unrelated));
+            try std.testing.expectEqual(@as(u64, 4), try storage.fileSize(root ++ "/unmanaged"));
+            if (published) {
+                var blocks = try VectorStore.openReadOnlyWithBlocks(alloc, storage, root);
+                defer blocks.deinit();
+                var scratch: [1]f32 = undefined;
+                try std.testing.expectEqualSlices(f32, &.{1.0}, try (try blocks.get("artifact", 0, 1)).vector.decodeInto(&scratch));
+            }
+        }
+    }
+}
+
+test "lite backend keeps vector blocks inside each single file and namespace" {
+    const alloc = std.testing.allocator;
+    var fixture = try @import("../../common/test_directory.zig").TestDirectory.init("vectors.aflite");
+    defer fixture.cleanup();
+    for ([_]bool{ false, true }) |reopen| {
+        var handle = if (reopen) try Handle.open(alloc, fixture.path(), .{}) else try Handle.create(alloc, fixture.path(), true);
+        defer handle.deinit();
+        for ([_]?[]const u8{ null, "tables/a", "tables/b" }, 0..) |namespace, index| {
+            var opts = db_mod.OpenOptions{};
+            if (namespace) |name| try handle.configureDbOpenOptionsForNamespace(&opts, name) else try handle.configureDbOpenOptions(&opts);
+            const storage = opts.index_backends.vector_block_storage orelse return error.MissingVectorBlockStorage;
+            const path = try std.fmt.allocPrint(alloc, "{s}/vector-blocks/test.afvb", .{opts.index_base_path.?});
+            defer alloc.free(path);
+            const payload = try std.fmt.allocPrint(alloc, "namespace-{d}", .{index});
+            defer alloc.free(payload);
+            if (!reopen) try storage.writeFileAbsolute(path, payload);
+            const read = try storage.readFileAlloc(alloc, path, 64);
+            defer alloc.free(read);
+            try std.testing.expectEqualStrings(payload, read);
+        }
+    }
 }

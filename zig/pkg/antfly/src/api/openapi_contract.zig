@@ -350,79 +350,82 @@ test "admin openapi contract module is generated and wired" {
     try std.testing.expect(@hasField(admin_generated.FenceAcquireRequest, "promoted_node_id"));
     try std.testing.expect(@hasDecl(admin_generated, "PromotionAssessRequest"));
     try std.testing.expect(@hasField(admin_generated.PromotionAssessRequest, "use_current_fence"));
-    try std.testing.expect(@hasDecl(admin_generated, "HAPromotionResult"));
-    try std.testing.expect(@hasField(admin_generated.HAPromotionResult, "node_id"));
-    try std.testing.expect(@hasDecl(admin_generated, "HAActionReceipt"));
-    try std.testing.expect(@hasField(admin_generated.HAActionReceipt, "action_id"));
-    try std.testing.expect(@hasField(admin_generated.HAActionReceipt, "action_kind"));
-    try std.testing.expect(@hasField(admin_generated.HAActionReceipt, "target"));
-    try std.testing.expect(@hasField(admin_generated.HAActionReceipt, "state"));
-    try std.testing.expect(@hasDecl(admin_generated, "HAPromotionResponse"));
-    try std.testing.expect(@hasField(admin_generated.HAPromotionResponse, "action"));
-    try std.testing.expect(@hasField(admin_generated.HAPromotionResponse, "promotion"));
-    try std.testing.expect(@hasDecl(admin_generated, "HAFenceReceipt"));
-    try std.testing.expect(@hasField(admin_generated.HAFenceReceipt, "parent_timeline_id"));
+    try std.testing.expect(@hasDecl(admin_generated, "StandbyPromotionResult"));
+    try std.testing.expect(@hasField(admin_generated.StandbyPromotionResult, "node_id"));
+    try std.testing.expect(@hasDecl(admin_generated, "StandbyActionReceipt"));
+    try std.testing.expect(@hasField(admin_generated.StandbyActionReceipt, "action_id"));
+    try std.testing.expect(@hasField(admin_generated.StandbyActionReceipt, "action_kind"));
+    try std.testing.expect(@hasField(admin_generated.StandbyActionReceipt, "target"));
+    try std.testing.expect(@hasField(admin_generated.StandbyActionReceipt, "state"));
+    try std.testing.expect(@hasDecl(admin_generated, "StandbyPromotionResponse"));
+    try std.testing.expect(@hasField(admin_generated.StandbyPromotionResponse, "action"));
+    try std.testing.expect(@hasField(admin_generated.StandbyPromotionResponse, "promotion"));
+    try std.testing.expect(@hasDecl(admin_generated, "StandbyFenceReceipt"));
+    try std.testing.expect(@hasField(admin_generated.StandbyFenceReceipt, "parent_timeline_id"));
     try std.testing.expect(@hasDecl(admin_generated, "RejoinAssessRequest"));
     try std.testing.expect(@hasField(admin_generated.RejoinAssessRequest, "retained_from_lsn"));
     try std.testing.expect(@hasField(admin_generated.RejoinAssessRequest, "receipt"));
-    try std.testing.expect(@hasDecl(admin_generated, "HARejoinAssessResponse"));
-    try std.testing.expect(@hasField(admin_generated.HARejoinAssessResponse, "action"));
-    try std.testing.expect(@hasField(admin_generated.HARejoinAssessResponse, "assessment"));
-    try std.testing.expect(@hasField(admin_generated.HARejoinAssessResponse, "rewind"));
-    try std.testing.expect(@hasField(admin_generated.HARejoinAssessResponse, "reseed"));
-    try std.testing.expect(@hasDecl(admin_generated, "HARejoinRewindResult"));
-    try std.testing.expect(@hasField(admin_generated.HARejoinRewindResult, "discarded_lsn_count"));
-    try std.testing.expect(@hasDecl(admin_generated, "HARejoinReseedResult"));
-    try std.testing.expect(@hasField(admin_generated.HARejoinReseedResult, "base_backup_required"));
-    try std.testing.expect(@hasDecl(admin_generated, "HASeedLifecycleReceiptInventoryResponse"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptInventoryResponse, "entries"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptInventoryResponse, "first_cursor"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptInventoryResponse, "end_cursor"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptInventoryResponse, "next_cursor"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptInventoryResponse, "history_truncated"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptInventoryResponse, "gap"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptInventoryResponse, "has_more"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptInventoryResponse, "runtime"));
-    try std.testing.expect(@hasDecl(admin_generated, "HASeedLifecycleReceiptEvent"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptEvent, "receipt_json"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptEvent, "receipt_sha256"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptEvent, "topology_id"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptEvent, "topology_generation"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptEvent, "target_pvc_uid"));
-    try std.testing.expect(@hasField(admin_generated.HASeedLifecycleReceiptEvent, "recorded_at_unix_ns"));
-    try std.testing.expect(@hasDecl(admin_generated, "HARuntimeLifecycleObservation"));
-    try std.testing.expect(@hasField(admin_generated.HARuntimeLifecycleObservation, "pod_uid"));
-    try std.testing.expect(@hasField(admin_generated.HARuntimeLifecycleObservation, "fenced"));
+    try std.testing.expect(@hasDecl(admin_generated, "StandbyRejoinAssessResponse"));
+    try std.testing.expect(@hasField(admin_generated.StandbyRejoinAssessResponse, "action"));
+    try std.testing.expect(@hasField(admin_generated.StandbyRejoinAssessResponse, "assessment"));
+    try std.testing.expect(@hasField(admin_generated.StandbyRejoinAssessResponse, "rewind"));
+    try std.testing.expect(@hasField(admin_generated.StandbyRejoinAssessResponse, "reseed"));
+    try std.testing.expect(@hasDecl(admin_generated, "StandbyRejoinRewindResult"));
+    try std.testing.expect(@hasField(admin_generated.StandbyRejoinRewindResult, "discarded_lsn_count"));
+    try std.testing.expect(@hasDecl(admin_generated, "StandbyRejoinReseedResult"));
+    try std.testing.expect(@hasField(admin_generated.StandbyRejoinReseedResult, "base_backup_required"));
+    try std.testing.expect(@hasDecl(admin_generated, "StandbySeedLifecycleReceiptInventoryResponse"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptInventoryResponse, "entries"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptInventoryResponse, "first_cursor"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptInventoryResponse, "end_cursor"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptInventoryResponse, "next_cursor"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptInventoryResponse, "history_truncated"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptInventoryResponse, "gap"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptInventoryResponse, "has_more"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptInventoryResponse, "runtime"));
+    try std.testing.expect(@hasDecl(admin_generated, "StandbySeedLifecycleReceiptEvent"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptEvent, "receipt_json"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptEvent, "receipt_sha256"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptEvent, "topology_id"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptEvent, "topology_generation"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptEvent, "target_pvc_uid"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedLifecycleReceiptEvent, "recorded_at_unix_ns"));
+    try std.testing.expect(@hasDecl(admin_generated, "StandbyRuntimeLifecycleObservation"));
+    try std.testing.expect(@hasField(admin_generated.StandbyRuntimeLifecycleObservation, "pod_uid"));
+    try std.testing.expect(@hasField(admin_generated.StandbyRuntimeLifecycleObservation, "fenced"));
     try std.testing.expect(@hasField(admin_generated.SeedArtifactCaptureRequest, "topology_id"));
     try std.testing.expect(@hasField(admin_generated.SeedArtifactCaptureRequest, "topology_generation"));
     try std.testing.expect(@hasField(admin_generated.SeedArtifactCaptureRequest, "node_id"));
     try std.testing.expect(@hasField(admin_generated.SeedArtifactCaptureRequest, "target_pvc_name"));
     try std.testing.expect(@hasField(admin_generated.SeedArtifactCaptureRequest, "target_pvc_uid"));
-    try std.testing.expect(@hasField(admin_generated.HASeedArtifactCaptureResponse, "topology_id"));
-    try std.testing.expect(@hasField(admin_generated.HASeedArtifactCaptureResponse, "target_pvc_uid"));
-    try std.testing.expect(@hasField(admin_generated.HASeedArtifactCaptureResponse, "capture_receipt_sha256"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedArtifactCaptureResponse, "topology_id"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedArtifactCaptureResponse, "target_pvc_uid"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeedArtifactCaptureResponse, "capture_receipt_sha256"));
     try std.testing.expect(@hasField(admin_generated.SeededSlotActivateRequest, "capture_receipt_sha256"));
-    try std.testing.expect(@hasField(admin_generated.HASeededSlotActivateResponse, "capture_receipt_sha256"));
+    try std.testing.expect(@hasField(admin_generated.StandbySeededSlotActivateResponse, "capture_receipt_sha256"));
+    try std.testing.expect(@hasDecl(admin_facade, "StandbyActionReceipt"));
+    try std.testing.expect(@hasDecl(admin_facade, "StandbySeedLifecycleReceiptInventoryResponse"));
+    try std.testing.expect(@hasDecl(admin_facade, "StandbyRejoinRewindResult"));
+    try std.testing.expect(@hasDecl(admin_facade, "StandbyRejoinReseedResult"));
+    // Deprecated spellings stay exported for one minor release.
     try std.testing.expect(@hasDecl(admin_facade, "HAActionReceipt"));
-    try std.testing.expect(@hasDecl(admin_facade, "HASeedLifecycleReceiptInventoryResponse"));
-    try std.testing.expect(@hasDecl(admin_facade, "HARejoinRewindResult"));
     try std.testing.expect(@hasDecl(admin_facade, "HARejoinReseedResult"));
     try std.testing.expect(@hasDecl(admin_generated.server, "PauseHAReplicationSlotPathParams"));
     try std.testing.expect(@hasField(admin_generated.server.PauseHAReplicationSlotPathParams, "slot_name"));
 }
 
 test "internal openapi contract module is generated and wired" {
-    try std.testing.expect(@hasDecl(internal_generated, "HAIdentifySystemResponse"));
-    try std.testing.expect(@hasField(internal_generated.HAIdentifySystemResponse, "identity"));
-    try std.testing.expect(@hasField(internal_generated.HAIdentifySystemResponse, "record_format_version"));
-    try std.testing.expect(@hasDecl(internal_generated, "HACreateReplicationSlotRequest"));
-    try std.testing.expect(@hasField(internal_generated.HACreateReplicationSlotRequest, "slot_name"));
-    try std.testing.expect(@hasDecl(internal_generated, "HAStartReplicationRequest"));
-    try std.testing.expect(@hasField(internal_generated.HAStartReplicationRequest, "from_lsn"));
-    try std.testing.expect(@hasDecl(internal_generated, "HAReplicationFrame"));
-    try std.testing.expect(@hasField(internal_generated.HAReplicationFrame, "encoded"));
-    try std.testing.expect(@hasDecl(internal_generated, "HAStandbyStatusUpdateRequest"));
-    try std.testing.expect(@hasField(internal_generated.HAStandbyStatusUpdateRequest, "safe_read_lsn"));
+    try std.testing.expect(@hasDecl(internal_generated, "StandbyIdentifySystemResponse"));
+    try std.testing.expect(@hasField(internal_generated.StandbyIdentifySystemResponse, "identity"));
+    try std.testing.expect(@hasField(internal_generated.StandbyIdentifySystemResponse, "record_format_version"));
+    try std.testing.expect(@hasDecl(internal_generated, "StandbyCreateReplicationSlotRequest"));
+    try std.testing.expect(@hasField(internal_generated.StandbyCreateReplicationSlotRequest, "slot_name"));
+    try std.testing.expect(@hasDecl(internal_generated, "StandbyStartReplicationRequest"));
+    try std.testing.expect(@hasField(internal_generated.StandbyStartReplicationRequest, "from_lsn"));
+    try std.testing.expect(@hasDecl(internal_generated, "StandbyReplicationFrame"));
+    try std.testing.expect(@hasField(internal_generated.StandbyReplicationFrame, "encoded"));
+    try std.testing.expect(@hasDecl(internal_generated, "StandbyStatusUpdateRequest"));
+    try std.testing.expect(@hasField(internal_generated.StandbyStatusUpdateRequest, "safe_read_lsn"));
     try std.testing.expect(@hasDecl(internal_generated.server, "ServerRouter"));
 }
 
@@ -462,6 +465,26 @@ pub fn expectPublicIndexRuntimeStatusMetadata() !void {
     try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "projection_checkpoint_config_fingerprint"));
     try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "checkpoint_replay_tail_sequence_count"));
     try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "repair_scan_issue_count"));
+    try std.testing.expect(@hasDecl(indexes_generated, "GraphMetricRuntimeStats"));
+    try std.testing.expect(@hasDecl(indexes_generated, "GraphMetricQuery"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricQuery, "name"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricQuery, "top_k"));
+    try std.testing.expect(@hasField(generated.QueryRequest, "graph_metric"));
+    try std.testing.expect(@hasField(metadata_generated.QueryRequest, "graph_metric"));
+    try std.testing.expect(@hasField(client_generated.QueryRequest, "graph_metric"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "graph_metric_runtime"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "owner_id_hash"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "worker_count"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "takeover_count"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "lost_leases"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "lease_expires_at_ms"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "lease_renew_after_ms"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "renewal_count"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "total_pages_claimed"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "last_pages_completed"));
+    try std.testing.expect(@hasDecl(client_generated, "GraphMetricRuntimeStats"));
+    try std.testing.expect(@hasField(client_generated.GraphIndexStats, "graph_metric_runtime"));
+    try std.testing.expect(@hasField(client_generated.GraphMetricRuntimeStats, "owner_id_hash"));
     try std.testing.expect(@hasDecl(indexes_generated, "AlgebraicIndexStats"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "index_type"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "projection_checkpoint_status"));
@@ -502,6 +525,54 @@ pub fn expectPublicIndexRuntimeStatusMetadata() !void {
 
 test "public index contract exposes runtime status metadata" {
     try expectPublicIndexRuntimeStatusMetadata();
+}
+
+test "indexes openapi parses graph metric runtime summary" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(indexes_generated.IndexStats, alloc,
+        \\{"index_type":"graph","counts_pending":true,"total_edges":4,"graph_metric_runtime":{"enabled":true,"role":"worker_pool","owner_id_hash":17,"worker_id_hash":23,"worker_count":3,"lease_owned":true,"has_lease":true,"takeover_count":2,"lost_leases":1,"ticks_started":9,"ticks_completed":8,"durable_progress_ticks":7,"total_pages_claimed":6,"total_pages_completed":5,"last_pages_claimed":4,"last_pages_completed":3}}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .graph_index_stats => |stats| {
+            const runtime = stats.graph_metric_runtime orelse return error.UnexpectedOpenApiVariant;
+            try std.testing.expect(runtime.enabled.?);
+            try std.testing.expect(stats.counts_pending.?);
+            try std.testing.expectEqualStrings("worker_pool", runtime.role.?);
+            try std.testing.expectEqual(@as(i64, 17), runtime.owner_id_hash.?);
+            try std.testing.expectEqual(@as(i64, 3), runtime.worker_count.?);
+            try std.testing.expectEqual(@as(i64, 2), runtime.takeover_count.?);
+            try std.testing.expectEqual(@as(i64, 1), runtime.lost_leases.?);
+            try std.testing.expectEqual(@as(i64, 6), runtime.total_pages_claimed.?);
+            try std.testing.expectEqual(@as(i64, 3), runtime.last_pages_completed.?);
+        },
+        else => return error.UnexpectedOpenApiVariant,
+    }
+}
+
+test "client openapi parses graph metric runtime summary" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(client_generated.IndexStats, alloc,
+        \\{"index_type":"graph","counts_pending":true,"total_edges":4,"graph_metric_runtime":{"enabled":true,"role":"coordinator","owner_id_hash":99,"worker_count":1,"takeover_count":2,"lost_leases":1,"total_pages_claimed":6,"last_pages_completed":3}}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .graph_index_stats => |stats| {
+            const runtime = stats.graph_metric_runtime orelse return error.UnexpectedOpenApiVariant;
+            try std.testing.expect(runtime.enabled.?);
+            try std.testing.expect(stats.counts_pending.?);
+            try std.testing.expectEqualStrings("coordinator", runtime.role.?);
+            try std.testing.expectEqual(@as(i64, 99), runtime.owner_id_hash.?);
+            try std.testing.expectEqual(@as(i64, 1), runtime.worker_count.?);
+            try std.testing.expectEqual(@as(i64, 2), runtime.takeover_count.?);
+            try std.testing.expectEqual(@as(i64, 1), runtime.lost_leases.?);
+            try std.testing.expectEqual(@as(i64, 6), runtime.total_pages_claimed.?);
+            try std.testing.expectEqual(@as(i64, 3), runtime.last_pages_completed.?);
+        },
+        else => return error.UnexpectedOpenApiVariant,
+    }
 }
 
 test "indexes openapi parses algebraic status as algebraic stats" {
@@ -943,6 +1014,7 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
     var found_create_index = false;
     var found_drop_index = false;
     var found_get_index = false;
+    var found_execute_graph_metric_action = false;
     var found_put_artifact_enrichment = false;
     var found_delete_artifact_enrichment = false;
     for (server.routes) |route| {
@@ -973,6 +1045,7 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
         if (std.mem.eql(u8, route.operation_id, "createIndex")) found_create_index = true;
         if (std.mem.eql(u8, route.operation_id, "dropIndex")) found_drop_index = true;
         if (std.mem.eql(u8, route.operation_id, "getIndex")) found_get_index = true;
+        if (std.mem.eql(u8, route.operation_id, "executeGraphMetricAction")) found_execute_graph_metric_action = true;
         if (std.mem.eql(u8, route.operation_id, "putArtifactEnrichment")) found_put_artifact_enrichment = true;
         if (std.mem.eql(u8, route.operation_id, "deleteArtifactEnrichment")) found_delete_artifact_enrichment = true;
     }
@@ -1003,6 +1076,7 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
     try std.testing.expect(found_create_index);
     try std.testing.expect(found_drop_index);
     try std.testing.expect(found_get_index);
+    try std.testing.expect(found_execute_graph_metric_action);
     try std.testing.expect(found_put_artifact_enrichment);
     try std.testing.expect(found_delete_artifact_enrichment);
 }

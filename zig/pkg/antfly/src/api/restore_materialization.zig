@@ -18,7 +18,7 @@ const std = @import("std");
 const backups = @import("backups.zig");
 const native = @import("../storage/db/native_backup.zig");
 const fs = @import("../common/fs_paths.zig");
-const staging = @import("../storage/db/restore_staging.zig");
+const staging = @import("../storage/db/restore_staging_contract.zig");
 const Sha = std.crypto.hash.sha2.Sha256;
 pub const chunk_bytes = 8 * 1024 * 1024;
 

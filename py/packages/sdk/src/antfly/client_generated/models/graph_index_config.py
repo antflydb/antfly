@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
     from ..models.graph_artifact_producer_config import GraphArtifactProducerConfig
     from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
+    from ..models.graph_index_config_metrics import GraphIndexConfigMetrics
     from ..models.graph_resolver_config import GraphResolverConfig
 
 
@@ -25,6 +26,9 @@ class GraphIndexConfig:
     """Configuration for graph index type
 
     Attributes:
+        metrics (GraphIndexConfigMetrics | Unset): Named published graph metrics. Serverless supports background refresh
+            only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128
+            UTF-8 bytes per metric name.
         sources (list[GraphArtifactSourceConfig] | Unset): Ordered chunk or JSON asset streams whose edge-like values
             are unioned into this graph index. Artifact names must be unique within the array because the artifact name is
             the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires
@@ -50,6 +54,7 @@ class GraphIndexConfig:
         resolvers (list[GraphResolverConfig] | Unset):
     """
 
+    metrics: GraphIndexConfigMetrics | Unset = UNSET
     sources: list[GraphArtifactSourceConfig] | Unset = UNSET
     summarizer: GeneratorConfig | Unset = UNSET
     template: str | Unset = UNSET
@@ -62,6 +67,10 @@ class GraphIndexConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        metrics: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.metrics, Unset):
+            metrics = self.metrics.to_dict()
+
         sources: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.sources, Unset):
             sources = []
@@ -106,6 +115,8 @@ class GraphIndexConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if metrics is not UNSET:
+            field_dict["metrics"] = metrics
         if sources is not UNSET:
             field_dict["sources"] = sources
         if summarizer is not UNSET:
@@ -134,9 +145,17 @@ class GraphIndexConfig:
         from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
         from ..models.graph_artifact_producer_config import GraphArtifactProducerConfig
         from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
+        from ..models.graph_index_config_metrics import GraphIndexConfigMetrics
         from ..models.graph_resolver_config import GraphResolverConfig
 
         d = dict(src_dict)
+        _metrics = d.pop("metrics", UNSET)
+        metrics: GraphIndexConfigMetrics | Unset
+        if isinstance(_metrics, Unset):
+            metrics = UNSET
+        else:
+            metrics = GraphIndexConfigMetrics.from_dict(_metrics)
+
         _sources = d.pop("sources", UNSET)
         sources: list[GraphArtifactSourceConfig] | Unset = UNSET
         if _sources is not UNSET:
@@ -197,6 +216,7 @@ class GraphIndexConfig:
                 resolvers.append(resolvers_item)
 
         graph_index_config = cls(
+            metrics=metrics,
             sources=sources,
             summarizer=summarizer,
             template=template,

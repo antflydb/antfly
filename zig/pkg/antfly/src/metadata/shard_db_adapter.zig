@@ -13,9 +13,11 @@
 // limitations.
 
 const std = @import("std");
+const storage_source_options = @import("storage_source_options");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const restore_state_contract = @import("../storage/restore_state_contract.zig");
 const tables_api = @import("../api/tables.zig");
 const metadata_api = @import("api.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
@@ -69,6 +71,12 @@ pub const ShardDbAdapter = struct {
             schema_version: u32,
             read_schema_version: u32,
         ) anyerror!bool,
+        restore_state: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            group_id: u64,
+        ) anyerror!?restore_state_contract.State = null,
         /// Hand an idempotent catalog index activation to the resident group
         /// owner. Acceptance means the process-lifetime owner durably owns the
         /// retry; corpus work and publication remain asynchronous.
@@ -94,6 +102,16 @@ pub const ShardDbAdapter = struct {
         return try self.vtable.schema_index_ready(self.ptr, alloc, table_name, group_id, schema_version, read_schema_version);
     }
 
+    pub fn restoreState(
+        self: ShardDbAdapter,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+    ) !?restore_state_contract.State {
+        const read = self.vtable.restore_state orelse return error.StorageKernelOwnerUnavailable;
+        return try read(self.ptr, alloc, table_name, group_id);
+    }
+
     pub fn activateIndex(
         self: ShardDbAdapter,
         alloc: std.mem.Allocator,
@@ -104,7 +122,7 @@ pub const ShardDbAdapter = struct {
     }
 };
 
-pub const FallbackLocalShardDbAdapter = struct {
+const PhysicalFallbackLocalShardDbAdapter = struct {
     replica_root_dir: []const u8,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
 
@@ -114,6 +132,7 @@ pub const FallbackLocalShardDbAdapter = struct {
             .vtable = &.{
                 .fetch_median_key = fetchMedianKey,
                 .schema_index_ready = schemaIndexReady,
+                .restore_state = restoreState,
             },
         };
     }
@@ -167,7 +186,80 @@ pub const FallbackLocalShardDbAdapter = struct {
 
         return try dbStatsSchemaIndexReady(alloc, stats, schema_version, read_schema_version);
     }
+
+    fn restoreState(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        _: []const u8,
+        group_id: u64,
+    ) !?restore_state_contract.State {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const path = try backup_restore.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var state = (try db_mod.DB.readRestoreStateForPath(alloc, path)) orelse return null;
+        defer state.deinit(alloc);
+        return try (restore_state_contract.State{
+            .backup_id = state.backup_id,
+            .location = state.location,
+            .artifact_sha256 = state.artifact_sha256,
+            .native_manifest_size_bytes = state.native_manifest_size_bytes,
+            .native_manifest_sha256 = state.native_manifest_sha256,
+            .snapshot_path = state.snapshot_path,
+            .group_id = state.group_id,
+            .phase = state.phase,
+            .primary_restored = state.primary_restored,
+            .runtime_repair_complete = state.runtime_repair_complete,
+            .last_error = state.last_error,
+        }).cloneAlloc(alloc);
+    }
 };
+
+const UnavailableFallbackLocalShardDbAdapter = struct {
+    replica_root_dir: []const u8,
+    backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
+
+    pub fn adapter(self: *@This()) ShardDbAdapter {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .fetch_median_key = fetchMedianKey,
+                .schema_index_ready = schemaIndexReady,
+                .restore_state = restoreState,
+            },
+        };
+    }
+
+    fn fetchMedianKey(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+        return error.StorageKernelOwnerUnavailable;
+    }
+
+    fn schemaIndexReady(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: u64,
+        _: u32,
+        _: u32,
+    ) !bool {
+        return error.StorageKernelOwnerUnavailable;
+    }
+
+    fn restoreState(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: u64,
+    ) !?restore_state_contract.State {
+        return error.StorageKernelOwnerUnavailable;
+    }
+};
+
+/// A control compilation unit may use injected shard operations, but it must
+/// never recover by opening a physical DB itself.
+pub const FallbackLocalShardDbAdapter = if (storage_source_options.control_only)
+    UnavailableFallbackLocalShardDbAdapter
+else
+    PhysicalFallbackLocalShardDbAdapter;
 
 pub fn dbStatsSchemaIndexReady(
     alloc: std.mem.Allocator,

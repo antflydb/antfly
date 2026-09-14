@@ -271,7 +271,11 @@ pub const Cache = struct {
     stats: AtomicStats = .{},
 
     pub fn init(allocator: Allocator, max_bytes: usize) Cache {
-        const shards = allocator.alloc(Shard, default_shard_count) catch @panic("OOM");
+        return initFallible(allocator, max_bytes) catch @panic("OOM");
+    }
+
+    pub fn initFallible(allocator: Allocator, max_bytes: usize) Allocator.Error!Cache {
+        const shards = try allocator.alloc(Shard, default_shard_count);
         @memset(shards, .{});
         return .{
             .allocator = allocator,

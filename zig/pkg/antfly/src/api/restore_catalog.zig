@@ -21,7 +21,7 @@ const tables = @import("../metadata/table_manager.zig");
 const routing = @import("table_catalog.zig");
 const reads = @import("table_reads.zig");
 const writes = @import("table_writes.zig");
-const Scope = @import("../storage/db/restore_staging.zig").Scope;
+const Scope = @import("../storage/db/restore_staging_contract.zig").Scope;
 
 pub const Owner = struct { group_id: u64, scope: Scope };
 pub const Authority = struct {
@@ -29,6 +29,14 @@ pub const Authority = struct {
     /// The metadata restore driver verifies the same active job/plan identity
     /// after a linearizable barrier. Cancellation/publication revoke this view.
     verify: *const fn (*anyopaque, [16]u8, [32]u8) anyerror!bool,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+
+    const VTable = struct { verify: *const fn (*anyopaque, [16]u8, [32]u8) anyerror!bool };
+    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+
+    fn permits(self: @This(), id: [16]u8, digest: [32]u8) !bool {
+        return BoundaryAbi.call("verify", self.boundary_dispatch, self.verify, .{ self.ptr, id, digest });
+    }
 };
 
 pub const Catalog = struct {
@@ -80,7 +88,7 @@ pub const Catalog = struct {
         return @ptrCast(@alignCast(ptr));
     }
     fn verify(self: *Catalog) !void {
-        if (!try self.authority.verify(self.authority.ptr, self.plan_id, self.plan_digest)) return error.RestoreStagingScopeChanged;
+        if (!try self.authority.permits(self.plan_id, self.plan_digest)) return error.RestoreStagingScopeChanged;
     }
     fn adminSnapshot(ptr: *anyopaque) !metadata.AdminSnapshot {
         const self = cast(ptr);
@@ -150,18 +158,78 @@ pub const ValidationCursor = struct {
 /// queue or a public query route. Templates are lightweight hosted sources.
 pub const ValidationPort = struct {
     status: @import("http_server.zig").StatusSource,
-    reader: ?*reads.HostedProvisionedTableReadSource = null,
-    writer: ?*writes.HostedProvisionedTableWriteSource = null,
-    local_reader: ?*reads.ProvisionedTableReadSource = null,
-    local_writer: ?*writes.ProvisionedTableWriteSource = null,
     /// Internal embedding boundary. Implementations borrow the exact private
     /// catalog for the session lifetime and must not fall back to live names.
     factory: ?SourceFactory = null,
 
-    pub const SourcePair = struct { reader: reads.TableReadSource, writer: writes.TableWriteSource };
+    pub const SourcePair = struct {
+        reader: @import("table_read_source.zig").TableReadSource,
+        writer: @import("table_write_source.zig").TableWriteSource,
+        owner: ?*anyopaque = null,
+        release: ?*const fn (*anyopaque) void = null,
+        pub fn deinit(self: *@This()) void {
+            if (self.release) |callback| callback(self.owner.?);
+            self.* = undefined;
+        }
+    };
     pub const SourceFactory = struct {
         ptr: *anyopaque,
-        bind: *const fn (*anyopaque, *Catalog) anyerror!SourcePair,
+        secondary: ?*anyopaque = null,
+        bind: *const fn (*anyopaque, ?*anyopaque, *Catalog) anyerror!SourcePair,
+        boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+
+        const VTable = struct { bind: *const fn (*anyopaque, ?*anyopaque, *Catalog) anyerror!SourcePair };
+        const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+
+        fn bindSources(self: @This(), catalog: *Catalog) !SourcePair {
+            return BoundaryAbi.call("bind", self.boundary_dispatch, self.bind, .{ self.ptr, self.secondary, catalog });
+        }
+
+        pub fn hosted(reader: *reads.HostedProvisionedTableReadSource, writer: *writes.HostedProvisionedTableWriteSource) @This() {
+            return .{ .ptr = reader, .secondary = writer, .bind = bindHosted };
+        }
+
+        pub fn local(reader: *reads.ProvisionedTableReadSource, writer: *writes.ProvisionedTableWriteSource) @This() {
+            return .{ .ptr = reader, .secondary = writer, .bind = bindLocal };
+        }
+
+        fn bindHosted(ptr: *anyopaque, secondary: ?*anyopaque, catalog: *Catalog) !SourcePair {
+            const Owned = struct {
+                alloc: std.mem.Allocator,
+                sources: Sources,
+                fn release(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.alloc.destroy(self);
+                }
+            };
+            const reader: *reads.HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+            const writer: *writes.HostedProvisionedTableWriteSource = @ptrCast(@alignCast(secondary.?));
+            const owned = try catalog.alloc.create(Owned);
+            owned.alloc = catalog.alloc;
+            catalog.io = reader.catalog.io;
+            owned.sources.bind(catalog, reader.*, writer.*);
+            return .{ .reader = owned.sources.reader.source(), .writer = owned.sources.writer.source(), .owner = owned, .release = Owned.release };
+        }
+
+        fn bindLocal(ptr: *anyopaque, secondary: ?*anyopaque, catalog: *Catalog) !SourcePair {
+            const Owned = struct {
+                alloc: std.mem.Allocator,
+                reader: reads.ProvisionedTableReadSource,
+                writer: writes.ProvisionedTableWriteSource,
+                fn release(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.alloc.destroy(self);
+                }
+            };
+            const reader: *reads.ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+            const writer: *writes.ProvisionedTableWriteSource = @ptrCast(@alignCast(secondary.?));
+            const owned = try catalog.alloc.create(Owned);
+            owned.* = .{ .alloc = catalog.alloc, .reader = reader.*, .writer = writer.* };
+            catalog.io = reader.catalog.io;
+            owned.reader.catalog = catalog.source();
+            owned.writer.catalog = catalog.source();
+            return .{ .reader = owned.reader.source(), .writer = owned.writer.source(), .owner = owned, .release = Owned.release };
+        }
     };
 
     pub fn validate(self: @This(), alloc: std.mem.Allocator, job: @import("../metadata/restore_staging.zig").Job, cursor: *ValidationCursor, request: @import("operation.zig").RequestContext) !bool {
@@ -181,7 +249,7 @@ pub const ValidationPort = struct {
         errdefer self.status.freeAdminSnapshot(&live);
         const session = try alloc.create(ValidationSession);
         errdefer alloc.destroy(session);
-        session.* = .{ .alloc = alloc, .port = self, .arena = std.heap.ArenaAllocator.init(alloc), .live = live, .catalog = undefined, .sources = undefined, .request = request };
+        session.* = .{ .alloc = alloc, .port = self, .arena = std.heap.ArenaAllocator.init(alloc), .live = live, .catalog = undefined, .request = request };
         errdefer session.arena.deinit();
         const owned = session.arena.allocator();
         // Own the plan bytes; the driver's next metadata update may replace its
@@ -206,23 +274,8 @@ pub const ValidationPort = struct {
         snapshot.tables = private_tables.items;
         snapshot.ranges = private_ranges.items;
         session.catalog = try Catalog.init(alloc, snapshot, owners.items, .{ .ptr = session, .verify = ValidationSession.verify });
-        if (self.factory) |factory| {
-            session.bound = try factory.bind(factory.ptr, &session.catalog);
-        } else if (self.local_reader) |reader| {
-            const writer = self.local_writer orelse return error.RestoreValidationPending;
-            session.catalog.io = reader.catalog.io;
-            session.local_reader = reader.*;
-            session.local_writer = writer.*;
-            session.local_reader.catalog = session.catalog.source();
-            session.local_writer.catalog = session.catalog.source();
-            session.bound = .{ .reader = session.local_reader.source(), .writer = session.local_writer.source() };
-        } else {
-            const reader = self.reader orelse return error.RestoreValidationPending;
-            const writer = self.writer orelse return error.RestoreValidationPending;
-            session.catalog.io = reader.catalog.io;
-            session.sources.bind(&session.catalog, reader.*, writer.*);
-            session.bound = .{ .reader = session.sources.reader.source(), .writer = session.sources.writer.source() };
-        }
+        const factory = self.factory orelse return error.RestoreValidationPending;
+        session.bound = try factory.bindSources(&session.catalog);
         return session;
     }
 };
@@ -233,13 +286,11 @@ pub const ValidationSession = struct {
     arena: std.heap.ArenaAllocator,
     live: metadata.AdminSnapshot,
     catalog: Catalog,
-    sources: Sources,
-    local_reader: reads.ProvisionedTableReadSource = undefined,
-    local_writer: writes.ProvisionedTableWriteSource = undefined,
     bound: ValidationPort.SourcePair = undefined,
     request: @import("operation.zig").RequestContext,
 
     pub fn deinit(self: *@This()) void {
+        self.bound.deinit();
         self.port.status.freeAdminSnapshot(&self.live);
         self.arena.deinit();
         self.alloc.destroy(self);
@@ -283,7 +334,7 @@ pub fn validateSlice(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.
         return false;
     };
     defer status.deinit(alloc);
-    const State = @import("../storage/db/relational_integrity_activation.zig").State;
+    const State = @import("../storage/db/relational_integrity_activation_contract.zig").State;
     var parsed = try std.json.parseFromSlice(struct { state: State, unique_covered: bool }, alloc, status.json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     if (parsed.value.state == .invalid) return error.ConstraintActivationFailed;
@@ -298,8 +349,8 @@ pub fn validateSlice(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.
 test "distributed txn staged mixed restore rebuilds fresh FK claims with durable 2PC and hides invalid cohorts" {
     const db_mod = @import("../storage/db/db.zig");
     const types = @import("../storage/db/types.zig");
-    const native = @import("../storage/db/restore_staging.zig");
-    const activation = @import("../storage/db/relational_integrity_activation.zig");
+    const native = @import("../storage/db/restore_staging_contract.zig");
+    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
     const distributed = @import("distributed_txn.zig");
     const contract = @import("distributed_txn_contract.zig");
     const read_gate = @import("../raft/read_gate.zig");

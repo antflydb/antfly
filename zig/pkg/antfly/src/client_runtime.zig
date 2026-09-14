@@ -24,6 +24,20 @@ pub fn runFromIterator(
     args: *std.process.Args.Iterator,
 ) !void {
     if (helpRequested(args)) {
+        var probe = args.*;
+        while (probe.next()) |arg| {
+            if (std.mem.eql(u8, arg, "maintenance")) {
+                const commands = @import("maintenance_commands.zig");
+                if (std.mem.eql(u8, command, "index")) {
+                    std.debug.print("{s}", .{commands.usage(.index)});
+                    return;
+                }
+                if (std.mem.eql(u8, command, "artifact")) {
+                    std.debug.print("{s}", .{commands.usage(.artifact)});
+                    return;
+                }
+            }
+        }
         cli.printCommandUsage(command);
         return;
     }

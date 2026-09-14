@@ -17,7 +17,7 @@
 const std = @import("std");
 const staging = @import("../metadata/restore_staging.zig");
 const tables = @import("../metadata/table_manager.zig");
-pub const Owner = struct { plan_id: [16]u8, plan_digest: [32]u8, table: tables.TableRecord, range: tables.RangeRecord, scope: @import("../storage/db/restore_staging.zig").Scope, cancel_recovery: bool = false };
+pub const Owner = struct { plan_id: [16]u8, plan_digest: [32]u8, table: tables.TableRecord, range: tables.RangeRecord, scope: @import("../storage/db/restore_staging_contract.zig").Scope, cancel_recovery: bool = false };
 
 pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRecord, public_ranges: []const tables.RangeRecord, projection: staging.ProvisioningProjection) ![]Owner {
     if (projection.jobs_json.len > staging.max_active_attempts) return error.InvalidRestoreStaging;

@@ -34,37 +34,7 @@ pub const TensorPlan = struct {
     access_path: ir.PhysicalAccessPath,
 };
 
-pub const TensorProgramQueryPlan = struct {
-    program_id: []u8,
-    inputs: []ir.TensorExpr = &.{},
-    access_paths: []ir.PhysicalAccessPath,
-    steps: []ir.TensorProgramStep,
-    output: ir.TensorProgramRef,
-    outputs: []ir.TensorProgramRef = &.{},
-    owned_metadata: []?[]u8 = &.{},
-
-    pub fn deinit(self: *TensorProgramQueryPlan, alloc: std.mem.Allocator) void {
-        alloc.free(self.program_id);
-        if (self.inputs.len > 0) alloc.free(self.inputs);
-        if (self.access_paths.len > 0) alloc.free(self.access_paths);
-        for (self.owned_metadata) |metadata| {
-            if (metadata) |bytes| alloc.free(bytes);
-        }
-        if (self.owned_metadata.len > 0) alloc.free(self.owned_metadata);
-        if (self.steps.len > 0) alloc.free(self.steps);
-        if (self.outputs.len > 0) alloc.free(self.outputs);
-        self.* = undefined;
-    }
-
-    pub fn asProgram(self: *const TensorProgramQueryPlan) ir.TensorProgram {
-        return .{
-            .inputs = self.inputs,
-            .steps = self.steps,
-            .output = self.output,
-            .outputs = self.outputs,
-        };
-    }
-};
+pub const TensorProgramQueryPlan = @import("planner_control.zig").TensorProgramQueryPlan;
 
 pub const BucketTensorProgramQueryPlan = struct {
     count: TensorProgramQueryPlan,

@@ -216,7 +216,7 @@ test "restore staging cohort proof binds every source identity and durable seal"
     defer arena.deinit();
     const a = arena.allocator();
     const cohort = @import("../metadata/backup_cohort.zig");
-    const fence: @import("../storage/db/relational_integrity_topology.zig").Fence = .{ .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 301, .role = .backup_snapshot, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(1) };
+    const fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 301, .role = .backup_snapshot, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(1) };
     const owner: cohort.Owner = .{ .table_name = "docs", .range_start = "", .range_end = "", .fence = fence, .artifact_id = "artifact", .capture_node_id = 44 };
     const receipt: cohort.SealReceipt = .{ .source_node_id = 44, .handle = .{ .fence = fence, .digest = @splat(2) } };
     var proof: cohort.Job = .{ .id = 7, .revision = 9, .attempt_id = "attempt", .backup_id = "daily", .location = "s3://archive/daily", .connection = "archive", .tables = &.{.{ .table_id = 9, .name = "docs", .definition = @splat(1), .manifest_definition = cohort.manifestDefinition("docs", "", "{}", "", "{}", "[]") }}, .state = .{ .phase = .publishing, .metadata_digest = @splat(3), .owners = &.{owner} }, .seals = &.{receipt} };

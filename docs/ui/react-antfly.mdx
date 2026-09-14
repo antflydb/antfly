@@ -9,20 +9,28 @@ description: UI components for building search applications with React and Antfl
 - How do I build a search interface with React?
 - How do I add faceted search?
 - How do I display search results?
-- How do I use the RAG components?
+- How do I add AI-generated answers or a chat interface?
 </Questions>
 
-React Antfly provides declarative React components for building search interfaces powered by Antfly. It offers a simple way to create search applications with faceted search, filters, customizable result displays, and AI-powered Q&A.
+React Antfly provides declarative React components for building search interfaces powered by Antfly. It offers a simple way to create search applications with faceted search, filters, customizable result displays, and AI-powered answers and chat.
 
 ## Installation
 
-Install the package using npm or yarn:
+Install the package along with its peer dependencies. `@antfly/components` does not bundle `@antfly/sdk`, `react`, or `react-dom`, so install them explicitly:
 
 ```bash
-npm install @antfly/components
+npm install @antfly/components @antfly/sdk react react-dom
 # or
-yarn add @antfly/components
+yarn add @antfly/components @antfly/sdk react react-dom
 ```
+
+Then import the stylesheet once, at your app's entry point:
+
+```ts
+import '@antfly/components/styles';
+```
+
+Without it, components render as unstyled markup: autosuggest dropdowns won't position over the input, pagination and facet lists lose their layout, and so on. See [Styling](#styling) for how the shipped stylesheet works and how to override it.
 
 ## Quick Start
 
@@ -30,6 +38,7 @@ Here's a basic example of a search interface using React Antfly:
 
 ```jsx
 import React from 'react';
+import '@antfly/components/styles';
 import {
   Antfly,
   QueryBox,
@@ -38,12 +47,14 @@ import {
 } from '@antfly/components';
 
 const MySearchApp = () => (
-  <Antfly url="http://127.0.0.1:8080" table="movies">
+  <Antfly url="http://127.0.0.1:8080/db/v1" table="movies">
     <QueryBox id="mainSearch" mode="live" placeholder="Search movies..." />
     <Facet id="actors" fields={["actors"]} />
     <Facet id="releasedYear" fields={["releasedYear"]} />
     <Results
       id="results"
+      searchBoxId="mainSearch"
+      fields={["title", "description"]}
       items={data =>
         data.map(item => (
           <div key={item._id}>
@@ -61,11 +72,11 @@ const MySearchApp = () => (
 
 ### Antfly Provider
 
-The `<Antfly>` component is the root provider that manages the search state and coordinates all child components.
+The `<Antfly>` component is the root provider that manages the search state and coordinates all child components. It also mounts the internal [`Listener`](#listener) that batches and runs queries, so you never render `Listener` yourself.
 
 ```jsx
 <Antfly
-  url="http://127.0.0.1:8080"
+  url="http://127.0.0.1:8080/db/v1"
   table="your_table"
   headers={{
     Authorization: "Bearer your-token"
@@ -79,10 +90,10 @@ The `<Antfly>` component is the root provider that manages the search state and 
 ```
 
 **Props:**
-- `url` (string, required): The Antfly API base URL
-- `table` (string): Default table name for queries (can be overridden per component)
+- `url` (string, required): The Antfly API base URL, including the `/db/v1` path, e.g. `http://127.0.0.1:8080/db/v1`
+- `table` (string, required): Default table used by every widget (individual widgets can override it with their own `table` prop)
 - `headers` (object): Custom headers for API requests
-- `onChange` (function): Callback fired when search state changes
+- `onChange` (function): Callback fired with the current widget state whenever a query-relevant value changes
 
 ### QueryBox
 
@@ -114,9 +125,13 @@ The `<QueryBox>` component provides a unified text input for both search and que
 - `placeholder` (string): Input placeholder text
 - `buttonLabel` (string): Submit button text (submit mode only, default: "Submit")
 - `initialValue` (string): Initial search value
+- `autoSubmit` (boolean): In submit mode, automatically submit when `initialValue` is set or changes (used to feed a follow-up question back into the box)
+- `submitSignal` (string | number): Bump this alongside `initialValue` to force a re-submit of the same text
+- `clearOnSubmit` (boolean): Clear the input after a submit-mode submission (default: false)
 - `onSubmit` (function): Callback when query is submitted
 - `onInputChange` (function): Callback when input value changes
-- `onEscape` (function): Custom escape key handler
+- `onEscape` (function): Custom escape key handler; return `true` to prevent the default clear behavior
+- `renderInput` (function): Replace the default `<input>` with a custom component (receives `value`, `onChange`, `onSubmit`, `onKeyDown`, and more — see `CustomInputProps`)
 - `children` (ReactNode): Child components (e.g., Autosuggest)
 
 ### Autosuggest
@@ -157,22 +172,23 @@ The `<Autosuggest>` component provides autocomplete suggestions. It can be used 
 
 **Props:**
 - `fields` (array): Fields to search for suggestions
-- `returnFields` (array): Fields to return in results
+- `returnFields` (array): Fields to return in results (defaults to `fields`)
 - `limit` (number): Maximum number of suggestions (default: 10)
 - `minChars` (number): Minimum characters to trigger suggestions (default: 2)
-- `renderSuggestion` (function): Custom render function for suggestions
-- `customQuery` (function): Custom query transformation function
+- `debounceMs` (number): Debounce delay before querying (default: 300, 0 to disable)
+- `renderSuggestion` (function): Custom render function for suggestions (legacy mode, no children)
+- `customQuery` (function): Custom query transformation function, `(value?, fields?) => query`
 - `semanticIndexes` (array): Vector indexes for semantic search
 - `table` (string): Optional table override
 - `filterQuery` (object): Query to constrain suggestions
 - `exclusionQuery` (object): Query to exclude matches
-- `onSuggestionSelect` (function): Callback when suggestion is selected
+- `onSuggestionSelect` (function): Callback when a suggestion is selected (legacy mode, no children)
 - `layout` ("vertical" | "horizontal" | "grid" | "custom"): Layout mode (default: "vertical")
-- `children` (ReactNode): Composable children (AutosuggestResults, AutosuggestFacets)
+- `children` (ReactNode): Composable children ([`AutosuggestResults`](#autosuggestresults), [`AutosuggestFacets`](#autosuggestfacets))
 
 ### Composable Autosuggest
 
-Use `<AutosuggestResults>` and `<AutosuggestFacets>` as children for advanced customization:
+Passing children switches `<Autosuggest>` into composable mode: it stops rendering its own list and instead provides context that `<AutosuggestResults>` and `<AutosuggestFacets>` consume.
 
 ```jsx
 <QueryBox id="search" mode="live">
@@ -200,6 +216,48 @@ Use `<AutosuggestResults>` and `<AutosuggestFacets>` as children for advanced cu
     />
   </Autosuggest>
 </QueryBox>
+```
+
+#### AutosuggestResults
+
+Renders the matched documents inside a composable `<Autosuggest>`. Must be a descendant of `<Autosuggest>` (it calls [`useAutosuggestContext`](#useautosuggestcontext) internally).
+
+**Props:**
+- `limit` (number): Cap the number of items shown
+- `renderItem` (function): `(hit, index) => ReactNode`
+- `onSelect` (function): Called when an item is clicked or selected via Enter
+- `filter` (function): `(hit) => boolean` to exclude items
+- `className`, `itemClassName`, `selectedItemClassName` (string): CSS hooks
+- `header` (ReactNode | function): Static node, or `(count) => ReactNode`
+- `footer` (ReactNode)
+- `emptyMessage` (ReactNode): Shown when there are no results after filtering
+
+```jsx
+<AutosuggestResults
+  renderItem={(hit) => <span>{hit._source.title}</span>}
+  emptyMessage={<em>No matches</em>}
+/>
+```
+
+#### AutosuggestFacets
+
+Renders one aggregation field's top terms inside a composable `<Autosuggest>`. Add one `<AutosuggestFacets field="...">` per field you want to aggregate on.
+
+**Props:**
+- `field` (string, required): Field to aggregate
+- `size` (number): Max terms to show (default: 5)
+- `label` (string): Section label
+- `order` ("count" | "term" | "reverse_count" | "reverse_term"): Sort order (default: "count")
+- `renderItem` (function): `(facet, index) => ReactNode`
+- `renderSection` (function): `(field, label, terms) => ReactNode`, replaces the whole section
+- `onSelect` (function): Called when a term is clicked
+- `clickable` (boolean): Whether terms respond to click/Enter (default: true)
+- `filter` (function): `(facet) => boolean`
+- `className`, `itemClassName`, `sectionClassName` (string): CSS hooks
+- `header` (ReactNode | function), `footer` (ReactNode), `emptyMessage` (ReactNode)
+
+```jsx
+<AutosuggestFacets field="category" label="Categories" size={5} />
 ```
 
 ### Facet Filters
@@ -253,8 +311,9 @@ The `<Results>` component displays search results with pagination.
 ```jsx
 <Results
   id="results"
+  searchBoxId="search"
   initialPage={1}
-  size={20}
+  itemsPerPage={20}
   items={(data) =>
     data.map(({ _source, _score, _id }) => (
       <div key={_id}>
@@ -263,32 +322,53 @@ The `<Results>` component displays search results with pagination.
       </div>
     ))
   }
-  pagination={(props) => (
-    <CustomPagination {...props} />
+  pagination={(total, itemsPerPage, page, setPage) => (
+    <CustomPagination total={total} itemsPerPage={itemsPerPage} page={page} onChange={setPage} />
   )}
 />
 ```
 
 **Props:**
 - `id` (string, required): Unique identifier
-- `initialPage` (number): Starting page number
-- `size` (number): Results per page
-- `items` (function, required): Render function for result items
-- `pagination` (function): Custom pagination component
+- `searchBoxId` (string): ID of the `QueryBox` that provides the search value (omit to just consume results from other widgets)
+- `fields` (array): Fields to search when `searchBoxId` is set and no `semanticIndexes` are given
+- `semanticIndexes` (array): Vector indexes to search
+- `customQuery` (function): `(query?) => unknown`, overrides the default query built from `fields`
+- `limit` (number): Retrieval limit for semantic queries (default: 10)
+- `itemsPerPage` (number): Results per page (default: 10)
+- `initialPage` (number): Starting page number (default: 1)
+- `items` (function, required): `(data) => ReactNode`, render function for result items
+- `pagination` (function): `(total, itemsPerPage, page, setPage) => ReactNode`, replaces the default [`Pagination`](#pagination)
+- `stats` (function): `(total) => ReactNode`, replaces the default "N results" text
+- `onResults` (function): `(data, total) => void`, called whenever new results arrive
+- `sort`, `table`, `filterQuery`, `exclusionQuery`: query overrides, same shapes as elsewhere in the library
+
+### Pagination
+
+The control `<Results>` renders by default for keyword (non-semantic) result sets. Pass `pagination` on `<Results>` to replace it, or render `<Pagination>` directly for a fully custom results flow.
+
+**Props:**
+- `onChange` (function, required): `(page: number) => void`
+- `total` (number, required): Total number of results
+- `itemsPerPage` (number, required)
+- `page` (number, required): Current page
+
+```jsx
+<Pagination page={page} total={total} itemsPerPage={10} onChange={setPage} />
+```
 
 ### Active Filters
 
-Display and manage currently active filters:
+`<ActiveFilters>` reads every widget with a non-empty value and lets you clear them:
 
 ```jsx
 <ActiveFilters
-  id="activeFilters"
-  render={(filters, removeFilter) => (
+  items={(filters, removeFilter) => (
     <div>
       {filters.map(filter => (
-        <span key={filter.id}>
-          {filter.label}
-          <button onClick={() => removeFilter(filter)}>×</button>
+        <span key={filter.key}>
+          {filter.key}: {filter.value}
+          <button onClick={() => removeFilter(filter.key)}>×</button>
         </span>
       ))}
     </div>
@@ -296,96 +376,41 @@ Display and manage currently active filters:
 />
 ```
 
-## RAG (Retrieval-Augmented Generation)
-
-React Antfly provides first-class support for RAG applications with streaming responses.
-
-### RAGResults
-
-The `<RAGResults>` component displays AI-generated answers based on retrieved context from your data. It links to a `<QueryBox>` component and streams LLM responses.
-
-```jsx
-import { QueryBox, RAGResults } from '@antfly/components';
-
-const summarizer = {
-  provider: "ollama",
-  model: "gemma3:4b"
-};
-
-<QueryBox id="question" mode="submit" placeholder="Ask a question..." />
-<RAGResults
-  id="answer"
-  searchBoxId="question"
-  summarizer={summarizer}
-  systemPrompt="You are a helpful assistant."
-  fields={["content", "title"]}
-  semanticIndexes={["embeddings"]}
-/>
-```
+Without an `items` render prop it falls back to a plain `<ul>` of `key: value` pairs with a remove button.
 
 **Props:**
-- `id` (string, required): Unique identifier
-- `searchBoxId` (string, required): ID of the QueryBox that provides the search value
-- `summarizer` (object, required): LLM configuration
-- `provider`: "antfly", "ollama", "openai", "gemini", or "vertex"
-  - `model`: Model name
-  - `api_key`: API key (if required)
-- `systemPrompt` (string): Custom system prompt for the LLM
-- `table` (string): Optional table override (inherits from QueryBox if not specified)
-- `filterQuery` (object): Query to constrain RAG retrieval
-- `exclusionQuery` (object): Query to exclude matches
-- `fields` (array): Fields to search for context
-- `semanticIndexes` (array): Vector indexes to search
-- `showHits` (boolean): Display search results used for context (default: false)
-- `renderSummary` (function): Custom render function for the answer
-- `children` (ReactNode): Child components (e.g., AnswerFeedback)
+- `items` (function): `(activeFilters, removeFilter) => ReactNode`, where each filter is `{ key, value }` and `removeFilter(key)` clears that widget
 
-### Custom Summary Rendering
+### CustomWidget
 
-For production RAG applications, we recommend using **[streamdown.ai](https://streamdown.ai)** for rendering markdown with beautiful, streaming-aware components:
+Extensibility point for widgets that need direct access to the shared search state without importing `useSharedContext` themselves. It clones its children and injects `ctx` (the current shared state) and `dispatch` as props.
+
+**Props:**
+- `children` (ReactNode, required)
 
 ```jsx
-import Streamdown from 'streamdown';
-import { replaceCitations } from '@antfly/components';
+function RawTableLabel({ ctx }) {
+  return <span>Table: {ctx?.table}</span>;
+}
 
-<RAGResults
-  id="answer"
-  searchBoxId="question"
-  summarizer={summarizer}
-  renderSummary={(summary, isStreaming, hits) => {
-    // Convert citations to clickable numbered links
-    const withClickableCitations = replaceCitations(summary, (docId) => {
-      const index = hits.findIndex(h => h._id === docId);
-      return index >= 0 ? `[${index + 1}](javascript:void(0))` : `[${docId}]`;
-    });
-
-    return (
-      <div className="rag-answer">
-        <Streamdown
-          markdown={withClickableCitations}
-          onLinkClick={(href, text) => {
-            // Handle citation clicks
-            const citationNum = parseInt(text.replace(/[\[\]]/g, ''));
-            if (!isNaN(citationNum)) {
-              const element = document.getElementById(`source-${citationNum}`);
-              element?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            }
-          }}
-        />
-        {isStreaming && <span className="streaming-indicator">Generating...</span>}
-      </div>
-    );
-  }}
-/>
+<CustomWidget>
+  <RawTableLabel />
+</CustomWidget>
 ```
 
-## Retrieval Agent
+Calling [`useSharedContext()`](#usesharedcontext) directly from a component anywhere under `<Antfly>` achieves the same thing; `CustomWidget` exists for components that would rather receive `ctx`/`dispatch` as props.
 
-The Retrieval Agent is Antfly's advanced Q&A system. It provides query classification, reasoning, retrieval, generation, confidence scoring, and follow-up questions through `/agents/retrieval`.
+### Listener
+
+`<Antfly>` mounts `Listener` internally around your tree — you never render it yourself. It watches every registered widget, batches their queries with a 15ms debounce, runs them through `multiquery()`, and writes results back into the shared state. It's exported for advanced testing and typing scenarios only.
+
+## AI Answers (Retrieval Agent)
+
+Antfly's Retrieval Agent handles query classification, retrieval, reasoning, generation, confidence scoring, and follow-up questions in one streamed request. `<AnswerResults>` is the React component for it.
 
 ### AnswerResults
 
-The `<AnswerResults>` component is the legacy React component name for rendering Retrieval Agent responses with optional classification, reasoning, and follow-up questions.
+`<AnswerResults>` links to a `<QueryBox>` (usually `mode="submit"`) and streams the agent's response.
 
 ```jsx
 import { QueryBox, AnswerResults } from '@antfly/components';
@@ -410,34 +435,44 @@ const generator = {
 
 **Props:**
 - `id` (string, required): Unique identifier
-- `searchBoxId` (string, required): ID of the QueryBox that provides the search value
-- `generator` (object, required): LLM configuration (same format as RAGResults `summarizer`)
+- `searchBoxId` (string, required): ID of the `QueryBox` that provides the search value
+- `generator` (object, required): LLM configuration — `{ provider: "antfly" | "ollama" | "openai" | "gemini" | "vertex", model, api_key? }`
+- `agentKnowledge` (string): Additional domain context passed to the agent
 - `systemPrompt` (string): Custom system prompt for the LLM
-- `table` (string): Optional table override
+- `generationContext` (string): Additional generation-step context
+- `table` (string): Optional table override (inherits from `QueryBox`/`Antfly` if not specified)
 - `filterQuery` (object): Query to constrain search results
 - `exclusionQuery` (object): Query to exclude matches
 - `fields` (array): Fields to search for context
 - `semanticIndexes` (array): Vector indexes to search
+- `limit` (number): Results limit per search (default: 10)
+- `followUpCount` (number): Number of follow-up questions to request
+- `eval` (object): Inline evaluation config (`EvalConfig` from `@antfly/sdk`) to score the answer as it streams
 
 **Visibility Controls:**
 - `showClassification` (boolean): Display query classification (default: false)
 - `showReasoning` (boolean): Display reasoning process (default: false)
 - `showFollowUpQuestions` (boolean): Display follow-up questions (default: true)
-- `showHits` (boolean): Display search results (default: false)
+- `showConfidence` (boolean): Display confidence assessment (default: false)
+- `showHits` (boolean): Display search results used for context (default: false)
 
 **Custom Renderers:**
 - `renderLoading` (function): Custom loading state
 - `renderEmpty` (function): Custom empty state
-- `renderClassification` (function): Custom classification renderer
-- `renderReasoning` (function): Custom reasoning renderer
-- `renderAnswer` (function): Custom answer renderer
-- `renderFollowUpQuestions` (function): Custom follow-up questions renderer
-- `renderHits` (function): Custom hits renderer
+- `renderClassification` (function): `(data) => ReactNode`
+- `renderReasoning` (function): `(reasoning, isStreaming) => ReactNode`
+- `renderAnswer` (function): `(answer, isStreaming, hits?) => ReactNode`
+- `renderConfidence` (function): `(confidence) => ReactNode`
+- `renderFollowUpQuestions` (function): `(questions) => ReactNode`
+- `renderHits` (function): `(hits) => ReactNode`
+- `renderEvalResult` (function): `(evalResult) => ReactNode`
 
 **Callbacks:**
-- `onStreamStart` (function): Called when streaming starts
-- `onStreamEnd` (function): Called when streaming ends
-- `onError` (function): Called on error
+- `onStreamStart` / `onStreamEnd` (function): Lifecycle callbacks
+- `onError` (function): `(error: string) => void`
+- `onClassification`, `onHit`, `onGenerationChunk`, `onConfidence`, `onFollowup`: fine-grained streaming callbacks, one call per event
+
+- `children` (ReactNode): Rendered inside the same context — this is how `<AnswerFeedback>` (below) reads the live answer
 
 **Example with custom renderers:**
 
@@ -450,7 +485,7 @@ const generator = {
   showFollowUpQuestions={true}
   renderAnswer={(answer, isStreaming, hits) => (
     <div className="custom-answer">
-      <Streamdown markdown={answer} />
+      <Streamdown>{answer}</Streamdown>
       {isStreaming && <span>Generating...</span>}
     </div>
   )}
@@ -469,14 +504,45 @@ const generator = {
 />
 ```
 
+### Custom Answer Rendering
+
+For production applications, we recommend using **[streamdown.ai](https://streamdown.ai)** for rendering markdown with beautiful, streaming-aware components:
+
+```jsx
+import Streamdown from 'streamdown';
+import { replaceCitations } from '@antfly/components';
+
+<AnswerResults
+  id="answer"
+  searchBoxId="question"
+  generator={generator}
+  renderAnswer={(answer, isStreaming, hits) => {
+    // Convert citations to numbered links pointing at the hit anchors
+    const withLinks = replaceCitations(answer, {
+      renderCitation: (ids, allIds) =>
+        ids
+          .map((id) => `[${allIds.indexOf(id) + 1}](#source-${allIds.indexOf(id) + 1})`)
+          .join(', '),
+    });
+
+    return (
+      <div className="answer">
+        <Streamdown>{withLinks}</Streamdown>
+        {isStreaming && <span className="streaming-indicator">Generating...</span>}
+      </div>
+    );
+  }}
+/>
+```
+
 ### AnswerFeedback
 
-Collect user feedback on AI-generated answers with configurable rating systems. Works with both `<RAGResults>` and `<AnswerResults>`.
+Collect user feedback on AI-generated answers with configurable rating systems. It must be rendered as a child of `<AnswerResults>` — it reads the live answer via [`useAnswerResultsContext`](#useanswerresultscontext) internally.
 
 ```jsx
 import { AnswerFeedback, renderThumbsUpDown } from '@antfly/components';
 
-<RAGResults id="answer" searchBoxId="question" summarizer={summarizer}>
+<AnswerResults id="answer" searchBoxId="question" generator={generator}>
   <AnswerFeedback
     scale={1}
     renderRating={renderThumbsUpDown}
@@ -487,7 +553,7 @@ import { AnswerFeedback, renderThumbsUpDown } from '@antfly/components';
       console.log('Comment:', feedback.comment);
     }}
   />
-</RAGResults>
+</AnswerResults>
 ```
 
 **Built-in Renderers:**
@@ -549,8 +615,9 @@ const customRender = (currentRating, onRate) => {
 <AnswerFeedback
   scale={4}
   renderRating={customRender}
-  enableComments={true}
-  commentPlaceholder="Tell us more..."
+  renderComment={(comment, setComment) => (
+    <textarea value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Tell us more..." />
+  )}
   onFeedback={handleFeedback}
 />
 ```
@@ -558,10 +625,10 @@ const customRender = (currentRating, onRate) => {
 **Props:**
 - `scale` (number, required): Maximum rating value (e.g., 1 for binary, 4 for 5-star)
 - `renderRating` (function): Render function `(currentRating, onRate) => ReactNode`
-- `onFeedback` (function, required): Callback with `{ feedback, result, query }`
-- `enableComments` (boolean): Show optional comment field (default: true)
-- `commentPlaceholder` (string): Placeholder for comment textarea
-- `submitLabel` (string): Text for submit button
+- `renderComment` (function): `(comment, setComment) => ReactNode`, shown after a rating is picked
+- `renderSubmit` (function): `(onSubmit) => ReactNode`
+- `renderSubmitted` (function): `() => ReactNode`, shown after submission instead of the default "Thank you" message
+- `onFeedback` (function, required): Callback with `{ feedback, result, query, context? }`
 
 **Feedback Data:**
 
@@ -570,19 +637,88 @@ const customRender = (currentRating, onRate) => {
   feedback: {
     rating: number,      // 0 to scale
     scale: number,       // Max value
-    comment?: string     // Optional text
+    comment?: string     // Optional text, only present if a comment was entered
   },
-  result: {
-    summary_result: { summary: string },
-    query_results: [{ hits: { hits: QueryHit[] } }]
-  },
-  query: string
+  result: RetrievalAgentResult, // from @antfly/sdk — includes generation, hits, followup_questions, etc.
+  query: string,
+  context?: {
+    classification?: { route_type: "question" | "search", confidence: number },
+    reasoning?: string,
+    agentKnowledge?: string
+  }
 }
+```
+
+## Chat
+
+`<ChatBar>` wraps the Retrieval Agent for multi-turn conversations, keeping a full turn history instead of a single answer.
+
+### ChatBar
+
+```jsx
+import { Antfly, ChatBar } from '@antfly/components';
+
+const generator = { provider: "ollama", model: "gemma3:4b" };
+
+<Antfly url="http://127.0.0.1:8080/db/v1" table="docs">
+  <ChatBar
+    id="support-chat"
+    generator={generator}
+    semanticIndexes={["body_embeddings"]}
+    fields={["title", "body"]}
+    showHits
+  />
+</Antfly>
+```
+
+`<ChatBar>` renders a [`ChatMessages`](#chatmessages) log and a [`ChatInput`](#chatinput) composer for you, and accepts all of their props directly (`ChatBarProps` extends both).
+
+**Props:**
+- `id` (string, required): Unique identifier
+- `generator` (object, required): Same shape as `AnswerResults.generator`
+- `table`, `semanticIndexes`, `fields`, `filterQuery`, `exclusionQuery`: retrieval overrides, same shapes as `AnswerResults`
+- `agentKnowledge`, `systemPrompt`, `limit`, `followUpCount`: same meaning as `AnswerResults`
+- `maxInternalIterations` (number): Cap on agentic tool-call iterations per turn
+- `tools` (object): `ChatToolsConfig` from `@antfly/sdk`, enables agentic tool use
+- `steps` (object): `RetrievalAgentSteps` override for full control of the pipeline
+- `onStreamStart`, `onStreamEnd`, `onError`: lifecycle callbacks
+- `children` (ReactNode): rendered after the built-in messages/input, inside the same chat context
+- plus every prop from [`ChatMessages`](#chatmessages) and [`ChatInput`](#chatinput)
+
+### ChatInput
+
+Renders the message composer. Configure it by passing its props directly on `<ChatBar>`; for a fully custom composer, call [`useChatContext()`](#usechatcontext) yourself instead of rendering `<ChatInput>`.
+
+**Props:**
+- `placeholder` (string): default `"Type a message..."`
+- `renderInput` (function): `({ value, onChange, onSubmit, isStreaming, placeholder, abort }) => ReactNode`
+
+```jsx
+<ChatBar id="chat" generator={generator} placeholder="Ask about the docs…" />
+```
+
+### ChatMessages
+
+Renders the turn log. Configure it via the same-named props on `<ChatBar>`.
+
+**Props:**
+- `showHits`, `showFollowUpQuestions`, `showConfidence` (boolean): visibility toggles, mirroring `AnswerResults`
+- `renderUserMessage` (function): `(message, turn) => ReactNode`
+- `renderAssistantMessage` (function): `(message, isStreaming, turn) => ReactNode`
+- `renderHits` (function): `(hits, turn) => ReactNode`
+- `renderFollowUpQuestions` (function): `(questions, onSelect, turn) => ReactNode`
+- `renderClarification` (function): `(clarification, onRespond, turn) => ReactNode`, for agent clarifying questions
+- `renderConfidence` (function): `(confidence, turn) => ReactNode`
+- `renderStreamingIndicator` (function): `() => ReactNode`
+- `renderError` (function): `(error, turn) => ReactNode`
+
+```jsx
+<ChatBar id="chat" generator={generator} showHits showConfidence />
 ```
 
 ## Citation Utilities
 
-The `@antfly/components` package exports helper functions for parsing and rendering citations in AI-generated answers.
+The `@antfly/components` package exports helper functions for parsing and rendering citations in AI-generated answers. Citations appear in the text as `[resource_id 1, 2]` or the shorthand `[1, 2]`.
 
 **Available Functions:**
 
@@ -597,73 +733,71 @@ import {
 } from '@antfly/components';
 ```
 
-**`parseCitations(text: string)`**
+**`parseCitations(text: string): Citation[]`**
 
-Parses inline citations from the text. Returns an array of `Citation` objects with `docId` and `position` properties.
+Parses inline citations from the text. Each `Citation` is `{ originalText, ids, startIndex, endIndex }`.
 
 ```jsx
-const citations = parseCitations("This is a fact [doc123]. Another fact [doc456].");
-// Returns: [{ docId: 'doc123', position: 17 }, { docId: 'doc456', position: 42 }]
+const citations = parseCitations("The system uses consensus [resource_id 1] and replication [2, 3].");
+// [
+//   { originalText: "[resource_id 1]", ids: ["1"], startIndex: 27, endIndex: 42 },
+//   { originalText: "[2, 3]", ids: ["2", "3"], startIndex: 61, endIndex: 67 }
+// ]
 ```
 
-**`replaceCitations(text: string, replacer: (docId: string) => string)`**
+**`replaceCitations(text: string, options: { renderCitation: (ids, allCitationIds) => string })`**
 
-Replaces citations in text with custom formatting using a replacer function.
+Replaces every citation in the text with the string your `renderCitation` function returns.
 
 ```jsx
 const formatted = replaceCitations(
   "This is a fact [doc123].",
-  (docId) => `<sup><a href="#${docId}">[${docId}]</a></sup>`
+  { renderCitation: (ids) => ids.map((id) => `<sup><a href="#${id}">[${id}]</a></sup>`).join(', ') }
 );
 ```
 
-**`renderAsMarkdownLinks(text: string, hits: QueryHit[])`**
+**`renderAsMarkdownLinks(ids: string[]): string`**
 
-Converts citations to markdown links showing document IDs.
+Renders a citation's IDs as markdown links to `#hit-<id>` anchors. Pair it with `replaceCitations`:
 
 ```jsx
-<RAGResults
-  id="answer"
-  searchBoxId="question"
-  summarizer={summarizer}
-  renderSummary={(summary, isStreaming, hits) => {
-    const withLinks = renderAsMarkdownLinks(summary, hits);
-    return <Streamdown markdown={withLinks} />;
-  }}
-/>
+const withLinks = replaceCitations(answer, {
+  renderCitation: (ids) => renderAsMarkdownLinks(ids),
+});
 ```
 
-**`renderAsSequentialLinks(text: string, hits: QueryHit[])`**
+**`renderAsSequentialLinks(ids: string[], allCitationIds: string[]): string`**
 
-Converts citations to numbered references like `[1]`, `[2]`, etc.
+Same as above, but numbers citations by first-appearance order instead of using the raw IDs:
 
 ```jsx
-const numbered = renderAsSequentialLinks(summary, hits);
-// "This is a fact [1]. Another fact [2]."
+const numbered = replaceCitations(answer, {
+  renderCitation: (ids, allIds) => renderAsSequentialLinks(ids, allIds),
+});
+// "This is a fact [[1]](#hit-doc123). Another fact [[2]](#hit-doc456)."
 ```
 
 **`getCitedDocumentIds(text: string)`** / **`getCitedResourceIds(text: string)`**
 
-Extracts all cited document/resource IDs from the text. Useful for filtering which source documents to display.
+Extract all cited document/resource IDs from the text, in order of first appearance (`getCitedDocumentIds` is a deprecated alias for `getCitedResourceIds`). Useful for filtering which source documents to display.
 
 ```jsx
-<RAGResults
+// renderAnswer's third argument is the hit list used to generate the answer,
+// so no extra wiring is needed to cross-reference citations against sources.
+<AnswerResults
   id="answer"
   searchBoxId="question"
-  summarizer={summarizer}
-  renderSummary={(summary, isStreaming, hits) => {
-    const citedIds = getCitedDocumentIds(summary);
+  generator={generator}
+  renderAnswer={(answer, isStreaming, hits = []) => {
+    const citedIds = getCitedResourceIds(answer);
     const citedHits = hits.filter(hit => citedIds.includes(hit._id));
-
     return (
       <div>
-        <Streamdown markdown={summary} />
+        <Streamdown>{answer}</Streamdown>
         <div className="sources">
           <h4>Sources</h4>
           {citedHits.map(hit => (
-            <div key={hit._id} id={hit._id}>
-              {hit._source.title}
-            </div>
+            <div key={hit._id} id={hit._id}>{hit._source.title}</div>
           ))}
         </div>
       </div>
@@ -674,32 +808,31 @@ Extracts all cited document/resource IDs from the text. Useful for filtering whi
 
 **Advanced: Custom Citation Click Handlers**
 
-Create interactive citations that scroll to source documents:
+Create interactive citations that scroll to source documents by giving each source card a real `id` and linking to it:
 
 ```jsx
 import Streamdown from 'streamdown';
 import { replaceCitations } from '@antfly/components';
 
-<RAGResults
+<AnswerResults
   id="answer"
   searchBoxId="question"
-  summarizer={summarizer}
-  renderSummary={(summary, isStreaming, hits) => {
-    const withClickableCitations = replaceCitations(summary, (docId) => {
-      const index = hits.findIndex(h => h._id === docId);
-      return `[${index + 1}](javascript:void(0))`;
+  generator={generator}
+  showHits
+  renderAnswer={(answer, isStreaming, hits) => {
+    const withClickableCitations = replaceCitations(answer, {
+      renderCitation: (ids) =>
+        ids
+          .map((id) => {
+            const index = hits.findIndex((h) => h._id === id);
+            return index >= 0 ? `[${index + 1}](#source-${index + 1})` : `[${id}]`;
+          })
+          .join(', '),
     });
 
     return (
       <div>
-        <Streamdown
-          markdown={withClickableCitations}
-          onLinkClick={(href, text) => {
-            const citationNum = parseInt(text.replace(/[\[\]]/g, ''));
-            const element = document.getElementById(`source-${citationNum}`);
-            element?.scrollIntoView({ behavior: 'smooth' });
-          }}
-        />
+        <Streamdown>{withClickableCitations}</Streamdown>
         <div className="sources">
           {hits.map((hit, idx) => (
             <div key={hit._id} id={`source-${idx + 1}`}>
@@ -715,7 +848,7 @@ import { replaceCitations } from '@antfly/components';
 
 ## Hooks
 
-React Antfly provides React hooks for common search and RAG functionality.
+React Antfly provides React hooks for common search, chat, and AI-answer functionality.
 
 ### useSearchHistory
 
@@ -725,14 +858,15 @@ Manage search history with localStorage persistence.
 import { useSearchHistory } from '@antfly/components';
 
 function MyComponent() {
-  const { history, isReady, saveSearch, clearHistory } = useSearchHistory(10);
+  const { history, isReady, upsertSearch, clearHistory } = useSearchHistory(10);
 
-  // Save a search result
-  saveSearch({
+  // Save a search result (upserts by id)
+  upsertSearch({
+    id: "search-123",
     query: "how does raft work",
     timestamp: Date.now(),
     summary: "Raft is a consensus algorithm...",
-    hits: [...],
+    hits: [],
     citations: [{ id: "doc1", score: 0.95 }]
   });
 
@@ -742,8 +876,8 @@ function MyComponent() {
   // Display history
   return (
     <ul>
-      {history.results.map((result, idx) => (
-        <li key={idx}>
+      {history.map((result) => (
+        <li key={result.id}>
           <strong>{result.query}</strong>
           <p>{result.summary}</p>
         </li>
@@ -757,14 +891,15 @@ function MyComponent() {
 - `maxResults` (number): Maximum number of search results to store (default: 10, 0 to disable)
 
 **Returns:**
-- `history`: SearchHistory object with results array
-- `isReady`: Boolean indicating if localStorage is loaded
-- `saveSearch`: Function to save a search result
-- `clearHistory`: Function to clear all history
+- `history`: array of `SearchResult` (most recent first)
+- `isReady`: always `true` once mounted (history loads synchronously from localStorage)
+- `upsertSearch`: insert or update a result by `id`
+- `saveSearch`: alias for `upsertSearch`
+- `clearHistory`: clear all history
 
 ### useAnswerStream
 
-Stream Retrieval Agent responses with state management. The hook name is kept for component API compatibility.
+Stream Retrieval Agent responses with state management, independent of the `<QueryBox>`/`<AnswerResults>` widget wiring. This is what `<AnswerResults>` uses internally.
 
 ```jsx
 import { useAnswerStream } from '@antfly/components';
@@ -822,16 +957,49 @@ function MyComponent() {
 ```
 
 **Returns:**
-- `answer`: Current answer text (streaming)
-- `reasoning`: Reasoning text (if enabled)
-- `classification`: Query classification data
-- `hits`: Search result hits
-- `followUpQuestions`: Array of follow-up question strings
-- `isStreaming`: Boolean streaming status
-- `error`: Error object if any
-- `startStream`: Function to start streaming `({ url, request, headers })`
-- `stopStream`: Function to stop current stream
-- `reset`: Function to reset all state
+- `answer`, `reasoning`: streaming text
+- `classification`: query classification data
+- `hits`: search result hits
+- `followUpQuestions`: array of follow-up question strings
+- `isStreaming`: boolean streaming status
+- `error`: `Error` object if any
+- `startStream`: `({ url, request, headers }) => Promise<void>`
+- `stopStream`: abort the current stream
+- `reset`: reset all state
+
+### useChatStream
+
+The lower-level, multi-turn hook behind `<ChatBar>`. It manages its own `turns` array and streaming state, so it works outside `<Antfly>` entirely.
+
+```jsx
+import { useChatStream } from '@antfly/components';
+
+function MyChat() {
+  const { turns, isStreaming, sendMessage, abort, reset } = useChatStream();
+
+  const ask = (text) =>
+    sendMessage(text, {
+      url: 'http://127.0.0.1:8080/db/v1',
+      table: 'docs',
+      generator: { provider: 'ollama', model: 'gemma3:4b' },
+    });
+
+  return (
+    <div>
+      {turns.map((turn) => (
+        <p key={turn.id}>{turn.assistantMessage}</p>
+      ))}
+    </div>
+  );
+}
+```
+
+**Returns:**
+- `turns`: array of `ChatTurn` (`userMessage`, `assistantMessage`, `hits`, `followUpQuestions`, `classification`, `confidence`, `clarification`, `steps`, `error`, `isStreaming`, ...)
+- `isStreaming`: whether any turn is currently streaming
+- `sendMessage`: `(text, config: ChatConfig) => Promise<void>`
+- `abort`: abort the current stream
+- `reset`: clear all turns
 
 ### useCitations
 
@@ -857,24 +1025,44 @@ function MyComponent() {
   const citedHits = hits.filter(hit => citedIds.includes(hit._id));
 
   // Render with sequential numbering
-  const formatted = renderAsSequential(answer, hits);
+  const formatted = renderAsSequential(['1', '2'], citedIds);
 
   return <div>{formatted}</div>;
 }
 ```
 
 **Returns:**
-- `parseCitations`: Parse citation objects from text
-- `highlightCitations`: Highlight citations in text
-- `extractCitationUrls`: Extract cited document/resource IDs
-- `renderAsMarkdown`: Convert citations to markdown links
-- `renderAsSequential`: Convert to sequential numbers [1], [2], etc.
+- `parseCitations`: parse citation objects from text
+- `highlightCitations`: `(text, options: CitationRenderOptions) => string`
+- `extractCitationUrls`: extract cited document/resource IDs
+- `renderAsMarkdown`: `(ids) => string`, markdown links from raw IDs
+- `renderAsSequential`: `(ids, allCitationIds) => string`, markdown links numbered by first appearance
+
+### useSharedContext
+
+The low-level hook powering every widget: returns the `[state, dispatch]` tuple from the `<Antfly>` provider. Throws if called outside `<Antfly>`. This is what [`CustomWidget`](#customwidget) wraps.
+
+```jsx
+const [{ url, table, widgets }, dispatch] = useSharedContext();
+```
+
+### useAnswerResultsContext
+
+Returns the live `AnswerResultsContextValue` (`query`, `answer`, `reasoning`, `hits`, `classification`, `confidence`, `followUpQuestions`, `isStreaming`, `result`, `evalResult`) for a component rendered inside `<AnswerResults>`. This is how `<AnswerFeedback>` reads the current answer; call it directly to build custom feedback or citation UI.
+
+### useAutosuggestContext
+
+Returns the `AutosuggestContextValue` (`query`, `results`, `facetData`, `selectedIndex`, `handleSelect`, `isLoading`, `registerItem`, `unregisterItem`, `fields`) for a component rendered inside composable `<Autosuggest>` children. This is what `<AutosuggestResults>` and `<AutosuggestFacets>` use internally.
+
+### useChatContext
+
+Returns the `ChatContextValue` (`turns`, `isStreaming`, `sendMessage`, `sendFollowUp`, `respondToClarification`, `abort`, `reset`, `config`) for a component rendered inside `<ChatBar>`. This is what `<ChatInput>` and `<ChatMessages>` use internally.
 
 ## Advanced Features
 
-### Streamdown.ai Integration for RAG
+### Streamdown.ai Integration
 
-For production-quality RAG applications with markdown rendering, we recommend integrating **[streamdown.ai](https://streamdown.ai)**, which provides streaming-aware markdown rendering optimized for AI-generated content.
+For production-quality answer and chat UIs with markdown rendering, we recommend integrating **[streamdown.ai](https://streamdown.ai)**, which provides streaming-aware markdown rendering optimized for AI-generated content.
 
 **Installation:**
 
@@ -888,15 +1076,15 @@ yarn add streamdown
 
 ```jsx
 import React from 'react';
-import { QueryBox, RAGResults, replaceCitations } from '@antfly/components';
+import { QueryBox, AnswerResults, replaceCitations } from '@antfly/components';
 import Streamdown from 'streamdown';
 
-const summarizer = {
+const generator = {
   provider: "ollama",
   model: "gemma3:4b"
 };
 
-const RAGWithStreamdown = () => {
+const AnswerWithStreamdown = () => {
   return (
     <div>
       <QueryBox
@@ -905,34 +1093,30 @@ const RAGWithStreamdown = () => {
         placeholder="Ask a question..."
       />
 
-      <RAGResults
+      <AnswerResults
         id="answer"
         searchBoxId="question"
-        summarizer={summarizer}
-        systemPrompt="You are a helpful assistant. Cite sources using [doc_id] format."
+        generator={generator}
+        systemPrompt="You are a helpful assistant. Cite sources using [resource_id] format."
         fields={["content", "title"]}
         semanticIndexes={["embeddings"]}
-        renderSummary={(summary, isStreaming, hits) => {
+        showHits
+        renderAnswer={(answer, isStreaming, hits) => {
           // Convert citations to clickable numbered links
-          const withClickableCitations = replaceCitations(summary, (docId) => {
-            const index = hits.findIndex(h => h._id === docId);
-            return index >= 0 ? `[${index + 1}](javascript:void(0))` : `[${docId}]`;
+          const withClickableCitations = replaceCitations(answer, {
+            renderCitation: (ids) =>
+              ids
+                .map((id) => {
+                  const index = hits.findIndex((h) => h._id === id);
+                  return index >= 0 ? `[${index + 1}](#source-${index + 1})` : `[${id}]`;
+                })
+                .join(', '),
           });
 
           return (
-            <div className="rag-answer">
+            <div className="answer">
               {/* Render markdown with streaming support */}
-              <Streamdown
-                markdown={withClickableCitations}
-                onLinkClick={(href, text) => {
-                  // Handle citation clicks
-                  const citationNum = parseInt(text.replace(/[\[\]]/g, ''));
-                  if (!isNaN(citationNum)) {
-                    const element = document.getElementById(`source-${citationNum}`);
-                    element?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                  }
-                }}
-              />
+              <Streamdown>{withClickableCitations}</Streamdown>
 
               {isStreaming && (
                 <span className="streaming-indicator">Generating...</span>
@@ -961,7 +1145,7 @@ const RAGWithStreamdown = () => {
   );
 };
 
-export default RAGWithStreamdown;
+export default AnswerWithStreamdown;
 ```
 
 **Why Streamdown?**
@@ -969,7 +1153,6 @@ export default RAGWithStreamdown;
 - **Streaming-aware**: Renders markdown smoothly as tokens arrive
 - **Syntax highlighting**: Built-in code block highlighting
 - **Customizable**: Full control over styling and components
-- **Lightweight**: Small bundle size with tree-shaking support
 - **Production-ready**: Battle-tested in production RAG applications
 
 ### URL State Management
@@ -988,7 +1171,7 @@ const MyApp = () => {
 
   return (
     <Antfly
-      url="http://127.0.0.1:8080"
+      url="http://127.0.0.1:8080/db/v1"
       table="data"
       onChange={(values) => {
         const qs = toUrlQueryString(values);
@@ -1003,6 +1186,7 @@ const MyApp = () => {
       />
       <Results
         id="results"
+        searchBoxId="main"
         initialPage={initialValues.get("resultsPage")}
         items={/* ... */}
       />
@@ -1013,7 +1197,7 @@ const MyApp = () => {
 
 ### Custom Queries
 
-Implement custom query logic for complex search requirements:
+Implement custom query logic for complex search requirements. `customQuery` is a prop on `<Results>` and `<Autosuggest>`, not on `<QueryBox>`:
 
 ```jsx
 const customQuery = (query, fields) => {
@@ -1031,19 +1215,24 @@ const customQuery = (query, fields) => {
   };
 };
 
-<QueryBox
-  id="custom"
+<Autosuggest
+  fields={["title", "content"]}
   customQuery={customQuery}
 />
 ```
 
 ## Styling
 
-React Antfly components come unstyled, giving you complete control over the appearance. Apply your own CSS classes or use CSS-in-JS solutions:
+`@antfly/components` ships a baseline stylesheet at `@antfly/components/styles` (`dist/components.css`). It's not purely cosmetic: it also carries layout-critical CSS such as autosuggest dropdown positioning, pagination and facet list layout, and chat message spacing. Import it once and then override with your own CSS — every element carries a stable `react-af-*` class name (e.g. `react-af-results`, `react-af-autosuggest-dropdown`, `react-af-chat-messages`) you can target:
+
+```jsx
+import '@antfly/components/styles';
+```
 
 ```jsx
 <Results
   id="results"
+  searchBoxId="search"
   className="my-results-container"
   items={(data) =>
     data.map(({ _source, _id }) => (
@@ -1063,10 +1252,10 @@ React Antfly includes TypeScript definitions. Import types as needed:
 import {
   Antfly,
   QueryBox,
-  FacetProps,
-  ResultsProps,
-  RAGResultsProps,
-  AnswerResultsProps
+  type FacetProps,
+  type ResultsProps,
+  type AnswerResultsProps,
+  type ChatBarProps
 } from '@antfly/components';
 
 const MyFacet: React.FC<Partial<FacetProps>> = (props) => {
@@ -1091,7 +1280,7 @@ import {
 
 const MovieSearch = () => {
   return (
-    <Antfly url="http://127.0.0.1:8080" table="movies">
+    <Antfly url="http://127.0.0.1:8080/db/v1" table="movies">
       <div className="search-container">
         <header>
           <QueryBox id="search" mode="live" placeholder="Search movies...">
@@ -1124,10 +1313,11 @@ const MovieSearch = () => {
           </aside>
 
           <main className="results">
-            <ActiveFilters id="active" />
+            <ActiveFilters />
             <Results
               id="results"
-              size={20}
+              searchBoxId="search"
+              itemsPerPage={20}
               items={(data) =>
                 data.map(({ _source: movie, _id }) => (
                   <div key={_id} className="movie-card">
@@ -1167,14 +1357,14 @@ export default MovieSearch;
 
 ## Browser Support
 
-React Antfly supports all modern browsers and has a small bundle size (35.32KB gzipped) with compatibility for browsers with >0.03% usage.
+React Antfly supports all modern browsers, targeting browsers with >0.03% global usage share.
 
 ## Resources
 
 - [GitHub Repository](https://github.com/antflydb/antfly/tree/main/ts/packages/components)
 - [NPM Package](https://www.npmjs.com/package/@antfly/components)
 - [Storybook Examples](https://github.com/antflydb/antfly/tree/main/ts/packages/components#develop)
-- [Streamdown.ai](https://streamdown.ai) - Recommended markdown renderer for RAG
+- [Streamdown.ai](https://streamdown.ai) - Recommended markdown renderer for AI answers and chat
 
 ## License
 

@@ -1,6 +1,6 @@
 # Durable native backup seals
 
-## Hidden restore owners and HA continuity
+## Hidden restore owners and hot standby continuity
 
 Restore placement travels through a node-scoped private provisioning snapshot,
 not the public table catalog. Each hidden owner is authorized by the immutable
@@ -9,9 +9,9 @@ artifact checksum. Physical indexes are initialized while the owner is empty;
 imports maintain those indexes without starting enrichment or resolver producers.
 Validation drains bounded derived-index replay before recording readiness.
 
-HA seeds include hidden native roots and a separate private provisioning
+hot standby seeds include hidden native roots and a separate private provisioning
 sidecar. Hidden descriptors never enter the seed's public routing catalog.
-Owners created after a seed are introduced by an authenticated HA begin record
+Owners created after a seed are introduced by an authenticated hot standby begin record
 containing the immutable bootstrap descriptor. That descriptor is persisted in
 the native owner, so subsequent replay can reopen it after cache eviction or
 process restart without relying on public metadata visibility.
@@ -22,20 +22,20 @@ represent an empty public catalog, including a first restore whose owners are
 all still hidden. Catalog-only legacy seeds do not gain that allowance.
 
 Scoped Raft import/control commits and final two-phase constraint effects retain
-transactional HA outbox obligations, including with asynchronous mirroring.
+transactional hot standby outbox obligations, including with asynchronous mirroring.
 Retry deduplicates already appended records before clearing the obligation.
 Final constraint effects retain their scope and encode private binary metadata
 as byte arrays; the standby validates owner range and active constraint
 generation before applying them. Derived indexes are rebuilt from the original
 import payload, avoiding a second unscoped derived-effects stream.
 
-Canceled HA owners retain a compact, durable terminal identity rather than a
+Canceled hot standby owners retain a compact, durable terminal identity rather than a
 native database forever. Before acknowledging cancellation, the receiver
 journals the existing replica-retirement work; recovery rechecks the exact
 terminal scope and native owner identity, and live Raft placement still wins.
 The cleanup lane drains both read-cache and resident writer leases before
 retiring the root. A restart after acknowledgement but before cleanup resumes
-from that journal without recreating a canceled owner from an older HA record.
+from that journal without recreating a canceled owner from an older hot standby record.
 Standalone cancellation uses the same cleanup lane, with the immutable
 owner-to-job reservation and retained canceled metadata progress as authority.
 Its retirement intent is durable before `finish_cancel`, closing the crash
@@ -47,7 +47,7 @@ owner. Standalone skips owners whose cancellation receipts are already durable;
 distributed owners retain placement until cohort cancellation completes.
 
 Terminal proof reclamation uses a durable applied-prefix admission floor, not
-WAL retention estimates. After contiguous HA apply progress is committed, the
+WAL retention estimates. After contiguous hot standby apply progress is committed, the
 runtime persists the floor before deleting any proof. Each bounded GC slice
 checks at most four owners and requires exact native-root/registry retirement;
 held writer leases keep their proof. An indexed, persistent cursor resumes work
@@ -73,7 +73,7 @@ terminal cleanup uses the generation lifecycle's durable reclamation path.
 
 Every replica advances its own bounded CHECK/index catch-up before applying a
 committed restore validation control. Local lag is retryable apply work, never
-a deterministic command rejection: the Raft/HA receipt stays at the preceding
+a deterministic command rejection: the Raft/hot standby receipt stays at the preceding
 entry and reads remain fenced. This also covers a restart after primary import
 and its receipt became durable but before the physical projection watermark
 did, without relying on optional workers or an RPC addressed to the follower.

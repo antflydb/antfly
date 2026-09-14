@@ -14,7 +14,7 @@ const registry = @import("../storage/db/schema_registry.zig");
 const codec = @import("../storage/db/algebraic/relational_row_codec.zig");
 const tuples = @import("../storage/db/relational_index_keys.zig");
 const native = @import("../storage/relational_index.zig");
-pub const storage = @import("../storage/db/relational_integrity.zig");
+pub const storage = @import("../storage/db/relational_integrity_contract.zig");
 const Allocator = std.mem.Allocator;
 
 pub const UniqueBinding = struct {

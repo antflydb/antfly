@@ -3254,6 +3254,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         namespace: backend_types.Namespace,
         mutable_snapshot: *const State,
         owns_mutable_snapshot: bool = false,
+        owns_snapshot: bool = true,
         read_view: RunReadView,
         immutable_memtables: []const *const State = &.{},
         runs: []Run = &.{},
@@ -3339,8 +3340,35 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             };
         }
 
+        /// The erased read handle retains the parent snapshot until all forks
+        /// and their cursors close. Only immutable metadata is shared here.
+        pub fn forkBorrowedRead(self: *@This()) !@This() {
+            // Do not copy mutable read scratch even transiently: the source
+            // handle may be serving a read while another worker forks it.
+            return .{
+                .allocator = self.allocator,
+                .metadata_allocator = self.metadata_allocator,
+                .backend = self.backend,
+                .namespace = self.namespace,
+                .mutable_snapshot = self.mutable_snapshot,
+                .owns_mutable_snapshot = self.owns_mutable_snapshot,
+                .owns_snapshot = false,
+                .read_view = self.read_view,
+                .immutable_memtables = self.immutable_memtables,
+                .runs = self.runs,
+                .l0_groups = self.l0_groups,
+                .levels = self.levels,
+            };
+        }
+
         pub fn abort(self: *@This()) void {
             const backend = self.backend;
+            if (!self.owns_snapshot) {
+                releaseHeldBlocks(&self.held_blocks, backend.allocator);
+                releaseHeldValues(&self.held_values, self.allocator);
+                self.* = undefined;
+                return;
+            }
             if (self.owns_mutable_snapshot) {
                 var owned = @constCast(self.mutable_snapshot);
                 owned.deinit(self.allocator);
@@ -4583,6 +4611,57 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             return self.backend.getMergedWithOverlay(&self.backend.mutable, &self.mutable, self.namespace, key);
         }
 
+        pub fn containsManySorted(self: *@This(), keys: []const []const u8, present: []bool) !void {
+            if (self.closed) return error.TransactionClosed;
+            if (keys.len != present.len or !keysAreSorted(keys)) return error.InvalidBatch;
+            @memset(present, false);
+            self.backend.recordGetManySorted(keys.len);
+            self.backend.recordGetManySortedLocality(keys);
+            var offset: usize = 0;
+            while (offset < keys.len) {
+                const end = @min(keys.len, offset + 256);
+                // Pin the exact epoch under the lock, then perform directory
+                // and SST reads unlocked: their index-cache access takes the
+                // backend lock itself. All borrowed sources outlive this page.
+                var layout = blk: {
+                    const locked = lockBackend(BackendType, self.backend);
+                    defer unlockBackend(BackendType, self.backend, locked);
+                    break :blk try CurrentReadLayout(BackendType).init(self.backend, self.allocator);
+                };
+                defer layout.deinitAfterUnlockedRead();
+                var blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+                defer releaseHeldBlocks(&blocks, self.backend.allocator);
+                var values = std.ArrayListUnmanaged([]u8).empty;
+                defer {
+                    for (values.items) |value| self.allocator.free(value);
+                    values.deinit(self.allocator);
+                }
+                var group: ?usize = null;
+                var hint: ?BorrowedReadHint = null;
+                for (keys[offset..end], present[offset..end]) |key, *exists| {
+                    var bulk = self.bulk_appends.entries.items.len;
+                    while (bulk != 0) {
+                        bulk -= 1;
+                        const entry = self.bulk_appends.entries.items[bulk];
+                        if (compareEntryTo(entry, self.namespace, key) == .eq) {
+                            exists.* = !entry.tombstone;
+                            break;
+                        }
+                    } else {
+                        if (self.mutable.findIndex(self.namespace, key)) |i| {
+                            exists.* = !self.mutable.entryAt(i).tombstone;
+                            continue;
+                        }
+                        exists.* = if (getFromReadView(self.backend, layout.mutable_snapshot.?.state, layout.immutable_memtables, layout.read_view, &group, &hint, &blocks, &values, self.allocator, self.namespace, key)) |_| true else |err| switch (err) {
+                            error.NotFound => false,
+                            else => return err,
+                        };
+                    }
+                }
+                offset = end;
+            }
+        }
+
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
             if (self.closed) return error.TransactionClosed;
             if (keys.len != values.len) return error.InvalidBatch;
@@ -4974,6 +5053,7 @@ fn borrowRunSnapshotList(comptime BackendType: type, backend: *BackendType, allo
     var initialized: usize = 0;
     errdefer {
         for (runs[0..initialized]) |*run| {
+            if (run.releaseMemory()) continue;
             if (@hasDecl(BackendType, "releaseRunSnapshotRef")) {
                 backend.releaseRunSnapshotRef(run);
             }
@@ -4989,6 +5069,7 @@ fn borrowRunSnapshotList(comptime BackendType: type, backend: *BackendType, allo
         runs[i] = try repository_mod.cloneRunCompactionSnapshot(allocator, run);
         runs[i].shared_read_version = true;
         initialized = i + 1;
+        if (runs[i].shared_memory != null) continue;
         if (@hasDecl(BackendType, "retainRunSnapshotRef")) {
             try backend.retainRunSnapshotRef(&runs[i]);
         }
@@ -4998,6 +5079,7 @@ fn borrowRunSnapshotList(comptime BackendType: type, backend: *BackendType, allo
 
 fn freeRunSnapshotList(comptime BackendType: type, backend: *BackendType, allocator: Allocator, runs: []Run) void {
     for (runs) |*run| {
+        if (run.releaseMemory()) continue;
         if (@hasDecl(BackendType, "releaseRunSnapshotRef")) {
             backend.releaseRunSnapshotRef(run);
         }
@@ -8286,6 +8368,39 @@ test "lsm bounded merge cursor spills inactive persisted block" {
     try std.testing.expectEqual(@as(?usize, null), cursor.source_block_indices[run_source]);
     try std.testing.expectEqualStrings("replay:1", cursor.source_key_copies[run_source].?);
     try std.testing.expectEqual(@as(usize, 0), cursor.source_entries[run_source].?.value.len);
+}
+
+test "graph metric batch presence uses directory backed runs without a flat projection" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    // No block cache: indexForRunNoCache must acquire its own backend lock.
+    // The existence probe must not hold that lock across directory/SST I/O.
+    var backend = try Backend.open(allocator, "/graph-directory-presence", .{ .storage = storage.storage(), .flush_threshold = 1 });
+    defer backend.close();
+    var store = try backend.runtimeStore(allocator, .{ .name = "graph" });
+    defer store.deinit();
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("persisted", "node");
+        try write.commit();
+    }
+    while (try backend.runMaintenanceStep()) {}
+    try std.testing.expect(run_store.count(&backend) != 0);
+    var batch = try store.beginBatch();
+    defer batch.abort();
+    var present: [2]bool = undefined;
+    try batch.containsManySorted(&.{ "missing", "persisted" }, &present);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, &present);
+    const version = backend.read_version orelse return error.MissingReadVersion;
+    try std.testing.expect(version.directory != null);
+    try std.testing.expectEqual(@as(usize, 0), version.runs.len);
+    try batch.delete("persisted");
+    try batch.put("missing", "new node");
+    try batch.containsManySorted(&.{ "missing", "persisted" }, &present);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &present);
 }
 
 test "lsm async batch reads tree backed mutable and immutable snapshots" {

@@ -24,39 +24,18 @@ const rows = @import("relational_rows.zig");
 const ranges = @import("range_state.zig");
 const transactions = @import("../transactions.zig");
 const Allocator = std.mem.Allocator;
-pub const key = "\x00\x00__metadata__:relational_integrity_activation";
-const header_len = 88;
-const max_cursor_bytes = 1024 * 1024;
+pub const key = @import("relational_integrity_activation_contract.zig").key;
+const header_len = @import("relational_integrity_activation_contract.zig").header_len;
+const max_cursor_bytes = @import("relational_integrity_activation_contract.zig").max_cursor_bytes;
 const full_range = [_]u8{0} ** 8;
 
-fn digest(bytes: []const u8) integrity.Digest {
-    var result: integrity.Digest = undefined;
-    std.crypto.hash.Blake3.hash(bytes, &result, .{});
-    return result;
-}
+const digest = @import("relational_integrity_activation_contract.zig").digest;
 
-pub fn generationSet(catalog: catalog_mod.Catalog) integrity.Digest {
-    var state = std.crypto.hash.Blake3.init(.{});
-    state.update("antfly active constraint coverage v1");
-    state.update(&catalog.incarnation);
-    for (catalog.bindings) |binding| if (!binding.retired) {
-        state.update(&binding.generation);
-        state.update(&binding.definition.fingerprint);
-    };
-    var result: integrity.Digest = undefined;
-    state.final(&result);
-    return result;
-}
+pub const generationSet = @import("relational_integrity_activation_contract.zig").generationSet;
 
-pub fn hasActive(catalog: catalog_mod.Catalog) bool {
-    for (catalog.bindings) |binding| if (!binding.retired) return true;
-    return false;
-}
+pub const hasActive = @import("relational_integrity_activation_contract.zig").hasActive;
 
-fn hasKind(catalog: catalog_mod.Catalog, kind: catalog_mod.Kind) bool {
-    for (catalog.bindings) |binding| if (!binding.retired and binding.definition.kind == kind) return true;
-    return false;
-}
+const hasKind = @import("relational_integrity_activation_contract.zig").hasKind;
 
 fn optional(txn: anytype, physical_key: []const u8) !?[]const u8 {
     return txn.get(physical_key) catch |err| {
@@ -82,79 +61,9 @@ pub fn routingKey(alloc: Allocator, txn: anytype) ![]const u8 {
     return range.start;
 }
 
-pub const State = enum(u8) { validating = 0, enforced = 1, invalid = 2 };
-pub const Phase = enum(u8) { unique = 0, foreign_key = 1 };
-pub const Progress = struct {
-    generation_set: integrity.Digest,
-    owner: integrity.Digest,
-    schema_version: u32,
-    state: State = .validating,
-    phase: Phase = .unique,
-    rows_scanned: u64 = 0,
-    /// Physical primary-namespace continuation includes skipped auxiliary
-    /// records, preventing empty projected pages from repeatedly rescanning.
-    cursor: []const u8 = "",
-    failure: []const u8 = "",
-
-    pub fn readyForReferences(self: Progress) bool {
-        return self.state == .enforced or self.phase == .foreign_key;
-    }
-
-    pub fn retry(self: Progress, catalog: catalog_mod.Catalog) !Progress {
-        if (self.state != .invalid) return error.InvalidConstraintActivation;
-        return .{ .generation_set = generationSet(catalog), .owner = self.owner, .schema_version = catalog.schema_version, .phase = if (hasKind(catalog, .unique)) .unique else .foreign_key };
-    }
-
-    pub fn encode(self: Progress, alloc: Allocator) ![]u8 {
-        if (self.cursor.len > max_cursor_bytes or self.failure.len > 4096 or
-            (self.state == .enforced and self.cursor.len != 0) or (self.state != .invalid and self.failure.len != 0)) return error.InvalidConstraintActivation;
-        const out = try alloc.alloc(u8, header_len + self.cursor.len + self.failure.len + 32);
-        @memcpy(out[0..4], "AIA1");
-        @memcpy(out[4..36], &self.generation_set);
-        @memcpy(out[36..68], &self.owner);
-        std.mem.writeInt(u32, out[68..72], self.schema_version, .little);
-        out[72] = @intFromEnum(self.state);
-        out[73] = @intFromEnum(self.phase);
-        @memset(out[74..76], 0);
-        std.mem.writeInt(u64, out[76..84], self.rows_scanned, .little);
-        std.mem.writeInt(u32, out[84..88], @intCast(self.cursor.len), .little);
-        // The bounded footer remainder is the diagnostic; no duplicate size.
-        @memcpy(out[header_len..][0..self.cursor.len], self.cursor);
-        @memcpy(out[header_len + self.cursor.len ..][0..self.failure.len], self.failure);
-        @memcpy(out[out.len - 32 ..], &digest(out[0 .. out.len - 32]));
-        return out;
-    }
-
-    pub fn decode(bytes: []const u8) !Progress {
-        if (bytes.len < header_len + 32 or bytes.len > header_len + max_cursor_bytes + 4096 + 32 or
-            !std.mem.eql(u8, bytes[0..4], "AIA1") or !std.mem.allEqual(u8, bytes[74..76], 0) or bytes[72] > 2 or bytes[73] > 1 or
-            !std.mem.eql(u8, bytes[bytes.len - 32 ..], &digest(bytes[0 .. bytes.len - 32]))) return error.InvalidConstraintActivation;
-        const cursor_len = std.mem.readInt(u32, bytes[84..88], .little);
-        const payload = bytes[header_len .. bytes.len - 32];
-        if (cursor_len > max_cursor_bytes or cursor_len > payload.len or payload.len - cursor_len > 4096) return error.InvalidConstraintActivation;
-        const result: Progress = .{
-            .generation_set = bytes[4..36].*,
-            .owner = bytes[36..68].*,
-            .schema_version = std.mem.readInt(u32, bytes[68..72], .little),
-            .state = switch (bytes[72]) {
-                0 => .validating,
-                1 => .enforced,
-                2 => .invalid,
-                else => unreachable,
-            },
-            .phase = if (bytes[73] == 0) .unique else .foreign_key,
-            .rows_scanned = std.mem.readInt(u64, bytes[76..84], .little),
-            .cursor = payload[0..cursor_len],
-            .failure = payload[cursor_len..],
-        };
-        if ((result.state == .enforced and result.cursor.len != 0) or (result.state != .invalid and result.failure.len != 0)) return error.InvalidConstraintActivation;
-        return result;
-    }
-
-    pub fn matches(self: Progress, catalog: catalog_mod.Catalog, owner: integrity.Digest) bool {
-        return std.mem.eql(u8, &self.generation_set, &generationSet(catalog)) and std.mem.eql(u8, &self.owner, &owner);
-    }
-};
+pub const State = @import("relational_integrity_activation_contract.zig").State;
+pub const Phase = @import("relational_integrity_activation_contract.zig").Phase;
+pub const Progress = @import("relational_integrity_activation_contract.zig").Progress;
 
 pub fn status(txn: anytype, catalog: catalog_mod.Catalog) !Progress {
     const owner = try ownership(txn);
@@ -202,15 +111,7 @@ pub fn repairPredicate(alloc: Allocator, txn: anytype, catalog: catalog_mod.Cata
     return .{ .key = key, .comparison = .exact_value, .expected_value = try alloc.dupe(u8, current) };
 }
 
-pub const Command = struct {
-    routing_key: []const u8,
-    expected: ?[]const u8,
-    next: []const u8,
-    retry: bool = false,
-    pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
-        try @import("relational_integrity_json.zig").write(self, jw);
-    }
-};
+pub const Command = @import("relational_integrity_activation_contract.zig").Command;
 
 pub const Prepared = struct { intent: transactions.WriteIntent, predicate: transactions.VersionPredicate };
 

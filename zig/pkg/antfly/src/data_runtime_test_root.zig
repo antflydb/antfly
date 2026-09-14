@@ -16,9 +16,7 @@ const runtime = @import("data/runtime.zig");
 const raft_batch = @import("data/raft_batch.zig");
 const runtime_status = @import("api/runtime_status.zig");
 const indexes = @import("api/indexes.zig");
-const table_writes = @import("api/table_writes.zig");
-const enrichment_runtime = @import("storage/db/enrichment/enrichment_runtime.zig");
-const restore_terminal_ledger = @import("storage/ha/restore_terminal_ledger.zig");
+const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const private_provisioning = @import("data/private_provisioning.zig");
 
 // The auth storage adapter deliberately receives storage through an injected
@@ -33,7 +31,12 @@ test {
     _ = runtime_status;
     _ = indexes;
     _ = table_writes;
-    _ = enrichment_runtime;
-    _ = restore_terminal_ledger;
     _ = private_provisioning;
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_control.zig");
+
+pub const consumer_tests_only = true;
+
+pub const linked_owner_fixture = @import("api/linked_owner_test_fixture.zig");

@@ -1134,6 +1134,7 @@ pub const RuntimeIndexStatusReport = struct {
     doc_count: u64 = 0,
     term_count: u64 = 0,
     edge_count: u64 = 0,
+    graph_counts_pending: bool = false,
     node_count: u64 = 0,
     root_node: u64 = 0,
     /// Exact physical artifact cardinality for the reported incarnation.
@@ -2175,16 +2176,7 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
 }
 
 pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
-    alloc.free(record.relational_retirement_json);
-    alloc.free(record.name);
-    alloc.free(record.description);
-    alloc.free(record.schema_json);
-    alloc.free(record.read_schema_json);
-    alloc.free(record.indexes_json);
-    alloc.free(record.replication_sources_json);
-    alloc.free(record.placement_role);
-    alloc.free(record.restore_backup_id);
-    alloc.free(record.restore_location);
+    @import("restore_provisioning_contract.zig").freeTable(alloc, record);
 }
 
 pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
@@ -2283,15 +2275,7 @@ fn rangeMatchesTransitionIdentity(
 }
 
 pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
-    alloc.free(record.start_key);
-    freeOwnedOptional(alloc, record.end_key);
-    alloc.free(record.restore_backup_id);
-    alloc.free(record.restore_artifact_backup_id);
-    alloc.free(record.restore_location);
-    alloc.free(record.restore_snapshot_path);
-    alloc.free(record.restore_connection);
-    alloc.free(record.restore_artifact_sha256);
-    alloc.free(record.restore_native_manifest_sha256);
+    @import("restore_provisioning_contract.zig").freeRange(alloc, record);
 }
 
 test "routing clones exclude operational and schema payloads" {
@@ -2706,6 +2690,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .doc_count = record.doc_count,
         .term_count = record.term_count,
         .edge_count = record.edge_count,
+        .graph_counts_pending = record.graph_counts_pending,
         .node_count = record.node_count,
         .root_node = record.root_node,
         .publication_target_count = record.publication_target_count,
