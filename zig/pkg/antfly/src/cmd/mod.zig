@@ -13,7 +13,6 @@
 // limitations.
 
 pub const data = @import("data.zig");
-pub const graph_metric_maintenance = @import("graph_metric_maintenance.zig");
 pub const metadata = @import("metadata.zig");
 pub const serverless = @import("serverless.zig");
 pub const serverless_api = @import("serverless_api.zig");
@@ -22,13 +21,12 @@ pub const serverless_query = @import("serverless_query.zig");
 pub const serverless_combined = @import("serverless_combined.zig");
 pub const standalone = @import("standalone.zig");
 pub const inference = @import("inference.zig");
-pub const ha = @import("ha.zig");
+pub const standby = @import("standby.zig");
 pub const cli = @import("cli/mod.zig");
 pub const lite = @import("lite.zig");
 
 test "cmd module compiles" {
     _ = data;
-    _ = graph_metric_maintenance;
     _ = metadata;
     _ = serverless;
     _ = serverless_api;
@@ -37,7 +35,7 @@ test "cmd module compiles" {
     _ = serverless_combined;
     _ = standalone;
     _ = inference;
-    _ = ha;
+    _ = standby;
     _ = cli;
     _ = lite;
 }

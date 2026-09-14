@@ -137,9 +137,9 @@ pub fn addTests(b: *std.Build, options: struct {
     };
 }
 
-/// Python owns these POSIX process groups and signals. Compile foreign fixtures,
-/// but leave emulation of ordinary unit tests to std.Build.addRunArtifact.
-pub fn addNativeProcessTest(b: *std.Build, fixture: *std.Build.Step.Compile, script: std.Build.LazyPath) *std.Build.Step {
+/// Fixtures that spawn target executables directly require a native executor.
+/// Ordinary unit tests retain std.Build.addRunArtifact emulator support.
+pub fn canRunNativeProcess(b: *std.Build, fixture: *std.Build.Step.Compile) bool {
     const target = fixture.root_module.resolved_target.?.result;
     // Static libc does not require the target's dynamic linker to be installed
     // on the host. Zig defaults musl executables to static linkage.
@@ -153,7 +153,11 @@ pub fn addNativeProcessTest(b: *std.Build, fixture: *std.Build.Step.Compile, scr
         .allow_wasmtime = false,
         .allow_darling = false,
     });
-    if (executor == .native) {
+    return executor == .native;
+}
+
+pub fn addNativeProcessTest(b: *std.Build, fixture: *std.Build.Step.Compile, script: std.Build.LazyPath) *std.Build.Step {
+    if (canRunNativeProcess(b, fixture)) {
         const run = b.addSystemCommand(&.{"python3"});
         run.addFileArg(script);
         run.addArtifactArg(fixture);

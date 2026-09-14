@@ -681,6 +681,7 @@ pub const TableBackupConflictError = types.TableBackupConflictError;
 pub const TableBackupStatus = types.TableBackupStatus;
 pub const TableCatalogChangedConflict = types.TableCatalogChangedConflict;
 pub const TableMigration = types.TableMigration;
+pub const TableRepairControlJobStartRequest = types.TableRepairControlJobStartRequest;
 pub const TableRepairIssue = types.TableRepairIssue;
 pub const TableRepairIssueList = types.TableRepairIssueList;
 pub const TableRepairJob = types.TableRepairJob;

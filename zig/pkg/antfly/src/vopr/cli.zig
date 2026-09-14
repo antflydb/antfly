@@ -809,11 +809,11 @@ fn runDebugRecipeKnown(
             .suffix_seed = recorded.config.seed orelse 0,
         },
         .event_queries = &queries,
-        .collect_failure_window = antfly.domain_vopr.kindFromArtifact(recorded) != null,
+        .collect_failure_window = collectorsSupported(recorded),
         .flight = flight_config,
     }, .{
         .execution = execution,
-        .collectors = if (antfly.domain_vopr.kindFromArtifact(recorded) != null)
+        .collectors = if (collectorsSupported(recorded))
             .{ .collect_fn = recipeCollectKnown }
         else
             null,
@@ -844,11 +844,7 @@ fn declarationsKnown(recorded: *const vopr.trace.Trace) []const vopr.property.De
         return antfly.ha_vopr.CliScenario.properties;
     if (std.mem.eql(u8, recorded.header.scenario, HAScaling.name)) return HAScaling.properties;
     if (antfly.domain_vopr.kindFromArtifact(recorded)) |kind| return switch (kind) {
-        .distributed_transaction => antfly.domain_vopr.DistributedTransactionScenario.properties,
-        .data_plane => antfly.domain_vopr.DataPlaneScenario.properties,
-        .derived_workflow => antfly.domain_vopr.DerivedWorkflowScenario.properties,
-        .backup_restore => antfly.domain_vopr.BackupRestoreScenario.properties,
-        .clock_fault => antfly.domain_vopr.ClockLeaseTtlScenario.properties,
+        inline else => |known| known.scenario().properties,
     };
     // The metadata harness declares its operation properties dynamically from
     // trace parameters, so the generic report derives the complete encountered
@@ -1055,6 +1051,10 @@ fn explainCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     });
 }
 
+fn collectorsSupported(recorded: *const vopr.trace.Trace) bool {
+    return if (antfly.domain_vopr.kindFromArtifact(recorded)) |kind| kind.supportsCollectors() else false;
+}
+
 fn collectKnownAt(
     alloc: std.mem.Allocator,
     recorded: *const vopr.trace.Trace,
@@ -1062,12 +1062,9 @@ fn collectKnownAt(
 ) !vopr.collector.Sink {
     const kind = antfly.domain_vopr.kindFromArtifact(recorded) orelse
         return error.ScenarioCollectorsUnsupported;
+    if (!kind.supportsCollectors()) return error.ScenarioCollectorsUnsupported;
     return switch (kind) {
-        .distributed_transaction => vopr.debugger.collectAt(antfly.domain_vopr.DistributedTransactionScenario, alloc, recorded, prefix),
-        .data_plane => vopr.debugger.collectAt(antfly.domain_vopr.DataPlaneScenario, alloc, recorded, prefix),
-        .derived_workflow => vopr.debugger.collectAt(antfly.domain_vopr.DerivedWorkflowScenario, alloc, recorded, prefix),
-        .backup_restore => vopr.debugger.collectAt(antfly.domain_vopr.BackupRestoreScenario, alloc, recorded, prefix),
-        .clock_fault => vopr.debugger.collectAt(antfly.domain_vopr.ClockLeaseTtlScenario, alloc, recorded, prefix),
+        inline else => |known| vopr.debugger.collectAt(known.scenario(), alloc, recorded, prefix),
     };
 }
 
@@ -1666,11 +1663,7 @@ fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
     if (std.mem.eql(u8, recorded.header.scenario, HAScaling.name))
         return "pkg/antfly/src/vopr/fixtures/ha-scaling";
     if (antfly.domain_vopr.kindFromArtifact(recorded)) |kind| return switch (kind) {
-        .distributed_transaction => "pkg/antfly/src/vopr/fixtures/distributed-transaction",
-        .data_plane => "pkg/antfly/src/vopr/fixtures/data-plane",
-        .derived_workflow => "pkg/antfly/src/vopr/fixtures/derived-workflow",
-        .backup_restore => "pkg/antfly/src/vopr/fixtures/backup-restore",
-        .clock_fault => "pkg/antfly/src/vopr/fixtures/clock-fault",
+        inline else => |known| "pkg/antfly/src/vopr/fixtures/" ++ comptime known.cliName(),
     };
     return error.UnsupportedScenario;
 }
@@ -2867,12 +2860,24 @@ test "VOPR scenario registry records and exactly replays every context-free doma
         "derived-workflow",
         "backup-restore",
         "clock-fault",
+        "index-maintenance",
+        "index-ownership",
     };
     for (cases, 0..) |scenario, index| {
         const transitions = try defaultCampaignTransitions(scenario);
         var artifact = try recordCampaignScenario(alloc, scenario, 0xA17F_C000 + index, transitions, 0xA17F_C000);
         defer artifact.deinit();
         try std.testing.expect(artifactMatchesScenario(&artifact, scenario));
+        if (antfly.domain_vopr.kindFromArtifact(&artifact)) |kind| {
+            try std.testing.expectEqual(kind.supportsCollectors(), collectorsSupported(&artifact));
+            if (kind.supportsCollectors()) {
+                for ([_]usize{ 0, artifact.choices.items.len / 2, artifact.choices.items.len }) |prefix| {
+                    var collected = try collectKnownAt(alloc, &artifact, prefix);
+                    defer collected.deinit();
+                    try std.testing.expect(collected.records.items.len > 0);
+                }
+            }
+        }
         try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.property_failures);
         var replayed = try replayKnownScenario(alloc, &artifact);
         replayed.deinit();

@@ -7,7 +7,7 @@ info:
 
     This API is separate from the public `/db/v1` API and from node-to-node
     `/internal/v1` RPCs. Kubernetes operators, automation, and CLIs should use
-    this surface for typed HA control-plane operations.
+    this surface for typed hot-standby control-plane operations.
 servers:
   - url: /admin/v1
     description: Node-local admin API
@@ -17,9 +17,9 @@ tags:
   - name: maintenance
     x-displayName: Storage Maintenance
     description: Engine-neutral asynchronous storage inspection and reclamation.
-  - name: ha
-    x-displayName: High Availability
-    description: Hot-standby HA status and replication-slot management.
+  - name: standby
+    x-displayName: Hot Standby
+    description: Hot-standby status and replication-slot management.
 paths:
   /maintenance/check:
     post:
@@ -113,11 +113,11 @@ paths:
               schema: { $ref: "#/components/schemas/StorageMaintenanceJob" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
-  /ha/primary/status:
+  /standby/primary/status:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: getHAPrimaryStatus
-      summary: Get primary HA status
+      summary: Get primary hot-standby status
       parameters:
         - name: max_lag_lsn
           in: query
@@ -172,7 +172,7 @@ paths:
           schema:
             type: array
             items:
-              $ref: "#/components/schemas/HASlotName"
+              $ref: "#/components/schemas/StandbySlotName"
           style: form
           explode: true
         - name: sync_failure
@@ -188,14 +188,14 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAPrimaryStatusResponse"
+                $ref: "#/components/schemas/StandbyPrimaryStatusResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/watchdog-proof:
+  /standby/watchdog-proof:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: getHAWatchdogProof
       summary: Get the runtime Lease watchdog capability proof
       description: >-
@@ -209,16 +209,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAWatchdogProofResponse"
+                $ref: "#/components/schemas/StandbyWatchdogProofResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/standby/status:
+  /standby/status:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: getHAStandbyStatus
-      summary: Get standby HA status
+      summary: Get standby status
       parameters:
         - name: upstream_lsn
           in: query
@@ -234,14 +234,14 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAStandbyStatusResponse"
+                $ref: "#/components/schemas/StandbyStatusResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/commit/check:
+  /standby/commit/check:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: checkHACommit
       summary: Evaluate synchronous commit durability for an existing LSN
       requestBody:
@@ -256,16 +256,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommitCheckResponse"
+                $ref: "#/components/schemas/StandbyCommitCheckResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/commit/append:
+  /standby/commit/append:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: appendHACommit
       summary: Append a primary WAL/effects record and evaluate synchronous commit durability
       requestBody:
@@ -280,16 +280,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommitAppendResponse"
+                $ref: "#/components/schemas/StandbyCommitAppendResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/read/check:
+  /standby/read/check:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: checkHARead
       summary: Evaluate standby read freshness and routing
       requestBody:
@@ -304,16 +304,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAReadCheckResponse"
+                $ref: "#/components/schemas/StandbyReadCheckResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/write/check:
+  /standby/write/check:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: checkHAWrite
       summary: Evaluate whether this node can accept writes
       requestBody:
@@ -328,16 +328,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAWriteCheckResponse"
+                $ref: "#/components/schemas/StandbyWriteCheckResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/owner-jobs/check:
+  /standby/owner-jobs/check:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: checkHAOwnerJob
       summary: Evaluate whether an owner-only background job may run
       requestBody:
@@ -352,33 +352,33 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAOwnerJobCheckResponse"
+                $ref: "#/components/schemas/StandbyOwnerJobCheckResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/replication-slots:
+  /standby/replication-slots:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: listHAReplicationSlots
-      summary: List HA replication slots
+      summary: List hot-standby replication slots
       responses:
         "200":
           description: Replication slot list.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAReplicationSlotListResponse"
+                $ref: "#/components/schemas/StandbyReplicationSlotListResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: createHAReplicationSlot
-      summary: Create an HA replication slot
+      summary: Create a hot-standby replication slot
       requestBody:
         required: true
         content:
@@ -391,18 +391,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
+                $ref: "#/components/schemas/StandbyReplicationSlotActionResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/replication-slots/{slot_name}:
+  /standby/replication-slots/{slot_name}:
     delete:
-      tags: [ha]
+      tags: [standby]
       operationId: dropHAReplicationSlot
-      summary: Drop an HA replication slot
+      summary: Drop a hot-standby replication slot
       parameters:
         - $ref: "#/components/parameters/SlotName"
       responses:
@@ -411,18 +411,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
+                $ref: "#/components/schemas/StandbyReplicationSlotActionResponse"
         "404":
           $ref: "#/components/responses/NotFound"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/replication-slots/{slot_name}/pause:
+  /standby/replication-slots/{slot_name}/pause:
     put:
-      tags: [ha]
+      tags: [standby]
       operationId: pauseHAReplicationSlot
-      summary: Pause an HA replication slot
+      summary: Pause a hot-standby replication slot
       parameters:
         - $ref: "#/components/parameters/SlotName"
       responses:
@@ -431,18 +431,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
+                $ref: "#/components/schemas/StandbyReplicationSlotActionResponse"
         "404":
           $ref: "#/components/responses/NotFound"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/replication-slots/{slot_name}/resume:
+  /standby/replication-slots/{slot_name}/resume:
     put:
-      tags: [ha]
+      tags: [standby]
       operationId: resumeHAReplicationSlot
-      summary: Resume an HA replication slot
+      summary: Resume a hot-standby replication slot
       parameters:
         - $ref: "#/components/parameters/SlotName"
       responses:
@@ -451,18 +451,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
+                $ref: "#/components/schemas/StandbyReplicationSlotActionResponse"
         "404":
           $ref: "#/components/responses/NotFound"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/base-backups:
+  /standby/base-backups:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: beginHABaseBackup
-      summary: Begin an HA base backup and reserve its replication slot
+      summary: Begin a hot-standby base backup and reserve its replication slot
       requestBody:
         required: true
         content:
@@ -475,18 +475,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HABaseBackupBeginResponse"
+                $ref: "#/components/schemas/StandbyBaseBackupBeginResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/base-backups/finish:
+  /standby/base-backups/finish:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: finishHABaseBackup
-      summary: Finish an HA base backup from a local manifest path
+      summary: Finish a hot-standby base backup from a local manifest path
       requestBody:
         required: true
         content:
@@ -499,16 +499,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HABaseBackupFinishResponse"
+                $ref: "#/components/schemas/StandbyBaseBackupFinishResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/base-backups/capture:
+  /standby/base-backups/capture:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: captureHASeedArtifact
       summary: Capture an immutable seed from runtime-owned primary storage
       requestBody:
@@ -523,18 +523,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HASeedArtifactCaptureResponse"
+                $ref: "#/components/schemas/StandbySeedArtifactCaptureResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/seed-lifecycle/receipts:
+  /standby/seed-lifecycle/receipts:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: getHASeedLifecycleReceipts
-      summary: Read durable runtime-owned HA seed lifecycle receipts
+      summary: Read durable runtime-owned hot-standby seed lifecycle receipts
       description: |
         Returns an authenticated, read-only cursor page from the runtime-owned
         append-only receipt ledger. `history_truncated` and `gap` make bounded
@@ -571,16 +571,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HASeedLifecycleReceiptInventoryResponse"
+                $ref: "#/components/schemas/StandbySeedLifecycleReceiptInventoryResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
           description: Durable ledger or authoritative retained receipt is corrupt.
-  /ha/base-backups/activate:
+  /standby/base-backups/activate:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: activateHASeededSlot
       summary: Activate a seeded slot after durable target-generation publication
       requestBody:
@@ -595,16 +595,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HASeededSlotActivateResponse"
+                $ref: "#/components/schemas/StandbySeededSlotActivateResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/standby/bootstrap:
+  /standby/bootstrap:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: bootstrapHAStandby
       summary: Bootstrap this standby from a local base-backup manifest and copied files
       requestBody:
@@ -619,18 +619,50 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAStandbyBootstrapResponse"
+                $ref: "#/components/schemas/StandbyBootstrapResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/fence:
+  /standby/upstream:
     post:
-      tags: [ha]
+      tags: [standby]
+      operationId: setHAStandbyUpstream
+      summary: Repoint a running standby at a different primary
+      description: |
+        Atomically replaces the upstream URL and replication slot a running
+        standby pulls from, without restarting the process. The request carries
+        the identity the caller expects the standby to have; the swap is
+        rejected with 409 when the standby's current identity differs, so a
+        stale operator cannot repoint a node that has since been promoted or
+        reseeded. The next replication round pulls from the new upstream. This
+        is the `follow` step of a switchover.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StandbyUpstreamRequest"
+      responses:
+        "200":
+          description: Upstream replaced.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandbyUpstreamResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /standby/fence:
+    post:
+      tags: [standby]
       operationId: acquireHAFence
-      summary: Acquire a durable HA promotion fence
+      summary: Acquire a durable hot-standby promotion fence
       requestBody:
         required: true
         content:
@@ -643,32 +675,32 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAFenceResponse"
+                $ref: "#/components/schemas/StandbyFenceResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/fence/current:
+  /standby/fence/current:
     get:
-      tags: [ha]
+      tags: [standby]
       operationId: getHACurrentFence
-      summary: Get the current durable HA promotion fence
+      summary: Get the current durable hot-standby promotion fence
       responses:
         "200":
           description: Current fence receipt, if any.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACurrentFenceResponse"
+                $ref: "#/components/schemas/StandbyCurrentFenceResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/promotion/assess:
+  /standby/promotion/assess:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: assessHAPromotion
       summary: Assess whether this standby can be promoted
       requestBody:
@@ -683,16 +715,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAPromotionAssessResponse"
+                $ref: "#/components/schemas/StandbyPromotionAssessResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/promotion/current-fence:
+  /standby/promotion/current-fence:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: promoteHAWithCurrentFence
       summary: Promote this standby using the current durable fence receipt
       responses:
@@ -701,14 +733,14 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAPromotionResponse"
+                $ref: "#/components/schemas/StandbyPromotionResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/promotion:
+  /standby/promotion:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: promoteHA
       summary: Acquire a fence and promote this standby
       requestBody:
@@ -723,16 +755,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAPromotionResponse"
+                $ref: "#/components/schemas/StandbyPromotionResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/rejoin/assess:
+  /standby/rejoin/assess:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: assessHARejoin
       summary: Assess whether a former primary can safely rejoin
       requestBody:
@@ -747,14 +779,14 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HARejoinAssessResponse"
+                $ref: "#/components/schemas/StandbyRejoinAssessResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
-  /ha/rejoin/rewind:
+  /standby/rejoin/rewind:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: rewindHARejoin
       summary: Rewind a fenced former primary onto the promoted timeline
       requestBody:
@@ -769,16 +801,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HARejoinAssessResponse"
+                $ref: "#/components/schemas/StandbyRejoinAssessResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
-  /ha/rejoin/reseed:
+  /standby/rejoin/reseed:
     post:
-      tags: [ha]
+      tags: [standby]
       operationId: reseedHARejoin
       summary: Reseed a fenced former primary when rewind is unsafe
       requestBody:
@@ -793,7 +825,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HARejoinAssessResponse"
+                $ref: "#/components/schemas/StandbyRejoinAssessResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -827,9 +859,9 @@ components:
       name: slot_name
       in: path
       required: true
-      description: Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
+      description: Stable standby replication slot name. Path values are percent-encoded; names must be hot-standby identifiers.
       schema:
-        $ref: "#/components/schemas/HASlotName"
+        $ref: "#/components/schemas/StandbySlotName"
   responses:
     BadRequest:
       description: Invalid admin request.
@@ -838,7 +870,7 @@ components:
           schema:
             type: string
     Conflict:
-      description: HA operation cannot be completed in the current state.
+      description: Hot-standby operation cannot be completed in the current state.
       content:
         text/plain:
           schema:
@@ -912,20 +944,20 @@ components:
         completed_at_ms: { type: integer, format: int64 }
         result: { $ref: "#/components/schemas/StorageMaintenanceResult" }
         error: { type: string }
-    HAIdentifier:
+    StandbyIdentifier:
       type: string
-      description: Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+      description: Stable hot-standby node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
       minLength: 1
       maxLength: 128
       pattern: "^[A-Za-z0-9_.:-]+$"
-    HASlotName:
+    StandbySlotName:
       description: Stable standby replication slot name.
       type: string
       minLength: 1
       maxLength: 128
       pattern: "^[A-Za-z0-9_.:-]+$"
-    HANodeID:
-      description: Stable HA node id.
+    StandbyNodeID:
+      description: Stable hot-standby node id.
       type: string
       minLength: 1
       maxLength: 128
@@ -936,7 +968,7 @@ components:
       additionalProperties: false
       properties:
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         initial_lsn:
           type: integer
           format: uint64
@@ -949,7 +981,7 @@ components:
       additionalProperties: false
       properties:
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         manifest_id:
           type: string
           description: Operator-chosen stable id for the base-backup manifest.
@@ -962,7 +994,7 @@ components:
       properties:
         manifest_path:
           type: string
-          description: Absolute normalized pod-local path to the HA base-backup manifest.
+          description: Absolute normalized pod-local path to the hot-standby base-backup manifest.
           minLength: 1
     StandbyBootstrapRequest:
       type: object
@@ -971,7 +1003,7 @@ components:
       properties:
         manifest_path:
           type: string
-          description: Absolute normalized pod-local path to the HA base-backup manifest.
+          description: Absolute normalized pod-local path to the hot-standby base-backup manifest.
           minLength: 1
         content_root:
           type: string
@@ -992,7 +1024,7 @@ components:
       additionalProperties: false
       properties:
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         generation:
           type: string
           minLength: 1
@@ -1036,7 +1068,7 @@ components:
       additionalProperties: false
       properties:
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         generation:
           type: string
           minLength: 1
@@ -1066,7 +1098,7 @@ components:
           minLength: 1
           maxLength: 128
           pattern: "^[A-Za-z0-9_.:-]+$"
-    HARuntimeLifecycleObservation:
+    StandbyRuntimeLifecycleObservation:
       type: object
       required: [role, fenced, observed_at_unix_ns]
       additionalProperties: false
@@ -1086,7 +1118,7 @@ components:
           type: integer
           format: uint64
           minimum: 1
-    HASeedLifecycleReceiptEvent:
+    StandbySeedLifecycleReceiptEvent:
       type: object
       required:
         - cursor
@@ -1115,7 +1147,7 @@ components:
           type: string
           minLength: 1
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         topology_id:
           type: string
           minLength: 1
@@ -1148,7 +1180,7 @@ components:
         authoritative_state:
           type: string
           enum: [retained, missing]
-    HASeedLifecycleReceiptInventoryResponse:
+    StandbySeedLifecycleReceiptInventoryResponse:
       type: object
       required:
         - schema_version
@@ -1169,7 +1201,7 @@ components:
         entries:
           type: array
           items:
-            $ref: "#/components/schemas/HASeedLifecycleReceiptEvent"
+            $ref: "#/components/schemas/StandbySeedLifecycleReceiptEvent"
         first_cursor:
           type: integer
           format: uint64
@@ -1189,8 +1221,8 @@ components:
         has_more:
           type: boolean
         runtime:
-          $ref: "#/components/schemas/HARuntimeLifecycleObservation"
-    HASyncPolicy:
+          $ref: "#/components/schemas/StandbyRuntimeLifecycleObservation"
+    StandbySyncPolicy:
       type: object
       required: [mode]
       additionalProperties: false
@@ -1213,7 +1245,7 @@ components:
         standby_names:
           type: array
           items:
-            $ref: "#/components/schemas/HASlotName"
+            $ref: "#/components/schemas/StandbySlotName"
           default: []
           description: Ordered candidate standby names for synchronous commit.
         failure_policy:
@@ -1231,7 +1263,7 @@ components:
           format: uint64
           minimum: 0
         sync_policy:
-          $ref: "#/components/schemas/HASyncPolicy"
+          $ref: "#/components/schemas/StandbySyncPolicy"
     CommitAppendRequest:
       type: object
       required: [payload, sync_policy]
@@ -1272,7 +1304,7 @@ components:
           format: int64
           default: 0
         sync_policy:
-          $ref: "#/components/schemas/HASyncPolicy"
+          $ref: "#/components/schemas/StandbySyncPolicy"
     ReadCheckRequest:
       type: object
       additionalProperties: false
@@ -1306,7 +1338,7 @@ components:
           enum: [primary, standby]
         expected_identity:
           nullable: true
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
     OwnerJobCheckRequest:
       type: object
       required: [role, kind]
@@ -1320,8 +1352,8 @@ components:
           enum: [compaction_publish, derived_effect_writer, enrichment_writer, retention_advance]
         expected_identity:
           nullable: true
-          $ref: "#/components/schemas/HAIdentity"
-    HAIdentity:
+          $ref: "#/components/schemas/StandbyIdentity"
+    StandbyIdentity:
       type: object
       required: [cluster_id, shard_id, table_id, timeline_id, epoch]
       additionalProperties: false
@@ -1334,12 +1366,12 @@ components:
           type: integer
           format: uint64
           minimum: 0
-          description: Shard identity. Use 0 for whole-instance HA scope.
+          description: Shard identity. Use 0 for whole-instance hot-standby scope.
         table_id:
           type: integer
           format: uint64
           minimum: 0
-          description: Table identity. Use 0 for whole-instance HA scope.
+          description: Table identity. Use 0 for whole-instance hot-standby scope.
         timeline_id:
           type: integer
           format: uint64
@@ -1356,18 +1388,17 @@ components:
         - promoted_node_id
         - new_timeline_id
         - new_epoch
-        - generation
         - required_lsn
         - observed_lsn
         - force
       additionalProperties: false
       properties:
         identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         old_primary_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
         promoted_node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
         new_timeline_id:
           type: integer
           format: uint64
@@ -1380,7 +1411,14 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: Exact Kubernetes Lease transition generation authorizing this fence.
+          description: |
+            Fence generation authorizing this fence. When the fencing authority is
+            a Kubernetes Lease this is the exact Lease transition generation and
+            must be supplied. When omitted, the node allocates the next
+            generation itself: the current durable fence generation plus one, or
+            1 when no fence exists. Allocation is only permitted when the node
+            is not configured with an external fencing authority, so a
+            Lease-managed cluster cannot be fenced by an unauthorized caller.
         required_lsn:
           type: integer
           format: uint64
@@ -1395,7 +1433,56 @@ components:
         reason:
           type: string
           default: ""
-    HAFenceReceipt:
+    StandbyUpstreamRequest:
+      type: object
+      required: [identity, upstream_url, slot_name]
+      additionalProperties: false
+      properties:
+        identity:
+          $ref: "#/components/schemas/StandbyIdentity"
+          description: Identity the standby is expected to have right now. Mismatch rejects the swap.
+        upstream_url:
+          type: string
+          format: uri
+          minLength: 1
+          description: Base URL of the primary to pull from.
+        slot_name:
+          $ref: "#/components/schemas/StandbySlotName"
+        reason:
+          type: string
+          default: ""
+    StandbyUpstream:
+      type: object
+      required: [upstream_url, slot_name]
+      additionalProperties: false
+      properties:
+        upstream_url:
+          type: string
+          format: uri
+        slot_name:
+          $ref: "#/components/schemas/StandbySlotName"
+    StandbyUpstreamResponse:
+      type: object
+      required: [schema_version, action, identity, upstream, changed]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        action:
+          $ref: "#/components/schemas/StandbyActionReceipt"
+        identity:
+          $ref: "#/components/schemas/StandbyIdentity"
+        upstream:
+          $ref: "#/components/schemas/StandbyUpstream"
+        previous:
+          $ref: "#/components/schemas/StandbyUpstream"
+          description: Upstream in effect before this request. Absent when the standby had no continuous upstream configured.
+        changed:
+          type: boolean
+          description: False when the requested upstream already matched, which makes retries idempotent.
+    StandbyFenceReceipt:
       type: object
       required:
         - identity
@@ -1414,11 +1501,11 @@ components:
       additionalProperties: false
       properties:
         identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         old_primary_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
         promoted_node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
         parent_timeline_id:
           type: integer
           format: uint64
@@ -1465,10 +1552,10 @@ components:
       additionalProperties: false
       properties:
         node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
           description: Former primary node id that is attempting to rejoin.
         identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         last_lsn:
           type: integer
           format: uint64
@@ -1483,7 +1570,7 @@ components:
           type: boolean
           default: false
         receipt:
-          $ref: "#/components/schemas/HAFenceReceipt"
+          $ref: "#/components/schemas/StandbyFenceReceipt"
           description: Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
     PromotionAssessRequest:
       type: object
@@ -1508,7 +1595,7 @@ components:
         use_current_fence:
           type: boolean
           default: false
-    HAPrimaryStatusResponse:
+    StandbyPrimaryStatusResponse:
       type: object
       required: [schema_version, snapshot]
       additionalProperties: false
@@ -1518,8 +1605,8 @@ components:
           format: uint32
           minimum: 1
         snapshot:
-          $ref: "#/components/schemas/HAPrimarySnapshot"
-    HAWatchdogProofResponse:
+          $ref: "#/components/schemas/StandbyPrimarySnapshot"
+    StandbyWatchdogProofResponse:
       type: object
       required: [schema_version, proof]
       additionalProperties: false
@@ -1529,8 +1616,8 @@ components:
           format: uint32
           minimum: 1
         proof:
-          $ref: "#/components/schemas/HALeaseWatchdogProof"
-    HAStandbyStatusResponse:
+          $ref: "#/components/schemas/StandbyLeaseWatchdogProof"
+    StandbyStatusResponse:
       type: object
       required: [schema_version, snapshot]
       additionalProperties: false
@@ -1540,8 +1627,8 @@ components:
           format: uint32
           minimum: 1
         snapshot:
-          $ref: "#/components/schemas/HAStandbySnapshot"
-    HACommitCheckResponse:
+          $ref: "#/components/schemas/StandbySnapshot"
+    StandbyCommitCheckResponse:
       type: object
       required: [schema_version, gate]
       additionalProperties: false
@@ -1551,8 +1638,8 @@ components:
           format: uint32
           minimum: 1
         gate:
-          $ref: "#/components/schemas/HACommitGate"
-    HACommitAppendResponse:
+          $ref: "#/components/schemas/StandbyCommitGate"
+    StandbyCommitAppendResponse:
       type: object
       required: [schema_version, lsn, gate]
       additionalProperties: false
@@ -1566,8 +1653,8 @@ components:
           format: uint64
           minimum: 0
         gate:
-          $ref: "#/components/schemas/HACommitGate"
-    HAReadCheckResponse:
+          $ref: "#/components/schemas/StandbyCommitGate"
+    StandbyReadCheckResponse:
       type: object
       required: [schema_version, decision]
       additionalProperties: false
@@ -1577,8 +1664,8 @@ components:
           format: uint32
           minimum: 1
         decision:
-          $ref: "#/components/schemas/HAReadDecision"
-    HAWriteCheckResponse:
+          $ref: "#/components/schemas/StandbyReadDecision"
+    StandbyWriteCheckResponse:
       type: object
       required: [schema_version, decision]
       additionalProperties: false
@@ -1588,8 +1675,8 @@ components:
           format: uint32
           minimum: 1
         decision:
-          $ref: "#/components/schemas/HAWriteDecision"
-    HAOwnerJobCheckResponse:
+          $ref: "#/components/schemas/StandbyWriteDecision"
+    StandbyOwnerJobCheckResponse:
       type: object
       required: [schema_version, decision]
       additionalProperties: false
@@ -1599,8 +1686,8 @@ components:
           format: uint32
           minimum: 1
         decision:
-          $ref: "#/components/schemas/HAOwnerJobDecision"
-    HAActionReceipt:
+          $ref: "#/components/schemas/StandbyOwnerJobDecision"
+    StandbyActionReceipt:
       type: object
       required: [action_id, action_kind, target, state, node_id]
       additionalProperties: false
@@ -1608,7 +1695,7 @@ components:
         action_id:
           type: string
           minLength: 1
-          description: Stable action correlation id derived from the acted-on HA resource and boundary values.
+          description: Stable action correlation id derived from the acted-on hot-standby resource and boundary values.
         action_kind:
           type: string
           enum:
@@ -1627,7 +1714,8 @@ components:
             - rejoin_assess
             - rejoin_rewind
             - rejoin_reseed
-          description: Typed HA action that produced this response.
+            - standby_upstream
+          description: Typed hot-standby action that produced this response.
         target:
           type: string
           minLength: 1
@@ -1637,9 +1725,9 @@ components:
           enum: [assessed, applied, already_applied]
           description: Idempotency state for this action response.
         node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
           description: Node id for the node-local admin endpoint that produced this receipt.
-    HAReplicationSlotActionResponse:
+    StandbyReplicationSlotActionResponse:
       type: object
       required: [schema_version, action, slot_action, slot]
       additionalProperties: false
@@ -1649,13 +1737,13 @@ components:
           format: uint32
           minimum: 1
         action:
-          $ref: "#/components/schemas/HAActionReceipt"
+          $ref: "#/components/schemas/StandbyActionReceipt"
         slot_action:
           type: string
           enum: [create, pause, resume, drop]
         slot:
-          $ref: "#/components/schemas/HAReplicationSlot"
-    HAReplicationSlotListResponse:
+          $ref: "#/components/schemas/StandbyReplicationSlot"
+    StandbyReplicationSlotListResponse:
       type: object
       required: [schema_version, slots]
       additionalProperties: false
@@ -1667,8 +1755,8 @@ components:
         slots:
           type: array
           items:
-            $ref: "#/components/schemas/HAReplicationSlot"
-    HABaseBackupBeginResponse:
+            $ref: "#/components/schemas/StandbyReplicationSlot"
+    StandbyBaseBackupBeginResponse:
       type: object
       required: [schema_version, action, slot_name, manifest_id, backup_lsn, start_record_lsn]
       additionalProperties: false
@@ -1678,9 +1766,9 @@ components:
           format: uint32
           minimum: 1
         action:
-          $ref: "#/components/schemas/HAActionReceipt"
+          $ref: "#/components/schemas/StandbyActionReceipt"
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
           description: Stable standby replication slot reserved for the base backup.
         manifest_id:
           type: string
@@ -1696,7 +1784,7 @@ components:
           format: uint64
           minimum: 1
           description: Durable `backup_start` record LSN.
-    HABaseBackupFinishResponse:
+    StandbyBaseBackupFinishResponse:
       type: object
       required: [schema_version, action, manifest_id, backup_lsn, end_record_lsn]
       additionalProperties: false
@@ -1706,7 +1794,7 @@ components:
           format: uint32
           minimum: 1
         action:
-          $ref: "#/components/schemas/HAActionReceipt"
+          $ref: "#/components/schemas/StandbyActionReceipt"
         manifest_id:
           type: string
           minLength: 1
@@ -1719,7 +1807,7 @@ components:
           format: uint64
           minimum: 1
           description: Durable `backup_end` record LSN.
-    HAStandbyBootstrapResponse:
+    StandbyBootstrapResponse:
       type: object
       required: [schema_version, action, manifest_id, backup_lsn, checkpoint_lsn]
       additionalProperties: false
@@ -1729,7 +1817,7 @@ components:
           format: uint32
           minimum: 1
         action:
-          $ref: "#/components/schemas/HAActionReceipt"
+          $ref: "#/components/schemas/StandbyActionReceipt"
         manifest_id:
           type: string
           minLength: 1
@@ -1742,7 +1830,7 @@ components:
           format: uint64
           minimum: 1
           description: Standby checkpoint LSN after manifest validation.
-    HASeededSlotActivateResponse:
+    StandbySeededSlotActivateResponse:
       type: object
       required:
         - schema_version
@@ -1763,9 +1851,9 @@ components:
           format: uint32
           minimum: 1
         action:
-          $ref: "#/components/schemas/HAActionReceipt"
+          $ref: "#/components/schemas/StandbyActionReceipt"
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         generation:
           type: string
           minLength: 1
@@ -1793,7 +1881,7 @@ components:
         aggregate_sha256:
           type: string
           pattern: "^[0-9a-f]{64}$"
-    HASeedArtifactCaptureResponse:
+    StandbySeedArtifactCaptureResponse:
       type: object
       required:
         - schema_version
@@ -1830,9 +1918,9 @@ components:
           format: uint32
           minimum: 1
         action:
-          $ref: "#/components/schemas/HAActionReceipt"
+          $ref: "#/components/schemas/StandbyActionReceipt"
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         generation:
           type: string
           minLength: 1
@@ -1916,7 +2004,7 @@ components:
           pattern: "^/.*"
         already_captured:
           type: boolean
-    HAFenceResponse:
+    StandbyFenceResponse:
       type: object
       required: [schema_version, action, receipt]
       additionalProperties: false
@@ -1926,10 +2014,10 @@ components:
           format: uint32
           minimum: 1
         action:
-          $ref: "#/components/schemas/HAActionReceipt"
+          $ref: "#/components/schemas/StandbyActionReceipt"
         receipt:
-          $ref: "#/components/schemas/HAFenceReceipt"
-    HACurrentFenceResponse:
+          $ref: "#/components/schemas/StandbyFenceReceipt"
+    StandbyCurrentFenceResponse:
       type: object
       required: [schema_version, held]
       additionalProperties: false
@@ -1942,8 +2030,8 @@ components:
           type: boolean
         receipt:
           nullable: true
-          $ref: "#/components/schemas/HAFenceReceipt"
-    HAPromotionAssessResponse:
+          $ref: "#/components/schemas/StandbyFenceReceipt"
+    StandbyPromotionAssessResponse:
       type: object
       required: [schema_version, action, assessment]
       additionalProperties: false
@@ -1953,10 +2041,10 @@ components:
           format: uint32
           minimum: 1
         action:
-          $ref: "#/components/schemas/HAActionReceipt"
+          $ref: "#/components/schemas/StandbyActionReceipt"
         assessment:
-          $ref: "#/components/schemas/HAPromotionAssessment"
-    HAPromotionResponse:
+          $ref: "#/components/schemas/StandbyPromotionAssessment"
+    StandbyPromotionResponse:
       type: object
       required: [schema_version, action, assessment, promotion, fence_generation, fence_token, forced]
       additionalProperties: false
@@ -1966,11 +2054,11 @@ components:
           format: uint32
           minimum: 1
         action:
-          $ref: "#/components/schemas/HAActionReceipt"
+          $ref: "#/components/schemas/StandbyActionReceipt"
         assessment:
-          $ref: "#/components/schemas/HAPromotionAssessment"
+          $ref: "#/components/schemas/StandbyPromotionAssessment"
         promotion:
-          $ref: "#/components/schemas/HAPromotionResult"
+          $ref: "#/components/schemas/StandbyPromotionResult"
         fence_generation:
           type: integer
           format: uint64
@@ -1980,7 +2068,7 @@ components:
           minLength: 1
         forced:
           type: boolean
-    HARejoinAssessResponse:
+    StandbyRejoinAssessResponse:
       type: object
       required: [schema_version, action, assessment]
       additionalProperties: false
@@ -1990,16 +2078,16 @@ components:
           format: uint32
           minimum: 1
         action:
-          $ref: "#/components/schemas/HAActionReceipt"
+          $ref: "#/components/schemas/StandbyActionReceipt"
         assessment:
-          $ref: "#/components/schemas/HARejoinAssessment"
+          $ref: "#/components/schemas/StandbyRejoinAssessment"
         rewind:
-          $ref: "#/components/schemas/HARejoinRewindResult"
+          $ref: "#/components/schemas/StandbyRejoinRewindResult"
           description: Present when `/ha/rejoin/rewind` executed against a configured local former-primary log.
         reseed:
-          $ref: "#/components/schemas/HARejoinReseedResult"
+          $ref: "#/components/schemas/StandbyRejoinReseedResult"
           description: Present when `/ha/rejoin/reseed` marked the former-primary slot for base-backup reseed.
-    HARejoinRewindResult:
+    StandbyRejoinRewindResult:
       type: object
       required:
         - node_id
@@ -2014,7 +2102,7 @@ components:
       additionalProperties: false
       properties:
         node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
           description: Former primary node id whose local log was rewound.
         fork_lsn:
           type: integer
@@ -2046,7 +2134,7 @@ components:
           minimum: 1
         data_loss_discarded:
           type: boolean
-    HARejoinReseedResult:
+    StandbyRejoinReseedResult:
       type: object
       required:
         - node_id
@@ -2060,10 +2148,10 @@ components:
       additionalProperties: false
       properties:
         node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
           description: Former primary node id scheduled for reseed.
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         target_timeline_id:
           type: integer
           format: uint64
@@ -2084,7 +2172,7 @@ components:
           type: boolean
         base_backup_required:
           type: boolean
-    HAPromotionAssessment:
+    StandbyPromotionAssessment:
       type: object
       required:
         - required_lsn
@@ -2141,27 +2229,27 @@ components:
           type: boolean
         can_promote:
           type: boolean
-    HAPromotionResult:
+    StandbyPromotionResult:
       type: object
       required: [node_id, switch_lsn, old_identity, new_identity, forced, data_loss_possible]
       additionalProperties: false
       properties:
         node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
           description: Standby node id that executed the promotion.
         switch_lsn:
           type: integer
           format: uint64
           minimum: 1
         old_identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         new_identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         forced:
           type: boolean
         data_loss_possible:
           type: boolean
-    HARejoinAssessment:
+    StandbyRejoinAssessment:
       type: object
       required:
         - action
@@ -2197,7 +2285,7 @@ components:
             - wrong_table
             - local_lsn_before_fork
         former_node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
         target_timeline_id:
           type: integer
           format: uint64
@@ -2245,7 +2333,7 @@ components:
           minimum: 0
         data_loss_discarded:
           type: boolean
-    HAPrimarySnapshot:
+    StandbyPrimarySnapshot:
       type: object
       required: [role, node_id, identity, current_lsn, slots, retention]
       additionalProperties: false
@@ -2254,10 +2342,10 @@ components:
           type: string
           enum: [primary]
         node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
           description: Node id for the node-local admin endpoint that produced this status snapshot.
         identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         current_lsn:
           type: integer
           format: uint64
@@ -2265,16 +2353,16 @@ components:
         slots:
           type: array
           items:
-            $ref: "#/components/schemas/HASlotSnapshot"
+            $ref: "#/components/schemas/StandbySlotSnapshot"
         retention:
-          $ref: "#/components/schemas/HARetentionSnapshot"
+          $ref: "#/components/schemas/StandbyRetentionSnapshot"
         durability:
           nullable: true
-          $ref: "#/components/schemas/HADurabilityDecision"
+          $ref: "#/components/schemas/StandbyDurabilityDecision"
         lease_watchdog:
           nullable: true
-          $ref: "#/components/schemas/HALeaseWatchdogProof"
-    HALeaseWatchdogProof:
+          $ref: "#/components/schemas/StandbyLeaseWatchdogProof"
+    StandbyLeaseWatchdogProof:
       type: object
       additionalProperties: false
       required:
@@ -2316,10 +2404,10 @@ components:
           type: string
           minLength: 1
         local_node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
           description: Local runtime node id producing the proof.
         observed_holder_node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
           description: Holder identity copied from the exact validated Kubernetes Lease.
         pod_uid:
           type: string
@@ -2335,7 +2423,7 @@ components:
           type: integer
           format: uint64
           minimum: 1
-    HAStandbySnapshot:
+    StandbySnapshot:
       type: object
       required:
         - role
@@ -2353,10 +2441,10 @@ components:
           type: string
           enum: [standby]
         node_id:
-          $ref: "#/components/schemas/HANodeID"
+          $ref: "#/components/schemas/StandbyNodeID"
           description: Node id for the node-local admin endpoint that produced this status snapshot.
         identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         received_lsn:
           type: integer
           format: uint64
@@ -2421,8 +2509,8 @@ components:
           type: boolean
         lease_watchdog:
           nullable: true
-          $ref: "#/components/schemas/HALeaseWatchdogProof"
-    HASlotSnapshot:
+          $ref: "#/components/schemas/StandbyLeaseWatchdogProof"
+    StandbySlotSnapshot:
       type: object
       required:
         - name
@@ -2488,7 +2576,7 @@ components:
         last_error:
           type: string
           nullable: true
-    HARetentionSnapshot:
+    StandbyRetentionSnapshot:
       type: object
       required: [primary_lsn, oldest_restart_lsn, retained_lsn_count, retained_byte_count, retained_age_ns, active_slots, reseed_recommended]
       additionalProperties: false
@@ -2521,7 +2609,7 @@ components:
           type: integer
           format: uint64
           minimum: 0
-    HADurabilityDecision:
+    StandbyDurabilityDecision:
       type: object
       required:
         - status
@@ -2568,7 +2656,7 @@ components:
           type: integer
           format: uint64
           minimum: 0
-    HAReadDecision:
+    StandbyReadDecision:
       type: object
       required:
         - action
@@ -2626,13 +2714,13 @@ components:
           type: integer
           format: uint64
           minimum: 0
-    HAPromotionHandoff:
+    StandbyPromotionHandoff:
       type: object
       required: [identity, switch_lsn, next_lsn]
       additionalProperties: false
       properties:
         identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         switch_lsn:
           type: integer
           format: uint64
@@ -2641,7 +2729,7 @@ components:
           type: integer
           format: uint64
           minimum: 0
-    HAWriteDecision:
+    StandbyWriteDecision:
       type: object
       required: [role, action, identity, durable_lsn, next_lsn]
       additionalProperties: false
@@ -2653,7 +2741,7 @@ components:
           type: string
           enum: [allow_write, reject_read_only_standby, open_promoted_primary, reject_fenced_primary]
         identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         durable_lsn:
           type: integer
           format: uint64
@@ -2664,8 +2752,8 @@ components:
           minimum: 0
         promotion_handoff:
           nullable: true
-          $ref: "#/components/schemas/HAPromotionHandoff"
-    HAOwnerJobDecision:
+          $ref: "#/components/schemas/StandbyPromotionHandoff"
+    StandbyOwnerJobDecision:
       type: object
       required: [kind, role, action, identity, durable_lsn, next_lsn]
       additionalProperties: false
@@ -2680,7 +2768,7 @@ components:
           type: string
           enum: [run, disable_on_standby, open_promoted_primary]
         identity:
-          $ref: "#/components/schemas/HAIdentity"
+          $ref: "#/components/schemas/StandbyIdentity"
         durable_lsn:
           type: integer
           format: uint64
@@ -2691,8 +2779,8 @@ components:
           minimum: 0
         promotion_handoff:
           nullable: true
-          $ref: "#/components/schemas/HAPromotionHandoff"
-    HACommitGate:
+          $ref: "#/components/schemas/StandbyPromotionHandoff"
+    StandbyCommitGate:
       type: object
       required: [target_lsn, action, durability]
       additionalProperties: false
@@ -2705,8 +2793,8 @@ components:
           type: string
           enum: [acknowledge, wait_for_standby, reject, acknowledge_degraded]
         durability:
-          $ref: "#/components/schemas/HADurabilityDecision"
-    HAReplicationSlot:
+          $ref: "#/components/schemas/StandbyDurabilityDecision"
+    StandbyReplicationSlot:
       type: object
       required:
         - slot_name
@@ -2721,7 +2809,7 @@ components:
       additionalProperties: false
       properties:
         slot_name:
-          $ref: "#/components/schemas/HASlotName"
+          $ref: "#/components/schemas/StandbySlotName"
         timeline_id:
           type: integer
           format: uint64

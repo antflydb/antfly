@@ -33,7 +33,7 @@ def readiness_cluster(monkeypatch):
     timeouts = []
 
     def read_status(path, *, upstream_lsn, request_timeout_s):
-        assert path == "/standby/status"
+        assert path == "/status"
         assert upstream_lsn == 10
         timeouts.append(request_timeout_s)
         snapshot = snapshots.pop(0) if len(snapshots) > 1 else snapshots[0]

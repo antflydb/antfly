@@ -53,6 +53,19 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_generating_openapi", ctx.graph.generating_openapi_mod);
     tests.root_module.addImport("antfly_extraction_openapi", ctx.graph.extraction_openapi_mod);
     tests.root_module.addImport("antfly_extracting", ctx.graph.extracting_mod);
+    // Direct reader API tests share the runtime's request and result types.
+    const readers_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/readers/src/mod.zig" })),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    readers_mod.addImport("httpx", ctx.graph.httpx_mod);
+    readers_mod.addImport("inference_api", ctx.graph.inference_api_mod);
+    readers_mod.addImport("antfly_google", ctx.graph.google_mod);
+    readers_mod.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
+    readers_mod.addImport("antfly_scraping", ctx.graph.scraping_mod);
+    readers_mod.addImport("antfly_image", ctx.graph.image_mod);
+    tests.root_module.addImport("antfly_readers", readers_mod);
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);

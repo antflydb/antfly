@@ -219,9 +219,9 @@ const Sample = struct {
     stats: pattern_mod.MatchStats,
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     const alloc = init.gpa;
-    const cfg = try parseArgs(alloc, init.minimal.args);
+    const cfg = try parseArgs(args);
 
     var graph = try graph_mod.GraphIndex.openWithPrivateStores(
         alloc,
@@ -374,27 +374,24 @@ fn buildFixture(alloc: std.mem.Allocator, graph: *graph_mod.GraphIndex, cfg: Con
     try batch.flush(alloc, graph);
 }
 
-fn parseArgs(alloc: std.mem.Allocator, proc_args: std.process.Args) !Config {
+fn parseArgs(args: *std.process.Args.Iterator) !Config {
     var cfg = Config{};
-    var args = try std.process.Args.Iterator.initAllocator(proc_args, alloc);
-    defer args.deinit();
-    _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--mode")) {
             const value = args.next() orelse return error.InvalidArgument;
             cfg.mode = std.meta.stringToEnum(Mode, value) orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--fanout")) {
-            cfg.fanout = try parseNextUsize(&args, arg);
+            cfg.fanout = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--tags-per-post")) {
-            cfg.tags_per_post = try parseNextUsize(&args, arg);
+            cfg.tags_per_post = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--target-degree")) {
-            cfg.target_degree = try parseNextUsize(&args, arg);
+            cfg.target_degree = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--match-every")) {
-            cfg.match_every = try parseNextUsize(&args, arg);
+            cfg.match_every = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--warmup")) {
-            cfg.warmup = try parseNextUsize(&args, arg);
+            cfg.warmup = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--samples")) {
-            cfg.samples = try parseNextUsize(&args, arg);
+            cfg.samples = try parseNextUsize(args, arg);
         } else {
             return error.InvalidArgument;
         }

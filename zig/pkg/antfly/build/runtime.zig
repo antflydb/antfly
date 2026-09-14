@@ -18,7 +18,6 @@ const AntflyRootImports = @import("imports.zig").AntflyRootImports;
 pub const RuntimeArtifactRole = enum {
     cli,
     data,
-    graph_metric_maintenance,
     inference,
     metadata,
     standalone,
@@ -281,7 +280,6 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.cli)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
             },
-            .graph_metric_maintenance => {},
             .data, .metadata => {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);

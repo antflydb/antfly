@@ -314,7 +314,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     model = AutoModel.from_pretrained(
         source,
-        attn_implementation="eager",
+        attn_implementation=args.attention,
         **{dtype_kwarg: torch.float32},
         **load_kwargs,
     )
@@ -378,7 +378,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         model_inputs = {name: value.to(args.device) for name, value in encoded.items()}
         with torch.inference_mode():
-            hidden = model(**model_inputs).last_hidden_state
+            # Embeddings do not reuse autoregressive K/V state. Avoid retaining
+            # that cache while generating long-context CPU references.
+            hidden = model(**model_inputs, use_cache=False).last_hidden_state
             pooled = last_token_pool(hidden, model_inputs["attention_mask"])
             normalized = F.normalize(pooled, p=2, dim=1)
         vector = [
@@ -434,7 +436,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "packages": versions,
             "device": args.device,
             "dtype": "float32",
-            "attn_implementation": "eager",
+            "attn_implementation": model.config._attn_implementation,
+            "use_cache": False,
             "padding_side": "left",
             "batch_size": 1,
         },
@@ -472,6 +475,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--revision", default=DEFAULT_REVISION)
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
     parser.add_argument("--device", choices=("cpu", "mps"), default="cpu")
+    parser.add_argument(
+        "--attention",
+        choices=("eager", "sdpa"),
+        default="eager",
+        help="FP32 reference attention; qualify SDPA against eager before using it for long contexts",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--allow-env-mismatch",

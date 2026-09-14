@@ -295,6 +295,9 @@ pub const Config = struct {
     backup: ?BackupConfig = null,
     storage: ?StorageConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
+    /// DEPRECATED: use hot_standby
+    ha: ?HotStandbyConfig = null,
+    hot_standby: ?HotStandbyConfig = null,
     metadata: ?MetadataInfo = null,
     inference: ?antfly_inference_config_openapi.RuntimeConfig = null,
     tls: ?TLSInfo = null,
@@ -351,6 +354,8 @@ pub const Config = struct {
         .{ "backup", "backup", true },
         .{ "storage", "storage", true },
         .{ "transaction_sessions", "transaction_sessions", true },
+        .{ "ha", "ha", true },
+        .{ "hot_standby", "hot_standby", true },
         .{ "metadata", "metadata", true },
         .{ "inference", "inference", false },
         .{ "tls", "tls", true },
@@ -428,6 +433,14 @@ pub const Config = struct {
         }
         if (self.transaction_sessions) |value| {
             try jw.objectField("transaction_sessions");
+            try jw.write(value);
+        }
+        if (self.ha) |value| {
+            try jw.objectField("ha");
+            try jw.write(value);
+        }
+        if (self.hot_standby) |value| {
+            try jw.objectField("hot_standby");
             try jw.write(value);
         }
         if (self.metadata) |value| {
@@ -999,6 +1012,371 @@ pub const GraphExecutionConfig = struct {
         }
         if (self.max_distinct_state_bytes) |value| {
             try jw.objectField("max_distinct_state_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// How the hot-standby admin API of this node is reached and authenticated.
+pub const HotStandbyAdminConfig = struct {
+    /// URL where this node's hot-standby admin API is reachable. Used as the default target by `antfly ha` when no `--admin-url`, `--data-dir`, or local handle flag is given. Not used by the server itself.
+    url: ?[]const u8 = null,
+    /// Name of the environment variable holding the admin bearer token. The server requires `Authorization: Bearer <token>` on admin and hot-standby routes when set (`--admin-token-env`); `antfly ha` reads the same variable to authenticate. Tokens never appear in configuration.
+    token_env: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "url", "url", true },
+        .{ "token_env", "token_env", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.token_env) |value| {
+            try jw.objectField("token_env");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Hot-standby replication settings for a standalone node. Every field mirrors an `antfly standalone --ha-*` flag; a flag given on the command line wins over the value here. `antfly ha --config <file>` reads the same section to find the node's replication state and admin endpoint, so the replication identity and paths are written once, in the same way a PostgreSQL standby carries `primary_conninfo` in its configuration. This section was named `ha` before v0.3; that spelling is still accepted for one minor release (see `ha` on `Config`), but `hot_standby` is the name going forward and wins if both are set.
+pub const HotStandbyConfig = struct {
+    admin: ?HotStandbyAdminConfig = null,
+    identity: ?HotStandbyIdentityConfig = null,
+    primary: ?HotStandbyPrimaryConfig = null,
+    standby: ?HotStandbyStandbyConfig = null,
+    sync: ?HotStandbySyncConfig = null,
+    retention: ?HotStandbyRetentionConfig = null,
+    /// Durable promotion fence WAL path (`--ha-fence-wal`).
+    fence_wal: ?[]const u8 = null,
+    /// Replication log a demoted primary rewinds in place (`--ha-former-primary-log`).
+    former_primary_log: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "admin", "admin", true },
+        .{ "identity", "identity", true },
+        .{ "primary", "primary", true },
+        .{ "standby", "standby", true },
+        .{ "sync", "sync", true },
+        .{ "retention", "retention", true },
+        .{ "fence_wal", "fence_wal", true },
+        .{ "former_primary_log", "former_primary_log", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.admin) |value| {
+            try jw.objectField("admin");
+            try jw.write(value);
+        }
+        if (self.identity) |value| {
+            try jw.objectField("identity");
+            try jw.write(value);
+        }
+        if (self.primary) |value| {
+            try jw.objectField("primary");
+            try jw.write(value);
+        }
+        if (self.standby) |value| {
+            try jw.objectField("standby");
+            try jw.write(value);
+        }
+        if (self.sync) |value| {
+            try jw.objectField("sync");
+            try jw.write(value);
+        }
+        if (self.retention) |value| {
+            try jw.objectField("retention");
+            try jw.write(value);
+        }
+        if (self.fence_wal) |value| {
+            try jw.objectField("fence_wal");
+            try jw.write(value);
+        }
+        if (self.former_primary_log) |value| {
+            try jw.objectField("former_primary_log");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Replication identity shared by the primary and its standbys.
+pub const HotStandbyIdentityConfig = struct {
+    /// Replicated cluster id (`--ha-cluster-id`).
+    cluster_id: ?i64 = null,
+    /// Replicated shard id; 0 means the whole instance (`--ha-shard-id`).
+    shard_id: ?i64 = null,
+    /// Replicated table id; 0 means the whole instance (`--ha-table-id`).
+    table_id: ?i64 = null,
+    /// Current timeline id (`--ha-timeline-id`).
+    timeline_id: ?i64 = null,
+    /// Current epoch (`--ha-epoch`).
+    epoch: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "cluster_id", "cluster_id", true },
+        .{ "shard_id", "shard_id", true },
+        .{ "table_id", "table_id", true },
+        .{ "timeline_id", "timeline_id", true },
+        .{ "epoch", "epoch", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.cluster_id) |value| {
+            try jw.objectField("cluster_id");
+            try jw.write(value);
+        }
+        if (self.shard_id) |value| {
+            try jw.objectField("shard_id");
+            try jw.write(value);
+        }
+        if (self.table_id) |value| {
+            try jw.objectField("table_id");
+            try jw.write(value);
+        }
+        if (self.timeline_id) |value| {
+            try jw.objectField("timeline_id");
+            try jw.write(value);
+        }
+        if (self.epoch) |value| {
+            try jw.objectField("epoch");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Primary-role state. Setting `log` and `slots` enables the primary hot-standby role.
+pub const HotStandbyPrimaryConfig = struct {
+    /// Replication log path (`--ha-primary-log`).
+    log: ?[]const u8 = null,
+    /// Replication slot store path (`--ha-primary-slots`).
+    slots: ?[]const u8 = null,
+    /// Node id stamped into typed admin receipts (`--ha-primary-node-id`).
+    node_id: ?[]const u8 = null,
+    /// Runtime-owned immutable seed generation root (`--ha-seed-capture-root`).
+    seed_capture_root: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "log", "log", true },
+        .{ "slots", "slots", true },
+        .{ "node_id", "node_id", true },
+        .{ "seed_capture_root", "seed_capture_root", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.log) |value| {
+            try jw.objectField("log");
+            try jw.write(value);
+        }
+        if (self.slots) |value| {
+            try jw.objectField("slots");
+            try jw.write(value);
+        }
+        if (self.node_id) |value| {
+            try jw.objectField("node_id");
+            try jw.write(value);
+        }
+        if (self.seed_capture_root) |value| {
+            try jw.objectField("seed_capture_root");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Retention caps after which the primary marks lagging slots reseed-required. 0 disables a cap.
+pub const HotStandbyRetentionConfig = struct {
+    /// `--ha-retention-max-lag-lsn`.
+    max_lag_lsn: ?i64 = null,
+    /// `--ha-retention-max-retained-bytes`.
+    max_retained_bytes: ?i64 = null,
+    /// `--ha-retention-max-retained-age-ns`.
+    max_retained_age_ns: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_lag_lsn", "max_lag_lsn", true },
+        .{ "max_retained_bytes", "max_retained_bytes", true },
+        .{ "max_retained_age_ns", "max_retained_age_ns", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_lag_lsn) |value| {
+            try jw.objectField("max_lag_lsn");
+            try jw.write(value);
+        }
+        if (self.max_retained_bytes) |value| {
+            try jw.objectField("max_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.max_retained_age_ns) |value| {
+            try jw.objectField("max_retained_age_ns");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Standby-role state. Setting `log` and `progress` enables the standby hot-standby role.
+pub const HotStandbyStandbyConfig = struct {
+    /// Received replication log path (`--ha-standby-log`).
+    log: ?[]const u8 = null,
+    /// Durable receive/apply progress WAL path (`--ha-standby-progress`).
+    progress: ?[]const u8 = null,
+    /// Node id stamped into typed admin receipts (`--ha-standby-node-id`).
+    node_id: ?[]const u8 = null,
+    /// Primary URL to pull from (`--ha-standby-upstream-url`). This is the initial upstream; `antfly ha follow` can repoint a running standby without a restart.
+    upstream_url: ?[]const u8 = null,
+    /// Replication slot name on the upstream (`--ha-standby-slot`).
+    slot: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "log", "log", true },
+        .{ "progress", "progress", true },
+        .{ "node_id", "node_id", true },
+        .{ "upstream_url", "upstream_url", true },
+        .{ "slot", "slot", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.log) |value| {
+            try jw.objectField("log");
+            try jw.write(value);
+        }
+        if (self.progress) |value| {
+            try jw.objectField("progress");
+            try jw.write(value);
+        }
+        if (self.node_id) |value| {
+            try jw.objectField("node_id");
+            try jw.write(value);
+        }
+        if (self.upstream_url) |value| {
+            try jw.objectField("upstream_url");
+            try jw.write(value);
+        }
+        if (self.slot) |value| {
+            try jw.objectField("slot");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Synchronous replication policy enforced by the primary.
+pub const HotStandbySyncConfig = struct {
+    /// `--ha-sync-mode`.
+    mode: ?[]const u8 = null,
+    /// `--ha-sync-selection`.
+    selection: ?[]const u8 = null,
+    /// Required standby acknowledgements; not allowed with `selection: all` (`--ha-sync-required`).
+    required: ?i64 = null,
+    /// Standby names participating in the sync policy (`--ha-sync-standby`, repeatable).
+    standbys: ?[]const []const u8 = null,
+    /// `--ha-sync-failure`.
+    failure: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", true },
+        .{ "selection", "selection", true },
+        .{ "required", "required", true },
+        .{ "standbys", "standbys", true },
+        .{ "failure", "failure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.selection) |value| {
+            try jw.objectField("selection");
+            try jw.write(value);
+        }
+        if (self.required) |value| {
+            try jw.objectField("required");
+            try jw.write(value);
+        }
+        if (self.standbys) |value| {
+            try jw.objectField("standbys");
+            try jw.write(value);
+        }
+        if (self.failure) |value| {
+            try jw.objectField("failure");
             try jw.write(value);
         }
         try jw.endObject();

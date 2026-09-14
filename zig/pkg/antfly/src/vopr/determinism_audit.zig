@@ -25,6 +25,7 @@ fn region(comptime source: []const u8, comptime begin: []const u8, comptime end:
 }
 
 const replayable_sources = [_]Source{
+    .{ .path = "vopr/index_maintenance.zig", .bytes = @embedFile("index_maintenance.zig") },
     .{ .path = "vopr/admission.zig", .bytes = @embedFile("admission.zig") },
     .{ .path = "vopr/auth_lifecycle.zig", .bytes = @embedFile("auth_lifecycle.zig") },
     .{ .path = "vopr/backfill_marker_discovery.zig", .bytes = @embedFile("backfill_marker_discovery.zig") },
@@ -59,7 +60,7 @@ const replayable_sources = [_]Source{
     .{ .path = "raft/vopr.zig", .bytes = @embedFile("../raft/vopr.zig") },
     .{ .path = "storage/lsm_vopr.zig", .bytes = @embedFile("../storage/lsm_vopr.zig") },
     .{ .path = "storage/lmdb_vopr.zig", .bytes = @embedFile("../storage/lmdb_vopr.zig") },
-    .{ .path = "storage/ha/vopr.zig", .bytes = @embedFile("../storage/ha/vopr.zig") },
+    .{ .path = "storage/hot_standby/vopr.zig", .bytes = @embedFile("../storage/hot_standby/vopr.zig") },
     .{ .path = "storage/wal_vopr.zig", .bytes = @embedFile("../storage/wal_vopr.zig") },
     .{ .path = "storage/persistent_vopr.zig", .bytes = @embedFile("../storage/persistent_vopr.zig") },
     .{ .path = "storage/transaction_vopr.zig", .bytes = @embedFile("../storage/transaction_vopr.zig") },

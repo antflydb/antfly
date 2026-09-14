@@ -6,6 +6,16 @@ const httpx = @import("httpx");
 const types = @import("types.zig");
 
 /// --- Extractors (framework-agnostic) ---
+/// Get a storage maintenance job
+pub const GetStorageMaintenanceJobPathParams = struct {
+    job_id: []const u8,
+};
+
+/// Request cancellation of a storage maintenance job
+pub const CancelStorageMaintenanceJobPathParams = struct {
+    job_id: []const u8,
+};
+
 /// Parse the JSON request body for beginHABaseBackup.
 pub fn parseBeginHABaseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BaseBackupStartRequest) {
     return std.json.parseFromSlice(types.BaseBackupStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -24,6 +34,11 @@ pub fn parseCaptureHASeedArtifactBody(allocator: std.mem.Allocator, body: []cons
 /// Parse the JSON request body for finishHABaseBackup.
 pub fn parseFinishHABaseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BaseBackupManifestPathRequest) {
     return std.json.parseFromSlice(types.BaseBackupManifestPathRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for bootstrapHAStandby.
+pub fn parseBootstrapHAStandbyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyBootstrapRequest) {
+    return std.json.parseFromSlice(types.StandbyBootstrapRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for appendHACommit.
@@ -100,21 +115,21 @@ pub fn parseCreateHAReplicationSlotBody(allocator: std.mem.Allocator, body: []co
     return std.json.parseFromSlice(types.ReplicationSlotCreateRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Drop an HA replication slot
+/// Drop a hot-standby replication slot
 pub const DropHAReplicationSlotPathParams = struct {
-    /// Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
+    /// Stable standby replication slot name. Path values are percent-encoded; names must be hot-standby identifiers.
     slot_name: []const u8,
 };
 
-/// Pause an HA replication slot
+/// Pause a hot-standby replication slot
 pub const PauseHAReplicationSlotPathParams = struct {
-    /// Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
+    /// Stable standby replication slot name. Path values are percent-encoded; names must be hot-standby identifiers.
     slot_name: []const u8,
 };
 
-/// Resume an HA replication slot
+/// Resume a hot-standby replication slot
 pub const ResumeHAReplicationSlotPathParams = struct {
-    /// Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
+    /// Stable standby replication slot name. Path values are percent-encoded; names must be hot-standby identifiers.
     slot_name: []const u8,
 };
 
@@ -125,30 +140,20 @@ pub const GetHASeedLifecycleReceiptsParams = struct {
     limit: ?[]const u8 = null,
 };
 
-/// Parse the JSON request body for bootstrapHAStandby.
-pub fn parseBootstrapHAStandbyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyBootstrapRequest) {
-    return std.json.parseFromSlice(types.StandbyBootstrapRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
 pub const GetHAStandbyStatusParams = struct {
     /// Current upstream primary LSN used to compute standby lag.
     upstream_lsn: ?[]const u8 = null,
 };
 
+/// Parse the JSON request body for setHAStandbyUpstream.
+pub fn parseSetHAStandbyUpstreamBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyUpstreamRequest) {
+    return std.json.parseFromSlice(types.StandbyUpstreamRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for checkHAWrite.
 pub fn parseCheckHAWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.WriteCheckRequest) {
     return std.json.parseFromSlice(types.WriteCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
-
-/// Get a storage maintenance job
-pub const GetStorageMaintenanceJobPathParams = struct {
-    job_id: []const u8,
-};
-
-/// Request cancellation of a storage maintenance job
-pub const CancelStorageMaintenanceJobPathParams = struct {
-    job_id: []const u8,
-};
 
 /// Route metadata for all operations.
 pub const RequestBodyMode = enum { none, buffered };
@@ -162,38 +167,39 @@ pub const Route = struct {
 };
 
 pub const routes = [_]Route{
-    .{ .method = "POST", .path = "/ha/base-backups", .operation_id = "beginHABaseBackup", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/base-backups/activate", .operation_id = "activateHASeededSlot", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/base-backups/capture", .operation_id = "captureHASeedArtifact", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/base-backups/finish", .operation_id = "finishHABaseBackup", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/commit/append", .operation_id = "appendHACommit", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/commit/check", .operation_id = "checkHACommit", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/fence", .operation_id = "acquireHAFence", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "GET", .path = "/ha/fence/current", .operation_id = "getHACurrentFence", .request_body = .none, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/owner-jobs/check", .operation_id = "checkHAOwnerJob", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "GET", .path = "/ha/primary/status", .operation_id = "getHAPrimaryStatus", .request_body = .none, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/promotion", .operation_id = "promoteHA", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/promotion/assess", .operation_id = "assessHAPromotion", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/promotion/current-fence", .operation_id = "promoteHAWithCurrentFence", .request_body = .none, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/read/check", .operation_id = "checkHARead", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/rejoin/assess", .operation_id = "assessHARejoin", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/rejoin/reseed", .operation_id = "reseedHARejoin", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/rejoin/rewind", .operation_id = "rewindHARejoin", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "GET", .path = "/ha/replication-slots", .operation_id = "listHAReplicationSlots", .request_body = .none, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/replication-slots", .operation_id = "createHAReplicationSlot", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "DELETE", .path = "/ha/replication-slots/{slot_name}", .operation_id = "dropHAReplicationSlot", .request_body = .none, .streaming_response = false },
-    .{ .method = "PUT", .path = "/ha/replication-slots/{slot_name}/pause", .operation_id = "pauseHAReplicationSlot", .request_body = .none, .streaming_response = false },
-    .{ .method = "PUT", .path = "/ha/replication-slots/{slot_name}/resume", .operation_id = "resumeHAReplicationSlot", .request_body = .none, .streaming_response = false },
-    .{ .method = "GET", .path = "/ha/seed-lifecycle/receipts", .operation_id = "getHASeedLifecycleReceipts", .request_body = .none, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/standby/bootstrap", .operation_id = "bootstrapHAStandby", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "GET", .path = "/ha/standby/status", .operation_id = "getHAStandbyStatus", .request_body = .none, .streaming_response = false },
-    .{ .method = "GET", .path = "/ha/watchdog-proof", .operation_id = "getHAWatchdogProof", .request_body = .none, .streaming_response = false },
-    .{ .method = "POST", .path = "/ha/write/check", .operation_id = "checkHAWrite", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/maintenance/check", .operation_id = "startStorageCheck", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/maintenance/compact", .operation_id = "startStorageCompact", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/maintenance/jobs/{job_id}", .operation_id = "getStorageMaintenanceJob", .request_body = .none, .streaming_response = false },
     .{ .method = "DELETE", .path = "/maintenance/jobs/{job_id}", .operation_id = "cancelStorageMaintenanceJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/maintenance/vacuum", .operation_id = "startStorageVacuum", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/base-backups", .operation_id = "beginHABaseBackup", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/base-backups/activate", .operation_id = "activateHASeededSlot", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/base-backups/capture", .operation_id = "captureHASeedArtifact", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/base-backups/finish", .operation_id = "finishHABaseBackup", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/bootstrap", .operation_id = "bootstrapHAStandby", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/commit/append", .operation_id = "appendHACommit", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/commit/check", .operation_id = "checkHACommit", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/fence", .operation_id = "acquireHAFence", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/standby/fence/current", .operation_id = "getHACurrentFence", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/owner-jobs/check", .operation_id = "checkHAOwnerJob", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/standby/primary/status", .operation_id = "getHAPrimaryStatus", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/promotion", .operation_id = "promoteHA", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/promotion/assess", .operation_id = "assessHAPromotion", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/promotion/current-fence", .operation_id = "promoteHAWithCurrentFence", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/read/check", .operation_id = "checkHARead", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/rejoin/assess", .operation_id = "assessHARejoin", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/rejoin/reseed", .operation_id = "reseedHARejoin", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/rejoin/rewind", .operation_id = "rewindHARejoin", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/standby/replication-slots", .operation_id = "listHAReplicationSlots", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/replication-slots", .operation_id = "createHAReplicationSlot", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/standby/replication-slots/{slot_name}", .operation_id = "dropHAReplicationSlot", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/standby/replication-slots/{slot_name}/pause", .operation_id = "pauseHAReplicationSlot", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/standby/replication-slots/{slot_name}/resume", .operation_id = "resumeHAReplicationSlot", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/standby/seed-lifecycle/receipts", .operation_id = "getHASeedLifecycleReceipts", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/standby/status", .operation_id = "getHAStandbyStatus", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/upstream", .operation_id = "setHAStandbyUpstream", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/standby/watchdog-proof", .operation_id = "getHAWatchdogProof", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/standby/write/check", .operation_id = "checkHAWrite", .request_body = .buffered, .streaming_response = false },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -207,10 +213,16 @@ pub const routes = [_]Route{
 ///   try router.register(&server);
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
+        if (!@hasDecl(Impl, "startStorageCheck")) @compileError("ServerRouter: Impl missing required method 'startStorageCheck'");
+        if (!@hasDecl(Impl, "startStorageCompact")) @compileError("ServerRouter: Impl missing required method 'startStorageCompact'");
+        if (!@hasDecl(Impl, "getStorageMaintenanceJob")) @compileError("ServerRouter: Impl missing required method 'getStorageMaintenanceJob'");
+        if (!@hasDecl(Impl, "cancelStorageMaintenanceJob")) @compileError("ServerRouter: Impl missing required method 'cancelStorageMaintenanceJob'");
+        if (!@hasDecl(Impl, "startStorageVacuum")) @compileError("ServerRouter: Impl missing required method 'startStorageVacuum'");
         if (!@hasDecl(Impl, "beginHABaseBackup")) @compileError("ServerRouter: Impl missing required method 'beginHABaseBackup'");
         if (!@hasDecl(Impl, "activateHASeededSlot")) @compileError("ServerRouter: Impl missing required method 'activateHASeededSlot'");
         if (!@hasDecl(Impl, "captureHASeedArtifact")) @compileError("ServerRouter: Impl missing required method 'captureHASeedArtifact'");
         if (!@hasDecl(Impl, "finishHABaseBackup")) @compileError("ServerRouter: Impl missing required method 'finishHABaseBackup'");
+        if (!@hasDecl(Impl, "bootstrapHAStandby")) @compileError("ServerRouter: Impl missing required method 'bootstrapHAStandby'");
         if (!@hasDecl(Impl, "appendHACommit")) @compileError("ServerRouter: Impl missing required method 'appendHACommit'");
         if (!@hasDecl(Impl, "checkHACommit")) @compileError("ServerRouter: Impl missing required method 'checkHACommit'");
         if (!@hasDecl(Impl, "acquireHAFence")) @compileError("ServerRouter: Impl missing required method 'acquireHAFence'");
@@ -230,15 +242,10 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "pauseHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'pauseHAReplicationSlot'");
         if (!@hasDecl(Impl, "resumeHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'resumeHAReplicationSlot'");
         if (!@hasDecl(Impl, "getHASeedLifecycleReceipts")) @compileError("ServerRouter: Impl missing required method 'getHASeedLifecycleReceipts'");
-        if (!@hasDecl(Impl, "bootstrapHAStandby")) @compileError("ServerRouter: Impl missing required method 'bootstrapHAStandby'");
         if (!@hasDecl(Impl, "getHAStandbyStatus")) @compileError("ServerRouter: Impl missing required method 'getHAStandbyStatus'");
+        if (!@hasDecl(Impl, "setHAStandbyUpstream")) @compileError("ServerRouter: Impl missing required method 'setHAStandbyUpstream'");
         if (!@hasDecl(Impl, "getHAWatchdogProof")) @compileError("ServerRouter: Impl missing required method 'getHAWatchdogProof'");
         if (!@hasDecl(Impl, "checkHAWrite")) @compileError("ServerRouter: Impl missing required method 'checkHAWrite'");
-        if (!@hasDecl(Impl, "startStorageCheck")) @compileError("ServerRouter: Impl missing required method 'startStorageCheck'");
-        if (!@hasDecl(Impl, "startStorageCompact")) @compileError("ServerRouter: Impl missing required method 'startStorageCompact'");
-        if (!@hasDecl(Impl, "getStorageMaintenanceJob")) @compileError("ServerRouter: Impl missing required method 'getStorageMaintenanceJob'");
-        if (!@hasDecl(Impl, "cancelStorageMaintenanceJob")) @compileError("ServerRouter: Impl missing required method 'cancelStorageMaintenanceJob'");
-        if (!@hasDecl(Impl, "startStorageVacuum")) @compileError("ServerRouter: Impl missing required method 'startStorageVacuum'");
     }
 
     return struct {
@@ -250,221 +257,39 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
-            try server.post("/ha/base-backups", httpx.Handler.bind(self.impl, beginHABaseBackup));
-            try server.post("/ha/base-backups/activate", httpx.Handler.bind(self.impl, activateHASeededSlot));
-            try server.post("/ha/base-backups/capture", httpx.Handler.bind(self.impl, captureHASeedArtifact));
-            try server.post("/ha/base-backups/finish", httpx.Handler.bind(self.impl, finishHABaseBackup));
-            try server.post("/ha/commit/append", httpx.Handler.bind(self.impl, appendHACommit));
-            try server.post("/ha/commit/check", httpx.Handler.bind(self.impl, checkHACommit));
-            try server.post("/ha/fence", httpx.Handler.bind(self.impl, acquireHAFence));
-            try server.get("/ha/fence/current", httpx.Handler.bind(self.impl, getHACurrentFence));
-            try server.post("/ha/owner-jobs/check", httpx.Handler.bind(self.impl, checkHAOwnerJob));
-            try server.get("/ha/primary/status", httpx.Handler.bind(self.impl, getHAPrimaryStatus));
-            try server.post("/ha/promotion", httpx.Handler.bind(self.impl, promoteHA));
-            try server.post("/ha/promotion/assess", httpx.Handler.bind(self.impl, assessHAPromotion));
-            try server.post("/ha/promotion/current-fence", httpx.Handler.bind(self.impl, promoteHAWithCurrentFence));
-            try server.post("/ha/read/check", httpx.Handler.bind(self.impl, checkHARead));
-            try server.post("/ha/rejoin/assess", httpx.Handler.bind(self.impl, assessHARejoin));
-            try server.post("/ha/rejoin/reseed", httpx.Handler.bind(self.impl, reseedHARejoin));
-            try server.post("/ha/rejoin/rewind", httpx.Handler.bind(self.impl, rewindHARejoin));
-            try server.get("/ha/replication-slots", httpx.Handler.bind(self.impl, listHAReplicationSlots));
-            try server.post("/ha/replication-slots", httpx.Handler.bind(self.impl, createHAReplicationSlot));
-            try server.delete("/ha/replication-slots/:slot_name", httpx.Handler.bind(self.impl, dropHAReplicationSlot));
-            try server.put("/ha/replication-slots/:slot_name/pause", httpx.Handler.bind(self.impl, pauseHAReplicationSlot));
-            try server.put("/ha/replication-slots/:slot_name/resume", httpx.Handler.bind(self.impl, resumeHAReplicationSlot));
-            try server.get("/ha/seed-lifecycle/receipts", httpx.Handler.bind(self.impl, getHASeedLifecycleReceipts));
-            try server.post("/ha/standby/bootstrap", httpx.Handler.bind(self.impl, bootstrapHAStandby));
-            try server.get("/ha/standby/status", httpx.Handler.bind(self.impl, getHAStandbyStatus));
-            try server.get("/ha/watchdog-proof", httpx.Handler.bind(self.impl, getHAWatchdogProof));
-            try server.post("/ha/write/check", httpx.Handler.bind(self.impl, checkHAWrite));
             try server.post("/maintenance/check", httpx.Handler.bind(self.impl, startStorageCheck));
             try server.post("/maintenance/compact", httpx.Handler.bind(self.impl, startStorageCompact));
             try server.get("/maintenance/jobs/:job_id", httpx.Handler.bind(self.impl, getStorageMaintenanceJob));
             try server.delete("/maintenance/jobs/:job_id", httpx.Handler.bind(self.impl, cancelStorageMaintenanceJob));
             try server.post("/maintenance/vacuum", httpx.Handler.bind(self.impl, startStorageVacuum));
-        }
-
-        /// Begin an HA base backup and reserve its replication slot
-        /// POST /ha/base-backups
-        fn beginHABaseBackup(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.beginHABaseBackup(ctx);
-        }
-
-        /// Activate a seeded slot after durable target-generation publication
-        /// POST /ha/base-backups/activate
-        fn activateHASeededSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.activateHASeededSlot(ctx);
-        }
-
-        /// Capture an immutable seed from runtime-owned primary storage
-        /// POST /ha/base-backups/capture
-        fn captureHASeedArtifact(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.captureHASeedArtifact(ctx);
-        }
-
-        /// Finish an HA base backup from a local manifest path
-        /// POST /ha/base-backups/finish
-        fn finishHABaseBackup(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.finishHABaseBackup(ctx);
-        }
-
-        /// Append a primary WAL/effects record and evaluate synchronous commit durability
-        /// POST /ha/commit/append
-        fn appendHACommit(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.appendHACommit(ctx);
-        }
-
-        /// Evaluate synchronous commit durability for an existing LSN
-        /// POST /ha/commit/check
-        fn checkHACommit(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.checkHACommit(ctx);
-        }
-
-        /// Acquire a durable HA promotion fence
-        /// POST /ha/fence
-        fn acquireHAFence(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.acquireHAFence(ctx);
-        }
-
-        /// Get the current durable HA promotion fence
-        /// GET /ha/fence/current
-        fn getHACurrentFence(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.getHACurrentFence(ctx);
-        }
-
-        /// Evaluate whether an owner-only background job may run
-        /// POST /ha/owner-jobs/check
-        fn checkHAOwnerJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.checkHAOwnerJob(ctx);
-        }
-
-        /// Get primary HA status
-        /// GET /ha/primary/status
-        fn getHAPrimaryStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            const query_params = GetHAPrimaryStatusParams{
-                .max_lag_lsn = try ctx.queryDecoded("max_lag_lsn"),
-                .max_retained_bytes = try ctx.queryDecoded("max_retained_bytes"),
-                .max_retained_age_ns = try ctx.queryDecoded("max_retained_age_ns"),
-                .sync_mode = try ctx.queryDecoded("sync_mode"),
-                .sync_selection = try ctx.queryDecoded("sync_selection"),
-                .sync_required = try ctx.queryDecoded("sync_required"),
-                .sync_standby = try ctx.queryDecoded("sync_standby"),
-                .sync_failure = try ctx.queryDecoded("sync_failure"),
-            };
-            return impl.getHAPrimaryStatus(ctx, query_params);
-        }
-
-        /// Acquire a fence and promote this standby
-        /// POST /ha/promotion
-        fn promoteHA(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.promoteHA(ctx);
-        }
-
-        /// Assess whether this standby can be promoted
-        /// POST /ha/promotion/assess
-        fn assessHAPromotion(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.assessHAPromotion(ctx);
-        }
-
-        /// Promote this standby using the current durable fence receipt
-        /// POST /ha/promotion/current-fence
-        fn promoteHAWithCurrentFence(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.promoteHAWithCurrentFence(ctx);
-        }
-
-        /// Evaluate standby read freshness and routing
-        /// POST /ha/read/check
-        fn checkHARead(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.checkHARead(ctx);
-        }
-
-        /// Assess whether a former primary can safely rejoin
-        /// POST /ha/rejoin/assess
-        fn assessHARejoin(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.assessHARejoin(ctx);
-        }
-
-        /// Reseed a fenced former primary when rewind is unsafe
-        /// POST /ha/rejoin/reseed
-        fn reseedHARejoin(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.reseedHARejoin(ctx);
-        }
-
-        /// Rewind a fenced former primary onto the promoted timeline
-        /// POST /ha/rejoin/rewind
-        fn rewindHARejoin(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.rewindHARejoin(ctx);
-        }
-
-        /// List HA replication slots
-        /// GET /ha/replication-slots
-        fn listHAReplicationSlots(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.listHAReplicationSlots(ctx);
-        }
-
-        /// Create an HA replication slot
-        /// POST /ha/replication-slots
-        fn createHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.createHAReplicationSlot(ctx);
-        }
-
-        /// Drop an HA replication slot
-        /// DELETE /ha/replication-slots/{slot_name}
-        fn dropHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            const slot_name = ctx.param("slot_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: slot_name" });
-            return impl.dropHAReplicationSlot(ctx, slot_name);
-        }
-
-        /// Pause an HA replication slot
-        /// PUT /ha/replication-slots/{slot_name}/pause
-        fn pauseHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            const slot_name = ctx.param("slot_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: slot_name" });
-            return impl.pauseHAReplicationSlot(ctx, slot_name);
-        }
-
-        /// Resume an HA replication slot
-        /// PUT /ha/replication-slots/{slot_name}/resume
-        fn resumeHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            const slot_name = ctx.param("slot_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: slot_name" });
-            return impl.resumeHAReplicationSlot(ctx, slot_name);
-        }
-
-        /// Read durable runtime-owned HA seed lifecycle receipts
-        /// GET /ha/seed-lifecycle/receipts
-        fn getHASeedLifecycleReceipts(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            const query_params = GetHASeedLifecycleReceiptsParams{
-                .kind = (try ctx.queryDecoded("kind")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: kind" }),
-                .after = try ctx.queryDecoded("after"),
-                .limit = try ctx.queryDecoded("limit"),
-            };
-            return impl.getHASeedLifecycleReceipts(ctx, query_params);
-        }
-
-        /// Bootstrap this standby from a local base-backup manifest and copied files
-        /// POST /ha/standby/bootstrap
-        fn bootstrapHAStandby(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.bootstrapHAStandby(ctx);
-        }
-
-        /// Get standby HA status
-        /// GET /ha/standby/status
-        fn getHAStandbyStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            const query_params = GetHAStandbyStatusParams{
-                .upstream_lsn = try ctx.queryDecoded("upstream_lsn"),
-            };
-            return impl.getHAStandbyStatus(ctx, query_params);
-        }
-
-        /// Get the runtime Lease watchdog capability proof
-        /// GET /ha/watchdog-proof
-        fn getHAWatchdogProof(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.getHAWatchdogProof(ctx);
-        }
-
-        /// Evaluate whether this node can accept writes
-        /// POST /ha/write/check
-        fn checkHAWrite(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.checkHAWrite(ctx);
+            try server.post("/standby/base-backups", httpx.Handler.bind(self.impl, beginHABaseBackup));
+            try server.post("/standby/base-backups/activate", httpx.Handler.bind(self.impl, activateHASeededSlot));
+            try server.post("/standby/base-backups/capture", httpx.Handler.bind(self.impl, captureHASeedArtifact));
+            try server.post("/standby/base-backups/finish", httpx.Handler.bind(self.impl, finishHABaseBackup));
+            try server.post("/standby/bootstrap", httpx.Handler.bind(self.impl, bootstrapHAStandby));
+            try server.post("/standby/commit/append", httpx.Handler.bind(self.impl, appendHACommit));
+            try server.post("/standby/commit/check", httpx.Handler.bind(self.impl, checkHACommit));
+            try server.post("/standby/fence", httpx.Handler.bind(self.impl, acquireHAFence));
+            try server.get("/standby/fence/current", httpx.Handler.bind(self.impl, getHACurrentFence));
+            try server.post("/standby/owner-jobs/check", httpx.Handler.bind(self.impl, checkHAOwnerJob));
+            try server.get("/standby/primary/status", httpx.Handler.bind(self.impl, getHAPrimaryStatus));
+            try server.post("/standby/promotion", httpx.Handler.bind(self.impl, promoteHA));
+            try server.post("/standby/promotion/assess", httpx.Handler.bind(self.impl, assessHAPromotion));
+            try server.post("/standby/promotion/current-fence", httpx.Handler.bind(self.impl, promoteHAWithCurrentFence));
+            try server.post("/standby/read/check", httpx.Handler.bind(self.impl, checkHARead));
+            try server.post("/standby/rejoin/assess", httpx.Handler.bind(self.impl, assessHARejoin));
+            try server.post("/standby/rejoin/reseed", httpx.Handler.bind(self.impl, reseedHARejoin));
+            try server.post("/standby/rejoin/rewind", httpx.Handler.bind(self.impl, rewindHARejoin));
+            try server.get("/standby/replication-slots", httpx.Handler.bind(self.impl, listHAReplicationSlots));
+            try server.post("/standby/replication-slots", httpx.Handler.bind(self.impl, createHAReplicationSlot));
+            try server.delete("/standby/replication-slots/:slot_name", httpx.Handler.bind(self.impl, dropHAReplicationSlot));
+            try server.put("/standby/replication-slots/:slot_name/pause", httpx.Handler.bind(self.impl, pauseHAReplicationSlot));
+            try server.put("/standby/replication-slots/:slot_name/resume", httpx.Handler.bind(self.impl, resumeHAReplicationSlot));
+            try server.get("/standby/seed-lifecycle/receipts", httpx.Handler.bind(self.impl, getHASeedLifecycleReceipts));
+            try server.get("/standby/status", httpx.Handler.bind(self.impl, getHAStandbyStatus));
+            try server.post("/standby/upstream", httpx.Handler.bind(self.impl, setHAStandbyUpstream));
+            try server.get("/standby/watchdog-proof", httpx.Handler.bind(self.impl, getHAWatchdogProof));
+            try server.post("/standby/write/check", httpx.Handler.bind(self.impl, checkHAWrite));
         }
 
         /// Start a coordinated storage integrity check
@@ -498,15 +323,210 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn startStorageVacuum(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.startStorageVacuum(ctx);
         }
+
+        /// Begin a hot-standby base backup and reserve its replication slot
+        /// POST /standby/base-backups
+        fn beginHABaseBackup(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.beginHABaseBackup(ctx);
+        }
+
+        /// Activate a seeded slot after durable target-generation publication
+        /// POST /standby/base-backups/activate
+        fn activateHASeededSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.activateHASeededSlot(ctx);
+        }
+
+        /// Capture an immutable seed from runtime-owned primary storage
+        /// POST /standby/base-backups/capture
+        fn captureHASeedArtifact(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.captureHASeedArtifact(ctx);
+        }
+
+        /// Finish a hot-standby base backup from a local manifest path
+        /// POST /standby/base-backups/finish
+        fn finishHABaseBackup(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.finishHABaseBackup(ctx);
+        }
+
+        /// Bootstrap this standby from a local base-backup manifest and copied files
+        /// POST /standby/bootstrap
+        fn bootstrapHAStandby(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.bootstrapHAStandby(ctx);
+        }
+
+        /// Append a primary WAL/effects record and evaluate synchronous commit durability
+        /// POST /standby/commit/append
+        fn appendHACommit(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.appendHACommit(ctx);
+        }
+
+        /// Evaluate synchronous commit durability for an existing LSN
+        /// POST /standby/commit/check
+        fn checkHACommit(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.checkHACommit(ctx);
+        }
+
+        /// Acquire a durable hot-standby promotion fence
+        /// POST /standby/fence
+        fn acquireHAFence(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.acquireHAFence(ctx);
+        }
+
+        /// Get the current durable hot-standby promotion fence
+        /// GET /standby/fence/current
+        fn getHACurrentFence(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.getHACurrentFence(ctx);
+        }
+
+        /// Evaluate whether an owner-only background job may run
+        /// POST /standby/owner-jobs/check
+        fn checkHAOwnerJob(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.checkHAOwnerJob(ctx);
+        }
+
+        /// Get primary hot-standby status
+        /// GET /standby/primary/status
+        fn getHAPrimaryStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const query_params = GetHAPrimaryStatusParams{
+                .max_lag_lsn = try ctx.queryDecoded("max_lag_lsn"),
+                .max_retained_bytes = try ctx.queryDecoded("max_retained_bytes"),
+                .max_retained_age_ns = try ctx.queryDecoded("max_retained_age_ns"),
+                .sync_mode = try ctx.queryDecoded("sync_mode"),
+                .sync_selection = try ctx.queryDecoded("sync_selection"),
+                .sync_required = try ctx.queryDecoded("sync_required"),
+                .sync_standby = try ctx.queryDecoded("sync_standby"),
+                .sync_failure = try ctx.queryDecoded("sync_failure"),
+            };
+            return impl.getHAPrimaryStatus(ctx, query_params);
+        }
+
+        /// Acquire a fence and promote this standby
+        /// POST /standby/promotion
+        fn promoteHA(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.promoteHA(ctx);
+        }
+
+        /// Assess whether this standby can be promoted
+        /// POST /standby/promotion/assess
+        fn assessHAPromotion(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.assessHAPromotion(ctx);
+        }
+
+        /// Promote this standby using the current durable fence receipt
+        /// POST /standby/promotion/current-fence
+        fn promoteHAWithCurrentFence(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.promoteHAWithCurrentFence(ctx);
+        }
+
+        /// Evaluate standby read freshness and routing
+        /// POST /standby/read/check
+        fn checkHARead(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.checkHARead(ctx);
+        }
+
+        /// Assess whether a former primary can safely rejoin
+        /// POST /standby/rejoin/assess
+        fn assessHARejoin(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.assessHARejoin(ctx);
+        }
+
+        /// Reseed a fenced former primary when rewind is unsafe
+        /// POST /standby/rejoin/reseed
+        fn reseedHARejoin(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.reseedHARejoin(ctx);
+        }
+
+        /// Rewind a fenced former primary onto the promoted timeline
+        /// POST /standby/rejoin/rewind
+        fn rewindHARejoin(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.rewindHARejoin(ctx);
+        }
+
+        /// List hot-standby replication slots
+        /// GET /standby/replication-slots
+        fn listHAReplicationSlots(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.listHAReplicationSlots(ctx);
+        }
+
+        /// Create a hot-standby replication slot
+        /// POST /standby/replication-slots
+        fn createHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.createHAReplicationSlot(ctx);
+        }
+
+        /// Drop a hot-standby replication slot
+        /// DELETE /standby/replication-slots/{slot_name}
+        fn dropHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const slot_name = ctx.param("slot_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: slot_name" });
+            return impl.dropHAReplicationSlot(ctx, slot_name);
+        }
+
+        /// Pause a hot-standby replication slot
+        /// PUT /standby/replication-slots/{slot_name}/pause
+        fn pauseHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const slot_name = ctx.param("slot_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: slot_name" });
+            return impl.pauseHAReplicationSlot(ctx, slot_name);
+        }
+
+        /// Resume a hot-standby replication slot
+        /// PUT /standby/replication-slots/{slot_name}/resume
+        fn resumeHAReplicationSlot(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const slot_name = ctx.param("slot_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: slot_name" });
+            return impl.resumeHAReplicationSlot(ctx, slot_name);
+        }
+
+        /// Read durable runtime-owned hot-standby seed lifecycle receipts
+        /// GET /standby/seed-lifecycle/receipts
+        fn getHASeedLifecycleReceipts(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const query_params = GetHASeedLifecycleReceiptsParams{
+                .kind = (try ctx.queryDecoded("kind")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: kind" }),
+                .after = try ctx.queryDecoded("after"),
+                .limit = try ctx.queryDecoded("limit"),
+            };
+            return impl.getHASeedLifecycleReceipts(ctx, query_params);
+        }
+
+        /// Get standby status
+        /// GET /standby/status
+        fn getHAStandbyStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const query_params = GetHAStandbyStatusParams{
+                .upstream_lsn = try ctx.queryDecoded("upstream_lsn"),
+            };
+            return impl.getHAStandbyStatus(ctx, query_params);
+        }
+
+        /// Repoint a running standby at a different primary
+        /// POST /standby/upstream
+        fn setHAStandbyUpstream(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.setHAStandbyUpstream(ctx);
+        }
+
+        /// Get the runtime Lease watchdog capability proof
+        /// GET /standby/watchdog-proof
+        fn getHAWatchdogProof(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.getHAWatchdogProof(ctx);
+        }
+
+        /// Evaluate whether this node can accept writes
+        /// POST /standby/write/check
+        fn checkHAWrite(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.checkHAWrite(ctx);
+        }
     };
 }
 
 // Handler interface. Implement these methods on your Impl struct:
 //
+//   fn startStorageCheck(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn startStorageCompact(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getStorageMaintenanceJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn cancelStorageMaintenanceJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
+//   fn startStorageVacuum(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn beginHABaseBackup(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn activateHASeededSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn captureHASeedArtifact(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn finishHABaseBackup(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn bootstrapHAStandby(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn appendHACommit(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn checkHACommit(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn acquireHAFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
@@ -526,12 +546,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn pauseHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
 //   fn resumeHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
 //   fn getHASeedLifecycleReceipts(self: *Impl, ctx: *httpx.Context, params: GetHASeedLifecycleReceiptsParams) !httpx.Response
-//   fn bootstrapHAStandby(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context, params: GetHAStandbyStatusParams) !httpx.Response
+//   fn setHAStandbyUpstream(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getHAWatchdogProof(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn checkHAWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn startStorageCheck(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn startStorageCompact(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn getStorageMaintenanceJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
-//   fn cancelStorageMaintenanceJob(self: *Impl, ctx: *httpx.Context, job_id: []const u8) !httpx.Response
-//   fn startStorageVacuum(self: *Impl, ctx: *httpx.Context) !httpx.Response

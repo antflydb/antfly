@@ -2593,6 +2593,35 @@ fn localModelCapabilities(
     return localModelCapabilitiesInScope(node, io, model, task, null);
 }
 
+test "encoded reader ABI enforces resolved model capabilities for Qwen3-VL generator bundles" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "generators/owner/qwen");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/owner/qwen/config.json",
+        .data = "{\"model_type\":\"qwen3_vl\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/owner/qwen/model_manifest.json",
+        .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/owner/qwen/antfly_inference_bundle.json",
+        .data = "{\"family\":\"qwen3_vl_gguf_bundle/v1\",\"decoder\":\"config.json\",\"projector\":\"model_manifest.json\"}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(models_root);
+    var node = try inference.server.Node.init(allocator, .{ .models_dir = models_root });
+    defer node.deinit();
+    const capabilities = try localModelCapabilities(&node, std.testing.io, "owner/qwen", .read);
+    try std.testing.expect(capabilities.input_modalities.image);
+    try std.testing.expectEqual(.serial_compatibility, capabilities.batch.mode);
+    try std.testing.expectEqual(.read_result, capabilities.output);
+    try std.testing.expect(capabilities.borrowed_attachments);
+    try std.testing.expect(!capabilities.borrowed_rasters);
+}
+
 fn localModelCapabilitiesInScope(
     node: *inference.server.Node,
     io: std.Io,

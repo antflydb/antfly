@@ -3456,42 +3456,67 @@ func haPromotedPrimaryNodeID(status *antflyv1.HAStatus) string {
 	return strings.TrimSpace(promotion.PromotedStandbyID)
 }
 
+// haLegacySlotOperation builds a slot-scoped admin operation addressed at the
+// legacy /admin/v1/ha/replication-slots/... route. The operator keeps
+// surfacing this spelling in status.haStatus.plannedActions[].adminPath
+// regardless of which spelling actually goes out on the wire (that is
+// negotiated per node by the SDK client's PathStyle), so this deliberately
+// does not call the SDK's Standby*ReplicationSlotOperation helpers, which
+// return the canonical /admin/v1/standby/... path. It still delegates slot
+// name validation to the non-deprecated adminsdk.StandbyReplicationSlotPath.
+func haLegacySlotOperation(method string, slotName string, suffix string) (adminsdk.StandbyOperation, bool) {
+	canonicalPath, ok := adminsdk.StandbyReplicationSlotPath(slotName)
+	if !ok {
+		return adminsdk.StandbyOperation{}, false
+	}
+	legacyPath := adminsdk.HAReplicationSlotPathPrefix + strings.TrimPrefix(canonicalPath, adminsdk.StandbyReplicationSlotPathPrefix)
+	return adminsdk.StandbyOperation{Method: method, Path: legacyPath + suffix}, true
+}
+
+// haAdminOperation reports the method and path for a planned HA admin
+// action. It intentionally builds adminsdk.StandbyOperation values from the
+// still-supported legacy /admin/v1/ha/... path constants instead of calling
+// the deprecated adminsdk.HA*Operation() wrappers: those wrappers and the
+// path constants are equivalent legacy spellings, but the wrappers are
+// staticcheck SA1019 deprecated aliases while the underlying path constants
+// (adminsdk.HABaseBackupsFinishPath and siblings) are not. This keeps
+// status.haStatus.plannedActions[].adminPath byte-identical to before.
 func haAdminOperation(action haPlannedAction) (string, string) {
-	operation := adminsdk.HAOperation{}
+	var operation adminsdk.StandbyOperation
 	ok := true
 	switch action.Kind {
 	case haActionCreateSlot:
-		operation = adminsdk.HACreateReplicationSlotOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HAReplicationSlotsPath}
 	case haActionResumeSlot:
-		operation, ok = adminsdk.HAResumeReplicationSlotOperation(haPlannedActionSlotName(action))
+		operation, ok = haLegacySlotOperation(http.MethodPut, haPlannedActionSlotName(action), adminsdk.HAReplicationSlotResumePathSuffix)
 	case haActionPauseSlot:
-		operation, ok = adminsdk.HAPauseReplicationSlotOperation(haPlannedActionSlotName(action))
+		operation, ok = haLegacySlotOperation(http.MethodPut, haPlannedActionSlotName(action), adminsdk.HAReplicationSlotPausePathSuffix)
 	case haActionDropSlot:
-		operation, ok = adminsdk.HADropReplicationSlotOperation(haPlannedActionSlotName(action))
+		operation, ok = haLegacySlotOperation(http.MethodDelete, haPlannedActionSlotName(action), "")
 	case haActionSeedStandby, haActionMarkReseed:
-		operation = adminsdk.HABeginBaseBackupOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HABaseBackupsPath}
 	case haActionFinishStandbySeed:
-		operation = adminsdk.HAFinishBaseBackupOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HABaseBackupsFinishPath}
 	case haActionCaptureSeedArtifact:
-		operation = adminsdk.HASeedCaptureOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HABaseBackupsCapturePath}
 	case haActionActivateSeededSlot:
-		operation = adminsdk.HAActivateSeededSlotOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HABaseBackupsActivatePath}
 	case haActionBootstrapStandbySeed:
-		operation = adminsdk.HABootstrapStandbyOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HAStandbyBootstrapPath}
 	case haActionAcquireFence:
-		operation = adminsdk.HAAcquireFenceOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HAFencePath}
 	case haActionFenceFormerPrimary:
-		operation = adminsdk.HAAcquireFenceOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HAFencePath}
 	case haActionAssessPromotion:
-		operation = adminsdk.HAAssessPromotionOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HAPromotionAssessPath}
 	case haActionPromoteStandby:
-		operation = adminsdk.HAPromoteWithCurrentFenceOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HAPromotionCurrentFencePath}
 	case haActionDemoteFormerPrimary:
-		operation = adminsdk.HAAssessRejoinOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HARejoinAssessPath}
 	case haActionRewindFormerPrimary:
-		operation = adminsdk.HARewindRejoinOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HARejoinRewindPath}
 	case haActionReseedFormerPrimary:
-		operation = adminsdk.HAReseedRejoinOperation()
+		operation = adminsdk.StandbyOperation{Method: http.MethodPost, Path: adminsdk.HARejoinReseedPath}
 	default:
 		ok = false
 	}

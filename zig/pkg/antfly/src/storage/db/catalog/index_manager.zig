@@ -3091,11 +3091,7 @@ pub const IndexManager = struct {
         }
     }
 
-    fn bindPrimaryStore(self: *IndexManager, store: anytype) void {
-        self.bindPrimaryStoreWithMode(store, false);
-    }
-
-    fn bindPrimaryStoreWithMode(self: *IndexManager, store: anytype, read_only: bool) void {
+    fn bindPrimaryStore(self: *IndexManager, store: anytype, read_only: bool) void {
         const Store = @TypeOf(store);
         if (comptime Store == *docstore_mod.DocStore) {
             self.primary_store = store;
@@ -10557,7 +10553,7 @@ pub const IndexManager = struct {
 
     fn loadWithBackfill(self: *IndexManager, store: anytype, allow_backfill: bool, read_only: bool) !void {
         const load_started_ns = nowNs();
-        self.bindPrimaryStoreWithMode(store, read_only);
+        self.bindPrimaryStore(store, read_only);
         self.clearStatusOnlyIndexConfigs();
         self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);
@@ -10912,7 +10908,7 @@ pub const IndexManager = struct {
     ) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store);
+        self.bindPrimaryStore(store, false);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
 
         var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, self.io, cfg);
@@ -11001,7 +10997,7 @@ pub const IndexManager = struct {
     pub fn addAllNoBackfill(self: *IndexManager, store: anytype, configs: []const types.IndexConfig) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store);
+        self.bindPrimaryStore(store, false);
         if (configs.len == 0) return;
 
         var stored_configs = try self.alloc.alloc(types.IndexConfig, configs.len);
@@ -11080,7 +11076,7 @@ pub const IndexManager = struct {
     pub fn registerReplacementIndex(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store);
+        self.bindPrimaryStore(store, false);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
         // A replacement opens only its target generation, but named artifact
         // sources still depend on the canonical durable producer/resolver
@@ -12197,7 +12193,7 @@ pub const IndexManager = struct {
     ) !?DetachedIndex {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store);
+        self.bindPrimaryStore(store, false);
 
         if (std.meta.activeTag(replacement.*) != cfg.kind or
             types.indexConfigHash(detachedIndexConfig(replacement).*) != types.indexConfigHash(cfg))
@@ -31043,7 +31039,7 @@ test "repair shadow cleanup isolates malformed pointer ownership" {
     defer store.close();
     var manager = try IndexManager.init(alloc, base_path);
     defer manager.deinit();
-    manager.bindPrimaryStore(&store);
+    manager.bindPrimaryStore(&store, false);
 
     const corrupt_name = "dense_corrupt";
     const protected_root = ".repair-shadow-protected";
@@ -38305,7 +38301,7 @@ test "algebraic retirement pages generation keys and resumes from its durable cu
     {
         var restarted = try IndexManager.init(alloc, std.mem.span(path));
         defer restarted.deinit();
-        restarted.bindPrimaryStore(&store);
+        restarted.bindPrimaryStore(&store, false);
         while (true) {
             var result = try restarted.drainGeneratedArtifactCleanupOutboxPage(&store);
             defer result.deinit();
@@ -38365,7 +38361,7 @@ test "orphan algebraic generation cleanup resumes from deleted durable pages" {
     {
         var manager = try IndexManager.init(alloc, std.mem.span(path));
         defer manager.deinit();
-        manager.bindPrimaryStore(&store);
+        manager.bindPrimaryStore(&store, false);
         try std.testing.expect(try manager.cleanupInactiveRepairShadowRootsPage());
         const remaining = try store.scanPrefix(alloc, fact_prefix);
         defer docstore_mod.DocStore.freeResults(alloc, remaining);
@@ -38378,7 +38374,7 @@ test "orphan algebraic generation cleanup resumes from deleted durable pages" {
     {
         var restarted = try IndexManager.init(alloc, std.mem.span(path));
         defer restarted.deinit();
-        restarted.bindPrimaryStore(&store);
+        restarted.bindPrimaryStore(&store, false);
         while (try restarted.cleanupInactiveRepairShadowRootsPage()) {}
     }
     const remaining = try store.scanPrefix(alloc, fact_prefix);

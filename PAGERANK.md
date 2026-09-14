@@ -1,3 +1,9 @@
+> Current command and test organization is documented in
+> [GRAPH_METRICS_EXECUTION.md](zig/docs/GRAPH_METRICS_EXECUTION.md#test-ownership-and-fault-qualification).
+> The process-command and promotion-matrix descriptions below are historical:
+> operators now use `antfly index maintenance`; worker launch controls live in
+> the native integration fixture, and replayable fault histories live in VOPR.
+
 # PageRank Graph Metric Design
 
 ## Goal
