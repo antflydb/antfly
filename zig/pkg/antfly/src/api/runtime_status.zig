@@ -5222,6 +5222,84 @@ fn testGraphMetricStatsClone(alloc: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("page-error", status.build_pages[0].last_error);
 }
 
+fn freeSourceReplayStatuses(alloc: std.mem.Allocator, sources: []db_mod.types.IndexSourceReplayStatus) void {
+    for (sources) |source| alloc.free(source.artifact_name);
+    if (sources.len > 0) alloc.free(sources);
+}
+
+fn cloneSourceReplayStatuses(alloc: std.mem.Allocator, sources: []const db_mod.types.IndexSourceReplayStatus) ![]db_mod.types.IndexSourceReplayStatus {
+    if (sources.len == 0) return &.{};
+    const out = try alloc.alloc(db_mod.types.IndexSourceReplayStatus, sources.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |source| alloc.free(source.artifact_name);
+        alloc.free(out);
+    }
+    for (sources, out) |source, *copy| {
+        copy.* = source;
+        copy.artifact_name = try alloc.dupe(u8, source.artifact_name);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn testSourceReplayStatsClone(alloc: std.mem.Allocator) !void {
+    const expected = [_]db_mod.types.IndexSourceReplayStatus{
+        .{ .artifact_name = "document_dense_v1", .published_sequence = 7, .target_sequence = 7, .observation_count = 3 },
+        .{ .artifact_name = "lagging", .published_sequence = 5, .target_sequence = 9, .repair_summary_ready = false, .observation_count = 0 },
+        .{ .artifact_name = "failed", .published_sequence = 4, .target_sequence = 8, .failed = true, .repair_issue_count = 2 },
+    };
+    var source_arena = std.heap.ArenaAllocator.init(alloc);
+    defer source_arena.deinit();
+    const source_alloc = source_arena.allocator();
+    const sources = try source_alloc.dupe(db_mod.types.IndexSourceReplayStatus, &expected);
+    for (sources) |*source| source.artifact_name = try source_alloc.dupe(u8, source.artifact_name);
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "vec",
+        .kind = .dense_vector,
+        .source_replay = sources,
+        .projection_checkpoint_status = try source_alloc.dupe(u8, "rebuilding"),
+        .index_repair_trigger = try source_alloc.dupe(u8, "catalog_admission"),
+        .index_repair_phase = try source_alloc.dupe(u8, "building"),
+        .index_repair_automation = try source_alloc.dupe(u8, "paused"),
+        .index_repair_wait_reason = try source_alloc.dupe(u8, "backoff"),
+    }};
+    const cloned = try cloneDBStats(alloc, .{ .indexes = &indexes, .index_count = 1, .enrichment = .{
+        .embed_batches_completed = 11,
+        .projection_checkpoint_status = try source_alloc.dupe(u8, "clean"),
+        .active_phase = try source_alloc.dupe(u8, "publishing"),
+        .stall_reason = try source_alloc.dupe(u8, "publishing_overdue"),
+    } });
+    defer db_mod.types.freeDBStats(alloc, cloned);
+    try std.testing.expectEqual(expected.len, cloned.indexes[0].source_replay.len);
+    try std.testing.expect(cloned.indexes[0].source_replay.ptr != sources.ptr);
+    for (sources, cloned.indexes[0].source_replay) |original, copy|
+        try std.testing.expect(original.artifact_name.ptr != copy.artifact_name.ptr);
+    // The ABI response/parser and each cache reader have independent lifetimes.
+    _ = source_arena.reset(.free_all);
+    try std.testing.expectEqualDeep(&expected, cloned.indexes[0].source_replay);
+    try std.testing.expectEqual(@as(u64, 11), cloned.enrichment.embed_batches_completed);
+
+    var snapshot = snapshot: {
+        var cache = TableRuntimeSnapshotCache.init(alloc);
+        defer cache.deinit();
+        _ = try publishGroupForTest(&cache, "docs", .{ .group_id = 7, .stats = cloned });
+        break :snapshot (try cache.snapshotGroupStatus(alloc, "docs", 7)) orelse return error.OutOfMemory;
+    };
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqualDeep(&expected, snapshot.stats.indexes[0].source_replay);
+    try std.testing.expectEqual(@as(u64, 11), snapshot.stats.enrichment.embed_batches_completed);
+    try std.testing.expectEqualStrings("clean", snapshot.stats.enrichment.projection_checkpoint_status);
+    try std.testing.expectEqualStrings("publishing", snapshot.stats.enrichment.active_phase);
+    try std.testing.expectEqualStrings("publishing_overdue", snapshot.stats.enrichment.stall_reason);
+    const index = snapshot.stats.indexes[0];
+    try std.testing.expectEqualStrings("rebuilding", index.projection_checkpoint_status);
+    try std.testing.expectEqualStrings("catalog_admission", index.index_repair_trigger);
+    try std.testing.expectEqualStrings("building", index.index_repair_phase);
+    try std.testing.expectEqualStrings("paused", index.index_repair_automation);
+    try std.testing.expectEqualStrings("backoff", index.index_repair_wait_reason);
+}
+
 pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_mod.types.DBStats {
     const resolver_replay = try cloneResolverReplayDiagnostics(alloc, stats.resolver_replay);
     errdefer db_mod.types.freeResolverReplayDiagnostics(alloc, resolver_replay);
@@ -5233,6 +5311,8 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
     }
 
     for (stats.indexes, 0..) |item, i| {
+        const source_replay = try cloneSourceReplayStatuses(alloc, item.source_replay);
+        errdefer freeSourceReplayStatuses(alloc, source_replay);
         const load_error = if (item.load_error) |value|
             try alloc.dupe(u8, value)
         else
@@ -5332,6 +5412,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         const graph_metric_status = try db_mod.types.cloneGraphMetricStatuses(alloc, item.graph_metric_status);
         errdefer db_mod.types.freeGraphMetricStatuses(alloc, graph_metric_status);
         indexes[i] = .{
+            .source_replay = source_replay,
             .graph_metric_status = graph_metric_status,
             .name = try alloc.dupe(u8, item.name),
             .kind = item.kind,
@@ -5378,9 +5459,9 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .repair_scan_issue_count = item.repair_scan_issue_count,
             .index_repair_id = item.index_repair_id,
             .index_lifecycle_work_class = item.index_lifecycle_work_class,
-            .index_repair_trigger = item.index_repair_trigger,
-            .index_repair_phase = item.index_repair_phase,
-            .index_repair_automation = item.index_repair_automation,
+            .index_repair_trigger = stableStatusLabel(@import("../storage/db/derived/index_repair_state.zig").Trigger, item.index_repair_trigger, &.{ "none", "index_activation", "corrupt_local_repair_state" }),
+            .index_repair_phase = stableStatusLabel(@import("../storage/db/derived/index_repair_state.zig").Phase, item.index_repair_phase, &.{"none"}),
+            .index_repair_automation = stableStatusLabel(@import("../storage/db/derived/index_repair_state.zig").Automation, item.index_repair_automation, &.{"none"}),
             .index_repair_attempts = item.index_repair_attempts,
             .index_repair_started_at_ms = item.index_repair_started_at_ms,
             .index_repair_updated_at_ms = item.index_repair_updated_at_ms,
@@ -5389,11 +5470,11 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .index_repair_target_sequence = item.index_repair_target_sequence,
             .index_repair_next_retry_at_ms = item.index_repair_next_retry_at_ms,
             .index_repair_last_error = index_repair_last_error,
-            .index_repair_wait_reason = item.index_repair_wait_reason,
+            .index_repair_wait_reason = stableStatusLabel(enum {}, item.index_repair_wait_reason, &.{ "none", "paused", "terminal", "backoff", "rollback", "convergence", "action_required" }),
             .index_repair_status = item.index_repair_status,
             .index_repair_action_required = item.index_repair_action_required,
             .index_repair_active_generation_serviceable = item.index_repair_active_generation_serviceable,
-            .projection_checkpoint_status = item.projection_checkpoint_status,
+            .projection_checkpoint_status = stableProjectionStatus(item.projection_checkpoint_status),
             .projection_checkpoint_applied_sequence = item.projection_checkpoint_applied_sequence,
             .projection_checkpoint_generation = item.projection_checkpoint_generation,
             .projection_checkpoint_config_hash = item.projection_checkpoint_config_hash,
@@ -5484,7 +5565,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .repair_issue_count_estimated = stats.repair_issue_count_estimated,
         .doc_identity = stats.doc_identity,
         .doc_set_planning = stats.doc_set_planning,
-        .enrichment = stats.enrichment,
+        .enrichment = cloneEnrichmentStats(stats.enrichment),
         .resolution = cloneReplayStageStats(stats.resolution),
         .promotion = cloneReplayStageStats(stats.promotion),
         .resolver_replay = resolver_replay,
@@ -5495,6 +5576,29 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
         .async_indexing = stats.async_indexing,
     };
+}
+
+// These fields borrow static labels in native DBStats. Re-intern wire labels
+// through their owning enums before the parser buffer is released. Unknown
+// peer-version values stay explicit instead of becoming a false healthy state.
+fn stableStatusLabel(comptime T: type, value: []const u8, comptime extra: []const []const u8) []const u8 {
+    if (@typeInfo(T).@"enum".fields.len > 0) {
+        if (std.meta.stringToEnum(T, value)) |tag| return @tagName(tag);
+    }
+    inline for (extra) |label| if (std.mem.eql(u8, value, label)) return label;
+    return "unknown";
+}
+
+fn stableProjectionStatus(value: []const u8) []const u8 {
+    return stableStatusLabel(@import("../storage/db/derived/apply_state.zig").ProjectionStatus, value, &.{ "retrying", "failed" });
+}
+
+fn cloneEnrichmentStats(stats: db_mod.types.EnrichmentStats) db_mod.types.EnrichmentStats {
+    var cloned = stats;
+    cloned.projection_checkpoint_status = stableProjectionStatus(stats.projection_checkpoint_status);
+    cloned.active_phase = stableStatusLabel(@import("../inference/execution_context.zig").Phase, stats.active_phase, &.{"idle"});
+    cloned.stall_reason = stableStatusLabel(enum {}, stats.stall_reason, &.{ "", "worker_missing", "model_loading", "publishing_overdue", "embedding_overdue" });
+    return cloned;
 }
 
 fn cloneReplayStageStats(stats: db_mod.types.ReplayStageStats) db_mod.types.ReplayStageStats {
@@ -6308,6 +6412,11 @@ fn consumerTests() type {
             try std.testing.expect(failing.has_induced_failure);
             try std.testing.expect((try cache.snapshot(std.testing.allocator, "docs")) == null);
             try std.testing.expectEqual(@as(u64, 8), cache.tables.get("docs").?.groups.get(8).?.stats.doc_count);
+        }
+
+        test "table runtime snapshot cache clones stored status source replay with independent ownership" {
+            try testSourceReplayStatsClone(std.testing.allocator);
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, testSourceReplayStatsClone, .{});
         }
 
         test "table runtime snapshot cache clones stored status" {

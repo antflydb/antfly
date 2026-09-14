@@ -4,6 +4,49 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-13: producer readiness snapshot loss (#723)
+
+[The Antfly E2E job on #723](https://github.com/antflydb/antfly/actions/runs/34801864332/job/103853126220)
+ran `07bb51bdf0a063ad0f4782e35a48669b6c253f2c` and reported one failure,
+445 passes, and five skips. The four previously investigated cases passed.
+`test_embedding_producer_registry_rejects_orphans_and_owner_mismatches`
+timed out requiring `enrichment_runtime.embed_batches_completed > 0`, despite
+one indexed, query-visible document and complete durable source coverage.
+Its aggregate readiness also reported `source_observation_incomplete` while
+the individual shard reported complete publication without its source list.
+
+The counter is scoped to the enrichment runtime, not durable completion.
+Catalog descriptor changes can close/reopen an owner, and restart necessarily
+replaces it. The exact CI replacement interleaving was not captured; the
+unchanged executable passed 20 isolated repetitions locally. The test now
+requires complete readiness for the configured artifact source and successful
+semantic queries through both the producer index and its artifact consumer,
+before and after a forced process restart. It does not require replaying
+already-published artifacts just to increment a new runtime's counters.
+
+The readiness contradiction has a deterministic production cause:
+`runtime_status.cloneDBStats` omitted `DBIndexStats.source_replay`. That copy
+runs when an ABI response is detached from its JSON parser and when the
+control-plane cache publishes or returns a snapshot. Source names, replay
+watermarks, repair facts, and observation counts now retain independent
+ownership across these copies. The regression covers complete, lagging, and
+failed sources, frees the original backing arena, destroys the intermediate
+cache, and checks the retained result. Allocation-failure injection checks
+partial-clone cleanup. It belongs to the existing runtime snapshot test family.
+
+The same native reproduction exposed poisoned diagnostic labels (`0xaa` byte
+arrays) after the ABI parser was freed. Enrichment phase/checkpoint/stall and
+index repair/checkpoint labels now resolve to immutable labels, using the
+owner enums where available and an explicit `unknown` for unsupported peer
+values. This keeps native DBStats' borrowed-label contract and does not add
+allocations to status merges.
+
+Before the fix, the new unit regression reported **expected three sources,
+found zero**; the strengthened E2E case timed out on the original executable
+with `source_observation_incomplete`. Logs are
+`/tmp/pr723-source-negative.log` and `/tmp/pr723-source-e2e-before.log`.
+Final merged-revision validation is recorded below when complete.
+
 ## 2026-09-13: overlapping storage owner E2E failures (#626, #722)
 
 [PR #626's Antfly E2E job](https://github.com/antflydb/antfly/actions/runs/34781521711/job/103794277696)
