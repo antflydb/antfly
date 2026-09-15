@@ -1035,3 +1035,162 @@ test "catalog projection timeout does not publish a late build" {
     defer reader.unlock();
     try std.testing.expect(reader.cachedSnapshotLocked() == null);
 }
+
+test "catalog retained WAL replay preserves durable metadata while applied watermark catches up" {
+    const raft = @import("raft_engine");
+    const raft_storage = @import("../raft/storage/mod.zig");
+    const state_machine = @import("../raft/state_machine/mod.zig");
+    const metadata_machine = @import("../raft/state_machine/metadata.zig");
+    const group_id: u64 = 9223372036854775809;
+    const alloc = std.testing.allocator;
+    const Source = struct {
+        store: *metadata_storage.RaftApplyStore,
+        epoch: std.atomic.Value(u64) = .init(1),
+        registered: bool = false,
+
+        fn source(self: *@This()) CatalogProjectionReader.Source {
+            return .{ .ptr = self, .vtable = &.{
+                .ensure_listener_registered = ensureListenerRegistered,
+                .catalog_epoch = catalogEpoch,
+                .capture_projection = captureProjection,
+            } };
+        }
+
+        fn ensureListenerRegistered(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.registered) return;
+            try self.store.addProjectionListener(.{
+                .ptr = self,
+                .vtable = &.{ .on_projection_signal = onProjection },
+            });
+            self.registered = true;
+        }
+
+        fn onProjection(ptr: *anyopaque, signal: metadata_storage.ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (signal.kind) {
+                .metadata_incarnation, .table, .range => _ = self.epoch.fetchAdd(1, .release),
+                else => {},
+            }
+        }
+
+        fn catalogEpoch(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.epoch.load(.acquire);
+        }
+
+        fn captureProjection(ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, deadline_ns: ?u64) !metadata_storage.CatalogProjectionSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.store.captureCatalogProjection(allocator, group, deadline_ns);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retained-catalog", .{tmp.sub_path});
+    defer alloc.free(root);
+    const wal_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retained-wal", .{tmp.sub_path});
+    defer alloc.free(wal_root);
+    var layout = try raft_storage.ReplicaPathLayout.initForReplica(alloc, wal_root, group_id, 2);
+    defer layout.deinit(alloc);
+    const initialize = try metadata_storage.encodeTransitionCommand(alloc, .{
+        .initialize_metadata_incarnation = "11111111111111111111111111111111".*,
+    });
+    defer alloc.free(initialize);
+    const old_table = try metadata_storage.encodeTransitionCommand(alloc, .{
+        .upsert_table = .{ .table_id = 7, .name = "retained-old", .schema_json = "{}", .indexes_json = "{}" },
+    });
+    defer alloc.free(old_table);
+    const new_table = try metadata_storage.encodeTransitionCommand(alloc, .{
+        .upsert_table = .{ .table_id = 7, .name = "retained-new", .schema_json = "{}", .indexes_json = "{}" },
+    });
+    defer alloc.free(new_table);
+    const entries = [_]raft.core.Entry{
+        .{ .index = 1, .term = 1, .data = initialize },
+        .{ .index = 2, .term = 1, .data = old_table },
+        .{ .index = 3, .term = 1 },
+        .{ .index = 4, .term = 1, .data = new_table },
+        .{ .index = 5, .term = 1 },
+    };
+    {
+        var initial_wal = try raft_storage.WalReplicaState.init(alloc, layout, .{ .applied_watermark_persist_interval = 1 });
+        defer initial_wal.deinit();
+        try initial_wal.seedConfStateIfEmpty(&.{ 1, 2, 3 });
+        try initial_wal.groupStorage().persistReady(group_id, .{
+            .entries = &entries,
+            .hard_state = .{ .current_term = 1, .commit_index = 5 },
+        });
+        try initial_wal.setAppliedIndex(1);
+        try initial_wal.flushForShutdown();
+        var initial_store = try metadata_storage.RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer initial_store.deinit();
+        for ([_][]const raft.core.Entry{ entries[0..4], entries[4..] }) |batch| {
+            const encoded = try state_machine.encodeCommittedEntries(alloc, batch);
+            defer alloc.free(encoded);
+            try initial_store.snapshotBuilder().applyBatch(.{
+                .group_id = group_id,
+                .commit_index = batch[batch.len - 1].index,
+                .entries_bytes = encoded,
+            });
+        }
+    }
+    var store = try metadata_storage.RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    var wal = try raft_storage.WalReplicaState.init(alloc, layout, .{ .applied_watermark_persist_interval = 1 });
+    defer wal.deinit();
+    try std.testing.expectEqual(@as(u64, 1), wal.appliedIndex());
+    try std.testing.expectEqual(@as(u64, 5), (try store.latestBatch(group_id)).?.commit_index);
+    var source = Source{ .store = &store };
+    var reader: CatalogProjectionReader = .{};
+    defer reader.deinit(alloc);
+    var before = try reader.routingSnapshot(alloc, group_id, source.source(), null);
+    defer reader.freeRoutingSnapshot(alloc, &before);
+    try std.testing.expectEqual(@as(u64, 4), before.catalog_revision);
+    try std.testing.expectEqual(@as(usize, 1), before.tables.len);
+    try std.testing.expectEqualStrings("retained-new", before.tables[0].name);
+    try std.testing.expectEqual("11111111111111111111111111111111".*, (try store.captureCatalogCursor(group_id)).metadata_incarnation.?);
+    const epoch = source.epoch.load(.acquire);
+    var node = try raft.core.RawNode.init(alloc, .{
+        .id = 2,
+        .group_id = group_id,
+        .peers = &.{ 1, 2, 3 },
+        .applied = wal.appliedIndex(),
+        .max_committed_size_per_ready = 1,
+        .election_tick = 10,
+        .heartbeat_tick = 1,
+    }, wal.storage());
+    defer node.deinit();
+    const Sink = struct {
+        fn set(ptr: *anyopaque, group: u64, index: u64) !void {
+            try std.testing.expectEqual(group_id, group);
+            const state: *raft_storage.WalReplicaState = @ptrCast(@alignCast(ptr));
+            try state.setAppliedIndex(index);
+        }
+    };
+    var machine = metadata_machine.MetadataStateMachine{
+        .alloc = alloc,
+        .snapshot_builder = store.snapshotBuilder(),
+        .applied_sink = .{ .ptr = &wal, .vtable = &.{ .set_applied_index = Sink.set } },
+    };
+    for (2..6) |expected_index| {
+        const ready = node.ready();
+        try std.testing.expect(ready.snapshot == null);
+        try std.testing.expectEqual(@as(usize, 1), ready.committed_entries.len);
+        try std.testing.expectEqual(@as(u64, @intCast(expected_index)), ready.committed_entries[0].index);
+        try wal.groupStorage().persistReady(group_id, ready);
+        try machine.stateMachine().applyReady(group_id, ready.snapshot, ready.committed_entries, ready.read_states);
+        node.advance(ready);
+        try std.testing.expectEqual(@as(u64, @intCast(expected_index)), node.status().applied_index);
+        try std.testing.expectEqual(@as(u64, @intCast(expected_index)), wal.appliedIndex());
+        std.debug.print("retained-wal-probe replayed={d} durable_before=5 durable_now={d} revision_before={d} revision_now={d}\n", .{
+            expected_index, (try store.latestBatch(group_id)).?.commit_index, before.catalog_revision, (try store.captureCatalogCursor(group_id)).revision,
+        });
+        var current = try reader.routingSnapshot(alloc, group_id, source.source(), null);
+        defer reader.freeRoutingSnapshot(alloc, &current);
+        try std.testing.expectEqualDeep(before.tables, current.tables);
+        try std.testing.expectEqual(before.catalog_revision, current.catalog_revision);
+        try std.testing.expectEqual(@as(u64, 5), (try store.latestBatch(group_id)).?.commit_index);
+        try std.testing.expectEqual(epoch, source.epoch.load(.acquire));
+    }
+    try std.testing.expectEqual(@as(u64, 5), wal.appliedIndex());
+    try std.testing.expectEqual(@as(u64, 5), node.status().applied_index);
+}
