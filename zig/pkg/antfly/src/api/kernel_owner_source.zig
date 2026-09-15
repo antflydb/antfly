@@ -4044,10 +4044,10 @@ test "storage repair lease downgrade admits readers while fencing configuration"
     entry.exclusive_active = true;
     entry.exclusive_pending = false;
     var lease = Source.Lease{ .source = &source, .entry = &entry, .exclusive = true };
-    try std.testing.expect(!Source.tryReserveEntryLeaseLocked(&entry, false));
+    try std.testing.expect(!Source.tryReserveEntryLeaseLocked(&entry, .shared));
     lease.downgrade();
     try std.testing.expect(!lease.exclusive);
-    try std.testing.expect(Source.tryReserveEntryLeaseLocked(&entry, false));
+    try std.testing.expect(Source.tryReserveEntryLeaseLocked(&entry, .shared));
     try std.testing.expectEqual(@as(usize, 2), entry.active_users);
-    try std.testing.expect(!Source.tryReserveEntryLeaseLocked(&entry, true));
+    try std.testing.expect(!Source.tryReserveEntryLeaseLocked(&entry, .exclusive));
 }

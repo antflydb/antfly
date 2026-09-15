@@ -113,7 +113,10 @@ def test_catalog_restore_to_qualified_destination(backup_api, long_names):
     destination = "destination".ljust(255, "a") if long_names else "destination"
     api.post(f"/databases/{database}", {})
     path = f"/databases/{database}/namespaces/public/tables"
-    api.post(path + "/source", {"num_shards": 1})
+    api.post(
+        path + "/source",
+        {"num_shards": 1, "storage": {"dense_embeddings": "primary_lsm"}},
+    )
     api.post(
         path + "/source/batch",
         {"inserts": {"doc1": {"title": "restored"}}, "sync_level": "full_index"},
@@ -366,7 +369,9 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
         f"/databases/{database}/namespaces/public/tables/" + quote(literal, safe=""),
     ]
     for index, path in enumerate(paths):
-        api.post(path, {})
+        # Snapshot qualification requires primary ownership, including scoped
+        # tables now covered by the standalone vector-storage creation policy.
+        api.post(path, {"storage": {"dense_embeddings": "primary_lsm"}})
         api.post(
             path + "/batch",
             {"inserts": {"doc": {"scope": index}}, "sync_level": "full_index"},
