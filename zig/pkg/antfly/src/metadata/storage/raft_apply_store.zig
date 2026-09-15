@@ -128,7 +128,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "8";
+const derived_catalog_index_version = "9";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -2949,6 +2949,47 @@ pub const RaftApplyStore = struct {
         return .{ .revision = meta.revision, .tables = tables };
     }
 
+    pub fn writeValidationRevision(self: *RaftApplyStore, group_id: u64) !u64 {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var buf: [160]u8 = undefined;
+        const bytes = txn.get(try catalogRevisionKeyForGroup(&buf, group_id)) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        if (bytes.len != 8) return error.InvalidCatalogRecord;
+        return std.mem.readInt(u64, bytes[0..8], .little);
+    }
+
+    pub fn tableWriteValidation(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        const identity = (try self.getTableByNameResultTxn(system_catalog.ResolvedTable, a, &txn, group_id, name)) orelse return error.TableNotFound;
+        var table_key_buf: [160]u8 = undefined;
+        const table_bytes = try txn.get(try tableKeyForGroup(&table_key_buf, group_id, identity.table_id));
+        const definition = (try decodeTableProjection(a, table_bytes, .schema)).query_definition.?;
+        var shapes: std.ArrayList([]const u8) = .empty;
+        var prefix_buf: [1024]u8 = undefined;
+        const prefix = try extensionTableOwnerIndexPrefixForTable(&prefix_buf, group_id, name);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const member = try decodeExtensionMemberRecord(a, try txn.get(entry.value));
+            if (member.object_kind != .data_shape) continue;
+            const kind = member.shape_kind orelse continue;
+            if (kind == .document or kind == .row) try shapes.append(a, member.owner_metadata_json);
+        }
+        return std.json.Stringify.valueAlloc(alloc, @import("../../system_catalog/projection.zig").WriteValidation{
+            .schema_json = definition.schema_json,
+            .data_shapes = shapes.items,
+        }, .{});
+    }
+
     pub fn queryTableDefinition(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) !?system_catalog.QueryDefinition {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
@@ -5530,7 +5571,9 @@ pub const RaftApplyStore = struct {
             member.object_kind,
             member.object_name,
         );
-        try txn.put(key, "");
+        var member_key_buf: [1024]u8 = undefined;
+        const member_key = try extensionMemberKeyForGroup(&member_key_buf, group_id, member.extension_name, member.object_kind, member.object_name);
+        try txn.put(key, member_key);
     }
 
     fn deleteExtensionTableOwnerIndexTxn(
@@ -5957,7 +6000,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.reallocation_request_pending),
             .upsert_extension_package, .remove_extension_package => metadataSnapshotProjectionBit(.extension_package),
             .upsert_installed_extension, .remove_installed_extension => metadataSnapshotProjectionBit(.installed_extension),
-            .upsert_extension_member, .remove_extension_member => metadataSnapshotProjectionBit(.extension_member),
+            .upsert_extension_member, .remove_extension_member => metadataSnapshotProjectionBit(.extension_member) | metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_extension_dependency, .remove_extension_dependency => metadataSnapshotProjectionBit(.extension_dependency),
             .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.table_transition_fence) |
@@ -6311,7 +6354,10 @@ pub const RaftApplyStore = struct {
         try txn.put(key, &value);
         try self.projectEntriesTxn(&txn, group_id, entries_bytes);
         if (outcome.failure) |err| return err;
-        if (outcomeChangesCatalog(outcome.projection_signals.items)) {
+        const extension_changed = for (outcome.committed_keys.items) |changed| {
+            if (std.mem.startsWith(u8, changed.key, "\x00\x00__metadata__:metadata_extension_member:")) break true;
+        } else false;
+        if (extension_changed or outcomeChangesCatalog(outcome.projection_signals.items)) {
             var catalog_revision_buf: [@sizeOf(u64)]u8 = undefined;
             std.mem.writeInt(u64, &catalog_revision_buf, commit_index, .little);
             var catalog_revision_key_buf: [160]u8 = undefined;
@@ -10195,6 +10241,10 @@ fn decodeTableIdentity(alloc: std.mem.Allocator, encoded: []const u8) !system_ca
 }
 
 fn decodeTableQueryProjection(alloc: std.mem.Allocator, encoded: []const u8, include_definition: bool) !system_catalog.ResolvedTable {
+    return decodeTableProjection(alloc, encoded, if (include_definition) .query else .identity);
+}
+
+fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: enum { identity, schema, query }) !system_catalog.ResolvedTable {
     var pos: usize = 0;
     const table_id = try readInt(encoded, &pos, u64);
     _ = try readInt(encoded, &pos, u16); // replicas
@@ -10213,11 +10263,11 @@ fn decodeTableQueryProjection(alloc: std.mem.Allocator, encoded: []const u8, inc
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
     // framed fields to validate the encoding, but copy only query-owned data.
     if (count != 5 and count != 6 and count != 8) return error.InvalidMetadataTransitionEncoding;
-    return .{ .table_id = table_id, .name = name, .query_definition = if (include_definition) try (system_catalog.QueryDefinition{
+    return .{ .table_id = table_id, .name = name, .query_definition = if (mode != .identity) try (system_catalog.QueryDefinition{
         .table_id = table_id,
         .schema_json = fields[1],
-        .read_schema_json = if (count == 5) "" else fields[2],
-        .indexes_json = fields[if (count == 5) 2 else 3],
+        .read_schema_json = if (mode == .schema or count == 5) "" else fields[2],
+        .indexes_json = if (mode == .schema) "" else fields[if (count == 5) 2 else 3],
     }).clone(alloc) else null };
 }
 
@@ -20127,4 +20177,53 @@ test "system catalog schema progress batch is bounded atomic replayable and dura
     const progress = try reopened.listSchemaProgress(a, 41);
     defer reopened.freeSchemaProgress(a, progress);
     try std.testing.expectEqualDeep(&records, progress);
+}
+
+test "system catalog write validation is indexed bounded and invalidates extension changes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/validation", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const Apply = struct {
+        fn run(owner: *RaftApplyStore, index: u64, command: TransitionCommand) !void {
+            const bytes = try encodeTransitionCommand(std.testing.allocator, command);
+            defer std.testing.allocator.free(bytes);
+            const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = bytes }});
+            defer std.testing.allocator.free(entries);
+            try owner.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = index, .entries_bytes = entries });
+        }
+    };
+    const large = [_]u8{'x'} ** (256 * 1024);
+    try Apply.run(&store, 1, .{ .upsert_table = .{ .table_id = 42, .name = "docs", .schema_json = "{}", .indexes_json = &large } });
+    var member: extension_domain.ExtensionMember = .{
+        .extension_name = "ext",
+        .object_kind = .data_shape,
+        .object_name = "shape",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .shape_kind = .document,
+        .owner_metadata_json = "{\"version\":1}",
+    };
+    try Apply.run(&store, 2, .{ .upsert_extension_member = member });
+    try std.testing.expectEqual(@as(u64, 2), try store.writeValidationRevision(21));
+    {
+        var buffer: [16 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+        const bytes = try store.tableWriteValidation(bounded.allocator(), 21, "docs");
+        var parsed = try std.json.parseFromSlice(@import("../../system_catalog/projection.zig").WriteValidation, alloc, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("{}", parsed.value.schema_json);
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.data_shapes.len);
+        try std.testing.expectEqualStrings(member.owner_metadata_json, parsed.value.data_shapes[0]);
+    }
+    member.scope.table_name = "other";
+    try Apply.run(&store, 3, .{ .upsert_extension_member = member });
+    try std.testing.expectEqual(@as(u64, 3), try store.writeValidationRevision(21));
+    const moved = try store.tableWriteValidation(alloc, 21, "docs");
+    defer alloc.free(moved);
+    var parsed = try std.json.parseFromSlice(@import("../../system_catalog/projection.zig").WriteValidation, alloc, moved, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.data_shapes.len);
 }

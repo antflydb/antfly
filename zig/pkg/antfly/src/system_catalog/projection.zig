@@ -21,6 +21,13 @@ const api = @import("../metadata/api.zig");
 const extensions = @import("../extensions/mod.zig");
 const raft = @import("../raft/reconciler.zig");
 
+/// One immutable metadata read: the table schema and all applicable extension
+/// constraints. No placement, runtime, or unrelated-table inventory is copied.
+pub const WriteValidation = struct {
+    schema_json: []const u8,
+    data_shapes: []const []const u8 = &.{},
+};
+
 pub const TableEntry = struct { name: []const u8, table: metadata.TableRecord };
 pub const TableListing = struct {
     revision: u64,

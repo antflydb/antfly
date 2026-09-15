@@ -660,6 +660,7 @@ pub const AntflyApiHandler = struct {
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         self.api_server.recordHandledRequest();
         try self.api_server.reachRequestLifecycle(.ingress, null);
+        establishInternalRoutedBatchDeadline(ctx);
         establishInternalTxnPreDecisionDeadline(ctx);
         establishInternalTxnStatusDeadline(ctx);
         establishInternalBackupDeadline(ctx);
@@ -690,6 +691,23 @@ pub const AntflyApiHandler = struct {
         try ctx.request.replaceOwnedBodyAllocation(decoded.body, decoded.allocation);
         _ = ctx.request.headers.remove("content-encoding");
         return next.call(ctx);
+    }
+
+    fn establishInternalRoutedBatchDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_invalid) return;
+        const raw = ctx.header(internal_batch_forwarding.remaining_ms_header) orelse return;
+        const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        if (budget_ms == 0 or budget_ms > internal_batch_forwarding.max_remaining_ms) {
+            ctx.application_deadline_invalid = true;
+            return;
+        }
+        const deadline = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
+            @as(u64, budget_ms) *| std.time.ns_per_ms;
+        ctx.application_deadline_io = ctx.io;
+        ctx.application_deadline_ns = @min(ctx.application_deadline_ns orelse deadline, deadline);
     }
 
     fn establishCatalogRouteFenceDeadline(ctx: *httpx.Context) void {
@@ -812,6 +830,7 @@ pub const AntflyApiHandler = struct {
     pub fn dispatchLinkedRoute(self: *AntflyApiHandler, ctx: *httpx.Context, route_handler: httpx.Handler) !httpx.Response {
         self.api_server.recordHandledRequest();
         try self.api_server.reachRequestLifecycle(.ingress, null);
+        establishInternalRoutedBatchDeadline(ctx);
         establishInternalTxnPreDecisionDeadline(ctx);
         if (try self.haMutationRejection(ctx)) |response| {
             try self.api_server.reachRequestLifecycle(.response_ready, null);
@@ -1833,9 +1852,9 @@ pub const AntflyApiHandler = struct {
             .batch_validator = .{
                 .ptr = self.api_server,
                 .validate_fn = struct {
-                    fn call(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+                    fn call(ptr: *anyopaque, request: operation_contract.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
                         const server: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-                        return server.validateTableWritesAgainstSchema(table_name, writes);
+                        return server.validateTableWritesAgainstSchemaWithContext(request, table_name, writes);
                     }
                 }.call,
             },
@@ -1844,9 +1863,9 @@ pub const AntflyApiHandler = struct {
             .txn_validator = .{
                 .ptr = self.api_server,
                 .validate_fn = struct {
-                    fn call(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
+                    fn call(ptr: *anyopaque, request: operation_contract.RequestContext, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
                         const server: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-                        return server.validateTableWritesAgainstSchema(table_name, writes);
+                        return server.validateTableWritesAgainstSchemaWithContext(request, table_name, writes);
                     }
                 }.call,
             },
@@ -2941,8 +2960,10 @@ pub const AntflyApiHandler = struct {
                 break :blk textResponse(ctx, 503, "routed raft batch unavailable");
             },
             error.NotFound => textResponse(ctx, 404, "not found"),
-            error.Canceled => textResponse(ctx, 408, "request canceled"),
-            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.Canceled, error.DeadlineExceeded => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, if (err == error.Canceled) 408 else 504, @errorName(err));
+            },
             else => textResponse(ctx, 500, "internal server error"),
         };
         _ = ctx.status(201);
@@ -3470,7 +3491,7 @@ pub const AntflyApiHandler = struct {
 
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
-        self.api_server.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
+        self.api_server.validateCommitTablesAgainstSchema(operationContext(ctx, null), distributed_tables) catch |err| switch (err) {
             error.InvalidBatchRequest,
             error.InvalidArgument,
             error.InvalidGraphEdges,
@@ -3479,6 +3500,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
+            error.TableNotFound => return textResponse(ctx, 404, "not found"),
+            error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return textResponse(ctx, 503, "catalog validation unavailable"),
+            error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return textResponse(ctx, 504, "request deadline exceeded"),
+            error.Canceled, error.Cancelled => return textResponse(ctx, 408, "request canceled"),
             else => return err,
         };
         if (try self.api_server.validateCommitReadSet(commit_req.*)) |conflict| {
@@ -4187,7 +4212,7 @@ pub const AntflyApiHandler = struct {
 
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
-        self.api_server.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
+        self.api_server.validateCommitTablesAgainstSchema(operationContext(ctx, null), distributed_tables) catch |err| switch (err) {
             error.InvalidBatchRequest,
             error.InvalidArgument,
             error.InvalidGraphEdges,
@@ -4196,6 +4221,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
+            error.TableNotFound => return textResponse(ctx, 404, "not found"),
+            error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return textResponse(ctx, 503, "catalog validation unavailable"),
+            error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return textResponse(ctx, 504, "request deadline exceeded"),
+            error.Canceled, error.Cancelled => return textResponse(ctx, 408, "request canceled"),
             else => return err,
         };
         if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
@@ -5150,6 +5179,18 @@ pub const AntflyApiHandler = struct {
         return self.lookupKey(ctx, table_name, key, .{ .fields = params.fields, .consistency = params.consistency });
     }
 
+    pub fn updateNamespaceTableSchema(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.updateSchema(ctx, table_name);
+    }
+
+    pub fn patchNamespaceTableSchema(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.patchSchema(ctx, table_name);
+    }
+
     pub fn listNamespaceTableIndexes(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
         _ = database_name;
         _ = namespace_name;
@@ -5789,11 +5830,15 @@ pub const AntflyApiHandler = struct {
         };
         defer merge_req.deinit(alloc);
 
-        self.api_server.validateTableWritesAgainstSchema(decoded_table_name, merge_req.writes) catch |err| switch (err) {
+        self.api_server.validateTableWritesAgainstSchemaWithContext(operationContext(ctx, null), decoded_table_name, merge_req.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => {
                 _ = ctx.status(400);
                 return ctx.text("invalid linear merge request");
             },
+            error.TableNotFound => return textResponse(ctx, 404, "not found"),
+            error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return textResponse(ctx, 503, "catalog validation unavailable"),
+            error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return textResponse(ctx, 504, "request deadline exceeded"),
+            error.Canceled, error.Cancelled => return textResponse(ctx, 408, "request canceled"),
             else => return err,
         };
 

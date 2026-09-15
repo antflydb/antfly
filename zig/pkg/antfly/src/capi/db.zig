@@ -3114,6 +3114,14 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.resolveSystemCatalogIdentities(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .catalog_write_validation => |name| {
+                    const value = handle.store.tableWriteValidation(a, group_id, name) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_write_validation_revision => {
+                    const value = handle.store.writeValidationRevision(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .catalog_query_definition => |input| {
                     const value = handle.store.queryTableDefinition(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

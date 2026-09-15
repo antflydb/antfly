@@ -18705,20 +18705,20 @@ pub const IndexManager = struct {
                 defer manager.alloc.free(ordinals);
                 for (docs_buf.items, ordinals) |*doc, ordinal| doc.doc_ordinal = ordinal;
 
-                // Page publication and the repair-intent cursor are separate
-                // durable commits. A retry may therefore cover an already
-                // persisted page. Upsert into the private candidate so crashes
-                // before or after either commit cannot duplicate live entries.
-                // Ordinary one-shot backfills still start from an empty index.
-                const replaced = if (resumable) try manager.deleteTextBatchEntry(text_entry, doc_ids) else TextBatchMutationStats{};
-                var stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
-                stats.noteDelete(replaced.deleted_any);
+                var page = @import("../../persistent.zig").PersistentIndex.RebuildPage{
+                    .index = &text_entry.persistent,
+                    .cursor = last_doc_key,
+                };
+                if (resumable) try page.begin();
+                defer page.deinit();
+                const stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
+                if (resumable) try page.commit();
                 try manager.finalizeTextBatchMutations(text_entry, .{
                     .compact_text = false,
                     .compact_text_segment_threshold = if (resumable) null else text_backfill_compact_segment_threshold,
                     .defer_text_compaction = resumable,
                 }, stats);
-                try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
+                if (!resumable) try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
@@ -18737,7 +18737,16 @@ pub const IndexManager = struct {
             }
         }.run;
 
-        var scan_lower_buf: ?[]u8 = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else null;
+        const durable_cursor = try entry.persistent.rebuildCursorAlloc(self.alloc);
+        const resumable = yield_check != null or durable_cursor != null;
+        defer if (durable_cursor) |cursor| self.alloc.free(cursor);
+        // The candidate page transaction is authoritative if the separate
+        // primary repair-intent cursor was not persisted before a crash.
+        const effective_resume = if (durable_cursor) |cursor|
+            if (resume_from == null or std.mem.order(u8, cursor, resume_from.?) == .gt) cursor else resume_from
+        else
+            resume_from;
+        var scan_lower_buf: ?[]u8 = if (effective_resume) |buf| try self.alloc.dupe(u8, buf) else null;
         defer if (scan_lower_buf) |buf| self.alloc.free(buf);
         const configured_doc_limit = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
         // Bulk throughput settings are not scheduler quanta. Bound both rows
@@ -18872,7 +18881,7 @@ pub const IndexManager = struct {
                     read_txn,
                     cancel_check,
                     capacity_check,
-                    yield_check != null,
+                    resumable,
                 );
                 if (batch_last_doc_key) |old| self.alloc.free(old);
                 batch_last_doc_key = null;
@@ -18888,7 +18897,7 @@ pub const IndexManager = struct {
 
         // Cooperative builds leave merging to the normal bounded text merge
         // scheduler instead of adding a whole-index compaction to their tail.
-        if (flushed_batches > 0 and yield_check == null) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
+        if (flushed_batches > 0 and !resumable) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
         return null;

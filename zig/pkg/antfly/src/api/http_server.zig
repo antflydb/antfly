@@ -7394,23 +7394,52 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn validateTableWritesAgainstSchema(self: *ApiHttpServer, table_name: []const u8, writes: anytype) !void {
+        return self.validateTableWritesAgainstSchemaWithContext(.{}, table_name, writes);
+    }
+
+    pub fn validateTableWritesAgainstSchemaWithContext(self: *ApiHttpServer, context: api_operation.RequestContext, table_name: []const u8, writes: anytype) !void {
+        try context.ensureActive();
         if (writes.len == 0) return;
+        if (self.source.vtable.system_catalog != null) {
+            const bytes = try self.source.systemCatalog(self.alloc, context, .{ .write_validation = table_name });
+            defer self.alloc.free(bytes);
+            var parsed = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").WriteValidation, self.alloc, bytes, .{});
+            defer parsed.deinit();
+            try context.ensureActive();
+            if (parsed.value.schema_json.len != 0) {
+                var schema = try tables_api.parseValidatedTableSchema(self.alloc, parsed.value.schema_json);
+                defer schema.deinit(self.alloc);
+                try tables_api.validateWritesAgainstTableSchema(self.alloc, schema, writes);
+            }
+            for (parsed.value.data_shapes) |shape| {
+                try context.ensureActive();
+                try validateExtensionDataShapeSchema(self.alloc, shape);
+                var schema = tables_api.parseValidatedTableSchema(self.alloc, shape) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.InvalidExtensionShape,
+                };
+                defer schema.deinit(self.alloc);
+                try tables_api.validateWritesAgainstTableSchema(self.alloc, schema, writes);
+            }
+            return context.ensureActive();
+        }
+        // Minimal embedded/test sources without a system-catalog capability.
         var snapshot_opt = try self.source.cachedAdminSnapshot();
         if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
         var snapshot = snapshot_opt orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-
         if (table.schema_json.len != 0) {
             var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, table.schema_json);
             defer parsed_schema.deinit(self.alloc);
             try tables_api.validateWritesAgainstTableSchema(self.alloc, parsed_schema, writes);
         }
         try validateWritesAgainstExtensionDataShapes(self.alloc, &snapshot, table_name, writes);
+        try context.ensureActive();
     }
 
-    pub fn validateCommitTablesAgainstSchema(self: *ApiHttpServer, tables: []const distributed_txn.TableCommitRequest) !void {
-        for (tables) |table| try self.validateTableWritesAgainstSchema(table.table_name, table.writes);
+    pub fn validateCommitTablesAgainstSchema(self: *ApiHttpServer, request: api_operation.RequestContext, tables: []const distributed_txn.TableCommitRequest) !void {
+        for (tables) |table| try self.validateTableWritesAgainstSchemaWithContext(request, table.table_name, table.writes);
     }
 
     fn readSetVersionMatches(expected_version: u64, actual_version: ?u64) bool {
@@ -11082,9 +11111,12 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
-        self.validateTableWritesAgainstSchema(table_name, req.writes) catch |err| switch (err) {
+        self.validateTableWritesAgainstSchemaWithContext(request, table_name, req.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
+            error.Timeout, error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.Cancelled, error.Canceled => return error.Canceled,
+            error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.ResourceTemporarilyUnavailable => return error.Unavailable,
             else => {
                 std.log.err("public table batch schema validation failed table={s} err={}", .{ table_name, err });
                 public_table_http.setLastBatchFailureName(err);
@@ -25862,7 +25894,7 @@ test "api http server serves extension catalog reads" {
     try std.testing.expectEqual(@as(u16, 405), write_resp.status);
 }
 
-test "api http server validates writes against extension data shape members" {
+test "system catalog validates writes against table-specific extension data shapes" {
     const alloc = std.testing.allocator;
     const shape_schema = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"},\"kind\":{\"type\":\"keyword\"}}}}}}";
 
@@ -25872,10 +25904,25 @@ test "api http server validates writes against extension data shape members" {
                 .ptr = undefined,
                 .vtable = &.{
                     .status = status,
+                    .system_catalog = catalog,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                 },
             };
+        }
+
+        fn catalog(_: *anyopaque, a: std.mem.Allocator, request: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+            try request.ensureActive();
+            if (input == .resolve) {
+                try std.testing.expectEqualStrings("memories", input.resolve.table);
+                return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedTable{ .table_id = 10, .name = "memories" }, .{});
+            }
+            try std.testing.expect(input == .write_validation);
+            try std.testing.expectEqualStrings("memories", input.write_validation);
+            return std.json.Stringify.valueAlloc(a, @import("../system_catalog/projection.zig").WriteValidation{
+                .schema_json = "",
+                .data_shapes = &.{shape_schema},
+            }, .{});
         }
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {

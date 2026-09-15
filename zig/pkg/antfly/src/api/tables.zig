@@ -6105,7 +6105,7 @@ test "system catalog stored create preserves tablespace and storage ownership to
     defer decoded.deinit(alloc);
     try std.testing.expectEqualStrings("serving", decoded.tablespace_name.?);
     try std.testing.expectEqual(@as(?u32, 1), decoded.num_shards);
-    try std.testing.expectEqual(@import("../common/table_storage.zig").DenseEmbeddings.vector_store, decoded.storage.dense_embeddings);
+    try std.testing.expectEqual(@import("../common/table_storage.zig").DenseEmbeddings.vector_store, decoded.storage.?.dense_embeddings);
 }
 
 test "system catalog definition cache shares immutable content and protects hot entries from scans" {

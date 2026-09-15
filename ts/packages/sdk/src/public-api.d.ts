@@ -2034,6 +2034,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Replace a table's schema
+         * @description Replaces the complete table schema. Properties omitted from the request
+         *     are removed. Use PATCH on this path for a partial JSON Merge Patch update.
+         */
+        put: operations["updateNamespaceTableSchema"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Patch a table's schema
+         * @description Applies an RFC 7396 JSON Merge Patch to the current table schema. Object
+         *     members are merged recursively and a null value removes that member.
+         *     Antfly validates and versions the resulting complete schema atomically.
+         */
+        patch: operations["patchNamespaceTableSchema"];
+        trace?: never;
+    };
     "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup": {
         parameters: {
             query?: never;
@@ -20493,6 +20527,89 @@ export interface operations {
                 };
                 content?: never;
             };
+        };
+    };
+    updateNamespaceTableSchema: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TableSchema"];
+            };
+        };
+        responses: {
+            /** @description Schema updated successfully */
+            200: {
+                headers: {
+                    /** @description Strong ETag for the committed schema version. */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Table"];
+                };
+            };
+            202: components["responses"]["CommittedMutationAccepted"];
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    patchNamespaceTableSchema: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/merge-patch+json": components["schemas"]["TableSchemaPatch"];
+                "application/json": components["schemas"]["TableSchemaPatch"];
+            };
+        };
+        responses: {
+            /** @description Schema patched successfully */
+            200: {
+                headers: {
+                    /** @description Strong ETag for the committed schema version. */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Table"];
+                };
+            };
+            202: components["responses"]["CommittedMutationAccepted"];
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
         };
     };
     backupNamespaceTable: {

@@ -264,6 +264,12 @@ pub const RaftApplyStore = struct {
     pub fn resolveSystemCatalogIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany) !system_catalog.ResolvedMany {
         return self.catalogProjection(system_catalog.ResolvedMany, alloc, group_id, .{ .catalog_resolve_many = request });
     }
+    pub fn tableWriteValidation(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_write_validation = name });
+    }
+    pub fn writeValidationRevision(self: *RaftApplyStore, group_id: u64) !u64 {
+        return self.catalogProjection(u64, self.alloc, group_id, .catalog_write_validation_revision);
+    }
     pub fn queryTableDefinition(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) !?system_catalog.QueryDefinition {
         return self.catalogProjection(?system_catalog.QueryDefinition, alloc, group_id, .{ .catalog_query_definition = name });
     }

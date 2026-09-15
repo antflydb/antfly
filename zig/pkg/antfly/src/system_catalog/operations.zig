@@ -112,6 +112,23 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
 
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
     return switch (input) {
+        .write_validation_revision => blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk std.json.Stringify.valueAlloc(alloc, @import("../metadata/api.zig").MetadataHead{
+                .metadata_group_id = svc.metadata_group_id,
+                .metadata_incarnation = try svc.metadataIncarnation(),
+                .metadata_epoch = try store.writeValidationRevision(svc.metadata_group_id),
+            }, .{});
+        },
+        .write_validation => |name| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const result = try store.tableWriteValidation(alloc, svc.metadata_group_id, name);
+            errdefer alloc.free(result);
+            try context.ensureActive();
+            break :blk result;
+        },
         .table_status => |target| listTablesJson(svc, alloc, context, target.listing()),
         .list_tables => |request| listTablesJson(svc, alloc, context, request),
         .export_snapshot => blk: {

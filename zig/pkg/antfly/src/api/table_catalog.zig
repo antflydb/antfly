@@ -1997,6 +1997,12 @@ pub fn tableGroupDescriptorProjection(
             return projection;
     }
 
+    // A budgeted background quantum cannot fall back to an unbounded
+    // diagnostic read. Its scheduler keeps the debt until the point projection
+    // is ready. Explicit split/restore structural admission retains the full
+    // lifecycle fallback below.
+    if (deadline_ns != null) return error.CatalogRoutingUnavailable;
+
     // A split destination does not become an active routing range until
     // cutover, but its immutable descriptor is already captured in the
     // replicated transition contract. Consult the full lifecycle projection

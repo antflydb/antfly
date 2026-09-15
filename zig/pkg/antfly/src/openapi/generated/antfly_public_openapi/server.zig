@@ -565,6 +565,36 @@ pub fn parseRestoreNamespaceTableBody(allocator: std.mem.Allocator, body: []cons
     return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Replace a table's schema
+pub const UpdateNamespaceTableSchemaPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for updateNamespaceTableSchema.
+pub fn parseUpdateNamespaceTableSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_schema_openapi.TableSchema) {
+    return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Patch a table's schema
+pub const PatchNamespaceTableSchemaPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for patchNamespaceTableSchema.
+pub fn parsePatchNamespaceTableSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TableSchemaPatch) {
+    return std.json.parseFromSlice(types.TableSchemaPatch, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Set namespace tablespace
 pub const SetNamespaceTableTablespacePathParams = struct {
     table_name: []const u8,
@@ -1250,6 +1280,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename", .operation_id = "renameNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore", .operation_id = "restoreNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "updateNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "PATCH", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "patchNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "setNamespaceTableTablespace", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "clearNamespaceTableTablespace", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tablespace", .operation_id = "setNamespaceTablespace", .request_body = .buffered, .streaming_response = false },
@@ -1381,6 +1413,8 @@ pub const routes = [_]Route{
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn renameNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn restoreNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn updateNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn patchNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn setNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn clearNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn setNamespaceTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response

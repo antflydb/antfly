@@ -677,3 +677,64 @@ def test_catalog_transaction_session_keeps_bound_identity_through_rename(statefu
     assert original in retry_result["tables"]
     api.delete(f"/tables/{original}")
     api.delete(f"/tables/{renamed}")
+
+
+def test_catalog_write_validation_refreshes_after_schema_change(stateful_api):
+    api = stateful_api
+    database = "validation_" + uuid.uuid4().hex[:10]
+    api.post(f"/databases/{database}", {})
+    path = f"/databases/{database}/namespaces/public/tables/events"
+
+    def schema(value_type):
+        return {
+            "default_type": "doc",
+            "enforce_types": True,
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"value": {"type": value_type}},
+                        "additionalProperties": False,
+                    }
+                }
+            },
+        }
+
+    api.post(path, {"schema": schema("integer")})
+    try:
+        api.post(
+            path + "/batch",
+            {"inserts": {"warm": {"value": 1}}, "sync_level": "full_index"},
+        )
+        api.post(path + "/batch", {"deletes": ["warm"], "sync_level": "full_index"})
+        updated = api.put(path + "/schema", schema("string"))
+        version = updated["schema"]["version"]
+
+        def stable():
+            current = api.get(path)
+            return (
+                current["schema"]["version"] == version
+                and current.get("migration") is None
+            )
+
+        assert wait_until(stable, timeout_s=120, interval_s=0.1)
+        patched = api._request(
+            "PATCH", path + "/schema", payload={"description": "validated events"}
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["schema"]["version"] == version + 1
+        version += 1
+        assert wait_until(stable, timeout_s=120, interval_s=0.1)
+        invalid = api._request(
+            "POST", path + "/batch", payload={"inserts": {"bad": {"value": 2}}}
+        )
+        assert invalid.status_code == 400, invalid.text
+        api.post(
+            path + "/batch",
+            {"inserts": {"good": {"value": "current"}}, "sync_level": "full_index"},
+        )
+        assert api.get(path + "/documents/good") == {"value": "current"}
+        assert api._request("GET", path + "/documents/bad").status_code == 404
+    finally:
+        api.delete(path)
+        api.delete(f"/databases/{database}")

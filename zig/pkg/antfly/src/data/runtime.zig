@@ -385,6 +385,7 @@ const DataRaftMutationDiscovery = enum {
 };
 
 const DataRaftBatchRoute = struct {
+    admission_deadline_ns: ?u64 = null,
     /// Local structural commands must not be forwarded into a successor term.
     required_local_term: ?u64 = null,
     allow_remote_forward: bool = true,
@@ -4518,6 +4519,16 @@ const IndexRepairCancellationFence = struct {
 const IndexRepairYieldFence = struct {
     server: *DataServer,
     deadline_ns: u64,
+
+    fn catalogDeadline(self: @This()) ?u64 {
+        // Scheduler and catalog clocks may have different epochs (notably
+        // Threaded awake versus native MONOTONIC on Darwin). Preserve only
+        // the remaining quantum at the descriptor-admission boundary.
+        const io = if (self.server.backend_runtime) |runtime| runtime.io() else null;
+        return self.server.write_source.catalog.deadlineFrom(
+            antfly.public_api.table_catalog.RoutingBudget.initIo(self.deadline_ns, io),
+        );
+    }
 
     fn requested(ptr: *anyopaque) bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -8985,9 +8996,22 @@ pub const DataServer = struct {
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
         forwarding: antfly.public_api.internal_batch_forwarding.Context,
-        cancellation_token: antfly.public_api.operation.CancellationToken,
+        request: antfly.public_api.operation.RequestContext,
     ) !?void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        const cancellation_token = request.cancellation;
+        // Convert the caller clock once, preserving the remaining absolute
+        // budget across all lower-level admission and forwarding phases.
+        const received_at = self.dataRaftMonotonicNs();
+        const remaining = if (request.deadline_ns) |deadline| blk: {
+            const now = if (request.deadline_io) |borrow| clock: {
+                var receiver = try borrow.receive();
+                break :clock @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds)));
+            } else platform_time.monotonicNs();
+            break :blk deadline -| now;
+        } else dataRaftForwardedLeaderWaitNs(forwarding);
+        if (remaining == 0) return error.DeadlineExceeded;
         const write_route_fence: ?antfly.metadata_api.CatalogRouteFence = switch (authority) {
             .catalog => |fence| fence,
             .transaction, .split_replication, .merge_replication => null,
@@ -9001,6 +9025,7 @@ pub const DataServer = struct {
             table_name,
             req,
             .{
+                .admission_deadline_ns = received_at +| remaining,
                 .discovery = .cached,
                 .campaign_allowed = forwarding.campaign_allowed,
                 .forwards_remaining = forwarding.forwards_remaining,
@@ -9466,7 +9491,7 @@ pub const DataServer = struct {
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
         const required_protocol_version = requiredRaftBatchProtocolVersion(req);
-        const deadline_ns = self.dataRaftMonotonicNs() +| leader_wait_ns;
+        const deadline_ns = @min(route.admission_deadline_ns orelse std.math.maxInt(u64), self.dataRaftMonotonicNs() +| leader_wait_ns);
         try ensureDataRaftBatchRouteActive(route);
         try self.reachDataRequestLifecycle(.{
             .phase = .routing_started,
@@ -17155,6 +17180,7 @@ pub const DataServer = struct {
                     .target_index_name = schema_index_name,
                     .advance_index_repairs = schema_index_name != null,
                     .index_repair_options = .{
+                        .admission_deadline_ns = schema_yield.catalogDeadline(),
                         .target_index_name = schema_index_name,
                         .cancel_check = .{ .ptr = &schema_fence, .is_requested = SchemaRepairFence.cancelled },
                         .yield_check = .{ .ptr = &schema_yield, .is_requested = IndexRepairYieldFence.requested },
@@ -17641,6 +17667,7 @@ pub const DataServer = struct {
             const result = self.liveRuntimeWriteSource().catchUpTableGroupBestEffortWithMetadata(self.alloc, group_id, table_name, .{
                 .advance_index_repairs = true,
                 .index_repair_options = .{
+                    .admission_deadline_ns = yield_fence.catalogDeadline(),
                     .cancel_check = .{
                         .ptr = &cancellation_fence,
                         .is_requested = IndexRepairCancellationFence.requested,
@@ -20005,6 +20032,13 @@ const RemoteMetadataSource = struct {
     // the next mutation or post-mutation catalog refresh away from the leader.
     preferred_authority_uri_index: usize = 0,
     preferred_read_uri_index: usize = 0,
+    // Bounded, table-keyed immutable wire projections. Stripe admission
+    // coalesces same-table misses without serializing unrelated tables.
+    validation_slots: [128]ValidationSlot = @splat(.{}),
+    validation_head_mutex: std.atomic.Mutex = .unlocked,
+    validation_head: ?antfly.metadata_api.MetadataHead = null,
+    validation_head_at_ns: u64 = 0,
+    validation_head_generation: u64 = 0,
     cache_mutex: std.atomic.Mutex = .unlocked,
     cached_head: ?antfly.metadata_api.MetadataHead = null,
     metadata_group_id: ?u64 = null,
@@ -20038,6 +20072,23 @@ const RemoteMetadataSource = struct {
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
     test_faults: TestFaults = .{},
+
+    const ValidationSlot = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        entry: ?struct {
+            name: []u8,
+            bytes: []u8,
+            head: antfly.metadata_api.MetadataHead,
+            invalidation: u64,
+        } = null,
+        fn clear(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.entry) |entry| {
+                alloc.free(entry.name);
+                alloc.free(entry.bytes);
+            }
+            self.entry = null;
+        }
+    };
 
     fn init(
         alloc: std.mem.Allocator,
@@ -20109,6 +20160,7 @@ const RemoteMetadataSource = struct {
     }
 
     fn deinit(self: *RemoteMetadataSource) void {
+        for (&self.validation_slots) |*slot| slot.clear(self.alloc);
         for (self.http_executors) |*executor| executor.deinit();
         if (self.http_executors.len > 0) self.alloc.free(self.http_executors);
         if (self.request_executors.len > 0) self.alloc.free(self.request_executors);
@@ -21944,9 +21996,81 @@ const RemoteMetadataSource = struct {
         }
     }
 
+    fn readWriteValidation(self: *RemoteMetadataSource, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, name: []const u8) ![]u8 {
+        try request.ensureActive();
+        const started = self.awakeNs();
+        var remaining: u64 = remote_metadata_snapshot_timeout_ns;
+        if (request.deadline_ns) |deadline| {
+            const now = if (request.deadline_io) |borrow| clock: {
+                var receiver = try borrow.receive();
+                break :clock @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds)));
+            } else platform_time.monotonicNs();
+            remaining = @min(remaining, deadline -| now);
+        }
+        var bounded = request;
+        bounded.deadline_ns = started +| remaining;
+        bounded.deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&self.io);
+        const slot = &self.validation_slots[std.hash.Wyhash.hash(0, name) % self.validation_slots.len];
+        while (!slot.mutex.tryLock()) {
+            try bounded.ensureActive();
+            try self.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        defer slot.mutex.unlock();
+        while (true) {
+            try bounded.ensureActive();
+            lockAtomic(&self.cache_mutex);
+            const generation = self.snapshot_invalidation_generation;
+            self.cache_mutex.unlock();
+            // The durable catalog revision includes extension membership but
+            // excludes heartbeats. Checking it is one metadata point read,
+            // independent of catalog size, shared by every validation stripe.
+            const head = head: {
+                while (!self.validation_head_mutex.tryLock()) {
+                    try bounded.ensureActive();
+                    try self.io.sleep(.fromMilliseconds(1), .awake);
+                }
+                defer self.validation_head_mutex.unlock();
+                if (self.validation_head) |cached| if (self.validation_head_generation == generation and self.awakeNs() -| self.validation_head_at_ns < std.time.ns_per_s) break :head cached;
+                const bytes = try self.readSystemCatalog(alloc, bounded, .write_validation_revision);
+                defer alloc.free(bytes);
+                var parsed = try std.json.parseFromSlice(antfly.metadata_api.MetadataHead, alloc, bytes, .{});
+                defer parsed.deinit();
+                self.validation_head = parsed.value;
+                self.validation_head_at_ns = self.awakeNs();
+                self.validation_head_generation = generation;
+                break :head parsed.value;
+            };
+            if (slot.entry) |entry| if (entry.invalidation == generation and std.meta.eql(entry.head, head) and std.mem.eql(u8, entry.name, name)) {
+                try bounded.ensureActive();
+                return alloc.dupe(u8, entry.bytes);
+            };
+            const bytes = try self.readSystemCatalog(alloc, bounded, .{ .write_validation = name });
+            errdefer alloc.free(bytes);
+            try bounded.ensureActive();
+            lockAtomic(&self.cache_mutex);
+            const current = self.snapshot_invalidation_generation;
+            self.cache_mutex.unlock();
+            if (generation != current) {
+                alloc.free(bytes);
+                continue;
+            }
+            // A huge definition is valid but must not evict the cache's memory
+            // bound: at most 128 * 256 KiB plus bounded table-name storage.
+            if (bytes.len <= 256 * 1024 and name.len <= 1024) {
+                const owned_name = try self.alloc.dupe(u8, name);
+                errdefer self.alloc.free(owned_name);
+                const owned_bytes = try self.alloc.dupe(u8, bytes);
+                slot.clear(self.alloc);
+                slot.entry = .{ .name = owned_name, .bytes = owned_bytes, .head = head, .invalidation = generation };
+            }
+            return bytes;
+        }
+    }
+
     fn remoteSystemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         try request.ensureActive();
+        if (input == .write_validation) return self.readWriteValidation(alloc, request, input.write_validation);
         if (input != .mutate) return self.readSystemCatalog(alloc, request, input);
         // Even ambiguous writes may have committed new topology. Invalidate
         // cached snapshots without automatically replaying the mutation.
@@ -26196,7 +26320,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 const parsed = try std.json.parseFromSlice(catalog.Call, response_alloc, request.body, .{});
                 defer parsed.deinit();
                 const body = switch (parsed.value) {
-                    .read, .list_tables, .export_snapshot, .table_status => return error.UnexpectedCatalogRead,
+                    .read, .list_tables, .export_snapshot, .table_status, .write_validation, .write_validation_revision => return error.UnexpectedCatalogRead,
                     .snapshot => try std.json.Stringify.valueAlloc(response_alloc, catalog.State{ .revision = snapshot.status.metadata_epoch }, .{}),
                     .resolve => |target| try std.json.Stringify.valueAlloc(response_alloc, resolve(snapshot, target), .{}),
                     .resolve_many => |input| blk: {
@@ -28170,6 +28294,70 @@ fn consumerTests() type {
             source.noteMetadataAuthoritySuccess(0);
             try std.testing.expectError(error.StoreReportBaseMismatch, source.withMetadataApiClient(u32, Fake.call, &fake));
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        }
+
+        test "system catalog write validation cache follows revisions and bounds admission" {
+            const alloc = std.testing.allocator;
+            const Http = antfly.common.http;
+            const Fake = struct {
+                revision: u64 = 1,
+                heads: usize = 0,
+                projections: usize = 0,
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: Http.HttpRequest) !Http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+                    var parsed = try std.json.parseFromSlice(system_catalog.Call, a, request.body, .{});
+                    defer parsed.deinit();
+                    const body = switch (parsed.value) {
+                        .write_validation_revision => blk: {
+                            self.heads += 1;
+                            break :blk try std.json.Stringify.valueAlloc(a, antfly.metadata_api.MetadataHead{
+                                .metadata_group_id = 9,
+                                .metadata_epoch = self.revision,
+                            }, .{});
+                        },
+                        .write_validation => |name| blk: {
+                            self.projections += 1;
+                            try std.testing.expectEqualStrings("docs", name);
+                            break :blk try std.json.Stringify.valueAlloc(a, @import("../system_catalog/projection.zig").WriteValidation{
+                                .schema_json = if (self.revision == 1) "old" else "new",
+                            }, .{});
+                        },
+                        else => return error.UnexpectedCatalogRead,
+                    };
+                    const headers = try a.alloc(Http.Header, 2);
+                    headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "9") };
+                    headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, "11111111111111111111111111111111") };
+                    return .{ .status = 200, .headers = headers, .body = body };
+                }
+            };
+            var fake: Fake = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
+            for (0..8) |_| {
+                const bytes = try source.readWriteValidation(alloc, .{}, "docs");
+                defer alloc.free(bytes);
+                try std.testing.expect(std.mem.indexOf(u8, bytes, "old") != null);
+            }
+            try std.testing.expectEqual(@as(usize, 1), fake.heads);
+            try std.testing.expectEqual(@as(usize, 1), fake.projections);
+            fake.revision = 2;
+            source.validation_head_at_ns = 0;
+            const revised = try source.readWriteValidation(alloc, .{}, "docs");
+            defer alloc.free(revised);
+            try std.testing.expect(std.mem.indexOf(u8, revised, "new") != null);
+            try std.testing.expectEqual(@as(usize, 2), fake.projections);
+            source.invalidateCache();
+            const invalidated = try source.readWriteValidation(alloc, .{}, "docs");
+            defer alloc.free(invalidated);
+            try std.testing.expectEqual(@as(usize, 3), fake.projections);
+            const slot = &source.validation_slots[std.hash.Wyhash.hash(0, "docs") % source.validation_slots.len];
+            try std.testing.expect(slot.mutex.tryLock());
+            defer slot.mutex.unlock();
+            try std.testing.expectError(error.DeadlineExceeded, source.readWriteValidation(alloc, .{
+                .deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_ms,
+            }, "docs"));
+            try std.testing.expectEqual(@as(usize, 3), fake.projections);
         }
 
         test "system catalog remote reads survive elections without skipping peers or extending budgets" {

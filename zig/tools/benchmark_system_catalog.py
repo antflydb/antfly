@@ -233,6 +233,8 @@ def listing_table_config(args):
     table_config = {"num_shards": 1}
     if args.schema_fields or args.storage_mode == "relational":
         table_config["schema"] = {
+            "default_type": "default",
+            "enforce_types": True,
             "document_schemas": {
                 "default": {
                     "schema": {
@@ -243,6 +245,10 @@ def listing_table_config(args):
                                 "x-antfly-types": ["text"],
                                 "x-antfly-include-in-all": True,
                             },
+                            "customer_id": {
+                                "type": "string",
+                                "x-antfly-types": ["keyword"],
+                            },
                             **{
                                 f"field_{field}": {"type": "string"}
                                 for field in range(args.schema_fields)
@@ -250,7 +256,7 @@ def listing_table_config(args):
                         },
                     }
                 }
-            }
+            },
         }
         if args.storage_mode == "relational":
             schema = table_config["schema"]
@@ -258,10 +264,6 @@ def listing_table_config(args):
             row = schema["document_schemas"]["default"]["schema"]
             row["additionalProperties"] = False
             row["required"] = ["body"]
-            row["properties"]["customer_id"] = {
-                "type": "string",
-                "x-antfly-types": ["keyword"],
-            }
     return table_config
 
 
@@ -373,9 +375,7 @@ def catalog_scenario(args, binary: Path) -> dict:
                     properties = created["schema"]["document_schemas"]["default"][
                         "schema"
                     ]["properties"]
-                    expected_fields = args.schema_fields + (
-                        2 if args.storage_mode == "relational" else 1
-                    )
+                    expected_fields = args.schema_fields + 2
                     if len(properties) != expected_fields:
                         raise RuntimeError(
                             "table did not retain benchmark schema fields"
@@ -458,7 +458,23 @@ def catalog_scenario(args, binary: Path) -> dict:
                 if len(rows) != count:
                     raise RuntimeError(f"listing count mismatch: {len(rows)}/{count}")
 
+            def write_batch(path=path):
+                # Fixed work while unrelated catalog size grows: validate and
+                # durably replace one schema-constrained event. Reusing its
+                # identity keeps query and join correctness checks unchanged.
+                api.request(
+                    "POST",
+                    path + "/batch",
+                    {
+                        "inserts": {
+                            "doc": {"body": "catalog benchmark", "customer_id": "doc"}
+                        },
+                        "sync_level": "full_index",
+                    },
+                )
+
             operations = {
+                "qualified_batch_validation": write_batch,
                 "qualified_lookup": lookup,
                 "qualified_query": lambda query=query: run_query(query),
                 "qualified_join": lambda joined=joined: run_query(joined),
@@ -1087,9 +1103,21 @@ def main():
         ("management", management_scenario),
     ]:
         if args.scenario in ("all", name):
-            result["scenarios"][name] = run(args, binary)
             args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(json.dumps(result, indent=2) + "\n")
+            try:
+                result["scenarios"][name] = run(args, binary)
+            except BaseException as error:
+                # Preserve the binary/settings and explicit failure instead
+                # of leaving no artifact or reusing a previous successful one.
+                # Incomplete scenarios are not successful latency samples.
+                result["failure"] = {
+                    "scenario": name,
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                }
+                raise
+            finally:
+                args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
 
 

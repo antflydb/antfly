@@ -1451,6 +1451,48 @@ pub const Client = struct {
         return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
     }
 
+    /// Replace a table's schema
+    /// PUT /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema
+    pub fn updateNamespaceTableSchema(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.TableSchema, if_match: ?[]const u8) !ApiResponse(types.Table) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/schema", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
+        var resp = try self.http.put(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+    }
+
+    /// Patch a table's schema
+    /// PATCH /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema
+    pub fn patchNamespaceTableSchema(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.TableSchemaPatch, if_match: ?[]const u8) !ApiResponse(types.Table) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/schema", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
+        var resp = try self.http.patch(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+    }
+
     /// Set namespace tablespace
     /// PUT /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace
     pub fn setNamespaceTableTablespace(self: *@This(), table_name: []const u8, database_name: []const u8, namespace_name: []const u8, body: types.CatalogTablespaceBindingRequest) !ApiResponse(std.json.Value) {

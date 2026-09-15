@@ -215,6 +215,8 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_resolve_identity: system_catalog.Target,
     catalog_resolve_many: system_catalog.ResolveMany,
     catalog_query_definition: []const u8,
+    catalog_write_validation: []const u8,
+    catalog_write_validation_revision: void,
     topology_activation: void,
     report_cursor: u64,
     read_control_stores: []const u64,

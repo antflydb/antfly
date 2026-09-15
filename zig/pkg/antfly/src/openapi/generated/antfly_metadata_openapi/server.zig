@@ -322,6 +322,36 @@ pub fn parseRestoreNamespaceTableBody(allocator: std.mem.Allocator, body: []cons
     return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Replace a table's schema
+pub const UpdateNamespaceTableSchemaPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for updateNamespaceTableSchema.
+pub fn parseUpdateNamespaceTableSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_schema_openapi.TableSchema) {
+    return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Patch a table's schema
+pub const PatchNamespaceTableSchemaPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for patchNamespaceTableSchema.
+pub fn parsePatchNamespaceTableSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TableSchemaPatch) {
+    return std.json.parseFromSlice(types.TableSchemaPatch, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Set namespace tablespace
 pub const SetNamespaceTableTablespacePathParams = struct {
     table_name: []const u8,
@@ -983,6 +1013,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename", .operation_id = "renameNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore", .operation_id = "restoreNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "updateNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "PATCH", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "patchNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "setNamespaceTableTablespace", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "clearNamespaceTableTablespace", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tablespace", .operation_id = "setNamespaceTablespace", .request_body = .buffered, .streaming_response = false },
@@ -1099,6 +1131,8 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "queryNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'queryNamespaceTable'");
         if (!@hasDecl(Impl, "renameNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'renameNamespaceTable'");
         if (!@hasDecl(Impl, "restoreNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'restoreNamespaceTable'");
+        if (!@hasDecl(Impl, "updateNamespaceTableSchema")) @compileError("ServerRouter: Impl missing required method 'updateNamespaceTableSchema'");
+        if (!@hasDecl(Impl, "patchNamespaceTableSchema")) @compileError("ServerRouter: Impl missing required method 'patchNamespaceTableSchema'");
         if (!@hasDecl(Impl, "setNamespaceTableTablespace")) @compileError("ServerRouter: Impl missing required method 'setNamespaceTableTablespace'");
         if (!@hasDecl(Impl, "clearNamespaceTableTablespace")) @compileError("ServerRouter: Impl missing required method 'clearNamespaceTableTablespace'");
         if (!@hasDecl(Impl, "setNamespaceTablespace")) @compileError("ServerRouter: Impl missing required method 'setNamespaceTablespace'");
@@ -1213,6 +1247,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/query", httpx.Handler.bind(self.impl, queryNamespaceTable));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/rename", httpx.Handler.bind(self.impl, renameNamespaceTable));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/restore", httpx.Handler.bind(self.impl, restoreNamespaceTable));
+            try server.put("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/schema", httpx.Handler.bind(self.impl, updateNamespaceTableSchema));
+            try server.patch("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/schema", httpx.Handler.bind(self.impl, patchNamespaceTableSchema));
             try server.put("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/tablespace", httpx.Handler.bind(self.impl, setNamespaceTableTablespace));
             try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/tablespace", httpx.Handler.bind(self.impl, clearNamespaceTableTablespace));
             try server.put("/databases/:databaseName/namespaces/:namespaceName/tablespace", httpx.Handler.bind(self.impl, setNamespaceTablespace));
@@ -1554,6 +1590,24 @@ pub fn ServerRouter(comptime Impl: type) type {
             const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.restoreNamespaceTable(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Replace a table's schema
+        /// PUT /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema
+        fn updateNamespaceTableSchema(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.updateNamespaceTableSchema(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Patch a table's schema
+        /// PATCH /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema
+        fn patchNamespaceTableSchema(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.patchNamespaceTableSchema(ctx, database_name, namespace_name, table_name);
         }
 
         /// Set namespace tablespace
@@ -2140,6 +2194,8 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn renameNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn restoreNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn updateNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn patchNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn setNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn clearNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn setNamespaceTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response

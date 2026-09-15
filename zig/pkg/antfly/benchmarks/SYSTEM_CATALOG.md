@@ -35,6 +35,21 @@ migration and validation, excludes provisioning, and has no performance threshol
 Use repeated independent runs for latency comparisons. Node-drain E2Es separately
 verify that live Raft apply progress still satisfies retirement fences.
 
+For skewed tenants under foreground traffic, compare immutable binaries serially:
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_schema_migrations.py \
+  --binary zig-out/bin/antfly --baseline /path/to/baseline \
+  --traffic-clients 4 --samples 3 --warmups 0 --output migration-comparison.json
+```
+
+Each fresh three-metadata/three-data cluster migrates a 10,000-document tenant
+alongside five small tenants. Independent clients write, look up documents, and
+search during the migrations. The scenario verifies every acknowledged write
+and final full-text counts; failures remain in the artifact and ambiguous writes
+are never replayed to make a run pass. Inspect completion times together with
+request distributions because traffic is closed-loop.
+
 ## Catalog scale in process
 
 ```sh
@@ -89,6 +104,10 @@ The catalog workload models an application serving tenant-scoped tables:
   10 to 100 tables by default, with one document in each measured target.
 - Read a document, issue a qualified query and join to a second table, and run 20 NDJSON
   queries sharing a target. NDJSON timing is for the whole HTTP batch.
+- Repeatedly replace one document with full-index visibility while unrelated
+  table count grows. `--schema-fields 32` enables type enforcement and models
+  schema-constrained event ingestion; the timed write includes validation,
+  replication, storage, and indexing rather than isolating catalog CPU cost.
 - List the namespace's tables, rename a table while checking stable identity,
   and run concurrent qualified lookups with eight independent client sessions.
   Concurrent output includes total throughput and individual request latency.

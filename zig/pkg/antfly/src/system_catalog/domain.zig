@@ -850,6 +850,8 @@ pub const Call = union(enum) {
     mutate: Request,
     // A distinct operation makes older peers reject unsupported point reads.
     table_status: TableStatusTarget,
+    write_validation: []const u8,
+    write_validation_revision: void,
 };
 
 pub fn httpStatus(err: anyerror) u16 {

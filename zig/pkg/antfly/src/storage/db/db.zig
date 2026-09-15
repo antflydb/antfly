@@ -106666,6 +106666,8 @@ test "db full text repair page replay is idempotent without compaction" {
     }
     var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
     defer reopened.close();
+    // Restart policy may change; the durable page format still owns resume.
+    options.yield_check = null;
     var complete = false;
     for (0..32) |_| {
         const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, options);

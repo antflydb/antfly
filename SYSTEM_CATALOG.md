@@ -847,17 +847,28 @@ deadline is checked after a bounded
 page (at most 256 documents and 256 KiB source data, except a single large document).
 These are scheduling budgets, not hard wall-clock bounds on storage I/O.
 
-Structural configuration acquires the exact descriptor's exclusive lease, then
-atomically downgrades it for reconstruction. Shared generation ownership permits
-foreground reads and Raft apply while preventing concurrent reconfiguration.
-The compiled boundary carries borrowed cancellation, yield, activation and resource
-policy for the synchronous call. Cold-owner retention remains an explicit, independent
-choice; repair controls do not implicitly retain owners. Full-text candidates persist a synced page cursor
-in the existing durable repair intent; reopening retains the prefix and replays
-writes from the pinned build floor before bounded activation. Each resumable page
-upserts its document IDs into the private candidate: a crash after page persistence
-but before cursor publication cannot leave duplicate live entries on retry. Page
-retries retain deferred merge work for the serving generation's normal scheduler. Normal bulk text
+Background structural admission takes an exclusive lease only when idle, without
+installing writer preference behind foreground readers. A configured repair reuses
+a shared lease only when its table, schema, indexes, storage policy, root and target
+match the retained configuration proof. Structural follow-up invalidates that proof.
+The scheduler translates its remaining quantum into the catalog's clock before
+descriptor lookup (awake and native monotonic epochs differ on Darwin), then checks cancellation
+and yield before admission. Shared generation ownership permits foreground reads
+and Raft apply while preventing concurrent reconfiguration. The compiled boundary
+carries borrowed cancellation, yield, activation and resource policy for the
+synchronous call. Cold-owner retention remains an explicit, independent choice.
+Standalone supplies the same bounded point projection: it retains the indexed
+routing generation, verifies its revision under the metadata mutex, and copies
+only the requested table's complete definition and ranges. Budgeted repair never
+falls back to a full administrative snapshot.
+
+Full-text candidates stage every segment produced by a bounded page. One candidate
+metadata transaction publishes all active segment markers and the source cursor;
+files become durable before that transaction. The separate repair intent may lag
+this cursor after a crash. Reopening resumes after the candidate's committed page,
+without scanning and deleting IDs from the accumulated prefix. An aborted page
+publishes neither segments nor its cursor. Catch-up still replays writes from the
+pinned build floor before bounded activation. Normal bulk text
 loading keeps its larger throughput-oriented batches. Exact repair selection uses the
 resident name index, leaves the general repair cursor unchanged, honors paused and
 future-dated intents, and excludes unrelated repair debt from the target's readiness.
@@ -878,3 +889,34 @@ Catalog routing timeout, unavailability and projection-refresh errors retain exa
 identities across compiled write callbacks. The public handler can therefore keep
 pre-proposal admission failures distinct from an unknown Raft or transaction commit
 outcome. These stable ABI details do not authorize replay of ambiguous writes.
+
+
+### Foreground write validation
+
+Scoped tables expose schema replacement (`PUT`) and JSON Merge Patch (`PATCH`)
+at their namespace-qualified `/schema` path. Both delegate to the same schema
+mutation authority, ETag/version checks, and migration flow as literal table
+routes. Generated Zig, Go, TypeScript, and Python clients expose these operations.
+
+Write admission reads an immutable table-specific projection containing only the
+schema and applicable extension document/row data shapes. The metadata owner uses
+its physical-name index and table-to-extension-member index in one read transaction;
+large index definitions, unrelated tables, placements and diagnostic inventory are
+not materialized. Standalone maintains a membership-generation index for the same
+constraints. Extension add, move, replacement and removal invalidate membership.
+
+Remote nodes cache at most 128 projections of 256 KiB each. Table-keyed admission
+coalesces cache misses with cancellation and deadlines. A shared revision probe is
+a point read of the durable catalog revision, including extension membership and
+schema changes, excluding heartbeat traffic. Local mutations invalidate immediately;
+remote changes follow the existing one-second metadata cache freshness window.
+Snapshots crossing local mutation invalidation are discarded. Large projections
+remain valid but bypass cache retention. Validation never falls back to diagnostic
+snapshots on production sources or drops extension constraints on overload.
+
+Forwarded batch ingress establishes one absolute local deadline before decoding.
+Validation, catalog lookup, writer admission and further forwarding consume it.
+Clock translation preserves the remaining budget instead of restarting it after
+validation. Cancellation or expiry before proposal carries the not-proposed outcome;
+post-proposal uncertainty and committed-but-pending visibility retain their existing
+explicit outcomes.

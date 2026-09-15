@@ -121,6 +121,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         indexes_json: []u8,
         table_storage: ?@import("../common/table_storage.zig").Settings = null,
         owner: client.Owner,
+        // Exact descriptor/target proof, owned by this physical generation.
+        // Shared repair steps may reuse it until a structural follow-up is due.
+        repair_target: ?[]u8 = null,
+        repair_configuration: ?abi.ReconcileResult = null,
         active_users: usize = 0,
         /// Foreground admission or durable background debt owns residency.
         /// Status and maintenance leases only borrow it until their release.
@@ -1280,20 +1284,30 @@ pub const ProvisionedKernelOwnerSource = struct {
         retain_cold_owner: bool,
     ) !?table_write_source.LocalStructuralReconcileObservation {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
+        if (repair_options.cancelled()) return error.Canceled;
+        if (repair_options.yield_check) |check| if (check.requested()) return .{ .result = .{ .state = .busy } };
+        var descriptor = try self.loadDescriptorWithDeadline(self.alloc, group_id, table_name, repair_options.admission_deadline_ns);
         defer descriptor.deinit(self.alloc);
-        var lease = (try self.acquireDescriptorForReconcile(
+        if (repair_options.cancelled()) return error.Canceled;
+        if (repair_options.yield_check) |check| if (check.requested()) return .{ .result = .{ .state = .busy } };
+        const configured = if (advance_index_repair)
+            self.tryAcquireConfiguredRepair(group_id, table_name, descriptor.view(), target_index_name)
+        else
+            null;
+        var lease = if (configured) |ready| ready.lease else (try self.acquireDescriptorForReconcile(
             group_id,
             table_name,
             descriptor.path,
             descriptor.view(),
-            retain_cold_owner or advance_index_repair,
+            // Only an explicit structural caller may install writer preference.
+            // A scheduled repair returns busy immediately behind live leases.
+            retain_cold_owner,
             if (retain_cold_owner) .resident else .transient,
         )) orelse return .{ .result = .{ .state = .busy } };
         defer lease.deinit();
         errdefer lease.requestTransientRetirement();
 
-        var result = lease.owner().reconcile(
+        var result = if (configured) |ready| ready.result else lease.owner().reconcile(
             table_name,
             descriptor.schema_json,
             descriptor.indexes_json,
@@ -1304,9 +1318,15 @@ pub const ProvisionedKernelOwnerSource = struct {
             return err;
         };
         if (advance_index_repair and result.restore_repair_pending == 0) {
-            // Keep the exact configured generation alive while allowing reads
-            // and Raft apply. Structural changes still wait for this lease.
-            lease.downgrade();
+            if (configured == null) {
+                const owned_target = if (target_index_name) |target| try self.alloc.dupe(u8, target) else null;
+                lock(&self.mutex);
+                if (lease.entry.repair_target) |old| self.alloc.free(old);
+                lease.entry.repair_target = owned_target;
+                lease.entry.repair_configuration = result;
+                self.mutex.unlock();
+            }
+            if (lease.exclusive) lease.downgrade();
             var controls = RepairControlsBridge{ .options = repair_options };
             const repair = try lease.owner().repairIndex(table_name, target_index_name, controls.wire());
             const added = result.indexes_added;
@@ -1315,11 +1335,15 @@ pub const ProvisionedKernelOwnerSource = struct {
             result = repair;
             result.indexes_added = added;
             result.indexes_removed = removed;
-            // Pending includes durable admission awaiting this reconstruction.
-            // It cannot gate execution. Retain the structural observation until
-            // a subsequent pass confirms the current catalog is installed.
             result.indexes_pending = pending;
-            if (result.state == .complete and pending != 0) result.state = .busy;
+            if (repair.state == .complete and pending != 0) {
+                // Admission may have left cleanup/activation debt. Verify it
+                // under a new nonblocking structural lease on the next pass.
+                lock(&self.mutex);
+                lease.entry.repair_configuration = null;
+                self.mutex.unlock();
+                result.state = .busy;
+            }
         }
         var response = lease.owner().runtimeStatusJson(table_name) catch |err| switch (err) {
             // Runtime status is deliberately best effort and returns busy
@@ -1369,6 +1393,25 @@ pub const ProvisionedKernelOwnerSource = struct {
             .result = localStructuralReconcileResult(result),
             .runtime_status = observed,
         };
+    }
+
+    const ConfiguredRepair = struct { lease: Lease, result: abi.ReconcileResult };
+
+    fn tryAcquireConfiguredRepair(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor, target: ?[]const u8) ?ConfiguredRepair {
+        if (!self.mutex.tryLock()) return null;
+        defer self.mutex.unlock();
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.closing or entry.retired or entry.generation != descriptor.lsm_root_generation or
+                !entry.identity.eql(descriptor.identity) or !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
+                !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or !std.meta.eql(entry.table_storage, descriptor.table_storage)) return null;
+            const result = entry.repair_configuration orelse return null;
+            if ((target == null) != (entry.repair_target == null)) return null;
+            if (target) |name| if (!std.mem.eql(u8, entry.repair_target.?, name)) return null;
+            if (!tryReserveEntryLeaseLocked(entry, .shared)) return null;
+            return .{ .lease = .{ .source = self, .entry = entry }, .result = result };
+        }
+        return null;
     }
 
     fn runtimeStatusNeedsResidentOwner(status: runtime_status.LocalTableRuntimeStatus) bool {
@@ -1454,6 +1497,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.alloc.free(entry.table_name);
         self.alloc.free(entry.schema_json);
         self.alloc.free(entry.indexes_json);
+        if (entry.repair_target) |target| self.alloc.free(target);
         self.alloc.destroy(entry);
     }
 
@@ -1694,12 +1738,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !LoadedDescriptor {
+        return self.loadDescriptorWithDeadline(alloc, group_id, table_name, null);
+    }
+
+    fn loadDescriptorWithDeadline(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        deadline_ns: ?u64,
+    ) !LoadedDescriptor {
         var projection = (try table_catalog.tableGroupDescriptorProjection(
             alloc,
             self.catalog,
             table_name,
             group_id,
-            null,
+            deadline_ns,
         )) orelse return error.TableNotFound;
         errdefer projection.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
@@ -4050,4 +4104,49 @@ test "storage repair lease downgrade admits readers while fencing configuration"
     try std.testing.expect(Source.tryReserveEntryLeaseLocked(&entry, .shared));
     try std.testing.expectEqual(@as(usize, 2), entry.active_users);
     try std.testing.expect(!Source.tryReserveEntryLeaseLocked(&entry, .exclusive));
+}
+
+test "scheduled repair admission yields to readers and reuses exact configured generation" {
+    const Source = ProvisionedKernelOwnerSource;
+    var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    var entry: Source.Entry = .{
+        .group_id = 1,
+        .table_name = @constCast("docs"),
+        .generation = 7,
+        .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .schema_json = @constCast("schema"),
+        .indexes_json = @constCast("indexes"),
+        .owner = undefined,
+        .active_users = 1,
+        .resident = true,
+    };
+    try source.entries.append(std.testing.allocator, &entry);
+    const descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = 7,
+        .identity = entry.identity,
+        .schema_json = entry.schema_json,
+        .indexes_json = entry.indexes_json,
+    };
+    try std.testing.expect((try source.acquireDescriptorForReconcile(1, "docs", "/unused", descriptor, false, .transient)) == null);
+    try std.testing.expect(!entry.exclusive_pending);
+    try std.testing.expect(Source.tryReserveEntryLeaseLocked(&entry, .shared));
+    entry.active_users -= 1;
+    entry.repair_target = @constCast("text");
+    entry.repair_configuration = .{ .state = .busy, .repair_remaining = 1 };
+    var repair = source.tryAcquireConfiguredRepair(1, "docs", descriptor, "text").?;
+    try std.testing.expect(!repair.lease.exclusive);
+    try std.testing.expectEqual(@as(usize, 2), entry.active_users);
+    repair.lease.deinit();
+    try std.testing.expect(source.tryAcquireConfiguredRepair(1, "docs", descriptor, "other") == null);
+    var changed = descriptor;
+    changed.schema_json = "new schema";
+    try std.testing.expect(source.tryAcquireConfiguredRepair(1, "docs", changed, "text") == null);
+    entry.repair_target = null;
+    var ordinary = source.tryAcquireConfiguredRepair(1, "docs", descriptor, null).?;
+    try std.testing.expect(!ordinary.lease.exclusive);
+    ordinary.lease.deinit();
+    changed = descriptor;
+    changed.lsm_root_generation += 1;
+    try std.testing.expect(source.tryAcquireConfiguredRepair(1, "docs", changed, null) == null);
 }

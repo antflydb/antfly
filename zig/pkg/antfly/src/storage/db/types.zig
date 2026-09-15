@@ -3513,6 +3513,9 @@ pub const RepairCapacityCheck = struct {
 };
 
 pub const ArtifactRepairRunOptions = struct {
+    /// Absolute local catalog-admission deadline in the source routing clock.
+    /// Background admission must not consume the quantum waiting for metadata.
+    admission_deadline_ns: ?u64 = null,
     /// Restrict a local schema-migration quantum to its exact index. Unrelated
     /// durable repairs retain their existing scheduler and ownership policy.
     target_index_name: ?[]const u8 = null,

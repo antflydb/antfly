@@ -943,6 +943,8 @@ const LocalStandaloneMetadata = struct {
                 .acquire_routing_generation = acquireRoutingGeneration,
                 .routing_snapshot = catalogRoutingSnapshot,
                 .linearizable_routing_snapshot = catalogRoutingSnapshot,
+                .table_routing_snapshot = catalogTableRoutingSnapshot,
+                .linearizable_table_routing_snapshot = catalogTableRoutingSnapshot,
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .wait_for_routing_change = catalogWaitForRoutingChange,
             },
@@ -1154,6 +1156,51 @@ const LocalStandaloneMetadata = struct {
         if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
 
         return self.routingSnapshotLocked(deadline_ns);
+    }
+
+    fn catalogTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        const budget = antfly.public_api.table_catalog.RoutingBudget{ .deadline_ns = deadline_ns };
+        while (true) {
+            try budget.checkpoint();
+            const generation = try acquireRoutingGeneration(ptr, deadline_ns, true);
+            defer generation.release();
+            if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+            defer self.mutex.unlock();
+            if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
+            if (generation.indexed.snapshot.value.catalog_revision != self.epoch) continue;
+            const table = self.manager.findTableByName(table_name);
+            const tables = try self.alloc.alloc(antfly.metadata.TableRecord, if (table != null) 1 else 0);
+            var copied_table = false;
+            errdefer {
+                if (copied_table) antfly.metadata.table_manager.freeTable(self.alloc, tables[0]);
+                self.alloc.free(tables);
+            }
+            if (table) |value| {
+                tables[0] = try antfly.metadata.table_manager.cloneTable(self.alloc, value.*);
+                copied_table = true;
+            }
+            const refs = if (table) |value| generation.indexed.table_range_refs.get(value.table_id) orelse &.{} else &.{};
+            const ranges = try self.alloc.alloc(antfly.metadata.RangeRecord, refs.len);
+            var copied_ranges: usize = 0;
+            errdefer {
+                for (ranges[0..copied_ranges]) |range| antfly.metadata.table_manager.freeRange(self.alloc, range);
+                self.alloc.free(ranges);
+            }
+            for (refs, 0..) |range, i| {
+                try budget.checkpointIndex(i);
+                ranges[i] = try antfly.metadata.table_manager.cloneRoutingRange(self.alloc, range.*);
+                copied_ranges += 1;
+            }
+            try budget.checkpoint();
+            return .{
+                .metadata_group_id = group_ids.main_metadata_group_id,
+                .catalog_revision = self.epoch,
+                .change_token = .{ .metadata_group_id = group_ids.main_metadata_group_id, .revision = self.epoch },
+                .tables = tables,
+                .ranges = ranges,
+            };
+        }
     }
 
     fn routingSnapshotLocked(self: *LocalStandaloneMetadata, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
@@ -1506,6 +1553,19 @@ const LocalStandaloneMetadata = struct {
                 const resources = try system_catalog.projectRead(alloc, index, request);
                 defer alloc.free(resources);
                 return std.json.Stringify.valueAlloc(alloc, system_catalog.State{ .revision = self.systemCatalogState().revision, .resources = resources }, .{});
+            },
+            .write_validation_revision => return std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataHead{
+                .metadata_group_id = 1,
+                .metadata_epoch = self.epoch,
+            }, .{}),
+            .write_validation => |name| {
+                const table = self.manager.findTableByName(name) orelse return error.TableNotFound;
+                const shapes = try self.extension_catalog.tableDataShapes(name);
+                try context.ensureActive();
+                return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/projection.zig").WriteValidation{
+                    .schema_json = table.schema_json,
+                    .data_shapes = shapes,
+                }, .{});
             },
             .query_definition => |name| {
                 const table = self.manager.findTableByName(name);
@@ -9502,6 +9562,21 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     try std.testing.expectEqual(@as(u64, 9), snapshot.status.metadata_epoch);
     try std.testing.expectEqual(@as(usize, 1), snapshot.tables.len);
     try std.testing.expectEqualStrings("docs", snapshot.tables[0].name);
+
+    // Scheduled repair must resolve a complete physical descriptor without
+    // falling back to the unbounded administrative snapshot.
+    const catalog = metadata.catalogSource();
+    var descriptor = (try antfly.public_api.table_catalog.tableGroupDescriptorProjection(
+        alloc,
+        catalog,
+        "docs",
+        7001,
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    )).?;
+    defer descriptor.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 7), descriptor.table_id);
+    try std.testing.expectEqualStrings(metadata.manager.findTableByName("docs").?.schema_json, descriptor.schema_json);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, antfly.public_api.table_catalog.tableGroupDescriptorProjection(alloc, catalog, "docs", 7001, 0));
 
     try metadata.setApiUrl("http://127.0.0.1:49152");
     var rebound_snapshot = (try source.linearizableSnapshot(.{})) orelse return error.TestUnexpectedResult;

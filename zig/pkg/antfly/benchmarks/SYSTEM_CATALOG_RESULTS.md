@@ -1881,3 +1881,115 @@ source tests, and three compiled write-boundary/full-text replay regressions.
 Generated-file checks, regenerated Go SDK tests, Python lint/format, and patch
 whitespace checks passed. These checks cover correctness and integration separately
 from the failed four-client qualification above.
+
+## Atomic rebuild pages and table-specific validation — 2026-09-15
+
+The resumable full-text builder now publishes a page's segments and its cursor
+in one candidate transaction. Restart uses this cursor even when the separate
+repair-intent cursor lags or the scheduling policy changes. This removes the
+page-by-page scan of every older document ID. Append publication also carries
+forward unchanged field totals instead of reparsing older segment headers.
+
+The first component comparison used Debug and `std.testing.allocator`, 256
+rows/page, freshly created indexes, and one sample per size/path. Segment
+construction and final exact-count verification are outside the timed region.
+The production file-backed layout includes segment and metadata durability.
+These initial measurements precede the incremental field-total optimization.
+
+| Documents | Previous delete-then-publish | Atomic page | Reduction |
+| --- | ---: | ---: | ---: |
+| 16,384 | 3.414 s | 3.043 s | 10.9% |
+| 65,536 | 16.904 s | 12.969 s | 23.3% |
+| 131,072 | 38.249 s | 29.402 s | 23.1% |
+
+An exploratory in-memory LSM run embedded the segment payloads in metadata and
+showed only 4–11% reductions; its allocation/copying cost is not representative
+of production file-backed publication. Both layouts and binary hashes are
+retained in `system_catalog_rebuild_pages_2026_09_15.json`. Every exact live-count
+assertion passed. These are component observations, not migration latency or
+production throughput claims.
+
+The final implementation was measured again with incremental append field totals
+enabled on both paths. At 16,384 / 65,536 / 131,072 documents, delete-then-publish
+took 2.805 / 14.604 / 37.920 s and atomic pages took 2.542 / 12.126 / 29.372 s
+(9.4% / 17.0% / 22.5% lower). These remain single component samples; the small
+differences between the initial and final atomic-page runs do not establish an
+independent benefit from the field-total change. The final regression also
+verifies field totals after reopen and another committed page.
+
+Run the page regression and optional measurements with:
+
+```sh
+zig build persistent-rebuild-page-test
+ANTFLY_BENCH_REBUILD_PAGE=1 zig build persistent-rebuild-page-test
+```
+
+The real catalog workload now also measures `qualified_batch_validation`: one
+schema-constrained, full-index write held fixed while unrelated table count
+grows. This complements the multi-tenant migration workload with concurrent
+lookups, searches and writes. A representative command is:
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario catalog --deployment cluster --table-counts 10 100 \
+  --schema-fields 32 --samples 20 --warmup 2 --output catalog-validation.json
+```
+
+The final production binary passed all three measured four-client migration runs;
+the pre-change binary passed two of three. The failed baseline reported two
+unknown forwarded-write outcomes. Every candidate run verified acknowledged
+writes and final index counts, without retrying ambiguous writes. Large-tenant
+completion was 8.348 / 7.175 / 12.687 s for the candidate and 7.955 / 10.506 /
+7.553 s for the baseline (the first baseline run failed availability checks).
+The candidate's slowest small-tenant cutover was 6.739 / 6.392 / 12.874 s. These
+variable closed-loop samples do **not** establish a migration latency speedup or
+prove that every previously observed availability failure is eliminated. The
+maximum candidate write latency across the three runs was 887 ms; the baseline
+included two unknown outcomes and a successful run with a 6.319 s write.
+
+The comparison used Debug binaries, 10,000 large-tenant documents, five 20-document
+small tenants, four clients, and three metadata plus three data processes with
+three replicas. Runs alternated serially with no task-owned compiler or other
+benchmark running. No warmup runs were performed; all six measured runs were retained. Raw observations, failures, source
+identity, binary hashes and free disk space are retained in
+[the comparison artifact](system_catalog_schema_validation_2026_09_15.json).
+
+Integration testing exposed and fixed two additional gaps: missing scoped schema
+PUT/PATCH routes, and standalone's missing bounded table-descriptor projection.
+The standalone migration then exposed an awake/native-monotonic clock mismatch on
+Darwin; translating the remaining scheduler budget resolved it. The previously
+240-second-timeout migration completed its test body in 1.25 s after that fix.
+Thirty catalog/resilience API cases passed before the clock fix, and both the
+standalone migration and scoped schema-validation regression passed afterward
+(7.75 s combined, including setup). The final stress runs above exercise cluster
+repair with the translated deadline.
+
+Focused checks passed: nine storage-owner tests, 129 standalone runtime tests,
+79 read/write contracts, two crash/resume lifecycle regressions, and the atomic
+page regression plus optional scaling benchmark. Catalog projection/validation
+suites passed earlier in this update. Production builds, generated-file checks,
+Go SDK tests, and changed Python lint/format passed.
+
+The schema-constrained catalog workload completed on the candidate at both 10
+and 100 tables (32 extra string fields plus body/customer fields, 20 measured
+requests per operation, two warmups). It checks full-index writes, lookups,
+qualified queries/joins, NDJSON, listing, concurrent reads and rename identity.
+The baseline completed 10 tables but failed during the 100-table measured write
+phase with HTTP 409 / unknown write outcome; no successful baseline latency
+comparison is available. Its failure is preserved explicitly in
+[the baseline observation](system_catalog_validation_baseline_2026_09_15.json).
+The harness now writes failure/interruption artifacts automatically.
+
+| Candidate operation | 10 tables p50 / p95 | 100 tables p50 / p95 |
+| --- | ---: | ---: |
+| Schema-constrained full-index write | 239.11 / 267.32 ms | 259.26 / 631.91 ms |
+| Sequential qualified lookup | 26.56 / 32.67 ms | 28.20 / 57.61 ms |
+| Qualified lookup, 8 clients | 54.68 / 107.73 ms | 48.80 / 7,011.86 ms |
+
+All operations completed, but the 100-table concurrent read phase had a 21.46 s
+maximum and only 7.03 requests/s, versus 121.54 requests/s at 10 tables. This is
+an unresolved read-tail performance concern, not a satisfactory scale-latency
+qualification. The write-validation changes do not establish a fix for that
+bottleneck; it requires a separate profile of routing/control admission and
+storage under concurrent reads. These are observations from one fresh cluster
+per binary, not production SLOs. [Candidate results and binary identity](system_catalog_validation_candidate_2026_09_15.json).
