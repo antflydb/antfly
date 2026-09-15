@@ -545,6 +545,12 @@ acknowledged foreground write after cutover. Storage regression tests separately
 force page yields, reopen the DB and verify replay of updates/inserts/deletes on
 both sides of the saved source cursor.
 
+Use `--traffic-clients 4` to run four independent closed-loop clients against the
+same cluster. Each client performs lookups, searches and uniquely keyed writes
+against the large and last small tenant. Compare this separately from the default
+single-client workload. Both binaries are staged under the canonical `antfly`
+filename so fixture routing is identical even when the baseline has been renamed.
+
 The completed-prefix scheduling component can also run without a server:
 
 ```sh

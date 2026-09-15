@@ -34,7 +34,7 @@ from test_scaling import MultiNodeScalingCluster, _insert_docs
 
 
 @pytest.fixture
-def catalog_cluster():
+def catalog_cluster(request):
     binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
     if not binary.exists():
         pytest.skip(f"antfly binary not built: {binary}")
@@ -42,7 +42,11 @@ def catalog_cluster():
     try:
         yield cluster
     finally:
-        cluster.stop()
+        report = getattr(request.node, "rep_call", None)
+        if report and report.failed:
+            for path in cluster.log_paths:
+                print(f"[{path.name}]\n{path.read_text(errors='replace')[-8192:]}")
+        cluster.stop(test_failed=bool(report and report.failed))
 
 
 def post_report(cluster, path, body):
@@ -529,6 +533,8 @@ def test_skewed_schema_migrations_keep_foreground_traffic_available(catalog_clus
     api = c.data_api_urls[0]
     large_docs = int(os.environ.get("ANTFLY_MIGRATION_LARGE_DOCS", "2000"))
     small_count = int(os.environ.get("ANTFLY_MIGRATION_SMALL_TENANTS", "3"))
+    traffic_clients = int(os.environ.get("ANTFLY_MIGRATION_TRAFFIC_CLIENTS", "1"))
+    assert large_docs > 0 and small_count > 0 and traffic_clients > 0
     tables = ["migration_large"] + [f"migration_small_{i}" for i in range(small_count)]
     for table in tables:
         c.create_table(table, num_shards=1)
@@ -583,13 +589,16 @@ def test_skewed_schema_migrations_keep_foreground_traffic_available(catalog_clus
     acknowledged = []
     start = time.monotonic()
 
-    def traffic():
+    def traffic(client_id):
         with requests.Session() as session:
             sequence = 0
             while not stop.is_set():
                 for table in (tables[0], tables[-1]):
                     for operation in ("lookup", "search", "write"):
+                        if stop.is_set():
+                            return
                         before = time.monotonic()
+                        response = None
                         try:
                             if operation == "lookup":
                                 response = session.get(
@@ -610,7 +619,7 @@ def test_skewed_schema_migrations_keep_foreground_traffic_available(catalog_clus
                                 response.raise_for_status()
                                 assert response.json()["responses"][0]["hits"]["hits"]
                             else:
-                                key = f"live-{sequence:06d}"
+                                key = f"live-{client_id}-{sequence:06d}"
                                 response = session.post(
                                     f"{api}/tables/{table}/batch",
                                     json={"inserts": {key: {"title": "live traffic"}}},
@@ -624,7 +633,12 @@ def test_skewed_schema_migrations_keep_foreground_traffic_available(catalog_clus
                             KeyError,
                             ValueError,
                         ) as error:
-                            failures.append(f"{operation} {table}: {error}")
+                            detail = (
+                                response.text
+                                if response is not None and not response.ok
+                                else ""
+                            )
+                            failures.append(f"{operation} {table}: {error} {detail}")
                         finally:
                             latencies[f"{operation}_ms"].append(
                                 (time.monotonic() - before) * 1000
@@ -636,8 +650,11 @@ def test_skewed_schema_migrations_keep_foreground_traffic_available(catalog_clus
         response = requests.put(f"{api}/tables/{table}/schema", json=schema, timeout=30)
         response.raise_for_status()
 
-    worker = threading.Thread(target=traffic)
-    worker.start()
+    workers = [
+        threading.Thread(target=traffic, args=(i,)) for i in range(traffic_clients)
+    ]
+    for worker in workers:
+        worker.start()
     completed_ms = {}
     try:
         with ThreadPoolExecutor(max_workers=len(tables)) as pool:
@@ -659,11 +676,14 @@ def test_skewed_schema_migrations_keep_foreground_traffic_available(catalog_clus
             time.sleep(0.05)
     finally:
         stop.set()
-        worker.join(timeout=45)
+        join_deadline = time.monotonic() + 45
+        for worker in workers:
+            worker.join(timeout=max(0, join_deadline - time.monotonic()))
         record = {
             "scenario": "skewed_schema_migrations_with_foreground_traffic",
             "large_documents": large_docs,
             "small_tenants": small_count,
+            "traffic_clients": traffic_clients,
             "small_documents_per_tenant": 20,
             "replicas": 3,
             "completed_ms": completed_ms,
@@ -671,7 +691,7 @@ def test_skewed_schema_migrations_keep_foreground_traffic_available(catalog_clus
             "failures": failures,
         }
         print(json.dumps(record, sort_keys=True))
-    assert not worker.is_alive()
+    assert not any(worker.is_alive() for worker in workers)
     assert not failures, json.dumps(record)
     assert acknowledged
     # Check every acknowledged write after cutover; migration must not lose

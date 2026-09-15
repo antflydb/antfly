@@ -8417,6 +8417,7 @@ pub const DataServer = struct {
         fn classify(self: *const GraphReadDeadline, err: anyerror) anyerror {
             if (self.cancellation.isCancelled()) return error.Cancelled;
             if (self.timedOut()) return error.Timeout;
+            if (err == error.ReadIndexTimeout) return error.Timeout;
             return err;
         }
     };
@@ -8462,7 +8463,12 @@ pub const DataServer = struct {
         request_ctx: []const u8,
     ) anyerror!void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        try self.waitDataReadSafeWithCancellation(group_id, request_ctx, null, .none);
+        self.waitDataReadSafeWithCancellation(group_id, request_ctx, null, .none) catch |err| switch (err) {
+            // ReadIndexTimeout is internal to this owner. The compiled read
+            // callback contract carries the canonical deadline classification.
+            error.ReadIndexTimeout => return error.Timeout,
+            else => return err,
+        };
     }
 
     fn waitDataReadSafeWithCancellation(
@@ -8501,13 +8507,27 @@ pub const DataServer = struct {
             try raft.requestReadIndex(group_id, registration.request_ctx);
         }
 
-        // Release the owner before waiting for the dedicated Raft driver to
-        // deliver the quorum response and apply its matching ReadState.
+        // ReadIndex forwarding and responses can be lost during transport or
+        // leadership changes. Retry this exact request identity with bounded
+        // backoff under the original deadline; quorum and local apply remain
+        // mandatory. Stop retransmitting once its first proof is observed.
+        var retry_delay_ns: u64 = 100 * std.time.ns_per_ms;
+        var next_request_ns = self.dataRaftMonotonicNs() +| retry_delay_ns;
         while (self.dataRaftMonotonicNs() < deadline_ns) {
             if (cancellation.isCancelled()) return error.Cancelled;
             if (apply_sm.read_barriers.takeCompleted(registration.token)) {
                 waiter_live = false;
                 return;
+            }
+            if (self.dataRaftMonotonicNs() >= next_request_ns and
+                apply_sm.read_barriers.needsReadIndex(registration.token) and self.data_raft_mutex.tryLock())
+            {
+                defer self.data_raft_mutex.unlock();
+                if (cancellation.isCancelled()) return error.Cancelled;
+                if (self.dataRaftMonotonicNs() >= deadline_ns) return error.ReadIndexTimeout;
+                try raft.requestReadIndex(group_id, registration.request_ctx);
+                retry_delay_ns = @min(retry_delay_ns * 2, std.time.ns_per_s);
+                next_request_ns = self.dataRaftMonotonicNs() +| retry_delay_ns;
             }
             try io.sleep(.fromMilliseconds(1), .awake);
         }
@@ -26908,6 +26928,39 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     .none,
                 );
             }
+
+            // Drop the first forwarded ReadIndex before transport sees it.
+            // A healthy cluster must recover this same logical read without
+            // requiring an application retry or weakening local apply safety.
+            self.stage = 19;
+            self.pauseAllRaftDrivers();
+            try self.waitForRaftDriversIdle();
+            const follower_raft = self.servers[0].data_raft.?;
+            const requests_before = follower_raft.metrics.read_index_requests;
+            var lost_read = self.io.async(waitReadSafeTask, .{
+                &self.servers[0], 172, @as(?u32, 1_000), antfly.db.types.CancellationToken.none,
+            });
+            var lost_read_joined = false;
+            defer if (!lost_read_joined) {
+                self.resumeAllRaftDrivers();
+                lost_read.await(self.io) catch {};
+            };
+            try self.waitForPendingReadBarrier(0);
+            const core = &follower_raft.host.http_host.host.runtime_host.group(172).?.raw_node.raft;
+            var dropped: usize = 0;
+            var message_index: usize = 0;
+            while (message_index < core.messages.items.len) {
+                if (core.messages.items[message_index].msg_type == .read_index) {
+                    var message = core.messages.orderedRemove(message_index);
+                    message.deinit(core.alloc);
+                    dropped += 1;
+                } else message_index += 1;
+            }
+            self.resumeAllRaftDrivers();
+            lost_read_joined = true;
+            try lost_read.await(self.io);
+            try std.testing.expectEqual(@as(usize, 1), dropped);
+            try std.testing.expect(follower_raft.metrics.read_index_requests >= requests_before + 2);
 
             // Hold Ready processing after registration, enqueue a leadership
             // transfer, then resume the old/new leaders. The old-leader

@@ -851,3 +851,12 @@ future-dated intents, and excludes unrelated repair debt from the target's readi
 Ordinary repairs retain their existing leader admission. Busy runtime observations
 retain their typed errors across the compiled boundary; the control owner preserves
 refresh debt before using cached or synthetic facts.
+
+Replicated foreground reads retain one request identity through ReadIndex
+retransmission. Missing quorum responses retry with 100 ms to 1 s backoff under
+the original five-second maximum; retries stop after the first valid quorum proof.
+The read still waits for that replica's applied index. Duplicate responses cannot
+move the apply target or revoke completion, and retired/cancelled waiters do not
+retransmit. Deadline exhaustion uses the compiled callback's canonical timeout
+classification. The production three-node simulation drops the first forwarded
+request and checks recovery without an application retry.

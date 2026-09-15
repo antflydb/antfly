@@ -6118,6 +6118,13 @@ pub const AntflyApiHandler = struct {
     }
 
     pub fn lookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_openapi.server.LookupKeyParams) !httpx.Response {
+        return self.lookupKeyImpl(ctx, table_name, key, params) catch |err| {
+            std.log.warn("public document lookup failed table={s} err={s}", .{ table_name, @errorName(err) });
+            return err;
+        };
+    }
+
+    fn lookupKeyImpl(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_openapi.server.LookupKeyParams) !httpx.Response {
         _ = params;
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);

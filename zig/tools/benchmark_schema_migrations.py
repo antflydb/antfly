@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--large-docs", type=positive, default=10000)
     parser.add_argument("--small-tenants", type=positive, default=5)
+    parser.add_argument("--traffic-clients", type=positive, default=1)
     args = parser.parse_args()
     if args.warmups < 0:
         parser.error("warmups must be nonnegative")
@@ -71,6 +72,7 @@ def main():
         "configuration": {
             "large_documents": args.large_docs,
             "small_tenants": args.small_tenants,
+            "traffic_clients": args.traffic_clients,
             "warmups_per_binary": args.warmups,
             "samples_per_binary": args.samples,
         },
@@ -119,6 +121,7 @@ def run_comparison(args, result, binaries):
                 "ANTFLY_BIN": str(binary),
                 "ANTFLY_MIGRATION_LARGE_DOCS": str(args.large_docs),
                 "ANTFLY_MIGRATION_SMALL_TENANTS": str(args.small_tenants),
+                "ANTFLY_MIGRATION_TRAFFIC_CLIENTS": str(args.traffic_clients),
             }
             start = time.monotonic()
             timed_out = False
@@ -164,6 +167,7 @@ def run_comparison(args, result, binaries):
                     if isinstance(error, KeyboardInterrupt):
                         raise
             observations = []
+            seen_observations = set()
             for line in log_path.read_text().splitlines():
                 if f'"scenario": "{SCENARIO}"' not in line:
                     continue
@@ -172,7 +176,12 @@ def run_comparison(args, result, binaries):
                 except (ValueError, json.JSONDecodeError):
                     continue
                 if record.get("scenario") == SCENARIO:
-                    observations.append(record)
+                    # Pytest repeats assertion payloads in failure reports.
+                    # Preserve the failed run, but count its JSON sample once.
+                    identity = json.dumps(record, sort_keys=True)
+                    if identity not in seen_observations:
+                        seen_observations.add(identity)
+                        observations.append(record)
             run = {
                 "binary": label,
                 "iteration": iteration,
