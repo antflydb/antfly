@@ -42,7 +42,6 @@ jobs:
           SUITE: ${{ inputs.suite }}
           HEAD_SHA: ${{ inputs.head_sha }}
           BASE_SHA: ${{ inputs.base_sha }}
-          PR_CI_APPROVERS: ${{ vars.PR_CI_APPROVERS }}
         with:
           script: |
             if (!process.env.PR_NUMBER) {

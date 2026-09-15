@@ -90,27 +90,33 @@ async function main({github, context, core, mode, config, env = process.env}) {
   };
   const human = async comment => {
     if (comment.user.type !== 'User' || comment.user.login.endsWith('[bot]')) {
-      throw new Error('Approval must come from a human maintainer account.');
+      throw new Error('Approval must come from a human organization member.');
     }
-    const allow = (env.PR_CI_APPROVERS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-    if (allow.length && !allow.includes(comment.user.login.toLowerCase())) {
-      throw new Error('Comment author is not in PR_CI_APPROVERS.');
+    if (!env.PR_CI_MEMBERS_TOKEN) {
+      throw new Error('Configure PR_CI_MEMBERS_TOKEN with organization Members: read permission.');
     }
-    const {data} = await github.rest.repos.getCollaboratorPermissionLevel({
-      ...repo, username: comment.user.login,
+    // author_association/public_members do not reliably include private members.
+    // Use a separate read-only credential for this request only; all repository
+    // operations continue to use the job's scoped GITHUB_TOKEN.
+    const {data} = await github.rest.orgs.getMembershipForUser({
+      org: repo.owner, username: comment.user.login,
+      headers: {authorization: `Bearer ${env.PR_CI_MEMBERS_TOKEN}`},
     });
-    if (!['write', 'maintain', 'admin'].includes(data.permission) && !data.user?.permissions?.push) {
-      throw new Error('Approval requires repository write access.');
+    if (data.state !== 'active') {
+      throw new Error('Approval requires active membership in the repository owner organization.');
     }
   };
-  const validateComment = async approval => {
+  const validateComment = async (approval, checkMembership = true) => {
     const {data: comment} = await github.rest.issues.getComment({...repo, comment_id: approval.comment_id});
     if (comment.issue_url !== `${context.apiUrl}/repos/${repository}/issues/${number}` ||
         comment.body.trim() !== `/ci run ${approval.sha}` ||
         comment.updated_at !== comment.created_at || comment.user.login !== approval.approver) {
       throw new Error('Approval comment was edited, moved, or no longer matches.');
     }
-    await human(comment);
+    // Suite admission trusts the membership decision made by the orchestrator.
+    // Only the controller and approval job receive the membership credential;
+    // completion rechecks membership before publishing a passing PR check.
+    if (checkMembership) await human(comment);
   };
   const cancel = async () => {
     // Only cancel this PR's orchestrator, never main, schedules, or releases.
@@ -156,7 +162,7 @@ async function main({github, context, core, mode, config, env = process.env}) {
       throw new Error('Suite checkout does not match the approved commit and base.');
     }
     validateSnapshot(await getPR(), data, config);
-    await validateComment(data);
+    await validateComment(data, mode === 'admit');
     if (mode === 'admit') {
       data.run_id = context.runId;
       await writeCheck(check, data, 'in_progress',

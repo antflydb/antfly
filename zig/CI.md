@@ -8,7 +8,7 @@ use the same controller implementation and repository-specific suite maps.
 
 1. Mark the PR ready for review. Draft PRs do not start test runners.
 2. Add any optional suite labels from the table below.
-3. A human with repository write, maintain, or admin access posts a **new** comment:
+3. Any human member of the `antflydb` organization posts a **new** comment:
 
    ```text
    /ci run <full 40-character PR head SHA>
@@ -16,9 +16,9 @@ use the same controller implementation and repository-specific suite maps.
 
    Obtain the SHA with `gh pr view NUMBER --json headRefOid --jq .headRefOid`.
    The command must be the entire comment. Short SHAs and edited comments are
-   rejected. An optional `PR_CI_APPROVERS` repository variable restricts approvers
-   further to a comma-separated list of GitHub usernames. Each listed user still
-   needs write access. Without the variable, any human repository writer can approve.
+   rejected. Public and private org memberships both qualify; repository write
+   access is not required. Outside collaborators and pending org invitations do
+   not qualify. The member must be able to view and comment on the PR.
 4. Follow **Approved PR CI** in Actions and the **PR CI** check on the PR head.
 
 Posting a new approval cancels the previous PR run and starts another attempt.
@@ -104,6 +104,29 @@ keep human approval credentials out of agents. Repository administrators and
 writers who can change workflow definitions remain trusted; this is a cost gate,
 not a sandbox against malicious repository maintainers.
 
+## Organization membership credential
+
+Before rollout, set the repository secret `PR_CI_MEMBERS_TOKEN` in both Antfly and
+Colony. Use a fine-grained PAT with resource owner `antflydb` and organization **Members:
+read** permission and no repository-content or write permissions. Obtain any
+organization approval required for the token. A GitHub App installation token
+with the same permission also works, but its short lifetime requires automated
+renewal; do not store a one-hour token as a permanent secret.
+
+The ordinary Actions `GITHUB_TOKEN` cannot read private organization membership.
+The controller queries the membership API for the repository-owning organization
+and accepts only `state: active`. Comment badges and public member lists are not
+used as a substitute. Missing credentials, pending invitations, nonmembers, and
+API failures all deny approval. No `PR_CI_APPROVERS` variable is used.
+
+Only the default-branch controller and orchestrator approval job receive this
+credential. They check membership when accepting the comment, when admitting the
+run, and before publishing success. Suite admission validates the recorded
+approval and comment without receiving the membership token. Removing a member
+while a run is in progress prevents a passing final check; it does not emit a
+cancellation event or immediately stop already authorized jobs. Membership tokens
+are not forwarded to test workflows, including Colony's credentialed previews.
+
 ## Main, schedules, manual runs, and merge queues
 
 Existing main/master push, schedule, release, and merge-group triggers retain
@@ -125,9 +148,9 @@ actionlint 1.7.12 does not yet recognize.
    together into each repository's default branch. Default-branch event handlers
    cannot be exercised by merely pushing this implementation branch. Existing
    queued/running workflows from before rollout are not retroactively gated.
-2. Create the suite labels above. Optionally configure `PR_CI_APPROVERS` with the
-   intended human approvers. No personal access token or approval environment is
-   required for the controller: `GITHUB_TOKEN` can dispatch workflows.
+2. Create the suite labels above and configure `PR_CI_MEMBERS_TOKEN` as a repository
+   secret in both repositories (see below). No per-user allowlist or approval
+   environment is required. Dispatch and check updates use `GITHUB_TOKEN`.
 3. Verify with a small non-draft PR: no tests before approval, a new full-SHA
    comment starts selected tests, and a subsequent push requires fresh approval.
    Verify draft conversion and adding/removing suite labels cancel an active run.
@@ -168,3 +191,4 @@ and late/failed completion. They do not provision runners or run GPU/scale tests
 - [Concurrency queues](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency)
 - [Environment feature availability](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
 - [Protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)
+- [Organization membership API permissions](https://docs.github.com/en/rest/orgs/members#get-organization-membership-for-a-user)
