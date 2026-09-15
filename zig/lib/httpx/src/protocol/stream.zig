@@ -114,6 +114,8 @@ pub const Stream = struct {
     total_data_received: u64 = 0,
     /// Per-stream body ceiling. Null inherits the connection-wide ceiling.
     max_data_size: ?usize = null,
+    /// Client error-body ceiling selected from the initial response status.
+    max_error_data_size: ?usize = null,
 
     /// Bytes charged to the server's aggregate H2 mailbox budget. The stream
     /// owns this reservation until removal, including error paths.
