@@ -259,6 +259,14 @@ pub const ApplyRwLock = struct {
         }
     }
 
+    /// Retain an existing shared lease without re-entering reader admission.
+    /// The caller must keep its original lease alive until this returns.
+    pub fn retainShared(self: *@This()) void {
+        const previous = self.state.fetchAdd(1, .acquire);
+        const readers = previous & ~writer_bit;
+        std.debug.assert(readers != 0 and readers < writer_bit - 1);
+    }
+
     pub fn unlockShared(self: *@This()) void {
         const previous = self.state.fetchSub(1, .release);
         std.debug.assert(previous & ~writer_bit != 0);

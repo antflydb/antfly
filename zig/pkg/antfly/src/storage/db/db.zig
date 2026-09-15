@@ -2879,6 +2879,7 @@ fn prepareRelationalRows(
 const BatchExecutionOptions = struct {
     validate_range_ownership: bool = true,
     store_batch_options: backend_types.BatchOptions = .{},
+    snapshot_mutation: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease = null,
     wait_for_sync_level: bool = true,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
@@ -8038,6 +8039,11 @@ pub const DB = struct {
     fn runLsmMaintenanceStepWithHAMutationHeld(self: *DB) !bool {
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
+        return self.runLsmMaintenanceStepAdmitted(&snapshot_replay);
+    }
+
+    fn runLsmMaintenanceStepAdmitted(self: *DB, snapshot_replay: *const snapshot_admission_mod.SnapshotAdmission.MutationLease) !bool {
+        std.debug.assert(snapshot_replay.active and snapshot_replay.admission == self.core.snapshot_replay_admission);
         if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -8133,7 +8139,7 @@ pub const DB = struct {
             if (!progressed) {
                 const wake_due = if (self.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
                 if (!wake_due) break;
-                if (!try self.runLsmMaintenanceStepWithHAMutationHeld()) break;
+                if (!try self.runLsmMaintenanceStepAdmitted(&snapshot_replay)) break;
             }
         }
         return steps;
@@ -9369,8 +9375,9 @@ pub const DB = struct {
             );
         }
 
-        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        var snapshot_mutation = if (opts.snapshot_mutation) |lease| lease.retain() else self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
+        std.debug.assert(snapshot_mutation.admission == self.core.snapshot_admission);
         if (builtin.is_test) {
             if (test_portable_runtime_batch_prelock_hook) |hook| {
                 hook.entered.store(true, .release);
@@ -9480,7 +9487,7 @@ pub const DB = struct {
         if (self.bulk_ingest_coalescer.active and !self.flushing_bulk_ingest_coalescer) {
             if (self.bulk_ingest_coalescer.hasPending()) {
                 unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
-                try self.flushBulkIngestCoalescerWithSyncLevel(req.sync_level, profile);
+                try self.flushBulkIngestCoalescerWithAdmission(req.sync_level, profile, &snapshot_mutation);
                 const reacquire_wait_start_ns = monotonicTimeNs();
                 try self.lockApplyForPortableRuntime();
                 if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - reacquire_wait_start_ns;
@@ -11457,7 +11464,18 @@ pub const DB = struct {
         operation: []const u8,
         index_name: []const u8,
     ) IndexStructuralMutationGuard {
-        const snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        return self.beginDrainedIndexStructuralMutationWithLease(operation, index_name, self.core.snapshot_admission.acquireMutation());
+    }
+
+    // Consumes the caller's admission. Native capture lends an explicit scoped
+    // lease; ordinary structural operations acquire their own shared lease.
+    fn beginDrainedIndexStructuralMutationWithLease(
+        self: *DB,
+        operation: []const u8,
+        index_name: []const u8,
+        snapshot_mutation: snapshot_admission_mod.SnapshotAdmission.MutationLease,
+    ) IndexStructuralMutationGuard {
+        std.debug.assert(snapshot_mutation.active and snapshot_mutation.admission == self.core.snapshot_admission);
         lockAtomicWithBackoff(&self.index_structural_mutation_mutex);
         return .{
             .db = self,
@@ -12704,6 +12722,10 @@ pub const DB = struct {
     }
 
     fn flushBulkIngestCoalescerWithSyncLevel(self: *DB, sync_level: types.SyncLevel, profile: ?*BatchProfile) anyerror!void {
+        return self.flushBulkIngestCoalescerWithAdmission(sync_level, profile, null);
+    }
+
+    fn flushBulkIngestCoalescerWithAdmission(self: *DB, sync_level: types.SyncLevel, profile: ?*BatchProfile, snapshot_mutation: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) anyerror!void {
         if (!self.bulk_ingest_coalescer.active or !self.bulk_ingest_coalescer.hasPending()) return;
         _ = self.bulk_ingest_coalescer.stats.flush_calls.fetchAdd(1, .monotonic);
         _ = self.bulk_ingest_coalescer.stats.flushed_keys.fetchAdd(@intCast(self.bulk_ingest_coalescer.entries.items.len), .monotonic);
@@ -12720,7 +12742,7 @@ pub const DB = struct {
             .writes = view.writes,
             .deletes = view.deletes,
             .sync_level = sync_level,
-        }, profile, .{ .store_batch_options = .{ .mode = .bulk_ingest, .defer_commit_flush = true } });
+        }, profile, .{ .store_batch_options = .{ .mode = .bulk_ingest, .defer_commit_flush = true }, .snapshot_mutation = snapshot_mutation });
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -21883,7 +21905,8 @@ pub const DB = struct {
             try ensureSnapshotActive(cancellation);
             try self.flushAppliedSequencesForIdle();
 
-            structural = self.beginIndexStructuralMutation("native snapshot", "*");
+            structural = self.beginDrainedIndexStructuralMutationWithLease("native snapshot", "*", capture.borrowMutation());
+            if (!structural.?.acquireCatalogBarrierUntil(std.math.maxInt(u64))) unreachable;
             replay_capture = self.core.snapshot_replay_admission.acquireCaptureIo(
                 io,
                 @as(?types.CancellationToken, cancellation),
@@ -50886,12 +50909,18 @@ test "async dense catch-up token owns snapshot admission through close" {
     try std.testing.expect(mutation == null);
     try std.testing.expect(!snapshot_admission.lock.tryLockExclusive());
 
+    try std.testing.expectError(error.DenseCatchUpSessionSuperseded, retainAsyncDenseCatchUpAdmission(&ctx, "other", token));
+    var retained = (try retainAsyncDenseCatchUpAdmission(&ctx, "vec", token)).?;
+    defer retained.release();
     var session = try takeAsyncDenseCatchUpSession(&ctx, "vec", token);
     defer ctx.alloc.free(session.index_name);
     try std.testing.expect(!snapshot_admission.lock.tryLockExclusive());
     if (session.snapshot_replay) |*lease| lease.release();
     session.snapshot_replay = null;
 
+    try std.testing.expect(!snapshot_admission.lock.tryLockExclusive());
+    try std.testing.expectError(error.DenseCatchUpSessionSuperseded, retainAsyncDenseCatchUpAdmission(&ctx, "vec", token));
+    retained.release();
     try std.testing.expect(snapshot_admission.lock.tryLockExclusive());
     snapshot_admission.lock.unlockExclusive();
 }
@@ -52772,7 +52801,7 @@ fn applyDerivedBatchToIndexReplayContext(
     if (benchMetricsEnabled()) {
         var profile = BatchProfile{};
         const total_start_ns = monotonicTimeNs();
-        try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, &profile, true);
+        try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, &profile, true, null);
         const index_sync_start_ns = monotonicTimeNs();
         try ctx.index_manager.syncReplayStateByName(ctx.store, index_ref.name);
         recordProfileNs(&profile, &profile.index_sync_ns, index_sync_start_ns);
@@ -52784,7 +52813,7 @@ fn applyDerivedBatchToIndexReplayContext(
         // the same explicit borrowing capability as the profiled path; routing
         // it through the ordinary foreground helper would correctly reject
         // the already-active capture as unrelated ownership.
-        try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, null, true);
+        try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, null, true, null);
         try ctx.index_manager.syncReplayStateByName(ctx.store, index_ref.name);
     }
     return true;
@@ -52851,7 +52880,7 @@ fn applyDerivedBatchTargetsContextProfiled(ctx: *const BatchExecutionContext, ba
                 .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
                 .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
             };
-            try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, profile, false);
+            try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, profile, false, null);
             const index_sync_start_ns = monotonicTimeNs();
             try ctx.index_manager.syncReplayStateByName(ctx.store, index_ref.name);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.index_sync_ns, index_sync_start_ns);
@@ -53315,7 +53344,7 @@ fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_
 }
 
 fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
-    try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, false);
+    try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, false, null);
 }
 
 fn loadDerivedCoverageOutcomeCounterFromStore(
@@ -55131,11 +55160,18 @@ fn applyDerivedBatchToIndexContextProfiled(
     index_ref: index_manager_mod.ManagedIndexRef,
     profile: ?*BatchProfile,
     borrow_active_source_capture: bool,
+    admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease,
 ) !void {
     // Generated files and their publication metadata are one physical
     // generation. Native capture takes the exclusive side of this admission
     // while copying, so no async worker may rewrite an artifact mid-copy.
-    var snapshot_replay = try acquireSnapshotReplayAsyncContext(ctx);
+    var snapshot_replay = if (admitted_replay) |lease| blk: {
+        std.debug.assert(lease.admission == ctx.snapshot_replay_admission);
+        std.debug.assert(lease.active);
+        // The callback keeps its retained lease alive for this entire call.
+        // Borrow it directly instead of adding another shared-count round trip.
+        break :blk @as(?snapshot_admission_mod.SnapshotAdmission.MutationLease, null);
+    } else try acquireSnapshotReplayAsyncContext(ctx);
     defer if (snapshot_replay) |*lease| lease.release();
     if (index_ref.kind == .full_text) {
         const apply_start_ns = monotonicTimeNs();
@@ -59883,7 +59919,7 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
     };
-    applyDerivedBatchToIndexContextProfiled(&ctx, batch, index_ref, null, true) catch |err| switch (err) {
+    applyDerivedBatchToIndexContextProfiled(&ctx, batch, index_ref, null, true, null) catch |err| switch (err) {
         // External-vector dense indexes can discover a missing artifact while
         // replaying an otherwise valid journal window. Existing generations
         // turn that into durable repair debt; initial materialization keeps it
@@ -62007,12 +62043,19 @@ fn resetPath(path: []const u8) !void {
     try fs_paths.createDirPathPortable(io, path);
 }
 
-fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
+fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: derived_executor_mod.CatchUpSessionToken) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) return false;
     if (index_ref.kind == .dense_vector and ctx.active_external_dense_bulk_sessions.load(.acquire) != 0) {
         return error.ReplayDocumentNotVisible;
     }
+
+    var admitted_replay = if (index_ref.kind == .dense_vector)
+        try retainAsyncDenseCatchUpAdmission(ctx, index_ref.name, token)
+    else
+        null;
+    defer if (admitted_replay) |*lease| lease.release();
+    const admission = if (admitted_replay) |*lease| lease else null;
 
     // The executor opened the source capture in
     // beginDerivedCatchUpSessionAsync; this callback alone owns the right to
@@ -62021,11 +62064,11 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
     if (benchMetricsEnabled()) {
         var profile = BatchProfile{};
         const start = monotonicTimeNs();
-        try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, &profile, true);
+        try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, &profile, true, admission);
         profile.total_ns = monotonicTimeNs() - start;
         logDerivedWorkerProfile(index_ref, batch, profile);
     } else {
-        try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, true);
+        try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, true, admission);
     }
 
     if (index_ref.kind == .dense_vector) {
@@ -62080,6 +62123,22 @@ fn installAsyncDenseCatchUpSession(
     return .{ .value = session_id };
 }
 
+// The map mutex protects the transfer from the session's lease to an
+// independently retained batch lease. Session close cannot retire admission
+// underneath an in-flight callback, and stale tokens cannot borrow a new one.
+fn retainAsyncDenseCatchUpAdmission(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    token: derived_executor_mod.CatchUpSessionToken,
+) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+    if (token.isNone()) return error.DenseCatchUpSessionSuperseded;
+    lockAtomicWithBackoff(&ctx.dense_catch_up_session_mutex);
+    defer ctx.dense_catch_up_session_mutex.unlock();
+    const session = ctx.dense_catch_up_sessions.getPtr(token.value) orelse return error.DenseCatchUpSessionSuperseded;
+    if (!std.mem.eql(u8, session.index_name, index_name)) return error.DenseCatchUpSessionSuperseded;
+    return if (session.snapshot_replay) |*lease| lease.retain() else null;
+}
+
 fn takeAsyncDenseCatchUpSession(
     ctx: *AsyncContext,
     index_name: []const u8,
@@ -62099,8 +62158,8 @@ fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
     index_ref: index_manager_mod.ManagedIndexRef,
 ) !derived_executor_mod.CatchUpSessionToken {
     // Acquire before any derived mutation and transfer the lease into the
-    // opaque catch-up token. Per-batch leases remain nested fast paths, while
-    // this outer lease closes the old apply/finish publication gap.
+    // opaque catch-up token. Each batch explicitly retains that token's lease,
+    // closing the apply/finish gap without ambient thread ownership.
     var snapshot_replay = try acquireSnapshotReplayAsyncContext(ctx);
     defer if (snapshot_replay) |*lease| lease.release();
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);

@@ -4,6 +4,38 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-15: snapshot ownership leaked between cooperative tasks
+
+Review of #704 reproduced a pre-existing `SnapshotAdmission` bug on both
+`096a1f9e4` and `origin/main` (`0fb01a4add`). A VOPR task acquired capture and
+slept for ten virtual milliseconds. Before advancing time, another task acquired
+mutation admission on the same OS thread and reported `capture_active=true`,
+`mutation_overlapped=true`, and `lease_bypassed=true`. Thread-local ownership
+mistook an unrelated task for the capture owner. The same mechanism also made
+leases unsafe to transfer between native Io workers.
+
+Admission now belongs to explicit operation leases. Nested mutations retain a
+shared lease without re-entering the writer-closed gate. Capture lends a scoped
+mutation capability to its catalog guard. Bulk-ingest nested batches pass their
+parent lease; LSM maintenance calls its admitted helper. Dense replay passes the
+exact catch-up session token through both manual and Io executor callbacks,
+retains its lease under the session-map mutex, and rejects stale or mismatched
+tokens. Closing the session cannot retire a lease still held by an active batch.
+Ordinary acquisition remains allocation-free; waits use the owner's `std.Io`.
+
+Five admission regressions cover independent VOPR tasks, cancellation, a queued
+capture with an explicitly retained mutation, capture-owned maintenance, and
+release on a different native Io worker. They passed **200/200 fresh processes
+(1,000 test executions)**. The DB token regression also checks that a retained
+batch keeps capture excluded after session close and that closed/wrong-index
+tokens cannot borrow admission. These cases run in `vopr-runtime-test` and
+production VOPR qualification. The focused DB integration run passed 28 cases
+(native snapshots, concurrent capture/writes, bulk ingest, and replay-worker
+lifecycle), with one LSM-backend fixture skip and no leaks. The final
+`vopr-runtime-test` run passed all 25 storage/runtime and seven DataServer tests
+with no skips or leaks. Full-soak results must be associated with the new commit;
+an earlier-head soak cannot qualify this fix.
+
 ## 2026-09-15: runtime-bound apply locks delayed handoff by polling
 
 Review of #704 found that binding `ApplyRwLock` to the DB runtime selected
