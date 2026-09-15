@@ -1599,3 +1599,11 @@ described in [Implementation](#implementation):
   reads the final LSN. An explicit "stop accepting writes and report the final
   LSN" call would let the CLI report the boundary before fencing; it is not
   required for correctness.
+
+### Catalog-create retries
+
+In whole-instance mode, a table-create retry waits for RemoteApply through the
+current primary log position before returning `table already exists`. A table
+visible only on the primary still returns the versioned unknown-outcome response,
+including after primary restart. Catch-up lets the same retry complete without
+appending another catalog record or restarting the primary.

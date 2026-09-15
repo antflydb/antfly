@@ -5849,6 +5849,23 @@ pub const DataServer = struct {
         return .{ .mirror = mirror, .generation = generation, .lsn = lsn };
     }
 
+    /// Caller holds the catalog lock and shared mutation barrier, so every
+    /// visible catalog record is already in this log frontier. Reuse the normal
+    /// RemoteApply wait rather than treating a primary-local lookup as proof.
+    pub fn acknowledgeHAExistingCatalog(self: *DataServer) !void {
+        const commit: HACatalogCommit = blk: {
+            platform_sync.lockYielding(&self.ha_state_mutex);
+            defer self.ha_state_mutex.unlock();
+            const generation = self.ha_public_gate_state.currentGeneration();
+            try self.ha_public_gate_state.checkWrite(generation);
+            const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
+            if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+                return error.HACatalogRequiresWholeInstance;
+            break :blk .{ .mirror = mirror, .generation = generation, .lsn = mirror.primary.lastLsn() };
+        };
+        try self.acknowledgeHACatalogCreate(commit);
+    }
+
     /// Local catalog publication has completed. A remote timeout leaves an
     /// uncertain client outcome, but must not undo committed catalog state or
     /// require a process restart when the standby becomes available again.

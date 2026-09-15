@@ -193,10 +193,31 @@ def test_catalog_remote_apply_outage_recovers_without_primary_restart(ha_cluster
     )
     assert response.status_code >= 400, response.text
     assert "outcome is unknown" in response.text, response.text
+    assert response.headers.get("X-Antfly-Raft-Mutation-Outcome") == "unknown-v1"
+    # The table is visible locally, but neither a retry nor a primary restart
+    # may turn that visibility into an acknowledged AlreadyExists response.
+    for restart in (False, True):
+        if restart:
+            cluster.primary.restart()
+            primary_pid = cluster.primary.proc.pid
+        retry = cluster.primary._request(
+            "POST", f"{cluster.primary.url}{DB_API_ROOT}/tables/pending_table",
+            json={"num_shards": 1}, timeout=30,
+        )
+        assert retry.status_code == 409, retry.text
+        assert retry.headers.get("X-Antfly-Raft-Mutation-Outcome") == "unknown-v1", retry.text
+        assert "outcome is unknown" in retry.text, retry.text
     # Creation is durable but unacknowledged. Replication catches up without
     # restarting the primary when its required standby becomes available.
     cluster.standby.start()
     _wait_for_standby_applied(cluster, _primary_lsn(cluster), require_live_replication=True)
+    retry = cluster.primary._request(
+        "POST", f"{cluster.primary.url}{DB_API_ROOT}/tables/pending_table",
+        json={"num_shards": 1}, timeout=30,
+    )
+    assert retry.status_code == 409, retry.text
+    assert retry.text == "table already exists"
+    assert retry.headers.get("X-Antfly-Raft-Mutation-Outcome") is None
     cluster.primary.batch_write("pending_table", {"recovered": {"title": "replayed catalog"}})
     _wait_for_standby_lookup(cluster, "pending_table", "recovered")
     cluster.primary.create_table("after_outage")

@@ -1167,7 +1167,15 @@ const LocalStandaloneMetadata = struct {
         defer if (lease) |*value| value.release();
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
+        if (self.findTableByNameLocked(table_name) != null) {
+            if (self.ha_catalog_server) |server| {
+                // A retry may observe a catalog whose original RemoteApply wait
+                // timed out. Existence is safe to acknowledge only after the
+                // required standby has applied the current catalog frontier.
+                server.acknowledgeHAExistingCatalog() catch return error.MetadataMutationOutcomeUnknown;
+            }
+            return error.TableAlreadyExists;
+        }
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try self.manager.upsertTable(table);
