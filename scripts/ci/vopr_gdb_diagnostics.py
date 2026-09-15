@@ -93,12 +93,30 @@ def application_error():
     frame = gdb.newest_frame()
     gdb.write(f"VOPR HTTP error boundary: {frame.name()}\n")
     try:
-        gdb.write(f"  error={frame.read_var('err')}\n")
+        value = frame.read_var("err")
+        gdb.write(f"  error={value} numeric={int(value)} type={value.type}\n")
+        gdb.execute("ptype err")
     except (gdb.error, ValueError) as error:
         gdb.write(f"  error identity unavailable: {error}\n")
+    # Keep the calling convention evidence as well as optimized DWARF values.
+    # Zig error unions can otherwise render only their `err` discriminant.
+    gdb.execute("info registers rax rbx rcx rdx rsi rdi r8 r9")
+    gdb.execute("x/16i $pc")
     try:
-        context = frame.read_var("ctx").dereference()
-        request = context["request"].dereference()
+        owner = frame
+        while owner is not None:
+            try:
+                context = owner.read_var("ctx")
+                break
+            except (gdb.error, ValueError):
+                owner = owner.older()
+        else:
+            raise ValueError("request context unavailable on transport stack")
+        if context.type.code == gdb.TYPE_CODE_PTR:
+            context = context.dereference()
+        request = context["request"]
+        if request.type.code == gdb.TYPE_CODE_PTR:
+            request = request.dereference()
         uri = request["uri"]["raw"]
         raw = gdb.selected_inferior().read_memory(
             int(uri["ptr"]), min(int(uri["len"]), 512)
@@ -176,18 +194,16 @@ for expression in (
         breakpoint.silent = True
         breakpoint.commands = "silent\npython boundary()\ncontinue\n"
 
-# rbreak only searches out-of-line functions. ReleaseSafe can inline every
-# ingress error boundary, so use its source location in the retained executable
-# as well. These locations belong to the original 919fa9d diagnostic artifact;
-# fail visibly if its debug information does not contain them.
-http_boundaries = []
-for location in ("httpx_handler.zig:926", "server.zig:2334"):
-    breakpoint = gdb.Breakpoint(location)
-    if breakpoint.pending:
-        raise gdb.GdbError(f"HTTP diagnostic boundary did not resolve: {location}")
+# The transport boundary survives ReleaseSafe inlining of ingress handlers.
+# Resolve symbols from the retained executable, never source line numbers from
+# the diagnostic checkout (which can belong to a different revision).
+http_boundaries = gdb.rbreak("routeErrorResponseStatus")
+if not http_boundaries:
+    raise gdb.GdbError("No HTTP transport error boundary found in retained executable")
+http_boundaries += gdb.rbreak("AntflyApiHandler.mapIngressError")
+for breakpoint in http_boundaries:
     breakpoint.silent = True
     breakpoint.commands = "silent\npython application_error()\ncontinue\n"
-    http_boundaries.append(breakpoint)
 
 
 gdb.execute("run")
