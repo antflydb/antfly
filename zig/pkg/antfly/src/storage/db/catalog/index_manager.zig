@@ -4453,7 +4453,28 @@ pub const IndexManager = struct {
     }
 
     pub fn ensureVectorBlockBaseAtAppliedSequence(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
+        return self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(name, applied_sequence, false);
+    }
+
+    fn vectorBlockUsesDesiredEncoding(self: *IndexManager) bool {
+        const generation = self.acquireVectorBlockGeneration() orelse return false;
+        defer generation.release();
+        return generation.opened.usesBaseEncoding(self.vectorBlockStorageEncoding());
+    }
+
+    pub fn sourceMigrationServingComplete(self: *IndexManager) bool {
+        if (self.dense_indexes.items.len == 0) return true;
+        if (self.source_payload_store == null or !self.vectorBlockUsesDesiredEncoding()) return false;
+        for (self.dense_indexes.items) |*entry| {
+            if (!entry.native_physical_v2 or !self.vectorBlockReadyForDenseIndex(entry.config.name) or
+                self.repairUnavailable(entry.config.name)) return false;
+        }
+        return true;
+    }
+
+    fn ensureVectorBlockBaseAtAppliedSequenceWithEncoding(self: *IndexManager, name: []const u8, applied_sequence: u64, require_storage_encoding: bool) !void {
         if (self.vector_block_storage == null) return;
+        const converting = require_storage_encoding and !self.vectorBlockUsesDesiredEncoding();
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
         if (entry.index.experimentalPostingDurableAppliedSequence()) |posting_sequence| {
             // A stable source snapshot may legitimately be ahead of the last
@@ -4507,7 +4528,7 @@ pub const IndexManager = struct {
         // maintenance lane. The empty-bootstrap exception remains enforced
         // by vectorBlockGenerationReadyAtSequenceAndCount, so initial
         // publication still produces a cardinality-certified base.
-        if (self.vectorBlockReadyAtSequenceAndCount(
+        if (!converting and self.vectorBlockReadyAtSequenceAndCount(
             applied_sequence,
             entry,
             entry.index.stats().active_count,
@@ -4521,7 +4542,7 @@ pub const IndexManager = struct {
         // without cloning/scanning primary LSM artifacts. Missing, lossy, or
         // sequence-mismatched native state falls through to the pinned primary
         // snapshot repair path below.
-        if (try self.compactVectorBlockGenerationAtStableTip(entry, applied_sequence)) return;
+        if (!converting and try self.compactVectorBlockGenerationAtStableTip(entry, applied_sequence)) return;
 
         // Only one snapshot builder may reserve the next immutable generation.
         // Ordinary WAL appends continue under vector_block_build_mu while the
@@ -4611,7 +4632,7 @@ pub const IndexManager = struct {
         defer store.deinit();
         if (store.manifest != null and store.covered_source_sequence == applied_sequence) {
             try self.loadVectorBlockGenerationIfPresent(false);
-            if (self.vectorBlockReadyAtSequenceAndCount(
+            if (!converting and self.vectorBlockReadyAtSequenceAndCount(
                 applied_sequence,
                 entry,
                 entry.index.stats().active_count,
@@ -10583,6 +10604,10 @@ pub const IndexManager = struct {
     }
 
     pub const OnlineVectorBlockPublicationOptions = struct {
+        /// Source ownership conversion calls this only after physical primary
+        /// values are all references. Preserve healthy serving while replacing
+        /// the old full-payload exact-vector plane.
+        require_storage_encoding: bool = false,
         cancel_check: ?types.RepairCancelCheck = null,
         /// The repair owner has verified terminal source-outcome coverage for
         /// this rebuilding index. This permits staging only; serving and the
@@ -10626,7 +10651,9 @@ pub const IndexManager = struct {
             if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
             if (self.repairUnavailable(entry.config.name) and
                 !(options.covered_rebuilding_index != null and std.mem.eql(u8, options.covered_rebuilding_index.?, entry.config.name))) continue;
-            if (self.vectorBlockReadyForDenseIndex(entry.config.name) and !entry.index.nativePostingAccelerationPending()) continue;
+            const healthy = self.vectorBlockReadyForDenseIndex(entry.config.name);
+            if (healthy and !entry.index.nativePostingAccelerationPending() and
+                (!options.require_storage_encoding or self.vectorBlockUsesDesiredEncoding())) continue;
             const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
             if (sequence != primary.lastReplaySequence(0)) {
                 deferred = true;
@@ -10646,16 +10673,20 @@ pub const IndexManager = struct {
                     continue;
                 }
             }
-            if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
-                return .{ .published = published, .deferred = true };
-            self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
-            self.vector_block_stable_tip_sequence.store(sequence, .release);
-            defer {
+            // Healthy replacements are serialized by the DB projection owner
+            // and base-staging reservation. They do not close serving admission.
+            if (!healthy) {
+                if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+                    return .{ .published = published, .deferred = true };
+                self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
+                self.vector_block_stable_tip_sequence.store(sequence, .release);
+            }
+            defer if (!healthy) {
                 self.vector_block_stable_tip_sequence.store(0, .release);
                 self.vector_block_stable_tip_index.store(0, .release);
                 self.vector_block_stable_tip_finalizing.store(false, .release);
-            }
-            self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, sequence) catch |err| switch (err) {
+            };
+            self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(entry.config.name, sequence, options.require_storage_encoding) catch |err| switch (err) {
                 error.PostingCheckpointSequenceMismatch,
                 error.VectorBlockSnapshotAdvancedWithoutWal,
                 error.VectorBlockGenerationReservationLost,

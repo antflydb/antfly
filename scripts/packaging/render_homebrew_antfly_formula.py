@@ -92,6 +92,7 @@ class Antfly < Formula
 
   def install
     bin.install "antfly"
+    bin.install "antfly-vector-migrate" if File.exist?("antfly-vector-migrate")
     include.install Dir["include/*"] if Dir.exist?("include")
     lib.install Dir["lib/*"] if Dir.exist?("lib")
     (share/"antfly").install Dir["share/antfly/*"] if Dir.exist?("share/antfly")

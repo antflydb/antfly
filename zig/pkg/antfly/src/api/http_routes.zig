@@ -551,6 +551,10 @@ pub const Routes = struct {
         return matchTableArtifactRepairWithSuffix(path, artifact_repair_suffix);
     }
 
+    pub fn matchTableStorageMigration(path: []const u8) ?TableArtifactRepair {
+        return matchTableArtifactRepairWithSuffix(path, "/storage-migration");
+    }
+
     pub fn matchTableArtifactRepairRun(path: []const u8) ?TableArtifactRepair {
         return matchTableArtifactRepairWithSuffix(path, artifact_repair_run_suffix);
     }

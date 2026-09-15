@@ -2218,6 +2218,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
     lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
 
+    const vector_migrate_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/vector_migrate.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vector_migrate_mod.addImport("antfly-zig", antfly_mod);
+    const vector_migrate = b.addExecutable(.{ .name = "antfly-vector-migrate", .root_module = vector_migrate_mod });
+    b.step("vector-migrate", "Build exclusive offline table migration command").dependOn(&b.addInstallArtifact(vector_migrate, .{}).step);
+
+    const vector_migration_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"source vector migration"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("vector-migration-test", "Run source ownership migration and recovery tests").dependOn(&b.addRunArtifact(vector_migration_tests).step);
+
     const resource_budget_runtime_filters = [_][]const u8{
         "default tokenizer cache budget is aligned with its resource slice",
         "default lake range cache queue budget is aligned with its terminal resource slice",

@@ -6029,6 +6029,25 @@ fn storageOwnerArtifactJsonResponse(
     return .ok;
 }
 
+pub fn storageOwnerVectorMigrationJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(@import("../common/vector_migration.zig").Command, handle.alloc, request.request_json.slice(), .{}) catch return .invalid_argument;
+    defer parsed.deinit();
+    // Offline publication owns a separate exclusive root transition; it may
+    // never run against a serving compiled owner through this online endpoint.
+    if (parsed.value.request.mode != .online) return .invalid_argument;
+    const result = handle.db.vectorMigrationCommand(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = result.ptr, .len = @intCast(result.len) };
+    return .ok;
+}
+
 pub fn storageOwnerArtifactOperationJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.ArtifactOperationRequest,

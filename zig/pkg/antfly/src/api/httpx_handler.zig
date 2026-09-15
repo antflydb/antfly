@@ -5298,6 +5298,7 @@ pub const AntflyApiHandler = struct {
         while (true) {
             metadata_drop_attempts += 1;
             drop_result = self.api_server.source.dropTableExact(alloc, decoded_table_name) catch |err| switch (err) {
+                error.VectorMigrationActive => return textResponse(ctx, 409, "table storage migration is active"),
                 error.TableNotFound => {
                     _ = ctx.status(404);
                     return ctx.text("not found");
@@ -5982,6 +5983,27 @@ pub const AntflyApiHandler = struct {
 
     pub fn listArtifactRepairIssues(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         return try self.listTableRepairIssues(ctx, table_name);
+    }
+
+    pub fn executeTableStorageMigration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*owned| owned.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return textResponse(ctx, 400, "invalid table name");
+        defer ctx.allocator.free(name);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing migration command");
+        const result = self.api_server.executeVectorMigration(name, body) catch |err| {
+            const code: u16 = switch (err) {
+                error.TableNotFound, error.NotFound, error.VectorMigrationNotFound => 404,
+                error.VectorMigrationIdempotencyConflict, error.VectorMigrationAlreadyExists, error.VectorMigrationAlreadyPublished, error.VectorMigrationNotReady, error.VectorMigrationActive, error.VectorMigrationConfigurationChanged, error.TableGenerationChanged => 409,
+                error.VectorMigrationRecoveryRequired, error.VectorMigrationDiskReserve, error.VectorMigrationTemporaryBudgetExceeded, error.ResourceBudgetExceeded, error.StorageBusy, error.GenerationTransitionActive => 503,
+                error.InvalidVectorMigrationId, error.InvalidVectorMigrationBudget, error.VectorMigrationRowExceedsBudget, error.VectorStoreLifecycleUnsupported, error.VectorStoreRequiresLocalSingleShardTable, error.VectorStoreRequiresOfflineCommand, error.UnsupportedOperation, error.SyntaxError, error.UnexpectedToken, error.UnknownField, error.MissingField, error.InvalidEnumTag => 400,
+                else => 500,
+            };
+            return textResponse(ctx, code, @errorName(err));
+        };
+        defer self.api_server.alloc.free(result);
+        return jsonResponse(ctx, 200, result);
     }
 
     pub fn runTableRepair(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {

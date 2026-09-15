@@ -256,10 +256,11 @@ run_zig_build_steps_with_retry() {
   # Runtime archives carry measured max-RSS admission claims. Independent units
   # can compile concurrently when they fit the release memory budget; there are
   # no artificial ordering dependencies between those compilations.
-  run_zig_build_steps_with_retry archive antfly capi
+  run_zig_build_steps_with_retry archive antfly vector-migrate capi
 )
 
 test -x "$prefix/bin/antfly"
+test -x "$prefix/bin/antfly-vector-migrate"
 test -f "$prefix/include/antfly.h"
 if [ ! -f "$lite_lib_prefix_path" ]; then
   echo "missing Antfly C ABI library: $lite_lib_prefix_path" >&2
@@ -267,6 +268,7 @@ if [ ! -f "$lite_lib_prefix_path" ]; then
   exit 1
 fi
 cp "$prefix/bin/antfly" "$stage/antfly"
+cp "$prefix/bin/antfly-vector-migrate" "$stage/antfly-vector-migrate"
 if [ -d "$prefix/share" ]; then
   cp -R "$prefix/share" "$stage/share"
 fi
@@ -286,6 +288,7 @@ python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
   --output "$out_dir/$archive_name" \
   --mtime "$source_date_epoch"
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
+grep -Fx "./antfly-vector-migrate" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "./THIRD_PARTY_NOTICES.md" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null

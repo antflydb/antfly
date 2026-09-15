@@ -1378,6 +1378,7 @@ pub const StatusSource = struct {
         free_routing_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
+        publish_vector_migration_table: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         replace_table_definition_stamped: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!?metadata_api.CatalogMutationStamp = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
@@ -1486,6 +1487,11 @@ pub const StatusSource = struct {
     pub fn replaceTableDefinition(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const fn_ptr = self.vtable.replace_table_definition orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("replace_table_definition", self.boundary_dispatch, fn_ptr, .{ self.ptr, expected, replacement });
+    }
+
+    pub fn publishVectorMigrationTable(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+        const callback = self.vtable.publish_vector_migration_table orelse return error.VectorStoreRequiresLocalSingleShardTable;
+        return try BoundaryAbi.call("publish_vector_migration_table", self.boundary_dispatch, callback, .{ self.ptr, expected, replacement });
     }
 
     pub fn replaceTableDefinitionStamped(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
@@ -12330,6 +12336,7 @@ pub const ApiHttpServer = struct {
             };
             defer self.source.freeAdminSnapshot(&authoritative_snapshot);
             const record = tables_api.findTableByName(&authoritative_snapshot, table_name) orelse return error.NotFound;
+            if (record.storage_migration != null) return error.UnsupportedBackupMigrationState;
             admitted_fence = backups_api.tableBackupFence(&authoritative_snapshot, record);
             if (expected_fence) |expected| {
                 if (!expected.matches(admitted_fence)) return error.CatalogChanged;
@@ -13998,6 +14005,10 @@ pub const ApiHttpServer = struct {
                 continue;
             };
 
+            if (table.storage_migration != null) {
+                statuses[i].@"error" = "storage migration active";
+                continue;
+            }
             self.backupOwnedTableWithArtifactId(
                 backup_io,
                 table,
@@ -15149,6 +15160,7 @@ pub const ApiHttpServer = struct {
 
     fn executeMcpDropTable(self: *ApiHttpServer, table_name: []const u8) !contextual_operations.OwnedResponse {
         var drop_result = self.source.dropTableExact(self.alloc, table_name) catch |err| return switch (err) {
+            error.VectorMigrationActive => try contextual_operations.textAlloc(self.alloc, 409, "table storage migration is active"),
             error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table name"),
             error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
             error.MetadataTopologyCommandTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "table topology exceeds the 3 MiB metadata command limit; reduce the initial shard count or table definition size"),
@@ -15615,6 +15627,69 @@ pub const ApiHttpServer = struct {
             try markLegacyGraphSearchResponse(self.alloc, &response);
         }
         return response;
+    }
+
+    /// Durable admission is persisted before touching the table owner. If the
+    /// response is lost, the same command resumes the original admitted job.
+    pub fn executeVectorMigration(self: *ApiHttpServer, table_name: []const u8, body: []const u8) ![]u8 {
+        const migration = @import("../common/vector_migration.zig");
+        if (!self.cfg.deployment_mode.isStandalone() or self.source.vtable.publish_vector_migration_table == null)
+            return error.VectorStoreRequiresLocalSingleShardTable;
+        var command = try std.json.parseFromSlice(migration.Command, self.alloc, body, .{});
+        defer command.deinit();
+        try command.value.request.validate();
+        if (command.value.request.mode != .online) return error.VectorStoreRequiresOfflineCommand;
+        var snapshot = try self.source.adminSnapshot() orelse return error.UnsupportedOperation;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        var table = blk: {
+            for (snapshot.tables) |record| if (std.mem.eql(u8, record.name, table_name)) break :blk record;
+            return error.TableNotFound;
+        };
+        if (table.desired_replica_count != 1 or table.read_schema_json.len != 0 or table.restore_backup_id.len != 0)
+            return error.VectorStoreRequiresLocalSingleShardTable;
+        var replication = try std.json.parseFromSlice(std.json.Value, self.alloc, table.replication_sources_json, .{});
+        defer replication.deinit();
+        if (replication.value != .array or replication.value.array.items.len != 0) return error.VectorStoreRequiresLocalSingleShardTable;
+        var group: ?u64 = null;
+        for (snapshot.ranges) |range| if (range.table_id == table.table_id) {
+            if (group != null or range.start_key.len != 0 or (range.end_key != null and range.end_key.?.len != 0) or
+                range.restore_backup_id.len != 0 or range.restore_snapshot_path.len != 0)
+                return error.VectorStoreRequiresLocalSingleShardTable;
+            group = range.group_id;
+        };
+        const group_id = group orelse return error.TableNotFound;
+        const source = self.table_writes orelse return error.UnsupportedOperation;
+        if (table.storage_migration) |admission| {
+            if (!admission.eql(.{ .request = command.value.request })) return error.VectorMigrationIdempotencyConflict;
+        } else if (command.value.action == .start and table.storage.dense_embeddings == .primary_lsm) {
+            var admitted = table;
+            admitted.storage_migration = .{ .request = command.value.request };
+            try self.source.publishVectorMigrationTable(table, admitted);
+            table = admitted;
+        }
+        // A durable marker with no DB job means admission committed before a
+        // crash. Starting its exact request is idempotent, including on status.
+        if (table.storage_migration != null) {
+            var start = command.value;
+            start.action = .start;
+            const start_body = try std.json.Stringify.valueAlloc(self.alloc, start, .{});
+            defer self.alloc.free(start_body);
+            const receipt = try source.vectorMigrationGroupLocal(self.alloc, group_id, table_name, start_body) orelse return error.UnsupportedOperation;
+            self.alloc.free(receipt);
+        }
+        const result = try source.vectorMigrationGroupLocal(self.alloc, group_id, table_name, body) orelse return error.UnsupportedOperation;
+        errdefer self.alloc.free(result);
+        var job = try std.json.parseFromSlice(migration.Job, self.alloc, result, .{});
+        defer job.deinit();
+        try job.value.validate();
+        if (table.storage_migration != null) {
+            var reconciled = table;
+            if (job.value.published()) reconciled.storage = .{ .dense_embeddings = .vector_store };
+            if (!job.value.active()) reconciled.storage_migration = null;
+            if (!metadata_table_manager.tableDefinitionsEqual(table, reconciled))
+                try self.source.publishVectorMigrationTable(table, reconciled);
+        }
+        return result;
     }
 
     const PublicRepairListRequest = struct {
@@ -19998,6 +20073,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         .POST => .admin,
         .GET, .PUT, .DELETE => return null,
     });
+    if (routes.Routes.matchTableStorageMigration(path)) |table| return try tablePermission(alloc, table.table_name, .admin);
     if (routes.Routes.matchTableArtifactRepairRun(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
         .POST => .admin,
         .GET, .PUT, .DELETE => return null,
@@ -20539,6 +20615,13 @@ test "document artifact routes declare read and admin permissions" {
     }
     {
         const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/issues")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/storage-migration")).?;
         defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);

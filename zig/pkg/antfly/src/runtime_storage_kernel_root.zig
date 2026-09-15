@@ -154,6 +154,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerGraphEdgesJson, "antfly_storage_owner_graph_edges_json");
     exportInternal(&storage_kernel_exports.storageOwnerDocumentArtifactManifestJson, "antfly_storage_owner_document_artifact_manifest_json");
     exportInternal(&storage_kernel_exports.storageOwnerDocumentArtifactManifestsJson, "antfly_storage_owner_document_artifact_manifests_json");
+    exportInternal(&storage_kernel_exports.storageOwnerVectorMigrationJson, "antfly_storage_owner_vector_migration_json");
     exportInternal(&storage_kernel_exports.storageOwnerArtifactOperationJson, "antfly_storage_owner_artifact_operation_json");
     exportInternal(&storage_kernel_exports.storageOwnerRuntimeStatusJson, "antfly_storage_owner_runtime_status_json");
     exportInternal(&storage_kernel_exports.storageOwnerObservedDynamicFieldCapabilitySetsJson, "antfly_storage_owner_observed_dynamic_field_capability_sets_json");

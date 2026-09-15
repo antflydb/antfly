@@ -32,6 +32,7 @@ const backend_types = @import("../backend_types.zig");
 const backup_codec = @import("../backup_codec.zig");
 const docstore_mod = @import("../docstore.zig");
 const table_storage_mod = @import("../../common/table_storage.zig");
+pub const vector_migration = @import("../vector_migration.zig");
 const vector_payload_store_mod = @import("../vector_payload_store.zig");
 const segment_mod = @import("../../segment.zig");
 const backend_erased_mod = @import("../backend_erased.zig");
@@ -595,6 +596,9 @@ pub const OpenOptions = struct {
     hbc_cache: ?*hbc_mod.Cache = null,
     lsm_root_generation: u64 = 0,
     staged_generation: ?*const generation_lifecycle.StagedGeneration = null,
+    /// Exclusive offline tooling may inspect a fenced source root. The caller
+    /// must close it before publication; ordinary open cannot bypass the fence.
+    exclusive_generation: ?*const generation_lifecycle.ExclusiveTransition = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     /// Optional storage-backend capacity probe. BackendRuntime configurators
     /// may install this while composing a DB open; it is resource policy input,
@@ -5042,7 +5046,10 @@ const GraphRestoreParseCache = struct {
 
 pub const DB = struct {
     table_storage: table_storage_mod.Settings = .{},
-    source_vectors: ?*vector_payload_store_mod.Store = null,
+    vector_migration_offline_candidate: bool = false,
+    vector_migration_active: std.atomic.Value(bool) = .init(false),
+    vector_migration_reopen_required: std.atomic.Value(bool) = .init(false),
+    source_vectors: std.atomic.Value(?*vector_payload_store_mod.Store) = .init(null),
     source_vector_storage: ?*lsm_backend_mod.NativeStorage = null,
     closed: bool = false,
     stable_address: bool = false,
@@ -5270,6 +5277,7 @@ pub const DB = struct {
     }
 
     fn enforcePortableRuntimeGate(self: *const DB) !void {
+        if (self.vector_migration_reopen_required.load(.acquire)) return error.VectorMigrationRecoveryRequired;
         try enforcePortableRuntimeGateOptional(&self.async_context.portable_runtime_activation_pending);
     }
 
@@ -5679,11 +5687,23 @@ pub const DB = struct {
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
                 try staged_generation.validatePath(path);
                 break :staged_blk null;
+            } else if (opts.exclusive_generation) |transition| exclusive_blk: {
+                try transition.validate(path);
+                break :exclusive_blk null;
             } else if (opts.physical_root_mode == .external_backend)
                 null
             else
                 try generation_lifecycle.acquirePublishedGenerationReadWithRuntime(alloc, path, backend_runtime);
             errdefer if (generation_read_lease) |*lease| lease.deinit();
+            if (opts.physical_root_mode == .filesystem_managed and opts.exclusive_generation == null) {
+                const fence = try std.fs.path.join(alloc, &.{ path, vector_migration.contract.offline_fence_file });
+                defer alloc.free(fence);
+                const io = backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+                if (std.Io.Dir.cwd().access(io, fence, .{})) |_| {
+                    return error.VectorMigrationOfflineAdmission;
+                } else |err| if (err != error.FileNotFound) return err;
+            }
+
             const open_started_ns = monotonicTimeNs();
             const ha_write_gate = if (opts.ha_write_gate) |gate| gate.pinned() else null;
             var profile = OpenProfile{};
@@ -6149,6 +6169,8 @@ pub const DB = struct {
     }
 
     fn initializeTableStorage(self: *DB, requested: ?table_storage_mod.Settings) !void {
+        var migration_job = try vector_migration.load(self.alloc, self.core.store);
+        defer if (migration_job) |*job| job.deinit();
         const raw = self.core.store.get(self.alloc, &internal_keys.table_storage_settings_key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -6158,7 +6180,14 @@ pub const DB = struct {
             var parsed = try std.json.parseFromSlice(table_storage_mod.Settings, self.alloc, value, .{});
             defer parsed.deinit();
             if (requested) |settings| {
-                if (settings.dense_embeddings != parsed.value.dense_embeddings) return error.ImmutableTableStorageSettings;
+                if (settings.dense_embeddings != parsed.value.dense_embeddings) {
+                    // Only this table's durable ownership publication can
+                    // bridge a catalog update interrupted after DB commit.
+                    const job = if (migration_job) |job| job.value else return error.ImmutableTableStorageSettings;
+                    try self.validateVectorMigrationIdentity(job);
+                    if (!job.published() or settings.dense_embeddings != .primary_lsm or
+                        parsed.value.dense_embeddings != .vector_store) return error.ImmutableTableStorageSettings;
+                }
             }
             self.table_storage = parsed.value;
             if (self.table_storage.dense_embeddings == .vector_store) {
@@ -6182,10 +6211,302 @@ pub const DB = struct {
                 if (settings.dense_embeddings != .primary_lsm) return error.MissingTableStorageSettings;
             } else try self.configureTableStorage(settings);
         }
+        if (migration_job) |job| {
+            try self.validateVectorMigrationIdentity(job.value);
+            if (job.value.published() != (self.table_storage.dense_embeddings == .vector_store))
+                return error.InvalidVectorMigrationState;
+            if (job.value.phase == .cancelled) {
+                if (self.table_storage.dense_embeddings != .primary_lsm) return error.InvalidVectorMigrationState;
+                // No primary reference was ever published by a cancelled job.
+                // At open there are no local sessions/workers to race teardown;
+                // other process read mappings retain their own file leases.
+                if (!openModeRequiresReadOnlyBackends(self.open_mode)) {
+                    const root = try std.fs.path.join(self.alloc, &.{ self.core.path, "source-vectors" });
+                    defer self.alloc.free(root);
+                    const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+                    std.Io.Dir.cwd().deleteTree(io, root) catch |err| {
+                        std.log.warn("cancelled source candidate cleanup deferred err={s}", .{@errorName(err)});
+                    };
+                }
+            } else if (job.value.active()) {
+                try self.openSourceVectors(false);
+                self.installVectorMigrationRuntime(job.value);
+            }
+        }
+    }
+
+    fn validateVectorMigrationIdentity(self: *DB, job: vector_migration.contract.Job) !void {
+        const identity = try std.json.Stringify.valueAlloc(self.alloc, self.core.identity_namespace, .{});
+        defer self.alloc.free(identity);
+        if (!std.mem.eql(u8, identity, job.table_identity)) return error.VectorMigrationIdentityMismatch;
+    }
+
+    fn vectorMigrationConfigurationHash(self: *DB) !u64 {
+        const indexes = try self.core.listIndexes(self.alloc);
+        defer types.freeIndexConfigs(self.alloc, indexes);
+        const enrichments = try self.core.listEnrichments(self.alloc);
+        defer types.freeEnrichmentConfigs(self.alloc, enrichments);
+        const encoded = try std.json.Stringify.valueAlloc(self.alloc, .{
+            .schema = self.core.schema,
+            .indexes = indexes,
+            .enrichments = enrichments,
+        }, .{});
+        defer self.alloc.free(encoded);
+        return std.hash.Wyhash.hash(0, encoded);
+    }
+
+    fn installVectorMigrationRuntime(self: *DB, job: vector_migration.contract.Job) void {
+        self.vector_migration_active.store(job.active(), .release);
+        const source = self.source_vectors.load(.acquire) orelse return;
+        source.setMigrationRetention(job.active());
+        source.migration_disk_reserve.store(if (job.active()) job.budget.disk_reserve_bytes else 0, .release);
+        source.migration_temporary_limit.store(if (job.active()) job.budget.temporary_bytes else 0, .release);
+        self.core.store.configurePayloadPolicy(
+            if (job.phase == .cancelling or job.phase == .cancelled) null else source.interface(),
+            job.captures(),
+            if (job.active()) job.budget.temporary_bytes else null,
+        );
+    }
+
+    pub fn authorizeOfflineVectorMigrationCandidate(self: *DB, stage: *const generation_lifecycle.StagedGeneration) !void {
+        try stage.validatePath(self.core.path);
+        self.vector_migration_offline_candidate = true;
+    }
+
+    pub fn vectorMigrationCommand(self: *DB, alloc: Allocator, command: vector_migration.contract.Command) ![]u8 {
+        try command.request.validate();
+        if (command.action != .start) {
+            const raw = try self.vectorMigrationStatus(alloc) orelse return error.VectorMigrationNotFound;
+            defer alloc.free(raw);
+            var prior = try std.json.parseFromSlice(vector_migration.contract.Job, alloc, raw, .{});
+            defer prior.deinit();
+            if (!std.mem.eql(u8, prior.value.job_id, command.request.job_id) or
+                prior.value.mode != command.request.mode or !std.meta.eql(prior.value.budget, command.request.budget))
+                return error.VectorMigrationIdempotencyConflict;
+        }
+        switch (command.action) {
+            .start => try self.startVectorMigration(command.request),
+            .step => try self.advanceVectorMigration(command.request.job_id),
+            .publish => try self.publishVectorMigration(command.request.job_id),
+            .cancel => try self.cancelVectorMigration(command.request.job_id),
+            .status => {},
+        }
+        const result = try self.vectorMigrationStatus(alloc) orelse return error.VectorMigrationNotFound;
+        errdefer alloc.free(result);
+        var parsed = try std.json.parseFromSlice(vector_migration.contract.Job, alloc, result, .{});
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.job_id, command.request.job_id)) return error.VectorMigrationIdempotencyConflict;
+        return result;
+    }
+
+    pub fn vectorMigrationStatus(self: *DB, alloc: Allocator) !?[]u8 {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        var job = (try vector_migration.load(alloc, self.core.store)) orelse return null;
+        defer job.deinit();
+        if (self.core.store.get(alloc, vector_migration.contract.accounting_key)) |bytes| {
+            defer alloc.free(bytes);
+            if (bytes.len != 8) return error.InvalidVectorMigrationState;
+            job.value.charged_temporary_bytes = std.mem.readInt(u64, bytes[0..8], .little);
+        } else |err| if (err != error.NotFound) return err;
+        return try std.json.Stringify.valueAlloc(alloc, job.value, .{});
+    }
+
+    pub fn startVectorMigration(self: *DB, request: vector_migration.contract.Request) !void {
+        try request.validate();
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (request.mode == .offline and !self.vector_migration_offline_candidate) return error.VectorStoreRequiresOfflineCommand;
+        var structural = self.beginIndexStructuralMutation("source ownership migration", "*");
+        defer structural.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var ownership_epoch: u64 = 1;
+        if (try vector_migration.load(self.alloc, self.core.store)) |existing| {
+            var job = existing;
+            defer job.deinit();
+            try self.validateVectorMigrationIdentity(job.value);
+            if (std.mem.eql(u8, job.value.job_id, request.job_id)) {
+                if (job.value.mode != request.mode or !std.meta.eql(job.value.budget, request.budget))
+                    return error.VectorMigrationIdempotencyConflict;
+                return;
+            }
+            if (job.value.phase != .cancelled) return error.VectorMigrationAlreadyExists;
+            ownership_epoch = try std.math.add(u64, job.value.ownership_epoch, 1);
+        }
+        if (self.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
+        if (self.core.splitState() != null) return error.VectorStoreLifecycleUnsupported;
+        for (self.core.index_manager.dense_indexes.items) |entry| {
+            if (!entry.native_physical_v2 and !try self.core.index_manager.denseNativePhysicalMigrationRequired(entry.config.name))
+                return error.VectorStoreLifecycleUnsupported;
+        }
+        const identity = try std.json.Stringify.valueAlloc(self.alloc, self.core.identity_namespace, .{});
+        defer self.alloc.free(identity);
+        const configuration_hash = try self.vectorMigrationConfigurationHash();
+        const disk = try @import("antfly_platform").filesystem.capacity(self.core.path);
+        if (disk.available_bytes < request.budget.disk_reserve_bytes +| request.budget.batch_bytes * 8)
+            return error.VectorMigrationDiskReserve;
+        // The source manifest is durable before the primary job admits any
+        // capture. A crash before the job commit leaves only orphan data.
+        try self.openSourceVectors(true);
+        try self.source_vectors.load(.acquire).?.beginMigrationRetention();
+        errdefer self.requireVectorMigrationRecovery();
+        const raw_epoch = self.core.store.get(self.alloc, @import("../artifact_payload.zig").reference_epoch_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (raw_epoch) |value| self.alloc.free(value);
+        const epoch: u64 = if (raw_epoch) |value| blk: {
+            if (value.len != 8) return error.InvalidVectorReferenceEpoch;
+            break :blk std.mem.readInt(u64, value[0..8], .little);
+        } else 0;
+        const job: vector_migration.contract.Job = .{
+            .job_id = request.job_id,
+            .mode = request.mode,
+            .budget = request.budget,
+            .table_identity = identity,
+            .configuration_hash = configuration_hash,
+            .ownership_epoch = ownership_epoch,
+            .snapshot_fence = epoch,
+            .replay_cursor = epoch,
+        };
+        var txn = try self.core.store.runtime_store.beginWrite();
+        var committed = false;
+        defer if (!committed) txn.abort();
+        try vector_migration.save(self.alloc, &txn, job);
+        try txn.put(vector_migration.contract.accounting_key, &(@as([8]u8, @splat(0))));
+        try txn.commit();
+        committed = true;
+        try self.core.store.runtime_store.sync(true);
+        self.installVectorMigrationRuntime(job);
+    }
+
+    pub fn advanceVectorMigration(self: *DB, job_id: []const u8) anyerror!void {
+        // Staging pins index/catalog lifetime but never holds table apply over
+        // corpus-sized ANN work. Completion is checked again under apply.
+        const status = try self.vectorMigrationStatus(self.alloc) orelse return error.VectorMigrationNotFound;
+        defer self.alloc.free(status);
+        var observed = try std.json.parseFromSlice(vector_migration.contract.Job, self.alloc, status, .{});
+        defer observed.deinit();
+        if (!std.mem.eql(u8, observed.value.job_id, job_id)) return error.VectorMigrationIdempotencyConflict;
+        if (observed.value.phase == .serving) {
+            const legacy = blk: {
+                var lease = self.tryAcquireIndexCatalogReadLease() orelse return;
+                defer lease.release();
+                for (self.core.index_manager.dense_indexes.items) |entry| {
+                    if (try self.core.index_manager.denseNativePhysicalMigrationRequired(entry.config.name))
+                        break :blk try self.alloc.dupe(u8, entry.config.name);
+                }
+                break :blk null;
+            };
+            if (legacy) |name| {
+                defer self.alloc.free(name);
+                var repair = try self.repairArtifactIssuesWithRequest(self.alloc, .{ .target = .index, .index_name = name, .limit = 1 });
+                defer repair.deinit(self.alloc);
+            }
+            _ = try self.publishVectorBlockBasesOnlineReported(.{ .require_quiescence = false, .require_storage_encoding = true });
+        }
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var job = (try vector_migration.load(self.alloc, self.core.store)) orelse return error.VectorMigrationNotFound;
+        defer job.deinit();
+        if (!std.mem.eql(u8, job.value.job_id, job_id)) return error.VectorMigrationIdempotencyConflict;
+        try self.validateVectorMigrationIdentity(job.value);
+        if (job.value.configuration_hash != try self.vectorMigrationConfigurationHash()) return error.VectorMigrationConfigurationChanged;
+        if (!job.value.active() or job.value.phase == .ready) return;
+        errdefer |err| switch (err) {
+            error.VectorMigrationTemporaryBudgetExceeded, error.VectorMigrationDiskReserve, error.VectorMigrationRowExceedsBudget => {},
+            else => self.requireVectorMigrationRecovery(),
+        };
+        if (job.value.phase == .serving) {
+            if (!self.core.index_manager.sourceMigrationServingComplete()) return;
+            job.value.phase = .cleanup;
+            var txn = try self.core.store.runtime_store.beginWrite();
+            var committed = false;
+            defer if (!committed) txn.abort();
+            try vector_migration.save(self.alloc, &txn, job.value);
+            try txn.commit();
+            committed = true;
+            try self.core.store.runtime_store.sync(true);
+        } else vector_migration.advance(self.alloc, self.core.store, self.source_vectors.load(.acquire).?.interface(), job.value) catch |err| {
+            switch (err) {
+                error.VectorMigrationTemporaryBudgetExceeded, error.VectorMigrationDiskReserve, error.VectorMigrationRowExceedsBudget => {
+                    // Known pre-preparation admission failure: preserve progress
+                    // and expose the reason without requiring a DB restart.
+                    job.value.last_error = @errorName(err);
+                    var txn = try self.core.store.runtime_store.beginWrite();
+                    var committed = false;
+                    defer if (!committed) txn.abort();
+                    try vector_migration.save(self.alloc, &txn, job.value);
+                    try txn.commit();
+                    committed = true;
+                    try self.core.store.runtime_store.sync(true);
+                },
+                else => {},
+            }
+            return @as(anyerror!void, err);
+        };
+        var next = (try vector_migration.load(self.alloc, self.core.store)).?;
+        defer next.deinit();
+        self.installVectorMigrationRuntime(next.value);
+    }
+
+    pub fn publishVectorMigration(self: *DB, job_id: []const u8) !void {
+        var structural = self.beginIndexStructuralMutation("source ownership publication", "*");
+        defer structural.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var job = (try vector_migration.load(self.alloc, self.core.store)) orelse return error.VectorMigrationNotFound;
+        defer job.deinit();
+        if (!std.mem.eql(u8, job.value.job_id, job_id)) return error.VectorMigrationIdempotencyConflict;
+        try self.validateVectorMigrationIdentity(job.value);
+        if (job.value.configuration_hash != try self.vectorMigrationConfigurationHash()) return error.VectorMigrationConfigurationChanged;
+        if (job.value.published()) return;
+        if (job.value.phase != .ready) return error.VectorMigrationNotReady;
+        errdefer self.requireVectorMigrationRecovery();
+        try vector_migration.publish(self.alloc, self.core.store, job.value);
+        self.table_storage = .{ .dense_embeddings = .vector_store };
+        self.core.store.configurePayloadPolicy(self.source_vectors.load(.acquire).?.interface(), false, job.value.budget.temporary_bytes);
+        self.core.index_manager.table_owns_embedding_artifacts = true;
+        self.core.index_manager.source_payload_store = self.source_vectors.load(.acquire);
+        try self.refreshSourceVectorOwnershipScopes();
+        try self.core.index_manager.refreshSourcePayloadGeneration();
+    }
+
+    pub fn cancelVectorMigration(self: *DB, job_id: []const u8) !void {
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var job = (try vector_migration.load(self.alloc, self.core.store)) orelse return error.VectorMigrationNotFound;
+        defer job.deinit();
+        if (!std.mem.eql(u8, job.value.job_id, job_id)) return error.VectorMigrationIdempotencyConflict;
+        try self.validateVectorMigrationIdentity(job.value);
+        if (job.value.published()) return error.VectorMigrationAlreadyPublished;
+        if (job.value.phase == .cancelled or job.value.phase == .cancelling) return;
+        job.value.phase = .cancelling;
+        job.value.cursor = "";
+        var txn = try self.core.store.runtime_store.beginWrite();
+        var committed = false;
+        defer if (!committed) txn.abort();
+        errdefer self.requireVectorMigrationRecovery();
+        try vector_migration.save(self.alloc, &txn, job.value);
+        try txn.commit();
+        committed = true;
+        try self.core.store.runtime_store.sync(true);
+        self.installVectorMigrationRuntime(job.value);
+    }
+
+    fn requireVectorMigrationRecovery(self: *DB) void {
+        self.vector_migration_reopen_required.store(true, .release);
+        // Transaction-recovery owners share this DocStore but have copied DB
+        // wrapper fields. Fence their admission too after an ambiguous commit.
+        self.core.store.payload_recovery_required.store(true, .release);
+    }
+
+    fn enforceVectorMigrationConfigurationGate(self: *const DB) !void {
+        if (self.vector_migration_active.load(.acquire)) return error.VectorMigrationActive;
     }
 
     fn openSourceVectors(self: *DB, create: bool) !void {
-        if (self.source_vectors != null) return;
+        if (self.source_vectors.load(.acquire) != null) return;
         if (self.primary_backend != .lsm or self.physical_root_mode != .filesystem_managed or
             self.ha_write_gate != null or self.ha_async_batch_mirror != null or self.ha_async_effect_mirror != null)
             return error.VectorStoreRequiresLocalSingleShardTable;
@@ -6210,10 +6531,12 @@ pub const DB = struct {
         source.enableBackgroundCollection();
         source.ann_reference_root = try std.fs.path.join(source.alloc, &.{ self.core.index_manager.base_path, "vector-blocks" });
         self.source_vector_storage = storage;
-        self.source_vectors = source;
-        self.core.store.payload_store = source.interface();
-        self.core.index_manager.table_owns_embedding_artifacts = true;
-        self.core.index_manager.source_payload_store = source;
+        self.source_vectors.store(source, .release);
+        if (self.table_storage.dense_embeddings == .vector_store) {
+            self.core.store.configurePayloadPolicy(source.interface(), false, null);
+            self.core.index_manager.table_owns_embedding_artifacts = true;
+            self.core.index_manager.source_payload_store = source;
+        }
     }
 
     /// Creation/provisioning-only configuration. Existing persisted authority
@@ -6247,20 +6570,26 @@ pub const DB = struct {
         // A failed primary append/sync may have persisted the marker. Fence
         // source writes until reopen resolves that outcome; never continue
         // creating references under an unconfirmed table mode.
-        errdefer if (self.source_vectors) |source| {
+        errdefer if (self.source_vectors.load(.acquire)) |source| {
             source.poison();
         };
         try self.core.store.put(&internal_keys.table_storage_settings_key, encoded);
         try self.core.store.sync(true);
         self.table_storage = settings;
+        if (settings.dense_embeddings == .vector_store) {
+            const source = self.source_vectors.load(.acquire).?;
+            self.core.store.configurePayloadPolicy(source.interface(), false, null);
+            self.core.index_manager.table_owns_embedding_artifacts = true;
+            self.core.index_manager.source_payload_store = source;
+        }
     }
 
     pub fn sourceVectorStats(self: *DB) ?vector_payload_store_mod.Stats {
-        return if (self.source_vectors) |source| source.tryStatsSnapshot() else null;
+        return if (self.source_vectors.load(.acquire)) |source| source.tryStatsSnapshot() else null;
     }
 
     fn refreshSourceVectorOwnershipScopes(self: *DB) !void {
-        const source = self.source_vectors orelse return;
+        const source = self.source_vectors.load(.acquire) orelse return;
         const configs = try self.core.listIndexes(self.alloc);
         defer types.freeIndexConfigs(self.alloc, configs);
         const scopes = try self.core.index_manager.sourcePayloadScopeHashesAlloc(configs);
@@ -6274,7 +6603,7 @@ pub const DB = struct {
     /// requires quiescent readers and sufficient per-call work/memory budgets;
     /// disabling index workers alone does not drain startup cleanup readers.
     pub fn collectSourceVectorGarbage(self: *DB) !bool {
-        const source = self.source_vectors orelse return false;
+        const source = self.source_vectors.load(.acquire) orelse return false;
         try source.advanceMarkingSnapshot();
         lockApply(self);
         defer self.core.unlockApply();
@@ -7399,11 +7728,11 @@ pub const DB = struct {
         self.runtime_alloc.destroy(self.async_context);
         // A bounded source mark owns a read transaction on core's backend.
         // Workers are stopped; release it before core destroys that backend.
-        if (self.source_vectors) |source| source.cancelMarking();
+        if (self.source_vectors.load(.acquire)) |source| source.cancelMarking();
         const core = self.core;
         core.deinit();
         self.alloc.destroy(core);
-        if (self.source_vectors) |source| {
+        if (self.source_vectors.load(.acquire)) |source| {
             source.deinit();
             self.alloc.destroy(source);
         }
@@ -9381,7 +9710,7 @@ pub const DB = struct {
         const apply_lock_wait_start_ns = monotonicTimeNs();
         try self.lockApplyForPortableRuntime();
         if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
-        if (self.source_vectors) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
+        if (self.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
         var apply_mutex_held = true;
         var apply_lock_acquired_ns = monotonicTimeNs();
         errdefer if (apply_mutex_held) unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
@@ -19801,7 +20130,7 @@ pub const DB = struct {
         );
         // Repair candidates share the table's immutable source owner too.
         // Otherwise their native base build silently recreates payload copies.
-        shadow_manager.source_payload_store = self.source_vectors;
+        shadow_manager.source_payload_store = self.core.index_manager.source_payload_store;
         shadow_manager.setIo(self.backend_runtime.io());
         shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
         shadow_manager.registerReplacementIndex(self.core.store, cfg) catch |err| {
@@ -21119,7 +21448,7 @@ pub const DB = struct {
     }
 
     pub fn setSplitState(self: *DB, state: ?types.SplitState) !void {
-        if (self.source_vectors != null) return error.VectorStoreLifecycleUnsupported;
+        if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -21628,7 +21957,7 @@ pub const DB = struct {
         dest_dir2: []const u8,
         prepare_only: bool,
     ) !void {
-        if (self.source_vectors != null) return error.VectorStoreLifecycleUnsupported;
+        if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -21749,7 +22078,7 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
         maintenance_deadline_ns: ?u64,
     ) !u64 {
-        if (self.source_vectors != null) return error.VectorStoreLifecycleUnsupported;
+        if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
         // Serialize only snapshot construction/publication. Normal writes can
         // resume before native manifest hashing, while same-ID captures cannot
         // race the fresh-directory check or atomic rename.
@@ -21834,6 +22163,9 @@ pub const DB = struct {
             else => return err,
         };
         defer capture.release();
+        // Migration may have won admission after the optimistic entry check.
+        // Its structural mutation uses this same snapshot fence.
+        if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
         if (builtin.is_test) {
             if (test_snapshot_fence_hook) |hook| hook.after_capture_admission(hook.ptr);
         }
@@ -22064,11 +22396,11 @@ pub const DB = struct {
     }
 
     pub fn sync(self: *DB, full: bool) !void {
-        if (full) if (self.source_vectors) |source| try source.advanceMarkingSnapshot();
+        if (full) if (self.source_vectors.load(.acquire)) |source| try source.advanceMarkingSnapshot();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.syncStore(full);
-        if (self.source_vectors) |source| {
+        if (self.source_vectors.load(.acquire)) |source| {
             try source.checkpoint();
             if (full) {
                 try self.refreshSourceVectorOwnershipScopes();
@@ -23714,6 +24046,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
+        try self.enforceVectorMigrationConfigurationGate();
         const reconciled_row_count = try self.validateStorageModeCompatibilityLocked(table_schema);
         if (durable_ha_schema_outbox_key != null) self.durable_ha_outbox_maybe.store(true, .release);
         _ = try self.core.commitPreparedSchemaMetadata(
@@ -25660,6 +25993,7 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         var structural_guard = self.beginIndexStructuralMutation("index creation", cfg.name);
         defer structural_guard.deinit();
+        try self.enforceVectorMigrationConfigurationGate();
         // Generated artifact namespaces can be shared across differently named
         // indexes. Cleanup is durable and owner-driven; never turn index
         // admission into an unbounded corpus scan. Metadata reconciliation can
@@ -25725,6 +26059,7 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        try self.enforceVectorMigrationConfigurationGate();
         try self.core.addEnrichment(cfg);
     }
 
@@ -25735,6 +26070,7 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        try self.enforceVectorMigrationConfigurationGate();
         return try self.core.upsertEnrichment(cfg);
     }
 
@@ -27082,6 +27418,7 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         var structural_guard = self.beginIndexStructuralMutation("index deletion", name);
         defer structural_guard.deinit();
+        try self.enforceVectorMigrationConfigurationGate();
         const restart_enrichment = self.quiesceEnrichmentForStructuralMutation();
         const removed = self.deleteIndexWhileEnrichmentQuiesced(name) catch |delete_err| {
             if (restart_enrichment) self.restartEnrichmentAfterStructuralMutation("failed index deletion", name) catch |restart_err| {
@@ -27179,6 +27516,7 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        try self.enforceVectorMigrationConfigurationGate();
         return try self.core.deleteEnrichment(kind, name);
     }
 
@@ -27769,7 +28107,7 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         // The mark owns immutable primary/ANN/source leases. Scan before
         // taking apply; only setup, planning, and publication need that fence.
-        if (self.source_vectors) |source| try source.advanceMarkingSnapshot();
+        if (self.source_vectors.load(.acquire)) |source| try source.advanceMarkingSnapshot();
         return self.runArtifactRepairMetadataMaintenanceAfterScan();
     }
 
@@ -27780,7 +28118,7 @@ pub const DB = struct {
         var more = try self.core.index_manager.runGraphOwnershipCleanupStep();
         more = (try self.rebuildArtifactRepairSummaryIfMissing(self.alloc)) or more;
         more = (try self.rebuildArtifactRepairKindIndexIfMissing(self.alloc)) or more;
-        if (self.source_vectors) |source| {
+        if (self.source_vectors.load(.acquire)) |source| {
             const step_bytes = source.backgroundCollectionStepBytes();
             if (step_bytes != 0) {
                 try self.refreshSourceVectorOwnershipScopes();
@@ -27840,11 +28178,11 @@ pub const DB = struct {
         if (self.artifact_repair_metadata_stop.load(.acquire)) return null;
         self.runIndependentMaintenancePass();
         const artifact_active = self.artifact_repair_metadata_pending or
-            (if (self.source_vectors) |source| source.collectionPending() else false);
+            (if (self.source_vectors.load(.acquire)) |source| source.collectionPending() else false);
         const active = (platform_time.monotonicNs() >= self.artifact_metadata_retry_after_ns and artifact_active) or
             (self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire));
-        const scan_pause = if (self.source_vectors) |source| source.activeScanPauseNs() else null;
-        if (self.source_vectors) |source| if (source.background_checkpoint and scan_pause == null and !active) return 50;
+        const scan_pause = if (self.source_vectors.load(.acquire)) |source| source.activeScanPauseNs() else null;
+        if (self.source_vectors.load(.acquire)) |source| if (source.background_checkpoint and scan_pause == null and !active) return 50;
         return std.math.divCeil(u64, scan_pause orelse if (active) artifact_repair_metadata_active_poll_ns else artifact_repair_metadata_poll_ns, std.time.ns_per_ms) catch unreachable;
     }
 
@@ -28144,13 +28482,13 @@ pub const DB = struct {
     }
 
     fn runArtifactRepairMaintenanceTurn(self: *DB) !void {
-        if (self.source_vectors) |source| try source.checkpointMaintenance();
-        const independent = if (self.source_vectors) |source| source.independent_scan else false;
+        if (self.source_vectors.load(.acquire)) |source| try source.checkpointMaintenance();
+        const independent = if (self.source_vectors.load(.acquire)) |source| source.independent_scan else false;
         const now = monotonicTimeNs();
         if (!independent or now >= self.artifact_repair_metadata_due_ns)
             self.artifact_repair_metadata_pending = self.artifactRepairMetadataRebuildPending();
         if (independent) {
-            const source = self.source_vectors.?;
+            const source = self.source_vectors.load(.acquire).?;
             try source.advanceMarkingSnapshot();
             // Immutable scan turns bypass apply/catalog work until metadata
             // is due. State survives scheduler yields, not a pinned thread.
@@ -29374,7 +29712,7 @@ pub const DB = struct {
         // them without populating the new generation.
         // Table-owned sources can predate even an ordinary ANN admission,
         // including after its last consumer was dropped. Bootstrap them too.
-        if (disposition == .managed_rebuild or (self.source_vectors != null and try self.externalCoverageHasStoredArtifacts(cfg))) {
+        if (disposition == .managed_rebuild or (self.source_vectors.load(.acquire) != null and try self.externalCoverageHasStoredArtifacts(cfg))) {
             try self.deleteDenseArtifactCounterMetadata(cfg.name);
             return;
         }
@@ -89106,7 +89444,7 @@ fn testDenseSourceHashReuse(settings: table_storage_mod.Settings) !void {
     });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
-    if (db.source_vectors) |source| {
+    if (db.source_vectors.load(.acquire)) |source| {
         const key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
         defer alloc.free(key);
         const before = source.stats.resolved_payloads;
@@ -89205,14 +89543,18 @@ test "db dense enrichment republishes unchanged source hash from cached artifact
 }
 
 test "db chunked dense enrichment skips unchanged chunks and deletes stale chunk artifacts" {
-    try testDenseChunkArtifactLifecycle(.{});
+    try testDenseChunkArtifactLifecycle(.{}, false);
 }
 
 test "source vector table deletes stale chunk embeddings" {
-    try testDenseChunkArtifactLifecycle(.{ .dense_embeddings = .vector_store });
+    try testDenseChunkArtifactLifecycle(.{ .dense_embeddings = .vector_store }, false);
 }
 
-fn testDenseChunkArtifactLifecycle(settings: table_storage_mod.Settings) !void {
+test "source vector migration captures enrichment updates and stale chunk deletion" {
+    try testDenseChunkArtifactLifecycle(.{ .dense_embeddings = .primary_lsm }, true);
+}
+
+fn testDenseChunkArtifactLifecycle(settings: table_storage_mod.Settings, migrate: bool) !void {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -89243,6 +89585,10 @@ fn testDenseChunkArtifactLifecycle(settings: table_storage_mod.Settings) !void {
     try db.runUntilIdle();
     const first_calls = counting.calls;
     try std.testing.expect(first_calls > 0);
+    if (migrate) {
+        try db.startVectorMigration(.{ .job_id = "chunks", .mode = .online });
+        try db.advanceVectorMigration("chunks");
+    }
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"abcdefghijklmno\"}" }},
@@ -89281,6 +89627,14 @@ fn testDenseChunkArtifactLifecycle(settings: table_storage_mod.Settings) !void {
     });
     try db.runUntilIdle();
     try std.testing.expect(counting.calls > first_calls);
+    if (migrate) {
+        for (0..256) |_| {
+            var state = (try vector_migration.load(alloc, db.core.store)).?;
+            defer state.deinit();
+            if (state.value.phase == .complete) break;
+            if (state.value.phase == .ready) try db.publishVectorMigration("chunks") else try db.advanceVectorMigration("chunks");
+        } else return error.VectorMigrationDidNotFinish;
+    }
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
@@ -128365,6 +128719,153 @@ fn loadStoredSearchDocumentManyCallback(
     return try loadStoredSearchDocumentsMany(self, alloc, keys, null);
 }
 
+test "source vector migration recovers each preparation commit and publication boundary" {
+    const alloc = std.testing.allocator;
+    const Hook = struct {
+        var selected: vector_migration.Boundary = .before_prepare;
+        fn fail(point: vector_migration.Boundary) !void {
+            if (point == selected) return error.TestVectorMigrationCrash;
+        }
+    };
+    inline for (std.meta.tags(vector_migration.Boundary)) |point| {
+        var tmp = try TestDirectory.init("vector-migration-crash");
+        defer tmp.cleanup();
+        const path = std.mem.span(tmp.path().ptr);
+        const options: OpenOptions = .{
+            .table_storage = .{ .dense_embeddings = .primary_lsm },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        };
+        const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+        defer alloc.free(key);
+        const value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 123, &.{ 1, -2, 3 });
+        defer alloc.free(value);
+        const request: vector_migration.contract.Request = .{ .job_id = "crash", .mode = .online };
+        {
+            var db = try DB.open(alloc, path, options);
+            defer db.close();
+            try db.core.store.put(key, value);
+            try db.startVectorMigration(request);
+            Hook.selected = point;
+            vector_migration.test_boundary = Hook.fail;
+            defer vector_migration.test_boundary = null;
+            if (point == .publication_commit or point == .publication_sync) {
+                for (0..256) |_| {
+                    var state = (try vector_migration.load(alloc, db.core.store)).?;
+                    defer state.deinit();
+                    if (state.value.phase == .ready) break;
+                    try db.advanceVectorMigration(request.job_id);
+                } else return error.VectorMigrationDidNotFinish;
+                try std.testing.expectError(error.TestVectorMigrationCrash, db.publishVectorMigration(request.job_id));
+            } else {
+                try std.testing.expectError(error.TestVectorMigrationCrash, db.advanceVectorMigration(request.job_id));
+            }
+            try std.testing.expectError(error.VectorMigrationRecoveryRequired, db.advanceVectorMigration(request.job_id));
+            try std.testing.expectError(error.VectorMigrationRecoveryRequired, db.core.store.put(key, value));
+        }
+        // Multiple reopens must agree on both the decision and exact payload.
+        for (0..3) |_| {
+            var db = try DB.open(alloc, path, options);
+            defer db.close();
+            for (0..256) |_| {
+                var state = (try vector_migration.load(alloc, db.core.store)).?;
+                defer state.deinit();
+                if (state.value.phase == .complete) break;
+                if (state.value.phase == .ready) {
+                    try db.publishVectorMigration(request.job_id);
+                } else try db.advanceVectorMigration(request.job_id);
+            } else return error.VectorMigrationDidNotFinish;
+            const restored = try db.core.store.get(alloc, key);
+            defer alloc.free(restored);
+            try std.testing.expectEqualSlices(u8, value, restored);
+            try std.testing.expectError(error.VectorMigrationAlreadyPublished, db.cancelVectorMigration(request.job_id));
+        }
+    }
+}
+
+test "source vector migration preserves concurrent models deletes and old snapshots through restart" {
+    const alloc = std.testing.allocator;
+    const payload = @import("../artifact_payload.zig");
+    var tmp = try TestDirectory.init("vector-migration");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    const options: OpenOptions = .{
+        .table_storage = .{ .dense_embeddings = .primary_lsm },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    const key_a = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model-a");
+    defer alloc.free(key_a);
+    const key_b = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model-b");
+    defer alloc.free(key_b);
+    const key_c = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "earlier", "model-c");
+    defer alloc.free(key_c);
+    const old = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 11, &.{ 1, 2, 3 });
+    defer alloc.free(old);
+    const new = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 12, &.{ 4, 5, 6 });
+    defer alloc.free(new);
+    const request: vector_migration.contract.Request = .{
+        .job_id = "online-test",
+        .mode = .online,
+        .budget = .{ .batch_rows = 2 },
+    };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.core.store.putBatch(&.{ .{ .key = key_a, .value = old }, .{ .key = key_b, .value = old } }, &.{});
+        var old_reader = try db.core.store.beginReadTxn();
+        defer old_reader.abort();
+        try db.startVectorMigration(request);
+        try db.startVectorMigration(request);
+        try db.advanceVectorMigration(request.job_id);
+        try db.core.store.putBatch(&.{ .{ .key = key_a, .value = new }, .{ .key = key_c, .value = old } }, &.{key_b});
+        var raw = try db.core.store.runtime_store.beginRead();
+        defer raw.abort();
+        try std.testing.expectEqualSlices(u8, new, try raw.get(key_a));
+        const candidate_key = try vector_migration.contract.candidateKeyAlloc(alloc, key_a);
+        defer alloc.free(candidate_key);
+        try std.testing.expectEqualSlices(u8, &(try payload.Reference.forArtifact(key_a, new)).encode(), try raw.get(candidate_key));
+        try std.testing.expectEqualSlices(u8, old, try old_reader.get(key_a));
+        try std.testing.expect(!try db.collectSourceVectorGarbage());
+    }
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        var before_publication = try db.core.store.beginReadTxn();
+        defer before_publication.abort();
+        for (0..256) |_| {
+            var state = (try vector_migration.load(alloc, db.core.store)).?;
+            defer state.deinit();
+            if (state.value.phase == .ready) break;
+            try db.advanceVectorMigration(request.job_id);
+        } else return error.VectorMigrationDidNotFinish;
+        try db.publishVectorMigration(request.job_id);
+        try db.publishVectorMigration(request.job_id);
+        try db.core.store.put(key_c, new);
+        for (0..256) |_| {
+            var state = (try vector_migration.load(alloc, db.core.store)).?;
+            defer state.deinit();
+            if (state.value.phase == .complete) break;
+            try db.advanceVectorMigration(request.job_id);
+        } else return error.VectorMigrationDidNotFinish;
+        try std.testing.expectEqualSlices(u8, old, try before_publication.get(key_c));
+        var raw = try db.core.store.runtime_store.beginRead();
+        defer raw.abort();
+        try std.testing.expect(payload.isReference(try raw.get(key_a)));
+        try std.testing.expect(payload.isReference(try raw.get(key_c)));
+        try std.testing.expectError(error.NotFound, raw.get(key_b));
+    }
+    // The durable publication bridges a catalog response lost after DB sync.
+    var reopened = try DB.open(alloc, path, options);
+    defer reopened.close();
+    try std.testing.expectEqual(.vector_store, reopened.table_storage.dense_embeddings);
+    const restored = try reopened.core.store.get(alloc, key_a);
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, new, restored);
+}
+
 test "source vector table persists references without an ANN index and reopens" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -128762,7 +129263,7 @@ test "source vector table defers reopen GC and bounded maintenance preserves rea
         defer db.close();
         try db.core.store.put(key, first);
         try db.core.store.put(key, second);
-        const source = db.source_vectors.?;
+        const source = db.source_vectors.load(.acquire).?;
         const iface = source.interface();
         try iface.vtable.prepare(iface.ptr, &.{.{ .reference = try payload.Reference.forArtifact("uncommitted", first), .artifact = first }});
         try db.core.store.sync(true);
@@ -128772,7 +129273,7 @@ test "source vector table defers reopen GC and bounded maintenance preserves rea
     {
         var db = try DB.open(alloc, std.mem.span(path), opts);
         defer db.close();
-        const source = db.source_vectors.?;
+        const source = db.source_vectors.load(.acquire).?;
         try std.testing.expect(source.background_gc and source.mark_outside_lock and source.independent_scan);
         try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().collections);
         try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().collection_mark_rows);
@@ -128798,7 +129299,7 @@ test "source vector table defers reopen GC and bounded maintenance preserves rea
     }
     var db = try DB.open(alloc, std.mem.span(path), opts);
     defer db.close();
-    const source = db.source_vectors.?;
+    const source = db.source_vectors.load(.acquire).?;
     try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().collection_mark_rows);
     const current = try db.core.store.get(alloc, key);
     defer alloc.free(current);
@@ -128832,4 +129333,328 @@ test "source vector table defers reopen GC and bounded maintenance preserves rea
     while (!try db.collectSourceVectorGarbage()) : (turns += 1)
         try std.testing.expect(turns < 1024);
     try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().retained_payloads);
+}
+
+test "source vector migration offline resumes a physical shadow preserving every internal namespace" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("offline-vector-migration");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    const payload = @import("../artifact_payload.zig");
+    const offline = @import("../vector_migration_offline.zig");
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model-a");
+    defer alloc.free(key);
+    const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 29, &.{ 1, 2, 3 });
+    defer alloc.free(encoded);
+    const options: OpenOptions = .{ .table_storage = .{ .dense_embeddings = .primary_lsm }, .start_index_workers = false, .start_optional_runtimes = false };
+    var identity: DocIdentityNamespace = undefined;
+    {
+        var source = try DB.open(alloc, path, options);
+        defer source.close();
+        identity = source.core.identity_namespace;
+        try source.core.store.putBatch(&.{ .{ .key = key, .value = encoded }, .{ .key = "private-copy-test", .value = "preserve opaque internal state" } }, &.{});
+        try source.core.store.runtime_store.sync(true);
+    }
+    const request: vector_migration.contract.Request = .{ .job_id = "offline-test", .mode = .offline, .budget = .{ .batch_bytes = 4096, .disk_reserve_bytes = 0 } };
+    try std.testing.expectEqual(.pending, try offline.run(alloc, std.testing.io, path, request, .{ .open = options, .max_steps = 1 }));
+    try std.testing.expectError(error.VectorMigrationOfflineAdmission, DB.open(alloc, path, options));
+    try std.testing.expectEqual(.complete, try offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+    try std.testing.expectEqual(.complete, try offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+    var target = try DB.open(alloc, path, options);
+    defer target.close();
+    try std.testing.expect(identity.eql(target.core.identity_namespace));
+    try std.testing.expectEqual(.vector_store, target.table_storage.dense_embeddings);
+    const restored = try target.core.store.get(alloc, key);
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, encoded, restored);
+    const opaque_value = try target.core.store.get(alloc, "private-copy-test");
+    defer alloc.free(opaque_value);
+    try std.testing.expectEqualStrings("preserve opaque internal state", opaque_value);
+    var raw = try target.core.store.runtime_store.beginRead();
+    defer raw.abort();
+    try std.testing.expect(payload.isReference(try raw.get(key)));
+}
+
+test "source vector migration consolidates ANN serving while preserving queries and last-index ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("migration-ann");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    var db = try DB.open(alloc, path, .{
+        .table_storage = .{ .dense_embeddings = .primary_lsm },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const cfg: types.IndexConfig = .{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"shared\"}" };
+    try db.addIndex(cfg);
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"shared\":[1,0,0]}}" },
+        .{ .key = "b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"shared\":[0,1,0]}}" },
+    }, .sync_level = .write });
+    try db.runUntilIdle();
+    const request: vector_migration.contract.Request = .{ .job_id = "ann", .mode = .online, .budget = .{ .batch_rows = 3 } };
+    try db.startVectorMigration(request);
+    try std.testing.expectError(error.VectorMigrationActive, db.deleteIndex(cfg.name));
+    for (0..256) |_| {
+        var status = (try vector_migration.load(alloc, db.core.store)).?;
+        defer status.deinit();
+        var result = try db.search(alloc, .{ .index_name = "semantic", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 2 }, .limit = 2 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+        try std.testing.expectEqualStrings("a", result.hits[0].id);
+        if (status.value.phase == .complete) break;
+        if (status.value.phase == .ready) try db.publishVectorMigration(request.job_id) else try db.advanceVectorMigration(request.job_id);
+    } else return error.VectorMigrationDidNotFinish;
+    try std.testing.expect(db.core.index_manager.sourceMigrationServingComplete());
+    try std.testing.expect(try db.deleteIndex(cfg.name));
+    const key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "a", "shared");
+    defer alloc.free(key);
+    const retained = try db.core.store.get(alloc, key);
+    defer alloc.free(retained);
+    try std.testing.expectEqual(@as(usize, 3), try enrichment_artifact_codec.decodeDenseEmbeddingDims(retained));
+    _ = try db.admitManagedIndex(.{ .name = "replacement", .kind = cfg.kind, .config_json = cfg.config_json });
+    _ = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+    const repair_id = (try db.indexRepairIdForIndex(alloc, "replacement")) orelse return error.TestUnexpectedResult;
+    _ = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try db.runUntilIdle();
+    var result = try db.search(alloc, .{ .index_name = "replacement", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 2 }, .limit = 2 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+}
+
+test "source vector migration budget rejection is retryable and cancellation survives restart" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("migration-cancel");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    const options: OpenOptions = .{ .table_storage = .{ .dense_embeddings = .primary_lsm }, .start_index_workers = false, .start_optional_runtimes = false };
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "source");
+    defer alloc.free(key);
+    const artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    const request: vector_migration.contract.Request = .{ .job_id = "too-small", .mode = .online, .budget = .{ .batch_bytes = 4096, .temporary_bytes = 4096, .disk_reserve_bytes = 0 } };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.core.store.put(key, artifact);
+        try db.startVectorMigration(request);
+        try std.testing.expectError(error.VectorMigrationTemporaryBudgetExceeded, db.advanceVectorMigration(request.job_id));
+        try std.testing.expect(!db.vector_migration_reopen_required.load(.acquire));
+        try std.testing.expectError(error.VectorMigrationTemporaryBudgetExceeded, db.core.store.put(key, artifact));
+        try db.cancelVectorMigration(request.job_id);
+    }
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        for (0..128) |_| {
+            var status = (try vector_migration.load(alloc, db.core.store)).?;
+            defer status.deinit();
+            if (status.value.phase == .cancelled) break;
+            try db.advanceVectorMigration(request.job_id);
+        } else return error.VectorMigrationDidNotFinish;
+        const actual = try db.core.store.get(alloc, key);
+        defer alloc.free(actual);
+        try std.testing.expectEqualSlices(u8, artifact, actual);
+    }
+    var db = try DB.open(alloc, path, options);
+    defer db.close();
+    try std.testing.expect(db.source_vectors.load(.acquire) == null);
+    try db.startVectorMigration(.{ .job_id = "retry", .mode = .online });
+    var status = (try vector_migration.load(alloc, db.core.store)).?;
+    defer status.deinit();
+    try std.testing.expectEqual(@as(u64, 2), status.value.ownership_epoch);
+}
+
+test "source vector migration offline recovers every copy and publication boundary" {
+    const offline = @import("../vector_migration_offline.zig");
+    const Hook = struct {
+        var selected: offline.Boundary = .fenced;
+        var fired: bool = false;
+        fn inject(point: offline.Boundary) !void {
+            if (!fired and point == selected) {
+                fired = true;
+                return error.InjectedMigrationCrash;
+            }
+        }
+    };
+    const alloc = std.testing.allocator;
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    const artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 99, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    inline for (std.meta.tags(offline.Boundary)) |point| {
+        var tmp = try TestDirectory.init("offline-crash");
+        defer tmp.cleanup();
+        const path = std.mem.span(tmp.path().ptr);
+        const options: OpenOptions = .{ .table_storage = .{ .dense_embeddings = .primary_lsm }, .start_index_workers = false, .start_optional_runtimes = false };
+        {
+            var source = try DB.open(alloc, path, options);
+            defer source.close();
+            try source.core.store.put(key, artifact);
+        }
+        const request: vector_migration.contract.Request = .{ .job_id = "crash", .mode = .offline, .budget = .{ .batch_bytes = 4096, .disk_reserve_bytes = 0 } };
+        Hook.selected = point;
+        Hook.fired = false;
+        offline.test_boundary = Hook.inject;
+        defer offline.test_boundary = null;
+        try std.testing.expectError(error.InjectedMigrationCrash, offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+        try std.testing.expect(Hook.fired);
+        offline.test_boundary = null;
+        try std.testing.expectEqual(.complete, try offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+        try std.testing.expectEqual(.complete, try offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+        try std.testing.expectError(error.VectorMigrationAlreadyPublished, offline.cancel(alloc, std.testing.io, path, request, options));
+        var target = try DB.open(alloc, path, options);
+        defer target.close();
+        try std.testing.expectEqual(.vector_store, target.table_storage.dense_embeddings);
+        const actual = try target.core.store.get(alloc, key);
+        defer alloc.free(actual);
+        try std.testing.expectEqualSlices(u8, artifact, actual);
+    }
+}
+
+test "source vector migration catalog fences configurations topology and stale publication" {
+    const catalog = @import("../../metadata/table_manager.zig");
+    var manager = catalog.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    const before: catalog.TableRecord = .{ .table_id = 10, .name = "migrate" };
+    const range: catalog.RangeRecord = .{ .group_id = 101, .table_id = 10, .start_key = "", .end_key = null };
+    try manager.upsertTable(before);
+    try manager.upsertRange(range);
+    var admitted = before;
+    admitted.storage_migration = .{ .request = .{ .job_id = "online", .mode = .online } };
+    try manager.publishVectorMigrationTable(before, admitted);
+    try std.testing.expect(!std.mem.eql(u8, &catalog.tableDefinitionFingerprint(before), &catalog.tableDefinitionFingerprint(admitted)));
+    try manager.upsertTable(admitted);
+    try manager.upsertRange(range); // Normalized range ID is still idempotent.
+    try std.testing.expectError(error.VectorMigrationActive, manager.upsertTable(before));
+    var edited = admitted;
+    edited.schema_json = "{\"version\":2}";
+    try std.testing.expectError(error.VectorMigrationActive, manager.upsertTable(edited));
+    try std.testing.expectError(error.VectorMigrationConfigurationChanged, manager.publishVectorMigrationTable(admitted, edited));
+    try std.testing.expectError(error.VectorMigrationActive, manager.requestSplit(.{ .transition_id = 1, .table_id = 10, .source_group_id = 101, .destination_group_id = 102, .split_key = "m" }));
+    var published = admitted;
+    published.storage.dense_embeddings = .vector_store;
+    try manager.publishVectorMigrationTable(admitted, published);
+    try std.testing.expectError(error.TableGenerationChanged, manager.publishVectorMigrationTable(admitted, before));
+    var complete = published;
+    complete.storage_migration = null;
+    try manager.publishVectorMigrationTable(published, complete);
+    try std.testing.expectError(error.UnsupportedVectorMigrationDirection, manager.publishVectorMigrationTable(complete, before));
+}
+
+test "source vector migration offline cancellation retains an idempotency receipt" {
+    const offline = @import("../vector_migration_offline.zig");
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("offline-cancel");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    const options: OpenOptions = .{ .table_storage = .{ .dense_embeddings = .primary_lsm }, .start_index_workers = false, .start_optional_runtimes = false };
+    {
+        var source = try DB.open(alloc, path, options);
+        defer source.close();
+        try source.core.store.put("preserve", "original");
+    }
+    const request: vector_migration.contract.Request = .{ .job_id = "cancel", .mode = .offline, .budget = .{ .batch_bytes = 4096, .disk_reserve_bytes = 0 } };
+    try std.testing.expectEqual(.pending, try offline.run(alloc, std.testing.io, path, request, .{ .open = options, .max_steps = 1 }));
+    try offline.cancel(alloc, std.testing.io, path, request, options);
+    try offline.cancel(alloc, std.testing.io, path, request, options);
+    try std.testing.expectError(error.VectorMigrationCancelled, offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+    var source = try DB.open(alloc, path, options);
+    defer source.close();
+    try std.testing.expectEqual(.primary_lsm, source.table_storage.dense_embeddings);
+    const actual = try source.core.store.get(alloc, "preserve");
+    defer alloc.free(actual);
+    try std.testing.expectEqualStrings("original", actual);
+}
+
+test "source vector migration fences live probes admitted before activation" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("migration-live-probe");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{ .table_storage = .{ .dense_embeddings = .primary_lsm }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    const artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 4, &.{ 1, 2 });
+    defer alloc.free(artifact);
+    try db.core.store.put(key, artifact);
+    var probe = try db.core.store.beginProbeTxn();
+    defer probe.abort();
+    var snapshot = try db.core.store.beginReadTxn();
+    defer snapshot.abort();
+    const request: vector_migration.contract.Request = .{ .job_id = "probe", .mode = .online };
+    try db.startVectorMigration(request);
+    for (0..128) |_| {
+        var state = (try vector_migration.load(alloc, db.core.store)).?;
+        defer state.deinit();
+        if (state.value.phase == .complete) break;
+        if (state.value.phase == .ready) try db.publishVectorMigration(request.job_id) else try db.advanceVectorMigration(request.job_id);
+    } else return error.VectorMigrationDidNotFinish;
+    try std.testing.expectError(error.VectorMigrationReadEpochChanged, probe.get(key));
+    try std.testing.expectError(error.VectorMigrationReadEpochChanged, probe.getLeased(key));
+    var values: [1]?[]const u8 = undefined;
+    try std.testing.expectError(error.VectorMigrationReadEpochChanged, probe.getManySorted(&.{key}, &values));
+    try std.testing.expectError(error.VectorMigrationReadEpochChanged, probe.getManySortedTransient(&.{key}, &values));
+    try std.testing.expectEqualSlices(u8, artifact, try snapshot.get(key));
+    var current = try db.core.store.beginProbeTxn();
+    defer current.abort();
+    try std.testing.expectEqualSlices(u8, artifact, try current.get(key));
+}
+
+test "source vector migration converts legacy ANN generations in both modes" {
+    const offline = @import("../vector_migration_offline.zig");
+    const Gate = struct {
+        permitted: bool = false,
+        fn read(ptr: *const anyopaque) bool {
+            return (@as(*const @This(), @ptrCast(@alignCast(ptr)))).permitted;
+        }
+    };
+    const alloc = std.testing.allocator;
+    inline for (std.meta.tags(vector_migration.contract.Mode)) |mode| {
+        var tmp = try TestDirectory.init("migration-legacy-ann");
+        defer tmp.cleanup();
+        const path = std.mem.span(tmp.path().ptr);
+        var gate = Gate{};
+        const options: OpenOptions = .{
+            .table_storage = .{ .dense_embeddings = .primary_lsm },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .index_backends = .{ .dense_native_migration_policy_source = .{ .ptr = &gate, .authority_permitted = Gate.read } },
+        };
+        const request: vector_migration.contract.Request = .{ .job_id = "legacy", .mode = mode, .budget = .{ .disk_reserve_bytes = 0 } };
+        {
+            var source = try DB.open(alloc, path, options);
+            defer source.close();
+            try source.addIndex(.{ .name = "model", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}" });
+            try source.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"model\":[1,0,0]}}" }}, .sync_level = .full_index });
+            try std.testing.expect(!source.core.index_manager.denseIndex("model").?.native_physical_v2);
+            if (mode == .online) {
+                try std.testing.expectError(error.VectorStoreLifecycleUnsupported, source.startVectorMigration(request));
+                gate.permitted = true;
+                try source.startVectorMigration(request);
+                for (0..256) |_| {
+                    var state = (try vector_migration.load(alloc, source.core.store)).?;
+                    defer state.deinit();
+                    var result = try source.search(alloc, .{ .index_name = "model", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
+                    defer result.deinit();
+                    try std.testing.expectEqualStrings("a", result.hits[0].id);
+                    if (state.value.phase == .complete) break;
+                    if (state.value.phase == .ready) try source.publishVectorMigration(request.job_id) else try source.advanceVectorMigration(request.job_id);
+                } else return error.VectorMigrationDidNotFinish;
+            }
+        }
+        gate.permitted = true;
+        if (mode == .offline) try std.testing.expectEqual(.complete, try offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+        var migrated = try DB.open(alloc, path, options);
+        defer migrated.close();
+        try std.testing.expectEqual(.vector_store, migrated.table_storage.dense_embeddings);
+        try std.testing.expect(migrated.core.index_manager.denseIndex("model").?.native_physical_v2);
+        try std.testing.expect(migrated.core.index_manager.sourceMigrationServingComplete());
+        var result = try migrated.search(alloc, .{ .index_name = "model", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("a", result.hits[0].id);
+    }
 }
