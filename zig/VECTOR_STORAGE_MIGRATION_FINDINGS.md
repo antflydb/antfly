@@ -169,3 +169,26 @@ progress, and removal of superseded values in a store with zero tombstones.
 The LSM suite passed 493 tests (23 skipped), and all 12 DB migration tests passed,
 including recovery at the manifest-request and primary-receipt boundaries.
 Production and 50K/1M qualification of this additional step are pending.
+
+### Descriptor-cache hit cost
+
+A short offline final-verification sample found primary point reads repeatedly
+allocating a filename in the process-wide descriptor cache. The sample contains
+only 17 main-thread stacks and cannot establish a percentage of migration time.
+Inspection confirmed that even a cache hit duplicated and freed the path using
+the page allocator before returning the existing descriptor.
+
+The hit path now retains the existing descriptor under its shard mutex before
+allocating anything. Misses retain the existing outside-lock allocation,
+entry recheck and mutation-epoch fencing. Five descriptor-cache tests pass,
+including mutation races and admission limits. A new allocation-failure check
+proves that a populated-cache hit needs no allocation.
+
+A Debug microbenchmark with the process pool's page-allocator shape alternates
+baseline/candidate/candidate/baseline three times. Each cell performs 20,000
+cached descriptor acquisitions. Baseline averaged 48.081 ms (46.870–51.090 ms)
+and 20,000 allocations; the candidate averaged 7.394 ms (7.324–7.425 ms) and zero
+allocations: about 6.5× faster for this operation. This does not establish an
+end-to-end migration speedup. Logs, results, source snapshots and test binaries
+are retained under `fd-cache-hit/` in the implementation result root. The
+baseline intentionally fails the newly added allocation-free assertion.

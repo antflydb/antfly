@@ -1393,6 +1393,20 @@ else
         fn retain(self: *FdCache, namespace: u64, io: std.Io, path: []const u8) !*Entry {
             const path_hash = namespacedPathHash(namespace, path);
             const shard = self.shardForHash(path_hash);
+            // Cache hits already own a stable filename and descriptor. Avoid
+            // allocating a transient pathname (mmap/munmap in the process-wide
+            // page-allocated pool) on every point read. Misses still allocate
+            // outside the mutex and recheck both the entry and mutation epoch.
+            {
+                const locked = lockAtomic(&shard.mutex);
+                defer if (locked) shard.mutex.unlock();
+                if (self.findEntryLocked(shard, namespace, path_hash, path)) |existing| {
+                    existing.ref_count += 1;
+                    existing.last_access = self.nextAccessLocked();
+                    self.touchEntryLocked(shard, existing);
+                    return existing;
+                }
+            }
             const owned_path = try self.allocator.dupeZ(u8, path);
             var owned_path_active = true;
             errdefer if (owned_path_active) self.allocator.free(owned_path);
@@ -4550,6 +4564,36 @@ test "native storage retained runtime has a finite worker ceiling" {
         std.Io.Limit.limited(threaded_io_limits.service),
         native.state.threaded.concurrent_limit,
     );
+}
+
+test "native fd cache hits reuse their path without allocation" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    var test_tmp = try TestDirectory.init("fd-hit");
+    defer test_tmp.cleanup();
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-cached-file", .{test_tmp.path()});
+    defer native.storage().deleteFileAbsolute(path) catch {};
+    try native.storage().writeFileAbsolute(path, "value");
+    // The process-wide FD pool uses the page allocator. Exercise that shape,
+    // and reject any allocation after the descriptor has been populated.
+    var failing = std.testing.FailingAllocator.init(std.heap.page_allocator, .{});
+    var cache = FdCache.init(failing.allocator(), 8);
+    defer cache.deinit();
+    const first = try cache.retain(1, std.testing.io, path);
+    cache.release(std.testing.io, first);
+    const before = failing.alloc_index;
+    const started = @import("antfly_platform").time.monotonicNs();
+    for (0..20000) |_| {
+        const entry = try cache.retain(1, std.testing.io, path);
+        cache.release(std.testing.io, entry);
+    }
+    std.debug.print("fd cache 20000 hits: {d} ns, {d} allocations\n", .{ @import("antfly_platform").time.monotonicNs() - started, failing.alloc_index - before });
+    failing.fail_index = failing.alloc_index;
+    const hit = try cache.retain(1, std.testing.io, path);
+    cache.release(std.testing.io, hit);
+    try std.testing.expectEqual(before, failing.alloc_index);
 }
 
 test "native fd cache retries an open that straddles a mutation fence" {
