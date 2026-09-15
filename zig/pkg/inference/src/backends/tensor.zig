@@ -130,6 +130,10 @@ pub const Tensor = struct {
         return initOwned(i64, allocator, name, shape, data, .i64);
     }
 
+    pub fn initInt32(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i32) !Tensor {
+        return initOwned(i32, allocator, name, shape, data, .i32);
+    }
+
     pub fn initInt8(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i8) !Tensor {
         return initOwned(i8, allocator, name, shape, data, .i8);
     }

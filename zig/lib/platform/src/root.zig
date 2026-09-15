@@ -18,6 +18,7 @@ pub const clock = @import("clock.zig");
 pub const env = @import("env.zig");
 pub const filesystem = @import("filesystem.zig");
 pub const inference_process_supervisor = @import("inference_process_supervisor.zig");
+pub const one_shot_process = @import("one_shot_process.zig");
 pub const process = @import("process.zig");
 pub const process_memory = @import("process_memory.zig");
 pub const sync = @import("sync.zig");

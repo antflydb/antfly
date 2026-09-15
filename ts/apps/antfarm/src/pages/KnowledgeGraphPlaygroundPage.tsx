@@ -15,11 +15,6 @@ import {
   FormActions,
   Input,
   Label,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
   Tabs,
   TabsContent,
   TabsList,
@@ -32,12 +27,14 @@ import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
+import { Combobox } from "@/components/Combobox";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
+import { isGliner25Model } from "@/lib/extraction-model";
 import { fetchWithRetry } from "@/lib/utils";
 
 // Entity and relation response types matching the Antfly extraction API.
@@ -284,7 +281,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     );
     setAvailableModels(models);
     setSelectedModel((current: string) =>
-      current && models.includes(current) ? current : models[0] || ""
+      current && (models.includes(current) || isGliner25Model(current)) ? current : models[0] || ""
     );
     setModelsLoaded(!modelsLoading);
   }, [connectionModels, modelsLoading]);
@@ -292,7 +289,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
     const modelParam = searchParams.get("model");
-    if (modelParam && modelsLoaded && availableModels.includes(modelParam)) {
+    if (modelParam && modelsLoaded) {
       setSelectedModel(modelParam);
       setSearchParams(
         (prev) => {
@@ -302,10 +299,11 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         { replace: true }
       );
     }
-  }, [searchParams, modelsLoaded, availableModels, setSearchParams]);
+  }, [searchParams, modelsLoaded, setSearchParams]);
 
   // Check if the selected model is a REBEL model
   const isRebelModel = selectedModel.startsWith("rel:");
+  const isGliner25 = !isRebelModel && isGliner25Model(selectedModel);
 
   const handleBuildGraph = useCallback(async () => {
     if (!inputText.trim()) {
@@ -345,22 +343,34 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         .map((t: string) => t.trim())
         .filter((t: string) => t.length > 0);
 
-      // Build a relation extraction request with resolver config.
+      // Build a relation extraction request for the selected schema version.
       const requestBody: Record<string, unknown> = {
         model: getModelName(selectedModel),
-        inputs: texts.map((content: string) => ({ content })),
-        schema: {
-          relations: relationLabels.map((type) => ({ type })),
-        },
+        inputs: texts.map((content: string, index: number) =>
+          isGliner25 ? { id: `input-${index}`, content } : { content }
+        ),
+        schema: isGliner25
+          ? {
+              joint_ie: {
+                entities: Object.fromEntries(entityLabels.map((label) => [label, label])),
+                relations: Object.fromEntries(
+                  relationLabels.map((type) => [type, { head: entityLabels, tail: entityLabels }])
+                ),
+              },
+            }
+          : {
+              relations: relationLabels.map((type) => ({ type })),
+            },
         options: {
-          resolver: config,
           include_confidence: true,
           include_spans: true,
+          ...(isGliner25 ? { offset_unit: "utf16_codeunits" } : { resolver: config }),
         },
       };
 
-      // Only include labels for GLiNER models
-      if (!isRebelModel) {
+      if (isGliner25) {
+        requestBody.schema_version = 2;
+      } else if (!isRebelModel) {
         (requestBody.schema as Record<string, unknown>).entities = entityLabels;
       }
 
@@ -393,7 +403,16 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [inputText, selectedModel, isRebelModel, entityLabels, relationLabels, config, inferenceUrl]);
+  }, [
+    inputText,
+    selectedModel,
+    isRebelModel,
+    isGliner25,
+    entityLabels,
+    relationLabels,
+    config,
+    inferenceUrl,
+  ]);
 
   // Cmd+Enter shortcut
   useEffect(() => {
@@ -655,55 +674,55 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           {/* Model and Build Button */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="model">Model</Label>
-              <Select
+              <Label>Model</Label>
+              <Combobox
+                options={availableModels.map((model) => ({
+                  value: model,
+                  label: model.startsWith("rel:")
+                    ? `${model.slice(4)} (REBEL)`
+                    : isGliner25Model(model)
+                      ? `${model} (GLiNER2.5)`
+                      : `${model} (GLiNER)`,
+                }))}
                 value={selectedModel}
-                onValueChange={setSelectedModel}
-                disabled={!modelsLoaded || availableModels.length === 0}
-              >
-                <SelectTrigger id="model">
-                  <SelectValue
-                    placeholder={
-                      !modelsLoaded
-                        ? "Loading models..."
-                        : availableModels.length === 0
-                          ? "No KG models available"
-                          : "Select a model"
-                    }
-                  />
-                </SelectTrigger>
-                <SelectContent>
-                  {availableModels.map((model) => (
-                    <SelectItem key={model} value={model}>
-                      {model.startsWith("rel:") ? `${model.slice(4)} (REBEL)` : `${model} (GLiNER)`}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                onChange={setSelectedModel}
+                placeholder={!modelsLoaded ? "Loading models..." : "Select or enter a model"}
+                searchPlaceholder="Search or enter a model ID..."
+                emptyText="Enter a relation extraction model ID."
+                allowCustomValue
+                disabled={!modelsLoaded}
+              />
               {isRebelModel && (
                 <p className="text-xs text-muted-foreground">
                   REBEL models extract 200+ relation types automatically
                 </p>
               )}
+              {isGliner25 && (
+                <p className="text-xs text-muted-foreground">
+                  GLiNER2.5 uses schema v2 JointIE with typed relation endpoints.
+                </p>
+              )}
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="similarity">Similarity Threshold</Label>
-              <Input
-                id="similarity"
-                type="number"
-                min={0}
-                max={1}
-                step={0.05}
-                value={config.similarity_threshold}
-                onChange={(e) =>
-                  setConfig({
-                    ...config,
-                    similarity_threshold: Number.parseFloat(e.target.value) || 0.85,
-                  })
-                }
-              />
-            </div>
+            {!isGliner25 && (
+              <div className="space-y-2">
+                <Label htmlFor="similarity">Similarity Threshold</Label>
+                <Input
+                  id="similarity"
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={config.similarity_threshold}
+                  onChange={(e) =>
+                    setConfig({
+                      ...config,
+                      similarity_threshold: Number.parseFloat(e.target.value) || 0.85,
+                    })
+                  }
+                />
+              </div>
+            )}
           </div>
 
           {/* Labels Configuration - only for GLiNER models */}
@@ -801,38 +820,40 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           )}
 
           {/* Advanced Options */}
-          <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
-            <label htmlFor="type-must-match" className="flex items-center gap-2">
-              <Checkbox
-                id="type-must-match"
-                checked={config.type_must_match}
-                onCheckedChange={(checked) =>
-                  setConfig({ ...config, type_must_match: checked === true })
-                }
-              />
-              Type must match for merge
-            </label>
-            <label htmlFor="deduplicate-relations" className="flex items-center gap-2">
-              <Checkbox
-                id="deduplicate-relations"
-                checked={config.deduplicate_relations}
-                onCheckedChange={(checked) =>
-                  setConfig({ ...config, deduplicate_relations: checked === true })
-                }
-              />
-              Deduplicate relations
-            </label>
-            <label htmlFor="track-provenance" className="flex items-center gap-2">
-              <Checkbox
-                id="track-provenance"
-                checked={config.track_provenance}
-                onCheckedChange={(checked) =>
-                  setConfig({ ...config, track_provenance: checked === true })
-                }
-              />
-              Track provenance
-            </label>
-          </div>
+          {!isGliner25 && (
+            <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
+              <label htmlFor="type-must-match" className="flex items-center gap-2">
+                <Checkbox
+                  id="type-must-match"
+                  checked={config.type_must_match}
+                  onCheckedChange={(checked) =>
+                    setConfig({ ...config, type_must_match: checked === true })
+                  }
+                />
+                Type must match for merge
+              </label>
+              <label htmlFor="deduplicate-relations" className="flex items-center gap-2">
+                <Checkbox
+                  id="deduplicate-relations"
+                  checked={config.deduplicate_relations}
+                  onCheckedChange={(checked) =>
+                    setConfig({ ...config, deduplicate_relations: checked === true })
+                  }
+                />
+                Deduplicate relations
+              </label>
+              <label htmlFor="track-provenance" className="flex items-center gap-2">
+                <Checkbox
+                  id="track-provenance"
+                  checked={config.track_provenance}
+                  onCheckedChange={(checked) =>
+                    setConfig({ ...config, track_provenance: checked === true })
+                  }
+                />
+                Track provenance
+              </label>
+            </div>
+          )}
 
           <FormActions>
             <Button
@@ -1048,7 +1069,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         </p>
         <p>
           <strong>GLiNER:</strong> Zero-shot entity and relation extraction with custom labels.
-          Requires specifying entity and relation types to extract.
+          GLiNER2.5 uses strict schema v2 JointIE with typed endpoints.
         </p>
       </div>
     </DashboardPage>

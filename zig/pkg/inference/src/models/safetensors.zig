@@ -207,8 +207,11 @@ pub const MMapReader = struct {
     data_offset: u64,
     file_bytes: []const u8,
     mmap_region: ?c_file.MmapRegion = null,
+    file_storage_owned: bool = true,
+    borrow_tensor_data: bool = false,
 
-    /// Create a reader from bytes already in memory (e.g., from mmap or file read).
+    /// Adopt allocator-owned bytes already in memory. Use the explicitly
+    /// borrowed constructor for storage whose lifetime belongs to a caller.
     pub fn fromBytes(allocator: std.mem.Allocator, file_bytes: []const u8) !MMapReader {
         const result = try parseHeader(allocator, file_bytes);
         return .{
@@ -217,6 +220,18 @@ pub const MMapReader = struct {
             .data_offset = result.data_offset,
             .file_bytes = file_bytes,
         };
+    }
+
+    /// Parse a caller-owned immutable snapshot. Aligned tensor data borrows
+    /// that snapshot until tensor and reader users drain; deinit frees metadata
+    /// only. Unlike fromBytes, this API does not adopt the input allocation.
+    pub fn fromBorrowedBytesLimited(allocator: std.mem.Allocator, file_bytes: []const u8, max_header_bytes: usize) !MMapReader {
+        if (file_bytes.len < 8) return error.FileTooSmall;
+        if (std.mem.readInt(u64, file_bytes[0..8], .little) > max_header_bytes) return error.HeaderTooLarge;
+        var reader = try fromBytes(allocator, file_bytes);
+        reader.file_storage_owned = false;
+        reader.borrow_tensor_data = true;
+        return reader;
     }
 
     /// Create a reader by reading a file from a directory handle.
@@ -243,13 +258,21 @@ pub const MMapReader = struct {
     pub fn readTensor(self: *const MMapReader, name: []const u8) !Tensor {
         const meta = self.header.tensors.get(name) orelse return error.TensorNotFound;
 
-        const abs_start = self.data_offset + meta.data_start;
-        const abs_end = self.data_offset + meta.data_end;
+        if (meta.data_start > meta.data_end) return error.InvalidOffset;
+        const abs_start = std.math.add(u64, self.data_offset, meta.data_start) catch return error.DataOutOfBounds;
+        const abs_end = std.math.add(u64, self.data_offset, meta.data_end) catch return error.DataOutOfBounds;
         if (abs_end > self.file_bytes.len) return error.DataOutOfBounds;
+        var elements: usize = 1;
+        for (meta.shape) |dim| {
+            if (dim < 0) return error.InvalidShape;
+            elements = std.math.mul(usize, elements, std.math.cast(usize, dim) orelse return error.InvalidShape) catch return error.InvalidShape;
+        }
+        const expected_bytes = std.math.mul(usize, elements, meta.dtype.byteSize()) catch return error.InvalidShape;
+        if (meta.data_end - meta.data_start != expected_bytes) return error.InvalidTensorSize;
 
         const raw = self.file_bytes[@intCast(abs_start)..@intCast(abs_end)];
 
-        if (self.mmap_region != null) {
+        if ((self.mmap_region != null or self.borrow_tensor_data) and @intFromPtr(raw.ptr) % meta.dtype.byteSize() == 0) {
             // Data is mmap'd — return borrowed view (no copy).
             return .{
                 .data = @constCast(raw),
@@ -264,7 +287,9 @@ pub const MMapReader = struct {
         }
 
         const owned_shape = try self.allocator.dupe(i64, meta.shape);
-        const owned = try self.allocator.dupe(u8, raw);
+        errdefer self.allocator.free(owned_shape);
+        const owned = try self.allocator.alignedAlloc(u8, .@"8", raw.len);
+        @memcpy(owned, raw);
         return .{
             .data = owned,
             .dtype = meta.dtype,
@@ -273,14 +298,23 @@ pub const MMapReader = struct {
             .allocator = self.allocator,
             .owns_data = true,
             .owns_shape = true,
+            .data_alignment = .@"8",
         };
     }
 
     /// Open a SafeTensors file by absolute path using mmap.
     pub fn openFileAbsolute(allocator: std.mem.Allocator, path: []const u8) !MMapReader {
-        var mmap_region = try c_file.MmapRegion.init(allocator, path);
+        return openFileAbsoluteLimited(allocator, path, std.math.maxInt(usize), max_header_size);
+    }
+
+    /// The supplied allocator owns parsed metadata until deinit. Callers can
+    /// impose an independent heap budget without copying the mapped payload.
+    pub fn openFileAbsoluteLimited(allocator: std.mem.Allocator, path: []const u8, max_file_bytes: usize, max_header_bytes: usize) !MMapReader {
+        var mmap_region = try c_file.MmapRegion.initLimited(allocator, path, max_file_bytes);
         errdefer mmap_region.deinit();
 
+        if (mmap_region.data.len < 8) return error.FileTooSmall;
+        if (std.mem.readInt(u64, mmap_region.data[0..8], .little) > max_header_bytes) return error.HeaderTooLarge;
         const result = try parseHeader(allocator, mmap_region.data);
         // Header parse done — switch to random-access advice for inference.
         mmap_region.adviseRandom();
@@ -297,7 +331,7 @@ pub const MMapReader = struct {
         self.header.deinit();
         if (self.mmap_region) |*region| {
             region.deinit();
-        } else {
+        } else if (self.file_storage_owned) {
             self.allocator.free(self.file_bytes);
         }
     }
@@ -365,7 +399,7 @@ fn tensorIntervalLessThan(_: void, lhs: TensorInterval, rhs: TensorInterval) boo
 /// Validate the complete structural contract of one safetensors file without
 /// materializing tensor payloads. The file is mmap'd, so only the bounded JSON
 /// header and filesystem pages needed by the kernel are touched.
-fn validateReader(allocator: std.mem.Allocator, reader: *const MMapReader) !void {
+pub fn validateReader(allocator: std.mem.Allocator, reader: *const MMapReader) !void {
     if (reader.header.tensors.count() == 0) return error.EmptyTensorSet;
     const data_bytes: u64 = @intCast(reader.file_bytes.len - @as(usize, @intCast(reader.data_offset)));
     const intervals = try allocator.alloc(TensorInterval, reader.header.tensors.count());
@@ -622,6 +656,92 @@ test "read tensor from bytes" {
     const values = tensor.asFloat32();
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), values[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), values[3], 1e-6);
+}
+
+fn exerciseOwnedTensor(a: std.mem.Allocator) !void {
+    const json = "{\"weights\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+    const bytes = try a.alloc(u8, 8 + json.len + 8);
+    std.mem.writeInt(u64, bytes[0..8], json.len, .little);
+    @memcpy(bytes[8..][0..json.len], json);
+    @memset(bytes[8 + json.len ..], 0);
+    var reader = MMapReader.fromBytes(a, bytes) catch |err| {
+        a.free(bytes);
+        return err;
+    };
+    defer reader.deinit();
+    var tensor = try reader.readTensor("weights");
+    defer tensor.deinit();
+    try std.testing.expectEqual(@as(usize, 2), tensor.elementCount());
+    const meta = reader.header.tensors.getPtr("weights").?;
+    meta.data_start = 9;
+    try std.testing.expectError(error.InvalidOffset, reader.readTensor("weights"));
+    meta.data_start = 0;
+    meta.data_end = std.math.maxInt(u64);
+    try std.testing.expectError(error.DataOutOfBounds, reader.readTensor("weights"));
+    meta.data_end = 4;
+    try std.testing.expectError(error.InvalidTensorSize, reader.readTensor("weights"));
+    meta.data_end = 8;
+    @constCast(meta.shape)[0] = std.math.maxInt(i64);
+    try std.testing.expectError(error.InvalidShape, reader.readTensor("weights"));
+}
+
+test "safetensors tensor bounds and owned shape allocation failures are safe" {
+    try exerciseOwnedTensor(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseOwnedTensor, .{});
+}
+
+fn exerciseBorrowedSnapshot(a: std.mem.Allocator) !void {
+    const json = "{\"weights\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+    const header_size = comptime std.mem.alignForward(usize, json.len, 8);
+    var bytes: [8 + header_size + 8]u8 align(8) = undefined;
+    std.mem.writeInt(u64, bytes[0..8], header_size, .little);
+    @memset(bytes[8 .. 8 + header_size], ' ');
+    @memcpy(bytes[8..][0..json.len], json);
+    @memcpy(bytes[8 + header_size ..], std.mem.asBytes(&[_]f32{ 1, -2 }));
+    var reader = try MMapReader.fromBorrowedBytesLimited(a, &bytes, 1024);
+    defer reader.deinit();
+    var tensor = try reader.readTensor("weights");
+    defer tensor.deinit();
+    try std.testing.expect(!tensor.owns_data and !tensor.owns_shape);
+    try std.testing.expectEqual(@intFromPtr(&bytes) + 8 + header_size, @intFromPtr(tensor.data.ptr));
+    try std.testing.expectEqualSlices(f32, &.{ 1, -2 }, tensor.asFloat32());
+    try std.testing.expectError(error.HeaderTooLarge, MMapReader.fromBorrowedBytesLimited(a, &bytes, 1));
+}
+
+test "safetensors borrowed immutable snapshot keeps caller bytes and zero-copy aligned tensors through allocation failures" {
+    try exerciseBorrowedSnapshot(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseBorrowedSnapshot, .{});
+}
+
+test "safetensors unaligned mapped payload becomes an aligned owned tensor" {
+    const a = std.testing.allocator;
+    const compat = @import("../io/compat.zig");
+    const json = "{\"weights\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+    const padding = (3 + 4 - json.len % 4) % 4;
+    const header_len = json.len + padding;
+    var bytes: [8 + header_len + 8]u8 = undefined;
+    std.mem.writeInt(u64, bytes[0..8], header_len, .little);
+    @memcpy(bytes[8..][0..json.len], json);
+    @memset(bytes[8 + json.len ..][0..padding], ' ');
+    const values = [_]f32{ 1.25, -2.5 };
+    @memcpy(bytes[8 + header_len ..], std.mem.asBytes(&values));
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/unaligned.safetensors", .{temporary.sub_path});
+    defer a.free(path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = &bytes });
+    const absolute = try compat.cwd().realPathFileAlloc(compat.io(), path, a);
+    defer a.free(absolute);
+    try std.testing.expectError(error.FileTooLarge, MMapReader.openFileAbsoluteLimited(a, absolute, 1, 1024));
+    try std.testing.expectError(error.HeaderTooLarge, MMapReader.openFileAbsoluteLimited(a, absolute, 1024, 1));
+    var reader = try MMapReader.openFileAbsoluteLimited(a, absolute, 1024, 1024);
+    defer reader.deinit();
+    try std.testing.expect(@intFromPtr(reader.file_bytes[reader.data_offset..].ptr) % 4 != 0);
+    var tensor = try reader.readTensor("weights");
+    defer tensor.deinit();
+    try std.testing.expect(tensor.owns_data and tensor.owns_shape);
+    try std.testing.expect(tensor.isAlignedFor(f32));
+    try std.testing.expectEqualSlices(f32, &values, tensor.asFloat32());
 }
 
 test "sharded index" {

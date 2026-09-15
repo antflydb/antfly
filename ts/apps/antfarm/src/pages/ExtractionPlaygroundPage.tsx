@@ -39,12 +39,14 @@ import {
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import { Combobox } from "@/components/Combobox";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
+import { isGliner25Model } from "@/lib/extraction-model";
 import { fetchWithRetry } from "@/lib/utils";
 
 // Entity extraction response types matching the Antfly inference API.
@@ -377,6 +379,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
   ]);
 
   const availableModels = extractorModels;
+  const usesSchemaV2 = isGliner25Model(selectedModel);
 
   useEffect(() => {
     setExtractorModels(connectionExtractors);
@@ -386,14 +389,16 @@ const ExtractionPlaygroundPage: React.FC = () => {
   // Update selected model when mode changes
   useEffect(() => {
     setSelectedModel((prev: string) =>
-      prev && extractorModels.includes(prev) ? prev : extractorModels[0] || ""
+      prev && (extractorModels.includes(prev) || isGliner25Model(prev))
+        ? prev
+        : extractorModels[0] || ""
     );
   }, [extractorModels]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
     const modelParam = searchParams.get("model");
-    if (modelParam && modelsLoaded && extractorModels.includes(modelParam)) {
+    if (modelParam && modelsLoaded) {
       setSelectedModel(modelParam);
       setSearchParams(
         (prev) => {
@@ -403,7 +408,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
         { replace: true }
       );
     }
-  }, [searchParams, modelsLoaded, extractorModels, setSearchParams]);
+  }, [searchParams, modelsLoaded, setSearchParams]);
 
   const getColorForLabel = (label: string) => {
     const normalizedLabel = label.toLowerCase();
@@ -460,14 +465,21 @@ const ExtractionPlaygroundPage: React.FC = () => {
 
     try {
       if (mode === "entities") {
+        const v2Request = usesSchemaV2
+          ? { schema_version: 2, inputs: [{ id: "input-0", content: inputText }] }
+          : { inputs: [{ content: inputText }] };
         const response = await fetchWithRetry(inferenceUrl("extract"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: selectedModel,
-            inputs: [{ content: inputText }],
+            ...v2Request,
             schema: { entities: labels },
-            options: { include_confidence: true, include_spans: true },
+            options: {
+              include_confidence: true,
+              include_spans: true,
+              ...(usesSchemaV2 ? { offset_unit: "utf16_codeunits" } : {}),
+            },
           }),
           signal: abortControllerRef.current.signal,
         });
@@ -488,17 +500,21 @@ const ExtractionPlaygroundPage: React.FC = () => {
           };
         }
 
+        const v2Request = usesSchemaV2
+          ? { schema_version: 2, inputs: [{ id: "input-0", content: inputText }] }
+          : { inputs: [{ content: inputText }] };
         const response = await fetchWithRetry(inferenceUrl("extract"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: selectedModel,
-            inputs: [{ content: inputText }],
+            ...v2Request,
             schema: { structures: apiSchema },
             options: {
               threshold: extractThreshold,
               include_confidence: includeConfidence,
               include_spans: includeSpans,
+              ...(usesSchemaV2 ? { offset_unit: "utf16_codeunits" } : {}),
             },
           }),
           signal: abortControllerRef.current.signal,
@@ -535,6 +551,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
     extractThreshold,
     includeConfidence,
     includeSpans,
+    usesSchemaV2,
   ]);
 
   // Cmd+Enter shortcut
@@ -817,7 +834,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
         <div>
           <DashboardPageTitle>Extraction Playground</DashboardPageTitle>
           <DashboardPageDescription>
-            Extract entities and structured data from text using GLiNER models
+            Extract entities and structured data from text using GLiNER2 and GLiNER2.5 models
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
@@ -864,31 +881,25 @@ const ExtractionPlaygroundPage: React.FC = () => {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {/* Model Selection */}
             <div className="space-y-2">
-              <Label htmlFor="model">Model</Label>
-              <Select
+              <Label>Model</Label>
+              <Combobox
+                options={availableModels.map((model) => ({
+                  value: model,
+                  label: isGliner25Model(model) ? `${model} (GLiNER2.5)` : model,
+                }))}
                 value={selectedModel}
-                onValueChange={setSelectedModel}
-                disabled={!modelsLoaded || availableModels.length === 0}
-              >
-                <SelectTrigger id="model">
-                  <SelectValue
-                    placeholder={
-                      !modelsLoaded
-                        ? "Loading models..."
-                        : availableModels.length === 0
-                          ? "No models available"
-                          : "Select a model"
-                    }
-                  />
-                </SelectTrigger>
-                <SelectContent>
-                  {availableModels.map((model) => (
-                    <SelectItem key={model} value={model}>
-                      {model}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                onChange={setSelectedModel}
+                placeholder={!modelsLoaded ? "Loading models..." : "Select or enter a model"}
+                searchPlaceholder="Search or enter a model ID..."
+                emptyText="Enter an extractor model ID."
+                allowCustomValue
+                disabled={!modelsLoaded}
+              />
+              {usesSchemaV2 && (
+                <p className="text-xs text-muted-foreground">
+                  GLiNER2.5 uses the strict extraction schema v2 contract.
+                </p>
+              )}
             </div>
 
             {/* Confidence Threshold (entity mode) */}
@@ -1325,8 +1336,8 @@ const ExtractionPlaygroundPage: React.FC = () => {
         {mode === "entities" ? (
           <>
             <p>
-              <strong>GLiNER Models:</strong> Zero-shot named entity recognition. Add custom labels
-              to extract any entity types you need - no retraining required.
+              <strong>GLiNER Models:</strong> Zero-shot named entity recognition. GLiNER2.5 requests
+              use strict schema v2 and browser-compatible Unicode offsets.
             </p>
             <p>
               <strong>Confidence Threshold:</strong> Adjust to filter out low-confidence
@@ -1336,8 +1347,9 @@ const ExtractionPlaygroundPage: React.FC = () => {
         ) : (
           <>
             <p>
-              <strong>GLiNER2 Extraction:</strong> Extract structured data from text by defining a
-              schema with structures and fields. The model maps text spans to your schema.
+              <strong>GLiNER2 and GLiNER2.5 Extraction:</strong> Extract structured data from text
+              by defining a schema with structures and fields. The model maps text spans to your
+              schema.
             </p>
             <p>
               <strong>Field Types:</strong> Use "str" for single-value fields and "list" for fields

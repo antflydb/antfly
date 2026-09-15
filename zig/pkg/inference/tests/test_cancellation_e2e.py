@@ -155,9 +155,10 @@ class CancellationE2E(unittest.TestCase):
             recovered = self.wait_state(lambda s: s["pid"] != initial["pid"])
             with self.assertRaises(ProcessLookupError):
                 os.kill(initial["pid"], 0)
-            # A native crash also restarts a worker; it must not make this pass.
+            # The watchdog exits with its reserved code without logging: a
+            # wedged worker may hold stderr's lock. Check the supervisor's
+            # exit report so an unrelated native crash cannot make this pass.
             log = self.read_log()
-            self.assertIn("terminating supervised worker err=Cancelled", log)
             self.assertIn(".exited = 86", log)
         else:
             recovered = self.wait_state(

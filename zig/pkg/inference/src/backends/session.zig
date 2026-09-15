@@ -556,6 +556,7 @@ pub const OutputCredits = struct {
 pub const Session = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    close_protection: ?CloseProtection = null,
     run_admission: ?RunAdmission = null,
     output_geometry: ?SequenceOutputGeometry = null,
     cached_decoder_geometry: ?CachedDecoderGeometry = null,
@@ -866,7 +867,45 @@ pub const Session = struct {
         return self.backend().executionInterruption();
     }
 
+    /// A manager may attach an independently owned protection ticket without
+    /// changing backend identity. Session copies borrow the same ticket, just
+    /// as they borrow ptr; exactly one owner must eventually call close.
+    pub const CloseProtection = struct {
+        ptr: *anyopaque,
+        begin_fn: *const fn (*anyopaque) CloseScope,
+        release_fn: *const fn (*anyopaque) void,
+
+        pub fn begin(self: CloseProtection) CloseScope {
+            return self.begin_fn(self.ptr);
+        }
+
+        pub fn release(self: CloseProtection) void {
+            self.release_fn(self.ptr);
+        }
+    };
+
+    /// Keeps protection alive while an aggregate owner destroys dependent
+    /// caches as well as its session. Starting close is irreversible: callers
+    /// must finish destroying the owner, rather than resume inference.
+    pub const CloseScope = struct {
+        ptr: ?*anyopaque = null,
+        release_fn: ?*const fn (*anyopaque) void = null,
+
+        pub fn deinit(self: *CloseScope) void {
+            const ptr = self.ptr orelse return;
+            self.ptr = null;
+            self.release_fn.?(ptr);
+        }
+    };
+
+    pub fn beginClose(self: Session) CloseScope {
+        return if (self.close_protection) |protection| protection.begin() else .{};
+    }
+
     pub fn close(self: Session) void {
+        var scope = self.beginClose();
+        defer scope.deinit();
+        defer if (self.close_protection) |protection| protection.release();
         self.vtable.close(self.ptr);
     }
 
