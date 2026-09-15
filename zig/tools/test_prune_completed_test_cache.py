@@ -7,7 +7,8 @@ import unittest
 import importlib.util
 
 _SPEC = importlib.util.spec_from_file_location(
-    "prune_completed_test_cache", Path(__file__).with_name("prune_completed_test_cache.py")
+    "prune_completed_test_cache",
+    Path(__file__).with_name("prune_completed_test_cache.py"),
 )
 assert _SPEC and _SPEC.loader
 _module = importlib.util.module_from_spec(_SPEC)
@@ -19,7 +20,9 @@ class PruneTests(unittest.TestCase):
     def test_removes_test_link_outputs_and_preserves_reusable_artifacts(self):
         with tempfile.TemporaryDirectory() as root:
             cache = Path(root)
-            for index, name in enumerate(("test", "api-tests", "build", "libfoo.a", "test.o")):
+            for index, name in enumerate(
+                ("test", "api-tests", "build", "libfoo.a", "test.o")
+            ):
                 artifact = cache / "o" / f"{index:032x}"
                 artifact.mkdir(parents=True)
                 output = artifact / name
