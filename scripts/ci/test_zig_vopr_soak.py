@@ -60,12 +60,12 @@ class SoakTests(unittest.TestCase):
         result = subprocess.CompletedProcess([], 1)
         report = {
             "properties": [
-                {"name": "production-ha-scaling.history-completes", "status": "fail"}
+                {"name": "production-standby-scaling.history-completes", "status": "fail"}
             ]
         }
         self.assertEqual(soak.result_status(result, report), "incomplete_history")
         report["properties"].append(
-            {"name": "production-ha-scaling.owners-quiesce", "status": "fail"}
+            {"name": "production-standby-scaling.owners-quiesce", "status": "fail"}
         )
         self.assertEqual(soak.result_status(result, report), "property_failure")
         report["histories"] = {"replay_divergences": 1}
@@ -106,10 +106,10 @@ class SoakTests(unittest.TestCase):
         # campaign launch so the CLI boundary sees exactly what CI would pass.
         capture = "python3() { printf '%s\\0' \"$@\"; }\n"
         for scenario, default in (
-            ("ha", 1000),
+            ("standby", 1000),
             ("raft", 1000),
             ("distributed-data", 12),
-            ("ha-scaling", 2),
+            ("standby-scaling", 2),
         ):
             for override in ("", "0", "7", "-1"):
                 with self.subTest(scenario=scenario, override=override):
@@ -173,7 +173,7 @@ class SoakTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     soak.run_shard(
-                        Path("vopr"), "ha", 1, 1, root / "empty", root / "run"
+                        Path("vopr"), "standby", 1, 1, root / "empty", root / "run"
                     ),
                     1,
                 )
@@ -350,7 +350,7 @@ class SoakTests(unittest.TestCase):
                 output,
                 retained,
                 {
-                    "scenario": "production-ha-scaling",
+                    "scenario": "production-standby-scaling",
                     "artifacts": artifacts,
                 },
             )

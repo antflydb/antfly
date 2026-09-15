@@ -131,9 +131,10 @@ def boundary():
     global production_fixture, inspection_failed, tasks_inspected
     frame = gdb.newest_frame()
     gdb.write(f"VOPR boundary: {frame.name()}\n")
-    if frame.name() in (
-        "vopr.full_cluster.HAScalingScenario.finalize",
-        "vopr.full_cluster.Scenario.deinit",
+    frame_name = frame.name() or ""
+    if (
+        frame_name.endswith("ScalingScenario.finalize")
+        or frame_name == "vopr.full_cluster.Scenario.deinit"
     ):
         # Version 2 releases production owners during finalization. Inspect
         # there, before deinit can encounter the already-freed fixture. Older
@@ -154,12 +155,17 @@ def boundary():
         pointer = frame.read_var("self")
         owner = pointer.dereference()
         fields = {field.name for field in owner.type.fields()}
-        if "ha_scaling_stage" in fields:
+        # Retained executables may predate the standby naming. Discover the
+        # field from their debug information without changing replay identities.
+        stage_field = next(
+            (name for name in fields if name and name.endswith("_scaling_stage")), None
+        )
+        if stage_field is not None:
             # Preserve the pointer value while its frame is live. Reading World
             # through optimized debug information at deinit is unreliable.
             production_fixture = gdb.Value(int(pointer)).cast(pointer.type)
         for name in (
-            "ha_scaling_stage",
+            stage_field,
             "phase",
             "driver_rounds",
             "control_round_active",
@@ -167,7 +173,7 @@ def boundary():
             "data_server_paused",
             "data_server_live",
         ):
-            if name in fields:
+            if name is not None and name in fields:
                 gdb.write(f"  {name}={owner[name]}\n")
     except gdb.error as error:
         gdb.write(f"  owner unavailable: {error}\n")
@@ -180,15 +186,15 @@ gdb.execute("set print elements 12")
 gdb.execute("set breakpoint pending on")
 # These are infrequent ownership/control boundaries, not scheduler steps.
 for expression in (
-    "haReconcile",
-    "haSetReplicaCount",
+    "production_cluster.*[A-Za-z]+Reconcile",
+    "production_cluster.*[A-Za-z]+SetReplicaCount",
     "stopDataServerForRestart",
     "restartDataServer",
-    "runHAScaling",
-    "full_cluster.HAScalingScenario.finalize",
+    "production_cluster.*run[A-Za-z]+Scaling",
+    "full_cluster.*ScalingScenario.finalize",
     "full_cluster.Scenario.deinit",
     "production_cluster.*beginTeardown",
-    "production_ha.*(startPrimary|startStandby|catchUp|write|verify|promote)",
+    "production_.*Owners.*(startPrimary|startStandby|catchUp|write|verify|promote)",
 ):
     for breakpoint in gdb.rbreak(expression):
         breakpoint.silent = True

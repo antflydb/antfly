@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // Licensed under the Elastic License 2.0 (ELv2).
 
-//! Replayable HA lifecycle scenario over the real primary, standby, slot,
+//! Replayable standby lifecycle scenario over the real primary, standby, slot,
 //! replication-log, progress-WAL, fencing, retention, promotion, and rejoin
 //! implementations.
 
@@ -47,11 +47,11 @@ const rejoin_safe_id = vopr.id.stable("property", "storage.hot_standby.former_pr
 const complete_id = vopr.id.stable("property", "storage.hot_standby.campaign_completed");
 
 const Paths = struct {
-    primary_log: [:0]const u8 = "/ha/primary/log",
-    primary_slots: [:0]const u8 = "/ha/primary/slots",
-    standby_log: [:0]const u8 = "/ha/standby/log",
-    standby_progress: [:0]const u8 = "/ha/standby/progress",
-    fence_wal: [:0]const u8 = "/ha/fence",
+    primary_log: [:0]const u8 = "/standby/primary/log",
+    primary_slots: [:0]const u8 = "/standby/primary/slots",
+    standby_log: [:0]const u8 = "/standby/standby/log",
+    standby_progress: [:0]const u8 = "/standby/standby/progress",
+    fence_wal: [:0]const u8 = "/standby/fence",
 };
 
 const ApplyModel = struct {
@@ -71,7 +71,7 @@ const ApplyModel = struct {
 
 pub fn Scenario(comptime action_budget: u64) type {
     return struct {
-        pub const name: []const u8 = "ha-lifecycle";
+        pub const name: []const u8 = "standby-lifecycle";
         pub const version: u32 = 3;
         pub const properties = &[_]vopr.property.Declaration{
             .{ .id = progress_ordered_id, .name = "storage.hot_standby.progress_is_ordered", .kind = .always },
@@ -402,7 +402,7 @@ pub fn record(allocator: std.mem.Allocator, seed: u64) !vopr.trace.Trace {
         .system = "antfly",
         .seed = seed,
         .transition_budget = 33,
-        .source_revision = "ha-vopr-cli",
+        .source_revision = "standby-vopr-cli",
         .target = "native",
         .optimize = @tagName(builtin.mode),
     });
@@ -595,12 +595,12 @@ fn expectEvent(artifact: *const vopr.trace.Trace, name: []const u8) !void {
     return error.ExpectedHaVoprEventMissing;
 }
 
-test "HA VOPR replays crash standby fencing retention backup and promotion lifecycles" {
+test "standby VOPR replays crash standby fencing retention backup and promotion lifecycles" {
     try runRecordReplay(32, 0xA17F_AA11);
     try runRecordReplay(32, 0xA17F_AA12);
 }
 
-test "HA VOPR bounded standby apply uses the virtual WAL clock" {
+test "standby VOPR bounded standby apply uses the virtual WAL clock" {
     const HaScenario = Scenario(32);
     var world = try HaScenario.init(std.testing.allocator);
     defer HaScenario.deinit(&world, std.testing.allocator);
@@ -629,7 +629,7 @@ test "HA VOPR bounded standby apply uses the virtual WAL clock" {
     try state.vopr_io.ensureNoCapabilityViolation();
 }
 
-test "HA VOPR preserves exact progress and property streams across fresh worlds" {
+test "standby VOPR preserves exact progress and property streams across fresh worlds" {
     const HaScenario = Scenario(20);
     var seeded = vopr.choice.Seeded.init(0xA17F_AA13);
     var artifact = try vopr.runner.run(HaScenario, std.testing.allocator, seeded.source(), .{
@@ -644,7 +644,7 @@ test "HA VOPR preserves exact progress and property streams across fresh worlds"
     }
 }
 
-test "HA VOPR scripted partition rejects unfenced promotion and safely fences promotes and rejoins" {
+test "standby VOPR scripted partition rejects unfenced promotion and safely fences promotes and rejoins" {
     const selections = [_]vopr.id.StableId{
         append_id,
         receive_id,
@@ -665,7 +665,7 @@ test "HA VOPR scripted partition rejects unfenced promotion and safely fences pr
     try expectEvent(&artifact, "storage.hot_standby.former_primary_assessed");
 }
 
-test "HA VOPR promotion rejects a newly received tail then catches up across restart" {
+test "standby VOPR promotion rejects a newly received tail then catches up across restart" {
     const selections = [_]vopr.id.StableId{
         append_id,
         receive_id,
@@ -695,7 +695,7 @@ test "HA VOPR promotion rejects a newly received tail then catches up across res
     try expectEvent(&artifact, "storage.hot_standby.former_primary_assessed");
 }
 
-test "HA VOPR an explicitly forced fence permits promotion behind the required tail" {
+test "standby VOPR an explicitly forced fence permits promotion behind the required tail" {
     const selections = [_]vopr.id.StableId{
         append_id,
         append_id,
@@ -712,7 +712,7 @@ test "HA VOPR an explicitly forced fence permits promotion behind the required t
     try expectEvent(&artifact, "storage.hot_standby.former_primary_assessed");
 }
 
-test "HA VOPR scripted receive apply report and backup crash windows recover durably" {
+test "standby VOPR scripted receive apply report and backup crash windows recover durably" {
     const selections = [_]vopr.id.StableId{
         append_id,
         receive_id,
@@ -732,7 +732,7 @@ test "HA VOPR scripted receive apply report and backup crash windows recover dur
     try expectEvent(&artifact, "storage.hot_standby.campaign_complete");
 }
 
-test "HA VOPR scripted retention expires lagging stream and persists reseed state" {
+test "standby VOPR scripted retention expires lagging stream and persists reseed state" {
     const selections = [_]vopr.id.StableId{
         append_id,
         append_id,

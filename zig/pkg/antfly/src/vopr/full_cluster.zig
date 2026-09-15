@@ -873,7 +873,7 @@ pub const Scenario = struct {
         service_rates_healed: bool = false,
         public_cluster: ?*metadata_vopr.VoprPublicClusterFixture = null,
         production_cluster: ?*production_cluster.Fixture = null,
-        ha_scaling_enabled: bool = false,
+        standby_scaling_enabled: bool = false,
         deployment: ?vopr.deployment.Composer = null,
         serverless: *serverless_workflow.Scenario.Fixture,
         initialization_future: ?std.Io.Future(void) = null,
@@ -1799,7 +1799,7 @@ pub const Scenario = struct {
                         .ready_fn = queryCacheCompletionReady,
                     });
                 }
-                self.production_cluster.?.ha_scaling_enabled = self.ha_scaling_enabled;
+                self.production_cluster.?.standby_scaling_enabled = self.standby_scaling_enabled;
                 self.production_cluster.?.setActiveSplitEnabled(
                     mode == .production_data_plane or
                         mode == .production_data_plane_graph_split or
@@ -3261,10 +3261,10 @@ pub const Scenario = struct {
     }
 };
 
-/// The HA/scaling campaign uses the same production deployment and scheduler,
+/// The standby/scaling campaign uses the same production deployment and scheduler,
 /// but fixes the workload family so corpus mutation explores its interleavings.
-pub const HAScalingScenario = struct {
-    pub const name: []const u8 = "production-ha-scaling";
+pub const StandbyScalingScenario = struct {
+    pub const name: []const u8 = "production-standby-scaling";
     pub const version: u32 = 2;
     pub const World = Scenario.World;
     const safety_id = vopr.id.stable(name, "promotion-and-topology-converge");
@@ -3277,7 +3277,7 @@ pub const HAScalingScenario = struct {
     };
     pub fn init(alloc: std.mem.Allocator) !World {
         const world = try Scenario.init(alloc);
-        world.state.ha_scaling_enabled = true;
+        world.state.standby_scaling_enabled = true;
         return world;
     }
     pub const deinit = Scenario.deinit;
@@ -3285,7 +3285,7 @@ pub const HAScalingScenario = struct {
     pub const done = Scenario.done;
     pub fn enumerate(world: *World, list: *vopr.transition.List, alloc: std.mem.Allocator) !void {
         if (world.state.mode == null) {
-            try list.append(alloc, .{ .id = Scenario.mode_ids[Scenario.production_split_ordinal], .name = "production-ha-scaling.start", .kind = .workload });
+            try list.append(alloc, .{ .id = Scenario.mode_ids[Scenario.production_split_ordinal], .name = "production-standby-scaling.start", .kind = .workload });
         } else try Scenario.enumerate(world, list, alloc);
     }
     pub fn observe(world: *World, builder: *vopr.observation.Builder, alloc: std.mem.Allocator) !void {
@@ -3297,7 +3297,7 @@ pub const HAScalingScenario = struct {
             std.hash.autoHash(&frontier, f.primaryGroupProgress());
             std.hash.autoHash(&frontier, f.data_server_live);
             std.hash.autoHash(&frontier, f.driver_rounds);
-            if (!f.cleanup_started) if (f.ha_owners) |owners| {
+            if (!f.cleanup_started) if (f.standby_owners) |owners| {
                 std.hash.autoHash(&frontier, owners.boundary);
                 if (owners.primary) |*primary| std.hash.autoHash(&frontier, primary.lastLsn());
                 std.hash.autoHash(&frontier, owners.promoted_lsn);
@@ -3307,18 +3307,18 @@ pub const HAScalingScenario = struct {
             };
         }
         try builder.addNamed(alloc, name ++ ".frontier", @as(i64, @bitCast(frontier.final())));
-        try builder.addNamed(alloc, name ++ ".stage", if (fixture) |f| f.ha_scaling_stage else 0);
-        try builder.addNamed(alloc, name ++ ".scale-out", @intFromBool(if (fixture) |f| f.ha_scale_out_complete else false));
-        try builder.addNamed(alloc, name ++ ".scale-in", @intFromBool(if (fixture) |f| f.ha_scale_in_complete else false));
-        try builder.addNamed(alloc, name ++ ".auto-merge", @intFromBool(if (fixture) |f| f.ha_auto_merge_complete else false));
+        try builder.addNamed(alloc, name ++ ".stage", if (fixture) |f| f.standby_scaling_stage else 0);
+        try builder.addNamed(alloc, name ++ ".scale-out", @intFromBool(if (fixture) |f| f.standby_scale_out_complete else false));
+        try builder.addNamed(alloc, name ++ ".scale-in", @intFromBool(if (fixture) |f| f.standby_scale_in_complete else false));
+        try builder.addNamed(alloc, name ++ ".auto-merge", @intFromBool(if (fixture) |f| f.standby_auto_merge_complete else false));
     }
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, alloc: std.mem.Allocator) !void {
         const state = world.state;
         const fixture = state.production_cluster;
         try sink.check(alloc, safety_id, !state.initialization_failed and
-            (if (fixture) |f| f.failure == null and (!state.complete or f.ha_scaling_sound) else !state.complete));
+            (if (fixture) |f| f.failure == null and (!state.complete or f.standby_scaling_sound) else !state.complete));
         try sink.check(alloc, complete_id, state.complete and
-            (if (fixture) |f| f.ha_scaling_sound else false));
+            (if (fixture) |f| f.standby_scaling_sound else false));
     }
     pub fn finalize(world: *World, sink: *vopr.property.Sink, alloc: std.mem.Allocator) !void {
         const state = world.state;
@@ -3326,7 +3326,7 @@ pub const HAScalingScenario = struct {
         const resources = state.sim.resourceSnapshot();
         const quiet = state.sim.scheduler().quiescent() and resources.active_tasks == 0 and
             resources.total_tasks == 0 and resources.open_file_handles == 0 and resources.open_sockets == 0;
-        std.debug.print("HA teardown verified quiet={} resources={any}\n", .{ quiet, resources });
+        std.debug.print("standby teardown verified quiet={} resources={any}\n", .{ quiet, resources });
         try sink.check(alloc, cleanup_id, quiet);
     }
 
@@ -3368,27 +3368,27 @@ test "full cluster VOPR initializes teardown ownership on reused memory" {
     state.releaseRuntime();
 }
 
-pub fn recordHAScaling(alloc: std.mem.Allocator, seed: u64, transition_budget: u64) !vopr.trace.Trace {
+pub fn recordStandbyScaling(alloc: std.mem.Allocator, seed: u64, transition_budget: u64) !vopr.trace.Trace {
     var choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{}, seed);
     const backends = vopr.vopr_io.artifactBackendIds();
-    return vopr.runner.run(HAScalingScenario, alloc, choices.source(), .{
+    return vopr.runner.run(StandbyScalingScenario, alloc, choices.source(), .{
         .system = "antfly",
         .seed = seed,
         .transition_budget = transition_budget,
         .resource_budget = 256,
         .backend_ids = &backends,
-        .source_revision = "production-ha-scaling-v2",
+        .source_revision = "production-standby-scaling-v2",
     });
 }
 
-test "production HA scaling VOPR exact replays bounded startup cleanup" {
+test "production standby scaling VOPR exact replays bounded startup cleanup" {
     for ([_]u64{ 1, 2, 4, 8, 16, 32 }) |budget| {
         var history_allocator: FixtureAllocator = .init;
         defer std.debug.assert(history_allocator.deinit() == .ok);
         const alloc = history_allocator.allocator();
         var choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{}, 42);
         const backends = vopr.vopr_io.artifactBackendIds();
-        var recorded = try vopr.runner.run(HAScalingScenario, alloc, choices.source(), .{
+        var recorded = try vopr.runner.run(StandbyScalingScenario, alloc, choices.source(), .{
             .seed = 42,
             .transition_budget = budget,
             .resource_budget = 256,
@@ -3397,26 +3397,26 @@ test "production HA scaling VOPR exact replays bounded startup cleanup" {
         defer recorded.deinit();
         var checked_cleanup = false;
         for (recorded.properties.items) |record| {
-            if (!std.mem.eql(u8, record.name, "production-ha-scaling.owners-quiesce")) continue;
+            if (!std.mem.eql(u8, record.name, "production-standby-scaling.owners-quiesce")) continue;
             checked_cleanup = true;
             try std.testing.expect(record.condition);
         }
         try std.testing.expect(checked_cleanup);
         try std.testing.expect(recorded.failures.items.len > 0);
-        var replayed = try vopr.replay.exact(HAScalingScenario, alloc, &recorded);
+        var replayed = try vopr.replay.exact(StandbyScalingScenario, alloc, &recorded);
         defer replayed.deinit();
     }
 }
 
-test "production HA scaling VOPR exact replays standby promotion automatic sharding and drain" {
+test "production standby scaling VOPR exact replays standby promotion automatic sharding and drain" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
     const alloc = history_allocator.allocator();
-    var recorded = try recordHAScaling(alloc, 0x4655_4c4c + Scenario.production_split_ordinal, 600_000);
+    var recorded = try recordStandbyScaling(alloc, 0x4655_4c4c + Scenario.production_split_ordinal, 600_000);
     defer recorded.deinit();
-    for (recorded.failures.items) |failure| std.debug.print("HA scaling failure: {any}\n", .{failure});
+    for (recorded.failures.items) |failure| std.debug.print("standby scaling failure: {any}\n", .{failure});
     try std.testing.expectEqual(@as(usize, 0), recorded.failures.items.len);
-    var replayed = try vopr.replay.exact(HAScalingScenario, alloc, &recorded);
+    var replayed = try vopr.replay.exact(StandbyScalingScenario, alloc, &recorded);
     defer replayed.deinit();
 }
 

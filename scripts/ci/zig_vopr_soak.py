@@ -117,7 +117,7 @@ def trace_digest(path):
 
 def retain_working_corpus(output, retained, manifest):
     """Bound clean replay cost while preserving every distinct finding."""
-    clean_limit = {"production-ha-scaling": 2, "distributed-data-vopr": 8}.get(
+    clean_limit = {"production-standby-scaling": 2, "distributed-data-vopr": 8}.get(
         manifest["scenario"], 128
     )
     clean, findings = [], {}
@@ -347,7 +347,7 @@ def main():
     run = commands.add_parser("run")
     run.add_argument(
         "--scenario",
-        choices=("ha", "raft", "distributed-data", "ha-scaling"),
+        choices=("standby", "raft", "distributed-data", "standby-scaling"),
         required=True,
     )
     run.add_argument("--seed", type=lambda value: int(value, 0), required=True)

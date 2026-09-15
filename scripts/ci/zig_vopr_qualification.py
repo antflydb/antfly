@@ -181,7 +181,7 @@ def qualify(binary, output):
             str(binary),
             "campaign",
             "--scenario",
-            "ha-scaling",
+            "standby-scaling",
             "--histories",
             "1",
             "--seed",
@@ -202,11 +202,11 @@ def qualify(binary, output):
         )
         properties = {item["name"]: item["status"] for item in report["properties"]}
         require(
-            properties["production-ha-scaling.owners-quiesce"] == "pass",
+            properties["production-standby-scaling.owners-quiesce"] == "pass",
             "startup cancellation leaked owners",
         )
         require(
-            properties["production-ha-scaling.history-completes"] == "fail",
+            properties["production-standby-scaling.history-completes"] == "fail",
             "incomplete startup was hidden",
         )
 

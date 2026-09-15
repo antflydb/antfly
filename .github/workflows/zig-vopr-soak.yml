@@ -81,7 +81,7 @@ jobs:
       - name: Test production transport, runtime scheduling, and determinism boundaries
         working-directory: zig
         run: |
-          zig build antfly-raft-transport-test ha-vopr-test vopr-runtime-test vopr-determinism-audit \
+          zig build antfly-raft-transport-test standby-vopr-test vopr-runtime-test vopr-determinism-audit \
             -Doptimize=ReleaseSafe -j1 --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
 
@@ -170,16 +170,16 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        scenario: [ha, raft, distributed-data, ha-scaling]
+        scenario: [standby, raft, distributed-data, standby-scaling]
         shard: [0, 1]
         include:
-          - scenario: ha
+          - scenario: standby
             histories: 1000
           - scenario: raft
             histories: 1000
           - scenario: distributed-data
             histories: 12
-          - scenario: ha-scaling
+          - scenario: standby-scaling
             histories: 2
           - shard: 0
             policy: bounded-fair
@@ -342,7 +342,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        scenario: [ha, raft, distributed-data, ha-scaling]
+        scenario: [standby, raft, distributed-data, standby-scaling]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
