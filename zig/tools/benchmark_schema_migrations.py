@@ -25,8 +25,10 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -89,6 +91,25 @@ def main():
             "Warmups are retained and labeled; failed runs are retained, never included as successful latency samples.",
         ],
     }
+    # E2E routing selects the production API prefix from the executable name.
+    # Copy each immutable input once; arbitrary baseline filenames must not
+    # silently select the legacy fixture's routes. Copies are outside timings.
+    staging = tempfile.TemporaryDirectory(prefix="antfly-migration-benchmark-")
+    try:
+        staged = {}
+        for label, binary in binaries.items():
+            destination = Path(staging.name) / label / "antfly"
+            destination.parent.mkdir()
+            shutil.copy2(binary, destination)
+            if digest(destination) != result["binaries"][label]["sha256"]:
+                raise RuntimeError(f"{label} binary changed while staging")
+            staged[label] = destination
+        run_comparison(args, result, staged)
+    finally:
+        staging.cleanup()
+
+
+def run_comparison(args, result, binaries):
     # Alternate revisions, while never running competing task-owned workloads.
     for iteration in range(args.warmups + args.samples):
         for label, binary in binaries.items():
@@ -121,8 +142,8 @@ def main():
                         start_new_session=True,
                     )
                     exit_code = proc.wait(timeout=900)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
+                except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+                    timed_out = isinstance(error, subprocess.TimeoutExpired)
                     exit_code = None
                     # The pytest fixture owns six server children. Bound the
                     # entire process group, including children left behind if
@@ -140,6 +161,8 @@ def main():
                     except ProcessLookupError:
                         pass
                     proc.wait()
+                    if isinstance(error, KeyboardInterrupt):
+                        raise
             observations = []
             for line in log_path.read_text().splitlines():
                 if f'"scenario": "{SCENARIO}"' not in line:
