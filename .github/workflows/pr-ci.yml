@@ -1,0 +1,151 @@
+name: Approved PR CI
+run-name: 'PR CI #${{ inputs.pr_number }} / check ${{ inputs.check_id }} / approval ${{ inputs.comment_id }}'
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number (set by the approval controller)
+        type: string
+        required: true
+      check_id:
+        description: Approval check ID (set by the approval controller)
+        type: string
+        required: true
+      comment_id:
+        description: Human approval comment ID (set by the approval controller)
+        type: string
+        required: true
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+jobs:
+  approve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: pr-ci-state-${{ inputs.pr_number }}
+      queue: max
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: read
+      issues: read
+    outputs:
+      head_sha: ${{ steps.approval.outputs.head_sha }}
+      base_sha: ${{ steps.approval.outputs.base_sha }}
+      suites: ${{ steps.approval.outputs.suites }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        id: approval
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CHECK_ID: ${{ inputs.check_id }}
+          COMMENT_ID: ${{ inputs.comment_id }}
+        with:
+          script: |
+            const {main} = require('./.github/scripts/pr-ci.cjs');
+            await main({github, context, core, mode: 'admit',
+              config: require('./.github/scripts/pr-ci-config.json')});
+  policy:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'policy')
+    uses: ./.github/workflows/pr-ci-policy.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+  zig:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'zig')
+    uses: ./.github/workflows/zig-tests.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+  sdks:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'sdks')
+    uses: ./.github/workflows/sdks-ci.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+  proxy:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'proxy')
+    uses: ./.github/workflows/antfly-proxy-go.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+  operator:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'operator')
+    uses: ./.github/workflows/antfly-operator-go.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+  scale:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'scale')
+    uses: ./.github/workflows/zig-scale-tests.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+  gpu:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'gpu')
+    uses: ./.github/workflows/zig-inference-l4-spot.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+  darwin:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'darwin')
+    uses: ./.github/workflows/diagnose-zig-arm64-bad-alloc.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+  result:
+    name: PR CI result
+    needs: [approve, policy, zig, sdks, proxy, operator, scale, gpu, darwin]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const needs = JSON.parse(process.env.RESULTS);
+            if (needs.approve.result !== 'success') throw new Error('Approval failed');
+            for (const suite of JSON.parse(needs.approve.outputs.suites)) {
+              if (needs[suite]?.result !== 'success') throw new Error(`${suite} did not pass`);
+            }
