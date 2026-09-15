@@ -4339,6 +4339,7 @@ pub fn build(b: *std.Build) void {
         "gzip request completes with combined encoded and decoded budget",
         "shared application admission covers MCP query and write operations",
         "API kernel ABI rejects mismatched context and function-table prefixes",
+        "API kernel failed fallible create releases unpublished state",
         "runtime HTTP values retain C layout",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
