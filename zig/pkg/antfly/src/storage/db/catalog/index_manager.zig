@@ -43959,7 +43959,9 @@ test "exact sparse vector generation remains eligible for mutation capture befor
     {
         var store = try vector_block_store_mod.Store.open(alloc, memory.storage(), root);
         defer store.deinit();
-        var writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, 0, .float16);
+        // Isolate sparse-layout admission from the encoding migration gate.
+        const encoding = IndexManager.denseVectorBlockPreferredEncoding();
+        var writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, 0, encoding);
         defer writer.deinit();
         try writer.appendVector("embedding:a", 0, 1, &.{ 1.25, -2.5 });
         const block = try writer.build();
