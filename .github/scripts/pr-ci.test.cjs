@@ -35,7 +35,8 @@ function fixture() {
       update: async body => {
         const c = checks.find(c => c.id === body.check_run_id);
         Object.assign(c, structuredClone(body));
-        if (body.status !== 'completed') c.conclusion = null;
+        // GitHub retains a previous conclusion when status alone is updated.
+        if (c.conclusion) c.status = 'completed';
         return {data: structuredClone(c)};
       },
     },
@@ -59,7 +60,7 @@ function fixture() {
     call: (mode='event') => main({github, context, core, mode, config, env}),
     finish: () => {
       context.eventName = 'workflow_run';
-      context.payload.workflow_run = {id: 91, name: 'Approved PR CI',
+      context.payload.workflow_run = {id: 91, name: 'PR CI #7 / check 1 / approval 17',
         display_title: 'PR CI #7 / check 1 / approval 17', run_attempt: 1,
         path: '.github/workflows/pr-ci.yml', event: 'workflow_dispatch', head_branch: 'main', conclusion: 'success'};
     },
@@ -131,7 +132,7 @@ test('suites are a snapshot and optional labels never dispatch by themselves', a
   f.context.payload.action='labeled'; f.context.payload.label={name:optional.label};
   await f.call(); assert.equal(f.dispatches.length,0);
   f.context.eventName='issue_comment'; f.context.payload.action='created';
-  await f.call(); await f.call('admit');
+  await f.call(); f.env.CHECK_ID=f.dispatches[0].inputs.check_id; await f.call('admit');
   assert.ok(JSON.parse(f.outputs.suites).includes(optional.id));
   f.pr.labels=[];
   await assert.rejects(f.call('verify'),/selected suites changed/);
@@ -171,10 +172,11 @@ test('a fresh approval revokes the old run; a late completion cannot pass it', a
   f.runs.push({id:91,status:'in_progress',display_title:'PR CI #7 / check 1 / approval 17'});
   f.comment.id=18; f.env.COMMENT_ID='18'; await f.call();
   assert.deepEqual(f.cancelled,[91]);
-  assert.equal(f.checks[0].status,'queued');
+  assert.equal(f.checks[0].conclusion,'action_required');
+  assert.equal(f.checks[1].status,'queued');
   f.finish(); await f.call();
-  assert.equal(f.checks[0].status,'queued');
-  assert.equal(JSON.parse(f.checks[0].output.text).comment_id,18);
+  assert.equal(f.checks[1].status,'queued');
+  assert.equal(JSON.parse(f.checks[1].output.text).comment_id,18);
 });
 
 test('unauthorized comments do not cancel legitimate runs', async () => {
@@ -264,7 +266,7 @@ test('path selection matches repository CI owners and does not enable optional t
 
 test('completion routing uses the orchestrator title, not a branch or arbitrary workflow', () => {
   const f=fixture(); f.finish(); assert.equal(route(f.context),'7');
-  f.context.payload.workflow_run.name='Release'; assert.equal(route(f.context),'');
+  f.context.payload.workflow_run.path='.github/workflows/release.yml'; assert.equal(route(f.context),'');
 });
 
 test('every expensive worker is gated, pins its checkout, and disables automatic PR triggers', () => {
@@ -293,4 +295,22 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
       assert.doesNotMatch(text,/secrets: inherit/,file);
     }
   }
+});
+
+// The live rollout first creates an action_required check before an approval.
+test('approval after waiting or successful CI creates a fresh consumable check', async () => {
+  const f=fixture();
+  f.context.eventName='pull_request_target'; f.context.payload.action='opened';
+  await f.call(); assert.equal(f.checks[0].conclusion,'action_required');
+  f.context.eventName='issue_comment'; f.context.payload.action='created';
+  await f.call();
+  assert.equal(f.dispatches[0].inputs.check_id,'2');
+  assert.equal(f.checks[1].status,'queued');
+  f.env.CHECK_ID='2'; await f.call('admit'); await f.call('verify');
+  f.finish(); f.context.payload.workflow_run.display_title='PR CI #7 / check 2 / approval 17';
+  await f.call(); assert.equal(f.checks[1].conclusion,'success');
+  f.context.eventName='issue_comment'; f.comment.id=18; f.env.COMMENT_ID='18';
+  await f.call(); assert.equal(f.dispatches[1].inputs.check_id,'3');
+  f.env.CHECK_ID='3'; await f.call('admit'); await f.call('verify');
+  await f.call(); assert.equal(f.dispatches.length,2);
 });

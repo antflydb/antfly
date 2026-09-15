@@ -5,13 +5,16 @@ on:
   issue_comment:
     types: [created, edited, deleted]
   workflow_run:
-    workflows: [Approved PR CI]
+    # Match both workflow and dynamic run names; validate the path below.
+    workflows: [Approved PR CI, "PR CI #**"]
     types: [completed]
 permissions:
   contents: read
 jobs:
   route:
-    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    if: >-
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request) &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.path == '.github/workflows/pr-ci.yml')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:

@@ -10,7 +10,7 @@ const TITLE = /^PR CI #(\d+) \/ check (\d+) \/ approval (\d+)$/;
 function route(context) {
   const p = context.payload;
   if (context.eventName === 'workflow_run') {
-    return p.workflow_run.name === 'Approved PR CI'
+    return p.workflow_run.path === `.github/workflows/${WORKFLOW}`
       ? (p.workflow_run.display_title.match(TITLE)?.[1] || '') : '';
   }
   return String(p.pull_request?.number || (p.issue?.pull_request && p.issue.number) || '');
@@ -77,7 +77,9 @@ async function main({github, context, core, mode, config, env = process.env}) {
     // Retain the last consumed comment ID across invalidation. A redelivered
     // old webhook must not purchase another run after draft/label changes.
     if (check && !approved) data = {...metadata(check), ...data};
-    if (!check) {
+    // A completed GitHub check cannot be requeued by changing status alone.
+    // Each approval gets a fresh check; the newest record retains replay protection.
+    if (!check || approved) {
       check = (await github.rest.checks.create({
         ...repo, name: CHECK, head_sha: pr.head.sha,
         external_id: `pr-ci:${number}:v1`, status: 'queued',
