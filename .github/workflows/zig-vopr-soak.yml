@@ -55,7 +55,7 @@ jobs:
       run_id: ${{ inputs.diagnostic_run }}
       shard_artifact: ${{ inputs.diagnostic_shard }}
       trace_name: ${{ inputs.diagnostic_trace }}
-      replays: ${{ inputs.diagnostic_replays }}
+      replays: ${{ fromJSON(inputs.diagnostic_replays || '1') }}
 
   # Cold qualification and runner compilation have independent job budgets.
   # Dedicated cache variables keep setup actions from replacing these paths.
