@@ -841,7 +841,9 @@ remains active. Discovery scans routes once; completed prefixes no longer reopen
 their physical owners. A shard rotates only when its turn starts, so a pass that
 exhausts its budget preserves the priority of unstarted selections. Pending migration
 work wakes at 100 ms intervals and admits up to 16 groups within a 100 ms pass budget.
-Each reconstruction slice has a 25 ms cooperative deadline, checked after a bounded
+Both the schema and ordinary repair queues use the same 25 ms reconstruction
+quantum, so ordinary repair cannot bypass migration fairness. The cooperative
+deadline is checked after a bounded
 page (at most 256 documents and 256 KiB source data, except a single large document).
 These are scheduling budgets, not hard wall-clock bounds on storage I/O.
 

@@ -222,10 +222,11 @@ const provisioned_index_repair_queued_groups_per_scan: usize = 32;
 const provisioned_index_repair_retry_min_ms: u64 = 30 * std.time.ms_per_s;
 const provisioned_index_repair_retry_max_ms: u64 = 10 * std.time.ms_per_min;
 const data_raft_writer_unavailable_log_interval_ns: u64 = 5 * std.time.ns_per_s;
-/// Bound one non-activation reconstruction turn so the BackendRuntime owner can
-/// rotate fairly across broken groups. Dense scan code observes this only at a
-/// durable streaming-session boundary, keeping the hot batch path branch-free.
-const provisioned_index_repair_build_slice_ns: u64 = 15 * std.time.ns_per_s;
+/// Both schema and ordinary repair queues can select the same durable intent.
+/// Use one foreground-friendly quantum so the ordinary queue cannot bypass a
+/// schema migration's slice budget. Resumable builders check at durable pages;
+/// this does not bound a single storage operation or activation.
+const provisioned_index_repair_build_slice_ns: u64 = 25 * std.time.ns_per_ms;
 
 /// Durable repair intents use realtime deadlines so they survive restart.
 /// The in-memory scheduler uses monotonic time so wall-clock adjustments cannot
@@ -17123,7 +17124,7 @@ pub const DataServer = struct {
                 .root_generation = self.liveRuntimeWriteSource().visibleRootGenerationForRepair(group_id),
                 .ownership_generation = self.local_group_status_generation.load(.acquire),
             };
-            var schema_yield = IndexRepairYieldFence{ .server = self, .deadline_ns = @min(schema_deadline_ns, self.backgroundMonotonicNs() +| 25 * std.time.ns_per_ms) };
+            var schema_yield = IndexRepairYieldFence{ .server = self, .deadline_ns = @min(schema_deadline_ns, self.backgroundMonotonicNs() +| provisioned_index_repair_build_slice_ns) };
             const result = result_blk: {
                 self.setProvisionedStartupCatchUpTarget(group_id, table.name) catch |err| {
                     _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
@@ -17614,7 +17615,7 @@ pub const DataServer = struct {
             };
             var yield_fence = IndexRepairYieldFence{
                 .server = self,
-                .deadline_ns = started_ns +| provisioned_index_repair_build_slice_ns,
+                .deadline_ns = self.backgroundMonotonicNs() +| provisioned_index_repair_build_slice_ns,
             };
             ownership_fence.owner_epoch = ownership_fence.currentOwnerEpoch();
             groups_inspected +|= 1;

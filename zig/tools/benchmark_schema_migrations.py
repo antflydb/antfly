@@ -58,6 +58,7 @@ def main():
     parser.add_argument("--large-docs", type=positive, default=10000)
     parser.add_argument("--small-tenants", type=positive, default=5)
     parser.add_argument("--traffic-clients", type=positive, default=1)
+    parser.add_argument("--min-free-disk-gib", type=positive, default=8)
     args = parser.parse_args()
     if args.warmups < 0:
         parser.error("warmups must be nonnegative")
@@ -115,6 +116,19 @@ def run_comparison(args, result, binaries):
     # Alternate revisions, while never running competing task-owned workloads.
     for iteration in range(args.warmups + args.samples):
         for label, binary in binaries.items():
+            free_disk_bytes = shutil.disk_usage(tempfile.gettempdir()).free
+            if free_disk_bytes < args.min_free_disk_gib * 1024**3:
+                result["stopped_before_run"] = {
+                    "binary": label,
+                    "iteration": iteration,
+                    "reason": "insufficient free disk space",
+                    "free_disk_bytes": free_disk_bytes,
+                    "required_free_disk_gib": args.min_free_disk_gib,
+                }
+                args.output.write_text(json.dumps(result, indent=2) + "\n")
+                raise SystemExit(
+                    "Insufficient free disk space for another cluster sample."
+                )
             log_path = args.output.with_suffix(f".{label}.{iteration}.log")
             env = {
                 **os.environ,
@@ -125,6 +139,7 @@ def run_comparison(args, result, binaries):
             }
             start = time.monotonic()
             timed_out = False
+            interrupted = False
             with log_path.open("w") as log:
                 try:
                     proc = subprocess.Popen(
@@ -164,11 +179,12 @@ def run_comparison(args, result, binaries):
                     except ProcessLookupError:
                         pass
                     proc.wait()
-                    if isinstance(error, KeyboardInterrupt):
-                        raise
+                    interrupted = isinstance(error, KeyboardInterrupt)
             observations = []
             seen_observations = set()
-            for line in log_path.read_text().splitlines():
+            log_text = log_path.read_text()
+            disk_exhausted = "NoSpaceLeft" in log_text
+            for line in log_text.splitlines():
                 if f'"scenario": "{SCENARIO}"' not in line:
                     continue
                 try:
@@ -188,7 +204,10 @@ def run_comparison(args, result, binaries):
                 "warmup": iteration < args.warmups,
                 "exit_code": exit_code,
                 "timed_out": timed_out,
+                "interrupted": interrupted,
+                "environment_failure": "disk_exhaustion" if disk_exhausted else None,
                 "elapsed_seconds": time.monotonic() - start,
+                "free_disk_bytes_before": free_disk_bytes,
                 "log": str(log_path),
                 "observations": observations,
             }
@@ -200,6 +219,10 @@ def run_comparison(args, result, binaries):
                 ),
                 flush=True,
             )
+            if interrupted:
+                raise KeyboardInterrupt
+            if disk_exhausted:
+                raise SystemExit("Disk exhausted; stop before another cluster sample.")
             if timed_out:
                 raise SystemExit(
                     "Timed out; stop before running another cluster and inspect the recorded log."
