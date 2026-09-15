@@ -3858,6 +3858,7 @@ fn resolveEmbeddingDimensionsForManagedConfigWithSemanticBinding(
         else => return err,
     };
     defer managed.deinit(alloc);
+    try attachManagedBedrockCredentialCaches(alloc, (&managed)[0..1], options.provider_runtime);
     return try resolveEmbeddingDimensionsForEntry(alloc, cfg, &managed);
 }
 
@@ -3877,6 +3878,7 @@ fn resolveEmbeddingDimensionsForManagedConfigWithValidation(
     };
     defer managed.deinit(alloc);
     try attachProviderQuota(&managed, options);
+    try attachManagedBedrockCredentialCaches(alloc, (&managed)[0..1], options.provider_runtime);
     return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, &managed, declared, validation);
 }
 
@@ -7805,4 +7807,132 @@ test "managed embedder query template supports remoteText and surfaces permanent
     const rendered_pdf = try renderQueryTemplate(std.testing.allocator, "{{remotePDF url=this}}", pdf_url);
     defer std.testing.allocator.free(rendered_pdf);
     try std.testing.expectError(QueryTemplateError.PermanentPromptFailure, validateRenderedTemplate(std.testing.allocator, rendered_pdf));
+}
+
+fn testManagedBedrockDimensionProbeCache(validation: bool) !void {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","field":"body","embedder":{"provider":"bedrock","model":"amazon.titan-embed-text-v2:0","region":"us-east-1","url":"http://127.0.0.1:1","requests_per_minute":0}}
+    , .{});
+    defer parsed.deinit();
+    var cfg = try parseEmbeddingsIndexConfigFromValue(alloc, parsed.value);
+    defer cfg.deinit();
+    var registry = provider_limits.Registry.init(alloc);
+    defer registry.deinit();
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    runtime.limits = &registry;
+    defer runtime.deinit();
+    const cache = try runtime.bedrock_credentials.cacheForRegion("us-east-1");
+    cache.deinit(alloc);
+    const options = InitOptions{ .io = std.testing.io, .provider_runtime = &runtime };
+    const embedder = parsed.value.object.get("embedder").?;
+    for (0..2) |attempt| {
+        std.debug.print("BEDROCK_PROBE_CACHE validation={} attempt={d} expects CredentialCacheClosed\n", .{ validation, attempt });
+        const result = if (validation)
+            resolveEmbeddingDimensionsForManagedConfigWithValidation(alloc, "probe", cfg.value, embedder, options, .strict)
+        else
+            resolveEmbeddingDimensionsForManagedConfig(alloc, "probe", cfg.value, embedder, options);
+        try std.testing.expectError(error.CredentialCacheClosed, result);
+        try std.testing.expect(cache == try runtime.bedrock_credentials.cacheForRegion("us-east-1"));
+        try std.testing.expectEqual(@as(usize, 1), runtime.bedrock_credentials.by_region.count());
+    }
+}
+
+test "managed embedder temporary dimension probe reaches borrowed Bedrock cache" {
+    try testManagedBedrockDimensionProbeCache(false);
+}
+
+test "managed embedder validating dimension probe reaches borrowed Bedrock cache" {
+    try testManagedBedrockDimensionProbeCache(true);
+}
+
+fn testManagedBedrockCacheEntry(alloc: std.mem.Allocator, region: []const u8) !ManagedEmbeddingEntry {
+    const index_name = try alloc.dupe(u8, "probe");
+    errdefer alloc.free(index_name);
+    const model = try alloc.dupe(u8, "amazon.titan-embed-text-v2:0");
+    errdefer alloc.free(model);
+    const base_url = try alloc.dupe(u8, "http://127.0.0.1:1");
+    errdefer alloc.free(base_url);
+    return .{
+        .alloc = alloc,
+        .io = std.testing.io,
+        .index_name = index_name,
+        .provider = .bedrock,
+        .model = model,
+        .base_url = base_url,
+        .region = try alloc.dupe(u8, region),
+        .dimensions = 2,
+    };
+}
+
+fn testManagedBedrockOwnedCacheCleanup(alloc: std.mem.Allocator) !void {
+    var entries = [_]ManagedEmbeddingEntry{try testManagedBedrockCacheEntry(alloc, "us-east-1")};
+    defer entries[0].deinit(alloc);
+    try attachManagedBedrockCredentialCaches(alloc, &entries, null);
+    try std.testing.expect(entries[0].owns_bedrock_credentials);
+    try std.testing.expect(!entries[0].bedrock_credentials.?.closed.load(.acquire));
+}
+
+fn testManagedBedrockBorrowedCacheCleanup(alloc: std.mem.Allocator) !void {
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    defer runtime.deinit();
+    var east: ?*bedrock_provider.CredentialCache = null;
+    for ([_][]const u8{ "us-east-1", "us-west-2", "us-east-1" }) |region| {
+        var entries = [_]ManagedEmbeddingEntry{try testManagedBedrockCacheEntry(alloc, region)};
+        defer entries[0].deinit(alloc);
+        try attachManagedBedrockCredentialCaches(alloc, &entries, &runtime);
+        const cache = entries[0].bedrock_credentials.?;
+        try std.testing.expect(!entries[0].owns_bedrock_credentials);
+        try std.testing.expect(!cache.closed.load(.acquire));
+        if (std.mem.eql(u8, region, "us-east-1")) {
+            if (east) |previous| try std.testing.expect(previous == cache);
+            east = cache;
+        } else {
+            try std.testing.expect(east.? != cache);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), runtime.bedrock_credentials.by_region.count());
+    try std.testing.expect(!east.?.closed.load(.acquire));
+}
+
+test "managed embedder probe cache owned allocation failures clean up" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testManagedBedrockOwnedCacheCleanup, .{});
+}
+
+test "managed embedder probe cache borrowed allocation failures preserve region ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testManagedBedrockBorrowedCacheCleanup, .{});
+}
+
+test "managed embedder probe cache attachment leaves other providers unchanged" {
+    const alloc = std.testing.allocator;
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    defer runtime.deinit();
+    var entries = [_]ManagedEmbeddingEntry{try testManagedBedrockCacheEntry(alloc, "us-east-1")};
+    defer entries[0].deinit(alloc);
+    entries[0].provider = .openai;
+    try attachManagedBedrockCredentialCaches(alloc, &entries, &runtime);
+    try std.testing.expect(entries[0].bedrock_credentials == null);
+    try std.testing.expect(!entries[0].owns_bedrock_credentials);
+    try std.testing.expectEqual(@as(usize, 0), runtime.bedrock_credentials.by_region.count());
+}
+
+test "managed embedder declared dimensions skip temporary Bedrock cache construction" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","field":"body","dimension":2,"embedder":{"provider":"bedrock","model":"amazon.titan-embed-text-v2:0","region":"us-east-1","url":"http://127.0.0.1:1"}}
+    , .{});
+    defer parsed.deinit();
+    var cfg = try parseEmbeddingsIndexConfigFromValue(alloc, parsed.value);
+    defer cfg.deinit();
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    defer runtime.deinit();
+    const dimensions = try resolveEmbeddingDimensionsForManagedConfig(
+        alloc,
+        "probe",
+        cfg.value,
+        parsed.value.object.get("embedder").?,
+        .{ .io = std.testing.io, .provider_runtime = &runtime },
+    );
+    try std.testing.expectEqual(@as(u32, 2), dimensions);
+    try std.testing.expectEqual(@as(usize, 0), runtime.bedrock_credentials.by_region.count());
 }
