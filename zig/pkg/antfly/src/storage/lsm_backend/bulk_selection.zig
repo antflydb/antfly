@@ -15,8 +15,8 @@
 //! Allocation-free, resumable selection over immutable logical generations.
 //! Even a publication containing millions of files occupies one index entry.
 const std = @import("std");
+const work_budget = @import("work_budget.zig");
 const Directory = @import("run_directory.zig").Directory;
-const time = @import("antfly_platform").time;
 pub const Policy = struct {
     mode: enum { tier, delta, window } = .tier,
     fan_in: usize = 4,
@@ -41,10 +41,10 @@ pub const Job = struct {
     pub fn init(directory: *const Directory, policy: Policy) Job {
         return .{ .directory = directory, .policy = policy };
     }
-    pub fn step(self: *Job, credits_arg: usize, deadline: u64) bool {
+    pub fn step(self: *Job, credits_arg: usize, deadline: anytype) bool {
         var credits = credits_arg;
         const count = self.directory.generationCount();
-        while (!self.done and credits != 0 and time.monotonicNs() < deadline) {
+        while (!self.done and credits != 0 and work_budget.before(deadline)) {
             credits -= 1;
             self.visits += 1;
             if (self.policy.mode != .tier) {

@@ -25,7 +25,6 @@ const Plan = @import("compaction.zig").CompactionPlan;
 const Certificate = @import("dependency_job.zig").Job;
 const runtime = @import("runtime.zig");
 const resources = @import("../resource_manager.zig");
-const clock = @import("antfly_platform").time;
 const quantum_ns = 2 * std.time.ns_per_ms;
 
 pub const Job = struct {
@@ -88,7 +87,7 @@ pub const Job = struct {
         errdefer source.deinit(allocator);
         const store = try allocator.create(Store);
         store.* = backend.runs.fork();
-        return .{ .accounting = current.pinAccounting(), .base = base, .directory = directory, .source = source, .store = store, .base_obsolete = backend.obsolete_paths.fork(), .obsolete = backend.obsolete_paths.fork(), .plan = plan, .reservation = reservation, .created_ns = clock.monotonicNs(), .delete_after_ns = if (backend.options.obsolete_retention_ns == 0) 0 else backend.nowNs() +| backend.options.obsolete_retention_ns };
+        return .{ .accounting = current.pinAccounting(), .base = base, .directory = directory, .source = source, .store = store, .base_obsolete = backend.obsolete_paths.fork(), .obsolete = backend.obsolete_paths.fork(), .plan = plan, .reservation = reservation, .created_ns = backend.coordinationNowNs(), .delete_after_ns = if (backend.options.obsolete_retention_ns == 0) 0 else backend.nowNs() +| backend.options.obsolete_retention_ns };
     }
 
     pub fn accountedMemoryBytes(self: *const Job, pass: u64) u64 {
@@ -134,7 +133,7 @@ pub const Job = struct {
             self.certificate = .init(self.base, plan);
             self.certificate.?.covered = plan.complete_coverage orelse true;
         }
-        while (credits != 0 and clock.monotonicNs() < deadline) {
+        while (credits != 0 and backend.coordinationNowNs() < deadline) {
             credits -= 1;
             switch (self.phase) {
                 .inputs => {
@@ -211,7 +210,7 @@ pub const Job = struct {
     fn rebaseStep(self: *Job, backend: anytype, credits_arg: usize, deadline: u64) !bool {
         var credits = credits_arg;
         const rebase = &self.rebase.?;
-        while (credits != 0 and clock.monotonicNs() < deadline) {
+        while (credits != 0 and backend.coordinationNowNs() < deadline) {
             if (!rebase.runs.done()) {
                 const change = rebase.runs.next(&credits) orelse continue;
                 if (!self.certificate.?.acceptChange(change) or
@@ -254,7 +253,7 @@ pub const Job = struct {
         if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
         if (self.rebase != null) {
             runtime.unlockBackend(@TypeOf(backend.*), backend, true);
-            const result = self.rebaseStep(backend, 512, clock.monotonicNs() +| quantum_ns);
+            const result = self.rebaseStep(backend, 512, backend.coordinationNowNs() +| quantum_ns);
             _ = runtime.lockBackend(@TypeOf(backend.*), backend);
             if (!try result) return false;
             const rebase = self.rebase.?;
@@ -267,7 +266,7 @@ pub const Job = struct {
             self.drainLedger(backend, obsolete);
         } else if (self.phase != .ready) {
             runtime.unlockBackend(@TypeOf(backend.*), backend, true);
-            const result = self.step(backend, outputs, 512, clock.monotonicNs() +| quantum_ns);
+            const result = self.step(backend, outputs, 512, backend.coordinationNowNs() +| quantum_ns);
             _ = runtime.lockBackend(@TypeOf(backend.*), backend);
             try result;
         }
@@ -280,7 +279,7 @@ pub const Job = struct {
         // obsolete entries off-lock; increasing slack avoids chasing the clock
         // once per input on large jobs or after a long executor suspension.
         if (backend.options.obsolete_retention_ns != 0 and self.delete_after_ns < backend.nowNs() +| backend.options.obsolete_retention_ns) {
-            self.deadline_slack_ns = @max(self.deadline_slack_ns *| 2, (clock.monotonicNs() -| self.created_ns) *| 2 +| quantum_ns);
+            self.deadline_slack_ns = @max(self.deadline_slack_ns *| 2, (backend.coordinationNowNs() -| self.created_ns) *| 2 +| quantum_ns);
             self.delete_after_ns = backend.nowNs() +| backend.options.obsolete_retention_ns +| self.deadline_slack_ns;
             self.index = 0;
             self.phase = .deadlines;
@@ -340,9 +339,9 @@ pub const Job = struct {
             var i: usize = 0;
             while (i < self.prepared_inputs) {
                 runtime.unlockBackend(@TypeOf(backend.*), backend, true);
-                const deadline = clock.monotonicNs() +| quantum_ns;
+                const deadline = backend.coordinationNowNs() +| quantum_ns;
                 const end = @min(self.prepared_inputs, i + 512);
-                while (i < end and clock.monotonicNs() < deadline) : (i += 1) inputs[i].release(backend.allocator);
+                while (i < end and backend.coordinationNowNs() < deadline) : (i += 1) inputs[i].release(backend.allocator);
                 if (backend.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) catch {};
                 _ = runtime.lockBackend(@TypeOf(backend.*), backend);
             }
@@ -361,9 +360,9 @@ pub fn releaseOutputsLocked(backend: anytype, outputs: *std.ArrayListUnmanaged(R
     var index: usize = 0;
     while (index < outputs.items.len) {
         runtime.unlockBackend(@TypeOf(backend.*), backend, true);
-        const deadline = clock.monotonicNs() +| quantum_ns;
+        const deadline = backend.coordinationNowNs() +| quantum_ns;
         const end = @min(outputs.items.len, index + 512);
-        while (index < end and clock.monotonicNs() < deadline) : (index += 1) {
+        while (index < end and backend.coordinationNowNs() < deadline) : (index += 1) {
             const run = &outputs.items[index];
             if (discard) {
                 // Production outputs own preallocated tickets. Destruction

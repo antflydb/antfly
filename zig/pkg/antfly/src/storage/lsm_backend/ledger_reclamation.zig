@@ -86,11 +86,11 @@ pub fn reclaimSliceLocked(backend: anytype) void {
     if (backend.retired_ledger_snapshots == null) return;
     backend.ledger_reclaim_in_flight = true;
     backend.retainReaderKind(.other);
-    const deadline = clock.monotonicNs() +| 2 * std.time.ns_per_ms;
+    const deadline = backend.coordinationNowNs() +| 2 * std.time.ns_per_ms;
     var units: usize = 0;
     for (0..64) |_| {
         const pending = backend.retired_ledger_snapshots orelse break;
-        if (units >= 2048 or clock.monotonicNs() >= deadline) break;
+        if (units >= 2048 or backend.coordinationNowNs() >= deadline) break;
         backend.mu.unlock();
         const result = step(backend, &pending.reclaimer.?, 2048 - units, deadline);
         _ = runtime.lockBackend(@TypeOf(backend.*), backend);
@@ -115,7 +115,7 @@ fn step(backend: anytype, reclaimer: *Ledger.Reclaimer, limit: usize, deadline: 
     const started = clock.monotonicNs();
     var credits = limit;
     var done = false;
-    while (credits != 0 and clock.monotonicNs() < deadline) {
+    while (credits != 0 and backend.coordinationNowNs() < deadline) {
         var part: usize = @min(credits, 64);
         const before = part;
         done = reclaimer.step(backend.allocator, &part);
@@ -374,7 +374,7 @@ pub fn drainLocked(backend: anytype, ledger: *Ledger) void {
         // Do not invoke general unlock reclamation here: its callbacks can
         // recursively publish while our caller still owns the manifest lane.
         backend.mu.unlock();
-        const result = step(backend, &reclaimer, 2048, clock.monotonicNs() +| 2 * std.time.ns_per_ms);
+        const result = step(backend, &reclaimer, 2048, backend.coordinationNowNs() +| 2 * std.time.ns_per_ms);
         _ = runtime.lockBackend(@TypeOf(backend.*), backend);
         note(backend, result);
         if (result.done) break;

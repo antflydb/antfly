@@ -1780,10 +1780,12 @@ pub const Server = struct {
 
             const conn = self.listener.?.accept() catch |err| {
                 self.conn_semaphore.post(self.connectionIo());
-                if (!self.running or self.shutdown_mode.load(.acquire) != 0 or self.listener == null) break;
+                // Cancellation ends the listener task; retrying would consume
+                // the cancellation and leave its owner waiting during teardown.
+                if (err == error.Canceled or !self.running or self.shutdown_mode.load(.acquire) != 0 or self.listener == null) break;
                 _ = self.accept_errors_total.fetchAdd(1, .monotonic);
                 std.log.warn("httpx accept failed; backing off delay_ms={d} err={s}", .{ accept_error_backoff_ms, @errorName(err) });
-                self.io.sleep(Io.Duration.fromMilliseconds(accept_error_backoff_ms), .awake) catch {};
+                self.io.sleep(Io.Duration.fromMilliseconds(accept_error_backoff_ms), .awake) catch break;
                 accept_error_backoff_ms = @min(self.config.accept_error_backoff_max_ms, accept_error_backoff_ms *| 2);
                 continue;
             };
@@ -5075,6 +5077,36 @@ test "repeated stop requests do not inflate connection admission permits" {
     server.requestStop();
     server.requestStop();
     try std.testing.expectEqual(@as(usize, 3), server.conn_semaphore.permits);
+}
+
+test "listener cancellation exits without accept error or retry" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var server: *Server = undefined;
+
+        fn accept(_: ?*anyopaque, _: Io.net.Socket.Handle, _: Io.net.Server.AcceptOptions) Io.net.Server.AcceptError!Io.net.Socket {
+            calls += 1;
+            // Bound a regression: an incorrect retry must fail the assertions
+            // below instead of leaving the test in an infinite accept loop.
+            if (calls > 1) server.running = false;
+            return error.Canceled;
+        }
+    };
+    Fake.calls = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.netAccept = Fake.accept;
+    const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var server = Server.initWithConfig(std.testing.allocator, io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .borrow_http_runtime_io = true,
+    });
+    defer server.deinit();
+    Fake.server = &server;
+    try server.listen();
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+    try std.testing.expectEqual(@as(u64, 0), server.accept_errors_total.load(.acquire));
+    try std.testing.expect(!server.running);
 }
 
 test "accept backoff is normalized and bounded" {

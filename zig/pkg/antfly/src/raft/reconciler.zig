@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const platform_time = @import("antfly_platform").time;
 const raft_engine = @import("raft_engine");
 const catalog = @import("catalog.zig");
 const host_mod = @import("host.zig");
@@ -1085,6 +1084,11 @@ pub const Reconciler = struct {
     failure_group_domains: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     live_retry_cursor: usize = 0,
 
+    fn nowNs(self: *const Reconciler) u64 {
+        const now = std.Io.Clock.awake.now(self.host.deps.io).nanoseconds;
+        return @intCast(@min(@max(now, 0), std.math.maxInt(u64)));
+    }
+
     pub fn deinit(self: *Reconciler) void {
         self.last_intent_hashes.deinit(self.alloc);
         self.last_intent_hashes = .empty;
@@ -1220,7 +1224,7 @@ pub const Reconciler = struct {
         errdefer route_peers.deinit(self.alloc);
         var policies = std.ArrayListUnmanaged(PreparedPolicyValidation).empty;
         errdefer policies.deinit(self.alloc);
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.nowNs();
 
         var scanned: usize = 0;
         var scheduled: usize = 0;
@@ -1386,7 +1390,7 @@ pub const Reconciler = struct {
         errdefer catalog_upserts.deinit(self.alloc);
         var catalog_upsert_hashes = std.ArrayListUnmanaged(u64).empty;
         errdefer catalog_upsert_hashes.deinit(self.alloc);
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.nowNs();
 
         for (intents, 0..) |intent, intent_index| {
             try intent.desiredMembership().validate();
@@ -1564,7 +1568,7 @@ pub const Reconciler = struct {
         else
             1;
         const next_retry_ns = if (classification == .retryable)
-            platform_time.monotonicNs() +| routeRetryDelayNs(group_id ^ @intFromEnum(phase), attempts)
+            self.nowNs() +| routeRetryDelayNs(group_id ^ @intFromEnum(phase), attempts)
         else
             0;
         self.failure_retries.putAssumeCapacity(key, .{
@@ -1677,16 +1681,16 @@ pub const Reconciler = struct {
                 const attempts = previous_retry.attempts +| 1;
                 self.route_retries.putAssumeCapacity(group_id, .{
                     .attempts = attempts,
-                    .next_retry_ns = platform_time.monotonicNs() +|
+                    .next_retry_ns = self.nowNs() +|
                         routeRetryDelayNs(group_id, attempts),
                 });
             },
         }
         if (previous == null or previous.? != status) switch (status) {
-            .converged => std.log.info(
-                "raft peer routes converged group_id={d}",
-                .{group_id},
-            ),
+            .converged => if (previous == .retrying)
+                std.log.info("raft peer routes recovered group_id={d}", .{group_id})
+            else
+                std.log.debug("raft peer routes converged group_id={d}", .{group_id}),
             .retrying => std.log.warn(
                 "raft peer route convergence deferred group_id={d} err={s}",
                 .{ group_id, @errorName(last_error.?) },
@@ -1707,7 +1711,7 @@ pub const Reconciler = struct {
         conflict_remains: ?bool,
         last_error: ?anyerror,
     ) void {
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.nowNs();
         if (last_error) |err| {
             const previous = self.policy_retries.get(group_id) orelse RouteRetryState{};
             const attempts = previous.attempts +| 1;
@@ -2989,6 +2993,16 @@ test "restart-scoped policy conflicts are isolated and durably deduplicated" {
 }
 
 test "route convergence retries without replaying durable admission" {
+    const Clock = struct {
+        threadlocal var now_ns: u64 = 0;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = now_ns };
+        }
+    };
+    Clock.now_ns = 0;
+    var io_vtable = std.testing.io.vtable.*;
+    io_vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &io_vtable };
     const Resolver = struct {
         fail: bool = true,
 
@@ -3034,6 +3048,7 @@ test "route convergence retries without replaying durable admission" {
     defer replica_catalog.deinit();
     const catalog_iface = replica_catalog.catalog();
     var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .io = io,
         .descriptor_factory = factory.iface(),
         .peer_resolver = resolver.iface(),
         .replica_catalog = catalog_iface,
@@ -3063,7 +3078,11 @@ test "route convergence retries without replaying durable admission" {
     const durable_revision = catalog_iface.revision();
 
     resolver.fail = false;
-    owner.route_retries.getPtr(505).?.next_retry_ns = 0;
+    // Real elapsed time cannot bypass backoff in a borrowed clock domain.
+    const waiting = try owner.reconcileOnce();
+    try std.testing.expectEqual(@as(usize, 0), waiting.refreshed_peers);
+    try std.testing.expectEqual(RouteConvergence.retrying, owner.routeStatus(505).?);
+    Clock.now_ns = retry_diagnostics.next_retry_ns;
     const converged = try owner.reconcileOnce();
     try std.testing.expectEqual(@as(usize, 1), converged.refreshed_peers);
     try std.testing.expectEqual(@as(usize, 0), converged.route_retrying_groups);

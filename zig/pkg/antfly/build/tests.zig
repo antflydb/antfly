@@ -3387,7 +3387,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const generation_reranking_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"generation and reranking chain VOPR exact replays"},
+        .filters = &.{"generation and reranking"},
     });
     const run_generation_reranking_vopr_tests = b.addRunArtifact(generation_reranking_vopr_tests);
     const generation_reranking_vopr_test_step = b.step(

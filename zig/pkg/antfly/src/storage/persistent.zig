@@ -133,6 +133,7 @@ fn nsToMs(ns: u64) u64 {
 
 pub const PersistentIndexOptions = struct {
     path: [*:0]const u8,
+    io: ?std.Io = null,
     main_backend: MainBackend = .lsm,
     wal_backend: ?wal_mod.StorageBackend = null,
     main_lsm_storage: ?lsm_backend.Storage = null,
@@ -903,14 +904,49 @@ pub const text_projection_provenance_meta_key = "text_projection_provenance";
 const segments_db_name = "segments";
 const meta_db_name = "meta";
 const deletions_db_name = "deletions";
-var global_storage_mu: std.atomic.Mutex = .unlocked;
+var global_storage_mu: std.Io.Mutex = .init;
 
-fn lockPersistentStorage() void {
-    platform_sync.lockYielding(&global_storage_mu);
+fn persistentStorageIo(runtime_io: ?std.Io) std.Io {
+    return runtime_io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
-fn unlockPersistentStorage() void {
-    global_storage_mu.unlock();
+fn lockPersistentStorage(runtime_io: ?std.Io) void {
+    // Park contended callers until unlock, including cancellation cleanup.
+    // Polling with zero-duration sleeps can starve a cooperative lock holder.
+    global_storage_mu.lockUncancelable(persistentStorageIo(runtime_io));
+}
+
+fn unlockPersistentStorage(runtime_io: ?std.Io) void {
+    global_storage_mu.unlock(persistentStorageIo(runtime_io));
+}
+
+test "persistent storage contention yields through borrowed IO during cancellation cleanup" {
+    const Probe = struct {
+        waits: usize = 0,
+        wakes: usize = 0,
+        io: std.Io = undefined,
+
+        fn wait(ptr: ?*anyopaque, _: *const u32, _: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.waits += 1;
+            unlockPersistentStorage(self.io);
+        }
+
+        fn wake(ptr: ?*anyopaque, _: *const u32, _: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.wakes += 1;
+        }
+    };
+    var probe = Probe{};
+    var vtable: std.Io.VTable = undefined;
+    vtable.futexWaitUncancelable = Probe.wait;
+    vtable.futexWake = Probe.wake;
+    probe.io = .{ .userdata = &probe, .vtable = &vtable };
+    try std.testing.expect(global_storage_mu.tryLock());
+    lockPersistentStorage(probe.io);
+    unlockPersistentStorage(probe.io);
+    try std.testing.expectEqual(@as(usize, 1), probe.waits);
+    try std.testing.expectEqual(@as(usize, 2), probe.wakes);
 }
 
 const MainKeyspace = enum {
@@ -1056,6 +1092,7 @@ const OpenedMainStore = struct {
 
 pub const PersistentIndex = struct {
     alloc: Allocator,
+    io: ?std.Io = null,
     writer: index_mod.IndexWriter,
     main_store: backend_erased.NamespaceStore,
     main_store_owner: MainStoreOwner,
@@ -1320,8 +1357,8 @@ pub const PersistentIndex = struct {
 
     /// Open or create a persistent index. Recovers existing state + replays WAL.
     pub fn open(alloc: Allocator, opts: PersistentIndexOptions) !PersistentIndex {
-        lockPersistentStorage();
-        defer unlockPersistentStorage();
+        lockPersistentStorage(opts.io);
+        defer unlockPersistentStorage(opts.io);
 
         const path_span = std.mem.span(opts.path);
         const wal_storage = opts.wal_storage orelse opts.main_lsm_storage;
@@ -1501,6 +1538,7 @@ pub const PersistentIndex = struct {
         }
 
         var pi = PersistentIndex{
+            .io = opts.io,
             .alloc = alloc,
             .writer = writer,
             .main_store = opened_main.store,
@@ -1543,13 +1581,11 @@ pub const PersistentIndex = struct {
     }
 
     fn lockStorage(self: *PersistentIndex) void {
-        _ = self;
-        lockPersistentStorage();
+        lockPersistentStorage(self.io);
     }
 
     fn unlockStorage(self: *PersistentIndex) void {
-        _ = self;
-        unlockPersistentStorage();
+        unlockPersistentStorage(self.io);
     }
 
     pub fn close(self: *PersistentIndex) void {

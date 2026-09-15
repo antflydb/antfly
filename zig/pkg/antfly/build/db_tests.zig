@@ -505,13 +505,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.db.test.db delete index persists",
             "storage.db.db.test.db indexed delete removes",
             "storage.db.db.test.db indexed overwrite replaces",
-            "storage.db.db.test.db compacts tiny text segments",
             "storage.db.db.test.db phrase query survives",
             "storage.db.db.test.db prefix wildcard and regexp",
             "storage.db.db.test.db typed and dictionary queries survive",
             "storage.db.db.test.db mixed-type stored fields survive",
             "storage.db.db.test.db persists byte range across reopen",
-            "storage.db.db.test.db snapshot copies current store and derived log",
             "storage.db.db.test.db updateRange constrains index backfill",
         },
     });

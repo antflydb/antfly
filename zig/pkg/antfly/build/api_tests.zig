@@ -1569,6 +1569,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "structural reconcile retains ordered constant-time repair wake membership across plan resets",
             "resident DB retry preparation waits outside admission for writer publication",
             "resident DB retry preparation does not block a borrowed std.Io scheduler",
+            "write cache pending closes yield to the borrowed scheduler",
             "admitted resident DB lease never waits for an in-flight writer publication",
             "write cache local mutation preempts stale startup writer",
             "structural reconcile pending set never revisits completed groups",
