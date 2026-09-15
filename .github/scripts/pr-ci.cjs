@@ -10,7 +10,7 @@ const TITLE = /^PR CI #(\d+) \/ check (\d+) \/ approval (\d+)$/;
 function route(context) {
   const p = context.payload;
   if (context.eventName === 'workflow_run') {
-    return p.workflow_run.name === 'Approved PR CI'
+    return p.workflow_run.path === `.github/workflows/${WORKFLOW}`
       ? (p.workflow_run.display_title.match(TITLE)?.[1] || '') : '';
   }
   return String(p.pull_request?.number || (p.issue?.pull_request && p.issue.number) || '');
@@ -77,7 +77,9 @@ async function main({github, context, core, mode, config, env = process.env}) {
     // Retain the last consumed comment ID across invalidation. A redelivered
     // old webhook must not purchase another run after draft/label changes.
     if (check && !approved) data = {...metadata(check), ...data};
-    if (!check) {
+    // A completed GitHub check cannot be requeued by changing status alone.
+    // Each approval gets a fresh check; the newest record retains replay protection.
+    if (!check || approved) {
       check = (await github.rest.checks.create({
         ...repo, name: CHECK, head_sha: pr.head.sha,
         external_id: `pr-ci:${number}:v1`, status: 'queued',
@@ -166,10 +168,16 @@ async function main({github, context, core, mode, config, env = process.env}) {
     return;
   }
 
-  if (mode !== 'event' || !number) throw new Error('Invalid controller mode or PR number.');
-  if (context.eventName === 'workflow_run') {
-    const run = context.payload.workflow_run;
+  if (!['event', 'complete'].includes(mode) || !number) throw new Error('Invalid controller mode or PR number.');
+  if (mode === 'complete' || context.eventName === 'workflow_run') {
+    const run = mode === 'complete'
+      ? (await github.rest.actions.getWorkflowRun({...repo, run_id: context.runId})).data
+      : context.payload.workflow_run;
     const match = run.display_title.match(TITLE);
+    if (!match || Number(match[1]) !== number || (mode === 'complete' &&
+        (match[2] !== env.CHECK_ID || match[3] !== env.COMMENT_ID))) {
+      throw new Error('Completion does not match this approval.');
+    }
     const check = await getCheck(match[2]);
     const data = metadata(check);
     if ((data.run_id && data.run_id !== run.id) || data.comment_id !== Number(match[3]) || data.revoked) return;
@@ -185,7 +193,8 @@ async function main({github, context, core, mode, config, env = process.env}) {
         ...repo, run_id: run.id, filter: 'latest', per_page: 100,
       });
       const result = jobs.find(j => j.name === 'PR CI result');
-      if (!data.run_id || run.conclusion !== 'success' || result?.conclusion !== 'success') {
+      const passed = mode === 'complete' ? env.RESULT === 'success' : run.conclusion === 'success';
+      if (!data.run_id || !passed || result?.conclusion !== 'success') {
         throw new Error(`CI did not pass (${run.conclusion}). Post a new approval to retry.`);
       }
       await writeCheck(check, data, 'completed',
