@@ -334,7 +334,7 @@ pub fn cancel(alloc: Allocator, io: std.Io, root: []const u8, request: contract.
     open.open_mode = .status_only;
     open.start_index_workers = false;
     open.start_optional_runtimes = false;
-    {
+    const identity = blk: {
         var source = try db.DB.open(alloc, transition.path, open);
         defer source.close();
         if (source.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
@@ -344,25 +344,44 @@ pub fn cancel(alloc: Allocator, io: std.Io, root: []const u8, request: contract.
             defer job.deinit();
             if (job.value.active() or job.value.published()) return error.VectorMigrationAlreadyExists;
         }
-    }
+        break :blk try std.json.Stringify.valueAlloc(alloc, source.core.identity_namespace, .{});
+    };
+    defer alloc.free(identity);
     const fence_path = try std.fs.path.join(alloc, &.{ transition.path, contract.offline_fence_file });
     defer alloc.free(fence_path);
-    if (!try exists(io, fence_path)) return;
-    var fence = try readJson(Fence, alloc, io, fence_path);
-    defer fence.deinit();
-    if (fence.value.version != 1 or !(contract.Admission{ .request = fence.value.request }).eql(.{ .request = request }))
-        return error.VectorMigrationIdempotencyConflict;
-    var staged = try transition.resumeStaging(request.job_id);
-    defer staged.deinit();
-    try std.Io.Dir.cwd().deleteTree(io, staged.path());
-    try fs.syncDirPortable(io, std.fs.path.dirname(staged.path()).?);
+    var fence: ?std.json.Parsed(Fence) = if (try exists(io, fence_path)) try readJson(Fence, alloc, io, fence_path) else null;
+    defer if (fence) |*value| value.deinit();
+    if (fence) |value| {
+        if (value.value.version != 1 or !(contract.Admission{ .request = value.value.request }).eql(.{ .request = request }))
+            return error.VectorMigrationIdempotencyConflict;
+        if (!std.mem.eql(u8, value.value.identity, identity)) return error.VectorMigrationIdentityMismatch;
+    }
     const cancelled_path = try std.fs.path.join(alloc, &.{ transition.path, cancellation_file });
     defer alloc.free(cancelled_path);
+    if (try exists(io, cancelled_path)) {
+        var cancelled = try readJson(Cancellation, alloc, io, cancelled_path);
+        defer cancelled.deinit();
+        if (std.mem.eql(u8, cancelled.value.request.job_id, request.job_id)) {
+            if (cancelled.value.version != 1 or !(contract.Admission{ .request = cancelled.value.request }).eql(.{ .request = request }))
+                return error.VectorMigrationIdempotencyConflict;
+            if (!std.mem.eql(u8, cancelled.value.identity, identity)) return error.VectorMigrationIdentityMismatch;
+            if (fence == null) return;
+        }
+    }
+    if (fence != null) {
+        var staged = try transition.resumeStaging(request.job_id);
+        defer staged.deinit();
+        try std.Io.Dir.cwd().deleteTree(io, staged.path());
+        try fs.syncDirPortable(io, std.fs.path.dirname(staged.path()).?);
+    }
     // Keep a receipt before releasing admission. A lost cancellation response
-    // must not let the same ID silently start a new physical migration.
-    try save(alloc, io, cancelled_path, Cancellation{ .request = request, .identity = fence.value.identity });
-    try std.Io.Dir.cwd().deleteFile(io, fence_path);
-    try fs.syncDirPortable(io, transition.path);
+    // must not let the same ID silently start a new physical migration, even
+    // when admission failed before creating the copy fence or shadow root.
+    try save(alloc, io, cancelled_path, Cancellation{ .request = request, .identity = identity });
+    if (fence != null) {
+        try std.Io.Dir.cwd().deleteFile(io, fence_path);
+        try fs.syncDirPortable(io, transition.path);
+    }
 }
 
 // VoprIo normally syncs the entire namespace on any directory fsync. Use a

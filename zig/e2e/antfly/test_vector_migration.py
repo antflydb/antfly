@@ -88,7 +88,8 @@ def nearest(api, table, index, vector):
 
 def finish(api, table, job, status=None, check=None):
     status = status or command(api, table, job)
-    for _ in range(256):
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
         if check:
             check()
         if status["phase"] in ("complete", "cancelled"):
@@ -96,6 +97,10 @@ def finish(api, table, job, status=None, check=None):
         status = command(
             api, table, job, "publish" if status["phase"] == "ready" else "step"
         )
+        # Reclamation includes timed GC admission retries and asynchronous work;
+        # a fixed number of tight HTTP requests is not a completion deadline.
+        if status["phase"] in ("serving", "reclaiming"):
+            time.sleep(0.01)
     pytest.fail(f"migration did not finish: {status}")
 
 
@@ -378,6 +383,73 @@ def test_online_vector_migration_cancellation_reopens_inline_authority(stateful_
     )
     assert completed.returncode == 0, completed.stderr
     assert command(api, table, "second", "status")["phase"] == "complete"
+
+
+def test_offline_vector_migration_cancels_before_copy_fence(stateful_api):
+    api = stateful_api
+    table = f"offline_cancel_admission_{time.time_ns()}"
+    api.create_table(table, storage={"dense_embeddings": "primary_lsm"})
+    server = api._server
+    api.pause_server()
+    catalog_path = server.root / "metadata/local-metadata.json"
+
+    def invoke(root, job="cancel-before-fence", *extra):
+        return subprocess.run(
+            [
+                str(server.binary),
+                "storage",
+                "migrate",
+                "--to",
+                "vector-store",
+                "--catalog",
+                str(catalog_path),
+                "--replica-root",
+                str(root),
+                "--table",
+                table,
+                "--job",
+                job,
+                "--disk-reserve-bytes",
+                "0",
+                *extra,
+            ],
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+
+    def record():
+        return next(
+            t for t in json.loads(catalog_path.read_text())["tables"]
+            if t["name"] == table
+        )
+
+    try:
+        rejected = invoke(server.root / "wrong-replica-root", "cancel-before-fence", "--once")
+        assert rejected.returncode != 0 and "FileNotFound" in rejected.stderr
+        admitted_catalog = catalog_path.read_text()
+        assert record()["storage_migration"]["request"]["job_id"] == "cancel-before-fence"
+        cancelled = invoke(server.replica_root, "cancel-before-fence", "--cancel")
+        assert cancelled.returncode == 0, cancelled.stderr
+        assert record().get("storage_migration") is None
+        # Model a lost catalog publication after the durable DB cancellation.
+        catalog_path.write_text(admitted_catalog)
+        cancelled = invoke(server.replica_root, "cancel-before-fence", "--cancel")
+        assert cancelled.returncode == 0, cancelled.stderr
+        assert record().get("storage_migration") is None
+        retried = invoke(server.replica_root, "cancel-before-fence", "--once")
+        assert retried.returncode != 0 and "VectorMigrationCancelled" in retried.stderr
+        assert record().get("storage_migration") is None
+        assert record()["storage"]["dense_embeddings"] == "primary_lsm"
+        replacement = invoke(server.replica_root, "replacement", "--once")
+        assert replacement.returncode == 0, replacement.stderr
+        cancelled = invoke(server.replica_root, "replacement", "--cancel")
+        assert cancelled.returncode == 0, cancelled.stderr
+        assert record().get("storage_migration") is None
+    finally:
+        api.resume_server()
+    assert api.get_table(table)["storage"]["dense_embeddings"] == "primary_lsm"
+    api.delete_table(table)
 
 
 def test_offline_vector_migration_lock_resume_catalog_and_native_queries(stateful_api):

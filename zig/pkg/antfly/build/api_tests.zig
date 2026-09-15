@@ -298,6 +298,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_api_auth_default_filters = [_][]const u8{
         "storage migration job observation preserves admitted and unpublished catalog state",
+        "storage migration command admission fences delayed starts across handlers",
         "api http server requires auth on public routes when enabled",
         "continuous HA rejects non-replicated public mutations before handlers",
         "HA mutation middleware fails closed for unregistered HTTP methods",

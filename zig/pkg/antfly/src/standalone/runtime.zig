@@ -731,6 +731,7 @@ const UnifiedServerLifecycle = antfly.common.runtime_lifecycle.HttpServerLifecyc
 const LocalStandaloneMetadata = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
+    vector_migration_commands: @import("../common/vector_migration.zig").CommandAdmissions = .{},
     manager: antfly.metadata.TableManager,
     extension_catalog: antfly.extensions.ExtensionCatalog,
     local_node_id: u64,
@@ -841,6 +842,7 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn deinit(self: *LocalStandaloneMetadata) void {
+        self.vector_migration_commands.deinit(self.alloc);
         if (self.operator_lock) |file| file.close(self.backend_runtime.filesystemIo().?);
         self.extension_catalog.deinit();
         self.manager.deinit();
@@ -888,6 +890,8 @@ const LocalStandaloneMetadata = struct {
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
                 .publish_vector_migration_table = publishVectorMigrationTable,
+                .begin_vector_migration_command = beginVectorMigrationCommand,
+                .end_vector_migration_command = endVectorMigrationCommand,
                 .restore_table = restoreTable,
                 .drop_table = dropTable,
                 .drop_table_exact = dropTableExact,
@@ -1286,6 +1290,16 @@ const LocalStandaloneMetadata = struct {
         try self.manager.publishVectorMigrationTable(expected, replacement);
         self.epoch +|= 1;
         try mutation.commit(self);
+    }
+
+    fn beginVectorMigrationCommand(ptr: *anyopaque, table_name: []const u8) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try self.vector_migration_commands.begin(self.alloc, table_name);
+    }
+
+    fn endVectorMigrationCommand(ptr: *anyopaque, table_name: []const u8) void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        self.vector_migration_commands.end(self.alloc, table_name);
     }
 
     fn restoreTable(

@@ -138,7 +138,7 @@ pub fn runFromIterator(init: std.process.Init, iterator: *std.process.Args.Itera
         std.debug.print("offline vector migration cancelled\n", .{});
         return;
     }
-    const result = try antfly.vector_migration_offline.run(std.heap.smp_allocator, init.io, db_path, request, .{
+    const result = antfly.vector_migration_offline.run(std.heap.smp_allocator, init.io, db_path, request, .{
         .open = .{
             .identity_namespace = .{
                 .table_id = table.value.table_id,
@@ -148,7 +148,16 @@ pub fn runFromIterator(init: std.process.Init, iterator: *std.process.Args.Itera
         },
         .max_steps = if (once) 1 else 0,
         .progress_fn = printProgress,
-    });
+    }) catch |err| {
+        // An exact retry can briefly readmit a terminal cancelled job. Its
+        // durable receipt proves no migration remains; do not strand the
+        // stopped server behind the marker installed by this invocation.
+        if (err == error.VectorMigrationCancelled) {
+            _ = table_value.object.swapRemove("storage_migration");
+            try publishCatalog(json_alloc, init.io, path, &catalog.value);
+        }
+        return err;
+    };
     if (result == .complete) {
         var storage = std.json.ObjectMap{};
         try storage.put(json_alloc, "dense_embeddings", .{ .string = "vector_store" });

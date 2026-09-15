@@ -129784,6 +129784,44 @@ test "source vector migration offline cancellation retains an idempotency receip
     try std.testing.expectEqualStrings("original", actual);
 }
 
+test "source vector migration offline cancellation before the copy fence survives retry" {
+    const offline = @import("../vector_migration_offline.zig");
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("offline-cancel-admission");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    const options: OpenOptions = .{ .table_storage = .{ .dense_embeddings = .primary_lsm }, .start_index_workers = false, .start_optional_runtimes = false };
+    {
+        var source = try DB.open(alloc, path, options);
+        defer source.close();
+        try source.core.store.put("preserve", "original");
+    }
+    const request: vector_migration.contract.Request = .{ .job_id = "cancel-before-fence", .mode = .offline, .budget = .{ .disk_reserve_bytes = std.math.maxInt(u64) } };
+    try std.testing.expectError(error.VectorMigrationDiskReserve, offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+    const fence = try std.fs.path.join(alloc, &.{ path, vector_migration.contract.offline_fence_file });
+    defer alloc.free(fence);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, fence, .{}));
+    // Reopening between these calls models losing the successful cancellation
+    // response before the operator can clear the persisted catalog marker.
+    try offline.cancel(alloc, std.testing.io, path, request, options);
+    try offline.cancel(alloc, std.testing.io, path, request, options);
+    try std.testing.expectError(error.VectorMigrationCancelled, offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+    var conflict = request;
+    conflict.budget.disk_reserve_bytes = 0;
+    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, offline.cancel(alloc, std.testing.io, path, conflict, options));
+    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, offline.run(alloc, std.testing.io, path, conflict, .{ .open = options }));
+    conflict.job_id = "replacement";
+    try std.testing.expectEqual(.pending, try offline.run(alloc, std.testing.io, path, conflict, .{ .open = options, .max_steps = 1 }));
+    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, offline.cancel(alloc, std.testing.io, path, request, options));
+    try offline.cancel(alloc, std.testing.io, path, conflict, options);
+    var source = try DB.open(alloc, path, options);
+    defer source.close();
+    try std.testing.expectEqual(.primary_lsm, source.table_storage.dense_embeddings);
+    const actual = try source.core.store.get(alloc, "preserve");
+    defer alloc.free(actual);
+    try std.testing.expectEqualStrings("original", actual);
+}
+
 test "source vector migration fences live probes admitted before activation" {
     const alloc = std.testing.allocator;
     var tmp = try TestDirectory.init("migration-live-probe");

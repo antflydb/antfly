@@ -1379,6 +1379,8 @@ pub const StatusSource = struct {
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         publish_vector_migration_table: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
+        begin_vector_migration_command: ?*const fn (ptr: *anyopaque, table_name: []const u8) anyerror!void = null,
+        end_vector_migration_command: ?*const fn (ptr: *anyopaque, table_name: []const u8) void = null,
         replace_table_definition_stamped: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!?metadata_api.CatalogMutationStamp = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
@@ -1492,6 +1494,17 @@ pub const StatusSource = struct {
     pub fn publishVectorMigrationTable(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const callback = self.vtable.publish_vector_migration_table orelse return error.VectorStoreRequiresLocalSingleShardTable;
         return try BoundaryAbi.call("publish_vector_migration_table", self.boundary_dispatch, callback, .{ self.ptr, expected, replacement });
+    }
+
+    pub fn beginVectorMigrationCommand(self: StatusSource, table_name: []const u8) !void {
+        const callback = self.vtable.begin_vector_migration_command orelse return error.VectorStoreRequiresLocalSingleShardTable;
+        if (self.vtable.end_vector_migration_command == null) return error.VectorStoreRequiresLocalSingleShardTable;
+        try BoundaryAbi.call("begin_vector_migration_command", self.boundary_dispatch, callback, .{ self.ptr, table_name });
+    }
+
+    pub fn endVectorMigrationCommand(self: StatusSource, table_name: []const u8) void {
+        BoundaryAbi.call("end_vector_migration_command", self.boundary_dispatch, self.vtable.end_vector_migration_command.?, .{ self.ptr, table_name }) catch
+            @panic("failed to release migration command admission");
     }
 
     pub fn replaceTableDefinitionStamped(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
@@ -15677,6 +15690,12 @@ pub const ApiHttpServer = struct {
         defer command.deinit();
         try command.value.request.validate();
         if (command.value.request.mode != .online) return error.VectorStoreRequiresOfflineCommand;
+        // Acquire before the snapshot, and retain through both owner mutation
+        // and catalog reconciliation. A delayed command must not keep an old
+        // admission alive after other commands cancel and replace that job.
+        const mutating = command.value.action != .status;
+        if (mutating) try self.source.beginVectorMigrationCommand(table_name);
+        defer if (mutating) self.source.endVectorMigrationCommand(table_name);
         var snapshot = try self.source.adminSnapshot() orelse return error.UnsupportedOperation;
         defer self.source.freeAdminSnapshot(&snapshot);
         var table = blk: {
@@ -20643,6 +20662,7 @@ test "storage migration job observation preserves admitted and unpublished catal
     const migration = @import("../common/vector_migration.zig");
     const alloc = std.testing.allocator;
     const Fake = struct {
+        commands: migration.CommandAdmissions = .{},
         table: metadata_table_manager.TableRecord = .{ .table_id = 10, .name = "docs", .desired_replica_count = 1, .storage_migration = .{ .request = .{ .job_id = "job", .mode = .online, .budget = .{ .batch_rows = 7 } } } },
         range: metadata_table_manager.RangeRecord = .{ .group_id = 101, .table_id = 10, .start_key = "", .end_key = null },
         job: ?migration.Job = null,
@@ -20650,6 +20670,12 @@ test "storage migration job observation preserves admitted and unpublished catal
         publications: usize = 0,
         reject_start: bool = false,
         fail_publication: bool = false,
+        fn beginMigration(ptr: *anyopaque, table_name: []const u8) !void {
+            try from(ptr).commands.begin(std.testing.allocator, table_name);
+        }
+        fn endMigration(ptr: *anyopaque, table_name: []const u8) void {
+            from(ptr).commands.end(std.testing.allocator, table_name);
+        }
         fn from(ptr: *anyopaque) *@This() {
             return @ptrCast(@alignCast(ptr));
         }
@@ -20701,11 +20727,14 @@ test "storage migration job observation preserves admitted and unpublished catal
         }
     };
     var fake = Fake{};
+    defer fake.commands.deinit(alloc);
     var server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, .{ .ptr = &fake, .vtable = &.{
         .status = Fake.status,
         .admin_snapshot = Fake.snapshot,
         .free_admin_snapshot = Fake.free,
         .publish_vector_migration_table = Fake.publish,
+        .begin_vector_migration_command = Fake.beginMigration,
+        .end_vector_migration_command = Fake.endMigration,
     } }, null, .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .vector_migration_group_local = Fake.command } });
     defer server.deinit();
     const admitted = try server.getStorageMigration("docs", "job");
@@ -20735,6 +20764,7 @@ test "storage migration job observation preserves admitted and unpublished catal
     // Catalog admission exists but DB startup cannot pass its reserve check.
     // Cancellation must reach the owner directly, retain its receipt if the
     // catalog update fails, and reconcile that receipt on an exact retry.
+    fake.commands.deinit(alloc);
     fake = .{ .reject_start = true, .fail_publication = true };
     try std.testing.expectError(error.InputOutput, server.advanceStorageMigration("docs", "job", "{\"action\":\"cancel\"}"));
     try std.testing.expectEqual(.cancelled, fake.job.?.phase);
@@ -20746,6 +20776,98 @@ test "storage migration job observation preserves admitted and unpublished catal
     const repeated = try server.advanceStorageMigration("docs", "job", "{\"action\":\"cancel\"}");
     defer alloc.free(repeated);
     try std.testing.expectEqualSlices(u8, cancelled, repeated);
+}
+
+test "storage migration command admission fences delayed starts across handlers" {
+    const migration = @import("../common/vector_migration.zig");
+    const Db = @import("../storage/db/db.zig").DB;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/review-db", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try Db.open(alloc, path, .{ .table_storage = .{ .dense_embeddings = .primary_lsm }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const Fake = struct {
+        commands: migration.CommandAdmissions = .{},
+        db: *Db,
+        server: *ApiHttpServer = undefined,
+        interleave: bool = true,
+        owns_table: bool = false,
+        table: metadata_table_manager.TableRecord = .{ .table_id = 10, .name = "docs", .desired_replica_count = 1 },
+        range: metadata_table_manager.RangeRecord = .{ .group_id = 101, .table_id = 10, .start_key = "", .end_key = null },
+        fn beginMigration(ptr: *anyopaque, table_name: []const u8) !void {
+            try from(ptr).commands.begin(std.testing.allocator, table_name);
+        }
+        fn endMigration(ptr: *anyopaque, table_name: []const u8) void {
+            from(ptr).commands.end(std.testing.allocator, table_name);
+        }
+        fn from(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            tables[0] = try metadata_table_manager.cloneTable(std.testing.allocator, from(ptr).table);
+            return .{ .status = try status(ptr), .tables = tables, .ranges = @as(*[1]metadata_table_manager.RangeRecord, @ptrCast(&from(ptr).range)), .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, snapshot_value: *metadata_api.AdminSnapshot) void {
+            metadata_table_manager.freeTable(std.testing.allocator, snapshot_value.tables[0]);
+            std.testing.allocator.free(snapshot_value.tables);
+        }
+        fn publish(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            const self = from(ptr);
+            if (!metadata_table_manager.tableDefinitionsEqual(self.table, expected)) return error.TableGenerationChanged;
+            const owned = try metadata_table_manager.cloneTable(std.testing.allocator, replacement);
+            if (self.owns_table) metadata_table_manager.freeTable(std.testing.allocator, self.table);
+            self.table = owned;
+            self.owns_table = true;
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+        fn command(ptr: *anyopaque, allocator: std.mem.Allocator, _: u64, _: []const u8, raw: []const u8) anyerror!?[]u8 {
+            const self = from(ptr);
+            var parsed = try std.json.parseFromSlice(migration.Command, allocator, raw, .{});
+            defer parsed.deinit();
+            if (self.interleave and parsed.value.action == .start) {
+                self.interleave = false;
+                // Reenter through a separate handler at the old race boundary.
+                // GET can observe admission, but cancellation/replacement must
+                // not pass the shared catalog owner's per-table command slot.
+                const observed = try self.server.getStorageMigration("docs", "A");
+                defer allocator.free(observed);
+                try std.testing.expect(std.mem.indexOf(u8, observed, "admitted") != null);
+                try std.testing.expectError(error.StorageBusy, self.server.advanceStorageMigration("docs", "A", "{\"action\":\"cancel\"}"));
+                try std.testing.expectError(error.StorageBusy, self.server.createStorageMigration("docs", "{\"job_id\":\"B\",\"target\":\"vector_store\"}"));
+                try std.testing.expect(self.table.storage_migration != null);
+            }
+            return try self.db.vectorMigrationCommand(allocator, parsed.value);
+        }
+    };
+    var fake = Fake{ .db = &db };
+    defer fake.commands.deinit(alloc);
+    defer if (fake.owns_table) metadata_table_manager.freeTable(alloc, fake.table);
+    var server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free, .publish_vector_migration_table = Fake.publish, .begin_vector_migration_command = Fake.beginMigration, .end_vector_migration_command = Fake.endMigration } }, null, .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .vector_migration_group_local = Fake.command } });
+    defer server.deinit();
+    var peer = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, server.source, null, server.table_writes);
+    defer peer.deinit();
+    fake.server = &peer;
+    const result = try server.createStorageMigration("docs", "{\"job_id\":\"A\",\"target\":\"vector_store\",\"budget\":{\"disk_reserve_bytes\":0}}");
+    defer alloc.free(result);
+    var job = try std.json.parseFromSlice(migration.Job, alloc, result, .{});
+    defer job.deinit();
+    try std.testing.expectEqual(.backfill, job.value.phase);
+    try std.testing.expectEqualStrings("A", fake.table.storage_migration.?.request.job_id);
+    alloc.free(try peer.advanceStorageMigration("docs", "A", "{\"action\":\"cancel\"}"));
+    alloc.free(try peer.advanceStorageMigration("docs", "A", "{\"action\":\"step\"}"));
+    try std.testing.expect(fake.table.storage_migration == null);
+    alloc.free(try peer.createStorageMigration("docs", "{\"job_id\":\"B\",\"target\":\"vector_store\",\"budget\":{\"disk_reserve_bytes\":0}}"));
+    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, server.createStorageMigration("docs", "{\"job_id\":\"A\",\"target\":\"vector_store\",\"budget\":{\"disk_reserve_bytes\":0}}"));
+    try std.testing.expectEqualStrings("B", fake.table.storage_migration.?.request.job_id);
+    try std.testing.expectEqual(@as(usize, 0), fake.commands.tables.count());
 }
 
 test "document artifact routes declare read and admin permissions" {

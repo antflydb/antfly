@@ -23,6 +23,36 @@ pub const candidate_prefix = "\x00\x00__metadata__:vector_migration_candidate:";
 pub const Mode = enum { offline, online };
 pub const Phase = enum { backfill, verifying, ready, draining, final_verification, serving, cleanup, reclaiming, complete, cancelling, cancelled };
 
+/// Shared by all API handlers using one standalone catalog owner. Hold a table
+/// slot from before reading admission through the DB command and catalog
+/// reconciliation. The catalog's process lock excludes another server/offline
+/// operator; after process loss the persisted marker is the recovery authority.
+pub const CommandAdmissions = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    tables: std.StringHashMapUnmanaged(void) = .empty,
+
+    pub fn begin(self: *CommandAdmissions, alloc: std.mem.Allocator, table: []const u8) !void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.tables.contains(table)) return error.StorageBusy;
+        const owned = try alloc.dupe(u8, table);
+        errdefer alloc.free(owned);
+        try self.tables.put(alloc, owned, {});
+    }
+
+    pub fn end(self: *CommandAdmissions, alloc: std.mem.Allocator, table: []const u8) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        const removed = self.tables.fetchRemove(table) orelse unreachable;
+        alloc.free(removed.key);
+    }
+
+    pub fn deinit(self: *CommandAdmissions, alloc: std.mem.Allocator) void {
+        std.debug.assert(self.tables.count() == 0);
+        self.tables.deinit(alloc);
+    }
+};
+
 pub const Budget = struct {
     batch_bytes: u64 = 4 * 1024 * 1024,
     batch_rows: u32 = 1024,
@@ -157,4 +187,16 @@ test "source vector migration validates durable identity and publication fencing
     try reopened.value.validate();
     try std.testing.expect(reopened.value.published());
     try std.testing.expectEqual(job.publication_fence, reopened.value.publication_fence);
+}
+
+test "source vector migration command admission isolates tables and releases slots" {
+    var commands: CommandAdmissions = .{};
+    defer commands.deinit(std.testing.allocator);
+    try commands.begin(std.testing.allocator, "A");
+    try std.testing.expectError(error.StorageBusy, commands.begin(std.testing.allocator, "A"));
+    try commands.begin(std.testing.allocator, "B");
+    commands.end(std.testing.allocator, "A");
+    try commands.begin(std.testing.allocator, "A");
+    commands.end(std.testing.allocator, "B");
+    commands.end(std.testing.allocator, "A");
 }

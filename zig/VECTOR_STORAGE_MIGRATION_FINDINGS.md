@@ -372,3 +372,46 @@ assertions remain unchanged; this is an unresolved pre-existing ANN
 stability/qualification issue, not a clean repeated end-to-end result.
 Logs, both failed database roots, the tested binary, and a control runner are
 preserved under `.benchmark-results/vector-migration-review-20260915/`.
+
+## Delayed commands and cancellation before copying
+
+Online mutation handlers now acquire a per-table command slot from the shared
+standalone catalog owner before reading admission. They retain it across the
+synchronous DB command and catalog reconciliation. This prevents a paused start
+from resuming after another handler cancels and replaces its admission. A
+contending migration mutation returns retryable HTTP 503; status reads and
+commands for other tables remain available. This applies to the supported
+single-process standalone deployment, whose catalog process lock excludes
+another server or offline operator. Persisted admission still governs recovery
+after process loss.
+
+The regression reenters through a second API handler between catalog admission
+and DB startup, with a real DB behind both handlers. It checks that observation
+works, cancellation/replacement cannot pass the slot, and subsequent commands
+release the slot and retain the correct catalog job. The existing test also
+checks slot release after DB rejection and failed catalog publication.
+
+Offline cancellation now persists a source-identity-bound receipt even when
+admission failed before the copy fence existed. Exact retries preserve the
+terminal cancellation; mismatched budgets and a replacement's active fence
+remain protected. If an exact CLI retry temporarily reinstalls admission before
+reading that receipt, it clears the marker before returning the cancelled
+error. The packaged CLI regression uses an incorrect replica root to leave
+catalog-only admission, cancels against the correct root, models a lost catalog
+publication, retries both cancellation and startup, and admits a replacement.
+
+Validation: the migration/recovery target passed 29/29 and the focused API
+target passed 2/2, with no leaks. The packaged Debug executable built and passed
+14/15 migration/vector-store E2E cases. The remaining online neighbor test
+exhausted 256 tight requests during reclamation; its completion helper now uses
+a 120-second deadline and yields during serving/reclamation, as timed GC work
+cannot be bounded by request count. This changes no production scheduling or
+completion/neighbor assertions.
+
+With that helper corrected, the migration suite passed 8/9. The online neighbor
+case completed migration, then showed the identical query-15 neighbor difference
+documented above for the pre-fix offline control. The offline neighbor case and
+both cancellation cases passed. This remains an unresolved ANN qualification
+issue, not a clean end-to-end result. Logs, the tested Debug executable, and both
+failed database roots are retained under
+`.benchmark-results/vector-migration-review-20260915/review-followup/fixes/`.
