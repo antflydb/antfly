@@ -853,7 +853,10 @@ foreground reads and Raft apply while preventing concurrent reconfiguration.
 The compiled boundary carries borrowed cancellation, yield, activation and resource
 policy for the synchronous call. Full-text candidates persist a synced page cursor
 in the existing durable repair intent; reopening retains the prefix and replays
-writes from the pinned build floor before bounded activation. Normal bulk text
+writes from the pinned build floor before bounded activation. Each resumable page
+upserts its document IDs into the private candidate: a crash after page persistence
+but before cursor publication cannot leave duplicate live entries on retry. Page
+retries retain deferred merge work for the serving generation's normal scheduler. Normal bulk text
 loading keeps its larger throughput-oriented batches. Exact repair selection uses the
 resident name index, leaves the general repair cursor unchanged, honors paused and
 future-dated intents, and excludes unrelated repair debt from the target's readiness.

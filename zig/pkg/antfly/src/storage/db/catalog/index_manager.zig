@@ -18338,6 +18338,7 @@ pub const IndexManager = struct {
                 identity_txn: *docstore_mod.DocStore.Txn,
                 check: ?types.RepairCancelCheck,
                 capacity: ?types.RepairCapacityCheck,
+                resumable: bool,
             ) !void {
                 try checkRepairCancelled(check);
                 if (capacity) |admission| try admission.boundary();
@@ -18351,10 +18352,18 @@ pub const IndexManager = struct {
                 defer manager.alloc.free(ordinals);
                 for (docs_buf.items, ordinals) |*doc, ordinal| doc.doc_ordinal = ordinal;
 
-                const stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
+                // Page publication and the repair-intent cursor are separate
+                // durable commits. A retry may therefore cover an already
+                // persisted page. Upsert into the private candidate so crashes
+                // before or after either commit cannot duplicate live entries.
+                // Ordinary one-shot backfills still start from an empty index.
+                const replaced = if (resumable) try manager.deleteTextBatchEntry(text_entry, doc_ids) else TextBatchMutationStats{};
+                var stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
+                stats.noteDelete(replaced.deleted_any);
                 try manager.finalizeTextBatchMutations(text_entry, .{
                     .compact_text = false,
-                    .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
+                    .compact_text_segment_threshold = if (resumable) null else text_backfill_compact_segment_threshold,
+                    .defer_text_compaction = resumable,
                 }, stats);
                 try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
                 for (docs_buf.items) |doc| {
@@ -18510,6 +18519,7 @@ pub const IndexManager = struct {
                     read_txn,
                     cancel_check,
                     capacity_check,
+                    yield_check != null,
                 );
                 if (batch_last_doc_key) |old| self.alloc.free(old);
                 batch_last_doc_key = null;

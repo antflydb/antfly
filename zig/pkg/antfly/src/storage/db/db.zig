@@ -106310,6 +106310,66 @@ test "db managed full text admission survives restart without in-place backfill"
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }
 
+test "db full text repair page replay is idempotent without compaction" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("full-text-page-replay");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const cfg: types.IndexConfig = .{ .name = "full_text_index_v1", .kind = .full_text, .config_json = "{}" };
+    index_manager_mod.test_text_backfill_batch_size = 1;
+    defer index_manager_mod.test_text_backfill_batch_size = null;
+    const Yield = struct {
+        fn requested(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var token: u8 = 0;
+    var options = repair_completion_test_options;
+    options.yield_check = .{ .ptr = &token, .is_requested = Yield.requested };
+    var repair_id: u128 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+        defer db.close();
+        try db.batch(.{ .writes = &.{
+            .{ .key = "a", .value = "{\"body\":\"original\"}" },
+            .{ .key = "b", .value = "{\"body\":\"original\"}" },
+            .{ .key = "c", .value = "{\"body\":\"original\"}" },
+        }, .sync_level = .write });
+        repair_id = (try db.admitManagedFullTextIndex(cfg)).?;
+        const first = try db.advanceIndexRepairIntent(alloc, repair_id, options);
+        try std.testing.expect(first.busy and !first.repaired);
+        var checkpoint = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer checkpoint.deinit(alloc);
+        const second = try db.advanceIndexRepairIntent(alloc, repair_id, options);
+        try std.testing.expect(second.busy and !second.repaired);
+        // Persist the state left by a crash between page durability and its
+        // intent cursor. No later source mutations or merges may hide repeats.
+        try db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .building,
+            .build_resume_key = checkpoint.intent.build_resume_key.?,
+            .replace_build_resume_key = true,
+            .build_reprocessed = checkpoint.intent.build_reprocessed,
+        });
+    }
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer reopened.close();
+    var complete = false;
+    for (0..32) |_| {
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, options);
+        try std.testing.expect(!step.terminal);
+        if (step.repaired) {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    try std.testing.expectEqual(@as(u32, 3), reopened.core.index_manager.textIndex(cfg.name).?.snapshot().liveDocCount());
+    var all = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match_all = {} }, .limit = 1 });
+    defer all.deinit();
+    try std.testing.expectEqual(@as(u32, 3), all.total_hits);
+}
+
 test "db full text repair yields resumes after reopen and catches writes behind its cursor" {
     const alloc = std.testing.allocator;
     var tmp = try TestDirectory.init("full-text-repair-slices");
@@ -106329,6 +106389,7 @@ test "db full text repair yields resumes after reopen and catches writes behind 
     options.yield_check = .{ .ptr = &token, .is_requested = Yield.requested };
     var repair_id: u128 = 0;
     var candidate: []u8 = undefined;
+    var first_cursor: []u8 = undefined;
     {
         var db = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
         defer db.close();
@@ -106346,6 +106407,7 @@ test "db full text repair yields resumes after reopen and catches writes behind 
         try std.testing.expectEqual(index_repair_state.Phase.building, entry.intent.phase);
         try std.testing.expect(entry.intent.build_resume_key != null);
         candidate = try alloc.dupe(u8, entry.intent.candidate_relative_path.?);
+        first_cursor = try alloc.dupe(u8, entry.intent.build_resume_key.?);
         // These mutations cross the saved cursor in both directions. Replay
         // from the pinned build floor must repair the mixed snapshot slices.
         try db.batch(.{ .writes = &.{
@@ -106354,6 +106416,7 @@ test "db full text repair yields resumes after reopen and catches writes behind 
         }, .deletes = &.{"c"}, .sync_level = .write });
     }
     defer alloc.free(candidate);
+    defer alloc.free(first_cursor);
     var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
     defer reopened.close();
     {
@@ -106361,6 +106424,17 @@ test "db full text repair yields resumes after reopen and catches writes behind 
         defer entry.deinit(alloc);
         try std.testing.expectEqualStrings(candidate, entry.intent.candidate_relative_path.?);
     }
+    // Model a crash/cancellation after the second page is durable but before
+    // its separate repair-intent cursor commits. Reopening the private index
+    // must replay that page as an upsert, not append duplicate live documents.
+    const second = try reopened.advanceIndexRepairIntent(alloc, repair_id, options);
+    try std.testing.expect(second.attempted and second.busy and !second.repaired);
+    try reopened.updateIndexRepairIntent(alloc, repair_id, .{
+        .phase = .building,
+        .build_resume_key = first_cursor,
+        .replace_build_resume_key = true,
+        .build_reprocessed = 1,
+    });
     var complete = false;
     for (0..32) |_| {
         const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, options);
@@ -106376,6 +106450,9 @@ test "db full text repair yields resumes after reopen and catches writes behind 
         std.debug.print("full text resume incomplete phase={s} error={?s} retry={} cursor_present={} count={}\n", .{ @tagName(remaining.intent.phase), remaining.intent.last_error, remaining.intent.next_retry_at_ms, remaining.intent.build_resume_key != null, remaining.intent.build_reprocessed });
     }
     try std.testing.expect(complete);
+    var all = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match_all = {} } });
+    defer all.deinit();
+    try std.testing.expectEqual(@as(u32, 3), all.total_hits);
     for ([_][]const u8{ "changed", "inserted", "original" }) |word| {
         var result = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match = .{ .field = "body", .text = word } } });
         defer result.deinit();
