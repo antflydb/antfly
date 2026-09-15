@@ -5428,6 +5428,16 @@ pub const Backend = struct {
         self.obsolete_manifest_dirty = self.obsolete_paths.tree.root != self.manifest_journal.obsolete.tree.root;
     }
 
+    /// Publication and reclamation budgets share the clock of their yield
+    /// lane. Reading host time here would change slice boundaries on replay.
+    pub fn coordinationNowNs(self: *Backend) u64 {
+        if (self.manifestCoordinationIo()) |io| {
+            const now = std.Io.Clock.awake.now(io).nanoseconds;
+            return @intCast(std.math.clamp(now, 0, std.math.maxInt(u64)));
+        }
+        return platform_time.monotonicNs();
+    }
+
     pub fn manifestCoordinationIo(self: *Backend) ?std.Io {
         if (comptime builtin.os.tag == .freestanding) return null;
         if (self.options.read_runtime) |runtime| return runtime.io;

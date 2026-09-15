@@ -3066,6 +3066,9 @@ test "http host reserves service workers through its runtime and rolls back over
     defer if (live) host.deinit();
     try host.start();
     try std.testing.expectEqual(@as(usize, 5), runtime.ptr().laneStats().reserved_workers);
+    const runtime_io = runtime.ptr().io() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_io.userdata, host.host.deps.io.userdata);
+    try std.testing.expectEqual(runtime_io.vtable, host.host.deps.io.vtable);
     try std.testing.expect(host.transport_stack.driver.sender_io == null);
     try std.testing.expect(host.transport_stack.snapshot_transport.sender_io == null);
     try std.testing.expect(host.listener.?.accept_io == null);

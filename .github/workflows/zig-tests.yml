@@ -435,6 +435,7 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_prune_completed_test_cache.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
@@ -745,6 +746,7 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_prune_completed_test_cache.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
@@ -793,6 +795,16 @@ jobs:
           fi
           exit "$status"
 
+      - name: Release completed phase compiler cache
+        run: |
+          # The preceding build has finished. Release its large test outputs
+          # while keeping compiler, dependency, and generator artifacts warm.
+          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          df -h "$cache"
+          df -i "$cache"
+
       - name: Run corpus-scale release regressions
         working-directory: zig
         run: >-
@@ -817,6 +829,16 @@ jobs:
 
       # Includes index-maintenance and index-ownership replay campaigns. The
       # fixed maintenance seed is already part of the zig-base unit aggregate.
+      - name: Release completed phase compiler cache
+        run: |
+          # The preceding build has finished. Release its large test outputs
+          # while keeping compiler, dependency, and generator artifacts warm.
+          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          df -h "$cache"
+          df -i "$cache"
+
       - name: Run Zig VOPR tests
         working-directory: zig
         run: >-
@@ -848,6 +870,16 @@ jobs:
 
       # Includes complete graph owner coverage and the native maintenance fixture;
       # no graph-specific CLI or promotion matrix is built here.
+      - name: Release completed phase compiler cache
+        run: |
+          # The preceding build has finished. Release its large test outputs
+          # while keeping compiler, dependency, and generator artifacts warm.
+          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          df -h "$cache"
+          df -i "$cache"
+
       - name: Run Zig integration tests
         working-directory: zig
         run: >-
@@ -874,6 +906,11 @@ jobs:
           antfly-chaos-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
+
+      - name: Remove job compiler cache
+        if: always()
+        run: |
+          rm -rf -- "/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
 
   zig-build-cache-tests:
     name: zig-full / build-cache

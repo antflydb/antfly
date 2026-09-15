@@ -1682,10 +1682,10 @@ pub const Reconciler = struct {
             },
         }
         if (previous == null or previous.? != status) switch (status) {
-            .converged => std.log.info(
-                "raft peer routes converged group_id={d}",
-                .{group_id},
-            ),
+            .converged => if (previous == .retrying)
+                std.log.info("raft peer routes recovered group_id={d}", .{group_id})
+            else
+                std.log.debug("raft peer routes converged group_id={d}", .{group_id}),
             .retrying => std.log.warn(
                 "raft peer route convergence deferred group_id={d} err={s}",
                 .{ group_id, @errorName(last_error.?) },
@@ -3033,6 +3033,16 @@ test "restart-scoped policy conflicts are isolated and durably deduplicated" {
 }
 
 test "route convergence retries without replaying durable admission" {
+    const Clock = struct {
+        threadlocal var now_ns: u64 = 0;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = now_ns };
+        }
+    };
+    Clock.now_ns = 0;
+    var io_vtable = std.testing.io.vtable.*;
+    io_vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &io_vtable };
     const Resolver = struct {
         fail: bool = true,
 
@@ -3078,6 +3088,7 @@ test "route convergence retries without replaying durable admission" {
     defer replica_catalog.deinit();
     const catalog_iface = replica_catalog.catalog();
     var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .io = io,
         .descriptor_factory = factory.iface(),
         .peer_resolver = resolver.iface(),
         .replica_catalog = catalog_iface,
@@ -3107,7 +3118,11 @@ test "route convergence retries without replaying durable admission" {
     const durable_revision = catalog_iface.revision();
 
     resolver.fail = false;
-    owner.route_retries.getPtr(505).?.next_retry_ns = 0;
+    // Real elapsed time cannot bypass backoff in a borrowed clock domain.
+    const waiting = try owner.reconcileOnce();
+    try std.testing.expectEqual(@as(usize, 0), waiting.refreshed_peers);
+    try std.testing.expectEqual(RouteConvergence.retrying, owner.routeStatus(505).?);
+    Clock.now_ns = retry_diagnostics.next_retry_ns;
     const converged = try owner.reconcileOnce();
     try std.testing.expectEqual(@as(usize, 1), converged.refreshed_peers);
     try std.testing.expectEqual(@as(usize, 0), converged.route_retrying_groups);

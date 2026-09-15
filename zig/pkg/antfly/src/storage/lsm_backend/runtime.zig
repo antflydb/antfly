@@ -55,17 +55,6 @@ fn workIoNowNs(io: ?std.Io) u64 {
     return @import("antfly_platform").time.monotonicNs();
 }
 
-/// Keep the clock with deadlines passed to cursors that do not own a backend.
-/// Callers explicitly select native time with null when no I/O owner exists.
-pub const WorkDeadline = struct {
-    io: ?std.Io,
-    at_ns: u64,
-
-    pub fn expired(self: WorkDeadline) bool {
-        return workIoNowNs(self.io) >= self.at_ns;
-    }
-};
-
 const OwnedBytes = struct {
     allocator: Allocator,
     bytes: []u8,

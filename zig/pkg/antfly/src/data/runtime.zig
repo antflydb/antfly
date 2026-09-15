@@ -38207,6 +38207,10 @@ fn implementationTests() type {
                 );
                 defer transition_lease.release();
                 try std.testing.expect(transition_lease.db.core.identity_namespace.eql(source_namespace));
+                const local_schema = (try transition_lease.db.getSchemaJson(alloc)) orelse
+                    return error.TestUnexpectedResult;
+                defer alloc.free(local_schema);
+                try std.testing.expectEqualStrings(antfly.public_api.tables.default_schema_json, local_schema);
                 try std.testing.expect(server.backend_runtime != null);
                 try std.testing.expect(
                     transition_lease.db.backend_runtime == server.backend_runtime.?,

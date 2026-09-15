@@ -819,8 +819,13 @@ pub const Kernel = struct {
         const storage_len = result_offset + @max(result_len, 1);
         const task = try self.allocator.create(Task);
         errdefer self.allocator.destroy(task);
-        const stack = try self.allocator.alignedAlloc(u8, .fromByteUnits(stack_alignment), self.config.stack_size);
-        errdefer self.allocator.free(stack);
+        // A fiber stack contains no initialized objects until the fiber runs.
+        // Keep allocator ownership/accounting, but avoid poisoning every byte
+        // of large stacks for each short-lived task in Debug/ReleaseSafe runs.
+        const stack_ptr = self.allocator.rawAlloc(self.config.stack_size, .fromByteUnits(stack_alignment), @returnAddress()) orelse
+            return error.OutOfMemory;
+        const stack: []align(stack_alignment) u8 = @alignCast(stack_ptr[0..self.config.stack_size]);
+        errdefer self.allocator.rawFree(stack, .fromByteUnits(stack_alignment), @returnAddress());
         const storage = try self.allocator.alignedAlloc(u8, .fromByteUnits(storage_alignment), storage_len);
         errdefer self.allocator.free(storage);
         @memcpy(storage[0..context_bytes.len], context_bytes);
@@ -975,7 +980,7 @@ pub const Kernel = struct {
 
     fn destroyTaskMemory(self: *Kernel, task: *Task) void {
         self.allocator.free(task.storage);
-        self.allocator.free(task.stack);
+        self.allocator.rawFree(task.stack, .fromByteUnits(stack_alignment), @returnAddress());
         self.allocator.destroy(task);
     }
 

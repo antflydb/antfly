@@ -1127,6 +1127,24 @@ test "virtual filesystem accounts bytes by logical storage prefix" {
     try std.testing.expectEqual(@as(u64, 0), try fs.bytesUnderPrefix("node"));
 }
 
+test "virtual filesystem repeated namespace sync avoids allocations and persists renames" {
+    var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var fs = try FileSystem.init(counter.allocator(), .{});
+    defer fs.deinit();
+    const file = try fs.createFile(.cwd(), "original", .{ .read = true }, 1);
+    try std.testing.expect(fs.closeFiles(&.{file}));
+    const before = counter.alloc_index;
+    try fs.syncNamespace();
+    try fs.syncNamespace();
+    try std.testing.expectEqual(before, counter.alloc_index);
+    try fs.rename(.cwd(), "original", .cwd(), "renamed", false);
+    try fs.syncNamespace();
+    try fs.crash();
+    try std.testing.expectError(error.FileNotFound, fs.openFile(.cwd(), "original", .{}));
+    const restored = try fs.openFile(.cwd(), "renamed", .{});
+    try std.testing.expect(fs.closeFiles(&.{restored}));
+}
+
 test "virtual filesystem enforces descriptor capacity partial writes and crash publication" {
     var fs = try FileSystem.init(std.testing.allocator, .{
         .max_open_handles = 1,

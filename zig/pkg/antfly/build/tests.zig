@@ -3418,7 +3418,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const generation_reranking_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"generation and reranking chain VOPR exact replays"},
+        .filters = &.{"generation and reranking"},
     });
     const run_generation_reranking_vopr_tests = b.addRunArtifact(generation_reranking_vopr_tests);
     const generation_reranking_vopr_test_step = b.step(
@@ -4243,6 +4243,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     storage_workload_soak_step.dependOn(&run_wal_soak_tests.step);
 
     const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    persistent_test_mod.addImport("antfly_pdf", pdf_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
     persistent_test_mod.addImport("antfly_vellum", vellum_mod);
     persistent_test_mod.addImport("antfly_regex", regex_mod);
@@ -4258,7 +4259,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const run_persistent_unit_tests = b.addRunArtifact(persistent_unit_tests);
+    const run_persistent_unit_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, persistent_unit_tests, selectTestFilters(b, &.{}));
 
     const persistent_test_step = b.step("persistent-test", "Run storage/persistent unit tests");
     persistent_test_step.dependOn(&run_persistent_unit_tests.step);
