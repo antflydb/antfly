@@ -43,14 +43,22 @@ def _bootstrap_empty(cluster: HACluster) -> None:
     # Match the operator, which preloads the sync policy on the standby for
     # promotion. Standby create rejection must not depend on an async policy.
     cluster.standby.extra_runtime_args = [
-        "--hot-standby-sync-mode", "remote_apply",
-        "--hot-standby-sync-selection", "first",
-        "--hot-standby-sync-required", "1",
-        "--hot-standby-sync-standby", "standby-a",
-        "--hot-standby-sync-failure", "block",
+        "--hot-standby-sync-mode",
+        "remote_apply",
+        "--hot-standby-sync-selection",
+        "first",
+        "--hot-standby-sync-required",
+        "1",
+        "--hot-standby-sync-standby",
+        "standby-a",
+        "--hot-standby-sync-failure",
+        "block",
     ]
     capture_root = cluster.primary.ha_root / "seed-captures"
-    cluster.primary.extra_runtime_args = ["--hot-standby-seed-capture-root", str(capture_root)]
+    cluster.primary.extra_runtime_args = [
+        "--hot-standby-seed-capture-root",
+        str(capture_root),
+    ]
     cluster.primary.start()
     binding = {
         "topology_id": "empty-cloud-instance",
@@ -93,7 +101,13 @@ def _bootstrap_empty(cluster: HACluster) -> None:
 
     def artifact(action, **values):
         result = subprocess.run(
-            [cluster.primary.binary, "standby", "artifact", action, *flags({**common, **values})],
+            [
+                cluster.primary.binary,
+                "standby",
+                "artifact",
+                action,
+                *flags({**common, **values}),
+            ],
             capture_output=True,
             text=True,
             timeout=90,
@@ -105,7 +119,9 @@ def _bootstrap_empty(cluster: HACluster) -> None:
     # fixtures. Never copy the primary's live catalog into the standby.
     location = (cluster.root / "object-store").as_uri()
     artifact(
-        "publish", location=location, manifest=capture["manifest_path"],
+        "publish",
+        location=location,
+        manifest=capture["manifest_path"],
         content_root=capture["content_root"],
         capture_receipt=Path(capture["generation_root"]) / "COMPLETE.json",
     )
@@ -113,36 +129,66 @@ def _bootstrap_empty(cluster: HACluster) -> None:
     target = cluster.standby.node_root / "standby-generations"
     artifact("restore", location=location, staging_root=staging, **identity)
     activated = artifact(
-        "activate", staging_root=staging, target_root=target,
-        target_local_node_id=1, target_replica_id=1, **identity,
+        "activate",
+        staging_root=staging,
+        target_root=target,
+        target_local_node_id=1,
+        target_replica_id=1,
+        **identity,
     )
     # Repeating activation must reuse the exact published generation.
     repeated = artifact(
-        "activate", staging_root=staging, target_root=target,
-        target_local_node_id=1, target_replica_id=1, **identity,
+        "activate",
+        staging_root=staging,
+        target_root=target,
+        target_local_node_id=1,
+        target_replica_id=1,
+        **identity,
     )
     assert repeated["generation_path"] == activated["generation_path"]
 
     startup = {
-        "target_root": target, "generation": generation, "slot_name": "standby-a",
-        "timeline_id": 1, "epoch": 1,
+        "target_root": target,
+        "generation": generation,
+        "slot_name": "standby-a",
+        "timeline_id": 1,
+        "epoch": 1,
         **{key: value for key, value in binding.items() if key != "node_id"},
-        **{key: activated[key] for key in (
-            "capture_receipt_sha256", "materialized_receipt_sha256",
-            "materialized_aggregate_sha256", "target_local_node_id", "target_replica_id",
-        )},
+        **{
+            key: activated[key]
+            for key in (
+                "capture_receipt_sha256",
+                "materialized_receipt_sha256",
+                "materialized_aggregate_sha256",
+                "target_local_node_id",
+                "target_replica_id",
+            )
+        },
     }
     cluster.standby.extra_runtime_args = flags(
         {"hot_standby_startup_" + key: value for key, value in startup.items()}
     )
-    cluster.primary.admin_post("/base-backups/activate", {
-        key: activated[key] for key in (
-            "slot_name", "generation", "manifest_id", "timeline_id", "checkpoint_lsn",
-            "seed_receipt_sha256", "capture_receipt_sha256", "manifest_sha256", "aggregate_sha256",
-        )
-    })
+    cluster.primary.admin_post(
+        "/base-backups/activate",
+        {
+            key: activated[key]
+            for key in (
+                "slot_name",
+                "generation",
+                "manifest_id",
+                "timeline_id",
+                "checkpoint_lsn",
+                "seed_receipt_sha256",
+                "capture_receipt_sha256",
+                "manifest_sha256",
+                "aggregate_sha256",
+            )
+        },
+    )
     cluster.standby.start()
-    _wait_for_standby_applied(cluster, _primary_lsn(cluster), require_live_replication=True)
+    _wait_for_standby_applied(
+        cluster, _primary_lsn(cluster), require_live_replication=True
+    )
 
 
 def test_empty_seed_artifact_bootstrap_and_restart(ha_cluster: HACluster):
@@ -166,12 +212,17 @@ def test_empty_seed_then_first_table_replication_and_fenced_promotion(
         "first_table", {"first": {"title": "created after empty bootstrap"}}
     )
     cluster.primary.create_table("second_table")
-    cluster.primary.batch_write("second_table", {"second": {"title": "independent table"}})
+    cluster.primary.batch_write(
+        "second_table", {"second": {"title": "independent table"}}
+    )
     lsn = _primary_lsn(cluster)
     _wait_for_standby_applied(cluster, lsn)
     _wait_for_standby_lookup(cluster, "second_table", "second")
     cluster.primary.restart()
-    assert cluster.primary.lookup_key("second_table", "second")["title"] == "independent table"
+    assert (
+        cluster.primary.lookup_key("second_table", "second")["title"]
+        == "independent table"
+    )
     _wait_for_standby_lookup(cluster, "first_table", "first")
     cluster.standby.restart()
     _wait_for_standby_applied(cluster, lsn, require_live_replication=True)
@@ -188,17 +239,24 @@ def test_empty_seed_then_first_table_replication_and_fenced_promotion(
         "first_table", {"stale": {"title": "must fail"}}
     )
     assert stale.status_code >= 400
-    assert cluster.standby.lookup_key("first_table", "first")["title"] == "created after empty bootstrap"
+    assert (
+        cluster.standby.lookup_key("first_table", "first")["title"]
+        == "created after empty bootstrap"
+    )
 
 
-def test_catalog_remote_apply_outage_recovers_without_primary_restart(ha_cluster: HACluster):
+def test_catalog_remote_apply_outage_recovers_without_primary_restart(
+    ha_cluster: HACluster,
+):
     cluster = ha_cluster
     _bootstrap_empty(cluster)
     primary_pid = cluster.primary.proc.pid
     cluster.standby.stop()
     response = cluster.primary._request(
-        "POST", f"{cluster.primary.url}{DB_API_ROOT}/tables/pending_table",
-        json={"num_shards": 1}, timeout=30,
+        "POST",
+        f"{cluster.primary.url}{DB_API_ROOT}/tables/pending_table",
+        json={"num_shards": 1},
+        timeout=30,
     )
     assert response.status_code >= 400, response.text
     assert "outcome is unknown" in response.text, response.text
@@ -210,29 +268,42 @@ def test_catalog_remote_apply_outage_recovers_without_primary_restart(ha_cluster
             cluster.primary.restart()
             primary_pid = cluster.primary.proc.pid
         retry = cluster.primary._request(
-            "POST", f"{cluster.primary.url}{DB_API_ROOT}/tables/pending_table",
-            json={"num_shards": 1}, timeout=30,
+            "POST",
+            f"{cluster.primary.url}{DB_API_ROOT}/tables/pending_table",
+            json={"num_shards": 1},
+            timeout=30,
         )
         assert retry.status_code == 409, retry.text
-        assert retry.headers.get("X-Antfly-Raft-Mutation-Outcome") == "unknown-v1", retry.text
+        assert retry.headers.get("X-Antfly-Raft-Mutation-Outcome") == "unknown-v1", (
+            retry.text
+        )
         assert "outcome is unknown" in retry.text, retry.text
     # Creation is durable but unacknowledged. Replication catches up without
     # restarting the primary when its required standby becomes available.
     cluster.standby.start()
-    _wait_for_standby_applied(cluster, _primary_lsn(cluster), require_live_replication=True)
+    _wait_for_standby_applied(
+        cluster, _primary_lsn(cluster), require_live_replication=True
+    )
     retry = cluster.primary._request(
-        "POST", f"{cluster.primary.url}{DB_API_ROOT}/tables/pending_table",
-        json={"num_shards": 1}, timeout=30,
+        "POST",
+        f"{cluster.primary.url}{DB_API_ROOT}/tables/pending_table",
+        json={"num_shards": 1},
+        timeout=30,
     )
     assert retry.status_code == 409, retry.text
     assert retry.text == "table already exists"
     assert retry.headers.get("X-Antfly-Raft-Mutation-Outcome") is None
-    cluster.primary.batch_write("pending_table", {"recovered": {"title": "replayed catalog"}})
+    cluster.primary.batch_write(
+        "pending_table", {"recovered": {"title": "replayed catalog"}}
+    )
     _wait_for_standby_lookup(cluster, "pending_table", "recovered")
     cluster.primary.create_table("after_outage")
     assert cluster.primary.proc.pid == primary_pid
     cluster.primary.restart()
-    assert cluster.primary.lookup_key("pending_table", "recovered")["title"] == "replayed catalog"
+    assert (
+        cluster.primary.lookup_key("pending_table", "recovered")["title"]
+        == "replayed catalog"
+    )
 
 
 def test_catalog_replays_when_local_snapshot_lags_wal(ha_cluster: HACluster):
@@ -246,12 +317,22 @@ def test_catalog_replays_when_local_snapshot_lags_wal(ha_cluster: HACluster):
     cluster.primary.stop()
     cluster.primary.catalog_path.write_bytes(before)
     cluster.primary.start()
-    assert cluster.primary.lookup_key("replay_table", "saved")["title"] == "durable data"
+    assert (
+        cluster.primary.lookup_key("replay_table", "saved")["title"] == "durable data"
+    )
     _wait_for_standby_lookup(cluster, "replay_table", "saved")
     for method, suffix in (("DELETE", ""), ("PUT", "/schema"), ("POST", "/unknown")):
-        response = cluster.primary._request(method,
-            f"{cluster.primary.url}{DB_API_ROOT}/tables/replay_table{suffix}", json={}, timeout=10)
+        response = cluster.primary._request(
+            method,
+            f"{cluster.primary.url}{DB_API_ROOT}/tables/replay_table{suffix}",
+            json={},
+            timeout=10,
+        )
         assert response.status_code >= 400, response.text
-    response = cluster.standby._request("POST",
-        f"{cluster.standby.url}{DB_API_ROOT}/tables/standby_local", json={"num_shards": 1}, timeout=10)
+    response = cluster.standby._request(
+        "POST",
+        f"{cluster.standby.url}{DB_API_ROOT}/tables/standby_local",
+        json={"num_shards": 1},
+        timeout=10,
+    )
     assert response.status_code >= 400, response.text
