@@ -3114,6 +3114,20 @@ adversarial mutation. Initial histories use the scenario's baseline generator
 (cooperative scheduling for standby/scaling). `--exploration-policy cooperative`
 selects the cooperative mutation suffix explicitly for comparisons.
 
+The parallel `production-e2e` job builds and retains one production executable,
+checks its SHA-256 before and after testing, repeats the compiled storage-owner
+publication tests 20 times, and runs 200 public restore cases. It also runs
+100 multi-node Autograph resolution/promotion/hydration cases: 50 with normal
+file-descriptor limits and 50 with a limit of 256, using two workers per profile.
+`scripts/ci/zig-e2e-autograph-soak.sh` exposes the same profiles locally; set
+`ANTFLY_E2E_REGRESSION_REPORT_DIR` to a fresh directory and optionally override
+workers/repetitions. These are production E2E stress tests; they do not provide
+VOPR schedule replay. They complement the deterministic runtime and Raft tests.
+The `production-e2e-soak` artifact retains the executable, logs, exact per-case
+JUnit reports, and failed server roots with native-stack diagnostics. Missing,
+skipped, failed, or incorrectly counted tests cannot qualify a run. PR-only
+qualification skips these full production soaks.
+
 A bounded-fair suffix randomizes runnable work, ages continuously enabled
 alternatives, and services the oldest overdue alternative after a 256-choice
 window. An adversarial suffix first prefers time advancement and delays a

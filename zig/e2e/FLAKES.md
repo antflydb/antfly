@@ -1,5 +1,18 @@
 # Zig E2E flakes
 
+## 2026-09-15: Autograph promotion and read-timeout boundary
+
+`test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities`
+failed in [run 34928784180](https://github.com/antflydb/antfly/actions/runs/34928784180/job/104259435053)
+with missing promoted entities and an HTTP 500 caused by an untransportable
+`ReadIndexTimeout`. See [the runtime investigation](../FLAKES.md#2026-09-15-multi-node-autograph-promotion-stalls-with-an-untransportable-read-timeout)
+for the exact revision, evidence, known mapping fix, and unresolved progress cause.
+The poller now rejects unexpected 500s immediately. The scheduled production
+soak runs 50 normal and 50 constrained-descriptor repetitions using
+`scripts/ci/zig-e2e-autograph-soak.sh`, with exact JUnit counts and retained native
+failure diagnostics. A passing helper test does not qualify the production soak.
+
+
 ## 2026-09-13: artifact coverage restart failure reproduced locally (#722)
 
 [CI run 34789270919, job 103815319126](https://github.com/antflydb/antfly/actions/runs/34789270919/job/103815319126?pr=722)

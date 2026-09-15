@@ -132,6 +132,16 @@ def resolution_cluster(request: pytest.FixtureRequest):
         yield cluster
     finally:
         report = getattr(request.node, "rep_call", None)
+        if report and report.failed:
+            # Capture while the six node processes are still alive, including
+            # failures that now stop immediately on an unexpected HTTP 500.
+            try:
+                (cluster.root / "native-stacks.txt").write_text(
+                    cluster.native_stack_dumps(per_process_timeout_s=5.0),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                print(f"failed to preserve Autograph native stacks: {exc!r}")
         cluster.stop(
             timeout_s=AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S,
             test_failed=bool(report and report.failed),
@@ -641,7 +651,11 @@ def _doc_text(doc: dict) -> str:
 def _transient_poll_error(exc: requests.RequestException) -> bool:
     response = getattr(exc, "response", None)
     if response is not None:
-        return response.status_code >= 500
+        # Availability has an explicit contract. Retrying an INTERNAL_ERROR
+        # hid an untransportable ReadIndexTimeout until the promotion deadline.
+        return response.status_code == 503 and bool(
+            response.headers.get("Retry-After", "").strip()
+        )
     return isinstance(
         exc,
         (
@@ -650,6 +664,40 @@ def _transient_poll_error(exc: requests.RequestException) -> bool:
             requests.Timeout,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "retry_after", "expected"),
+    [
+        (503, "1", True),
+        (503, None, False),
+        (500, "1", False),
+        (502, None, False),
+        (504, None, False),
+        (409, None, False),
+    ],
+)
+def test_autograph_poll_retries_only_explicit_availability(status, retry_after, expected):
+    response = requests.Response()
+    response.status_code = status
+    if retry_after is not None:
+        response.headers["Retry-After"] = retry_after
+    assert _transient_poll_error(requests.HTTPError(response=response)) is expected
+
+
+def test_autograph_entity_poll_propagates_internal_failure():
+    class BrokenApi:
+        def lookup(self, *_args, **_kwargs):
+            response = requests.Response()
+            response.status_code = 500
+            raise requests.HTTPError("RuntimeBoundaryFailure", response=response)
+
+    with pytest.raises(requests.HTTPError, match="RuntimeBoundaryFailure"):
+        _wait_for_entities(
+            BrokenApi(),
+            {"person/ada_lovelace": "Ada Lovelace"},
+            deadline=_Deadline(1.0),
+        )
 
 
 def _graph_result(result: dict, name: str) -> dict | None:

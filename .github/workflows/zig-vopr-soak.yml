@@ -257,7 +257,7 @@ jobs:
 
   # Native production stress complements the replayable scheduling campaigns.
   # Build once, repeat against those bytes, and keep every case's result.
-  production-restore:
+  production-e2e:
     if: inputs.diagnostic_run == '' && inputs.qualification_only != true
     runs-on: arc-antfly-heavy
     timeout-minutes: 180
@@ -276,60 +276,82 @@ jobs:
           submodules: true
       - name: Prepare evidence directories
         run: |
-          mkdir -p "$RUNNER_TEMP/restore-soak/tmp" "$RUNNER_TEMP/restore-soak/reports"
-          echo "TMPDIR=$RUNNER_TEMP/restore-soak/tmp" >> "$GITHUB_ENV"
-          echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/restore-soak/reports" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/production-e2e-soak/tmp" "$RUNNER_TEMP/production-e2e-soak/reports"
+          echo "TMPDIR=$RUNNER_TEMP/production-e2e-soak/tmp" >> "$GITHUB_ENV"
+          echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/production-e2e-soak/reports" >> "$GITHUB_ENV"
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+      - name: Install build tools and native debugger
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Build production executable and qualify owner publication
+        id: production-build
         working-directory: zig
         run: |
           zig build antfly antfly-storage-owner-source-test -Doptimize=ReleaseSafe -j1 --summary all \
-            2>&1 | tee "$RUNNER_TEMP/restore-soak/build.log"
-          sha256sum zig-out/bin/antfly > "$RUNNER_TEMP/restore-soak/binary.sha256"
-          tar -C zig-out/bin -czf "$RUNNER_TEMP/restore-soak/antfly.tar.gz" antfly
+            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/build.log"
+          sha256sum zig-out/bin/antfly > "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
+          tar -C zig-out/bin -czf "$RUNNER_TEMP/production-e2e-soak/antfly.tar.gz" antfly
       - name: Soak compiled-owner restore with concurrent maintenance and status
         working-directory: zig
         run: |
           for iteration in $(seq 1 20); do
             zig build antfly-storage-owner-source-test -Doptimize=ReleaseSafe -j1 --summary all \
-              > "$RUNNER_TEMP/restore-soak/owner-$iteration.log" 2>&1
+              > "$RUNNER_TEMP/production-e2e-soak/owner-$iteration.log" 2>&1
           done
       - name: Soak public overwrite restore with concurrent readers and status
         run: |
           scripts/ci/zig-e2e-regression-loop.sh \
             e2e/antfly/test_backup_restore.py::test_cluster_restore_modes \
             e2e/antfly/test_backup_restore.py::test_cluster_restore_modes_with_concurrent_observers \
-            2>&1 | tee "$RUNNER_TEMP/restore-soak/e2e.log"
+            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/e2e.log"
+      - name: Soak cross-shard Autograph resolution, promotion, and hydration
+        if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
+        env:
+          ANTFLY_E2E_REGRESSION_WORKERS: '2'
+          ANTFLY_E2E_REGRESSION_REPORT_DIR: ${{ runner.temp }}/production-e2e-soak/autograph
+        run: |
+          scripts/ci/zig-e2e-autograph-soak.sh \
+            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/autograph.log"
       - name: Verify complete production soak evidence
         working-directory: zig
         run: |
-          sha256sum -c "$RUNNER_TEMP/restore-soak/binary.sha256"
+          sha256sum -c "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
           python3 - <<'PY'
           import os
+          from collections import Counter
           from pathlib import Path
           import xml.etree.ElementTree as ET
           reports = list(Path(os.environ["ANTFLY_E2E_REGRESSION_REPORT_DIR"]).glob("*.xml"))
           assert len(reports) == 200, len(reports)
           cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
           assert len(cases) == 200, len(cases)
+          assert Counter(case.attrib["name"] for case in cases) == {
+              "test_cluster_restore_modes": 100,
+              "test_cluster_restore_modes_with_concurrent_observers": 100,
+          }
           assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases)
+          for profile in ("normal", "constrained"):
+              reports = list((Path(os.environ["RUNNER_TEMP"]) / "production-e2e-soak/autograph" / profile).glob("*.xml"))
+              assert len(reports) == 50, (profile, len(reports))
+              cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
+              assert Counter(case.attrib["name"] for case in cases) == {
+                  "test_multinode_autograph_resolves_promotes_and_hydrates_entities": 50,
+              }, profile
+              assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
           PY
       - name: Retain production executable, reports, and failed server roots
         if: always()
         timeout-minutes: 20
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: production-restore-soak
-          path: ${{ runner.temp }}/restore-soak
+          name: production-e2e-soak
+          path: ${{ runner.temp }}/production-e2e-soak
           retention-days: 30
           if-no-files-found: error
 
@@ -375,11 +397,6 @@ jobs:
           retention-days: 90
           overwrite: true
           if-no-files-found: error
-      - name: Publish corpus for the next scheduled run
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ${{ runner.temp }}/vopr-corpus-retained
-          key: vopr-corpus-v2-${{ github.ref_name }}--${{ matrix.scenario }}--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
       - name: Retain merged corpus and quarantine review evidence
         if: always()
         timeout-minutes: 40
@@ -390,3 +407,9 @@ jobs:
           retention-days: 90
           overwrite: true
           if-no-files-found: error
+
+      - name: Publish corpus for the next scheduled run
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/vopr-corpus-retained
+          key: vopr-corpus-v2-${{ github.ref_name }}--${{ matrix.scenario }}--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}

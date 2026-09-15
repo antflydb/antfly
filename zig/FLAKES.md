@@ -4,24 +4,89 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-15: multi-node Autograph promotion stalls with an untransportable read timeout
+
+[The base E2E shard](https://github.com/antflydb/antfly/actions/runs/34928784180/job/104259435053)
+failed `test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities`
+on `4dedffc703eb4aa744ae89d1d9fbd0ddc4b97931` (`codex/spfresh-segment-wal`).
+[The linked aggregate job](https://github.com/antflydb/antfly/actions/runs/34928784180/job/104263235408)
+only reports that shard failure. The shard finished with 447 passes, five skips,
+and one failure. Neither `person/ada_lovelace` nor `org/antfly` became visible
+within the 115-second promotion deadline. Its last lookup returned HTTP 500;
+the server logged `runtime callback returned untransportable error method=lookup
+err=ReadIndexTimeout`, `RuntimeBoundaryFailure`, and resolution
+`StorageKernelFailure`. Startup also logged `WriterLocked`. Attempts to capture
+six native process stacks were denied by ptrace policy.
+
+The failed revision lacks the `read_index_timeout` semantic identity and the
+public/internal read availability mapping already in #704. These preserve the
+error through the compiled callback and HTTP client boundaries and return
+503 with `Retry-After`, without weakening the Raft read barrier. The boundary
+round-trip and public-read parity regressions exercise this concrete error.
+The failed revision already contains bounded read-owner admission: that earlier
+fix alone did not prevent this failure. There are no usable stacks proving a
+new resolver/Raft deadlock; the promotion stall's underlying cause remains open
+until reproduced with the corrected executable.
+
+The E2E poller now stops on unexpected HTTP errors, including 500, instead of
+hiding them behind a generic promotion timeout. Only 503 with `Retry-After` and
+transport timeouts/disconnects are retryable. Its original deadline still applies.
+Failure teardown captures native stacks before stopping the cluster and stores
+them with the retained server root. The existing disposable Linux launcher
+opts the test children into debugger attachment; the scheduled job installs GDB.
+
+The full nightly/manual soak now runs the production Autograph scenario under
+both normal and 256-descriptor limits, two concurrent workers and 25 repetitions
+per profile: **100 fresh six-process clusters**. Reports are distinct from the
+200 restore repetitions and must contain the exact expected test names and
+counts with no skips or failures. A failed normal profile does not prevent
+collecting constrained-profile evidence, and either failure fails the soak.
+The source revision and retained production executable identify the tested bytes.
+Run locally against a prebuilt executable with:
+
+```sh
+SKIP_BUILD=1 ANTFLY_BIN="$PWD/zig/zig-out/bin/antfly" \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/autograph-soak-reports \
+  scripts/ci/zig-e2e-autograph-soak.sh
+```
+
+The poller/helper regressions pass locally (18 tests), as do the six regression
+orchestration tests, including profile isolation and failure propagation.
+Production repetition and Linux qualification results are pending; adding a
+soak is not proof that the progress failure is fixed.
+
+## 2026-09-15: standby/scaling corpus runner lost during cache publication
+
+[Corpus job 104276235667](https://github.com/antflydb/antfly/actions/runs/34927431365/job/104276235667)
+completed replay/merge validation and uploaded the small diagnostics artifact.
+The runner then lost communication during `actions/cache/save`; GitHub's check
+annotation reports runner loss, and full artifact retention was cancelled.
+Both scaling campaign shards passed. This is not evidence of a scaling assertion
+or replay failure, and the available log does not identify why the runner died.
+The workflow now retains the complete merged corpus before publishing its working
+cache. Cache publication still fails the job on failure; it is not treated as a
+passing seeded soak. The second full run failed independently in distributed-data.
+
 ## 2026-09-14: soak qualification exceeds declared compiler memory (#704)
 
 [Qualification job 104248350481](https://github.com/antflydb/antfly/actions/runs/34927431365/job/104248350481)
 on `0f56ccd77e` reports a Linux ReleaseSafe compilation peak of
 13,255,065,600 bytes against a declared upper bound of 7,516,192,768 bytes
-(7 GiB). The failing production DataServer VOPR artifact uses
+(7 GiB). The production DataServer VOPR artifact uses
 `productionVoprCompileMaxRss`; the separate background-adapter artifact has its
 own declaration. The eight standby lifecycle tests and seven DataServer runtime
-tests shown in the log passed with zero skips, failures, or leaks. Those passing
-test results do not override the build's compiler-budget failure.
+tests shown in the log passed with zero skips, failures, or leaks. The completed
+qualification job succeeded with 27/27 build steps. Zig 0.16 records this RSS
+overrun as a diagnostic without returning `MakeFailed`; it is an inaccurate
+build-scheduling reservation, not a test failure or a killed compiler.
 
 The shared production-owner compile reservation now uses 16 GiB on Linux, with
 headroom over the observed 12.35 GiB peak; macOS keeps its existing 18 GiB
 reservation. This allows Zig to account for the actual compiler footprint when
 admitting concurrent build steps. It does not alter production memory limits,
 suppress resource checks, reduce test coverage, or retry away the failure.
-Linux qualification and the required seeded full soak must pass after the fix;
-the interrupted qualification run is not a successful second soak.
+The revised reservation still needs Linux qualification. The second soak
+failed separately in its distributed-data replay; qualification itself passed.
 
 ## 2026-09-14: standby/scaling read fails after sibling merge (#704)
 
