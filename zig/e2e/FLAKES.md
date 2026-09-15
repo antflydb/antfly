@@ -2,6 +2,13 @@
 
 ## 2026-09-15: Autograph promotion and read-timeout boundary
 
+The first corrected local executable still failed 3/10 data-restart cases and
+exposed a promotion callback using a freed Raft service during shutdown. The
+compiled-owner shutdown barrier and resolver activation ordering are being
+corrected; production verification is pending. The restart test now rejects
+spontaneous assertion/segmentation crashes instead of silently replacing the
+process. See `../FLAKES.md` for exact executable hashes and evidence.
+
 `test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities`
 failed in [run 34928784180](https://github.com/antflydb/antfly/actions/runs/34928784180/job/104259435053)
 with missing promoted entities and an HTTP 500 caused by an untransportable

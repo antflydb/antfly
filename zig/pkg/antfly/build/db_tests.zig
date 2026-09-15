@@ -29,6 +29,17 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const repair_activation_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "db repair activation",
+            "db dense shadow activation rejects surplus candidate coverage",
+            "db paused dense repair resumes its durable candidate after restart",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = &.{
         "db resolver workers recover pending journal targets after reopen without new writes",
         "db resolver worker resumes durable backfill after deferred activation and reopen",

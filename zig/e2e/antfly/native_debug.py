@@ -73,7 +73,9 @@ def native_stack_dumps(
             )
             body = result.stdout[-250000:]
             if result.returncode != 0:
-                body += f"\n<{debugger} rc={result.returncode}>\n{result.stderr[-2000:]}"
+                body += (
+                    f"\n<{debugger} rc={result.returncode}>\n{result.stderr[-2000:]}"
+                )
             parts.append(f"[{label} pid {proc.pid}]\n{body}")
         except subprocess.TimeoutExpired as exc:
             # Preserve any frames emitted before the deadline. Loading full
@@ -82,7 +84,9 @@ def native_stack_dumps(
             partial = exc.stdout or b""
             if isinstance(partial, bytes):
                 partial = partial.decode(errors="replace")
-            parts.append(f"[{label} pid {proc.pid}] {debugger} timed out\n{partial[-250000:]}")
+            parts.append(
+                f"[{label} pid {proc.pid}] {debugger} timed out\n{partial[-250000:]}"
+            )
         except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
             parts.append(f"[{label} pid {proc.pid}] {debugger} failed: {exc!r}")
     return "\n".join(parts)

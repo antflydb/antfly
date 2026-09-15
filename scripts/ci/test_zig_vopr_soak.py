@@ -60,7 +60,10 @@ class SoakTests(unittest.TestCase):
         result = subprocess.CompletedProcess([], 1)
         report = {
             "properties": [
-                {"name": "production-standby-scaling.history-completes", "status": "fail"}
+                {
+                    "name": "production-standby-scaling.history-completes",
+                    "status": "fail",
+                }
             ]
         }
         self.assertEqual(soak.result_status(result, report), "incomplete_history")

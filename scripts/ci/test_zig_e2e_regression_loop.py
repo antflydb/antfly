@@ -10,7 +10,9 @@ SCRIPT = Path(__file__).with_name("zig-e2e-regression-loop.sh").resolve()
 
 
 class RegressionEvidenceTests(unittest.TestCase):
-    def run_loop(self, *, mode="pass", workers=1, repeats=1, stale=False, autograph=False):
+    def run_loop(
+        self, *, mode="pass", workers=1, repeats=1, stale=False, autograph=False
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             reports = root / "reports"
@@ -32,7 +34,8 @@ class RegressionEvidenceTests(unittest.TestCase):
                 (reports / "worker-1-case-1.xml").write_text("previous run")
             result = subprocess.run(
                 [str(SCRIPT.with_name("zig-e2e-autograph-soak.sh"))]
-                if autograph else [str(SCRIPT), "example.py::test_restore"],
+                if autograph
+                else [str(SCRIPT), "example.py::test_restore"],
                 env={
                     **os.environ,
                     "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
@@ -48,7 +51,10 @@ class RegressionEvidenceTests(unittest.TestCase):
                 text=True,
                 timeout=20,
             )
-            return result, {str(p.relative_to(reports)): p.read_text() for p in reports.rglob("*.xml")}
+            return result, {
+                str(p.relative_to(reports)): p.read_text()
+                for p in reports.rglob("*.xml")
+            }
 
     def test_every_worker_and_repetition_retains_distinct_evidence(self):
         result, reports = self.run_loop(workers=2, repeats=2)

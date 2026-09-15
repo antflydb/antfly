@@ -7561,6 +7561,10 @@ pub const DataServer = struct {
         self.write_source.quiesce();
         if (self.data_raft_apply) |apply_sm| apply_sm.write_source.quiesce();
         self.provisioned_storage.detachWriteSourceRuntimeHooks();
+        if (comptime linked_storage) {
+            if (self.kernel_owner_source) |owner_source|
+                try owner_source.quiesce(self.dataRaftIo() orelse std.Io.Threaded.global_single_threaded.io());
+        }
         try self.provisioned_storage.quiesceExternalProviderUsers();
         self.external_provider_users_quiesced = true;
     }

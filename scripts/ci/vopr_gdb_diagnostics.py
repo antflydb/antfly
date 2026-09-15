@@ -56,13 +56,21 @@ def repair_attempt():
             value = frame.read_var(name)
             if name == "err_name":
                 length = min(int(value["len"]), 512)
-                value = bytes(gdb.selected_inferior().read_memory(int(value["ptr"]), length))
+                value = bytes(
+                    gdb.selected_inferior().read_memory(int(value["ptr"]), length)
+                )
             gdb.write(f"  {name}={value}\n")
         except (gdb.error, ValueError):
             pass
     try:
         intent = frame.read_var("entry").dereference()["intent"]
-        for name in ("phase", "attempt_count", "failure_streak", "next_retry_at_ms", "last_error"):
+        for name in (
+            "phase",
+            "attempt_count",
+            "failure_streak",
+            "next_retry_at_ms",
+            "last_error",
+        ):
             gdb.write(f"  {name}={intent[name]}\n")
     except (gdb.error, ValueError):
         pass
@@ -207,7 +215,10 @@ gdb.execute("set pagination off")
 gdb.execute("set confirm off")
 gdb.execute("set print elements 12")
 gdb.execute("set breakpoint pending on")
-for expression in ("DB.recordIndexRepairAttemptFailure", "DB.advanceIndexRepairIntentOwned"):
+for expression in (
+    "DB.recordIndexRepairAttemptFailure",
+    "DB.advanceIndexRepairIntentOwned",
+):
     for breakpoint in gdb.rbreak(expression):
         breakpoint.silent = True
         breakpoint.commands = "silent\npython repair_attempt()\ncontinue\n"

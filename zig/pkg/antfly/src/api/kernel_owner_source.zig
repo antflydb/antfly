@@ -73,6 +73,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     context: client.Context = .{},
     owns_context: bool = true,
     mutex: std.atomic.Mutex = .unlocked,
+    quiescing: bool = false,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     publications: std.ArrayListUnmanaged(*PendingPublication) = .empty,
     owner_cache_hits: std.atomic.Value(u64) = .init(0),
@@ -307,6 +308,25 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.entries = .empty;
         self.mutex.unlock();
         if (self.owns_context) self.context.deinit();
+    }
+
+    /// Close admission and join every DB-owned worker while its Raft,
+    /// candidate, sink, and provider callback contexts are still alive.
+    /// Attached request/apply sources must already be stopped. Keep the
+    /// registry and context valid until their ordinary final deinit.
+    pub fn quiesce(self: *ProvisionedKernelOwnerSource, io: std.Io) !void {
+        while (true) {
+            const drained = blk: {
+                lock(&self.mutex);
+                defer self.mutex.unlock();
+                self.quiescing = true;
+                for (self.entries.items) |entry| entry.retired = true;
+                self.drainRetiredLocked(null, null);
+                break :blk self.entries.items.len == 0;
+            };
+            if (drained) return;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
     }
 
     pub fn readSource(self: *ProvisionedKernelOwnerSource) table_read_source.TableReadSource {
@@ -2171,6 +2191,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const exclusive = admission != .shared;
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
         defer self.mutex.unlock();
+        if (self.quiescing) return error.Canceled;
         // Return to the caller rather than waiting with a descriptor captured
         // before publication; a retry must acquire the new catalog descriptor.
         if (self.publicationPendingLocked(group_id, table_name)) return error.StorageReadTemporarilyUnavailable;
@@ -3914,6 +3935,102 @@ pub const ProvisionedKernelOwnerSource = struct {
         return result;
     }
 };
+
+test "storage owner quiesce drains leases and promotion callbacks before context destruction" {
+    const alloc = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-quiesce");
+    defer directory.cleanup();
+    const path = std.mem.span(directory.path().ptr);
+    var source = ProvisionedKernelOwnerSource.init(alloc, path, table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.deinit();
+    const Callback = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        released: std.atomic.Value(bool) = .init(false),
+        fn isLeader(ptr: *anyopaque, _: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.released.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            return false;
+        }
+    };
+    var callback = Callback{};
+    // Release on any failed assertion before source.deinit joins the worker.
+    defer callback.released.store(true, .release);
+    _ = source.withRuntimeHooks(null, null, .{ .ptr = &callback, .vtable = &.{ .is_local_leader = Callback.isLeader } });
+    const descriptor = descriptor_contract.Descriptor{
+        .lsm_root_generation = 0,
+        .identity = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+        .indexes_json =
+        \\{"relations_graph":{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"},"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","config_generation":1,"_antfly_destination_authorization_v1":{"principal":"service:auth-disabled","signature":"auth-disabled","destinations":["entities"]}}]}}
+        ,
+    };
+    var lease = try source.acquireDescriptor(7001, "docs", path, descriptor);
+    var lease_active = true;
+    defer if (lease_active) lease.deinit();
+    errdefer callback.released.store(true, .release);
+    var response = try lease.owner().batchJson("docs",
+        \\{"inserts":{"a":{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada"}]}}},"sync_level":"write"}
+    );
+    response.deinit();
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!callback.entered.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline) return error.PromotionCallbackDidNotStart;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const Shutdown = struct {
+        source: *ProvisionedKernelOwnerSource,
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.source.quiesce(std.testing.io) catch |err| {
+                self.err = err;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    var shutdown = Shutdown{ .source = &source };
+    var shutdown_task = try std.testing.io.concurrent(Shutdown.run, .{&shutdown});
+    defer {
+        callback.released.store(true, .release);
+        if (lease_active) {
+            lease.deinit();
+            lease_active = false;
+        }
+        shutdown_task.await(std.testing.io);
+    }
+    while (true) {
+        ProvisionedKernelOwnerSource.lock(&source.mutex);
+        const quiescing = source.quiescing;
+        source.mutex.unlock();
+        if (quiescing) break;
+        if (platform_time.monotonicNs() >= deadline) return error.QuiesceDidNotStart;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(!shutdown.done.load(.acquire));
+    try std.testing.expectError(error.Canceled, source.acquireDescriptor(7001, "docs", path, descriptor));
+    // Closing the last lease must wait for the autonomous callback as well.
+    var release_task = try std.testing.io.concurrent(ProvisionedKernelOwnerSource.Lease.deinit, .{&lease});
+    lease_active = false;
+    defer {
+        callback.released.store(true, .release);
+        release_task.await(std.testing.io);
+    }
+    while (true) {
+        ProvisionedKernelOwnerSource.lock(&source.mutex);
+        const closing = source.entries.items.len == 1 and source.entries.items[0].closing;
+        source.mutex.unlock();
+        if (closing) break;
+        if (platform_time.monotonicNs() >= deadline) return error.OwnerCloseDidNotStart;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(!shutdown.done.load(.acquire));
+    callback.released.store(true, .release);
+    while (!shutdown.done.load(.acquire)) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    if (shutdown.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 0), source.ownerCountForTest());
+    try source.quiesce(std.testing.io);
+    try std.testing.expectError(error.Canceled, source.acquireDescriptor(7001, "docs", path, descriptor));
+}
 
 test "pending exclusive storage owner lease blocks new readers until drain" {
     var entry: ProvisionedKernelOwnerSource.Entry = undefined;

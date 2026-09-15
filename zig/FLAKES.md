@@ -60,6 +60,37 @@ That now retains the existing `Unavailable`/503 response with the explicit
 `not_proposed_v1` outcome, rather than reporting an ambiguous HTTP 500. The
 operation regression asserts the writer was never called on those failures.
 
+The first corrected executable (`05ee0bf5c6`, SHA-256
+`c0c7056ebc8594d31d6d59a5838fcd9f6578dab9024e676e5639152151b110a2`)
+still failed **3/10 restart cases**: two second-document `WriterLocked` failures
+and one promotion deadline. Its retained log also caught a shutdown use-after-free:
+`PromotionRuntime.workerStep` called `GroupLeadershipSource.isLocalLeader` through
+a freed `ManagedHttpHostService` (`0xaaaaaaaaaaaab1da`, process exit `SIGABRT`).
+The provider shutdown barrier closed inline caches but skipped compiled owners,
+whose workers survived until after Raft destruction. Compiled-owner quiescence
+now fences admission, drains leases, and joins workers before destroying Raft or
+provider callback contexts. Its regression holds an actual promotion callback
+across shutdown using `std.Io.concurrent` and verifies admission stays closed.
+Restart and final teardown now reject spontaneous crashes and retain failure
+diagnostics instead of silently replacing or discarding the failed process;
+intentional bounded-stop `SIGKILL` remains a crash-recovery case.
+
+Compiled owner open also started resolver workers before reconciling the
+authoritative resolver configuration. A worker could hold the resolver catalog
+fence and make that configuration return `WriterLocked`. Open now defers those
+workers until configuration completes, matching the resident-cache lifecycle.
+Unchanged resolver refreshes also used the mutation fence and rewrote the
+catalog. With a distributed promotion in flight this could return `WriterLocked`,
+retire the owner, and repeatedly make promotion return `StorageBusy`. Exact
+configuration equality now uses a short catalog read lock and skips allocation,
+catalog persistence, and the replay mutation fence. Changed configurations still
+require that fence. The catalog regression holds each replay mutex in turn and
+requires an unchanged refresh to succeed while a changed refresh remains fenced.
+The compiled-owner suite passes all ten cases with no skips or leaks. The
+unchanged/changed resolver fence and both replay/reopen regressions also pass.
+Production validation of these additional fixes is pending; the 3/10 result
+is not a pass.
+
 The E2E poller now stops on unexpected HTTP errors, including 500, instead of
 hiding them behind a generic promotion timeout. Only 503 with `Retry-After` and
 transport timeouts/disconnects are retryable. Its original deadline still applies.
@@ -86,10 +117,37 @@ SKIP_BUILD=1 ANTFLY_BIN="$PWD/zig/zig-out/bin/antfly" \
   scripts/ci/zig-e2e-autograph-soak.sh
 ```
 
-The poller/helper regressions pass locally (21 tests), as do the six regression
+The poller/helper regressions pass locally (29 tests), as do the six regression
 orchestration tests, including profile isolation and failure propagation.
 Post-fix production repetition and Linux qualification results are pending; adding a
 soak is not proof that the progress failure is fixed.
+
+## 2026-09-15: distributed-data materialization fails during exact replay
+
+[The second full soak](https://github.com/antflydb/antfly/actions/runs/34927431365)
+failed distributed-data history 6 during replay with
+`VoprIndexMaterializationIncomplete`. The recording completed four transitions
+without property failures. The retained trace is
+`history-6-b54cda599d6a3d7e.voprtrace`, seed `13064056697522896254`; its original
+Linux executable SHA-256 is
+`163c27a17d1a0943f766840998bc9678fc88300578f126a4fea717a3700128fa`.
+
+The unchanged trace passed 30 native macOS replays, 25 emulated Linux replays,
+and [200 fresh-process native Linux replays under GDB](https://github.com/antflydb/antfly/actions/runs/34993873598).
+The retained log contains all 200 completed four-transition replays. Those
+passes do not explain or clear the original failure. The materialization helper
+uses 40 immediate repair polls; durable repair backoff uses host time. A normal
+activation-budget miss became a failed attempt with roughly 30 seconds of
+backoff, which the helper does not wait out. Budget exhaustion now returns the
+existing cooperative-yield result and keeps the durable candidate runnable;
+missing replay progress and actual storage errors retain failure handling.
+A deterministic regression gives activation less than its fixed publication
+reserve, requires no failure streak/backoff, then completes the same candidate
+with a sufficient budget. All four focused activation, coverage-failure, and
+candidate-resume tests pass locally. This independently validated scheduling
+fix is not proven attribution of this particular CI history.
+Native diagnostics now retain repair phase, attempt,
+failure streak, retry deadline, and last error when a replay fails.
 
 ## 2026-09-15: standby/scaling corpus runner lost during cache publication
 
@@ -121,8 +179,9 @@ headroom over the observed 12.35 GiB peak; macOS keeps its existing 18 GiB
 reservation. This allows Zig to account for the actual compiler footprint when
 admitting concurrent build steps. It does not alter production memory limits,
 suppress resource checks, reduce test coverage, or retry away the failure.
-The revised reservation still needs Linux qualification. The second soak
-failed separately in its distributed-data replay; qualification itself passed.
+The revised reservation passed [Linux qualification on `43b79fc10b`](https://github.com/antflydb/antfly/actions/runs/34993639738/job/104465497701).
+The second full soak failed separately in its distributed-data replay;
+qualification itself passed.
 
 ## 2026-09-14: standby/scaling read fails after sibling merge (#704)
 

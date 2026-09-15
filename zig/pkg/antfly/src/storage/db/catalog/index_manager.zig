@@ -11481,6 +11481,13 @@ pub const IndexManager = struct {
         updated_no_backfill,
     };
 
+    pub fn resolverConfigMatches(self: *IndexManager, cfg: resolver_catalog.ResolverConfig) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const existing = self.getResolver(cfg.name) orelse return false;
+        return existing.eql(cfg);
+    }
+
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return !std.mem.eql(u8, existing.table, next.table) or
             !std.mem.eql(u8, existing.key_template, next.key_template) or
@@ -11519,6 +11526,7 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         for (self.resolvers.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
+            if (entry.eql(cfg)) return .updated_no_backfill;
             if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) return error.ResolverSourceArtifactImmutable;
             if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;

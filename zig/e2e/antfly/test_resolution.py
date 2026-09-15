@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import time
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,7 @@ def resolution_cluster(request: pytest.FixtureRequest):
         cluster.stop(
             timeout_s=AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S,
             test_failed=bool(report and report.failed),
+            reject_data_crashes=not bool(report and report.failed),
         )
 
 
@@ -708,7 +710,9 @@ def _transient_poll_error(exc: requests.RequestException) -> bool:
         (409, None, False),
     ],
 )
-def test_autograph_poll_retries_only_explicit_availability(status, retry_after, expected):
+def test_autograph_poll_retries_only_explicit_availability(
+    status, retry_after, expected
+):
     response = requests.Response()
     response.status_code = status
     if retry_after is not None:
@@ -841,6 +845,116 @@ def test_multinode_autograph_recovers_after_data_restart(resolution_cluster):
     _exercise_multinode_autograph(resolution_cluster, restart_data=True)
 
 
+def _restart_data_owners(cluster):
+    for node in cluster.data_nodes:
+        node_id = int(node["id"])
+        cluster.stop_data_node(node_id)
+        returncode = cluster.data_proc_by_node_id[node_id].returncode
+        # The fixture may force a crash after its bounded graceful-stop wait.
+        # A spontaneous assertion/segfault must not disappear behind restart.
+        assert returncode in (0, -signal.SIGKILL), (
+            f"data node {node_id} crashed during restart rc={returncode}\n"
+            f"{cluster.debug_logs()}"
+        )
+    for node in cluster.data_nodes:
+        cluster._start_data_node(node)
+
+
+@pytest.mark.parametrize(
+    "returncode", [0, -signal.SIGKILL, -signal.SIGABRT, -signal.SIGSEGV]
+)
+def test_autograph_restart_rejects_spontaneous_crashes(returncode):
+    class Process:
+        pass
+
+    process = Process()
+    process.returncode = returncode
+
+    class Cluster:
+        data_nodes = [{"id": 101}, {"id": 102}]
+        data_proc_by_node_id = {101: process, 102: process}
+        actions = []
+
+        def stop_data_node(self, node_id):
+            self.actions.append(("stop", node_id))
+
+        def _start_data_node(self, node):
+            self.actions.append(("start", node["id"]))
+
+        def debug_logs(self):
+            return "retained crash evidence"
+
+    cluster = Cluster()
+    if returncode in (0, -signal.SIGKILL):
+        _restart_data_owners(cluster)
+        assert cluster.actions == [
+            ("stop", 101),
+            ("stop", 102),
+            ("start", 101),
+            ("start", 102),
+        ]
+    else:
+        with pytest.raises(AssertionError, match="retained crash evidence"):
+            _restart_data_owners(cluster)
+        assert cluster.actions == [("stop", 101)]
+
+
+@pytest.mark.parametrize(
+    "returncode", [0, -signal.SIGKILL, -signal.SIGABRT, -signal.SIGSEGV]
+)
+def test_autograph_teardown_crash_preserves_failure_evidence(monkeypatch, returncode):
+    import test_scaling
+
+    class Process:
+        def poll(self):
+            return self.returncode
+
+    process = Process()
+    process.returncode = returncode
+
+    class Resources:
+        cleaned = False
+
+        def close(self):
+            pass
+
+        def cleanup(self):
+            self.cleaned = True
+
+    class Cluster:
+        port_reservations = Resources()
+        tempdir = Resources()
+        data_procs = [process]
+        metadata_procs = []
+        data_proc_by_node_id = {101: process}
+        log_files = []
+        diagnostics_saved = False
+
+        def debug_logs(self):
+            return "promotion callback crash"
+
+        def preserve_failure_diagnostics(self):
+            self.diagnostics_saved = True
+
+    preserved = []
+
+    def preserve(tempdir, *, failed):
+        preserved.append(failed)
+        return failed
+
+    monkeypatch.setattr(test_scaling, "maybe_preserve_tempdir", preserve)
+    cluster = Cluster()
+    crashed = returncode not in (0, -signal.SIGKILL)
+    if crashed:
+        with pytest.raises(AssertionError, match="promotion callback crash"):
+            MultiNodeScalingCluster.stop(cluster, reject_data_crashes=True)
+    else:
+        MultiNodeScalingCluster.stop(cluster, reject_data_crashes=True)
+    assert preserved == [crashed]
+    assert cluster.diagnostics_saved == crashed
+    assert cluster.tempdir.cleaned != crashed
+
+
 def _exercise_multinode_autograph(cluster, *, restart_data: bool):
     api = _Api(cluster.data_api_urls[0], cluster)
 
@@ -873,10 +987,7 @@ def _exercise_multinode_autograph(cluster, *, restart_data: bool):
     if restart_data:
         # Reopen every data owner with the committed document on disk. Do not
         # issue another write before observing resolution/promotion recovery.
-        for node in cluster.data_nodes:
-            cluster.stop_data_node(int(node["id"]))
-        for node in cluster.data_nodes:
-            cluster._start_data_node(node)
+        _restart_data_owners(cluster)
 
     # The promoter upserts a canonical entity document per resolved mention into
     # the entity table on its own shard.

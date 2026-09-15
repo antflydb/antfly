@@ -19651,6 +19651,22 @@ pub const DB = struct {
         options: types.ArtifactRepairRunOptions,
         durable_repair_id: ?u128,
     ) !ShadowIndexReplacementResult {
+        return self.rebuildIndexWithShadowReplacementOwned(alloc, cfg, options, durable_repair_id) catch |err| switch (err) {
+            // A bounded activation pause yielding to readers/writers is not
+            // a storage failure. Keep the durable candidate runnable instead
+            // of imposing failure backoff on ordinary scheduler contention.
+            error.RepairActivationBudgetExhausted => .{ .yielded = true },
+            else => return err,
+        };
+    }
+
+    fn rebuildIndexWithShadowReplacementOwned(
+        self: *DB,
+        alloc: Allocator,
+        cfg: types.IndexConfig,
+        options: types.ArtifactRepairRunOptions,
+        durable_repair_id: ?u128,
+    ) !ShadowIndexReplacementResult {
         try checkArtifactRepairCancelled(options);
         const working_set_plan = if (self.core.index_manager.resource_manager) |manager|
             try repairWorkingSetPlan(alloc, manager, cfg)
@@ -20194,7 +20210,7 @@ pub const DB = struct {
             max_activation_gap_sequences,
             max_activation_pause_ns,
         )) {
-            return error.ShadowIndexCatchUpIncomplete;
+            return error.RepairActivationBudgetExhausted;
         }
         // Flatten outside the reader/apply pause. Final fenced replay below is
         // deliberately allowed to remain as a small committed WAL tail: a
@@ -20266,7 +20282,7 @@ pub const DB = struct {
         const activation_started_ns = monotonicTimeNs();
         const activation_deadline_ns = activation_started_ns +| max_activation_pause_ns;
         if (!structural_guard.acquireCatalogBarrierUntil(activation_deadline_ns)) {
-            return error.ShadowIndexCatchUpIncomplete;
+            return error.RepairActivationBudgetExhausted;
         }
         var unpublished_replacement: ?index_manager_mod.IndexManager.DetachedIndex = null;
         defer if (unpublished_replacement) |*replacement| {
@@ -20283,7 +20299,7 @@ pub const DB = struct {
             }
         };
         try checkArtifactRepairCancelled(options);
-        if (!self.lockApplyUntil(activation_deadline_ns)) return error.ShadowIndexCatchUpIncomplete;
+        if (!self.lockApplyUntil(activation_deadline_ns)) return error.RepairActivationBudgetExhausted;
         var apply_lock_held = true;
         defer if (apply_lock_held) self.core.unlockApply();
 
@@ -20294,13 +20310,13 @@ pub const DB = struct {
             max_activation_gap_sequences,
             max_activation_pause_ns,
         )) {
-            return error.ShadowIndexCatchUpIncomplete;
+            return error.RepairActivationBudgetExhausted;
         }
         const activation_replay_deadline_ns = repairActivationReplayDeadline(
             monotonicTimeNs(),
             activation_deadline_ns,
             max_activation_pause_ns,
-        ) orelse return error.ShadowIndexCatchUpIncomplete;
+        ) orelse return error.RepairActivationBudgetExhausted;
         const activation_catch_up = self.catchUpShadowReplacementUntil(
             alloc,
             &shadow_manager,
@@ -20311,7 +20327,7 @@ pub const DB = struct {
             activation_replay_deadline_ns,
             observed_ns_per_sequence,
         ) catch |err| switch (err) {
-            error.CatchUpDeadlineExceeded => return error.ShadowIndexCatchUpIncomplete,
+            error.CatchUpDeadlineExceeded => return error.RepairActivationBudgetExhausted,
             else => return err,
         };
         std.debug.assert(!activation_catch_up.yielded);
@@ -20540,7 +20556,7 @@ pub const DB = struct {
                 }
             }
             if (deadline_ns) |deadline| {
-                if (monotonicTimeNs() >= deadline) return error.ShadowIndexCatchUpIncomplete;
+                if (monotonicTimeNs() >= deadline) return error.RepairActivationBudgetExhausted;
             }
             var replay_ctx = ReplayApplyContextBatch{
                 .batch = &batch_ctx,
@@ -20610,7 +20626,7 @@ pub const DB = struct {
             }
             if (deadline_ns) |deadline| {
                 if (applied < target_sequence and monotonicTimeNs() >= deadline) {
-                    return error.ShadowIndexCatchUpIncomplete;
+                    return error.RepairActivationBudgetExhausted;
                 }
             }
         }
@@ -25806,6 +25822,11 @@ pub const DB = struct {
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         const upsert_result = blk: {
+            try cfg.validate();
+            // An unchanged catalog observation does not mutate resolver state.
+            // Do not wait for distributed callbacks, rewrite the catalog, or
+            // retire a serving owner just because replay is currently active.
+            if (self.core.index_manager.resolverConfigMatches(cfg)) break :blk .updated_no_backfill;
             var activity = try self.acquireResolverCatalogActivity(options.drain_backfill);
             defer activity.deinit();
             try self.lockApplyForPortableRuntime();
@@ -37917,7 +37938,7 @@ pub const DB = struct {
     }
 
     fn ensureRepairActivationDeadline(deadline_ns: u64) !void {
-        if (monotonicTimeNs() >= deadline_ns) return error.ShadowIndexCatchUpIncomplete;
+        if (monotonicTimeNs() >= deadline_ns) return error.RepairActivationBudgetExhausted;
     }
 
     fn denseDocKeyCallback(
@@ -77945,6 +77966,7 @@ test "db managed resolver changes fence in-flight replay and reset durable curso
         for ([_]*std.atomic.Mutex{ &db.resolution_runtime.?.catch_up_mutex, &db.promotion_runtime.?.catch_up_mutex }) |mutex| {
             try std.testing.expect(mutex.tryLock());
             defer mutex.unlock();
+            try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.updated_no_backfill, try db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false }));
             try std.testing.expectError(error.WriterLocked, db.upsertResolverWithResultOptions(replacement, .{ .drain_backfill = false }));
             try std.testing.expectError(error.WriterLocked, db.removeResolverWithoutDrain(cfg.name));
             var saved = (try db.resolverConfigByNameAlloc(cfg.name)).?;
@@ -102987,6 +103009,55 @@ test "db dense shadow activation rejects surplus candidate coverage" {
     try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
 }
 
+test "db repair activation budget yields without failure backoff and resumes its candidate" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("repair-activation-yield");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    const repair_id = (try db.admitManagedIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    })) orelse return error.TestUnexpectedResult;
+    var yielded = false;
+    for (0..8) |_| {
+        // One millisecond cannot satisfy the five-millisecond publication
+        // reserve, independently of host speed. No wall-clock sleep is needed
+        // to force the production activation-budget path.
+        const step = try db.advanceIndexRepairIntent(alloc, repair_id, .{ .max_activation_pause_ms = 1 });
+        try std.testing.expect(!step.repaired and !step.terminal);
+        var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer entry.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 0), entry.intent.failure_streak);
+        try std.testing.expectEqual(@as(u64, 0), entry.intent.next_retry_at_ms);
+        try std.testing.expect(entry.intent.last_error == null);
+        if (step.busy) {
+            yielded = true;
+            break;
+        }
+    }
+    try std.testing.expect(yielded);
+    var pending = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer pending.deinit(alloc);
+    try std.testing.expect(pending.intent.candidate_relative_path != null);
+    const resumed = try db.advanceIndexRepairIntent(alloc, repair_id, .{ .max_activation_pause_ms = 5_000 });
+    try std.testing.expect(resumed.attempted and resumed.repaired);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+    try std.testing.expect(try db.core.index_manager.isRepairCandidateActive("full_text_index_v0", pending.intent.candidate_relative_path.?));
+    var result = try db.search(alloc, .{ .index_name = "full_text_index_v0", .query = .{ .match = .{ .field = "_all", .text = "alpha" } }, .limit = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
 test "db repair activation admission is time and sequence bounded" {
     try std.testing.expect(DB.repairActivationAdmissible(0, 0, 200, 250 * std.time.ns_per_ms));
     try std.testing.expect(!DB.repairActivationAdmissible(201, std.time.ns_per_ms, 200, 250 * std.time.ns_per_ms));
@@ -106444,8 +106515,8 @@ test "db managed algebraic admission builds and reopens requires generation mark
 
 // Functional repair tests verify durable construction, activation, and reopen,
 // not the production reader-pause SLA. A contended CI worker can exhaust the
-// 250 ms production window, which correctly persists retry backoff that these
-// synchronous completion loops do not wait out.
+// 250 ms production window. These construction tests reserve a larger pause;
+// the activation-budget regression separately verifies cooperative yielding.
 const repair_completion_test_options = types.ArtifactRepairRunOptions{
     .max_activation_pause_ms = 5_000,
 };
