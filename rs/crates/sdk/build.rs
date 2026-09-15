@@ -52,6 +52,8 @@ fn normalize_mutation_success_transport(spec: &mut serde_yaml::Value) {
                 "patchSchema",
                 "createNamespaceTable",
                 "dropNamespaceTable",
+                "updateNamespaceTableSchema",
+                "patchNamespaceTableSchema",
             ]
             .contains(&id)
             {
@@ -76,6 +78,8 @@ fn inject_mutation_success_decoding(code: &mut String) {
         "patch_schema",
         "create_namespace_table",
         "drop_namespace_table",
+        "update_namespace_table_schema",
+        "patch_namespace_table_schema",
     ] {
         let anchor = format!("    pub async fn {method}<'a>(");
         let start = code.find(&anchor).expect("mutation method must exist");

@@ -147,6 +147,15 @@ pub fn resolveGroupRoute(
     group_id: u64,
     policy: RoutePolicy,
 ) !?GroupRoute {
+    if (router.vtable.resolve_group_routes) |resolve| {
+        const routes = (try resolve(router.ptr, alloc, &.{group_id}, policy)) orelse return null;
+        if (routes.len != 1) {
+            freeGroupRoutes(alloc, routes);
+            return error.InvalidGroupRouteBatch;
+        }
+        defer alloc.free(routes);
+        return routes[0];
+    }
     const local_node_id = router.localNodeId();
     const local_status = router.localStatus(group_id);
     if (policy == .prefer_leader) {
@@ -613,12 +622,22 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 107), routes[0].remote.node_id);
             try std.testing.expectEqualStrings("http://group-11", routes[2].remote.base_uri);
 
+            var single = (try resolveGroupRoute(std.testing.allocator, unused_catalog, router, 11, .prefer_leader)).?;
+            defer single.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("http://group-11", single.remote.base_uri);
+            try std.testing.expectEqual(@as(usize, 2), state.batch_calls);
+            try std.testing.expectEqual(@as(usize, 0), state.scalar_calls);
+
             state.omit_last_route = true;
+            try std.testing.expectError(
+                error.InvalidGroupRouteBatch,
+                resolveGroupRoute(std.testing.allocator, unused_catalog, router, 11, .prefer_leader),
+            );
             try std.testing.expectError(
                 error.InvalidGroupRouteBatch,
                 resolveGroupRoutes(std.testing.allocator, unused_catalog, router, &.{ 7, 9, 11 }, .prefer_leader),
             );
-            try std.testing.expectEqual(@as(usize, 2), state.batch_calls);
+            try std.testing.expectEqual(@as(usize, 4), state.batch_calls);
         }
 
         test "catalog backed router routes metadata-owned writes to placement leader api url" {

@@ -738,3 +738,53 @@ def test_catalog_write_validation_refreshes_after_schema_change(stateful_api):
     finally:
         api.delete(path)
         api.delete(f"/databases/{database}")
+
+
+def test_catalog_concurrent_reads_follow_rename_and_deletion(stateful_api):
+    api = stateful_api
+    database = "peer_reads_" + uuid.uuid4().hex[:10]
+    api.post(f"/databases/{database}", {})
+    scope = f"/databases/{database}/namespaces/public/tables"
+    path = scope + "/events"
+    api.post(path, {})
+    try:
+        api.post(
+            path + "/batch",
+            {"inserts": {"doc": {"value": "retained"}}, "sync_level": "full_index"},
+        )
+
+        def read_wave(path, present):
+            barrier = threading.Barrier(8, timeout=30)
+
+            def reader(_):
+                with requests.Session() as session:
+                    barrier.wait()
+                    for _ in range(5):
+                        response = session.get(
+                            api.url + path + "/documents/doc", timeout=30
+                        )
+                        assert response.status_code == (200 if present else 404), (
+                            response.text
+                        )
+                        if present:
+                            assert response.json() == {"value": "retained"}
+                            missing = session.get(
+                                api.url + path + "/documents/missing", timeout=30
+                            )
+                            assert missing.status_code == 404, missing.text
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(reader, range(8)))
+
+        read_wave(path, True)
+        api.post(path + "/rename", {"name": "renamed"})
+        old_path = path
+        path = scope + "/renamed"
+        read_wave(path, True)
+        read_wave(old_path, False)
+        api.delete(path)
+        read_wave(path, False)
+    finally:
+        cleanup = api._request("DELETE", path)
+        assert cleanup.status_code in (204, 404), cleanup.text
+        api.delete(f"/databases/{database}")

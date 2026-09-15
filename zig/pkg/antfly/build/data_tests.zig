@@ -195,6 +195,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "internal batch forwarding headers are all-or-none and strictly parsed",
         "metadata http client shares deadline and cancellation across retries",
         "system catalog write validation cache follows revisions and bounds admission",
+        "system catalog read peer routing retains healthy relocation views across publication and invalidation",
         "system catalog remote reads survive elections without skipping peers or extending budgets",
         "system catalog report failover preserves repair signals and stable peer order",
         "metadata capability client distinguishes advertised routing from N-1 absence",

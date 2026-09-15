@@ -581,3 +581,16 @@ and 10,000 groups. It includes scheduling allocation and destruction, uses one
 warmup and five samples, and verifies the number of owner inspections. Physical
 owner calls and the former one-second scheduling interval are excluded; the CPU
 comparison must not be presented as an end-to-end migration speedup.
+
+For diagnosing concurrent lookup tails, `--diagnostics-dir /private/tmp/catalog-read-logs`
+retains the catalog cluster's logs and writes its live endpoint/root to `server.json`.
+The concurrent lookup result includes each client's request sequence, start offset,
+and duration, so correlated stalls can be distinguished from steady per-request
+cost. Server profiling should be recorded as an instrumented run, separately from
+unprofiled timing comparisons.
+
+Use `--catalog-ingress nonmember` with the catalog cluster scenario to choose and
+record a coordinator that has no placement for the target table. This makes remote
+endpoint discovery an explicit part of the workload instead of depending on where
+the last-created shard happens to land. Provisioning and membership observation
+remain outside the measured operations.

@@ -28,6 +28,7 @@ import hashlib
 import json
 import math
 import platform
+import shutil
 import statistics
 import sys
 import threading
@@ -114,21 +115,24 @@ class Api:
 def concurrent_lookups(base: str, path: str, args) -> dict:
     barrier = threading.Barrier(args.concurrency, timeout=30)
 
-    def worker(_):
+    def worker(client):
         api = Api(base)
         try:
             for _ in range(args.warmup):
                 api.request("GET", path)
             barrier.wait()
             durations = []
+            requests = []
             started = time.perf_counter_ns()
-            for _ in range(args.samples):
+            for sequence in range(args.samples):
                 start = time.perf_counter_ns()
                 value = api.request("GET", path)
+                finish = time.perf_counter_ns()
                 if value.get("body") != "catalog benchmark":
                     raise RuntimeError(f"lookup mismatch: {value}")
-                durations.append((time.perf_counter_ns() - start) / 1e6)
-            return started, time.perf_counter_ns(), durations
+                durations.append((finish - start) / 1e6)
+                requests.append((client, sequence, start, finish))
+            return started, time.perf_counter_ns(), durations, requests
         except BaseException:
             barrier.abort()
             raise
@@ -139,16 +143,27 @@ def concurrent_lookups(base: str, path: str, args) -> dict:
         results = list(pool.map(worker, range(args.concurrency)))
     elapsed = (max(row[1] for row in results) - min(row[0] for row in results)) / 1e9
     durations = [duration for row in results for duration in row[2]]
+    origin = min(row[0] for row in results)
     return {
         **summary(durations),
         "concurrency": args.concurrency,
         "elapsed_seconds": elapsed,
         "requests_per_second": len(durations) / elapsed,
+        "requests": [
+            {
+                "client": client,
+                "sequence": sequence,
+                "start_ms": (start - origin) / 1e6,
+                "duration_ms": (finish - start) / 1e6,
+            }
+            for row in results
+            for client, sequence, start, finish in row[3]
+        ],
     }
 
 
 @contextmanager
-def server(binary: Path, deployment: str):
+def server(binary: Path, deployment: str, diagnostics_dir: Path | None = None):
     # E2E fixtures distinguish the Zig API root by executable basename.
     # Preserve arbitrary --binary paths without changing the measured binary.
     with TemporaryDirectory(prefix="antfly-catalog-binary-") as directory:
@@ -167,13 +182,27 @@ def server(binary: Path, deployment: str):
             else instance.data_api_urls[0]
         )
         try:
+            if diagnostics_dir is not None:
+                diagnostics_dir.mkdir(parents=True, exist_ok=True)
+                (diagnostics_dir / "server.json").write_text(
+                    json.dumps({"root": str(instance.root), "api": api.base}) + "\n"
+                )
             yield api, (time.perf_counter() - start) * 1000, instance
         except Exception:
             print(instance.debug_logs()[-12000:], file=sys.stderr)
             raise
         finally:
             api.session.close()
-            instance.stop()
+            try:
+                if diagnostics_dir is not None:
+                    for handle in instance.log_files:
+                        handle.flush()
+                    for path in instance.log_paths:
+                        shutil.copyfile(path, diagnostics_dir / path.name)
+            except OSError as error:
+                print(f"could not retain server logs: {error}", file=sys.stderr)
+            finally:
+                instance.stop()
 
 
 def wait_for_catalog_shards(
@@ -344,7 +373,11 @@ def mixed_catalog_workload(
 
 
 def catalog_scenario(args, binary: Path) -> dict:
-    with server(binary, args.deployment) as (api, startup, instance):
+    with server(binary, args.deployment, args.diagnostics_dir) as (
+        api,
+        startup,
+        instance,
+    ):
         scope = "/databases/benchmark/namespaces/serving"
         api.request("POST", "/databases/benchmark", {})
         api.request("POST", scope, {})
@@ -410,6 +443,34 @@ def catalog_scenario(args, binary: Path) -> dict:
                         "sync_level": "full_index",
                     },
                 )
+            ingress = None
+            if args.catalog_ingress == "nonmember":
+                groups = {int(group) for group in api.request("GET", path)["shards"]}
+                with requests.Session() as session:
+                    response = session.get(
+                        instance.metadata_urls[0] + "/metadata/v1/admin/snapshot",
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    placements = response.json()["placement_intents"]
+                members = {
+                    int(intent["record"]["local_node_id"])
+                    for intent in placements
+                    if int(intent["record"]["group_id"]) in groups
+                }
+                if not members:
+                    raise RuntimeError("cannot establish target placement membership")
+                for index, node in enumerate(instance.data_nodes):
+                    if node["id"] not in members:
+                        api.base = instance.data_api_urls[index]
+                        ingress = {
+                            "coordinator_node_id": node["id"],
+                            "placement_node_ids": sorted(members),
+                            "group_ids": sorted(groups),
+                        }
+                        break
+                else:
+                    raise RuntimeError("no nonmember coordinator for target table")
             target = {"database": "benchmark", "namespace": "serving", "table": table}
             query = {
                 "table_target": target,
@@ -485,6 +546,11 @@ def catalog_scenario(args, binary: Path) -> dict:
             for name, fn in operations.items():
                 print(f"catalog: {count} tables, {name}", file=sys.stderr)
                 measured[name] = api.measure(fn, args.samples, args.warmup)
+            print(
+                f"catalog: {count} tables, concurrent lookup at {time.time()}",
+                file=sys.stderr,
+                flush=True,
+            )
             measured["concurrent_qualified_lookup"] = concurrent_lookups(
                 api.base, path + "/documents/doc", args
             )
@@ -514,6 +580,7 @@ def catalog_scenario(args, binary: Path) -> dict:
             checkpoints.append(
                 {
                     "table_count": count,
+                    "ingress": ingress,
                     "table_create": summary(creates),
                     "shard_readiness": summary(shard_readiness),
                     "operations": measured,
@@ -1034,6 +1101,12 @@ def main():
     )
     parser.add_argument("--table-counts", nargs="+", type=positive, default=[10, 100])
     parser.add_argument(
+        "--catalog-ingress",
+        choices=["first", "nonmember"],
+        default="first",
+        help="Use the first node or verify and choose a coordinator without the target shard",
+    )
+    parser.add_argument(
         "--mixed-seconds",
         type=positive,
         default=0,
@@ -1070,7 +1143,24 @@ def main():
     parser.add_argument("--poll-ms", type=positive, default=20)
     parser.add_argument("--readiness-timeout", type=positive, default=115)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--diagnostics-dir",
+        type=Path,
+        help="Retain catalog cluster logs and its live endpoint for profiling",
+    )
     args = parser.parse_args()
+    if args.catalog_ingress == "nonmember" and (
+        args.scenario != "catalog" or args.deployment != "cluster"
+    ):
+        parser.error(
+            "--catalog-ingress nonmember requires --scenario catalog --deployment cluster"
+        )
+    if args.diagnostics_dir is not None and (
+        args.scenario != "catalog" or args.deployment != "cluster"
+    ):
+        parser.error(
+            "--diagnostics-dir requires --scenario catalog --deployment cluster"
+        )
     if args.storage_mode == "relational" and args.scenario not in (
         "catalog",
         "listing",

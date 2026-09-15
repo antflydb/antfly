@@ -896,7 +896,9 @@ outcome. These stable ABI details do not authorize replay of ambiguous writes.
 Scoped tables expose schema replacement (`PUT`) and JSON Merge Patch (`PATCH`)
 at their namespace-qualified `/schema` path. Both delegate to the same schema
 mutation authority, ETag/version checks, and migration flow as literal table
-routes. Generated Zig, Go, TypeScript, and Python clients expose these operations.
+routes. Generated Zig, Go, TypeScript, Python, and Rust clients expose these operations.
+The Rust generator uses the shared status-directed mutation decoder for both
+scoped schema methods, preserving completed and committed-pending outcomes.
 
 Write admission reads an immutable table-specific projection containing only the
 schema and applicable extension document/row data shapes. The metadata owner uses
@@ -920,3 +922,25 @@ Clock translation preserves the remaining budget instead of restarting it after
 validation. Cancellation or expiry before proposal carries the not-proposed outcome;
 post-proposal uncertainty and committed-but-pending visibility retain their existing
 explicit outcomes.
+
+### Read peer routing
+
+Remote document reads select endpoints from an immutable index derived from the
+accepted control snapshot. It contains healthy node API URLs, readable placement
+membership, and merged leader hints, keyed by node and group. It retains no table
+schemas, document statistics, or diagnostic inventory. Serving/draining relocation
+rules remain identical to the peer-aware placement rules.
+
+Control snapshot publication replaces the index under the same incarnation and
+mutation fences; retained readers finish against their original view. Invalidation
+removes the current view immediately. Cold refreshes share bounded admission and
+reuse the control snapshot refresh path. Peer freshness starts at publication, so
+a slow capture does not arrive already expired. They do not request independent diagnostic
+snapshot transfers. Single-group and fanout routing retain one view for leader,
+placement, and endpoint selection. Missing-document fallback uses readable peer
+IDs from the router, avoiding another administrative inventory capture.
+
+A local serving leader requires no endpoint discovery. A local Raft member's
+leader observation takes precedence over metadata hints; a non-member's retained
+Raft hint does not. Routing hints never replace the destination's topology fence,
+placement checks, or requested read-consistency barrier.

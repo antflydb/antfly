@@ -1993,3 +1993,52 @@ qualification. The write-validation changes do not establish a fix for that
 bottleneck; it requires a separate profile of routing/control admission and
 storage under concurrent reads. These are observations from one fresh cluster
 per binary, not production SLOs. [Candidate results and binary identity](system_catalog_validation_candidate_2026_09_15.json).
+
+
+### Remote read routing and concurrent lookup tail (2026-09-15)
+
+The prior 21.46 s tail was reproduced twice. Stack samples captured waiting
+lookups in `dataReadRouterGroupLeaderNodeId → remoteAdminSnapshot →
+fetchPagedSnapshot → waitBeforeMetadataMutationRetry`. Multiple readers spent
+an entire three-second sample in diagnostic snapshot admission backoff. Resolving
+one remote shard leader was independently capturing the full administrative
+inventory for each cache miss.
+
+The read router now retains a compact endpoint/placement/leader index from the
+accepted control snapshot. It coalesces cold refreshes, pins one view for scalar
+or fanout routing, retains the local-leader fast path, and uses readable peer IDs
+for missing-document fallback. Destination topology and consistency checks remain
+mandatory. No diagnostic snapshot is requested by these production routing paths.
+
+A fresh before/after pair explicitly chose a nonmember coordinator at both 10 and
+100 tables (`--catalog-ingress nonmember`). Each run used 32 extra schema fields,
+20 sequential samples, two warmups, and eight clients making 20 lookups each.
+The exact pre-fix binary (its hash matches the previous reproduced slow run)
+ran before the final candidate. Both completed every operation and correctness
+check. Obsolete task cache artifacts were removed between candidate checkpoints
+during provisioning to preserve the production disk safety floor. No profiler, task-owned compiler, or other task-owned workload ran during
+either measurement. Other worktree jobs were present; these are local Debug
+observations from one fresh cluster per binary, not isolated production estimates.
+
+| Tables | Concurrent lookup metric | Before | After |
+| --- | --- | ---: | ---: |
+| 10 | p50 / p95 | 44.20 / 57.18 ms | 47.65 / 83.28 ms |
+| 10 | Maximum | 7,994.66 ms | 218.88 ms |
+| 10 | Throughput | 18.19 requests/s | 150.86 requests/s |
+| 100 | p50 / p95 | 50.46 / 546.74 ms | 48.21 / 85.76 ms |
+| 100 | Maximum | 24,766.47 ms | 133.34 ms |
+| 100 | Throughput | 6.22 requests/s | 155.91 requests/s |
+
+The 100-table run's observed throughput increased 25.1× and its longest lookup
+fell from 24.77 s to 133.34 ms. Median latency stayed similar; the 10-table p95
+was higher. An earlier candidate run also removed the multi-second stalls but
+retained a 924.74 ms maximum at 100 tables. The final candidate additionally starts
+peer-view freshness at publication, so a slow control capture cannot publish an
+already-expired routing view. The final concurrent phases lasted only about one
+second each; this pair does not characterize repeated refresh cycles or establish
+uniformly low latency under sustained load. It demonstrates removal of the
+observed diagnostic-admission convoy, not the absence of other scale bottlenecks.
+
+Raw records, coordinator/placement identities, settings, and binary hashes:
+[`system_catalog_read_routing_baseline_2026_09_15.json`](system_catalog_read_routing_baseline_2026_09_15.json)
+and [`system_catalog_read_routing_candidate_2026_09_15.json`](system_catalog_read_routing_candidate_2026_09_15.json).

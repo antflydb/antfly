@@ -8387,6 +8387,8 @@ pub const DataServer = struct {
                 .group_leader_node_id = dataReadRouterGroupLeaderNodeId,
                 .node_base_uri = dataReadRouterNodeBaseUri,
                 .node_base_uri_for_group = dataReadRouterNodeBaseUriForGroup,
+                .group_node_ids = dataReadRouterGroupNodeIds,
+                .resolve_group_routes = dataReadRouterResolveGroupRoutes,
             },
         };
     }
@@ -8559,6 +8561,105 @@ pub const DataServer = struct {
         return error.ReadIndexTimeout;
     }
 
+    const PinnedReadPeerRouter = struct {
+        server: *DataServer,
+        peers: *ReadPeerRouting,
+
+        fn localNode(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return dataReadRouterLocalNodeId(self.server);
+        }
+        fn localStatus(ptr: *anyopaque, group_id: u64) antfly.raft.host.HostedReplicaStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return dataReadRouterLocalStatus(self.server, group_id);
+        }
+        fn leader(ptr: *anyopaque, group_id: u64) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.server.data_raft) |raft| {
+                if (raft.host.http_host.host.raftStatus(group_id) != null)
+                    return raft.host.http_host.host.leaderId(group_id);
+            }
+            return (self.peers.groups.get(group_id) orelse return null).leader;
+        }
+        fn nodes(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return alloc.dupe(u64, if (self.peers.groups.get(group_id)) |group| group.nodes.items else &.{});
+        }
+        fn status(ptr: *anyopaque, node_id: u64, group_id: u64) antfly.raft.host.HostedReplicaStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (self.peers.readable(group_id, node_id)) .active else .absent;
+        }
+        fn uri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.peers.nodeUri(alloc, node_id);
+        }
+        fn groupUri(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.peers.readable(group_id, node_id)) return null;
+            return self.peers.nodeUri(alloc, node_id);
+        }
+        fn router(self: *@This()) antfly.public_api.table_router.HostedGroupRouter {
+            return .{ .ptr = self, .vtable = &.{
+                .local_node_id = localNode,
+                .local_status = localStatus,
+                .group_leader_node_id = leader,
+                .group_node_ids = nodes,
+                .node_status = status,
+                .node_base_uri = uri,
+                .node_base_uri_for_group = groupUri,
+            } };
+        }
+    };
+
+    fn dataReadRouterResolveGroupRoutes(ptr: *anyopaque, alloc: std.mem.Allocator, group_ids: []const u64, policy: antfly.public_api.table_router.RoutePolicy) !?[]antfly.public_api.table_router.GroupRoute {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        // Local serving leaders need no endpoint discovery. Keep an entirely
+        // local read independent of the metadata routing cache's refresh TTL.
+        if (self.data_raft) |raft| {
+            var all_local = true;
+            for (group_ids) |group_id| {
+                if (raft.host.http_host.host.status(group_id) != .active or
+                    (policy == .prefer_leader and !raft.host.http_host.host.isLocalLeader(group_id)))
+                {
+                    all_local = false;
+                    break;
+                }
+            }
+            if (all_local) {
+                const routes = try alloc.alloc(antfly.public_api.table_router.GroupRoute, group_ids.len);
+                @memset(routes, .local);
+                return routes;
+            }
+        }
+        if (self.remote_metadata) |metadata| {
+            const peers = try metadata.acquireReadPeerRouting();
+            defer peers.release();
+            var pinned: PinnedReadPeerRouter = .{ .server = self, .peers = peers };
+            return antfly.public_api.table_router.resolveGroupRoutes(alloc, self.read_source.catalog, pinned.router(), group_ids, policy);
+        }
+        var vtable = self.dataReadGroupRouter().vtable.*;
+        vtable.resolve_group_routes = null;
+        return antfly.public_api.table_router.resolveGroupRoutes(alloc, self.read_source.catalog, .{ .ptr = self, .vtable = &vtable }, group_ids, policy);
+    }
+
+    fn dataReadRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.remote_metadata) |metadata| {
+            const peers = try metadata.acquireReadPeerRouting();
+            defer peers.release();
+            return alloc.dupe(u64, if (peers.groups.get(group_id)) |group| group.nodes.items else &.{});
+        }
+        var snapshot = try self.read_source.catalog.adminSnapshot();
+        defer self.read_source.catalog.freeAdminSnapshot(&snapshot);
+        var nodes: std.ArrayListUnmanaged(u64) = .empty;
+        errdefer nodes.deinit(alloc);
+        for (snapshot.placement_intents) |intent| {
+            if (intent.record.group_id == group_id and antfly.raft.reconciler.placementReadableWithPeers(snapshot.placement_intents, intent))
+                try appendUniqueNodeId(alloc, &nodes, intent.record.local_node_id);
+        }
+        return nodes.toOwnedSlice(alloc);
+    }
+
     fn dataReadRouterLocalNodeId(ptr: *anyopaque) u64 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const raft = self.data_raft orelse return 0;
@@ -8582,6 +8683,11 @@ pub const DataServer = struct {
         if (raft.host.http_host.host.raftStatus(group_id) != null)
             return raft.host.http_host.host.leaderId(group_id);
 
+        if (self.remote_metadata) |metadata| {
+            const peers = metadata.acquireReadPeerRouting() catch return null;
+            defer peers.release();
+            return (peers.groups.get(group_id) orelse return null).leader;
+        }
         var snapshot = self.read_source.catalog.adminSnapshot() catch return null;
         defer self.read_source.catalog.freeAdminSnapshot(&snapshot);
         const status = findMergedSnapshotGroupStatus(snapshot.merged_group_statuses, group_id) orelse return null;
@@ -8593,6 +8699,11 @@ pub const DataServer = struct {
 
     fn dataReadRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.remote_metadata) |metadata| {
+            const peers = try metadata.acquireReadPeerRouting();
+            defer peers.release();
+            return peers.nodeUri(alloc, node_id);
+        }
         var snapshot = try self.read_source.catalog.adminSnapshot();
         defer self.read_source.catalog.freeAdminSnapshot(&snapshot);
         const store = findSnapshotStoreByNodeId(snapshot.stores, node_id) orelse return null;
@@ -8608,6 +8719,12 @@ pub const DataServer = struct {
         node_id: u64,
     ) !?[]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.remote_metadata) |metadata| {
+            const peers = try metadata.acquireReadPeerRouting();
+            defer peers.release();
+            if (!peers.readable(group_id, node_id)) return null;
+            return peers.nodeUri(alloc, node_id);
+        }
         var snapshot = try self.read_source.catalog.adminSnapshot();
         defer self.read_source.catalog.freeAdminSnapshot(&snapshot);
         var readable_placement = false;
@@ -19956,6 +20073,92 @@ fn appendOwnedPeerRouteUpsert(
     });
 }
 
+/// Immutable routing hints derived once from the accepted control snapshot.
+/// Readers retain only healthy endpoints and readable placement membership;
+/// routing never copies the administrative inventory or its status payloads.
+const ReadPeerRouting = struct {
+    const Group = struct {
+        nodes: std.ArrayListUnmanaged(u64) = .empty,
+        leader: ?u64 = null,
+        serving_node: ?u64 = null,
+        multiple_serving: bool = false,
+    };
+    alloc: std.mem.Allocator,
+    references: std.atomic.Value(usize) = .init(1),
+    nodes: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+    groups: std.AutoHashMapUnmanaged(u64, Group) = .empty,
+
+    fn create(alloc: std.mem.Allocator, snapshot: antfly.metadata_api.AdminSnapshot) !*ReadPeerRouting {
+        const self = try alloc.create(ReadPeerRouting);
+        self.* = .{ .alloc = alloc };
+        errdefer self.release();
+        var store_nodes: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+        defer store_nodes.deinit(alloc);
+        for (snapshot.stores) |store| {
+            if (!store.live or !std.mem.eql(u8, store.health_class, "healthy") or store.api_url.len == 0) continue;
+            const url = try alloc.dupe(u8, store.api_url);
+            const entry = self.nodes.getOrPut(alloc, store.node_id) catch |err| {
+                alloc.free(url);
+                return err;
+            };
+            if (entry.found_existing) alloc.free(entry.value_ptr.*);
+            entry.value_ptr.* = url;
+            try store_nodes.put(alloc, store.store_id, store.node_id);
+        }
+        for (snapshot.placement_intents) |intent| {
+            const entry = try self.groups.getOrPut(alloc, intent.record.group_id);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            if (intent.serving_state == .serving) {
+                const group = entry.value_ptr;
+                if (group.serving_node) |node| {
+                    if (node != intent.record.local_node_id) group.multiple_serving = true;
+                } else group.serving_node = intent.record.local_node_id;
+            }
+        }
+        for (snapshot.placement_intents) |intent| {
+            const group = self.groups.getPtr(intent.record.group_id).?;
+            const is_readable = switch (intent.serving_state) {
+                .serving => true,
+                .draining => !group.multiple_serving and
+                    (group.serving_node == null or group.serving_node.? == intent.record.local_node_id),
+                else => false,
+            };
+            if (is_readable) try appendUniqueNodeId(alloc, &group.nodes, intent.record.local_node_id);
+        }
+        for (snapshot.merged_group_statuses) |status| {
+            if (!status.leader_known or status.leader_store_id == 0) continue;
+            const group = self.groups.getPtr(status.group_id) orelse continue;
+            group.leader = store_nodes.get(status.leader_store_id);
+        }
+        return self;
+    }
+
+    fn retain(self: *ReadPeerRouting) *ReadPeerRouting {
+        _ = self.references.fetchAdd(1, .monotonic);
+        return self;
+    }
+
+    fn release(self: *ReadPeerRouting) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        var nodes = self.nodes.valueIterator();
+        while (nodes.next()) |url| self.alloc.free(url.*);
+        self.nodes.deinit(self.alloc);
+        var groups = self.groups.valueIterator();
+        while (groups.next()) |group| group.nodes.deinit(self.alloc);
+        self.groups.deinit(self.alloc);
+        self.alloc.destroy(self);
+    }
+
+    fn readable(self: *const ReadPeerRouting, group_id: u64, node_id: u64) bool {
+        const group = self.groups.get(group_id) orelse return false;
+        return std.mem.indexOfScalar(u64, group.nodes.items, node_id) != null;
+    }
+
+    fn nodeUri(self: *const ReadPeerRouting, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+        return try alloc.dupe(u8, self.nodes.get(node_id) orelse return null);
+    }
+};
+
 const RemoteMetadataSource = struct {
     const RoutingProtocol = enum {
         unknown,
@@ -20045,6 +20248,9 @@ const RemoteMetadataSource = struct {
     metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation = null,
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
+    read_peer_routing: ?*ReadPeerRouting = null,
+    read_peer_routing_at_ms: u64 = 0,
+    read_peer_refresh_mutex: std.atomic.Mutex = .unlocked,
     diagnostic_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     diagnostic_snapshot_at_ms: u64 = 0,
     diagnostic_snapshot_generation: u64 = 0,
@@ -20165,6 +20371,7 @@ const RemoteMetadataSource = struct {
         if (self.http_executors.len > 0) self.alloc.free(self.http_executors);
         if (self.request_executors.len > 0) self.alloc.free(self.request_executors);
         lockAtomic(&self.cache_mutex);
+        if (self.read_peer_routing) |routing| routing.release();
         if (self.diagnostic_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         if (self.cached_routing_snapshot) |snapshot| snapshot.release(self.alloc);
@@ -20480,6 +20687,8 @@ const RemoteMetadataSource = struct {
         retired_snapshot = self.cached_snapshot;
         retired_routing_snapshot = self.cached_routing_snapshot;
         self.cached_snapshot = null;
+        const retired_peers = self.read_peer_routing;
+        self.read_peer_routing = null;
         self.cached_routing_snapshot = null;
         self.cached_head = null;
         self.cached_head_at_ms = 0;
@@ -20488,6 +20697,7 @@ const RemoteMetadataSource = struct {
         self.snapshot_fence_generation +%= 1;
         self.snapshot_invalidation_generation +%= 1;
         self.cache_mutex.unlock();
+        if (retired_peers) |peers| peers.release();
         if (retired_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         if (retired_routing_snapshot) |snapshot| snapshot.release(self.alloc);
     }
@@ -20498,6 +20708,9 @@ const RemoteMetadataSource = struct {
         ticket: LinearizableSnapshotTicket,
     ) !LinearizableSnapshotAcceptance {
         const incarnation = try requireValidMetadataIncarnation(snapshot.status.metadata_incarnation);
+        const peers = try ReadPeerRouting.create(self.alloc, snapshot);
+        var published = false;
+        defer if (!published) peers.release();
         const now_ms = self.awakeMs();
         var retired_snapshot: ?antfly.metadata_api.AdminSnapshot = null;
         lockAtomic(&self.cache_mutex);
@@ -20515,6 +20728,10 @@ const RemoteMetadataSource = struct {
         }
         retired_snapshot = self.cached_snapshot;
         self.cached_snapshot = snapshot;
+        const retired_peers = self.read_peer_routing;
+        self.read_peer_routing = peers;
+        self.read_peer_routing_at_ms = self.awakeMs();
+        published = true;
         self.cached_snapshot_at_ms = now_ms;
         // MetadataHead.metadata_epoch is a content fingerprint while the
         // snapshot status epoch is a lifecycle counter. Never mix them.
@@ -20523,6 +20740,7 @@ const RemoteMetadataSource = struct {
         self.published_linearizable_snapshot_sequence = ticket.sequence;
         self.snapshot_fence_generation +%= 1;
         self.cache_mutex.unlock();
+        if (retired_peers) |old| old.release();
         if (retired_snapshot) |*cached| freeAdminSnapshotOwned(self.alloc, cached);
         return .published;
     }
@@ -20634,6 +20852,9 @@ const RemoteMetadataSource = struct {
         var fresh_owned = true;
         defer if (fresh_owned) freeAdminSnapshotOwned(self.alloc, &fresh);
 
+        const peers = try ReadPeerRouting.create(self.alloc, incoming);
+        var published = false;
+        defer if (!published) peers.release();
         lockAtomic(&self.cache_mutex);
         defer self.cache_mutex.unlock();
         // A fenced snapshot or mutation invalidation completed during I/O.
@@ -20651,6 +20872,10 @@ const RemoteMetadataSource = struct {
         // remain non-authoritative for placement changes and name retirement.
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         self.cached_snapshot = fresh;
+        if (self.read_peer_routing) |old| old.release();
+        self.read_peer_routing = peers;
+        self.read_peer_routing_at_ms = self.awakeMs();
+        published = true;
         fresh_owned = false;
         self.cached_head = head;
         self.cached_head_at_ms = now_ms;
@@ -21145,6 +21370,28 @@ const RemoteMetadataSource = struct {
 
     fn remoteExportCatalog(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
         return remoteSystemCatalog(ptr, alloc, .{}, .export_snapshot);
+    }
+
+    fn cachedReadPeerRouting(self: *RemoteMetadataSource, deadline_ns: u64) !?*ReadPeerRouting {
+        if (!self.lockBefore(&self.cache_mutex, deadline_ns)) return error.Timeout;
+        defer self.cache_mutex.unlock();
+        if (self.awakeMs() -| self.read_peer_routing_at_ms > metadata_snapshot_cache_ttl_ms) return null;
+        return if (self.read_peer_routing) |peers| peers.retain() else null;
+    }
+
+    fn acquireReadPeerRouting(self: *RemoteMetadataSource) !*ReadPeerRouting {
+        const deadline_ns = self.awakeNs() +| remote_metadata_snapshot_timeout_ns;
+        if (try self.cachedReadPeerRouting(deadline_ns)) |peers| return peers;
+        // One bounded cold refresh feeds every lookup/fanout. Waiting readers
+        // retain their budget; they never compete for diagnostic transfer slots.
+        if (!self.lockBefore(&self.read_peer_refresh_mutex, deadline_ns)) return error.Timeout;
+        defer self.read_peer_refresh_mutex.unlock();
+        while (true) {
+            if (try self.cachedReadPeerRouting(deadline_ns)) |peers| return peers;
+            var snapshot = try self.fetchSnapshotWithBudget(.{ .deadline_ns = deadline_ns, .io = self.io });
+            freeAdminSnapshotOwned(self.alloc, &snapshot);
+            if (self.awakeNs() >= deadline_ns) return error.Timeout;
+        }
     }
 
     fn cachedDiagnosticSnapshot(self: *RemoteMetadataSource) !?antfly.metadata_api.AdminSnapshot {
@@ -36985,6 +37232,90 @@ fn consumerTests() type {
             try std.testing.expect(server.backgroundMaintenanceDue(100));
             try std.testing.expect(server.backgroundMaintenanceDue(101));
             try std.testing.expect(!server.backgroundMaintenanceDue(99));
+        }
+
+        test "system catalog read peer routing retains healthy relocation views across publication and invalidation" {
+            const alloc = std.testing.allocator;
+            var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+            defer backend_runtime.deinit();
+            var source = try RemoteMetadataSource.init(alloc, &.{"http://metadata.invalid"}, backend_runtime.ptr().apiIoImpl().?);
+            defer source.deinit();
+            var stores = [_]antfly.metadata.StoreRecord{
+                .{ .store_id = 10, .node_id = 1, .api_url = "http://old", .role = "data", .health_class = "healthy", .live = true },
+                .{ .store_id = 20, .node_id = 2, .api_url = "http://new", .role = "data", .health_class = "healthy", .live = true },
+                .{ .store_id = 30, .node_id = 3, .api_url = "http://dead", .role = "data", .health_class = "healthy", .live = false },
+            };
+            var intents = [_]antfly.raft.PlacementIntent{
+                .{ .store_id = 10, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 }, .serving_state = .draining },
+                .{ .store_id = 20, .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 }, .serving_state = .serving },
+                .{ .store_id = 30, .record = .{ .group_id = 77, .replica_id = 3, .local_node_id = 3 }, .serving_state = .serving },
+            };
+            var statuses = [_]antfly.metadata.reconciler.MergedGroupStatus{.{ .group_id = 77, .leader_known = true, .leader_store_id = 20 }};
+            const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 9, .metadata_incarnation = "11111111111111111111111111111111".*, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &stores,
+                .placement_intents = &intents,
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+                .merged_group_statuses = &statuses,
+            };
+            // Construction uses only endpoint/placement/leader fields. Every
+            // relocation state agrees with the existing peer-aware rule.
+            inline for (.{ .serving, .retiring }) |third_state| {
+                intents[2].serving_state = third_state;
+                inline for (std.meta.tags(@TypeOf(intents[1].serving_state))) |state| {
+                    intents[1].serving_state = state;
+                    const peers = try ReadPeerRouting.create(alloc, snapshot);
+                    defer peers.release();
+                    for (intents) |intent| try std.testing.expectEqual(
+                        antfly.raft.reconciler.placementReadableWithPeers(&intents, intent),
+                        peers.readable(77, intent.record.local_node_id),
+                    );
+                    try std.testing.expect((try peers.nodeUri(alloc, 3)) == null);
+                }
+            }
+            intents[1].serving_state = .serving;
+            const owned = try cloneAdminSnapshotOwned(alloc, snapshot);
+            try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(owned, source.beginLinearizableSnapshot()));
+            // Slow control capture must not publish an already-expired peer
+            // view and force every waiting reader through another refresh.
+            source.cached_snapshot_at_ms = 0;
+            const published = (try source.cachedReadPeerRouting(source.awakeNs() + std.time.ns_per_s)).?;
+            published.release();
+            const retained = try source.acquireReadPeerRouting();
+            defer retained.release();
+            const second_reader = try source.acquireReadPeerRouting();
+            try std.testing.expect(retained == second_reader);
+            second_reader.release();
+            var server: DataServer = undefined;
+            server.data_raft = null;
+            var pinned: DataServer.PinnedReadPeerRouter = .{ .server = &server, .peers = retained };
+            var route = (try antfly.public_api.table_router.resolveGroupRoute(alloc, undefined, pinned.router(), 77, .prefer_leader)).?;
+            defer route.deinit(alloc);
+            try std.testing.expectEqualStrings("http://new", route.remote.base_uri);
+            try std.testing.expectEqual(@as(u64, 2), route.remote.node_id);
+
+            statuses[0].leader_store_id = 30;
+            const failed_leader = try ReadPeerRouting.create(alloc, snapshot);
+            defer failed_leader.release();
+            pinned.peers = failed_leader;
+            var fallback = (try antfly.public_api.table_router.resolveGroupRoute(alloc, undefined, pinned.router(), 77, .prefer_leader)).?;
+            defer fallback.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 2), fallback.remote.node_id);
+            try std.testing.expect(failed_leader.groups.get(77).?.leader == null);
+
+            stores[1].api_url = "http://restarted";
+            const replacement = try cloneAdminSnapshotOwned(alloc, snapshot);
+            try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(replacement, source.beginLinearizableSnapshot()));
+            const latest = try source.acquireReadPeerRouting();
+            defer latest.release();
+            try std.testing.expectEqualStrings("http://restarted", latest.nodes.get(2).?);
+            try std.testing.expectEqualStrings("http://new", retained.nodes.get(2).?);
+            source.invalidateCache();
+            try std.testing.expect(source.read_peer_routing == null);
+            try std.testing.expectEqualStrings("http://restarted", latest.nodes.get(2).?);
         }
 
         test "remote metadata source pins one cluster incarnation across cache invalidation" {

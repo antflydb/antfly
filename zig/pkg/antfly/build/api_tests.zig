@@ -1113,6 +1113,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned reads reject a group removed from the table topology",
             "provisioned table read source falls back from read_index to stale on not leader",
             "catalog backed router skips non-serving relocation placements",
+            "resolve group routes uses one router-owned snapshot callback for fanout",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

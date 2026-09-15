@@ -6001,10 +6001,19 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         initial_route: table_router.GroupRoute,
     ) !?LookupResponse {
-        var snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-        const placements = try metadata_admin.listGroupPlacement(alloc, &snapshot, group_id);
-        defer metadata_admin.freePlacementRefs(alloc, placements);
+        const nodes = (try self.router.groupNodeIds(alloc, group_id)) orelse blk: {
+            var snapshot = try self.catalog.adminSnapshot();
+            defer self.catalog.freeAdminSnapshot(&snapshot);
+            const placements = try metadata_admin.listGroupPlacement(alloc, &snapshot, group_id);
+            defer metadata_admin.freePlacementRefs(alloc, placements);
+            var readable: std.ArrayListUnmanaged(u64) = .empty;
+            errdefer readable.deinit(alloc);
+            for (placements) |intent| {
+                if (placementRefReadableWithPeers(placements, intent)) try readable.append(alloc, intent.record.local_node_id);
+            }
+            break :blk try readable.toOwnedSlice(alloc);
+        };
+        defer alloc.free(nodes);
 
         const local_node_id = self.router.localNodeId();
         const tried_local = initial_route == .local;
@@ -6013,9 +6022,7 @@ pub const HostedProvisionedTableReadSource = struct {
             else => 0,
         };
 
-        for (placements) |intent| {
-            if (!placementRefReadableWithPeers(placements, intent)) continue;
-            const node_id = intent.record.local_node_id;
+        for (nodes) |node_id| {
             if (node_id == local_node_id) {
                 if (tried_local or self.router.localStatus(group_id) != .active) continue;
                 if (try (try self.groupLocalSourceForGroup(alloc, group_id, table_name, opts.execution_deadline_ns, opts.cancellation)).lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency)) |result| return result;
