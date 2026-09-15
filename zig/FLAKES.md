@@ -25,19 +25,55 @@ error through the compiled callback and HTTP client boundaries and return
 round-trip and public-read parity regressions exercise this concrete error.
 The failed revision already contains bounded read-owner admission: that earlier
 fix alone did not prevent this failure. There are no usable stacks proving a
-new resolver/Raft deadlock; the promotion stall's underlying cause remains open
-until reproduced with the corrected executable.
+new resolver/Raft deadlock in that CI job.
+
+Local production repetitions on the merged-main executable (SHA-256
+`710889d55cec215eeffd136ccf0327487cbb3b84d8cc99443f5ab330b42c7658`)
+reproduced **two failures in 100 fresh clusters**: normal 48/50, descriptor-limited
+50/50. Another 50 normal cases passed, illustrating why a rerun cannot clear the
+failure. Twenty repetitions of the original CI Linux executable under local
+emulation passed; that is not equivalent to native Linux CI qualification.
+
+The retained LSM tables from a local stall contain a generation-one resolution
+artifact with both canonical entities and a durable promotion replay record at
+sequence 3. Resolution and promotion report target/applied 2, while the graph is
+ready at 3 and the entity table is empty. Runtime initialization restored only
+the applied checkpoint, losing the volatile target on reopen. Both stages now
+recover their target from their own durable replay lane, independently of graph
+progress. The deterministic DB regression forces reopen before resolution and
+after resolution/before promotion, checks that the journal contains pending
+work, then requires completion without another write or synchronous drain. It
+fails before the change and passes with it, alongside the existing backfill and
+catalog-fencing regressions. The original CI's final read timeout is not by itself
+proof that its entire history followed this same reopen path.
+
+The new production data-restart case also exposed `AddressUnavailable` escaping
+the lookup callback as `RuntimeBoundaryFailure`/HTTP 500. Known read-transport
+failures now become `StorageReadTemporarilyUnavailable` before that boundary;
+cancellation, timeouts, and unexpected defects retain their distinct meanings.
+An injected failing transport verifies that normalization makes one attempt and
+does not silently retry or return a missing document.
+The pre-fix restart experiment failed 7/10 cases (three HTTP 500s and four
+promotion deadlines); its native stacks and roots are retained. Startup also
+returned `TableNotFound` from routed batch validation before invoking the writer.
+That now retains the existing `Unavailable`/503 response with the explicit
+`not_proposed_v1` outcome, rather than reporting an ambiguous HTTP 500. The
+operation regression asserts the writer was never called on those failures.
 
 The E2E poller now stops on unexpected HTTP errors, including 500, instead of
 hiding them behind a generic promotion timeout. Only 503 with `Retry-After` and
 transport timeouts/disconnects are retryable. Its original deadline still applies.
 The first failure captures native stacks with a five-second per-process limit;
-teardown reuses that snapshot and stores it with the retained server root. The existing disposable Linux launcher
-opts the test children into debugger attachment; the scheduled job installs GDB.
+teardown reuses that snapshot and stores it with the retained server root.
+macOS uses `sample`; the disposable Linux launcher opts test children into
+debugger attachment and the scheduled job installs GDB. Poll deadlines that
+fall below the request floor still report pending keys and graph diagnostics.
 
 The full nightly/manual soak now runs the production Autograph scenario under
 both normal and 256-descriptor limits, two concurrent workers and 25 repetitions
-per profile: **100 fresh six-process clusters**. Reports are distinct from the
+per case per profile: **200 fresh six-process clusters**, split equally between
+the original case and a case restarting all data nodes after the initial write.
+Reports are distinct from the
 200 restore repetitions and must contain the exact expected test names and
 counts with no skips or failures. A failed normal profile does not prevent
 collecting constrained-profile evidence, and either failure fails the soak.
@@ -50,9 +86,9 @@ SKIP_BUILD=1 ANTFLY_BIN="$PWD/zig/zig-out/bin/antfly" \
   scripts/ci/zig-e2e-autograph-soak.sh
 ```
 
-The poller/helper regressions pass locally (19 tests), as do the six regression
+The poller/helper regressions pass locally (21 tests), as do the six regression
 orchestration tests, including profile isolation and failure propagation.
-Production repetition and Linux qualification results are pending; adding a
+Post-fix production repetition and Linux qualification results are pending; adding a
 soak is not proof that the progress failure is fixed.
 
 ## 2026-09-15: standby/scaling corpus runner lost during cache publication

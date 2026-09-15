@@ -6,11 +6,18 @@
 failed in [run 34928784180](https://github.com/antflydb/antfly/actions/runs/34928784180/job/104259435053)
 with missing promoted entities and an HTTP 500 caused by an untransportable
 `ReadIndexTimeout`. See [the runtime investigation](../FLAKES.md#2026-09-15-multi-node-autograph-promotion-stalls-with-an-untransportable-read-timeout)
-for the exact revision, evidence, known mapping fix, and unresolved progress cause.
+for the exact revision, retained journal evidence, and deterministic reopen fix.
+The merged-main production binary reproduced two failures in 100 local cases:
+pending promotion at journal sequence 3 was absent from the reopened runtime's
+target of 2. A later 50/50 pass does not invalidate those failures.
 The poller now rejects unexpected 500s immediately. The scheduled production
-soak runs 50 normal and 50 constrained-descriptor repetitions using
+soak runs 50 normal and 50 constrained-descriptor repetitions of each of the
+original case and `test_multinode_autograph_recovers_after_data_restart`, using
 `scripts/ci/zig-e2e-autograph-soak.sh`, with exact JUnit counts and retained native
-failure diagnostics. A passing helper test does not qualify the production soak.
+failure diagnostics (GDB on Linux, `sample` on macOS). The restart case exposed
+an additional untransportable `AddressUnavailable`; known read-transport failures
+now preserve the existing retryable read-availability contract. A passing helper
+or deterministic test does not qualify the post-fix production soak.
 
 
 ## 2026-09-13: artifact coverage restart failure reproduced locally (#722)

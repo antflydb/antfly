@@ -3117,8 +3117,11 @@ selects the cooperative mutation suffix explicitly for comparisons.
 The parallel `production-e2e` job builds and retains one production executable,
 checks its SHA-256 before and after testing, repeats the compiled storage-owner
 publication tests 20 times, and runs 200 public restore cases. It also runs
-100 multi-node Autograph resolution/promotion/hydration cases: 50 with normal
-file-descriptor limits and 50 with a limit of 256, using two workers per profile.
+200 multi-node Autograph resolution/promotion/hydration cases: 50 original and
+50 data-restart cases with normal file-descriptor limits, then the same counts
+with a limit of 256, using two workers per profile. Restart cases reopen every
+data node after the initial document commit and require promotion without a new
+write to wake the recovered owners.
 `scripts/ci/zig-e2e-autograph-soak.sh` exposes the same profiles locally; set
 `ANTFLY_E2E_REGRESSION_REPORT_DIR` to a fresh directory and optionally override
 workers/repetitions. These are production E2E stress tests; they do not provide

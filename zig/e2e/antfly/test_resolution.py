@@ -644,7 +644,13 @@ def _wait_for_entities(
     while not deadline.expired():
         for key in list(pending):
             try:
-                doc = api.lookup("entities", key, timeout=deadline.request_timeout())
+                timeout = deadline.request_timeout()
+            except AssertionError:
+                # Preserve the pending keys and diagnostics when there is no
+                # longer enough budget to issue another bounded request.
+                break
+            try:
+                doc = api.lookup("entities", key, timeout=timeout)
             except requests.RequestException as exc:
                 if not _transient_poll_error(exc):
                     raise
@@ -725,6 +731,33 @@ def test_autograph_entity_poll_propagates_internal_failure():
         )
 
 
+@pytest.mark.parametrize("hydrate", [False, True])
+def test_autograph_poll_preserves_context_at_request_deadline(monkeypatch, hydrate):
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    monkeypatch.setitem(globals(), "_capture_failure_stacks", lambda _: "stacks")
+
+    class Api:
+        _server = None
+
+        def diagnostic(self, **_kwargs):
+            return "retained graph status"
+
+    deadline = _Deadline(0.05)
+    expected = {"person/ada_lovelace": "Ada Lovelace"}
+    with pytest.raises(AssertionError, match="retained graph status") as failure:
+        if hydrate:
+            _wait_for_mention_hydration(
+                Api(), start_node="doc:a", expected_names=expected, deadline=deadline
+            )
+        else:
+            _wait_for_entities(Api(), expected, deadline=deadline)
+    assert "person/ada_lovelace" in str(failure.value)
+    assert "request floor" not in str(failure.value)
+    assert now[0] <= deadline.timeout_s
+
+
 def _graph_result(result: dict, name: str) -> dict | None:
     responses = result.get("responses", [])
     if not responses:
@@ -761,9 +794,11 @@ def _wait_for_mention_hydration(
     last_error: str | None = None
     while not deadline.expired():
         try:
-            last = api.query_table(
-                "documents", payload, timeout=deadline.request_timeout()
-            )
+            timeout = deadline.request_timeout()
+        except AssertionError:
+            break
+        try:
+            last = api.query_table("documents", payload, timeout=timeout)
         except requests.RequestException as exc:
             if not _transient_poll_error(exc):
                 raise
@@ -799,7 +834,14 @@ def _wait_for_mention_hydration(
 def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
     resolution_cluster,
 ):
-    cluster = resolution_cluster
+    _exercise_multinode_autograph(resolution_cluster, restart_data=False)
+
+
+def test_multinode_autograph_recovers_after_data_restart(resolution_cluster):
+    _exercise_multinode_autograph(resolution_cluster, restart_data=True)
+
+
+def _exercise_multinode_autograph(cluster, *, restart_data: bool):
     api = _Api(cluster.data_api_urls[0], cluster)
 
     # Entities live in their own table (own shard group); documents are spread
@@ -827,6 +869,14 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
         },
         deadline=_new_e2e_deadline(),
     )
+
+    if restart_data:
+        # Reopen every data owner with the committed document on disk. Do not
+        # issue another write before observing resolution/promotion recovery.
+        for node in cluster.data_nodes:
+            cluster.stop_data_node(int(node["id"]))
+        for node in cluster.data_nodes:
+            cluster._start_data_node(node)
 
     # The promoter upserts a canonical entity document per resolved mention into
     # the entity table on its own shard.

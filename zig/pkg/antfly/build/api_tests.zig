@@ -1225,7 +1225,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     const lib_api_graph_wire_test_step = b.step("lib-api-graph-wire-test", "Run canonical internal graph wire-contract regressions");
     lib_api_graph_wire_test_step.dependOn(&run_lib_api_graph_wire_tests.step);
-    const lib_api_distributed_query_availability_runtime_filters = &.{"distributed query transport failures become one retryable availability condition"};
+    const lib_api_distributed_query_availability_runtime_filters = &.{
+        "distributed query transport failures become one retryable availability condition",
+        "remote lookup transport failures preserve read availability without retrying",
+    };
     const lib_api_distributed_query_availability_tests = @import("linked_tests.zig").add(b, .{
         .name = "api-distributed-query-availability-tests",
         .root_module = api_table_reads_docid_test_mod,

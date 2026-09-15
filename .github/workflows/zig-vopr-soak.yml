@@ -344,10 +344,11 @@ jobs:
           assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases)
           for profile in ("normal", "constrained"):
               reports = list((Path(os.environ["RUNNER_TEMP"]) / "production-e2e-soak/autograph" / profile).glob("*.xml"))
-              assert len(reports) == 50, (profile, len(reports))
+              assert len(reports) == 100, (profile, len(reports))
               cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
               assert Counter(case.attrib["name"] for case in cases) == {
                   "test_multinode_autograph_resolves_promotes_and_hydrates_entities": 50,
+                  "test_multinode_autograph_recovers_after_data_restart": 50,
               }, profile
               assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
           PY

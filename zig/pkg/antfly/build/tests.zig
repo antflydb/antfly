@@ -1423,6 +1423,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db reverse graph probe rejects a deleted or replaced index incarnation",
         "api http client preserves group doc identity conflicts",
         "typed internal group reads preserve retryable resident storage failures",
+        "typed routed batch preserves forwarding cancellation and identity conflicts",
         "boundary dispatcher preserves local calls and maps cross-unit calls",
         "stable status preserves public boundary semantics",
         "db graph search filters result nodes and hidden traversal intermediates",

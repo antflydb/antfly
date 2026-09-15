@@ -77751,6 +77751,74 @@ test "db re-resolves the corpus when upsertResolver bumps the config generation"
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":2") != null);
 }
 
+test "db resolver workers recover pending journal targets after reopen without new writes" {
+    for ([_]bool{ false, true }) |resolved_before_close| {
+        const alloc = std.testing.allocator;
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+        var sink = FakePromotionSink{ .alloc = alloc };
+        defer sink.deinit();
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .start_resolver_workers = false,
+            .entity_sink = sink.sink(),
+            .enrichment = .{ .enable_without_producers = true },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{"source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+            ,
+        });
+        try db.addResolver(.{
+            .name = "kg",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+            .config_generation = 1,
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+            }},
+            .sync_level = .write,
+        });
+        try db.runEnrichmentUntil(db.core.nextDerivedSequence());
+        if (resolved_before_close) try db.resolution_runtime.?.catchUp();
+        const pending_hint: change_journal_mod.TargetHint = if (resolved_before_close) .promotion else .resolution;
+        try std.testing.expect(try db.core.store.latestReplaySequenceForHint(pending_hint, 0) > 0);
+        // Graph replay can finish while the independent cross-table promotion
+        // is still pending. Startup must not infer its debt from graph debt.
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+        try std.testing.expectEqual(@as(usize, 0), sink.count());
+        db.close();
+        db = try DB.open(alloc, std.mem.span(path), .{
+            .start_resolver_workers = false,
+            .entity_sink = sink.sink(),
+        });
+        if (resolved_before_close) {
+            try std.testing.expect(db.promotionStageStats().catch_up_required);
+        } else {
+            try std.testing.expect(db.resolutionStageStats().catch_up_required);
+        }
+        try db.activateResolverReplayRuntimes();
+        const io = db.backend_runtime.controlIo() orelse db.backend_runtime.io().?;
+        for (0..1000) |_| {
+            if (sink.count() == 2 and !db.promotionStageStats().catch_up_required) break;
+            try io.sleep(.fromMilliseconds(5), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 2), sink.count());
+        try std.testing.expect(!db.resolutionStageStats().catch_up_required);
+        try std.testing.expect(!db.promotionStageStats().catch_up_required);
+    }
+}
+
 test "db resolver worker resumes durable backfill after deferred activation and reopen" {
     for ([_]bool{ false, true }) |reopen| {
         const alloc = std.testing.allocator;

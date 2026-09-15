@@ -13,14 +13,17 @@ report_root="$ANTFLY_E2E_REGRESSION_REPORT_DIR"
 export ANTFLY_E2E_REGRESSION_WORKERS="${ANTFLY_E2E_REGRESSION_WORKERS:-2}"
 export ANTFLY_E2E_REGRESSION_REPEATS="${ANTFLY_E2E_REGRESSION_REPEATS:-25}"
 export ANTFLY_E2E_NATIVE_STACKS=1
-test_name=e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
+tests=(
+  e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
+  e2e/antfly/test_resolution.py::test_multinode_autograph_recovers_after_data_restart
+)
 result=0
 for profile in normal constrained; do
   nofile_limit=""
   if [[ "$profile" == constrained ]]; then nofile_limit=256; fi
   if ANTFLY_E2E_NOFILE_LIMIT="$nofile_limit" \
     ANTFLY_E2E_REGRESSION_REPORT_DIR="$report_root/$profile" \
-    "$script_dir/zig-e2e-regression-loop.sh" "$test_name"; then
+    "$script_dir/zig-e2e-regression-loop.sh" "${tests[@]}"; then
     status=0
   else
     status=$?
