@@ -894,12 +894,10 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration strin
 	}
 	appendHAArg("--ha-seed-capture-root", seedCaptureRoot)
 	appendHAUint("--ha-cluster-id", identity.ClusterID)
-	if identity.ShardID != 0 {
-		appendHAUint("--ha-shard-id", identity.ShardID)
-	}
-	if identity.TableID != 0 {
-		appendHAUint("--ha-table-id", identity.TableID)
-	}
+	// Explicit zero selects the whole-instance stream and its continuous
+	// catalog mutation gate. Omission is the legacy bootstrap CLI mode.
+	appendHAUint("--ha-shard-id", identity.ShardID)
+	appendHAUint("--ha-table-id", identity.TableID)
 	appendHAUint("--ha-timeline-id", identity.TimelineID)
 	appendHAUint("--ha-epoch", identity.Epoch)
 	return args.String()

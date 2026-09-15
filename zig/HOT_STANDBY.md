@@ -10,6 +10,42 @@ productionized in the 0.2.1 release; see [Implementation](#implementation) for
 the components and [Open work](#open-work) for what remains outside the
 current scope.
 
+## Empty instances and later table creation
+
+The whole-instance stream uses explicit `--hot-standby-table-id 0` and
+`--hot-standby-shard-id 0`. It can capture and activate an empty portable seed,
+then replicate new tables before subsequent document mutations. The operator
+must preserve these explicit zero arguments; omitted identities retain the
+legacy catalog-bootstrap behavior.
+
+Table creation uses version 3 JSON metadata records at stream identity `0/0`.
+The payload carries the resolved table definition and initial ranges. The
+standby persists those records before advancing applied progress. The primary
+persists its local catalog and requires the configured RemoteApply
+acknowledgement before reporting success. Startup replays catalog records that reached the WAL but whose
+local catalog publication was interrupted. A WAL or local publication failure
+fences the primary process until restart/recovery. A remote acknowledgement
+timeout reports an uncertain client outcome while preserving the committed
+catalog; replication can resume without restarting the primary. Inspect the
+table before retrying an uncertain creation.
+
+The shared mutation barrier orders table creation with seed capture. The
+transition mutex and write generation checks order it with fencing. Both
+members need a runtime that understands catalog records: older receivers fail
+closed and cannot acknowledge them. Existing table-scoped streams keep their
+previous catalog restrictions.
+
+This adds table creation, including the initial table schema/index definition.
+It does not enable deletion or alteration of existing tables, native auth
+changes, backups or other surfaces still rejected by the mutation inventory.
+Those require their own replicated lifecycle contracts.
+
+`e2e/antfly/test_standby_empty_bootstrap.py` exercises empty portable seed
+activation, two newly created tables, document writes, restart, fenced
+promotion, unavailable-standby rejection and recovery of a catalog snapshot
+that lags the WAL. Empty standalone catalogs are persisted before readiness,
+so volume inspection does not need to interpret a missing file as empty.
+
 ## Summary
 
 Antfly can support an efficient hot-standby design by combining:

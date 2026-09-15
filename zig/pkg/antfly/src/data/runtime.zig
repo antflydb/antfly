@@ -4021,6 +4021,10 @@ const HAStandbyReplicationErrorCode = enum(u8) {
     ConnectionRefused,
     BrokenPipe,
     EndOfStream,
+    InvalidResponse,
+    InvalidSocketOption,
+    RecvFailed,
+    SendFailed,
     NoAddressReturned,
     Timeout,
     ConnectionTimedOut,
@@ -4075,6 +4079,10 @@ fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
         error.ConnectionRefused => .ConnectionRefused,
         error.BrokenPipe => .BrokenPipe,
         error.EndOfStream => .EndOfStream,
+        error.InvalidResponse => .InvalidResponse,
+        error.InvalidSocketOption => .InvalidSocketOption,
+        error.RecvFailed => .RecvFailed,
+        error.SendFailed => .SendFailed,
         error.NoAddressReturned => .NoAddressReturned,
         error.Timeout => .Timeout,
         error.ConnectionTimedOut => .ConnectionTimedOut,
@@ -4131,6 +4139,10 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
         .ConnectionRefused => "ConnectionRefused",
         .BrokenPipe => "BrokenPipe",
         .EndOfStream => "EndOfStream",
+        .InvalidResponse => "InvalidResponse",
+        .InvalidSocketOption => "InvalidSocketOption",
+        .RecvFailed => "RecvFailed",
+        .SendFailed => "SendFailed",
         .NoAddressReturned => "NoAddressReturned",
         .Timeout => "Timeout",
         .ConnectionTimedOut => "ConnectionTimedOut",
@@ -4190,6 +4202,13 @@ fn isRetryableControlPlaneTransportError(err: anyerror) bool {
         .ConnectionRefused,
         .BrokenPipe,
         .EndOfStream,
+        // httpx reports a peer closing mid-response this way. No incomplete
+        // replication frame is applied or acknowledged; retry from durable progress.
+        .InvalidResponse,
+        // A retired pooled socket can fail timeout setup before dispatch.
+        .InvalidSocketOption,
+        .RecvFailed,
+        .SendFailed,
         .NoAddressReturned,
         .Timeout,
         .ConnectionTimedOut,
@@ -5053,6 +5072,9 @@ pub const DataServer = struct {
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
     ha_cfg: DataServerHAConfig = .{},
+    /// Standalone owns its durable catalog; apply before routing later WAL records.
+    ha_catalog_apply_ctx: ?*anyopaque = null,
+    ha_catalog_apply_fn: ?*const fn (*anyopaque, antfly.hot_standby.replication_record.RecordView) anyerror!void = null,
     ha_state_mutex: std.atomic.Mutex = .unlocked,
     /// Global primary mutation/capture ordering point. All DB/catalog writers
     /// share this instance through their HA mirror configuration.
@@ -5770,6 +5792,11 @@ pub const DataServer = struct {
     }
 
     pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView) !void {
+        if (record.kind == .metadata_mutation and record.table_id == 0 and record.shard_id == 0) {
+            const apply = self.ha_catalog_apply_fn orelse return error.HACatalogReplicationUnavailable;
+            try apply(self.ha_catalog_apply_ctx orelse return error.HACatalogReplicationUnavailable, record);
+            return;
+        }
         if (isWholeInstanceHAControlRecord(record)) return;
 
         var snapshot = try self.write_source.catalog.adminSnapshot();
@@ -5791,6 +5818,51 @@ pub const DataServer = struct {
             route.table_name,
             record,
         );
+    }
+
+    pub const HACatalogCommit = struct {
+        mirror: antfly.db.HAAsyncEffectMirror,
+        generation: u64,
+        lsn: u64,
+    };
+
+    /// Caller holds the shared mutation barrier and catalog lock. An append
+    /// failure can have an uncertain durable outcome, so fence until replay.
+    pub fn appendHACatalogCreate(self: *DataServer, payload: []const u8) !HACatalogCommit {
+        platform_sync.lockYielding(&self.ha_state_mutex);
+        defer self.ha_state_mutex.unlock();
+        const generation = self.ha_public_gate_state.currentGeneration();
+        try self.ha_public_gate_state.checkWrite(generation);
+        const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
+        if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+            return error.HACatalogRequiresWholeInstance;
+        errdefer self.ha_public_gate_state.publishPrimaryFence(true);
+        const lsn = try mirror.primary.append(.{
+            .kind = .metadata_mutation,
+            .payload_codec = .json,
+            .table_id = 0,
+            .shard_id = 0,
+            .payload = payload,
+        });
+        try mirror.primary.log.wal.sync(true);
+        self.ha_primary_mirror_last_lsn.store(lsn, .release);
+        return .{ .mirror = mirror, .generation = generation, .lsn = lsn };
+    }
+
+    /// Local catalog publication has completed. A remote timeout leaves an
+    /// uncertain client outcome, but must not undo committed catalog state or
+    /// require a process restart when the standby becomes available again.
+    pub fn acknowledgeHACatalogCreate(self: *DataServer, commit: HACatalogCommit) !void {
+        const mirror = commit.mirror;
+        // Do not hold the transition mutex while waiting for receiver acks.
+        if (mirror.sync_wait_fn) |wait| {
+            try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.primary, commit.lsn, mirror.sync_policy);
+        }
+        platform_sync.lockYielding(&self.ha_state_mutex);
+        defer self.ha_state_mutex.unlock();
+        try self.ha_public_gate_state.checkWrite(commit.generation);
+        const gate = try antfly.hot_standby.commit_gate.evaluate(mirror.primary, commit.lsn, mirror.sync_policy);
+        if (!gate.shouldAcknowledge()) return error.SyncPolicyUnsatisfied;
     }
 
     pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: antfly.hot_standby.replication_record.RecordView) anyerror!void {
@@ -27680,6 +27752,10 @@ fn consumerTests() type {
                 error.ConnectionRefused,
                 error.BrokenPipe,
                 error.EndOfStream,
+                error.InvalidResponse,
+                error.InvalidSocketOption,
+                error.RecvFailed,
+                error.SendFailed,
                 error.NoAddressReturned,
                 error.Timeout,
                 error.ConnectionTimedOut,

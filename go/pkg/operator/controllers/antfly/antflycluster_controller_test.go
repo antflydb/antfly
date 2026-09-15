@@ -16713,3 +16713,19 @@ func baseStandaloneControllerCluster() *antflyv1.AntflyCluster {
 		},
 	}
 }
+
+func TestStandaloneHAArgsPreserveWholeInstanceScope(t *testing.T) {
+	for _, role := range []antflyv1.HARuntimeRole{antflyv1.HARuntimeRolePrimary, antflyv1.HARuntimeRoleStandby} {
+		t.Run(string(role), func(t *testing.T) {
+			g := NewWithT(t)
+			ha := &antflyv1.HighAvailabilitySpec{
+				Mode:     antflyv1.HAModeHotStandby,
+				Identity: &antflyv1.HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1},
+				Runtime:  &antflyv1.HARuntimeSpec{Role: role, NodeID: "node-a"},
+			}
+			args := standaloneHAArgs(ha, "", antflyv1.HADataLayoutLegacy)
+			g.Expect(args).To(ContainSubstring("--ha-shard-id 0"))
+			g.Expect(args).To(ContainSubstring("--ha-table-id 0"))
+		})
+	}
+}

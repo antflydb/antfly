@@ -24,6 +24,7 @@ import pytest
 
 from test_standby import (
     HACluster,
+    DB_API_ROOT,
     _primary_lsn,
     _promotion_fence_request,
     _wait_for_standby_applied,
@@ -148,21 +149,26 @@ def test_empty_seed_artifact_bootstrap_and_restart(ha_cluster: HACluster):
 def test_empty_seed_then_first_table_replication_and_fenced_promotion(
     ha_cluster: HACluster,
 ):
-    # Acceptance test for selectable Cloud hot standby. Currently fails at
-    # create_table: standalone catalog mutations are not yet replicated.
+    # Table catalog and document effects must survive the same stream.
     cluster = ha_cluster
     _bootstrap_empty(cluster)
     cluster.primary.create_table("first_table")
     cluster.primary.batch_write(
         "first_table", {"first": {"title": "created after empty bootstrap"}}
     )
+    cluster.primary.create_table("second_table")
+    cluster.primary.batch_write("second_table", {"second": {"title": "independent table"}})
     lsn = _primary_lsn(cluster)
     _wait_for_standby_applied(cluster, lsn)
+    _wait_for_standby_lookup(cluster, "second_table", "second")
+    cluster.primary.restart()
+    assert cluster.primary.lookup_key("second_table", "second")["title"] == "independent table"
     _wait_for_standby_lookup(cluster, "first_table", "first")
     cluster.standby.restart()
     _wait_for_standby_applied(cluster, lsn, require_live_replication=True)
     _wait_for_standby_lookup(cluster, "first_table", "first")
 
+    _wait_for_standby_lookup(cluster, "second_table", "second")
     fence = _promotion_fence_request(cluster, lsn)
     # Fence the old primary before authorizing the standby to write.
     cluster.primary.admin_post("/fence", fence)
@@ -174,3 +180,48 @@ def test_empty_seed_then_first_table_replication_and_fenced_promotion(
     )
     assert stale.status_code >= 400
     assert cluster.standby.lookup_key("first_table", "first")["title"] == "created after empty bootstrap"
+
+
+def test_catalog_remote_apply_outage_recovers_without_primary_restart(ha_cluster: HACluster):
+    cluster = ha_cluster
+    _bootstrap_empty(cluster)
+    primary_pid = cluster.primary.proc.pid
+    cluster.standby.stop()
+    response = cluster.primary._request(
+        "POST", f"{cluster.primary.url}{DB_API_ROOT}/tables/pending_table",
+        json={"num_shards": 1}, timeout=30,
+    )
+    assert response.status_code >= 400, response.text
+    assert "outcome is unknown" in response.text, response.text
+    # Creation is durable but unacknowledged. Replication catches up without
+    # restarting the primary when its required standby becomes available.
+    cluster.standby.start()
+    _wait_for_standby_applied(cluster, _primary_lsn(cluster), require_live_replication=True)
+    cluster.primary.batch_write("pending_table", {"recovered": {"title": "replayed catalog"}})
+    _wait_for_standby_lookup(cluster, "pending_table", "recovered")
+    cluster.primary.create_table("after_outage")
+    assert cluster.primary.proc.pid == primary_pid
+    cluster.primary.restart()
+    assert cluster.primary.lookup_key("pending_table", "recovered")["title"] == "replayed catalog"
+
+
+def test_catalog_replays_when_local_snapshot_lags_wal(ha_cluster: HACluster):
+    cluster = ha_cluster
+    _bootstrap_empty(cluster)
+    before = cluster.primary.catalog_path.read_bytes()
+    cluster.primary.create_table("replay_table")
+    cluster.primary.batch_write("replay_table", {"saved": {"title": "durable data"}})
+    # Model the startup state after WAL durability but before local catalog
+    # publication. Only the disposable fixture catalog is rolled back.
+    cluster.primary.stop()
+    cluster.primary.catalog_path.write_bytes(before)
+    cluster.primary.start()
+    assert cluster.primary.lookup_key("replay_table", "saved")["title"] == "durable data"
+    _wait_for_standby_lookup(cluster, "replay_table", "saved")
+    for method, suffix in (("DELETE", ""), ("PUT", "/schema"), ("POST", "/unknown")):
+        response = cluster.primary._request(method,
+            f"{cluster.primary.url}{DB_API_ROOT}/tables/replay_table{suffix}", json={}, timeout=10)
+        assert response.status_code >= 400, response.text
+    response = cluster.standby._request("POST",
+        f"{cluster.standby.url}{DB_API_ROOT}/tables/standby_local", json={"num_shards": 1}, timeout=10)
+    assert response.status_code >= 400, response.text
