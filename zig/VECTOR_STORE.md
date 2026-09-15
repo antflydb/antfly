@@ -242,6 +242,12 @@ lock waits, memory and complete disk accounting. Report retained/orphan bytes an
 reclamation separately from logical completion. A passing migration correctness
 suite is not evidence of equivalent steady-state throughput.
 
+The [migration qualification findings](VECTOR_STORAGE_MIGRATION_FINDINGS.md)
+record the initial screen, the WAL-only page durability fix, and the shared
+restart cost found in both fresh and migrated tables. Page durability must not
+force one SSTable per progress update. Query comparisons include a matched
+restart in every arm so ingestion-time identity caches do not confound them.
+
 Reverse migration, migration-overlap backup/restore, HA/replication and broader
 topology remain separately qualified work. Migration-overlap backups/restores
 are rejected; a primary-only backup cannot capture reference closure. After

@@ -164,6 +164,30 @@ def test_online_vector_migration_restart_concurrent_models_and_rebuild(stateful_
     )
 
 
+def test_online_vector_migration_page_receipt_survives_process_crash(stateful_api):
+    api = stateful_api
+    table = f"crash_migrate_{time.time_ns()}"
+    seed(api, table)
+    job = "wal-page"
+    state = command(api, table, job)
+    for _ in range(256):
+        state = command(api, table, job, "step")
+        if state["prepared_artifacts"]:
+            break
+    else:
+        pytest.fail("backfill never prepared a payload")
+    # Do not allow graceful shutdown to flush the WAL-only page receipt.
+    api._server.proc.kill()
+    api._server.proc.wait(timeout=10)
+    api.restart_server()
+    recovered = command(api, table, job, "status")
+    for field in ("phase", "cursor", "scanned_rows", "prepared_artifacts"):
+        assert recovered[field] == state[field]
+    assert finish(api, table, job, status=recovered)["phase"] == "complete"
+    assert nearest(api, table, "model_a", [1, 0, 0]) == ["a", "b"]
+    assert nearest(api, table, "model_b", [0, 1, 0]) == ["a", "b"]
+
+
 def test_online_vector_migration_cancellation_reopens_inline_authority(stateful_api):
     api = stateful_api
     table = f"cancel_migrate_{time.time_ns()}"

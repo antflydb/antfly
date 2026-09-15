@@ -426,6 +426,24 @@ def main():
                 response.raise_for_status()
                 return time.monotonic() - begin
 
+            def measure_workload():
+                cells = []
+                for concurrency in (1, 8, 32):
+                    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                        list(pool.map(measured, range(128)))
+                        begin = time.monotonic()
+                        latencies = list(pool.map(measured, range(args.query_count)))
+                        seconds = time.monotonic() - begin
+                    cells.append(
+                        {
+                            "concurrency": concurrency,
+                            "qps": args.query_count / seconds,
+                            "p50_ms": float(np.percentile(latencies, 50) * 1000),
+                            "p99_ms": float(np.percentile(latencies, 99) * 1000),
+                        }
+                    )
+                return cells
+
             for measurement, active_payloads in (
                 ("queries", payloads),
                 ("full_text_queries", [full_text_payload]),
@@ -438,21 +456,7 @@ def main():
                     ],
                 ),
             ):
-                result[measurement] = []
-                for concurrency in (1, 8, 32):
-                    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                        list(pool.map(measured, range(128)))
-                        begin = time.monotonic()
-                        latencies = list(pool.map(measured, range(args.query_count)))
-                        seconds = time.monotonic() - begin
-                    result[measurement].append(
-                        {
-                            "concurrency": concurrency,
-                            "qps": args.query_count / seconds,
-                            "p50_ms": float(np.percentile(latencies, 50) * 1000),
-                            "p99_ms": float(np.percentile(latencies, 99) * 1000),
-                        }
-                    )
+                result[measurement] = measure_workload()
             result["after"] = api("GET", f"/tables/{table}")
             stop_server()
             started = time.monotonic()
@@ -461,6 +465,8 @@ def main():
             query(queries[0])
             result["warm_restart_seconds"] = time.monotonic() - started
             result["restart"] = api("GET", f"/tables/{table}")
+            active_payloads = payloads
+            result["restart_queries"] = measure_workload()
             reclaim_started = time.monotonic()
             deadline = reclaim_started + 180
             result["source_reclamation_complete"] = False
