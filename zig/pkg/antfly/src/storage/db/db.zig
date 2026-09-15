@@ -212,7 +212,7 @@ fn standaloneResourceManagerOptionsForTotal(alloc: Allocator, total: u64) resour
     return options;
 }
 
-fn standaloneResourceManagerOptions(alloc: Allocator) resource_manager_mod.Options {
+pub fn standaloneResourceManagerOptions(alloc: Allocator) resource_manager_mod.Options {
     return standaloneResourceManagerOptionsForTotal(alloc, process_memory_mod.systemEnvelope().limit_bytes);
 }
 

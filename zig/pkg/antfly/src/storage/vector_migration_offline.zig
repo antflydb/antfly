@@ -238,6 +238,33 @@ pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Req
     target_options.start_index_workers = false;
     target_options.start_optional_runtimes = false;
     target_options.start_optional_runtime_workers = false;
+    // Offline opens do not inherit the server's shared block cache. Verification
+    // rereads current artifacts and candidate keys in adjacent compressed
+    // blocks; retain that bounded working set instead of rereading/decompressing
+    // a block for each point check. Preserve caller-supplied caches and budgets.
+    const resources = @import("resource_manager.zig");
+    const lsm = @import("lsm_backend/mod.zig");
+    var owned_manager: ?*resources.ResourceManager = null;
+    defer if (owned_manager) |manager| {
+        manager.deinit(alloc);
+        alloc.destroy(manager);
+    };
+    var owned_cache: ?lsm.Cache = null;
+    defer if (owned_cache) |*cache| cache.deinit();
+    const configured_cache = target_options.lsm_cache orelse switch (target_options.primary_backend) {
+        .lsm, .lsm_memory => |options_value| options_value.cache,
+        else => null,
+    };
+    if (configured_cache == null) {
+        if (target_options.resource_manager == null) {
+            const manager = try alloc.create(resources.ResourceManager);
+            manager.* = resources.ResourceManager.init(db.standaloneResourceManagerOptions(alloc));
+            owned_manager = manager;
+            target_options.resource_manager = manager;
+        }
+        owned_cache = try lsm.Cache.initFallible(alloc, 64 * 1024 * 1024);
+        target_options.lsm_cache = &owned_cache.?;
+    }
     {
         var target = try db.DB.open(alloc, staged.path(), target_options);
         defer target.close();

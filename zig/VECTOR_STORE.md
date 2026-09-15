@@ -208,6 +208,9 @@ qualification; old inline payloads are not retained indefinitely for rollback.
 ### Offline operator
 
 The same `antfly storage migrate` subcommand supports stopped-server migration.
+The offline candidate uses a 64 MiB shared LSM block cache for repeated
+verification point reads when the caller has not supplied a cache. It shares the
+normal standalone memory budget and is released after the candidate closes.
 Stop standalone, then run:
 
 ```sh

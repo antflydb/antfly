@@ -192,3 +192,13 @@ allocations: about 6.5× faster for this operation. This does not establish an
 end-to-end migration speedup. Logs, results, source snapshots and test binaries
 are retained under `fd-cache-hit/` in the implementation result root. The
 baseline intentionally fails the newly added allocation-free assertion.
+
+The offline candidate also now supplies a 64 MiB shared LSM block cache when
+none was supplied by the caller. Standalone serving already supplies a shared
+cache, but a direct offline DB open did not. Repeated current-value and candidate
+checks could therefore reload/decompress adjacent blocks for each artifact.
+The operator cache uses the same standalone resource policy, participates in
+memory admission, and is destroyed after the candidate closes. Caller caches
+and resource managers take precedence. All 12 DB migration tests pass with this
+change, including offline resume/copy/publication faults. Its end-to-end effect
+is pending the final comparison; it is distinct from the descriptor microbench.
