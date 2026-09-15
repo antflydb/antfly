@@ -181,9 +181,7 @@ def main():
                 stderr=subprocess.STDOUT,
                 env=env,
             )
-            reclaim_started = time.monotonic()
-            deadline = reclaim_started + 180
-            result["source_reclamation_complete"] = False
+            deadline = time.monotonic() + 120
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise RuntimeError(f"server exited: {arm / 'server.log'}")
