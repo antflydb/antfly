@@ -1165,6 +1165,12 @@ const LocalStandaloneMetadata = struct {
 
         var lease = if (self.ha_catalog_server) |server| server.ha_mutation_barrier.acquireShared() else null;
         defer if (lease) |*value| value.release();
+        if (self.ha_catalog_server) |server| {
+            // Standby apply takes the HA transition lock before this catalog
+            // lock. Reject non-writers through the lock-free role gate before
+            // taking either lock; append/ack still recheck primary authority.
+            try server.ha_public_gate_state.checkWrite(server.ha_public_gate_state.currentGeneration());
+        }
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (self.findTableByNameLocked(table_name) != null) {
@@ -8785,6 +8791,41 @@ test "standalone runtime data dir overrides common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/from-cli/data/catalog.txt", resolved.replica_catalog_path);
     try std.testing.expectEqualStrings("/tmp/from-cli/metadata/local-metadata.json", resolved.local_metadata_catalog_path);
     try std.testing.expectEqualStrings("/tmp/from-cli/data/snapshots", resolved.snapshot_root_dir);
+}
+
+test "standalone standby catalog create rejects before contended locks" {
+    const alloc = std.testing.allocator;
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server: antfly.data.runtime.DataServer = undefined;
+    server.ha_public_gate_state = .{};
+    server.ha_public_gate_state.configureStandby(.{ .received_lsn = 1, .applied_lsn = 1, .safe_read_lsn = 1 });
+    server.ha_mutation_barrier = .{};
+    server.ha_state_mutex = .unlocked;
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, "unused-catalog"),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+        .ha_catalog_server = &server,
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(antfly.public_api.tables.deriveTableRecord("existing", .{}));
+    // Model apply owning the HA lock while another catalog operation owns the
+    // catalog lock. Neither new nor repeated creates may wait for either lock.
+    lockAtomic(&server.ha_state_mutex);
+    defer server.ha_state_mutex.unlock();
+    lockAtomic(&metadata.mutex);
+    defer metadata.mutex.unlock();
+    for ([_][]const u8{ "new_table", "existing" }) |name| {
+        try std.testing.expectError(error.HAReadOnlyStandby, LocalStandaloneMetadata.createTable(&metadata, alloc, name, .{}));
+    }
 }
 
 test "standalone metadata rolls back an undurable catalog mutation" {

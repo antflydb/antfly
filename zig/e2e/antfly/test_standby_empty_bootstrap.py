@@ -40,6 +40,15 @@ def _bootstrap_empty(cluster: HACluster) -> None:
     # the continuous mutation guard. The fixture also enables RemoteApply
     # with one required standby and a blocking failure policy.
     cluster.configure_table_identity(shard_id=0, table_id=0)
+    # Match the operator, which preloads the sync policy on the standby for
+    # promotion. Standby create rejection must not depend on an async policy.
+    cluster.standby.extra_runtime_args = [
+        "--hot-standby-sync-mode", "remote_apply",
+        "--hot-standby-sync-selection", "first",
+        "--hot-standby-sync-required", "1",
+        "--hot-standby-sync-standby", "standby-a",
+        "--hot-standby-sync-failure", "block",
+    ]
     capture_root = cluster.primary.ha_root / "seed-captures"
     cluster.primary.extra_runtime_args = ["--hot-standby-seed-capture-root", str(capture_root)]
     cluster.primary.start()

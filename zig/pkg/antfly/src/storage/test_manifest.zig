@@ -194,6 +194,7 @@ comptime {
     _ = @import("hot_standby/seed_capture.zig");
     _ = @import("hot_standby/seed_namespace_control.zig");
     _ = @import("hot_standby/seed_prefix_cleanup_test.zig");
+    _ = @import("hot_standby/seed_topology.zig");
     _ = @import("hot_standby/session.zig");
     _ = @import("hot_standby/slot_store.zig");
     _ = @import("hot_standby/standby.zig");
