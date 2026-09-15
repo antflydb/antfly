@@ -40,6 +40,7 @@ pub const Error = operation.ApiError || error{
     HierarchyCursorStale,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
+    ReadIndexTimeout,
     QueryCandidateBudgetExceeded,
     GraphExploredEdgesBudgetExceeded,
     GraphExploredEdgeBytesBudgetExceeded,
@@ -160,6 +161,10 @@ pub const Operations = struct {
             error.GenerationTransitionActive => error.GenerationTransitionActive,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
             error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
+            // A bounded Raft quorum/apply wait is a retryable availability
+            // outcome, independent of the caller's request deadline. Preserve
+            // its identity so remote and local reads have the same contract.
+            error.ReadIndexTimeout => error.ReadIndexTimeout,
             error.CatalogRoutingUnavailable,
             error.CatalogProjectionRefreshRequired,
             => error.Unavailable,

@@ -23,13 +23,39 @@ run artifacts `vopr-run-ha-scaling--1` and `vopr-diagnostics-ha-scaling--1`.
 Several earlier merge observations report `UnknownGroup`; that alone does not
 identify the later lookup error.
 
-Test-linked executables suppress the HTTP transport's stderr diagnostics to
-preserve the Zig test protocol, so the generic 500 omitted its private error
-identity. Replay debugger diagnostics now inspect ingress errors before their
-request tasks unwind. The original Linux replay is being investigated; native
-macOS replay diverges at the first scheduled task and is not reproduction proof.
-The cause and correction remain pending; the restore-publication fix must not
-be assumed to resolve this finding without evidence.
+The [original Linux diagnostic replay](https://github.com/antflydb/antfly/actions/runs/34913890221)
+captured `ReadIndexTimeout` in the HTTP transport's concrete error argument for
+`GET /db/v1/tables/tenant_b_docs/documents/tenant%3Aq`. The adversarial suffix
+advances time by roughly a minute while tasks remain pending. The production
+Raft read barrier correctly expires without returning an unproven read, but
+the public lookup adapter omitted this availability error and emitted generic
+HTTP 500. This request reads the separate tenant table; the preceding sibling
+merge and its `UnknownGroup` observations do not establish a merge defect.
+
+Test-linked executables suppress HTTP stderr to preserve Zig's test protocol.
+The debugger now captures the transport function's concrete error argument,
+numeric value, and request without changing the retained executable or its
+schedule. An ingress-only breakpoint missed inlined code; a source-line
+breakpoint exposed the error-union discriminant rather than the error payload.
+Symbol-based transport diagnostics avoid both problems. Native macOS replay of
+this Linux trace diverges at the first scheduled task and is not reproduction
+proof.
+
+The fix preserves `ReadIndexTimeout` through typed internal read operations,
+internal HTTP responses, and client decoding. Public lookup and pre-stream scan
+return HTTP 503 with `Retry-After: 1`, using their existing group-unavailable
+response. Explicit request deadlines remain HTTP 504, and unexpected storage
+errors still propagate as failures. The Raft barrier's quorum/apply requirement
+and timeout budget are unchanged.
+
+The focused public-read regression failed on the baseline with
+`ReadIndexTimeout` (one executed test, zero leaks). It now exercises lookup and
+scan, the typed internal lookup and its HTTP/client round trip, explicit
+deadline handling, and fail-closed corruption handling. Existing production
+DataServer VOPR coverage also forces a real read-barrier timeout by pausing Raft
+drivers and verifies that no waiter remains. The updated public API parity suite
+passed all 192 tests with zero skips, failures, or leaks. Final Linux CI and
+full-soak qualification remain pending.
 
 ## 2026-09-14: restore publication races storage-owner users (#704)
 
