@@ -5100,6 +5100,8 @@ test "listener cancellation exits without accept error or retry" {
         .host = "127.0.0.1",
         .port = 0,
         .borrow_http_runtime_io = true,
+        // No connection is accepted, so this test needs no native H1 observer.
+        .h1_disconnect_cancellation = .disabled,
     });
     defer server.deinit();
     Fake.server = &server;

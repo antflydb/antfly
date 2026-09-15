@@ -48859,7 +48859,9 @@ fn implementationTests() type {
                     "docs",
                     .{
                         .indexes_json = managed_indexes_json,
-                        .schema_json = "{}",
+                        // Only the index changes; retain the schema installed
+                        // from the catalog default during the initial write.
+                        .schema_json = tables_api.default_schema_json,
                     },
                     &observations,
                 );
