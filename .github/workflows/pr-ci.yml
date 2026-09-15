@@ -149,3 +149,36 @@ jobs:
             for (const suite of JSON.parse(needs.approve.outputs.suites)) {
               if (needs[suite]?.result !== 'success') throw new Error(`${suite} did not pass`);
             }
+
+  publish:
+    name: Publish PR CI check
+    needs: result
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: pr-ci-state-${{ inputs.pr_number }}
+      queue: max
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+      pull-requests: read
+      issues: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CHECK_ID: ${{ inputs.check_id }}
+          COMMENT_ID: ${{ inputs.comment_id }}
+          RESULT: ${{ needs.result.result }}
+        with:
+          script: |
+            const {main} = require('./.github/scripts/pr-ci.cjs');
+            await main({github, context, core, mode: 'complete',
+              config: require('./.github/scripts/pr-ci-config.json')});

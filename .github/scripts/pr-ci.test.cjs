@@ -50,6 +50,7 @@ function fixture() {
       cancelWorkflowRun: async ({run_id}) => {cancelled.push(run_id);},
       createWorkflowDispatch: async data => {dispatches.push(data);},
       listJobsForWorkflowRun: async () => jobs,
+      getWorkflowRun: async () => ({data: structuredClone(context.payload.workflow_run)}),
     },
   }, paginate: async (method, args) => method(args)};
   const core = {setOutput: (k,v) => {outputs[k]=v;}, notice: msg => notices.push(msg)};
@@ -313,4 +314,28 @@ test('approval after waiting or successful CI creates a fresh consumable check',
   await f.call(); assert.equal(f.dispatches[1].inputs.check_id,'3');
   f.env.CHECK_ID='3'; await f.call('admit'); await f.call('verify');
   await f.call(); assert.equal(f.dispatches.length,2);
+});
+
+test('trusted finalizer publishes without a workflow_run event and rechecks the result', async () => {
+  for (const success of [true, false]) {
+    const f=fixture(); await f.call(); await f.call('admit');
+    f.finish(); f.context.eventName='workflow_dispatch';
+    f.context.payload.workflow_run.conclusion=null;
+    f.env.RESULT=success?'success':'failure';
+    await f.call('complete');
+    assert.equal(f.checks[0].conclusion,success?'success':'failure');
+  }
+  const f=fixture(); await f.call(); await f.call('admit');
+  f.finish(); f.context.eventName='workflow_dispatch'; f.env.RESULT='success';
+  f.jobs([]); await f.call('complete');
+  assert.equal(f.checks[0].conclusion,'failure');
+});
+
+test('finalizer rejects other approval inputs and cannot restore a revoked check', async () => {
+  const f=fixture(); await f.call(); await f.call('admit'); f.finish();
+  f.context.eventName='workflow_dispatch'; f.env.RESULT='success'; f.env.CHECK_ID='2';
+  await assert.rejects(f.call('complete'),/does not match/);
+  f.env.CHECK_ID='1';
+  f.checks[0].output.text=JSON.stringify({...JSON.parse(f.checks[0].output.text),revoked:true});
+  await f.call('complete'); assert.notEqual(f.checks[0].conclusion,'success');
 });
