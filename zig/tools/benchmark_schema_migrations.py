@@ -205,6 +205,11 @@ def run_comparison(args, result, binaries):
                     "Timed out; stop before running another cluster and inspect the recorded log."
                 )
 
+    if any(run["exit_code"] != 0 for run in result["runs"]):
+        raise SystemExit(
+            "One or more workload runs failed; inspect the retained observations and logs."
+        )
+
 
 if __name__ == "__main__":
     main()

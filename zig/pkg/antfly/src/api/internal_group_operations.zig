@@ -329,6 +329,9 @@ pub const Operations = struct {
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(table_name, input.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
+            // Validation precedes writer admission. Preserve its explicit
+            // not-proposed outcome when the catalog's bounded capacity is busy.
+            error.ResourceTemporarilyUnavailable => return error.Unavailable,
             else => {
                 std.log.err("routed Raft batch validation failed group_id={} table={s} err={s}", .{
                     group_id,
@@ -1416,6 +1419,7 @@ fn consumerTests() type {
                 cancellation_signal: *const std.atomic.Value(bool),
                 calls: usize = 0,
                 fail_identity: bool = false,
+                validation_error: ?anyerror = null,
                 visibility_error: ?anyerror = null,
                 saw_unfenced_split: bool = false,
                 saw_unfenced_merge: bool = false,
@@ -1423,7 +1427,7 @@ fn consumerTests() type {
 
                 fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    _ = self;
+                    if (self.validation_error) |err| return err;
                     try std.testing.expectEqualStrings("documents", table_name);
                     try std.testing.expectEqual(@as(usize, 0), writes.len);
                 }
@@ -1487,6 +1491,11 @@ fn consumerTests() type {
             );
             try std.testing.expectEqual(@as(u32, 0), result.inserted);
             try std.testing.expectEqual(@as(usize, 1), state.calls);
+
+            state.validation_error = error.ResourceTemporarilyUnavailable;
+            try std.testing.expectError(error.Unavailable, operations.routedBatch(std.testing.allocator, request, 17, "documents", .{}, forwarding));
+            try std.testing.expectEqual(@as(usize, 1), state.calls);
+            state.validation_error = null;
 
             state.fail_identity = true;
             try std.testing.expectError(error.DocIdentityNamespaceMismatch, operations.routedBatch(

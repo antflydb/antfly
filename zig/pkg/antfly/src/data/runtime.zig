@@ -20004,6 +20004,7 @@ const RemoteMetadataSource = struct {
     cached_routing_snapshot: ?*RoutingSnapshotCacheEntry = null,
     cached_routing_snapshot_at_ms: u64 = 0,
     authoritative_routing_generation: ?*antfly.public_api.table_catalog.RoutingGeneration = null,
+    snapshot_refresh_mutex: std.atomic.Mutex = .unlocked,
     routing_refresh_mutex: std.atomic.Mutex = .unlocked,
     // Incremented only by authoritative replacement or invalidation. An
     // ordinary snapshot request captures this before I/O and may not publish
@@ -20514,7 +20515,10 @@ const RemoteMetadataSource = struct {
     }
 
     fn fetchSnapshotForHead(self: *RemoteMetadataSource, head: antfly.metadata_api.MetadataHead) !antfly.metadata_api.AdminSnapshot {
-        return try self.fetchSnapshotForHeadWithBudget(head, null);
+        return try self.fetchSnapshotForHeadWithBudget(head, .{
+            .deadline_ns = self.awakeNs() +| remote_metadata_snapshot_timeout_ns,
+            .io = self.io,
+        });
     }
 
     fn fetchSnapshotForHeadWithBudget(
@@ -20522,9 +20526,23 @@ const RemoteMetadataSource = struct {
         head: antfly.metadata_api.MetadataHead,
         budget: ?antfly.metadata_http_client.RequestBudget,
     ) !antfly.metadata_api.AdminSnapshot {
-        try ensureBudgetActive(budget);
+        // Coalesce concurrent control-plane cache misses. Waiting callers keep
+        // their own deadline/cancellation and recheck the published generation;
+        // authoritative reads retain their separate fencing semantics.
+        while (true) {
+            try ensureBudgetActive(budget);
+            if (self.snapshot_refresh_mutex.tryLock()) break;
+            try self.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        defer self.snapshot_refresh_mutex.unlock();
         const now_ms = self.awakeMs();
         lockAtomic(&self.cache_mutex);
+        if (self.cached_head) |current_head| {
+            if (!std.meta.eql(current_head, head)) {
+                self.cache_mutex.unlock();
+                return error.MetadataSnapshotHeadMismatch;
+            }
+        }
         const observed_fence_generation = self.snapshot_fence_generation;
         if (self.cached_snapshot) |snapshot| {
             const cached_snapshot_head = snapshotHead(&snapshot);
@@ -36902,6 +36920,71 @@ fn consumerTests() type {
             source.noteMetadataReadSuccess(1);
             try std.testing.expectEqual(@as(usize, 2), source.metadataApiIndexForAttempt(0));
             try std.testing.expectEqual(@as(usize, 1), source.metadataReadApiIndexForAttempt(0));
+        }
+
+        test "remote metadata snapshot refresh waiters share publication and retain their budgets" {
+            var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+            defer backend_runtime.deinit();
+            var source = try RemoteMetadataSource.init(std.testing.allocator, &.{"http://metadata.invalid"}, backend_runtime.ptr().apiIoImpl().?);
+            defer source.deinit();
+            const snapshot = antfly.metadata_api.AdminSnapshot{
+                .status = .{ .metadata_group_id = 9, .metadata_incarnation = "11111111111111111111111111111111".*, .metadata_epoch = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+            const Worker = struct {
+                source: *RemoteMetadataSource,
+                head: antfly.metadata_api.MetadataHead,
+                budget: antfly.metadata_http_client.RequestBudget,
+                done: std.atomic.Value(bool) = .init(false),
+                failure: ?anyerror = null,
+                fn run(self: *@This()) void {
+                    defer self.done.store(true, .release);
+                    var fetched = self.source.fetchSnapshotForHeadWithBudget(self.head, self.budget) catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                    defer freeAdminSnapshotOwned(std.testing.allocator, &fetched);
+                    if (fetched.status.metadata_group_id != self.head.metadata_group_id) self.failure = error.TestUnexpectedResult;
+                }
+            };
+            for (0..3) |mode| {
+                var cancellation = antfly.raft.transport.http_common.RequestCancellation{};
+                var worker: Worker = .{
+                    .source = &source,
+                    .head = RemoteMetadataSource.snapshotHead(&snapshot),
+                    .budget = .{ .deadline_ns = source.awakeNs() + (if (mode == 1) @as(u64, 10 * std.time.ns_per_ms) else std.time.ns_per_s), .io = source.io, .cancellation = &cancellation },
+                };
+                lockAtomic(&source.snapshot_refresh_mutex);
+                var locked = true;
+                defer if (locked) source.snapshot_refresh_mutex.unlock();
+                var task = try std.testing.io.concurrent(Worker.run, .{&worker});
+                // Complete a refresh while its follower is queued. The follower
+                // must use this publication, without touching the invalid URL.
+                if (mode == 0) {
+                    std.testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
+                    var published = try source.acceptObservedSnapshot(try cloneAdminSnapshotOwned(std.testing.allocator, snapshot), worker.head, source.snapshot_fence_generation, source.awakeMs());
+                    freeAdminSnapshotOwned(std.testing.allocator, &published);
+                } else {
+                    if (mode == 2) cancellation.cancel();
+                    const watchdog = source.awakeNs() + std.time.ns_per_s;
+                    while (!worker.done.load(.acquire) and source.awakeNs() < watchdog) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                }
+                const completed_while_locked = worker.done.load(.acquire);
+                source.snapshot_refresh_mutex.unlock();
+                locked = false;
+                task.await(std.testing.io);
+                if (mode == 0) {
+                    try std.testing.expect(worker.failure == null);
+                } else {
+                    try std.testing.expect(completed_while_locked);
+                    try std.testing.expectEqual(@as(?anyerror, if (mode == 1) error.Timeout else error.Cancelled), worker.failure);
+                }
+            }
         }
 
         test "remote metadata source retries fenced snapshot generations until success" {

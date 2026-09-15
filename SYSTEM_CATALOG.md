@@ -646,6 +646,13 @@ cannot hide remote index status.
 `POST /internal/v1/snapshots/read` transfers an immutable encoded view in pages of
 at most 512 KiB. A token names one capture; the client checks token and total size
 on every page and publishes only the fully decoded view after authority checks.
+Concurrent control snapshot cache misses share one refresh per data node and
+recheck the catalog generation after waiting. Each waiter retains its own deadline
+and cancellation; authoritative snapshots keep their separate publication fences.
+Transfer capture admission retries at most eight times under the original caller
+budget and bounded Retry-After delay. A known transfer token is released using an
+independent one-second cleanup budget even when its caller expires or cancels.
+
 Control and diagnostic transfers use independent admission lanes. A completed
 client releases its token; abandoned tokens expire after 30 seconds. Control views
 have a 16 MiB ceiling and 128 MiB lane budget; diagnostic views have a 64 MiB ceiling

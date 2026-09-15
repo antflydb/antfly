@@ -32,6 +32,7 @@ const raft_routes = @import("../raft/transport/routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const routes = @import("http_routes.zig");
 
+const max_snapshot_admission_retries: usize = 8;
 const max_transport_retries: usize = 1;
 const max_metadata_not_leader_retries: usize = 2;
 const default_request_timeout_ms: u32 = 5_000;
@@ -257,20 +258,34 @@ pub const MetadataHttpClient = struct {
             const body = std.json.Stringify.valueAlloc(self.alloc, request, .{}) catch null;
             if (body) |bytes| {
                 defer self.alloc.free(bytes);
-                var response = self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .timeout_ms = 1000 }, budget) catch null;
+                // Releasing a retained transfer is cleanup, not a continuation of
+                // its caller. Cancellation or expiry must not strand capacity
+                // for the server's entire transfer TTL.
+                var cleanup_budget: RequestBudget = .{ .deadline_ns = 0, .io = if (budget) |value| value.io else null };
+                cleanup_budget.deadline_ns = cleanup_budget.nowNs() +| std.time.ns_per_s;
+                var response = self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .timeout_ms = 1000 }, cleanup_budget) catch null;
                 if (response) |*value| value.deinit(self.alloc);
             }
         };
         var bytes: std.ArrayListUnmanaged(u8) = .empty;
         defer bytes.deinit(self.alloc);
         var total: ?usize = null;
+        var admission_retries: usize = 0;
         while (true) {
             const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
             defer self.alloc.free(body);
             var response = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms }, budget);
             defer response.deinit(self.alloc);
             if (response.status == 413) return error.ResourceRequestTooLarge;
-            if (response.status == 503 and response.header(http_common.metadata_not_leader_header) == null) return error.ResourceTemporarilyUnavailable;
+            if (response.status == 503 and response.header(http_common.metadata_not_leader_header) == null) {
+                // Capture admission is replay-safe: no token has been issued.
+                // Keep one finite retry allowance and the original deadline.
+                if (request.token != 0 or admission_retries >= max_snapshot_admission_retries)
+                    return error.ResourceTemporarilyUnavailable;
+                admission_retries += 1;
+                try waitBeforeMetadataMutationRetry(metadataAuthorityRetryDelayNs(response), budget, if (budget) |value| value.cancellation else null);
+                continue;
+            }
             try mapResponseStatus(response, error.InvalidRequest, error.UnsupportedOperation, error.CatalogGenerationChanged);
             const token = try std.fmt.parseInt(u64, response.header("X-Antfly-Snapshot-Token") orelse return error.InvalidResponse, 10);
             const size = try std.fmt.parseInt(usize, response.header("X-Antfly-Snapshot-Bytes") orelse return error.InvalidResponse, 10);
@@ -2594,6 +2609,63 @@ fn consumerTests() type {
             _ = try client.fetchLinearizableHead("http://127.0.0.1:9000");
             try std.testing.expectEqual(@as(usize, 1), executor.public_calls);
             try std.testing.expectEqual(@as(usize, 1), executor.internal_calls);
+        }
+
+        test "metadata http client paged snapshot bounds admission and releases after cancellation" {
+            const Capture = struct {
+                const Mode = enum { complete, cancel, exhausted };
+                mode: Mode,
+                cancellation: *http_common.RequestCancellation,
+                captures: usize = 0,
+                releases: usize = 0,
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    var request = try std.json.parseFromSlice(snapshot_transfer.Request, alloc, req.body, .{});
+                    defer request.deinit();
+                    try std.testing.expect(request.value.control);
+                    if (request.value.release) {
+                        try std.testing.expectEqual(@as(u64, 2), request.value.token);
+                        try std.testing.expect(req.cancellation == null);
+                        try std.testing.expect(req.timeout_ms.? <= 1000);
+                        self.releases += 1;
+                        return .{ .status = 200, .body = try alloc.dupe(u8, "") };
+                    }
+                    self.captures += 1;
+                    try std.testing.expectEqual(@as(u64, 0), request.value.token);
+                    if (self.captures == 1 or self.mode == .exhausted) {
+                        const headers = try alloc.alloc(http_common.Header, 1);
+                        headers[0] = .{ .name = try alloc.dupe(u8, "Retry-After"), .value = try alloc.dupe(u8, "0") };
+                        return .{ .status = 503, .headers = headers, .body = try alloc.dupe(u8, "capacity exhausted") };
+                    }
+                    const snapshot =
+                        \\{"status":{"metadata_group_id":91,"metadata_epoch":3,"metrics":{}},"tables":[],"ranges":[],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
+                    ;
+                    const headers = try alloc.alloc(http_common.Header, 2);
+                    headers[0] = .{ .name = try alloc.dupe(u8, "X-Antfly-Snapshot-Token"), .value = try alloc.dupe(u8, "2") };
+                    headers[1] = .{ .name = try alloc.dupe(u8, "X-Antfly-Snapshot-Bytes"), .value = try std.fmt.allocPrint(alloc, "{d}", .{snapshot.len}) };
+                    if (self.mode == .cancel) self.cancellation.cancel();
+                    return .{ .status = 200, .headers = headers, .body = try alloc.dupe(u8, if (self.mode == .cancel) snapshot[0..1] else snapshot) };
+                }
+            };
+            for ([_]Capture.Mode{ .complete, .cancel, .exhausted }) |mode| {
+                var cancellation = http_common.RequestCancellation{};
+                var capture: Capture = .{ .mode = mode, .cancellation = &cancellation };
+                var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } });
+                const budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s, .cancellation = &cancellation };
+                const result = client.fetchPagedSnapshot("http://metadata.invalid", true, false, budget);
+                switch (mode) {
+                    .complete => {
+                        var parsed = try result;
+                        defer parsed.deinit();
+                        try std.testing.expectEqual(@as(u64, 91), parsed.value.status.metadata_group_id);
+                    },
+                    .cancel => try std.testing.expectError(error.Cancelled, result),
+                    .exhausted => try std.testing.expectError(error.ResourceTemporarilyUnavailable, result),
+                }
+                try std.testing.expectEqual(@as(usize, if (mode == .exhausted) 0 else 1), capture.releases);
+                try std.testing.expectEqual(@as(usize, if (mode == .exhausted) max_snapshot_admission_retries + 1 else 2), capture.captures);
+            }
         }
 
         test "metadata http client fetches one bounded linearizable snapshot" {
