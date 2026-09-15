@@ -8790,11 +8790,25 @@ pub const ApiHttpServer = struct {
                 "reservation_ownership_lost",
             );
         }
-        var writer_lease_future = std.Io.async(
+        var writer_lease_future = std.Io.concurrent(
             io,
             TableBackupWriterLeaseHeartbeat.run,
             .{&writer_lease_heartbeat},
-        );
+        ) catch |err| {
+            return self.rollbackFailedTableBackupAttempt(
+                io,
+                backup_location,
+                location_uri,
+                connection,
+                backup_id,
+                artifact_backup_id,
+                format,
+                writer_lease_role.rollbackWriterStateCleanup(),
+                &operation_control,
+                err,
+                "writer_lease_heartbeat",
+            );
+        };
         var writer_lease_future_running = true;
         defer if (writer_lease_future_running) {
             writer_lease_heartbeat.stop_event.set(io);
@@ -9116,7 +9130,7 @@ pub const ApiHttpServer = struct {
             .expires_at_unix_ns = .init(writer_not_after),
         };
         try writer_lease.ensureOwned();
-        var writer_lease_future = std.Io.async(
+        var writer_lease_future = try std.Io.concurrent(
             io,
             TableBackupWriterLeaseHeartbeat.run,
             .{&writer_lease},
@@ -13514,11 +13528,11 @@ pub const ApiHttpServer = struct {
         // the stored lease, then keep it alive across long shard snapshots.
         trace.enter(.lease_heartbeat);
         lease_heartbeat.ensureOwned() catch |err| return trace.internal(err);
-        var lease_future = std.Io.async(
+        var lease_future = std.Io.concurrent(
             backup_io,
             ClusterBackupMutationLeaseHeartbeat.run,
             .{&lease_heartbeat},
-        );
+        ) catch |err| return trace.internal(err);
         var lease_future_running = true;
         defer if (lease_future_running) {
             lease_heartbeat.stop_event.set(backup_io);
@@ -46683,4 +46697,209 @@ test "query builder dependency 503 responses preserve public retry contract" {
         }
         try std.testing.expect(retry_header);
     }
+}
+
+const BackupHeartbeatTestPath = enum { cluster, table, shard };
+
+fn testBackupHeartbeatCapacity(path: BackupHeartbeatTestPath, reject_concurrent: bool) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/heartbeat-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/heartbeat-backup", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+    var location: backups_api.BackupLocation = .{ .file = try alloc.dupe(u8, backup_root_abs) };
+    defer location.deinit(alloc);
+
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    const io_impl = runtime.apiIoImpl().?;
+    io_impl.async_limit = if (reject_concurrent) .limited(8) else .nothing;
+    io_impl.concurrent_limit = if (reject_concurrent) .nothing else .limited(8);
+    const io = io_impl.io();
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 1,
+    });
+    var writes = table_writes.BoundTableWriteSource.init("docs", &db);
+    const Source = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .linearizable_snapshot = linearizableSnapshot,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            return try adminSnapshot(ptr);
+        }
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 0,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var source = Source{};
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var server = ApiHttpServer.init(alloc, .{
+        .node_config = &node_config,
+        .backend_runtime = &runtime,
+    }, source.iface(), null, writes.source());
+    defer server.deinit();
+    const snapshot = try Source.adminSnapshot(&source);
+    var fence = backups_api.tableBackupFence(&snapshot, &snapshot.tables[0]);
+    const expiration = @as(u64, @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) + backups_api.table_backup_writer_lease_duration_ns;
+    fence.writer_not_after_unix_ns = expiration;
+    const logical_id = "heartbeat-snap";
+    const artifact_id = "afbg-0123456789abcdef0123456789abcdef";
+
+    if (path == .shard) {
+        try backups_api.reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, artifact_id, expiration);
+        if (reject_concurrent) {
+            const outcome = server.executeInternalTableBackupShard(
+                0,
+                "docs",
+                artifact_id,
+                .portable,
+                fence,
+                &location,
+                .{},
+            );
+            const accepted = if (outcome) |unexpected| accepted: {
+                freeBackupShards(alloc, unexpected);
+                break :accepted true;
+            } else |err| accepted: {
+                try std.testing.expectEqual(error.ConcurrencyUnavailable, err);
+                break :accepted false;
+            };
+            std.debug.print("BACKUP_HEARTBEAT_SHARD expects rejected concurrent admission\n", .{});
+            try std.testing.expect(!accepted);
+            try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(alloc, io, &location, artifact_id, expiration));
+            io_impl.concurrent_limit = .limited(8);
+        }
+        const shards = try server.executeInternalTableBackupShard(0, "docs", artifact_id, .portable, fence, &location, .{});
+        defer freeBackupShards(alloc, shards);
+        try std.testing.expectEqual(@as(usize, 1), shards.len);
+        try std.testing.expectEqual(@as(u64, 0), shards[0].group_id);
+        try std.testing.expect(shards[0].artifact_size_bytes > 0);
+        try std.testing.expectEqual(@as(usize, 64), shards[0].artifact_sha256.len);
+        return;
+    }
+    if (path == .table and reject_concurrent) {
+        std.debug.print("BACKUP_HEARTBEAT_TABLE expects ConcurrencyUnavailable\n", .{});
+        try std.testing.expectError(error.ConcurrencyUnavailable, server.backupOwnedTableWithArtifactId(
+            io,
+            &snapshot.tables[0],
+            fence,
+            "docs",
+            &location,
+            location_uri,
+            logical_id,
+            artifact_id,
+            .portable,
+            "test-backups",
+            null,
+            .logical_create,
+            .{},
+        ));
+        const retained = try backups_api.tableBackupAttemptArtifactIdAlloc(alloc, io, &location, logical_id);
+        defer if (retained) |value| alloc.free(value);
+        try std.testing.expect(retained == null);
+        try std.testing.expect(!try backups_api.renewTableBackupWriterLeaseAtLocation(alloc, io, &location, artifact_id, expiration));
+        try std.testing.expect(!try backups_api.manifestExistsAtLocationWithIoAndCancellation(alloc, io, &location, logical_id, .none));
+        io_impl.concurrent_limit = .limited(8);
+    }
+    const body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"{s}\",\"location\":\"{s}\",\"connection\":\"test-backups\",\"format\":\"portable\"}}", .{ logical_id, location_uri });
+    defer alloc.free(body);
+    const uri = if (path == .cluster) "/backup" else "/tables/docs/backup";
+    if (path == .cluster and reject_concurrent) {
+        var failed = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer failed.deinit(alloc);
+        std.debug.print("BACKUP_HEARTBEAT_CLUSTER expects status 500\n", .{});
+        try std.testing.expectEqual(@as(u16, 500), failed.status);
+        try std.testing.expect(!try backups_api.clusterManifestExistsAtLocation(alloc, &location, logical_id));
+        io_impl.concurrent_limit = .limited(8);
+    }
+    var response = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = uri,
+        .content_type = "application/json",
+        .body = body,
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, if (path == .cluster) 200 else 201), response.status);
+    if (path == .cluster) {
+        try std.testing.expect(std.mem.indexOf(u8, response.body, "\"completed\"") != null);
+        var manifest = try backups_api.readClusterManifest(alloc, backup_root_abs, logical_id);
+        defer manifest.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), manifest.tables.len);
+        try std.testing.expectEqualStrings("docs", manifest.tables[0].name);
+    } else {
+        var manifest = try backups_api.readManifest(alloc, backup_root_abs, logical_id);
+        defer manifest.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), manifest.shards.len);
+        try std.testing.expect(manifest.shards[0].artifact_size_bytes > 0);
+    }
+}
+
+test "backup heartbeat public cluster progresses with exhausted async capacity" {
+    try testBackupHeartbeatCapacity(.cluster, false);
+}
+
+test "backup heartbeat public table progresses with exhausted async capacity" {
+    try testBackupHeartbeatCapacity(.table, false);
+}
+
+test "backup heartbeat internal shard progresses with exhausted async capacity" {
+    try testBackupHeartbeatCapacity(.shard, false);
+}
+
+test "backup heartbeat cluster admission failure permits same ID retry" {
+    @import("../test_error_logs.zig").expectErrorLogs(1);
+    try testBackupHeartbeatCapacity(.cluster, true);
+}
+
+test "backup heartbeat table admission failure retires owned writer and reservation" {
+    try testBackupHeartbeatCapacity(.table, true);
+}
+
+test "backup heartbeat shard admission failure preserves coordinator writer" {
+    try testBackupHeartbeatCapacity(.shard, true);
 }
