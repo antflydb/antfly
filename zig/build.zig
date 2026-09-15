@@ -4254,6 +4254,7 @@ pub fn build(b: *std.Build) void {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "backup heartbeat ",
         "model-directed",
         "tool query builder",
         "agent conversation",
