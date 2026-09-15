@@ -72,9 +72,9 @@ pub fn reclaimSliceLocked(backend: anytype) void {
     backend.memtable_reclaim_in_flight = true;
     backend.retainReaderKind(.other);
     const started = clock.monotonicNs();
-    const deadline = backend.coordinationNowNs() +| 2 * std.time.ns_per_ms;
+    const deadline = started +| 2 * std.time.ns_per_ms;
     var credits: usize = 2048;
-    while (credits != 0 and backend.coordinationNowNs() < deadline) {
+    while (credits != 0 and clock.monotonicNs() < deadline) {
         if (backend.memtable_reclaimer == null) {
             const state = backend.retired_memory_head orelse break;
             backend.retired_memory_head = state.retired_next;

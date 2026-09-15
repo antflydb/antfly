@@ -2058,7 +2058,7 @@ pub const ProvisionedTableWriteCache = struct {
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror = null,
     table_eviction_hook: ?TableEvictionHook = null,
     state_mutex: ?*std.atomic.Mutex = null,
-    open_mutex: Io.Mutex = .init,
+    open_mutex: std.atomic.Mutex = .unlocked,
     entry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     hit_count: std.atomic.Value(u64) = .init(0),
     miss_count: std.atomic.Value(u64) = .init(0),
@@ -2542,32 +2542,32 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     pub fn setResolutionCandidateSource(self: *ProvisionedTableWriteCache, source: ?db_mod.CandidateSource) void {
-        self.lockOpenMutex();
-        defer self.unlockOpenMutex();
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
         if (candidateSourcesEqual(self.resolution_candidate_source, source)) return;
         self.resolution_candidate_source = source;
         self.refreshRuntimeHooksLocked();
     }
 
     pub fn setEntitySink(self: *ProvisionedTableWriteCache, sink: ?db_mod.EntitySink) void {
-        self.lockOpenMutex();
-        defer self.unlockOpenMutex();
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
         if (entitySinksEqual(self.entity_sink, sink)) return;
         self.entity_sink = sink;
         self.refreshRuntimeHooksLocked();
     }
 
     pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSourceContract) void {
-        self.lockOpenMutex();
-        defer self.unlockOpenMutex();
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
         if (promotionLeadershipSourcesEqual(self.promotion_leadership_source, source)) return;
         self.promotion_leadership_source = source;
         self.refreshRuntimeHooksLocked();
     }
 
     fn setHAWriteGate(self: *ProvisionedTableWriteCache, gate: ?db_mod.HAWriteGate) !void {
-        self.lockOpenMutex();
-        defer self.unlockOpenMutex();
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
         if (haWriteGatesEqual(self.ha_write_gate, gate)) return;
         lockAtomic(&self.entry_lifecycle_mutex);
         self.reserveClearCapacityAssumeLifecycleLocked() catch |err| {
@@ -2581,8 +2581,8 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn setHAMirror(self: *ProvisionedTableWriteCache, mirror: ?db_mod.HAAsyncEffectMirror) !void {
-        self.lockOpenMutex();
-        defer self.unlockOpenMutex();
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
         if (haAsyncMirrorsEqual(self.ha_async_mirror, mirror)) return;
         lockAtomic(&self.entry_lifecycle_mutex);
         self.reserveClearCapacityAssumeLifecycleLocked() catch |err| {
@@ -2766,8 +2766,8 @@ pub const ProvisionedTableWriteCache = struct {
     /// lease release into a shutdown deadlock. Active leases are a violated
     /// quiescence contract and must never be converted into use-after-free.
     pub fn closeAllDbsLocked(self: *ProvisionedTableWriteCache) !void {
-        self.lockOpenMutex();
-        defer self.unlockOpenMutex();
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
 
         lockAtomic(&self.entry_lifecycle_mutex);
         for (self.entries.items) |entry| {
@@ -4486,11 +4486,10 @@ pub const ProvisionedTableWriteCache = struct {
                         std.mem.eql(u8, cached, current.indexes_json)
                     else
                         current.indexes_json.len == 0;
-                    const current_schema = if (current.schema_json.len == 0) tables_api.default_schema_json else current.schema_json;
                     const schema_match = if (metadata.schema_json) |cached|
-                        std.mem.eql(u8, cached, current_schema)
+                        std.mem.eql(u8, cached, current.schema_json)
                     else
-                        false;
+                        current.schema_json.len == 0;
                     if (indexes_match and schema_match) return metadata;
                 } else if (metadata.indexes_json == null and metadata.schema_json == null) {
                     return metadata;
@@ -4506,10 +4505,7 @@ pub const ProvisionedTableWriteCache = struct {
         }
 
         const indexes_json = if (table) |current| current.indexes_json else null;
-        const schema_json = if (table) |current|
-            (if (current.schema_json.len == 0) tables_api.default_schema_json else current.schema_json)
-        else
-            null;
+        const schema_json = if (table) |current| current.schema_json else null;
         var replacement = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
         errdefer replacement.deinit(self.alloc);
 
@@ -4704,8 +4700,8 @@ pub const ProvisionedTableWriteCache = struct {
         group_id: u64,
         table_name: []const u8,
     ) void {
-        self.lockOpenMutex();
-        defer self.unlockOpenMutex();
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
         self.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
     }
 
@@ -4721,7 +4717,7 @@ pub const ProvisionedTableWriteCache = struct {
         open_mutex_held: bool,
     ) bool {
         if (!open_mutex_held and !self.open_mutex.tryLock()) return false;
-        defer if (!open_mutex_held) self.unlockOpenMutex();
+        defer if (!open_mutex_held) self.open_mutex.unlock();
         self.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
         lockAtomic(&self.entry_lifecycle_mutex);
         defer self.entry_lifecycle_mutex.unlock();
@@ -4729,8 +4725,8 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn drainPendingClosesForGroup(self: *ProvisionedTableWriteCache, group_id: u64) void {
-        self.lockOpenMutex();
-        defer self.unlockOpenMutex();
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
         while (true) {
             var entry_to_close: ?*Entry = null;
             lockAtomic(&self.entry_lifecycle_mutex);
@@ -4779,22 +4775,9 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn drainPendingCloses(self: *ProvisionedTableWriteCache) void {
-        self.lockOpenMutex();
-        defer self.unlockOpenMutex();
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
         self.drainPendingClosesAssumeOpenMutexHeld();
-    }
-
-    fn openMutexIo(self: *ProvisionedTableWriteCache) Io {
-        if (self.backend_runtime) |runtime| if (runtime.io()) |io| return io;
-        return Io.Threaded.global_single_threaded.io();
-    }
-
-    fn lockOpenMutex(self: *ProvisionedTableWriteCache) void {
-        self.open_mutex.lockUncancelable(self.openMutexIo());
-    }
-
-    fn unlockOpenMutex(self: *ProvisionedTableWriteCache) void {
-        self.open_mutex.unlock(self.openMutexIo());
     }
 };
 
@@ -7798,7 +7781,7 @@ pub const ProvisionedTableWriteSource = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     // Hosted storage shares a process-wide cache whose mutex must fence both
     // foreground opens and persistent dropped-table recovery jobs.
-    dropped_table_cleanup_outer_mutex: ?*Io.Mutex = null,
+    dropped_table_cleanup_outer_mutex: ?*std.atomic.Mutex = null,
     dropped_table_job_owner_mutex: std.atomic.Mutex = .unlocked,
     dropped_table_delete_owner_id: u64 = 0,
     dropped_table_recovery_started: std.atomic.Value(bool) = .init(false),
@@ -8128,8 +8111,8 @@ pub const ProvisionedTableWriteSource = struct {
                 second = null;
             }
 
-            if (first) |cache| cache.lockOpenMutex();
-            if (second) |cache| cache.lockOpenMutex();
+            if (first) |cache| lockAtomic(&cache.open_mutex);
+            if (second) |cache| lockAtomic(&cache.open_mutex);
             lockAtomic(&owner.local_db_mutex);
             if (first) |cache| lockAtomic(&cache.entry_lifecycle_mutex);
             if (second) |cache| lockAtomic(&cache.entry_lifecycle_mutex);
@@ -8180,8 +8163,8 @@ pub const ProvisionedTableWriteSource = struct {
 
         fn releaseOpenLocks(self: *WriteCacheTransitionLocks) void {
             if (!self.open_locked) return;
-            if (self.second) |cache| cache.unlockOpenMutex();
-            if (self.first) |cache| cache.unlockOpenMutex();
+            if (self.second) |cache| cache.open_mutex.unlock();
+            if (self.first) |cache| cache.open_mutex.unlock();
             self.open_locked = false;
         }
 
@@ -8583,8 +8566,8 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         cache: *ProvisionedTableWriteCache,
     ) void {
-        cache.lockOpenMutex();
-        defer cache.unlockOpenMutex();
+        lockAtomic(&cache.open_mutex);
+        defer cache.open_mutex.unlock();
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
         cache.setRuntimeHooksLocked(
@@ -11250,7 +11233,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn tryBeginReadCompatibleGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64, respect_waiters: bool) bool {
+    fn tryBeginReadCompatibleGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
         if (self.retiring_replica_groups.contains(group_id)) return false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
@@ -11258,10 +11241,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             const entry = self.active_table_activities.items[index];
-            // Committed apply may be the prerequisite for a read that queued
-            // structural work is waiting to drain. Only active owners fence it.
-            if (entry.operation_active or entry.generation_preparation_active or
-                (respect_waiters and (entry.operation_waiters > 0 or entry.transition_waiters > 0))) return false;
+            if (entry.operation_active or entry.operation_waiters > 0 or entry.transition_waiters > 0 or entry.generation_preparation_active) return false;
         }
         const entry = self.activityEntryLocked(table_name, group_id);
         entry.operation_active = true;
@@ -11271,7 +11251,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn beginReplicatedApplyOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.tableActivityIo();
-        while (!self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id, false)) {
+        while (!self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id)) {
             self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
         }
     }
@@ -11629,7 +11609,7 @@ pub const ProvisionedTableWriteSource = struct {
         const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
-        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id, true);
+        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
     }
 
     fn tryBeginStartupCatchUpGroupOperation(
@@ -11647,7 +11627,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const admitted = if (advance_index_repairs)
-            self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id, true)
+            self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id)
         else
             self.tryBeginGroupOperationLocked(table_name, group_id);
         if (!advance_index_repairs) {
@@ -11732,7 +11712,7 @@ pub const ProvisionedTableWriteSource = struct {
         // including contention on the activity bookkeeping mutex itself.
         if (!self.table_activity_mutex.tryLock()) return false;
         defer self.table_activity_mutex.unlock(self.tableActivityIo());
-        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id, false);
+        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
     }
 
     fn beginGroupTransitionOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
@@ -12071,7 +12051,7 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_ids: []const u64,
-        open_fence: ?*Io.Mutex,
+        open_fence: ?*std.atomic.Mutex,
         deadline: Io.Clock.Timestamp,
     ) !void {
         const io = self.tableActivityIo();
@@ -13094,9 +13074,9 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
 
-        cache.lockOpenMutex();
+        lockAtomic(&cache.open_mutex);
         var cache_open_locked = true;
-        defer if (cache_open_locked) cache.unlockOpenMutex();
+        defer if (cache_open_locked) cache.open_mutex.unlock();
 
         prepared_open_retry: while (true) {
             while (true) {
@@ -13266,18 +13246,18 @@ pub const ProvisionedTableWriteSource = struct {
                             // coordinated slow path acquires both caches in address
                             // order, then revalidate this prepared open after the
                             // victim has synchronously released its lifetime FDs.
-                            cache.unlockOpenMutex();
+                            cache.open_mutex.unlock();
                             cache_open_locked = false;
                             const cross_cache_evicted = self.reclaimInactiveEntryAcrossWriteCachesForDescriptorPressure(
                                 cache,
                                 group_id,
                                 table_name,
                             ) catch |reclaim_err| {
-                                cache.lockOpenMutex();
+                                lockAtomic(&cache.open_mutex);
                                 cache_open_locked = true;
                                 return reclaim_err;
                             };
-                            cache.lockOpenMutex();
+                            lockAtomic(&cache.open_mutex);
                             cache_open_locked = true;
                             if (!cross_cache_evicted) return err;
                             retry_prepared_open = true;
@@ -17422,12 +17402,12 @@ pub const ProvisionedTableWriteSource = struct {
                     continue;
                 }
             } else {
-                cache.lockOpenMutex();
+                lockAtomic(&cache.open_mutex);
             }
             lockAtomic(&self.local_db_mutex);
             const observed = self.snapshotResidentDbLocked(table_name, group_id, lsm_root_generation);
             self.local_db_mutex.unlock();
-            cache.unlockOpenMutex();
+            cache.open_mutex.unlock();
             if (observed.cached != null) return observed;
         }
         return .{ .open_contended = open_contended };
@@ -21332,7 +21312,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         const open_fence = self.dropped_table_cleanup_outer_mutex;
         var open_fence_held = false;
-        defer if (open_fence_held) open_fence.?.unlock(self.tableActivityIo());
+        defer if (open_fence_held) open_fence.?.unlock();
         const group_ids = contract.group_ids;
         // A durable index repair owns group admission while it advances one
         // bounded build slice. Publish cancellation before waiting for the
@@ -21514,7 +21494,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (read_cache_exclusive) |*exclusive| exclusive.deinit();
         read_cache_exclusive = null;
         if (open_fence_held) {
-            open_fence.?.unlock(self.tableActivityIo());
+            open_fence.?.unlock();
             open_fence_held = false;
         }
         for (group_ids) |group_id| {
@@ -25517,8 +25497,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             // still participates in the publication fence. Take the same
             // open->state order as every structural cache transition so a
             // dropped path cannot be reopened between invalidation and rename.
-            cache.write_cache.lockOpenMutex();
-            defer cache.write_cache.unlockOpenMutex();
+            lockAtomic(&cache.write_cache.open_mutex);
+            defer cache.write_cache.open_mutex.unlock();
             while (true) {
                 lockAtomic(&cache.mutex);
                 var cached = cache.write_cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, .status_only) catch |err| switch (err) {
@@ -25579,8 +25559,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             }
         }
 
-        cache.write_cache.lockOpenMutex();
-        defer cache.write_cache.unlockOpenMutex();
+        lockAtomic(&cache.write_cache.open_mutex);
+        defer cache.write_cache.open_mutex.unlock();
 
         while (true) {
             lockAtomic(&cache.mutex);
@@ -32019,9 +31999,7 @@ fn loadTableManagedMetadata(
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
     const indexes_json = if (table.indexes_json.len == 0) null else try alloc.dupe(u8, table.indexes_json);
     errdefer if (indexes_json) |value| alloc.free(value);
-    // An empty catalog schema still denotes a real default schema. Persist
-    // that manifest during provisioning so later Raft apply needs no catalog.
-    const schema_json = try alloc.dupe(u8, if (table.schema_json.len == 0) tables_api.default_schema_json else table.schema_json);
+    const schema_json = if (table.schema_json.len == 0) null else try alloc.dupe(u8, table.schema_json);
     return .{
         .indexes_json = indexes_json,
         .schema_json = schema_json,
@@ -35815,27 +35793,9 @@ fn consumerTests() type {
             var activity = source.readPreparation().beginRead("docs", .general).?;
             defer activity.deinit();
 
-            const io = source.tableActivityIo();
-            source.table_activity_mutex.lockUncancelable(io);
-            const queued = source.activityEntryLocked("docs", 7001);
-            queued.operation_waiters = 1;
-            queued.transition_waiters = 1;
-            source.table_activity_mutex.unlock(io);
-            defer {
-                source.table_activity_mutex.lockUncancelable(io);
-                defer source.table_activity_mutex.unlock(io);
-                const entry = source.activityEntryLocked("docs", 7001);
-                entry.operation_waiters = 0;
-                entry.transition_waiters = 0;
-                source.pruneTableActivityLocked("docs", 7001);
-            }
-            // A queued transition waits for this read; the read can itself
-            // be waiting for a committed entry. Preserve ordinary queue
-            // priority without fencing that entry behind its own reader.
-            try std.testing.expect(!source.tryBeginReadCompatibleGroupOperation("docs", 7001));
-            try std.testing.expect(source.tryBeginReplicatedApplyOperation("docs", 7001));
+            source.beginReplicatedApplyOperation("docs", 7001);
             defer source.endGroupOperation("docs", 7001);
-            try std.testing.expect(!source.tryBeginReplicatedApplyOperation("docs", 7001));
+
             try std.testing.expect(source.readCompatibleMaintenanceActiveBestEffort("docs", 7001));
         }
 
@@ -57257,7 +57217,7 @@ fn implementationTests() type {
                 fn beforeStructural(ptr: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.before_structural_open_available = self.cache.open_mutex.tryLock();
-                    if (self.before_structural_open_available) self.cache.unlockOpenMutex();
+                    if (self.before_structural_open_available) self.cache.open_mutex.unlock();
                 }
 
                 fn onChange(
@@ -57268,7 +57228,7 @@ fn implementationTests() type {
                     if (kind != .structural) return;
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.callback_open_available = self.cache.open_mutex.tryLock();
-                    if (self.callback_open_available) self.cache.unlockOpenMutex();
+                    if (self.callback_open_available) self.cache.open_mutex.unlock();
                 }
             };
             var probe = Probe{ .cache = &write_cache };
@@ -57466,8 +57426,8 @@ fn implementationTests() type {
             // Even empty queues are inconclusive while another closer owns the open
             // mutex. Both cache roles must honor the same caller-owned deadline.
             for ([_]*ProvisionedTableWriteCache{ &primary, &startup }) |cache| {
-                cache.lockOpenMutex();
-                defer cache.unlockOpenMutex();
+                lockAtomic(&cache.open_mutex);
+                defer cache.open_mutex.unlock();
                 clock = .{};
                 const deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMicroseconds(2500), .clock = .awake });
                 try std.testing.expectError(error.TableWriteDrainTimeout, source.drainDroppedTableWriteCachesWithDeadline("docs", &.{7001}, null, deadline));
@@ -57479,8 +57439,8 @@ fn implementationTests() type {
             }
             // The externally-held fence path is also valid, and an exhausted budget
             // still permits a nonblocking successful drain.
-            primary.lockOpenMutex();
-            defer primary.unlockOpenMutex();
+            lockAtomic(&primary.open_mutex);
+            defer primary.open_mutex.unlock();
             try source.drainDroppedTableWriteCachesWithDeadline("docs", &.{7001}, &primary.open_mutex, Io.Clock.Timestamp.now(io, .awake));
         }
 
@@ -57636,7 +57596,7 @@ fn implementationTests() type {
             };
             // Test both ordinary and externally-fenced sources, including error
             // unwinding: neither may wait indefinitely for the blocked closer.
-            for ([_]?*Io.Mutex{ null, &write_cache.open_mutex }) |fence| {
+            for ([_]?*std.atomic.Mutex{ null, &write_cache.open_mutex }) |fence| {
                 source.dropped_table_cleanup_outer_mutex = fence;
                 defer source.dropped_table_cleanup_outer_mutex = null;
                 var attempt: DropAttempt = .{ .source = &source, .contract = contract };
@@ -58445,7 +58405,7 @@ fn implementationTests() type {
                             .table_id = 7,
                             .name = "docs",
                             .description = "docs table",
-                            .schema_json = "",
+                            .schema_json = tables_api.default_schema_json,
                             .read_schema_json = "",
                             .indexes_json = tables_api.default_indexes_json,
                             .replication_sources_json = "[]",
@@ -58489,10 +58449,6 @@ fn implementationTests() type {
                     .startup_catch_up,
                 );
                 defer startup_owner.deinit(alloc);
-                const local_schema = (try loadLocalTableSchemaJson(alloc, startup_owner.db)) orelse
-                    return error.TestUnexpectedResult;
-                defer alloc.free(local_schema);
-                try std.testing.expectEqualStrings(tables_api.default_schema_json, local_schema);
                 try startup_owner.db.batch(.{
                     .writes = &.{.{ .key = "doc:admitted", .value = "{\"title\":\"already provisioned\"}" }},
                     .timestamp_ns = 1,
@@ -61122,9 +61078,9 @@ fn implementationTests() type {
                 }
             };
 
-            startup_cache.lockOpenMutex();
+            lockAtomic(&startup_cache.open_mutex);
             var open_locked = true;
-            defer if (open_locked) startup_cache.unlockOpenMutex();
+            defer if (open_locked) startup_cache.open_mutex.unlock();
 
             var context = Context{ .source = &source };
             var thread = try std.testing.io.concurrent(Context.run, .{&context});
@@ -61148,7 +61104,7 @@ fn implementationTests() type {
                 return err;
             };
             source.local_db_mutex.unlock();
-            startup_cache.unlockOpenMutex();
+            startup_cache.open_mutex.unlock();
             open_locked = false;
 
             thread.await(std.testing.io);
@@ -61189,8 +61145,8 @@ fn implementationTests() type {
             source.startup_write_cache = &startup_cache;
             source.backend_runtime = &runtime;
 
-            startup_cache.lockOpenMutex();
-            defer startup_cache.unlockOpenMutex();
+            lockAtomic(&startup_cache.open_mutex);
+            defer startup_cache.open_mutex.unlock();
             try std.testing.expectError(
                 error.StorageReadTemporarilyUnavailable,
                 source.residentDbSource().prepareGroupForReadRetry(
@@ -61200,40 +61156,6 @@ fn implementationTests() type {
                     table_reads.backend_current_root_generation,
                 ),
             );
-        }
-
-        test "write cache pending closes yield to the borrowed scheduler" {
-            const Probe = struct {
-                threadlocal var active: ?*@This() = null;
-                cache: *ProvisionedTableWriteCache,
-                waits: usize = 0,
-
-                fn wait(_: ?*anyopaque, _: *const u32, _: u32) void {
-                    const self = active.?;
-                    self.waits += 1;
-                    self.cache.unlockOpenMutex();
-                }
-            };
-            const alloc = std.testing.allocator;
-            var cache = ProvisionedTableWriteCache.init(alloc);
-            var probe = Probe{ .cache = &cache };
-            Probe.active = &probe;
-            defer Probe.active = null;
-            var vtable = std.testing.io.vtable.*;
-            vtable.futexWaitUncancelable = Probe.wait;
-            const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
-            var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{
-                .backend = .manual,
-                .borrowed_io = .{ .general = io },
-            });
-            defer runtime.deinit();
-            cache.backend_runtime = &runtime;
-            defer cache.deinit();
-            try std.testing.expect(cache.open_mutex.tryLock());
-            cache.drainPendingCloses();
-            try std.testing.expectEqual(@as(usize, 1), probe.waits);
-            try std.testing.expect(cache.open_mutex.tryLock());
-            cache.unlockOpenMutex();
         }
 
         test "write cache transition locks use stable cache roles instead of addresses" {
@@ -61273,8 +61195,8 @@ fn implementationTests() type {
             defer read_activity.deinit();
             try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
 
-            startup_cache.lockOpenMutex();
-            defer startup_cache.unlockOpenMutex();
+            lockAtomic(&startup_cache.open_mutex);
+            defer startup_cache.open_mutex.unlock();
             try std.testing.expectError(
                 error.ResidentDbRetryRequired,
                 source.residentDbSource().leaseGroup(

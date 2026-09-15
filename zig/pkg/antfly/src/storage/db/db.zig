@@ -1559,7 +1559,7 @@ const AsyncContext = struct {
     // after admission.
     portable_runtime_activation_pending: std.atomic.Value(bool) = .init(false),
     snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
-    repair_replay_mutex: ?*std.Io.Mutex = null,
+    repair_replay_mutex: ?*std.atomic.Mutex = null,
     repair_sequence: u64 = 0,
     repair_issue_counter: ?*AtomicU64 = null,
     allow_graph_materialization: bool = true,
@@ -2213,7 +2213,7 @@ const EnrichmentAppendContext = struct {
     portable_runtime_activation_pending: ?*const std.atomic.Value(bool) = null,
     snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
-    repair_replay_mutex: ?*std.Io.Mutex = null,
+    repair_replay_mutex: ?*std.atomic.Mutex = null,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
     executor: *derived_executor_mod.Executor,
@@ -2286,7 +2286,7 @@ const BatchExecutionContext = struct {
     portable_runtime_activation_pending: ?*const std.atomic.Value(bool) = null,
     snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
-    repair_replay_mutex: ?*std.Io.Mutex = null,
+    repair_replay_mutex: ?*std.atomic.Mutex = null,
     log_mutex: *std.atomic.Mutex,
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: ?*std.atomic.Value(bool) = null,
@@ -15654,9 +15654,8 @@ pub const DB = struct {
         alloc: Allocator,
         repair_id: u128,
     ) !PinnedIndexRepairSnapshot {
-        const io = self.async_context.io orelse std.Io.Threaded.global_single_threaded.io();
-        self.core.repair_replay_mutex.lockUncancelable(io);
-        defer self.core.repair_replay_mutex.unlock(io);
+        lockAtomic(self.core.repair_replay_mutex);
+        defer self.core.repair_replay_mutex.unlock();
         const location = try self.indexRepairStateLocation();
         var state = try index_repair_state.loadAt(alloc, location);
         defer state.deinit(alloc);
@@ -17212,9 +17211,8 @@ pub const DB = struct {
         // leases are insufficient because two different indexes may complete
         // concurrently.
         const repair_replay_mutex = ctx.repair_replay_mutex orelse return error.DurableIndexRepairStateUnavailable;
-        const io = ctx.io orelse std.Io.Threaded.global_single_threaded.io();
-        repair_replay_mutex.lockUncancelable(io);
-        defer repair_replay_mutex.unlock(io);
+        lockAtomic(repair_replay_mutex);
+        defer repair_replay_mutex.unlock();
         const location = try indexRepairStateLocationContext(ctx);
         var state = try index_repair_state.loadAt(alloc, location);
         defer state.deinit(alloc);
@@ -31908,13 +31906,6 @@ pub const DB = struct {
     }
 
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
-        // These bytes are persisted and compressed, so even an observational
-        // timestamp must use the owner's clock: host-time bytes can change run
-        // sizes and therefore the disk-usage reports used by shard planning.
-        const now_ns: u64 = if (index_manager.io) |io|
-            @intCast(std.math.clamp(std.Io.Clock.awake.now(io).nanoseconds, 0, std.math.maxInt(u64)))
-        else
-            platform_time.monotonicNs();
         if (index_manager.textIndex(index_name)) |entry| {
             // Applied-sequence persistence runs outside the DB apply lock; keep this
             // snapshot cheap and avoid walking full-text segment internals here.
@@ -31923,7 +31914,7 @@ pub const DB = struct {
             return .{
                 .kind = .full_text,
                 .doc_count = text_snapshot.liveDocCount(),
-                .updated_at_ns = now_ns,
+                .updated_at_ns = platform_time.monotonicNs(),
             };
         }
         if (index_manager.denseIndex(index_name)) |entry| {
@@ -31933,7 +31924,7 @@ pub const DB = struct {
                 .doc_count = dense_stats.active_count,
                 .node_count = dense_stats.node_count,
                 .root_node = dense_stats.root_node,
-                .updated_at_ns = now_ns,
+                .updated_at_ns = platform_time.monotonicNs(),
             };
         }
         if (index_manager.sparseIndex(index_name)) |entry| {
@@ -31942,7 +31933,7 @@ pub const DB = struct {
                 .kind = .sparse_vector,
                 .doc_count = sparse_stats.doc_count,
                 .term_count = sparse_stats.term_count,
-                .updated_at_ns = now_ns,
+                .updated_at_ns = platform_time.monotonicNs(),
             };
         }
         if (index_manager.graphIndex(index_name)) |entry| {
@@ -31953,7 +31944,7 @@ pub const DB = struct {
                 .edge_count = graph_stats.edge_count,
                 .graph_counts_pending = graph_stats.counts_pending,
                 .node_count = graph_stats.node_count,
-                .updated_at_ns = now_ns,
+                .updated_at_ns = platform_time.monotonicNs(),
             };
         }
         return null;
@@ -60128,9 +60119,8 @@ fn clampReplayTruncationForRepairPins(
 
 fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
-    const io = ctx.io orelse std.Io.Threaded.global_single_threaded.io();
-    if (ctx.repair_replay_mutex) |mutex| mutex.lockUncancelable(io);
-    defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock(io);
+    if (ctx.repair_replay_mutex) |mutex| lockAtomic(mutex);
+    defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock();
     var effective = sequence;
     // Generated enrichment consumes the same durable replay journal as the
     // managed-index executor, but advances independently. The executor may
@@ -60162,9 +60152,8 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
 }
 
 fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
-    const io = ctx.io orelse std.Io.Threaded.global_single_threaded.io();
-    if (ctx.repair_replay_mutex) |mutex| mutex.lockUncancelable(io);
-    defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock(io);
+    if (ctx.repair_replay_mutex) |mutex| lockAtomic(mutex);
+    defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock();
     if (!ctx.index_manager.hasManagedIndexes()) return;
 
     const managed_indexes = try ctx.index_manager.managedIndexes(ctx.alloc);
@@ -60617,7 +60606,6 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
         self.index_backends,
     );
     defer dest_indexes.deinit();
-    dest_indexes.setIo(self.core.index_manager.io);
     dest_indexes.setRelaxedSplitDurability(true);
     const dest_applied_sequence_checkpoint_path = try apply_state.checkpointPathAlloc(self.alloc, dest_dir);
     defer self.alloc.free(dest_applied_sequence_checkpoint_path);
@@ -60642,20 +60630,6 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     dest_indexes.updateRange(byte_range);
     try range_state_mod.saveRange(dest_store, byte_range);
     try self.core.saveSchemaCloneTo(dest_store);
-    // Replicated apply reopens prepared shards from their local manifest;
-    // it cannot consult metadata while metadata is waiting for that apply.
-    // Keep public validation/provenance alongside the internal runtime schema.
-    const schema_json = try self.core.getStoreValue(self.alloc, public_schema_json_key);
-    defer if (schema_json) |value| self.alloc.free(value);
-    const public_schema_versions = try self.core.store.scanPrefix(self.alloc, public_table_schema.versioned_schema_key_prefix);
-    defer docstore_mod.DocStore.freeResults(self.alloc, public_schema_versions);
-    if (schema_json != null or public_schema_versions.len != 0) {
-        var txn = try dest_store.beginWriteTxn();
-        errdefer txn.abort();
-        if (schema_json) |value| try txn.put(public_schema_json_key, value);
-        for (public_schema_versions) |entry| try txn.put(entry.key, entry.value);
-        try txn.commit();
-    }
     try dest_indexes.seedSplitArtifactCatalogsFrom(dest_store, self.core.index_manager);
 
     const configs = try self.core.listIndexes(self.alloc);
@@ -63346,26 +63320,26 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
     index_name: []const u8,
     applied_sequence: u64,
 ) !bool {
-    std.log.debug(
+    std.log.info(
         "dense projection stable-tip claim evaluating index={s} sequence={}",
         .{ index_name, applied_sequence },
     );
     const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) orelse return false;
     if (checkpoint.status != .rebuilding) return false;
 
-    std.log.debug(
+    std.log.info(
         "dense projection stable-tip target lookup started index={s} sequence={}",
         .{ index_name, applied_sequence },
     );
     const expected_count = (try denseTargetCountForIndexContext(ctx, index_name)) orelse return false;
-    std.log.debug(
+    std.log.info(
         "dense projection stable-tip target lookup completed index={s} sequence={} vectors={}",
         .{ index_name, applied_sequence, expected_count },
     );
     const entry = ctx.index_manager.denseIndex(index_name) orelse return false;
     if (entry.index.stats().active_count != expected_count) return false;
 
-    std.log.debug(
+    std.log.info(
         "dense projection stable-tip finalization started index={s} sequence={} vectors={}",
         .{ index_name, applied_sequence, expected_count },
     );
@@ -94767,32 +94741,7 @@ test "db async replay truncation retains durable enrichment debt" {
         enrichment_runtime_mod.scope_name,
         first_sequence,
     );
-    // Replay truncation must park on the supplied runtime when a repair pin
-    // update owns the fence, so that update can finish on a cooperative lane.
-    const Probe = struct {
-        mutex: *std.Io.Mutex,
-        io: std.Io = undefined,
-        waits: usize = 0,
-
-        fn wait(ptr: ?*anyopaque, _: *const u32, _: u32) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr.?));
-            self.waits += 1;
-            self.mutex.unlock(self.io);
-        }
-
-        fn wake(_: ?*anyopaque, _: *const u32, _: u32) void {}
-    };
-    var probe = Probe{ .mutex = db.core.repair_replay_mutex };
-    var vtable: std.Io.VTable = undefined;
-    vtable.futexWaitUncancelable = Probe.wait;
-    vtable.futexWake = Probe.wake;
-    probe.io = .{ .userdata = &probe, .vtable = &vtable };
-    const original_io = db.async_context.io;
-    db.async_context.io = probe.io;
-    defer db.async_context.io = original_io;
-    try std.testing.expect(probe.mutex.tryLock());
     try truncateReplaySequenceAsync(db.async_context, target_sequence);
-    try std.testing.expectEqual(@as(usize, 1), probe.waits);
 
     const retained = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
     defer {
@@ -122413,11 +122362,6 @@ test "db split prepare and finalize work with durable lsm primary backend" {
     });
     defer db.close();
 
-    const schema_v1 = "{\"version\":1,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true}}}}";
-    const schema_v2 = "{\"version\":2,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true}}}}";
-    try db.setSchemaJson(alloc, schema_v1);
-    try db.setSchemaJson(alloc, schema_v2);
-
     try db.addIndex(.{
         .name = "ft_v1",
         .kind = .full_text,
@@ -122437,14 +122381,6 @@ test "db split prepare and finalize work with durable lsm primary backend" {
         .primary_backend = primary_backend,
     });
     defer split_db.close();
-    const copied_schema = (try split_db.getSchemaJson(alloc)) orelse return error.TestUnexpectedResult;
-    defer alloc.free(copied_schema);
-    try std.testing.expectEqualStrings(schema_v2, copied_schema);
-    const old_schema_key = try public_table_schema.versionedSchemaKeyAlloc(alloc, 1);
-    defer alloc.free(old_schema_key);
-    const copied_old_schema = try split_db.core.store.get(alloc, old_schema_key);
-    defer alloc.free(copied_old_schema);
-    try std.testing.expectEqualStrings(schema_v1, copied_old_schema);
     try std.testing.expectEqualStrings("doc:m", split_db.getRange().start);
     const copied_admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, "ft_v1");
     defer alloc.free(copied_admission_key);
@@ -122488,33 +122424,6 @@ test "db split prepare and finalize work with durable lsm primary backend" {
     });
     defer removed.deinit();
     try std.testing.expectEqual(@as(u32, 0), removed.total_hits);
-}
-
-test "db reopens persisted index status with the borrowed clock" {
-    const Clock = struct {
-        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
-            return .{ .nanoseconds = 123456789 };
-        }
-    };
-    const alloc = std.testing.allocator;
-    var tmp = try TestDirectory.init("db");
-    defer tmp.cleanup();
-    var vtable = std.testing.io.vtable.*;
-    vtable.now = Clock.now;
-    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
-    {
-        var db = try DB.open(alloc, tmp.path(), .{});
-        defer db.close();
-        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-        db.core.index_manager.setIo(io);
-        try db.saveAllLiveIndexStatusSnapshots(alloc);
-        const snapshot = (try db.loadIndexStatusSnapshot(alloc, "g")).?;
-        try std.testing.expectEqual(@as(u64, 123456789), snapshot.updated_at_ns);
-    }
-    var reopened = try DB.open(alloc, tmp.path(), .{ .open_mode = .query_readonly });
-    defer reopened.close();
-    const snapshot = (try reopened.loadIndexStatusSnapshot(alloc, "g")).?;
-    try std.testing.expectEqual(@as(u64, 123456789), snapshot.updated_at_ns);
 }
 
 test "db split prepare survives reopen and finalizes with durable lsm primary backend" {

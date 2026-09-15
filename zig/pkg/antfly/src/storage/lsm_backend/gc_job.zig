@@ -16,7 +16,6 @@
 //! planning. Select the first eligible component in a rotating read-order
 //! sweep: a blocked hot component cannot monopolize collection indefinitely.
 const std = @import("std");
-const work_budget = @import("work_budget.zig");
 const Directory = @import("run_directory.zig").Directory;
 const Closure = @import("closure_job.zig").Job;
 const ResourceManager = @import("../resource_manager.zig").ResourceManager;
@@ -131,9 +130,9 @@ pub const Job = struct {
         const rank = if (start < directory.count()) start else 0;
         return .{ .directory = directory, .cursor = .{ .directory = directory, .rank = rank }, .start_rank = rank, .age = age, .percent = @min(percent, 100), .now = now, .limit = limit };
     }
-    pub fn step(self: *Job, allocator: std.mem.Allocator, credits_arg: usize, deadline: anytype) !bool {
+    pub fn step(self: *Job, allocator: std.mem.Allocator, credits_arg: usize, deadline: u64) !bool {
         var credits = credits_arg;
-        while (credits != 0 and work_budget.before(deadline)) {
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
             if (self.phase == .done) return true;
             credits -= 1;
             switch (self.phase) {

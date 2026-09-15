@@ -1477,11 +1477,6 @@ pub const HttpHost = struct {
         const host = try alloc.create(Host);
         errdefer alloc.destroy(host);
         var host_deps = deps.host;
-        // Transport, host synchronization, and reconciliation deadlines must
-        // use the same supplied runtime, including deterministic deployments.
-        if (deps.backend_runtime) |runtime| if (runtime.io()) |io| {
-            host_deps.io = io;
-        };
         host_deps.runtime_hooks = mergeRuntimeHooks(host_deps.runtime_hooks, transport_stack.runtimeHooks());
         host.* = Host.init(alloc, cfg.host, host_deps);
         errdefer host.deinit();
@@ -3028,9 +3023,6 @@ test "http host reserves service workers through its runtime and rolls back over
     defer if (live) host.deinit();
     try host.start();
     try std.testing.expectEqual(@as(usize, 5), runtime.ptr().laneStats().reserved_workers);
-    const runtime_io = runtime.ptr().io() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(runtime_io.userdata, host.host.deps.io.userdata);
-    try std.testing.expectEqual(runtime_io.vtable, host.host.deps.io.vtable);
     try std.testing.expect(host.transport_stack.driver.sender_io == null);
     try std.testing.expect(host.transport_stack.snapshot_transport.sender_io == null);
     try std.testing.expect(host.listener.?.accept_io == null);

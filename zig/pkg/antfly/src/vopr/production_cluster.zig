@@ -5653,46 +5653,11 @@ pub const Fixture = struct {
         try self.refreshDataServerMetadataSnapshots();
     }
 
-    fn haDrainGraphOwnershipCleanup(self: *Fixture) !void {
-        // DB background metadata workers are disabled in test builds. Drive
-        // their production graph-retirement step before asking merge to expand
-        // a split range; otherwise every replica waits forever for that worker.
-        const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return error.MetadataLeaderUnavailable;
-        const ranges = try self.metadata.?.cluster.node(leader).listProjectedRanges(self.alloc);
-        defer self.metadata.?.cluster.node(leader).freeProjectedRanges(self.alloc, ranges);
-        for (ranges) |range| {
-            if (range.table_id != metadata_vopr.VoprPublicClusterFixture.table_id) continue;
-            for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
-                if (!self.data_server_live[index] or self.data_server_paused[index]) continue;
-                var cached = (try server.write_source.leaseCachedGroupWriter(self.alloc, range.group_id, "docs")) orelse
-                    return error.ProductionHAGraphCleanupWriterMissing;
-                defer cached.deinit(server.write_source.write_cache.?.alloc);
-                for (0..256) |_| {
-                    if (cached.db.core.tryLockApplyExclusive()) {
-                        const progressed = cached.db.core.index_manager.runGraphOwnershipCleanupStep() catch |err| {
-                            cached.db.core.unlockApply();
-                            return err;
-                        };
-                        cached.db.core.unlockApply();
-                        if (!progressed) break;
-                    }
-                    try self.sim.io().sleep(.fromMilliseconds(1), .awake);
-                } else return error.ProductionHAGraphCleanupTimeout;
-            }
-        }
-    }
-
     fn haReconcile(self: *Fixture, workflow: *metadata_workflow.TableWorkflow) !void {
         try self.runOneControlRound();
         for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
             if (self.data_server_live[index] and !self.data_server_paused[index])
-                server.runStoreStatusRoundOnly() catch |err| switch (err) {
-                    // Promotion/restart can change metadata leadership between
-                    // the control round and this report. The next bounded
-                    // reconciliation round refreshes and retries the report.
-                    error.NotLeader, error.MetadataMutationOutcomeUnknown => continue,
-                    else => return err,
-                };
+                try server.runStoreStatusRoundOnly();
         }
         const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return;
         _ = self.metadata.?.cluster.node(leader).reconcileOnceEnsuringLease(workflow.controlLoop()) catch |err| switch (err) {
@@ -5956,7 +5921,6 @@ pub const Fixture = struct {
         self.split_sound = true;
         self.setHAScalingStage(5);
         try self.haVerifyAcknowledged();
-        try self.haDrainGraphOwnershipCleanup();
 
         // Lower utilization through the policy threshold, allowing production
         // planning to pick adjacent ranges and execute its merge protocol.

@@ -12576,10 +12576,8 @@ pub const DataServer = struct {
         );
         const metadata: antfly.public_api.table_writes.StartupCatchUpMetadata = .{
             .indexes_json = table_contract.indexes_json,
-            // Empty is the canonical default contract, not permission to omit
-            // the durable manifest needed by later catalog-free Raft apply.
             .schema_json = if (table_contract.schema_json.len == 0)
-                antfly.public_api.tables.default_schema_json
+                null
             else
                 table_contract.schema_json,
             .identity_namespace = identity_namespace,
@@ -12852,7 +12850,7 @@ pub const DataServer = struct {
                 else
                     table_contract.indexes_json,
                 .schema_json = if (table_contract.schema_json.len == 0)
-                    antfly.public_api.tables.default_schema_json
+                    null
                 else
                     table_contract.schema_json,
                 .identity_namespace = identityNamespaceFromTransitionContract(
@@ -37871,10 +37869,6 @@ fn implementationTests() type {
                 );
                 defer transition_lease.release();
                 try std.testing.expect(transition_lease.db.core.identity_namespace.eql(source_namespace));
-                const local_schema = (try transition_lease.db.getSchemaJson(alloc)) orelse
-                    return error.TestUnexpectedResult;
-                defer alloc.free(local_schema);
-                try std.testing.expectEqualStrings(antfly.public_api.tables.default_schema_json, local_schema);
                 try std.testing.expect(server.backend_runtime != null);
                 try std.testing.expect(
                     transition_lease.db.backend_runtime == server.backend_runtime.?,

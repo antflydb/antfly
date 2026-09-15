@@ -15,7 +15,6 @@
 //! Revalidate stable input identities and dependency coverage without an
 //! unbounded locked walk or a resizing membership hash table.
 const std = @import("std");
-const work_budget = @import("work_budget.zig");
 const Directory = @import("run_directory.zig").Directory;
 const state = @import("state.zig");
 const Member = struct {
@@ -225,10 +224,10 @@ pub const Job = struct {
         const order = state.compareNamespace(.{ .name = a_ns }, .{ .name = b_ns });
         return if (order == .eq) std.mem.order(u8, a, b) else order;
     }
-    pub fn step(self: *Job, allocator: std.mem.Allocator, credits_arg: usize, deadline: anytype) !bool {
+    pub fn step(self: *Job, allocator: std.mem.Allocator, credits_arg: usize, deadline: u64) !bool {
         if (self.done) return true;
         var credits = credits_arg;
-        while (credits != 0 and work_budget.before(deadline)) {
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
             if (self.indices == null) self.indices = try allocator.alloc(usize, self.handles.len);
             if (self.index < self.handles.len) {
                 credits -= 1;

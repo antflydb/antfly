@@ -789,10 +789,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
-            const schema_before_index_load: ?db_mod.SchemaBeforeIndexLoad = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |supplied_schema_json| blk: {
-                // Empty is the default catalog schema; null alone means no
-                // supplied schema. Prepared replicas must retain its manifest.
-                const schema_json = if (supplied_schema_json.len == 0) tables_api.default_schema_json else supplied_schema_json;
+            const schema_before_index_load: ?db_mod.SchemaBeforeIndexLoad = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |schema_json| blk: {
+                if (schema_json.len == 0) break :blk null;
                 var parsed_schema = try tables_api.parseValidatedTableSchema(allocator, schema_json);
                 defer parsed_schema.deinit(allocator);
                 break :blk .{
