@@ -22430,7 +22430,13 @@ pub const ProvisionedTableWriteSource = struct {
             var transition = try self.beginLocalTableGenerationTransitionFromPreparation(table_name);
             errdefer transition.abort();
             defer transition.deinit();
-            try snapshot_source.retireGroupForPublication(group_id, table_name);
+            var publication = try snapshot_source.beginPublication(.{
+                .io = restore_io,
+                .group_id = group_id,
+                .table_name = table_name,
+                .cancellation = plan.cancellation,
+            });
+            defer publication.deinit();
             self.invalidateSharedPathCaches(path);
             try snapshot_source.reconcileRestore(request);
             self.invalidateSharedPathCaches(path);
@@ -22459,7 +22465,18 @@ pub const ProvisionedTableWriteSource = struct {
                 var transition = try self.beginLocalTableGenerationTransitionFromPreparation(table_name);
                 errdefer transition.abort();
                 defer transition.deinit();
-                try snapshot_source.retireGroupForPublication(group_id, table_name);
+                var publication = try snapshot_source.beginPublication(.{
+                    .io = restore_io,
+                    .group_id = group_id,
+                    .table_name = table_name,
+                    .cancellation = plan.cancellation,
+                });
+                defer {
+                    // Snapshot destruction can roll back a partial promotion.
+                    // Finish it before permitting a replacement owner to open.
+                    prepared.deinit();
+                    publication.deinit();
+                }
                 self.invalidateSharedPathCaches(path);
                 try prepared.promote();
 
@@ -23304,7 +23321,15 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer transition.abort();
         defer transition.deinit();
 
-        try snapshot_source.retireGroupForPublication(group_id, table_name);
+        var publication = try snapshot_source.beginPublication(.{
+            .io = self.tableActivityIo(),
+            .group_id = group_id,
+            .table_name = table_name,
+        });
+        defer {
+            prepared.deinit();
+            publication.deinit();
+        }
         self.invalidateSharedPathCaches(path);
         try prepared.promote();
         const durability_uncertain = try prepared.publishPrepared();

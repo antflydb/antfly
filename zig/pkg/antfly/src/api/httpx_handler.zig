@@ -5766,6 +5766,8 @@ pub const AntflyApiHandler = struct {
                 error.LsmRootWriterAlreadyOpen,
                 error.ResidentDbRetryRequired,
                 error.StorageReadTemporarilyUnavailable,
+                error.GenerationTransitionActive,
+                error.StorageBusy,
                 => {
                     var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                     return respondOwnedApiResponse(ctx, &response);
@@ -5854,6 +5856,8 @@ pub const AntflyApiHandler = struct {
             error.LsmRootWriterAlreadyOpen,
             error.ResidentDbRetryRequired,
             error.StorageReadTemporarilyUnavailable,
+            error.GenerationTransitionActive,
+            error.StorageBusy,
             => {
                 var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                 return respondOwnedApiResponse(ctx, &response);
@@ -9614,10 +9618,11 @@ test "httpx antfly lookup route preserves projection and headers" {
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 
-test "httpx antfly reads map missing table errors to not found" {
+test "httpx antfly reads map missing tables and publication contention" {
     const MissingTableReads = struct {
-        fn source() table_reads.TableReadSource {
-            return .{ .ptr = undefined, .vtable = &vtable };
+        failure: anyerror,
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &vtable };
         }
 
         const vtable = table_reads.TableReadSource.VTable{
@@ -9627,18 +9632,19 @@ test "httpx antfly reads map missing table errors to not found" {
         };
 
         fn lookup(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
             _: db_mod.types.LookupOptions,
             _: raft_mod.ReadConsistency,
         ) anyerror!?table_reads.LookupResponse {
-            return error.TableNotFound;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
         }
 
         fn scan(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
@@ -9646,7 +9652,8 @@ test "httpx antfly reads map missing table errors to not found" {
             _: db_mod.types.ScanOptions,
             _: raft_mod.ReadConsistency,
         ) anyerror!?table_reads.ScanResponse {
-            return error.TableNotFound;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
         }
 
         fn query(
@@ -9662,30 +9669,42 @@ test "httpx antfly reads map missing table errors to not found" {
 
     const alloc = std.testing.allocator;
     var status_source = LookupStatusSource{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), MissingTableReads.source(), null);
-    var handler = AntflyApiHandler{ .api_server = &api_server };
+    for ([_]anyerror{ error.TableNotFound, error.GenerationTransitionActive, error.StorageBusy, error.StorageReadTemporarilyUnavailable }) |failure| {
+        var reads = MissingTableReads{ .failure = failure };
+        const missing = failure == error.TableNotFound;
+        var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), null);
+        var handler = AntflyApiHandler{ .api_server = &api_server };
 
-    var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/documents/doc:a");
-    defer request.deinit();
-    var ctx = httpx.Context.init(alloc, undefined, &request);
-    defer ctx.deinit();
+        var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/documents/doc:a");
+        defer request.deinit();
+        var ctx = httpx.Context.init(alloc, undefined, &request);
+        defer ctx.deinit();
 
-    var response = try handler.lookupKey(&ctx, "docs", "doc:a", .{});
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 404), response.status.code);
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", response.contentType().?);
-    try std.testing.expectEqualStrings("not found", response.body.?);
+        var response = try handler.lookupKey(&ctx, "docs", "doc:a", .{});
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, if (missing) 404 else 503), response.status.code);
+        if (missing) {
+            try std.testing.expectEqualStrings("not found", response.body.?);
+        } else {
+            try std.testing.expectEqualStrings("1", response.header("Retry-After").?);
+            try std.testing.expect(std.mem.indexOf(u8, response.body.?, "storage_read_temporarily_unavailable") != null);
+        }
 
-    var scan_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/documents");
-    defer scan_request.deinit();
-    var scan_ctx = httpx.Context.init(alloc, undefined, &scan_request);
-    defer scan_ctx.deinit();
+        var scan_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/documents");
+        defer scan_request.deinit();
+        var scan_ctx = httpx.Context.init(alloc, undefined, &scan_request);
+        defer scan_ctx.deinit();
 
-    var scan_response = try handler.scanKeys(&scan_ctx, "docs");
-    defer scan_response.deinit();
-    try std.testing.expectEqual(@as(u16, 404), scan_response.status.code);
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", scan_response.contentType().?);
-    try std.testing.expectEqualStrings("not found", scan_response.body.?);
+        var scan_response = try handler.scanKeys(&scan_ctx, "docs");
+        defer scan_response.deinit();
+        try std.testing.expectEqual(@as(u16, if (missing) 404 else 503), scan_response.status.code);
+        if (missing) {
+            try std.testing.expectEqualStrings("not found", scan_response.body.?);
+        } else {
+            try std.testing.expectEqualStrings("1", scan_response.header("Retry-After").?);
+            try std.testing.expect(std.mem.indexOf(u8, scan_response.body.?, "storage_read_temporarily_unavailable") != null);
+        }
+    }
 }
 
 test "httpx antfly scan honors optional body and documented bad requests" {

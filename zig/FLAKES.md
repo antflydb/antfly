@@ -4,6 +4,97 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-14: standby/scaling read fails after sibling merge (#704)
+
+[Adversarial scaling job 104181278895](https://github.com/antflydb/antfly/actions/runs/34899531048/job/104181278895)
+on `919fa9d124` completed two histories with one clean and one failed history.
+Both received exact replay; there were no harness errors or replay divergences.
+The failure was a document lookup returning generic HTTP 500 after the automatic
+sibling merge, immediately before scale-in. `history-completes` and
+`promotion-and-topology-converge` failed; `owners-quiesce` passed with zero live
+tasks, files, or sockets after teardown. This is a failed soak, not a timeout.
+
+The failed history is `history-1-9e3779ba20f0d116.voprtrace`, seed
+`11400714822035230998`, mutated at choice 251091 from the first history of
+campaign seed `2712032513`. The original Linux executable SHA-256 is
+`8d44bc8e6ba94292e93b68b57369aa6f74bd31fceb261d49a7aaf85e9d448a5c`.
+The trace, mutation schedule, flight recording, and reports are retained in
+run artifacts `vopr-run-ha-scaling--1` and `vopr-diagnostics-ha-scaling--1`.
+Several earlier merge observations report `UnknownGroup`; that alone does not
+identify the later lookup error.
+
+Test-linked executables suppress the HTTP transport's stderr diagnostics to
+preserve the Zig test protocol, so the generic 500 omitted its private error
+identity. Replay debugger diagnostics now inspect ingress errors before their
+request tasks unwind. The original Linux replay is being investigated; native
+macOS replay diverges at the first scheduled task and is not reproduction proof.
+The cause and correction remain pending; the restore-publication fix must not
+be assumed to resolve this finding without evidence.
+
+## 2026-09-14: restore publication races storage-owner users (#704)
+
+[CI job 104174381057](https://github.com/antflydb/antfly/actions/runs/34899514358/job/104174381057?pr=704)
+on `919fa9d124` failed `test_cluster_restore_modes` during cluster overwrite
+restore. The public restore job reported `InternalFailure`; the retained server
+log showed staged repair complete, then `table restore failed phase=execution
+class=StorageBusy` and `cluster restore failed phase=materialization
+class=StorageBusy`. This is separate from the earlier transaction HTTP 503.
+
+The unchanged native executable reproduced the same signature **5 times in 100
+fresh-server repetitions** (four workers, 25 iterations each; 95 passed).
+Binary SHA-256: `ae0f4294a59fd9eb0b90a58e5516e927927fa47d456bdd9a89abfe5d109dbdce`.
+Evidence is retained in `/tmp/pr704-919-restore-modes-soak.log`,
+`/tmp/pr704-919-restore-soak-evidence.json`, and its five retained server roots.
+The failing immediate-busy retirement function and restore caller were identical
+to `origin/main`; the retirement check dates to #536. This establishes a
+pre-existing handoff defect, but no matched base-binary reproduction establishes
+whether #704 changed its probability. A passing transaction soak is not evidence
+that this restore race is fixed.
+
+Table generation admission does not drain every storage-owner borrower: status
+and maintenance can already hold leases. Publication previously returned busy
+immediately, and retirement alone would allow a replacement owner to open after
+the last old entry closed but before namespace exchange completed.
+
+Publication now closes group admission under the owner registry mutex, drains
+existing users and owner shutdown using the operation's I/O and cancellation,
+and retains the gate across physical publication, catalog commit or rollback,
+and staged snapshot destruction. Timeout/cancellation releases the gate while
+existing leases keep their owners alive. Ordinary reads encountering the gate
+return temporary unavailability so callers can refresh their catalog descriptor.
+The same contract covers restore reconciliation and Raft snapshot installation.
+
+The deterministic compiled-owner regression forces a held read, status, or
+maintenance lease to release at the first drain wait. It checks successful
+handoff, exclusion after the entry disappears, and timeout/cancellation cleanup.
+The production restore composition runs real maintenance and status workers
+across portable/native restore, rejected publication, and reconciliation. The
+scheduled VOPR workflow also runs repeated public cluster restores with
+concurrent document reads and index-status observation, retaining failure roots
+and the exact executable. These production stress runs complement replayable
+VOPR campaigns; their OS schedules are not replay traces.
+
+The new concurrent HTTP case also failed on the unchanged executable with
+HTTP 500 and `GenerationTransitionActive` in the server log
+(`/tmp/pr704-publication-observer-baseline.log`). Lookup and pre-stream scan
+admission now translate that retryable identity and bounded `StorageBusy` into
+the existing structured storage-unavailable 503 with `Retry-After`. The response
+contract regression covers both routes. The stress test rejects arbitrary 500s
+and unclassified 503s and does not retry a restore request.
+
+Native post-fix validation passed all 56 build steps, six compiled-owner tests,
+and 192 public HTTP contract tests. Twenty additional owner-suite repetitions
+passed all 120 test executions without leaks. The public restore soak passed
+**200/200 fresh-server cases**: 100 original mode tests and 100 with concurrent
+read/status observers, four workers, no retries of failed restores and no skips.
+All used executable SHA-256
+`410911f311beeec02a44d723357e6f4d17edd5f81d28f325d3bc30005450f89a`;
+the digest was checked again after the soak. Evidence:
+`/tmp/pr704-publication-focused-build-approved.log`,
+`/tmp/pr704-publication-owner-soak/verified.json`, and
+`/tmp/pr704-publication-final/verified.json` with individual JUnit reports.
+Linux CI and the separately reported scaling finding remain outstanding.
+
 ## 2026-09-14: standby VOPR promotion overtakes apply (#704)
 
 [Full soak 34878521929](https://github.com/antflydb/antfly/actions/runs/34878521929)

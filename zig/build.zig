@@ -1361,6 +1361,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     }
 
     const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, runtime_library_artifacts);
+    const storage_owner_source_test = b.step("antfly-storage-owner-source-test", "Run compiled storage owner admission, restore, and publication integration tests");
+    storage_owner_source_test.dependOn(&storage_owner_runs.runs[1].step);
     for (storage_owner_runs.runs) |run| {
         owner_tests.storage_test_step.dependOn(&run.step);
         owner_tests.integration_test_step.dependOn(&run.step);
