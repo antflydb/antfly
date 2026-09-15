@@ -66705,6 +66705,9 @@ test "db replay truncation waits for repair pins through borrowed VoprIo" {
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
+    // The owner is authoritative even if this operation has no Io override.
+    // Do not substitute an incomplete fake vtable or switch a live mutex's Io.
+    db.async_context.io = null;
     const Work = struct {
         fn run(database: *DB, asynchronous: bool, completed: *bool) !void {
             if (asynchronous) {
@@ -95173,32 +95176,10 @@ test "db async replay truncation retains durable enrichment debt" {
         enrichment_runtime_mod.scope_name,
         first_sequence,
     );
-    // Replay truncation must park on the supplied runtime when a repair pin
-    // update owns the fence, so that update can finish on a cooperative lane.
-    const Probe = struct {
-        mutex: *std.Io.Mutex,
-        io: std.Io = undefined,
-        waits: usize = 0,
-
-        fn wait(ptr: ?*anyopaque, _: *const u32, _: u32) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr.?));
-            self.waits += 1;
-            self.mutex.unlock(self.io);
-        }
-
-        fn wake(_: ?*anyopaque, _: *const u32, _: u32) void {}
-    };
-    var probe = Probe{ .mutex = db.core.repair_replay_mutex };
-    var vtable: std.Io.VTable = undefined;
-    vtable.futexWaitUncancelable = Probe.wait;
-    vtable.futexWake = Probe.wake;
-    probe.io = .{ .userdata = &probe, .vtable = &vtable };
-    const original_io = db.async_context.io;
-    db.async_context.io = probe.io;
-    defer db.async_context.io = original_io;
-    try std.testing.expect(probe.mutex.tryLock());
+    // Repair-pin contention is covered with actual scheduled tasks in
+    // "db replay truncation waits for repair pins through borrowed VoprIo".
+    // This fixture verifies durable retention using the owner's native Io.
     try truncateReplaySequenceAsync(db.async_context, target_sequence);
-    try std.testing.expectEqual(@as(usize, 1), probe.waits);
 
     const retained = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
     defer {

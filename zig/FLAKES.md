@@ -4,6 +4,50 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-15: merged runtime-lane assertions and replay fixture deadlock
+
+PR #704's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35025324900/job/104571966002)
+at `7c061722ac` failed the Raft service-worker test twice, then terminated after
+1,801 seconds without log progress. No OOM kill was recorded. These were
+merge regressions, not evidence of an intermittent production race.
+
+The Raft host had been assigned `raftOutboundIo()` while the merged test and
+runtime ownership contract required `runtime.io()`. Native runtimes give those
+lanes distinct identities. Host synchronization/reconciliation now use the
+general owner runtime; transport retains its dedicated outbound lane. The VOPR
+regression supplies distinct general and outbound runtimes with different clock
+values and checks both identities, in addition to the native worker-budget and
+rollback test.
+
+A local run of the DB-core complement reproduced the stall in
+`db async replay truncation retains durable enrichment debt`. A native stack
+sample showed its main thread parked in `truncateReplaySequenceAsync` on the
+repair-pin mutex. The fixture had locked that mutex and installed an incomplete
+fake vtable in `AsyncContext.io`, expecting its wait callback to unlock it.
+Truncation correctly uses `index_manager.checkpointIo()`, so the fake callback
+could never execute. The durable-retention fixture now tests the journal
+watermark directly. Contention remains covered by the real scheduled VOPR test
+`db replay truncation waits for repair pins through borrowed VoprIo`, including
+both truncation entrypoints and an absent operation-level Io override. The
+owner's synchronization authority remains stable throughout the operation.
+
+CI's checked Run output buffered the entire unfinished DB partition, while its
+stack-dump selector missed named `*-tests` executables. Partition output now
+also streams to per-process logs, including a test name without its final
+newline. The watchdog observes those logs, prints their tails on failure, and
+includes named test executables in stack capture; the workflow retains the logs
+as artifacts. A process handshake regression verifies partial output is visible
+before the child exits and a nonzero child status is preserved. This preserves
+the existing watchdog limits rather than masking a blocked test with more time.
+
+Validation: all three focused Raft host cases and six managed-Raft contracts
+passed with native socket access. The three replay retention/repair-pin/restart
+cases passed; the retention and repair-pin cases also passed 20 fresh-process
+repetitions (40 executions). All 32 `vopr-runtime-test` cases passed without
+skips or leaks. Workflow lint, 55 CI policy tests, three partition-runner tests,
+and two validation-scope tests passed. This is local regression evidence; fresh
+standard CI and full-soak qualification must be checked separately.
+
 ## 2026-09-15: snapshot ownership leaked between cooperative tasks
 
 Review of #704 reproduced a pre-existing `SnapshotAdmission` bug on both

@@ -604,6 +604,12 @@ jobs:
 
           dump_stacks() {
             local root_pid="$1"
+            for partition_log in "$ANTFLY_TEST_LOG_DIR"/*.log; do
+              [ -f "$partition_log" ] || continue
+              echo "::group::partition progress $partition_log"
+              tail -n 80 "$partition_log" || true
+              echo "::endgroup::"
+            done
             echo "::group::antfly unit watchdog ptrace settings"
             if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
               cat /proc/sys/kernel/yama/ptrace_scope || true
@@ -624,7 +630,7 @@ jobs:
               local cmdline
               cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
               case "$cmdline" in
-                *"/test "*|*"/test"*|*"zig build"*|*" make "*)
+                *"/test "*|*"/test"*|*"-tests "*|*"-tests"|*"zig build"*|*" make "*)
                   echo "::group::proc snapshot pid=$pid cmd=$cmdline"
                   if [ -r "/proc/$pid/status" ]; then
                     grep -E "^(Name|State|Pid|PPid|Threads|VmRSS|VmHWM|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):" "/proc/$pid/status" || true
@@ -681,6 +687,8 @@ jobs:
 
           unit_log="${RUNNER_TEMP:-/tmp}/antfly-zig-unit.log"
           : > "$unit_log"
+          export ANTFLY_TEST_LOG_DIR="${RUNNER_TEMP:-/tmp}/antfly-zig-test-logs"
+          mkdir -p "$ANTFLY_TEST_LOG_DIR"
 
           (
             set +e
@@ -703,13 +711,14 @@ jobs:
             while kill -0 "$unit_pid" 2>/dev/null; do
               sleep 15
               now_epoch="$(date +%s)"
-              if [ -e "$unit_log" ]; then
-                current_mtime="$(stat -c %Y "$unit_log" 2>/dev/null || echo 0)"
+              for progress_log in "$unit_log" "$ANTFLY_TEST_LOG_DIR"/*.log; do
+                [ -f "$progress_log" ] || continue
+                current_mtime="$(stat -c %Y "$progress_log" 2>/dev/null || echo 0)"
                 if [ "$current_mtime" -gt "$last_mtime" ]; then
                   last_mtime="$current_mtime"
                   last_progress_epoch="$now_epoch"
                 fi
-              fi
+              done
 
               elapsed_secs=$((now_epoch - start_epoch))
               idle_secs=$((now_epoch - last_progress_epoch))
@@ -746,6 +755,17 @@ jobs:
             echo "::endgroup::"
           fi
           exit "$status"
+
+      - name: Retain unit test progress
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zig-unit-progress-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/antfly-zig-unit.log
+            ${{ runner.temp }}/antfly-zig-test-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'

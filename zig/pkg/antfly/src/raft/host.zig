@@ -1480,7 +1480,11 @@ pub const HttpHost = struct {
         const host = try alloc.create(Host);
         errdefer alloc.destroy(host);
         var host_deps = deps.host;
-        if (transport_io) |io| host_deps.io = io;
+        // Host synchronization and reconciliation use the owner runtime. The
+        // outbound transport lane may have its own capacity and Io identity.
+        if (deps.backend_runtime) |runtime| if (runtime.io()) |io| {
+            host_deps.io = io;
+        };
         host_deps.runtime_hooks = mergeRuntimeHooks(host_deps.runtime_hooks, transport_stack.runtimeHooks());
         host.* = Host.init(alloc, cfg.host, host_deps);
         errdefer host.deinit();
@@ -2986,9 +2990,11 @@ test "http host shares its borrowed clock with raft reconciliation" {
     const alloc = std.testing.allocator;
     var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
     defer clock.deinit();
+    var transport_clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 11 * std.time.ns_per_s });
+    defer transport_clock.deinit();
     var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
-        .borrowed_io = .{ .general = clock.io(), .raft_outbound = clock.io() },
+        .borrowed_io = .{ .general = clock.io(), .raft_outbound = transport_clock.io() },
     });
     defer runtime.deinit();
     const Unused = struct {
@@ -3015,7 +3021,10 @@ test "http host shares its borrowed clock with raft reconciliation" {
     defer {
         http_host.beginTransportShutdown();
         _ = clock.cancelAndDrainTasksForTeardown(alloc, 64) catch @panic("host clock test cleanup failed");
+        _ = transport_clock.cancelAndDrainTasksForTeardown(alloc, 64) catch @panic("transport clock test cleanup failed");
     }
+    try std.testing.expectEqual(clock.io().userdata, http_host.host.deps.io.userdata);
+    try std.testing.expectEqual(transport_clock.io().userdata, http_host.transport_stack.driver.io.userdata);
     try std.testing.expectEqual(@as(u64, 7 * std.time.ns_per_s), http_host.host.monotonicNs());
     try clock.advance(std.time.ns_per_ms);
     try std.testing.expectEqual(@as(u64, 7001 * std.time.ns_per_ms), http_host.host.monotonicNs());
