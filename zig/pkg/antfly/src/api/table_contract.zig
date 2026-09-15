@@ -89,10 +89,10 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (schema_value != .null) try tables_api.validateCreateSchemaVersion(schema_value, false);
     }
 
-    const storage_settings = if (raw_root.get("storage")) |value|
+    const storage_settings: ?@import("../common/table_storage.zig").Settings = if (raw_root.get("storage")) |value|
         try @import("../common/table_storage.zig").Settings.parse(value)
     else
-        @import("../common/table_storage.zig").Settings{};
+        null;
 
     // Use typed OpenAPI parsing for scalar fields (num_shards, description, schema,
     // replication_sources). For indexes, parse from the raw body to preserve
@@ -238,6 +238,12 @@ pub fn encodeCreateTableRequest(alloc: std.mem.Allocator, req: tables_api.Create
     try out.append(alloc, '{');
     var first = true;
 
+    if (req.storage) |storage| {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, storage, .{});
+        defer alloc.free(encoded);
+        try appendRawJsonField(alloc, &out, "storage", encoded, &first);
+    }
+
     if (req.num_shards) |num_shards| {
         try appendField(alloc, &out, "num_shards", .{ .integer = num_shards }, &first);
     }
@@ -256,6 +262,30 @@ pub fn encodeCreateTableRequest(alloc: std.mem.Allocator, req: tables_api.Create
 
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+test "table storage creation intent survives public and internal forwarding" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "{}", "{\"storage\":{}}", "{\"storage\":{\"dense_embeddings\":\"primary_lsm\"}}", "{\"storage\":{\"dense_embeddings\":\"vector_store\"}}" }, 0..) |body, index| {
+        var request = try parseCreateTableRequest(alloc, body);
+        defer request.deinit(alloc);
+        if (index == 0) {
+            try std.testing.expect(request.storage == null);
+        } else {
+            const expected: @import("../common/table_storage.zig").DenseEmbeddings = if (index == 3) .vector_store else .primary_lsm;
+            try std.testing.expectEqual(expected, request.storage.?.dense_embeddings);
+        }
+        const public = try encodeCreateTableRequest(alloc, request);
+        defer alloc.free(public);
+        var public_decoded = try tables_api.parseStoredCreateTableRequest(alloc, public);
+        defer public_decoded.deinit(alloc);
+        try std.testing.expectEqualDeep(request.storage, public_decoded.storage);
+        const internal = try tables_api.encodeStoredCreateTableRequestAlloc(alloc, request);
+        defer alloc.free(internal);
+        var internal_decoded = try tables_api.parseStoredCreateTableRequest(alloc, internal);
+        defer internal_decoded.deinit(alloc);
+        try std.testing.expectEqualDeep(request.storage, internal_decoded.storage);
+    }
 }
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {

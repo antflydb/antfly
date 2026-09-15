@@ -30,6 +30,11 @@ pub const Stats = struct {
     location_cache_misses: u64 = 0,
     location_cache_bytes: u64 = 0,
     source_shards: u64 = 0,
+    collection_plan_outside_lock_ns: u64 = 0,
+    collection_reader_prepare_ns: u64 = 0,
+    collection_max_reader_prepare_ns: u64 = 0,
+    collection_readers_prepared: u64 = 0,
+    collection_retire_outside_lock_ns: u64 = 0,
     collection_steps: u64 = 0,
     collection_pending_bytes: u64 = 0,
     collection_mark_ns: u64 = 0,
@@ -91,6 +96,9 @@ pub const Stats = struct {
     collections: u64 = 0,
     collection_deferrals: u64 = 0,
     collection_debt_deferrals: u64 = 0,
+    collection_copy_deferrals: u64 = 0,
+    collection_deferred_obsolete_bytes: u64 = 0,
+    collection_reclaim_deadline_ns: u64 = 0,
     obsolete_payload_debt_bytes: u64 = 0,
     collection_bytes_read: u64 = 0,
     collection_bytes_written: u64 = 0,
@@ -159,7 +167,7 @@ pub const Reference = struct {
     pub fn forArtifact(key: []const u8, value: []const u8) !Reference {
         const dims = try codec.decodeDenseEmbeddingDims(value);
         if (dims == 0) return error.InvalidVectorDimensions;
-        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var hasher = @import("antfly_hash").Sha256.init(.{});
         hasher.update("antfly-exact-artifact-v1");
         var len: [8]u8 = undefined;
         std.mem.writeInt(u64, &len, key.len, .little);
@@ -204,6 +212,76 @@ pub const Reference = struct {
         if (!std.mem.eql(u8, &actual.digest, &self.digest)) return error.VectorReferenceIdentityMismatch;
         return result;
     }
+
+    /// Validate the exact artifact identity without allocating its envelope.
+    pub fn validateVector(self: Reference, key: []const u8, vector: []const f32) !void {
+        if (vector.len != self.dims) return error.VectorReferenceIdentityMismatch;
+        var hasher = @import("antfly_hash").Sha256.init(.{});
+        hasher.update("antfly-exact-artifact-v1");
+        var len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len, key.len, .little);
+        hasher.update(&len);
+        hasher.update(key);
+        hasher.update(&self.header);
+        var dimensions: [4]u8 = undefined;
+        std.mem.writeInt(u32, &dimensions, self.dims, .little);
+        hasher.update(&dimensions);
+        if (@import("builtin").cpu.arch.endian() == .little) {
+            hasher.update(std.mem.sliceAsBytes(vector));
+        } else {
+            for (vector) |component| {
+                var bytes: [4]u8 = undefined;
+                std.mem.writeInt(u32, &bytes, @bitCast(component), .little);
+                hasher.update(&bytes);
+            }
+        }
+        var actual: Digest = undefined;
+        hasher.final(&actual);
+        if (!std.mem.eql(u8, &actual, &self.digest)) return error.VectorReferenceIdentityMismatch;
+    }
+};
+
+pub const DenseRead = struct { key: []const u8, reference: Reference };
+pub const DenseReadStats = struct {
+    batches: u64 = 0,
+    vectors: u64 = 0,
+    bytes: u64 = 0,
+    lock_wait_ns: u64 = 0,
+    locked_ns: u64 = 0,
+    scratch_fallbacks: u64 = 0,
+    primary_lookup_ns: u64 = 0,
+    payload_consume_ns: u64 = 0,
+    positional_batches: u64 = 0,
+    positional_bytes: u64 = 0,
+    read_batches: u64 = 0,
+    read_requests: u64 = 0,
+    read_helpers: u64 = 0,
+    read_denied: u64 = 0,
+    read_dispatch_ns: u64 = 0,
+    read_caller_ns: u64 = 0,
+    read_join_ns: u64 = 0,
+    read_worker_wall_ns: u64 = 0,
+    read_worker_start_delay_ns: u64 = 0,
+    read_mapped_requests: u64 = 0,
+    read_mapped_bytes: u64 = 0,
+    read_adaptive_inline_batches: u64 = 0,
+    read_adaptive_wide_batches: u64 = 0,
+    read_adaptive_probe_ns: u64 = 0,
+    lease_fallbacks: u64 = 0,
+
+    pub fn add(self: *DenseReadStats, other: DenseReadStats) void {
+        inline for (std.meta.fields(DenseReadStats)) |field| @field(self, field.name) +|= @field(other, field.name);
+    }
+};
+
+/// The vector is borrowed only for the callback. No source lock is held.
+pub const DenseSink = struct {
+    ptr: *anyopaque,
+    put: *const fn (*anyopaque, usize, []const f32) anyerror!void,
+    /// Optional caller-owned scratch for progress when optional batching cannot
+    /// be admitted. Its contents are overwritten; it must not alias output.
+    scratch: []f32 = &.{},
+    io: ?std.Io = null,
 };
 
 pub const Prepared = struct {
@@ -220,6 +298,7 @@ pub const Store = struct {
         release: *const fn (*anyopaque) void,
         prepare: *const fn (*anyopaque, []const Prepared) anyerror!void,
         resolve: *const fn (*anyopaque, Allocator, []const u8, Reference) anyerror![]u8,
+        resolve_dense_batch: ?*const fn (*anyopaque, []const DenseRead, usize, []f32, ?std.Io) anyerror!DenseReadStats = null,
         unresolved_commit: ?*const fn (*anyopaque) void = null,
         retired_payloads: ?*const fn (*anyopaque, u64) void = null,
     };
@@ -239,7 +318,11 @@ pub const Session = struct {
     refs: std.atomic.Value(usize) = .init(1),
     arena: std.heap.ArenaAllocator,
     store: Store,
-    prepared: std.ArrayListUnmanaged(Prepared) = .empty,
+    // Keep preparations contiguous for one durable append, indexed by their
+    // immutable identity for reads. The index owns no second payload copy and
+    // is released with this transaction, including on abort.
+    prepared: std.ArrayHashMapUnmanaged(Prepared, void, PreparedContext, false) = .{},
+
     durable: bool = false,
     prepared_once: bool = false,
     committed: bool = false,
@@ -248,6 +331,20 @@ pub const Session = struct {
     primary_commit_attempted: bool = false,
     ownership_failed: bool = false,
     retired_payload_bytes: u64 = 0,
+
+    const PreparedContext = struct {
+        pub fn hash(_: @This(), item: Prepared) u32 {
+            return @truncate(std.hash.Wyhash.hash(0, &item.reference.digest));
+        }
+        pub fn eql(_: @This(), a: Prepared, b: Prepared, _: usize) bool {
+            return std.mem.eql(u8, &a.reference.digest, &b.reference.digest);
+        }
+    };
+
+    pub fn findPrepared(self: *const Session, reference: Reference) ?[]const u8 {
+        const item = self.prepared.getKey(.{ .reference = reference, .artifact = &.{} }) orelse return null;
+        return item.artifact;
+    }
 
     pub fn create(alloc: Allocator, store: Store) !*Session {
         const self = try alloc.create(Session);
@@ -266,6 +363,7 @@ pub const Session = struct {
         if (self.committed and self.retired_payload_bytes != 0) {
             if (self.store.vtable.retired_payloads) |notify| notify(self.store.ptr, self.retired_payload_bytes);
         }
+        self.prepared.deinit(self.alloc);
         self.arena.deinit();
         self.store.release();
         self.alloc.destroy(self);
@@ -278,9 +376,14 @@ pub const Session = struct {
         if (header.kind != .dense_embedding) return value;
         const reference = try Reference.forArtifact(key, value);
         const alloc = self.arena.allocator();
-        const artifact = try alloc.dupe(u8, value);
-        try self.prepared.append(alloc, .{ .reference = reference, .artifact = artifact });
-        self.durable = false;
+        if (self.findPrepared(reference) == null) {
+            // Admit metadata before retaining a new payload. Growing the index
+            // frees its previous allocation instead of retaining arena copies.
+            try self.prepared.ensureTotalCapacity(self.alloc, self.prepared.count() + 1);
+            const artifact = try alloc.dupe(u8, value);
+            self.prepared.putAssumeCapacityNoClobber(.{ .reference = reference, .artifact = artifact }, {});
+            self.durable = false;
+        }
         return try alloc.dupe(u8, &reference.encode());
     }
     pub fn get(self: *Session, key: []const u8, value: []const u8) ![]const u8 {
@@ -289,18 +392,80 @@ pub const Session = struct {
     pub fn getAlloc(self: *Session, alloc: Allocator, key: []const u8, value: []const u8) ![]const u8 {
         if (!isEmbeddingKey(key) or !isReference(value)) return value;
         const reference = try Reference.decode(value);
-        for (self.prepared.items) |pending| {
-            if (std.mem.eql(u8, &pending.reference.digest, &reference.digest)) {
-                const actual = try Reference.forArtifact(key, pending.artifact);
-                if (!std.mem.eql(u8, &actual.digest, &reference.digest)) return error.VectorReferenceIdentityMismatch;
-                return pending.artifact;
-            }
+        if (self.findPrepared(reference)) |artifact| {
+            const actual = try Reference.forArtifact(key, artifact);
+            if (!std.mem.eql(u8, &actual.digest, &reference.digest)) return error.VectorReferenceIdentityMismatch;
+            return artifact;
         }
         return try self.store.vtable.resolve(self.store.ptr, alloc, key, reference);
     }
+
+    /// Primary values select versions, including this transaction's prepared
+    /// writes. A bounded scratch slab outlives each source lock, not the call.
+    pub fn consumeDenseMany(self: *Session, alloc: Allocator, artifact_keys: []const []const u8, values: []const ?[]const u8, dims: usize, sink: DenseSink) !DenseReadStats {
+        if (artifact_keys.len != values.len) return error.InvalidArgument;
+        if (dims == 0) return error.InvalidVectorDimensions;
+        if (values.len == 0) return .{};
+        const vector_bytes = try std.math.mul(usize, dims, @sizeOf(f32));
+        var capacity = @min(values.len, @min(32, @max(1, (128 * 1024) / vector_bytes)));
+        var borrowed = false;
+        const scratch = alloc.alloc(f32, try std.math.mul(usize, capacity, dims)) catch |err| blk: {
+            if (sink.scratch.len < dims) return err;
+            borrowed = true;
+            capacity = 1;
+            break :blk sink.scratch[0..dims];
+        };
+        defer if (!borrowed) alloc.free(scratch);
+        var reads: [32]DenseRead = undefined;
+        var positions: [32]usize = undefined;
+        var stats: DenseReadStats = .{ .scratch_fallbacks = @intFromBool(borrowed) };
+        var offset: usize = 0;
+        while (offset < values.len) {
+            const end = @min(values.len, offset + capacity);
+            var count: usize = 0;
+            for (offset..end) |i| {
+                const raw = values[i] orelse return error.NotFound;
+                const key = artifact_keys[i];
+                if (!isEmbeddingKey(key)) return error.InvalidVectorReference;
+                if (!isReference(raw)) {
+                    const vector = try codec.decodeDenseEmbeddingViewOrInto(raw, scratch[0..dims]);
+                    if (vector.len != dims) return error.InvalidVectorDimensions;
+                    try sink.put(sink.ptr, i, vector);
+                    continue;
+                }
+                const reference = try Reference.decode(raw);
+                if (reference.dims != dims) return error.InvalidVectorDimensions;
+                const pending_value = self.findPrepared(reference);
+                if (pending_value) |pending| {
+                    const vector = try codec.decodeDenseEmbeddingViewOrInto(pending, scratch[0..dims]);
+                    try reference.validateVector(key, vector);
+                    try sink.put(sink.ptr, i, vector);
+                    continue;
+                }
+                reads[count] = .{ .key = key, .reference = reference };
+                positions[count] = i;
+                count += 1;
+            }
+            if (count != 0) {
+                if (self.store.vtable.resolve_dense_batch) |resolve_batch| {
+                    stats.add(try resolve_batch(self.store.ptr, reads[0..count], dims, scratch[0 .. count * dims], sink.io));
+                    for (positions[0..count], 0..) |position, i| try sink.put(sink.ptr, position, scratch[i * dims ..][0..dims]);
+                } else {
+                    for (reads[0..count], positions[0..count]) |read, position| {
+                        const raw = try self.store.vtable.resolve(self.store.ptr, alloc, read.key, read.reference);
+                        defer alloc.free(raw);
+                        const vector = try codec.decodeDenseEmbeddingViewOrInto(raw, scratch[0..dims]);
+                        try sink.put(sink.ptr, position, vector);
+                    }
+                }
+            }
+            offset = end;
+        }
+        return stats;
+    }
     pub fn prepareCommit(self: *Session) !void {
-        if (self.durable or self.prepared.items.len == 0) return;
-        try self.store.vtable.prepare(self.store.ptr, self.prepared.items);
+        if (self.durable or self.prepared.count() == 0) return;
+        try self.store.vtable.prepare(self.store.ptr, self.prepared.keys());
         self.durable = true;
         self.prepared_once = true;
     }

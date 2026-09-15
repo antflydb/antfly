@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 53;
+pub const abi_version: u32 = 54;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1132,6 +1132,7 @@ pub const MaintenanceResult = extern struct {
     has_next_wake_delay: u8 = 0,
     _reserved0: [2]u8 = @splat(0),
     dense_steps: u64 = 0,
+    dense_scanned: u64 = 0,
     maintenance_score: u64 = 0,
     next_wake_delay_ns: u64 = 0,
 };

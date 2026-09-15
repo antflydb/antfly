@@ -10286,3 +10286,139 @@ before and 4.760 us/op after. Uncontended acquire/release was approximately
 section contention sample was scheduling-sensitive and is not a throughput
 result. These measurements check abstraction overhead, not public query QPS;
 no new 50K/1M readiness, latency, RSS, disk or recall qualification is claimed.
+
+
+#### Post-merge ownership comparison: structural observation repair
+
+The fresh comparison in `.benchmark-results/vector-store-promotion-20260913/`
+passed four 50K timed and reclamation arms after automatic source maintenance
+was restored in the compiled owner. Vector-store peak QPS was 5.4% below LSM
+in AB order and 6.5% above in BA order; this is no consistent small-table win.
+The first 1M LSM control then logged batch and query HTTP 500s. The runner
+rejected it even though the client exited zero, and no 1M vector-store arm
+started. These failed timings cannot support an ownership comparison.
+
+Two connected defects are being qualified in
+`.benchmark-results/vector-store-boundary-repair-20260913/`. StorageBusy had
+no stable callback error detail and therefore became RuntimeBoundaryFailure.
+The compiled structural reconciliation path also returned completion without
+adding an owner observation. Targeted publication rejected the empty proof with
+EmptyTargetedIndexObservation, repeatedly scheduling reconciliation that requested
+exclusive owner access. The repair captures status before releasing the same
+owner generation, carries it through targeted publication, and leaves a group
+pending when no status proof is available. Existing table epoch, physical root
+and target incarnation fences remain enforced. Transient startup inspection
+still retires idle cold owners; ongoing structural work retains its owner.
+
+StorageBusy now retains its retryable identity through callbacks and maps to
+HTTP 503 in batch/query handlers. Ambiguous write outcomes remain conflicts;
+the implementation does not retry commits automatically. The comparison still
+rejects request errors and retries, so changing the HTTP status alone cannot
+qualify an arm. Focused regressions, saved restart/maintenance gates and fresh
+same-binary timings must pass before reconsidering the default.
+
+The focused validation passes 18 callback/error-transport checks, three HTTP
+and compiled write-callback checks, and the compiled-control structural
+publication regression, with no leaks. The latter binds catalog authority,
+verifies that an empty observation is still rejected, and publishes the captured
+owner proof through the targeted path. Saved recovery and fresh timings remain
+pending for this revision.
+
+
+#### Post-merge comparison: periodic owner admission
+
+The committed observation repair (`8337942cb1`) passed three saved vector-store
+restart/automatic-GC checks and two saved LSM restart/concurrent-query checks.
+All four fresh 50K arms passed their workloads and reclamation gates. In AB/BA
+order, vector-store readiness improved 4.6%/7.8%, and total allocated disk after
+restart fell 45.5%/43.0%. Peak QPS changed -12.4%/+11.6%; mixed-workload QPS
+changed -8.8%/-3.8%. These controls share explicit ANN settings; ownership is
+the table-level treatment.
+
+The first fresh 1M LSM arm reached readiness in 318.5 seconds and completed the
+read-only query windows, but a query returned HTTP 503 during mixed updates.
+No 1M vector-store arm started. The empty targeted-observation loop and error
+identity collapse were absent. A separate unsampled restart reproduction also
+failed with query 503s. Evidence is preserved in
+`.benchmark-results/vector-store-boundary-repair-20260913/` and
+`.benchmark-results/vector-store-owner-admission-20260914/`.
+
+Periodic startup inspection used the same waiting exclusive owner admission as
+structural changes. Waiting behind an existing lease installed an exclusive
+pending flag, which blocked new foreground leases; a long derived-index apply
+could then exhaust their five-second admission deadline. A diagnostic sample
+captured catch-up waiting for owner admission and maintenance waiting for the DB
+apply lock. Sampling was intrusive and supplies stack evidence only; the fresh
+failure and separate unsampled reproduction establish the request failure.
+
+Periodic inspection now attempts exclusive admission only when idle, yielding
+without installing a pending writer gate. Structural changes and explicit repair
+retain their waiting admission. The compiled catch-up path also uses the existing
+group admission/deferred-key protocol: a busy owner preserves an exact retry,
+and a new attempt changes its generation so stale scheduler cleanup cannot
+remove new debt. Owner/root/catalog identity checks and observation publication
+fences remain enforced. Focused tests cover foreground admission, structural
+writer preference, deferred retry retention and eventual completion. All six owner-source suite checks pass with no leaks. Saved-workload recovery
+and fresh same-binary comparison qualification are pending; this change does not promote vector-store ownership to the default.
+
+
+#### Completed fresh ownership comparison after admission repair
+
+The pinned `5a90e99d6e` binary passed all eight fresh arms: 50K and 1M,
+LSM/vector-store and vector-store/LSM order. Every workload, strict request-error
+gate, restart and reclamation check passed. Before timing, six owner-source tests,
+two unsampled 60-second saved mixed workloads across restart, three vector-store
+restart/automatic-GC checks and two LSM restart/concurrent-query checks passed.
+The saved mixed runs completed 25,935 queries and 424,300 written rows without
+request errors. This fixes the reproduced foreground admission failure; changing
+HTTP error classification alone was not accepted as qualification.
+
+Both modes use the same binary and explicit common ANN settings, float32 serving
+encoding, durability, batch size, concurrency and recall policy. The tables are
+fresh, single-shard standalone tables on the available host. The 50K dataset is
+OpenAI 1536D; the 1M dataset is Cohere 768D. Their absolute QPS is not comparable
+as a size-only scaling result. Two runs per mode provide paired evidence, not a
+confidence interval. Full results and receipts are in
+[the comparison report](../.benchmark-results/vector-store-owner-admission-20260914/RESULTS.md).
+
+| 1M pair/order | Ownership | Readiness s | Peak QPS | Mixed QPS | Mixed write rows/s | Mixed query p99 ms |
+|---|---|---:|---:|---:|---:|---:|
+| 1 / AB | primary_lsm | 273.25 | 1144.2 | 211.29 | 4031.5 | 104.30 |
+| 1 / AB | vector_store | 247.44 | 1210.3 | 232.80 | 3977.6 | 95.38 |
+| 2 / BA | vector_store | 265.38 | 1225.6 | 225.02 | 3948.8 | 100.64 |
+| 2 / BA | primary_lsm | 264.22 | 1141.9 | 189.00 | 3674.9 | 113.90 |
+
+At 1M, vector-store peak QPS improves 5.8%/7.3%, mixed query QPS improves
+10.2%/19.1%, and mixed query p99 improves 8.6%/11.6%. Readiness improves 9.4%
+in the first pair and is essentially equal in the second (+0.4%). Recall stays
+at 0.9901–0.9904. Total allocated disk after restart, including journals, falls
+43.4% in both pairs: LSM uses 6.74–6.77 GiB and vector-store 3.82–3.84 GiB.
+Maximum observed server RSS falls about 28% in both pairs, from 9.35/10.06 GiB
+with LSM to 6.71/7.25 GiB with vector-store. These RSS figures use the continuous
+resource sampler. The separate footprint demand metric has one sample per arm
+and must not be presented as an ingestion peak. Kernel-reported lifetime
+footprint is 5.18/4.76 GiB for LSM and 1.13/1.15 GiB for vector-store.
+
+The remaining tradeoffs are measurable. At 50K, vector-store uses 47–49% less
+disk, but peak QPS changes +5.8%/-22.5% and mixed query QPS changes -4.1%/-1.3%.
+At 1M, fixed-count update/delete churn is 4.4%/15.5% slower. Reclamation settles
+in 149/155 seconds with vector-store versus about 33 seconds with LSM, including
+the gate's stability observation period. Each vector-store collection reads
+3,072,000,000 bytes and writes 3,192,012,800 bytes, marks 29,080,108 rows across
+its passes, and finishes with exactly 1M retained payloads and zero unreferenced
+payload bytes at the final collection. Completion proves reclamation works;
+it does not remove the full-rewrite cost. The controlled enrichment workload
+also remains a tradeoff: updated embedding readiness is 1.12/1.90 seconds for
+vector-store versus 1.00/1.04 seconds for LSM in the 1M arms.
+
+The post-mixed 50K profiles identify a concrete follow-up: the two vector-store
+runs perform almost identical scoring work, but resolve 0.225 versus 45.939
+metadata entries per query. Average rerank vector loading rises from 0.245 to
+1.496 ms while leaf scoring remains about 0.978 ms. These profiles run after
+mixed updates and do not prove the cause of the earlier read-only peak-QPS
+difference. Trace why the resolved fast path misses while preserving exact
+generation/identity validation, then qualify any change against the saved data.
+For GC, isolate copy/mark work and scheduling delays before selecting a different
+policy. The large-table result favors vector-store, but the small-table lookup
+variability and reclamation cost remain targets before blanket default promotion.
+`primary_lsm` remains the creation default.

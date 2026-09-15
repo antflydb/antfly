@@ -3,7 +3,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
-from validate_vdbbench_result import validate_lifecycle_log, validate_metrics
+from validate_vdbbench_result import (
+    validate_lifecycle_log,
+    validate_metrics,
+    restart_recall_comparison,
+)
 
 
 class ResultValidationTest(unittest.TestCase):
@@ -24,6 +28,23 @@ class ResultValidationTest(unittest.TestCase):
 
     def test_complete_curve(self):
         validate_metrics(self.result, 50000, True, [1, 10, 20, 30])
+
+    def test_restart_recall_separates_churn_and_recovery(self):
+        rows = [
+            {"label": "live", "recall": 0.983},
+            {"label": "before", "recall": 0.96},
+            {"label": "cold", "recall": 0.96},
+            {"label": "warm", "recall": 0.96},
+        ]
+        self.assertTrue(
+            restart_recall_comparison(rows, "before", "cold", "warm")["qualified"]
+        )
+        rows[-1]["recall"] = 0.958
+        self.assertFalse(
+            restart_recall_comparison(rows, "before", "cold", "warm")["qualified"]
+        )
+        with self.assertRaisesRegex(ValueError, "expected one"):
+            restart_recall_comparison(rows[2:], "before", "cold", "warm")
 
     def test_lifecycle_failure_cannot_pass_on_complete_query_metrics(self):
         for failure in (

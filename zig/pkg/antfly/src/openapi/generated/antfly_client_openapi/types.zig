@@ -33517,9 +33517,9 @@ pub const TableStatus = struct {
     }
 };
 
-/// Immutable source embedding storage selected when creating a table.
+/// Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required.
 pub const TableStorageSettings = struct {
-    /// Experimental vector_store mode requires a fresh local single-shard table without HA or replication.
+    /// Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
     dense_embeddings: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -35337,6 +35337,22 @@ pub const VectorSourceStorageStatus = struct {
     collection_max_copy_ns: ?i64 = null,
     /// Locked publication time including directory refresh, inventory, receipts and reclamation.
     collection_publish_ns: ?i64 = null,
+    /// Time preparing and sorting immutable collection input outside source and DB apply locks.
+    collection_plan_outside_lock_ns: ?i64 = null,
+    /// Time validating staged immutable readers outside source and DB apply locks.
+    collection_reader_prepare_ns: ?i64 = null,
+    /// Longest detached immutable reader validation step.
+    collection_max_reader_prepare_ns: ?i64 = null,
+    /// Staged immutable readers validated before publication.
+    collection_readers_prepared: ?i64 = null,
+    /// Time retiring old collection owners and known obsolete files outside source and DB apply locks.
+    collection_retire_outside_lock_ns: ?i64 = null,
+    /// Verified collections that deferred copying because reclamation benefit was small.
+    collection_copy_deferrals: ?i64 = null,
+    /// Verified obsolete payload bytes retained by the copy-cost policy.
+    collection_deferred_obsolete_bytes: ?i64 = null,
+    /// Process-monotonic reclamation scheduling deadline translated from the durable wall-clock deadline; not a completion guarantee.
+    collection_reclaim_deadline_ns: ?i64 = null,
     /// Longest locked publication step.
     collection_max_publish_ns: ?i64 = null,
     /// Active scan turns scheduled using the experimental wall-time duty policy.
@@ -35438,6 +35454,14 @@ pub const VectorSourceStorageStatus = struct {
         .{ "collection_copy_ns", "collection_copy_ns", true },
         .{ "collection_max_copy_ns", "collection_max_copy_ns", true },
         .{ "collection_publish_ns", "collection_publish_ns", true },
+        .{ "collection_plan_outside_lock_ns", "collection_plan_outside_lock_ns", true },
+        .{ "collection_reader_prepare_ns", "collection_reader_prepare_ns", true },
+        .{ "collection_max_reader_prepare_ns", "collection_max_reader_prepare_ns", true },
+        .{ "collection_readers_prepared", "collection_readers_prepared", true },
+        .{ "collection_retire_outside_lock_ns", "collection_retire_outside_lock_ns", true },
+        .{ "collection_copy_deferrals", "collection_copy_deferrals", true },
+        .{ "collection_deferred_obsolete_bytes", "collection_deferred_obsolete_bytes", true },
+        .{ "collection_reclaim_deadline_ns", "collection_reclaim_deadline_ns", true },
         .{ "collection_max_publish_ns", "collection_max_publish_ns", true },
         .{ "collection_active_scan_turns", "collection_active_scan_turns", true },
         .{ "collection_active_scan_pause_ns", "collection_active_scan_pause_ns", true },
@@ -35650,6 +35674,38 @@ pub const VectorSourceStorageStatus = struct {
         }
         if (self.collection_publish_ns) |value| {
             try jw.objectField("collection_publish_ns");
+            try jw.write(value);
+        }
+        if (self.collection_plan_outside_lock_ns) |value| {
+            try jw.objectField("collection_plan_outside_lock_ns");
+            try jw.write(value);
+        }
+        if (self.collection_reader_prepare_ns) |value| {
+            try jw.objectField("collection_reader_prepare_ns");
+            try jw.write(value);
+        }
+        if (self.collection_max_reader_prepare_ns) |value| {
+            try jw.objectField("collection_max_reader_prepare_ns");
+            try jw.write(value);
+        }
+        if (self.collection_readers_prepared) |value| {
+            try jw.objectField("collection_readers_prepared");
+            try jw.write(value);
+        }
+        if (self.collection_retire_outside_lock_ns) |value| {
+            try jw.objectField("collection_retire_outside_lock_ns");
+            try jw.write(value);
+        }
+        if (self.collection_copy_deferrals) |value| {
+            try jw.objectField("collection_copy_deferrals");
+            try jw.write(value);
+        }
+        if (self.collection_deferred_obsolete_bytes) |value| {
+            try jw.objectField("collection_deferred_obsolete_bytes");
+            try jw.write(value);
+        }
+        if (self.collection_reclaim_deadline_ns) |value| {
+            try jw.objectField("collection_reclaim_deadline_ns");
             try jw.write(value);
         }
         if (self.collection_max_publish_ns) |value| {
