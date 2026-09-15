@@ -222,7 +222,11 @@ pub fn advance(alloc: Allocator, primary: *docstore.DocStore, source: payload.St
     try txn.commit();
     committed = true;
     try boundary(.after_commit);
-    try primary.runtime_store.sync(true);
+    // The candidate references and cursor share the committed primary WAL
+    // record. Make that record durable without forcing an SSTable for every
+    // bounded page (verification pages often change only the job receipt).
+    // Publication retains the full storage barrier below.
+    try primary.runtime_store.syncReplayState();
     try boundary(.after_sync);
     session.committed = true;
 }

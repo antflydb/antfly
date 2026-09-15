@@ -128723,6 +128723,41 @@ fn loadStoredSearchDocumentManyCallback(
     return try loadStoredSearchDocumentsMany(self, alloc, keys, null);
 }
 
+test "source vector migration progress pages sync the WAL without flushing tiny runs" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("vector-migration-page-wal");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{
+        .table_storage = .{ .dense_embeddings = .primary_lsm },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    // Verification and cleanup often change only a small progress record.
+    // A byte-bounded scan must not turn those records into one SST per page.
+    for (0..64) |i| {
+        const key = try std.fmt.allocPrint(alloc, "ordinary-{d:0>4}", .{i});
+        defer alloc.free(key);
+        try db.core.store.put(key, "value");
+    }
+    const request: vector_migration.contract.Request = .{
+        .job_id = "page-wal",
+        .mode = .online,
+        .budget = .{ .batch_rows = 1, .disk_reserve_bytes = 0 },
+    };
+    try db.startVectorMigration(request);
+    const backend = db.core.primary_store_owner.lsmBackend().?;
+    const before = backend.snapshotWriteStats();
+    for (0..32) |_| try db.advanceVectorMigration(request.job_id);
+    const after = backend.snapshotWriteStats();
+    var job = (try vector_migration.load(alloc, db.core.store)).?;
+    defer job.deinit();
+    try std.testing.expectEqual(@as(u64, 32), job.value.scanned_rows);
+    try std.testing.expectEqual(before.flushes, after.flushes);
+    try std.testing.expectEqual(before.flush_output_runs, after.flush_output_runs);
+}
+
 test "source vector migration recovers each preparation commit and publication boundary" {
     const alloc = std.testing.allocator;
     const Hook = struct {

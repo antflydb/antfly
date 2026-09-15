@@ -373,6 +373,10 @@ def main():
                     start_server()
             result["migration_and_churn_seconds"] = time.monotonic() - started
             ready(args.rows - args.churn)
+            # Capture file/flush debt at the start of queries, before later
+            # maintenance or restart can hide migration-induced tiny runs.
+            result["before_queries"] = api("GET", f"/tables/{table}")
+            write_json(arm / "before-queries.json", result)
             recalls = []
             for vector, expected in zip(queries, truth):
                 response = query(vector)
