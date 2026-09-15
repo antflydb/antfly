@@ -31,8 +31,8 @@ until reproduced with the corrected executable.
 The E2E poller now stops on unexpected HTTP errors, including 500, instead of
 hiding them behind a generic promotion timeout. Only 503 with `Retry-After` and
 transport timeouts/disconnects are retryable. Its original deadline still applies.
-Failure teardown captures native stacks before stopping the cluster and stores
-them with the retained server root. The existing disposable Linux launcher
+The first failure captures native stacks with a five-second per-process limit;
+teardown reuses that snapshot and stores it with the retained server root. The existing disposable Linux launcher
 opts the test children into debugger attachment; the scheduled job installs GDB.
 
 The full nightly/manual soak now runs the production Autograph scenario under
@@ -50,7 +50,7 @@ SKIP_BUILD=1 ANTFLY_BIN="$PWD/zig/zig-out/bin/antfly" \
   scripts/ci/zig-e2e-autograph-soak.sh
 ```
 
-The poller/helper regressions pass locally (18 tests), as do the six regression
+The poller/helper regressions pass locally (19 tests), as do the six regression
 orchestration tests, including profile isolation and failure propagation.
 Production repetition and Linux qualification results are pending; adding a
 soak is not proof that the progress failure is fixed.

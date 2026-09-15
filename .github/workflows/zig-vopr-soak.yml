@@ -32,6 +32,10 @@ on:
         description: Trace filename when inspecting an earlier run
         type: string
         default: ''
+      diagnostic_replays:
+        description: Fresh process diagnostic replays, stopping at first failure (1-200)
+        type: number
+        default: 1
 
 permissions:
   contents: read
@@ -51,6 +55,7 @@ jobs:
       run_id: ${{ inputs.diagnostic_run }}
       shard_artifact: ${{ inputs.diagnostic_shard }}
       trace_name: ${{ inputs.diagnostic_trace }}
+      replays: ${{ inputs.diagnostic_replays }}
 
   # Cold qualification and runner compilation have independent job budgets.
   # Dedicated cache variables keep setup actions from replacing these paths.
@@ -260,7 +265,7 @@ jobs:
   production-e2e:
     if: inputs.diagnostic_run == '' && inputs.qualification_only != true
     runs-on: arc-antfly-heavy
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}-restore
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
@@ -311,6 +316,7 @@ jobs:
             e2e/antfly/test_backup_restore.py::test_cluster_restore_modes_with_concurrent_observers \
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/e2e.log"
       - name: Soak cross-shard Autograph resolution, promotion, and hydration
+        timeout-minutes: 45
         if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
         env:
           ANTFLY_E2E_REGRESSION_WORKERS: '2'

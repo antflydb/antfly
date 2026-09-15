@@ -15,6 +15,10 @@ on:
         description: Retained trace filename within the artifact
         type: string
         required: true
+      replays:
+        description: Fresh process replays, stopping at the first failure (1-200)
+        type: number
+        default: 1
   workflow_call:
     inputs:
       run_id:
@@ -29,6 +33,10 @@ on:
         description: Retained trace filename within the artifact
         type: string
         required: true
+      replays:
+        description: Fresh process replays, stopping at the first failure (1-200)
+        type: number
+        default: 1
 
 permissions:
   contents: read
@@ -58,6 +66,7 @@ jobs:
         timeout-minutes: 165
         env:
           TRACE_NAME: ${{ inputs.trace_name }}
+          VOPR_DIAGNOSTIC_REPLAYS: ${{ inputs.replays }}
         run: |
           tar -C "$RUNNER_TEMP/original-runner" -xzf "$RUNNER_TEMP/original-runner/vopr.tar.gz"
           mkdir -p "$RUNNER_TEMP/replay-diagnostics"

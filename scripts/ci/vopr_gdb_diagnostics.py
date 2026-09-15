@@ -4,6 +4,8 @@ Load with `gdb -batch -x scripts/ci/vopr_gdb_diagnostics.py --args vopr replay .
 This intentionally runs with GDB's embedded Python, not the system interpreter.
 """
 
+import os
+
 import gdb
 
 production_fixture = None
@@ -237,13 +239,21 @@ for breakpoint in http_boundaries:
     breakpoint.commands = "silent\npython application_error()\ncontinue\n"
 
 
-gdb.execute("run")
-# GDB itself can exit successfully after an inferior crash; retain its final
-# stack and propagate that distinction to the workflow.
-if gdb.selected_inferior().pid:
-    gdb.execute("thread apply all bt 12")
-    gdb.execute("quit 1")
-else:
-    gdb.execute(
-        f"quit {int(gdb.parse_and_eval('$_exitcode')) or int(inspection_failed)}"
-    )
+replays = int(os.environ.get("VOPR_DIAGNOSTIC_REPLAYS", "1"))
+if not 1 <= replays <= 200:
+    raise gdb.GdbError("VOPR_DIAGNOSTIC_REPLAYS must be between 1 and 200")
+for iteration in range(1, replays + 1):
+    production_fixture = None
+    inspection_failed = False
+    tasks_inspected = False
+    gdb.write(f"VOPR diagnostic replay {iteration}/{replays}\n")
+    gdb.execute("run")
+    # Each replay starts a new process. Keep the loaded symbols/breakpoints,
+    # never process state, and stop on the first failing execution.
+    if gdb.selected_inferior().pid:
+        gdb.execute("thread apply all bt 12")
+        gdb.execute("quit 1")
+    status = int(gdb.parse_and_eval("$_exitcode")) or int(inspection_failed)
+    if status:
+        gdb.execute(f"quit {status}")
+gdb.execute("quit 0")

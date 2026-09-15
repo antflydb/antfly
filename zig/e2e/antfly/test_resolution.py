@@ -135,17 +135,42 @@ def resolution_cluster(request: pytest.FixtureRequest):
         if report and report.failed:
             # Capture while the six node processes are still alive, including
             # failures that now stop immediately on an unexpected HTTP 500.
-            try:
-                (cluster.root / "native-stacks.txt").write_text(
-                    cluster.native_stack_dumps(per_process_timeout_s=5.0),
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                print(f"failed to preserve Autograph native stacks: {exc!r}")
+            _capture_failure_stacks(cluster)
         cluster.stop(
             timeout_s=AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S,
             test_failed=bool(report and report.failed),
         )
+
+
+def _capture_failure_stacks(cluster: MultiNodeScalingCluster) -> str:
+    # Capture once at the first failure, then reuse during fixture teardown.
+    # Six default 25-second debugger waits followed by another capture could
+    # otherwise consume the soak's evidence-upload budget on every failed case.
+    captured = getattr(cluster, "_autograph_failure_stacks", None)
+    if captured is None:
+        captured = cluster.native_stack_dumps(per_process_timeout_s=5.0)
+        cluster._autograph_failure_stacks = captured
+        try:
+            (cluster.root / "native-stacks.txt").write_text(captured, encoding="utf-8")
+        except OSError as exc:
+            print(f"failed to preserve Autograph native stacks: {exc!r}")
+    return captured
+
+
+def test_autograph_failure_stacks_are_bounded_and_retained_once(tmp_path):
+    class Cluster:
+        root = tmp_path
+        calls = []
+
+        def native_stack_dumps(self, *, per_process_timeout_s):
+            self.calls.append(per_process_timeout_s)
+            return "resolver waiting for read barrier"
+
+    cluster = Cluster()
+    first = _capture_failure_stacks(cluster)
+    assert _capture_failure_stacks(cluster) == first
+    assert cluster.calls == [5.0]
+    assert (tmp_path / "native-stacks.txt").read_text() == first
 
 
 class _Api:
@@ -185,7 +210,7 @@ class _Api:
                     else max_timeout
                 )
             except AssertionError as exc:
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 index_names = sorted(indexes.keys()) if indexes is not None else []
                 raise AssertionError(
                     f"create table exhausted its {deadline.timeout_s:.1f}s deadline "
@@ -202,7 +227,7 @@ class _Api:
             except requests.RequestException as exc:
                 # A transport failure does not prove whether the DDL reached
                 # Raft, so never replay it automatically.
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 index_names = sorted(indexes.keys()) if indexes is not None else []
                 raise AssertionError(
                     f"create table timed out/failed table={name!r} shards={num_shards} "
@@ -248,7 +273,7 @@ class _Api:
                     else max_timeout
                 )
             except AssertionError as exc:
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 raise AssertionError(
                     f"batch insert exhausted its {deadline.timeout_s:.1f}s deadline "
                     f"table={table!r} key={doc_id!r} sync_level={sync_level!r} "
@@ -265,7 +290,7 @@ class _Api:
                 # A timed-out write usually means a node wedged in memory without
                 # logging anything; capture native stacks before teardown so the
                 # CI failure is diagnosable.
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 raise AssertionError(
                     f"batch insert timed out/failed table={table!r} key={doc_id!r} "
                     f"sync_level={sync_level!r}: {exc!r}\n[native stacks]\n{stacks}"
@@ -637,7 +662,7 @@ def _wait_for_entities(
         f"entities were not promoted within {deadline.timeout_s}s "
         f"(elapsed={deadline.elapsed():.1f}s, pending={sorted(pending)!r}, "
         f"last={last!r}, last_error={last_error!r})"
-        f"\n[native stacks]\n{api._server.native_stack_dumps()}"
+        f"\n[native stacks]\n{_capture_failure_stacks(api._server)}"
         f"\n{api.diagnostic()}"
     )
 
