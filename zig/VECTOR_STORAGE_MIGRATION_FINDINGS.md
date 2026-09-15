@@ -19,6 +19,11 @@ at concurrency 1, 8, and 32. Workloads are semantic, full-text, and an alternati
 disk includes retained physical roots. After the restarted query cells, the
 harness waits up to 180 seconds for source reclamation. That additional wait is
 not the elapsed reclamation time since job completion.
+The final runner fails if source collection does not reach the expected live
+payload count. For the large-vector synthetic corpus (at least 512 dimensions),
+it also rejects migrated primary SSTables larger than half the raw vector plane.
+This broad regression guard catches inline-sized retention; it is not a proof
+that every obsolete byte has been removed. Exact bytes remain in each receipt.
 
 This is a sequential screen on the available host. It is not a repeated ABBA
 promotion qualification. The isotropic synthetic corpus has low absolute recall
@@ -148,7 +153,26 @@ physical primary reclamation: it retained 2,595,108,632 bytes of primary SSTable
 versus 379,544,230 for fresh storage. Total allocated disk was 6,233,559,040 versus
 3,987,898,368 bytes. Source collection was complete in both, so the difference
 was old inline primary values rather than orphan source payloads. These receipts
-are retained under `wal-1m/`; the offline arm is still running.
+are retained under `wal-1m/`. All three arms subsequently completed.
+
+| Measurement | Fresh vector-store | Online migration | Offline migration |
+|---|---:|---:|---:|
+| Initial ready, seconds | 572.8 | 593.5 | 595.4 |
+| Churn plus migration, seconds | 5.2 | 351.1 | 1,792.6 |
+| Semantic QPS C1/C8/C32 | 13.2 / 44.8 / 53.9 | 18.8 / 87.8 / 107.9 | 17.9 / 81.3 / 100.9 |
+| Restarted semantic QPS C1/C8/C32 | 13.5 / 66.5 / 80.9 | 17.7 / 76.7 / 100.3 | 18.9 / 76.5 / 80.9 |
+| Recall@10 | 0.094 | 0.097 | 0.091 |
+| Warm restart, seconds | 16.7 | 2.2 | 5.6 |
+| Sampled peak process RSS, GiB | 5.89 | 10.28 | 7.20 |
+| Primary SSTable bytes, GB | 0.380 | 2.595 | 3.614 |
+| Allocated disk, GB | 3.988 | 6.234 | 7.240 |
+
+All source collections completed with exactly 999,000 retained payloads. The
+primary stores reported no obsolete paths or ordinary compaction backlog:
+old inline values remained in active lower-level runs. Offline conversion took
+about 30 minutes. Compilation overlapped portions of this screen; these single
+sequential arms do not establish performance equivalence or causal speedups.
+The following changes are intended to address its disk and conversion costs.
 
 The migration now has an explicit `reclaiming` phase. After candidate cleanup,
 it flushes replacements once and durably requests overlap rewrites through the
@@ -168,7 +192,9 @@ The regression checks bounded input I/O, an old reader, restart after partial
 progress, and removal of superseded values in a store with zero tombstones.
 The LSM suite passed 493 tests (23 skipped), and all 12 DB migration tests passed,
 including recovery at the manifest-request and primary-receipt boundaries.
-Production and 50K/1M qualification of this additional step are pending.
+The final binary at `a494f01b21` passes all 11 production migration/vector-store
+checks, including abrupt process death after the reclamation receipt. The
+combined 50K/1M qualification is running.
 
 ### Descriptor-cache hit cost
 
@@ -201,4 +227,45 @@ The operator cache uses the same standalone resource policy, participates in
 memory admission, and is destroyed after the candidate closes. Caller caches
 and resource managers take precedence. All 12 DB migration tests pass with this
 change, including offline resume/copy/publication faults. Its end-to-end effect
-is pending the final comparison; it is distinct from the descriptor microbench.
+is evaluated in the final comparison; it is distinct from the descriptor microbench.
+
+## Final 50K screen
+
+Receipts: `.benchmark-results/vector-migration-implementation/final-50k/`.
+The final binary at `a494f01b21` includes explicit primary reclamation,
+allocation-free descriptor cache hits, and the bounded offline block cache.
+All arms completed, reopened, and collected down to 49,000 source payloads.
+
+| Measurement | Fresh vector-store | Online migration | Offline migration |
+|---|---:|---:|---:|
+| Initial ready, seconds | 24.58 | 24.72 | 24.53 |
+| Churn plus migration, seconds | 1.55 | 18.49 | 11.52 |
+| Semantic QPS C1/C8/C32 | 48.0 / 324.0 / 246.2 | 23.1 / 116.2 / 128.2 | 22.9 / 106.1 / 117.9 |
+| Restarted semantic QPS C1/C8/C32 | 23.5 / 130.0 / 140.9 | 23.0 / 111.2 / 116.5 | 22.8 / 111.1 / 122.9 |
+| Full-text QPS C8, before restart | 1,216.6 | 1,256.5 | 1,194.8 |
+| Mixed QPS C8, before restart | 207.7 | 177.8 | 193.8 |
+| Recall@10 | 0.197 | 0.159 | 0.181 |
+| Warm restart, seconds | 0.19 | 1.19 | 2.24 |
+| Sampled peak process RSS, MiB | 1,089.8 | 1,471.1 | 1,161.0 |
+| Final primary SSTable bytes, MB | 18.59 | 19.04 | 17.24 |
+| Final allocated disk, MB | 206.29 | 207.69 | 204.96 |
+
+Online primary SSTables were already down to 19.04 MB before query measurement,
+compared with 187 MB at that point in the WAL-only screen. Its longer conversion
+now includes explicit primary reclamation. Total final disk is within about 1%
+of fresh storage. Reopened C1 is close, while migrated C8/C32 remain lower in
+this single screen. The shared post-churn slowdown is still present. These
+results do not prove query-performance equivalence.
+
+### Same-index neighbor preservation
+
+The independently built 50K arms have different recall. A separate production
+regression isolates conversion from ANN build variation: create 4,096 normalized
+64-D vectors, restart the primary-LSM table, record 32 top-10 queries, migrate
+that same table, and repeat before and after another restart. Both online and
+offline conversion preserve all ordered neighbor lists exactly. The two checks
+pass in 9.21 seconds with the final binary. This covers native ANN conversion;
+it does not claim identical graph construction for legacy ANN rebuilding or
+equivalent recall for independently built million-vector tables.
+The complete production migration/vector-store suite, including these two
+checks, subsequently passed all 13 tests in 43.11 seconds.

@@ -15,6 +15,8 @@
 """Source ownership migration through the production compiled owner and catalog."""
 
 import json
+import math
+import random
 import subprocess
 import time
 
@@ -95,6 +97,108 @@ def finish(api, table, job, status=None, check=None):
             api, table, job, "publish" if status["phase"] == "ready" else "step"
         )
     pytest.fail(f"migration did not finish: {status}")
+
+
+@pytest.mark.parametrize("mode", ["online", "offline"])
+def test_vector_migration_preserves_native_ann_neighbors(stateful_api, mode):
+    """Compare the same built ANN before/after ownership conversion and restart."""
+    api = stateful_api
+    table = f"neighbors_migrate_{mode}_{time.time_ns()}"
+    rng = random.Random(728)
+
+    def vector():
+        values = [rng.gauss(0, 1) for _ in range(64)]
+        length = math.sqrt(sum(x * x for x in values))
+        return [x / length for x in values]
+
+    api.create_table(table, storage={"dense_embeddings": "primary_lsm"})
+    api.create_index(
+        table,
+        "model",
+        {"name": "model", "type": "embeddings", "external": True, "dimension": 64},
+    )
+    for first in range(0, 4096, 256):
+        api.batch_write(
+            table,
+            inserts={
+                f"doc:{i:06d}": {
+                    "text": f"document {i}",
+                    "_embeddings": {"model": vector()},
+                }
+                for i in range(first, first + 256)
+            },
+            sync_level="full_index",
+        )
+    assert wait_until(
+        lambda: api.get_index(table, "model").get("status", {}).get("total_indexed")
+        == 4096,
+        timeout_s=90,
+    )
+    queries = [vector() for _ in range(32)]
+
+    def neighbors():
+        return [
+            hit_ids(
+                api.query_table(
+                    table,
+                    {"embeddings": {"model": q}, "indexes": ["model"], "limit": 10},
+                )
+            )
+            for q in queries
+        ]
+
+    # Stabilize persistence before taking the baseline: a different ANN build
+    # can have different recall even with identical input and query vectors.
+    api.restart_server()
+    before = neighbors()
+    assert all(len(hits) == 10 for hits in before)
+    assert neighbors() == before
+    if mode == "online":
+        status = api.post(
+            f"/tables/{table}/storage/migrations",
+            {
+                "job_id": "neighbors",
+                "target": "vector_store",
+                "budget": {
+                    "batch_rows": 8192,
+                    "batch_bytes": 8 * 1024 * 1024,
+                    "disk_reserve_bytes": 0,
+                },
+            },
+        )
+        assert finish(api, table, "neighbors", status=status)["phase"] == "complete"
+    else:
+        server = api._server
+        api.pause_server()
+        try:
+            completed = subprocess.run(
+                [
+                    str(server.binary),
+                    "storage",
+                    "migrate",
+                    "--to",
+                    "vector-store",
+                    "--catalog",
+                    str(server.root / "metadata/local-metadata.json"),
+                    "--replica-root",
+                    str(server.replica_root),
+                    "--table",
+                    table,
+                    "--job",
+                    "neighbors",
+                    "--disk-reserve-bytes",
+                    "0",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            assert completed.returncode == 0, completed.stderr
+        finally:
+            api.resume_server()
+    assert neighbors() == before
+    api.restart_server()
+    assert neighbors() == before
 
 
 def test_online_vector_migration_restart_concurrent_models_and_rebuild(stateful_api):

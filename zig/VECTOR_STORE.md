@@ -3739,10 +3739,10 @@ for the experimental mode until their lifecycle contracts are implemented and
 validated. Supported backup/restore paths must preserve reference closure; any
 unimplemented path must reject the operation explicitly.
 
-Switching an existing table requires the separate migration protocol planned
-above. Until it is implemented, select ownership explicitly on a fresh table
-and reload the complete source data. A runtime toggle is not a rollback
-mechanism for reference-only artifacts.
+Switching an existing table uses the explicit offline or online protocol in
+[Existing-table migration](#existing-table-migration). Direct configuration
+changes remain rejected. A runtime toggle is not a rollback mechanism for
+reference-only artifacts.
 
 ## Implementation sequence and acceptance
 

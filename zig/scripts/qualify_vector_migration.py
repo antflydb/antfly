@@ -492,6 +492,19 @@ def main():
             stop_server()
             result["allocated_disk_bytes"] = disk_bytes(data)
             write_json(arm / "result.json", result)
+            if not result["source_reclamation_complete"]:
+                raise AssertionError(
+                    "source reclamation did not reach the live payload count"
+                )
+            # This fixed corpus has tiny documents relative to 768-D vectors.
+            # Catch inline-sized primary retention before qualifying larger arms;
+            # the exact table/byte measurements remain available in result.json.
+            if mode != "fresh" and args.dimensions >= 512:
+                primary_bytes = state["storage_status"]["lsm"]["run_bytes"]
+                if primary_bytes > args.rows * args.dimensions * 4 // 2:
+                    raise AssertionError(
+                        f"primary SSTables still occupy inline-payload-sized space: {primary_bytes}"
+                    )
             results.append(result)
             write_json(args.root / "results.json", results)
             print(
