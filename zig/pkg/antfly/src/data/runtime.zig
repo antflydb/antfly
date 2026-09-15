@@ -4482,6 +4482,21 @@ const IndexRepairOwnershipFence = struct {
     }
 };
 
+const SchemaRepairFence = struct {
+    server: *DataServer,
+    group_id: u64,
+    root_generation: u64,
+    ownership_generation: u64,
+    fn cancelled(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.server.background_jobs_shutdown.load(.acquire) or self.server.provisioned_index_repair_shutdown.load(.acquire);
+    }
+    fn current(ptr: *anyopaque) anyerror!bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return !cancelled(ptr) and self.server.local_group_status_generation.load(.acquire) == self.ownership_generation and self.server.liveRuntimeWriteSource().visibleRootGenerationForRepair(self.group_id) == self.root_generation;
+    }
+};
+
 const IndexRepairCancellationFence = struct {
     server: *DataServer,
     group_id: u64,
@@ -4953,6 +4968,8 @@ pub const DataServer = struct {
     provisioned_warmup_failed: std.atomic.Value(u64) = .init(0),
     provisioned_warmup_last_group_count: std.atomic.Value(u64) = .init(0),
     provisioned_warmup_last_duration_ns: std.atomic.Value(u64) = .init(0),
+    schema_repair_schedule: @import("schema_repair_schedule.zig").Schedule = .{},
+    schema_repair_pending: std.atomic.Value(bool) = .init(false),
     provisioned_startup_catch_up_mutex: std.atomic.Mutex = .unlocked,
     provisioned_startup_catch_up_active: std.atomic.Value(bool) = .init(false),
     // Persistent maintenance has an independent runtime reservation.
@@ -7670,6 +7687,7 @@ pub const DataServer = struct {
             if (entry.table_name) |table_name| self.alloc.free(table_name);
         }
         self.provisioned_index_repair_group_ages.deinit(self.alloc);
+        self.schema_repair_schedule.deinit(self.alloc);
         self.provisioned_index_repair_terminal_log_groups.deinit(self.alloc);
         self.provisioned_index_repair_cancel_groups.deinit(self.alloc);
         self.provisioned_index_repair_routes.deinit(self.alloc);
@@ -16845,6 +16863,52 @@ pub const DataServer = struct {
         return warmed_group_count;
     }
 
+    fn collectStartupCatchUpRoutes(self: *DataServer, snapshot: anytype, local_group_ids: []const u64, deferred_groups: anytype, full_scan: bool, now_ms: u64) ![]@import("schema_repair_schedule.zig").Route {
+        const Route = @import("schema_repair_schedule.zig").Route;
+        const TableRoute = struct { index: usize, schema_hash: u64 };
+        var tables: std.AutoHashMapUnmanaged(u64, TableRoute) = .empty;
+        defer tables.deinit(self.alloc);
+        for (snapshot.tables, 0..) |table, i| {
+            var hash = std.hash.Wyhash.init(0);
+            if (table.read_schema_json.len != 0) {
+                hash.update(table.schema_json);
+                hash.update(table.indexes_json);
+            }
+            try tables.put(self.alloc, table.table_id, .{ .index = i, .schema_hash = hash.final() });
+        }
+        var ordinary: std.ArrayListUnmanaged(Route) = .empty;
+        defer ordinary.deinit(self.alloc);
+        var routes: std.ArrayListUnmanaged(Route) = .empty;
+        errdefer routes.deinit(self.alloc);
+        self.schema_repair_schedule.beginSync(now_ms);
+        const ownership_generation = self.local_group_status_generation.load(.acquire);
+        for (snapshot.ranges, 0..) |range, i| {
+            if (!containsSortedU64(local_group_ids, range.group_id)) continue;
+            const table_route = tables.get(range.table_id) orelse continue;
+            const table_index = table_route.index;
+            const table = snapshot.tables[table_index];
+            const route: Route = .{ .group_id = range.group_id, .range_index = i, .table_index = table_index };
+            if (table.read_schema_json.len != 0) {
+                try self.schema_repair_schedule.observe(self.alloc, route, .{
+                    .table_id = table.table_id,
+                    .schema_hash = table_route.schema_hash,
+                    .root_generation = self.liveRuntimeWriteSource().visibleRootGenerationForRepair(range.group_id),
+                    .ownership_generation = ownership_generation,
+                });
+            } else if (full_scan or containsSortedDeferredStartupCatchUpGroup(deferred_groups, range.group_id)) {
+                try ordinary.append(self.alloc, route);
+            }
+        }
+        try self.schema_repair_schedule.endSync(self.alloc);
+        // Only attempted work rotates; unstarted selections retain priority
+        // when the pass exhausts its time budget.
+        var selected: [16]Route = undefined;
+        const selected_count = self.schema_repair_schedule.selectReady(now_ms, &selected);
+        try routes.appendSlice(self.alloc, selected[0..selected_count]);
+        try routes.appendSlice(self.alloc, ordinary.items);
+        return try routes.toOwnedSlice(self.alloc);
+    }
+
     fn runProvisionedStartupCatchUp(self: *DataServer) ProvisionedStartupCatchUpStats {
         const started_epoch = self.provisioned_startup_catch_up_epoch.load(.acquire);
         const requested_full_scan_epoch = self.provisioned_startup_catch_up_full_scan_epoch.load(.acquire);
@@ -16944,16 +17008,19 @@ pub const DataServer = struct {
             };
         };
 
-        // Group ids are the routing identity and are unique within the catalog.
-        // Walk ranges once with logarithmic membership checks instead of the
-        // former table/group Cartesian product plus repeated range scans.
-        // Exact retries perform disk work only for their keyed targets.
-        var schema_repair_attempted = false;
-        for (snapshot.ranges) |range| {
+        const routes = self.collectStartupCatchUpRoutes(snapshot, local_group_ids, deferred_groups, full_scan, started_at_ms) catch |err| {
+            std.log.warn("startup routing failed err={s}", .{@errorName(err)});
+            stats.debt_remaining = true;
+            stats.unparked_debt_remaining = true;
+            stats.full_scan_retry_required = true;
+            return stats;
+        };
+        defer self.alloc.free(routes);
+        const schema_deadline_ns = self.backgroundMonotonicNs() +| 100 * std.time.ns_per_ms;
+        for (routes) |route| {
+            const range = snapshot.ranges[route.range_index];
             const group_id = range.group_id;
-            if (!containsSortedU64(local_group_ids, group_id)) continue;
-            if (!full_scan and !containsSortedDeferredStartupCatchUpGroup(deferred_groups, group_id)) continue;
-            const table = findTableById(snapshot.tables, range.table_id) orelse continue;
+            const table = snapshot.tables[route.table_index];
             // Schema cutover requires a local index proof from every replica.
             // Give that exact full-text index one repair quantum on this owner;
             // unrelated steady-state repair keeps its leader-only admission.
@@ -16968,12 +17035,13 @@ pub const DataServer = struct {
                 };
                 break :name std.fmt.bufPrint(&schema_index_name_buf, "full_text_index_v{d}", .{version}) catch unreachable;
             } else null;
-            if (schema_index_name != null and schema_repair_attempted) {
+            if (schema_index_name != null and self.backgroundMonotonicNs() >= schema_deadline_ns) {
                 stats.debt_remaining = true;
                 stats.unparked_debt_remaining = true;
                 stats.full_scan_retry_required = true;
                 continue;
             }
+            if (schema_index_name != null) self.schema_repair_schedule.beginAttempt(group_id);
             // Restore imports a distinct physical generation into every
             // placement, and metadata does not complete the range intent
             // until every placement reports its local runtime repair
@@ -17029,6 +17097,13 @@ pub const DataServer = struct {
                 },
             };
 
+            var schema_fence = SchemaRepairFence{
+                .server = self,
+                .group_id = group_id,
+                .root_generation = self.liveRuntimeWriteSource().visibleRootGenerationForRepair(group_id),
+                .ownership_generation = self.local_group_status_generation.load(.acquire),
+            };
+            var schema_yield = IndexRepairYieldFence{ .server = self, .deadline_ns = @min(schema_deadline_ns, self.backgroundMonotonicNs() +| 25 * std.time.ns_per_ms) };
             const result = result_blk: {
                 self.setProvisionedStartupCatchUpTarget(group_id, table.name) catch |err| {
                     _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
@@ -17045,7 +17120,14 @@ pub const DataServer = struct {
                     .schema_json = table.schema_json,
                     .target_index_name = schema_index_name,
                     .advance_index_repairs = schema_index_name != null,
-                    .index_repair_options = .{ .target_index_name = schema_index_name },
+                    .index_repair_options = .{
+                        .target_index_name = schema_index_name,
+                        .cancel_check = .{ .ptr = &schema_fence, .is_requested = SchemaRepairFence.cancelled },
+                        .yield_check = .{ .ptr = &schema_yield, .is_requested = IndexRepairYieldFence.requested },
+                        .activation_check = .{ .ptr = &schema_fence, .is_current_owner = SchemaRepairFence.current },
+                        .owner_epoch = schema_fence.ownership_generation,
+                        .capacity_domain_id = registration.store_id,
+                    },
                     .identity_namespace = .{
                         .table_id = table.table_id,
                         .shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
@@ -17062,7 +17144,9 @@ pub const DataServer = struct {
             };
             stats.group_count += 1;
             if (schema_index_name != null) {
-                schema_repair_attempted = schema_repair_attempted or result.index_repair_attempted;
+                const complete = !result.busy and !result.index_repair_pending and !result.index_repair_paused and !result.restore_repair_pending and (!result.had_debt or result.cleared_debt) and !result.terminalDegraded() and (SchemaRepairFence.current(&schema_fence) catch false);
+                const retry_at_ms = if (result.index_repair_retry_at_ms != 0) indexRepairMonotonicDeadlineMs(result.index_repair_retry_at_ms, self.backgroundRealtimeMs(), started_at_ms) else if (result.index_repair_paused or result.terminalDegraded()) started_at_ms +| 30_000 else if (result.busy) started_at_ms +| 100 else 0;
+                self.schema_repair_schedule.finish(group_id, complete, retry_at_ms);
                 if (result.had_debt) stats.groups_with_debt += 1;
                 if (result.made_progress or result.cleared_debt) stats.groups_cleared += 1;
                 if (result.busy or result.index_repair_pending) {
@@ -17146,6 +17230,12 @@ pub const DataServer = struct {
             }
         }
 
+        self.schema_repair_pending.store(self.schema_repair_schedule.pending != 0, .release);
+        if (self.schema_repair_schedule.pending != 0) {
+            stats.debt_remaining = true;
+            stats.full_scan_retry_required = true;
+            stats.unparked_debt_remaining = true;
+        }
         inspection_complete = true;
         // Admission clears the live key before inspecting a shard and creates
         // a new generation if later work defers again. Retire every captured
@@ -17873,7 +17963,7 @@ pub const DataServer = struct {
         const not_before_ms = self.provisioned_startup_catch_up_not_before_ms.load(.acquire);
         if (not_before_ms != 0 and now_ms < not_before_ms) return;
         const last_at_ms = self.provisioned_startup_catch_up_last_run_at_ms.load(.monotonic);
-        if (last_at_ms != 0 and now_ms -| last_at_ms < provisioned_startup_catch_up_interval_ms) return;
+        if (last_at_ms != 0 and now_ms -| last_at_ms < (if (self.schema_repair_pending.load(.acquire)) @as(u64, 100) else provisioned_startup_catch_up_interval_ms)) return;
         try self.requestProvisionedStartupCatchUp();
     }
 

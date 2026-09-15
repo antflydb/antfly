@@ -1848,12 +1848,38 @@ pub fn reconcileStorageKernelOwnerDb(
         }
     }
 
+    const repair = try repairStorageKernelOwnerDb(alloc, db, target_index_name, advance_index_repair, .{});
+    result.repair_discovered = repair.repair_discovered;
+    result.repair_attempted = repair.repair_attempted;
+    result.repair_repaired = repair.repair_repaired;
+    result.repair_remaining = repair.repair_remaining;
+    result.repair_terminal = repair.repair_terminal;
+    result.repair_paused = repair.repair_paused;
+    result.repair_busy = repair.repair_busy;
+    result.repair_disk_waits = repair.repair_disk_waits;
+    result.next_retry_at_ms = repair.next_retry_at_ms;
+    result.state = if (repair.state != .complete) repair.state else if (result.restore_repair_pending != 0) .restore_repair_pending else if (provisioned.indexes_pending != 0) .busy else .complete;
+    return result;
+}
+
+/// Only shadow construction and its fenced activation may run under a shared
+/// generation lease. This entry point never applies a catalog configuration.
+pub fn repairStorageKernelOwnerDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    target_index_name: ?[]const u8,
+    advance_index_repair: bool,
+    options: db_mod.types.ArtifactRepairRunOptions,
+) !StorageKernelReconcileResult {
+    var result: StorageKernelReconcileResult = .{};
     var repair_summary = db.indexRepairIntentSummaryForIndex(alloc, target_index_name) catch |err| switch (err) {
-        error.DurableIndexRepairStateUnavailable => db_mod.DB.IndexRepairIntentSummary{},
+        error.DurableIndexRepairStateUnavailable => if (target_index_name != null or advance_index_repair) return err else db_mod.DB.IndexRepairIntentSummary{},
         else => return err,
     };
     if (advance_index_repair and repair_summary.runnable != 0) {
-        const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, .{ .target_index_name = target_index_name });
+        var effective = options;
+        effective.target_index_name = target_index_name;
+        const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, effective);
         result.repair_discovered = repair.discovered;
         result.repair_attempted = repair.attempted;
         result.repair_repaired = repair.repaired;
@@ -1872,16 +1898,13 @@ pub fn reconcileStorageKernelOwnerDb(
         result.next_retry_at_ms = repair_summary.earliest_retry_at_ms;
     }
 
+    result.repair_paused = repair_summary.paused;
     result.state = if (repair_summary.terminal != 0)
         .degraded
     else if (result.repair_busy != 0)
         .busy
-    else if (result.restore_repair_pending != 0)
-        .restore_repair_pending
     else if (repair_summary.runnable != 0 or repair_summary.paused != 0)
         .repair_pending
-    else if (provisioned.indexes_pending != 0)
-        .busy
     else
         .complete;
     return result;

@@ -15500,6 +15500,7 @@ fn consumerTests() type {
                     const right = std.mem.indexOf(u8, req.body, "doc:z") != null;
                     _ = self.calls.fetchAdd(1, .monotonic);
                     _ = self.keys_seen.fetchAdd(@as(usize, @intFromBool(left)) + @intFromBool(right), .monotonic);
+                    if (left == right) std.debug.print("unexpected candidate fanout payload uri={s} body={s}\n", .{ req.uri, req.body });
                     try std.testing.expect(left != right);
                     try std.testing.expectEqual(left, std.mem.indexOf(u8, req.uri, "/groups/7/") != null);
                     try std.testing.expectEqual(right, std.mem.indexOf(u8, req.uri, "/groups/8/") != null);

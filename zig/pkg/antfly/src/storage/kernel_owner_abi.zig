@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 56;
+pub const abi_version: u32 = 57;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1081,11 +1081,29 @@ pub const ReconcileState = enum(u32) {
 pub const ReconcileRequest = extern struct {
     version: u32 = abi_version,
     advance_index_repair: u8 = 0,
-    _reserved0: [3]u8 = .{ 0, 0, 0 },
+    repair_only: u8 = 0,
+    _reserved0: [2]u8 = .{ 0, 0 },
     table_name: BorrowedBytes = .{},
     schema_json: BorrowedBytes = .{},
     indexes_json: BorrowedBytes = .{},
     target_index_name: BorrowedBytes = .{},
+    repair_controls: RepairControls = .{},
+};
+
+/// Borrowed for one synchronous repair call. Callback state is never retained
+/// by the physical owner; durable progress belongs to the repair intent.
+pub const RepairControls = extern struct {
+    context: ?*anyopaque = null,
+    cancelled: ?CancellationCheckFn = null,
+    yield_requested: ?CancellationCheckFn = null,
+    activation_allowed: ?CancellationCheckFn = null,
+    owner_epoch: u64 = 0,
+    capacity_domain_lo: u64 = 0,
+    capacity_domain_hi: u64 = 0,
+    estimated_candidate_bytes: u64 = 0,
+    max_activation_gap_sequences: u64 = 200,
+    max_convergence_rounds: u32 = 32,
+    max_activation_pause_ms: u64 = 250,
 };
 
 pub const ReconcileResult = extern struct {
@@ -1099,6 +1117,7 @@ pub const ReconcileResult = extern struct {
     repair_repaired: u64 = 0,
     repair_remaining: u64 = 0,
     repair_terminal: u64 = 0,
+    repair_paused: u64 = 0,
     repair_busy: u64 = 0,
     repair_disk_waits: u64 = 0,
     next_retry_at_ms: u64 = 0,

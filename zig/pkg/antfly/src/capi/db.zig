@@ -4492,27 +4492,60 @@ pub fn storageOwnerConfigure(
     return .ok;
 }
 
+const OwnerRepairControls = struct {
+    wire: kernel_owner_abi.RepairControls,
+    fn cancelled(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return if (self.wire.cancelled) |check| check(self.wire.context) != 0 else false;
+    }
+    fn yieldRequested(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return if (self.wire.yield_requested) |check| check(self.wire.context) != 0 else false;
+    }
+    fn activationAllowed(ptr: *anyopaque) anyerror!bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return if (self.wire.activation_allowed) |check| check(self.wire.context) != 0 else true;
+    }
+    fn options(self: *@This()) db_mod.types.ArtifactRepairRunOptions {
+        return .{
+            .cancel_check = if (self.wire.cancelled != null) .{ .ptr = self, .is_requested = cancelled } else null,
+            .yield_check = if (self.wire.yield_requested != null) .{ .ptr = self, .is_requested = yieldRequested } else null,
+            .activation_check = if (self.wire.activation_allowed != null) .{ .ptr = self, .is_current_owner = activationAllowed } else null,
+            .owner_epoch = self.wire.owner_epoch,
+            .capacity_domain_id = (@as(u128, self.wire.capacity_domain_hi) << 64) | self.wire.capacity_domain_lo,
+            .estimated_candidate_bytes = self.wire.estimated_candidate_bytes,
+            .max_activation_gap_sequences = self.wire.max_activation_gap_sequences,
+            .max_convergence_rounds = self.wire.max_convergence_rounds,
+            .max_activation_pause_ms = self.wire.max_activation_pause_ms,
+        };
+    }
+};
+
 pub fn storageOwnerReconcile(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.ReconcileRequest,
     out_result: *kernel_owner_abi.ReconcileResult,
 ) callconv(.c) kernel_owner_abi.Status {
-    out_result.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    out_result.* = .{};
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    const reconciled = local_write.reconcileStorageKernelOwnerDb(
-        handle.alloc,
-        &handle.db,
-        request.table_name.slice(),
-        request.schema_json.slice(),
-        request.indexes_json.slice(),
-        if (request.target_index_name.slice().len == 0) null else request.target_index_name.slice(),
-        request.advance_index_repair != 0,
-        if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
-        if (handle.storage_owner_context) |context| context.antflyProvider() else null,
-        &handle.storage_owner_managed_config,
-    ) catch |err| return storageOwnerStatusFromError(err);
+    var controls = OwnerRepairControls{ .wire = request.repair_controls };
+    const reconciled = if (request.repair_only != 0)
+        local_write.repairStorageKernelOwnerDb(handle.alloc, &handle.db, if (request.target_index_name.slice().len == 0) null else request.target_index_name.slice(), request.advance_index_repair != 0, controls.options()) catch |err| return storageOwnerStatusFromError(err)
+    else
+        local_write.reconcileStorageKernelOwnerDb(
+            handle.alloc,
+            &handle.db,
+            request.table_name.slice(),
+            request.schema_json.slice(),
+            request.indexes_json.slice(),
+            if (request.target_index_name.slice().len == 0) null else request.target_index_name.slice(),
+            request.advance_index_repair != 0,
+            if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
+            if (handle.storage_owner_context) |context| context.antflyProvider() else null,
+            &handle.storage_owner_managed_config,
+        ) catch |err| return storageOwnerStatusFromError(err);
     out_result.* = .{
         .state = switch (reconciled.state) {
             .complete => .complete,
@@ -4529,6 +4562,7 @@ pub fn storageOwnerReconcile(
         .repair_repaired = @intCast(reconciled.repair_repaired),
         .repair_remaining = @intCast(reconciled.repair_remaining),
         .repair_terminal = @intCast(reconciled.repair_terminal),
+        .repair_paused = @intCast(reconciled.repair_paused),
         .repair_busy = @intCast(reconciled.repair_busy),
         .repair_disk_waits = @intCast(reconciled.repair_disk_waits),
         .next_retry_at_ms = reconciled.next_retry_at_ms,

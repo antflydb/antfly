@@ -50,6 +50,7 @@ pub const LocalStructuralReconcileResult = struct {
     repair_repaired: u64 = 0,
     repair_remaining: u64 = 0,
     repair_terminal: u64 = 0,
+    repair_paused: u64 = 0,
     repair_busy: u64 = 0,
     repair_disk_waits: u64 = 0,
     next_retry_at_ms: u64 = 0,
@@ -558,6 +559,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             target_index_name: ?[]const u8,
             advance_index_repair: bool,
+            repair_options: db_mod.types.ArtifactRepairRunOptions,
         ) anyerror!?LocalStructuralReconcileObservation = null,
         local_runtime_status_group_local: ?*const fn (
             ptr: *anyopaque,
@@ -1448,6 +1450,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         target_index_name: ?[]const u8,
         advance_index_repair: bool,
+        repair_options: db_mod.types.ArtifactRepairRunOptions,
     ) !?LocalStructuralReconcileObservation {
         const fn_ptr = self.vtable.reconcile_table_group_local_transient_observed orelse {
             const result = (try self.reconcileTableGroupLocalTransient(
@@ -1465,6 +1468,7 @@ pub const TableWriteSource = struct {
             table_name,
             target_index_name,
             advance_index_repair,
+            repair_options,
         });
     }
 

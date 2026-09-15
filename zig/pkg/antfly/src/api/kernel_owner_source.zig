@@ -144,6 +144,14 @@ pub const ProvisionedKernelOwnerSource = struct {
             return &self.entry.owner;
         }
 
+        fn downgrade(self: *Lease) void {
+            lock(&self.source.mutex);
+            defer self.source.mutex.unlock();
+            std.debug.assert(self.active and self.exclusive and self.entry.active_users == 1);
+            self.entry.exclusive_active = false;
+            self.exclusive = false;
+        }
+
         fn retireAfterConfigurationFailure(self: *Lease) void {
             lock(&self.source.mutex);
             self.entry.retired = true;
@@ -1195,6 +1203,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .repair_repaired = result.repair_repaired,
             .repair_remaining = result.repair_remaining,
             .repair_terminal = result.repair_terminal,
+            .repair_paused = result.repair_paused,
             .repair_busy = result.repair_busy,
             .repair_disk_waits = result.repair_disk_waits,
             .next_retry_at_ms = result.next_retry_at_ms,
@@ -1222,6 +1231,40 @@ pub const ProvisionedKernelOwnerSource = struct {
         return localStructuralReconcileResult(result);
     }
 
+    const RepairControlsBridge = struct {
+        options: db_types.ArtifactRepairRunOptions,
+        deadline_ns: u64 = 0,
+
+        fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            return @intFromBool(self.options.cancelled());
+        }
+        fn yieldRequested(ptr: ?*anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            return @intFromBool(if (self.options.yield_check) |check| check.requested() else platform_time.monotonicNs() >= self.deadline_ns);
+        }
+        fn activationAllowed(ptr: ?*anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            return @intFromBool(if (self.options.activation_check) |check| check.current() catch false else true);
+        }
+        fn wire(self: *@This()) abi.RepairControls {
+            self.deadline_ns = platform_time.monotonicNs() +| 50 * std.time.ns_per_ms;
+            return .{
+                .context = self,
+                .cancelled = cancelled,
+                .yield_requested = yieldRequested,
+                .activation_allowed = activationAllowed,
+                .owner_epoch = self.options.owner_epoch,
+                .capacity_domain_lo = @truncate(self.options.capacity_domain_id),
+                .capacity_domain_hi = @truncate(self.options.capacity_domain_id >> 64),
+                .estimated_candidate_bytes = self.options.estimated_candidate_bytes,
+                .max_activation_gap_sequences = self.options.max_activation_gap_sequences,
+                .max_convergence_rounds = self.options.max_convergence_rounds,
+                .max_activation_pause_ms = self.options.max_activation_pause_ms,
+            };
+        }
+    };
+
     fn reconcileTableGroupLocalTransientObserved(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -1229,6 +1272,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         target_index_name: ?[]const u8,
         advance_index_repair: bool,
+        repair_options: db_types.ArtifactRepairRunOptions,
     ) !?table_write_source.LocalStructuralReconcileObservation {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
@@ -1243,16 +1287,34 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         errdefer lease.requestTransientRetirement();
 
-        const result = lease.owner().reconcile(
+        var result = lease.owner().reconcile(
             table_name,
             descriptor.schema_json,
             descriptor.indexes_json,
             target_index_name,
-            advance_index_repair,
+            false,
         ) catch |err| {
             lease.retireAfterConfigurationFailure();
             return err;
         };
+        if (advance_index_repair and result.restore_repair_pending == 0) {
+            // Keep the exact configured generation alive while allowing reads
+            // and Raft apply. Structural changes still wait for this lease.
+            lease.downgrade();
+            var controls = RepairControlsBridge{ .options = repair_options };
+            const repair = try lease.owner().repairIndex(table_name, target_index_name, controls.wire());
+            const added = result.indexes_added;
+            const removed = result.indexes_removed;
+            const pending = result.indexes_pending;
+            result = repair;
+            result.indexes_added = added;
+            result.indexes_removed = removed;
+            // Pending includes durable admission awaiting this reconstruction.
+            // It cannot gate execution. Retain the structural observation until
+            // a subsequent pass confirms the current catalog is installed.
+            result.indexes_pending = pending;
+            if (result.state == .complete and pending != 0) result.state = .busy;
+        }
         var response = lease.owner().runtimeStatusJson(table_name) catch |err| switch (err) {
             // Runtime status is deliberately best effort and returns busy
             // rather than waiting behind a concurrent Raft apply writer. The
@@ -3914,4 +3976,21 @@ test "transient storage owner retirement drains borrowers and permits foreground
         try std.testing.expectEqual(@as(usize, 1), source.ownerCountForTest());
         try std.testing.expectEqual(@as(u64, if (history == .foreground_adoption or history == .prepared_adoption) 1 else 2), misses);
     }
+}
+
+test "storage repair lease downgrade admits readers while fencing configuration" {
+    const Source = ProvisionedKernelOwnerSource;
+    var source: Source = undefined;
+    source.mutex = .unlocked;
+    var entry: Source.Entry = undefined;
+    entry.active_users = 1;
+    entry.exclusive_active = true;
+    entry.exclusive_pending = false;
+    var lease = Source.Lease{ .source = &source, .entry = &entry, .exclusive = true };
+    try std.testing.expect(!Source.tryReserveEntryLeaseLocked(&entry, false));
+    lease.downgrade();
+    try std.testing.expect(!lease.exclusive);
+    try std.testing.expect(Source.tryReserveEntryLeaseLocked(&entry, false));
+    try std.testing.expectEqual(@as(usize, 2), entry.active_users);
+    try std.testing.expect(!Source.tryReserveEntryLeaseLocked(&entry, true));
 }

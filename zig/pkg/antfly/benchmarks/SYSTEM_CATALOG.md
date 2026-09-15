@@ -522,3 +522,37 @@ ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest \
   e2e/antfly/test_schema_migration.py \
   e2e/antfly/test_catalog_resilience.py
 ```
+
+
+## Skewed tenant migrations under foreground traffic
+
+Run the production workload with one large tenant and several small tenants, all
+with three replicas, while issuing document lookups, searches and writes to migrating tables:
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_schema_migrations.py \
+  --binary zig-out/bin/antfly --baseline /path/to/previous/antfly \
+  --large-docs 10000 --small-tenants 5 --warmups 1 --samples 3 \
+  --output /tmp/schema-migration-comparison.json
+```
+
+Runs alternate revisions sequentially and create fresh clusters. Results retain
+binary hashes, warmups, unsuccessful runs, each tenant's cutover time, and raw
+lookup/search/write latencies. Setup is excluded from workload timing. Traffic is closed
+loop: assess completion times, request counts and latency distributions together;
+these results do not establish a fixed-load production SLO. The E2E checks every
+acknowledged foreground write after cutover. Storage regression tests separately
+force page yields, reopen the DB and verify replay of updates/inserts/deletes on
+both sides of the saved source cursor.
+
+The completed-prefix scheduling component can also run without a server:
+
+```sh
+ANTFLY_CATALOG_REPORT_BENCH=1 zig test -lc pkg/antfly/src/data/schema_repair_schedule.zig
+```
+
+This compares the former repeated-prefix selection with the actual queue at 1,000
+and 10,000 groups. It includes scheduling allocation and destruction, uses one
+warmup and five samples, and verifies the number of owner inspections. Physical
+owner calls and the former one-second scheduling interval are excluded; the CPU
+comparison must not be presented as an end-to-end migration speedup.

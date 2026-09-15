@@ -1687,6 +1687,13 @@ const TargetAdvanceMaintenanceDebt = struct {
     generation: u64,
 };
 
+fn indexRepairSupportsSnapshotCursor(kind: types.IndexKind) bool {
+    return switch (kind) {
+        .dense_vector, .algebraic, .full_text => true,
+        else => false,
+    };
+}
+
 fn checkArtifactRepairCancelled(options: types.ArtifactRepairRunOptions) !void {
     if (options.cancelled()) return error.Canceled;
 }
@@ -19491,7 +19498,7 @@ pub const DB = struct {
             defer durable_entry.deinit(alloc);
             const resumable = durable_entry.intent.candidate_relative_path != null and switch (durable_entry.intent.phase) {
                 .building => durable_entry.intent.build_resume_key != null and
-                    (cfg.kind == .dense_vector or cfg.kind == .algebraic),
+                    indexRepairSupportsSnapshotCursor(cfg.kind),
                 .catching_up, .ready, .waiting_for_convergence => true,
                 else => false,
             };
@@ -19712,7 +19719,7 @@ pub const DB = struct {
             defer entry.deinit(alloc);
             const resumable_phase = switch (entry.intent.phase) {
                 .building => entry.intent.build_resume_key != null and
-                    (cfg.kind == .dense_vector or cfg.kind == .algebraic),
+                    indexRepairSupportsSnapshotCursor(cfg.kind),
                 .catching_up, .ready, .waiting_for_convergence => true,
                 else => false,
             };
@@ -19851,7 +19858,7 @@ pub const DB = struct {
         var effective_options = options;
         if (durable_repair_id == null) effective_options.yield_check = null;
         const cooperative_snapshot_build =
-            (cfg.kind == .dense_vector or cfg.kind == .algebraic) and
+            indexRepairSupportsSnapshotCursor(cfg.kind) and
             effective_options.yield_check != null;
         var repair_issue_counter: AtomicU64 = .init(0);
         var shadow_ctx = AsyncContext{
@@ -19959,13 +19966,24 @@ pub const DB = struct {
                         cfg.name,
                         graph_repair_rebuild_batch_size,
                     )),
-                    .full_text => try shadow_manager.resetFullTextIndexForArtifactRebuildFromReadTxn(
-                        self.core.store,
-                        snapshot_txn,
-                        cfg.name,
-                        options.cancel_check,
-                        options.capacity_check,
-                    ),
+                    .full_text => count_blk: {
+                        var slice = try shadow_manager.rebuildFullTextIndexFromReadTxnSlice(self.core.store, snapshot_txn, cfg.name, build_resume_key, effective_options);
+                        defer slice.deinit(shadow_manager.alloc);
+                        if (slice.resume_key) |cursor| {
+                            if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
+                                .phase = .building,
+                                .build_resume_key = cursor,
+                                .replace_build_resume_key = true,
+                                .build_reprocessed = slice.rebuilt,
+                                .failure_streak = 0,
+                                .next_retry_at_ms = 0,
+                                .replace_last_error = true,
+                            });
+                            candidate_reopenable = durable_repair_id != null;
+                            return .{ .reprocessed = @intCast(slice.rebuilt -| persisted_build_reprocessed), .yielded = true };
+                        }
+                        break :count_blk slice.rebuilt;
+                    },
                     .algebraic => count_blk: {
                         var slice = try rebuildAlgebraicIndexFromSnapshotSliceContext(
                             &shadow_ctx,
@@ -20004,7 +20022,7 @@ pub const DB = struct {
         // meanings separate prevents the final resumed slice from recounting
         // every vector processed by earlier turns.
         const reprocessed_this_pass = if (resume_building and
-            (cfg.kind == .dense_vector or cfg.kind == .algebraic))
+            indexRepairSupportsSnapshotCursor(cfg.kind))
             rebuilt -| persisted_build_reprocessed
         else
             rebuilt;
@@ -106290,6 +106308,79 @@ test "db managed full text admission survives restart without in-place backfill"
     });
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+}
+
+test "db full text repair yields resumes after reopen and catches writes behind its cursor" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("full-text-repair-slices");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const cfg: types.IndexConfig = .{ .name = "full_text_index_v1", .kind = .full_text, .config_json = "{}" };
+    index_manager_mod.test_text_backfill_batch_size = 1;
+    defer index_manager_mod.test_text_backfill_batch_size = null;
+    const Yield = struct {
+        fn requested(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var token: u8 = 0;
+    var options = repair_completion_test_options;
+    options.yield_check = .{ .ptr = &token, .is_requested = Yield.requested };
+    var repair_id: u128 = 0;
+    var candidate: []u8 = undefined;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+        defer db.close();
+        try db.batch(.{ .writes = &.{
+            .{ .key = "a", .value = "{\"body\":\"original\"}" },
+            .{ .key = "b", .value = "{\"body\":\"original\"}" },
+            .{ .key = "c", .value = "{\"body\":\"original\"}" },
+        }, .sync_level = .write });
+        repair_id = (try db.admitManagedFullTextIndex(cfg)).?;
+        const first = try db.advanceIndexRepairIntent(alloc, repair_id, options);
+        try std.testing.expect(first.attempted and first.busy and !first.repaired);
+        try std.testing.expectEqual(@as(u64, 1), first.documents_reprocessed);
+        var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer entry.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Phase.building, entry.intent.phase);
+        try std.testing.expect(entry.intent.build_resume_key != null);
+        candidate = try alloc.dupe(u8, entry.intent.candidate_relative_path.?);
+        // These mutations cross the saved cursor in both directions. Replay
+        // from the pinned build floor must repair the mixed snapshot slices.
+        try db.batch(.{ .writes = &.{
+            .{ .key = "a", .value = "{\"body\":\"changed\"}" },
+            .{ .key = "0", .value = "{\"body\":\"inserted\"}" },
+        }, .deletes = &.{"c"}, .sync_level = .write });
+    }
+    defer alloc.free(candidate);
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer reopened.close();
+    {
+        var entry = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+        defer entry.deinit(alloc);
+        try std.testing.expectEqualStrings(candidate, entry.intent.candidate_relative_path.?);
+    }
+    var complete = false;
+    for (0..32) |_| {
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, options);
+        try std.testing.expect(!step.terminal);
+        if (step.repaired) {
+            complete = true;
+            break;
+        }
+    }
+    if (!complete) {
+        var remaining = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+        defer remaining.deinit(alloc);
+        std.debug.print("full text resume incomplete phase={s} error={?s} retry={} cursor_present={} count={}\n", .{ @tagName(remaining.intent.phase), remaining.intent.last_error, remaining.intent.next_retry_at_ms, remaining.intent.build_resume_key != null, remaining.intent.build_reprocessed });
+    }
+    try std.testing.expect(complete);
+    for ([_][]const u8{ "changed", "inserted", "original" }) |word| {
+        var result = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match = .{ .field = "body", .text = word } } });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    }
 }
 
 test "db named repair advances managed full text admission without force" {

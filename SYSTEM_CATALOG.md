@@ -826,9 +826,26 @@ indexes refresh with heartbeats so drain and relocation fences observe catch-up
 without requiring an index-inventory rebuild.
 
 An in-progress schema migration admits local full-text reconstruction on every
-hosting replica. Startup maintenance targets the exact schema-version index and
-admits at most one repair attempt per pass. The storage owner's existing descriptor
-and exclusive lease fence the physical generation. Exact repair selection uses the
+hosting replica. A node-local fair queue targets the exact schema-version index,
+rotates pending shards, and retains completed proofs for the table, schema/index
+contract, physical root, and local ownership generation. Completed proofs expire
+after 60 seconds and are rechecked on the next maintenance scan while the migration
+remains active. Discovery scans routes once; completed prefixes no longer reopen
+their physical owners. A shard rotates only when its turn starts, so a pass that
+exhausts its budget preserves the priority of unstarted selections. Pending migration
+work wakes at 100 ms intervals and admits up to 16 groups within a 100 ms pass budget.
+Each reconstruction slice has a 25 ms cooperative deadline, checked after a bounded
+page (at most 256 documents and 256 KiB source data, except a single large document).
+These are scheduling budgets, not hard wall-clock bounds on storage I/O.
+
+Structural configuration acquires the exact descriptor's exclusive lease, then
+atomically downgrades it for reconstruction. Shared generation ownership permits
+foreground reads and Raft apply while preventing concurrent reconfiguration.
+The compiled boundary carries borrowed cancellation, yield, activation and resource
+policy for the synchronous call. Full-text candidates persist a synced page cursor
+in the existing durable repair intent; reopening retains the prefix and replays
+writes from the pinned build floor before bounded activation. Normal bulk text
+loading keeps its larger throughput-oriented batches. Exact repair selection uses the
 resident name index, leaves the general repair cursor unchanged, honors paused and
 future-dated intents, and excludes unrelated repair debt from the target's readiness.
 Ordinary repairs retain their existing leader admission. Busy runtime observations

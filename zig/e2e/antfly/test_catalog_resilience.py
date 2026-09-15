@@ -1,5 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+#
+# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+# except in compliance with the Elastic License 2.0. You may obtain a copy of
+# the Elastic License 2.0 at
+#
+#     https://www.antfly.io/licensing/ELv2-license
+#
+# Unless required by applicable law or agreed to in writing, software distributed
+# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# Elastic License 2.0 for the specific language governing permissions and
+# limitations.
+
 """Production catalog failover, large control views, and telemetry isolation."""
 
 import copy
@@ -502,3 +514,186 @@ def test_concurrent_tenant_schema_migrations_preserve_documents(catalog_cluster)
                 }
             )
         )
+
+
+def test_skewed_schema_migrations_keep_foreground_traffic_available(catalog_cluster):
+    """A large tenant migrates alongside small tenants and active reads/writes.
+
+    Set ANTFLY_MIGRATION_LARGE_DOCS and ANTFLY_MIGRATION_SMALL_TENANTS for
+    repeatable scale runs. JSON records contain raw request latency samples;
+    provisioning is excluded and application failures are never retried away.
+    """
+    import threading
+
+    c = catalog_cluster
+    api = c.data_api_urls[0]
+    large_docs = int(os.environ.get("ANTFLY_MIGRATION_LARGE_DOCS", "2000"))
+    small_count = int(os.environ.get("ANTFLY_MIGRATION_SMALL_TENANTS", "3"))
+    tables = ["migration_large"] + [f"migration_small_{i}" for i in range(small_count)]
+    for table in tables:
+        c.create_table(table, num_shards=1)
+        count = large_docs if table == tables[0] else 20
+        for offset in range(0, count, 500):
+            _insert_docs(
+                c,
+                table,
+                {
+                    f"doc-{i:06d}": {
+                        "title": f"searchable migration document {i}",
+                        "body": "production document payload " * 32,
+                    }
+                    for i in range(offset, min(offset + 500, count))
+                },
+            )
+
+    # Start timing only after the retained read indexes have caught up.
+    for table in tables:
+        deadline = time.monotonic() + 120
+        expected = large_docs if table == tables[0] else 20
+        while True:
+            response = requests.get(
+                f"{api}/tables/{table}/indexes/full_text_index_v0", timeout=15
+            )
+            response.raise_for_status()
+            status = response.json()["status"]
+            if (
+                not status.get("backfill_active", False)
+                and status.get("doc_count", 0) >= expected
+            ):
+                break
+            assert time.monotonic() < deadline, response.text
+            time.sleep(0.1)
+
+    schema = {
+        "document_schemas": {
+            "default": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "x-antfly-types": ["text"]},
+                        "body": {"type": "string", "x-antfly-types": ["text"]},
+                    },
+                }
+            }
+        }
+    }
+    stop = threading.Event()
+    latencies = {"lookup_ms": [], "search_ms": [], "write_ms": []}
+    failures = []
+    acknowledged = []
+    start = time.monotonic()
+
+    def traffic():
+        with requests.Session() as session:
+            sequence = 0
+            while not stop.is_set():
+                for table in (tables[0], tables[-1]):
+                    for operation in ("lookup", "search", "write"):
+                        before = time.monotonic()
+                        try:
+                            if operation == "lookup":
+                                response = session.get(
+                                    f"{api}/tables/{table}/documents/doc-000000",
+                                    timeout=10,
+                                )
+                                response.raise_for_status()
+                                assert response.json()["title"].startswith("searchable")
+                            elif operation == "search":
+                                response = session.post(
+                                    f"{api}/tables/{table}/query",
+                                    json={
+                                        "full_text_search": {"match_all": {}},
+                                        "limit": 1,
+                                    },
+                                    timeout=10,
+                                )
+                                response.raise_for_status()
+                                assert response.json()["responses"][0]["hits"]["hits"]
+                            else:
+                                key = f"live-{sequence:06d}"
+                                response = session.post(
+                                    f"{api}/tables/{table}/batch",
+                                    json={"inserts": {key: {"title": "live traffic"}}},
+                                    timeout=10,
+                                )
+                                response.raise_for_status()
+                                acknowledged.append((table, key))
+                        except (
+                            requests.RequestException,
+                            AssertionError,
+                            KeyError,
+                            ValueError,
+                        ) as error:
+                            failures.append(f"{operation} {table}: {error}")
+                        finally:
+                            latencies[f"{operation}_ms"].append(
+                                (time.monotonic() - before) * 1000
+                            )
+                sequence += 1
+                stop.wait(0.02)
+
+    def migrate(table):
+        response = requests.put(f"{api}/tables/{table}/schema", json=schema, timeout=30)
+        response.raise_for_status()
+
+    worker = threading.Thread(target=traffic)
+    worker.start()
+    completed_ms = {}
+    try:
+        with ThreadPoolExecutor(max_workers=len(tables)) as pool:
+            list(pool.map(migrate, tables))
+        deadline = start + 240
+        while len(completed_ms) != len(tables):
+            for table in tables:
+                if table in completed_ms:
+                    continue
+                response = requests.get(f"{api}/tables/{table}", timeout=15)
+                response.raise_for_status()
+                status = response.json()
+                if (
+                    status.get("migration") is None
+                    and status.get("schema", {}).get("version") == 1
+                ):
+                    completed_ms[table] = (time.monotonic() - start) * 1000
+            assert time.monotonic() < deadline, c.metadata_snapshot_diagnostic()
+            time.sleep(0.05)
+    finally:
+        stop.set()
+        worker.join(timeout=45)
+        record = {
+            "scenario": "skewed_schema_migrations_with_foreground_traffic",
+            "large_documents": large_docs,
+            "small_tenants": small_count,
+            "small_documents_per_tenant": 20,
+            "replicas": 3,
+            "completed_ms": completed_ms,
+            "request_latencies": latencies,
+            "failures": failures,
+        }
+        print(json.dumps(record, sort_keys=True))
+    assert not worker.is_alive()
+    assert not failures, json.dumps(record)
+    assert acknowledged
+    # Check every acknowledged write after cutover; migration must not lose
+    # documents arriving behind the durable source cursor.
+    for table, key in acknowledged:
+        response = requests.get(f"{api}/tables/{table}/documents/{key}", timeout=10)
+        response.raise_for_status()
+        assert response.json()["title"] == "live traffic"
+    for table in tables:
+        expected = (large_docs if table == tables[0] else 20) + sum(
+            name == table for name, _ in acknowledged
+        )
+        deadline = time.monotonic() + 30
+        while True:
+            response = requests.post(
+                f"{api}/tables/{table}/query",
+                json={"full_text_search": {"match_all": {}}, "limit": 1},
+                timeout=10,
+            )
+            response.raise_for_status()
+            total = response.json()["responses"][0]["hits"]["total"]["value"]
+            if total == expected:
+                break
+            assert time.monotonic() < deadline, (table, total, expected)
+            time.sleep(0.1)

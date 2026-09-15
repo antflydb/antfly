@@ -14603,6 +14603,7 @@ pub const ProvisionedTableWriteSource = struct {
                 table_name,
                 metadata.target_index_name,
                 metadata.advance_index_repairs,
+                metadata.index_repair_options,
             )) orelse return error.StorageKernelOwnerUnavailable;
             defer observation.deinit(alloc);
             if (publication_token) |token| {
@@ -14639,6 +14640,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .restore_repair_progressed = result.restore_repair_progressed != 0,
                 .index_repair_pending = result.state == .repair_pending or result.repair_remaining != 0,
                 .index_repair_attempted = result.repair_attempted != 0,
+                .index_repair_paused = result.repair_paused != 0,
                 .index_repair_repaired = result.repair_repaired != 0,
                 .index_repair_degraded = result.state == .degraded or result.repair_terminal != 0,
                 .index_repair_disk_wait = result.repair_disk_waits != 0,
@@ -19569,6 +19571,7 @@ pub const ProvisionedTableWriteSource = struct {
                 table_name,
                 metadata.target_index_name,
                 false,
+                .{},
             )) orelse return error.StorageKernelOwnerUnavailable;
             defer observation.deinit(alloc);
             // The physical mutation alone cannot acknowledge an activation.
