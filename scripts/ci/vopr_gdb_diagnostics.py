@@ -176,9 +176,18 @@ for expression in (
         breakpoint.silent = True
         breakpoint.commands = "silent\npython boundary()\ncontinue\n"
 
-for breakpoint in gdb.rbreak("AntflyApiHandler.mapIngressError"):
+# rbreak only searches out-of-line functions. ReleaseSafe can inline every
+# ingress error boundary, so use its source location in the retained executable
+# as well. These locations belong to the original 919fa9d diagnostic artifact;
+# fail visibly if its debug information does not contain them.
+http_boundaries = []
+for location in ("httpx_handler.zig:926", "server.zig:2334"):
+    breakpoint = gdb.Breakpoint(location)
+    if breakpoint.pending:
+        raise gdb.GdbError(f"HTTP diagnostic boundary did not resolve: {location}")
     breakpoint.silent = True
     breakpoint.commands = "silent\npython application_error()\ncontinue\n"
+    http_boundaries.append(breakpoint)
 
 
 gdb.execute("run")
