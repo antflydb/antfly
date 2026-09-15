@@ -486,13 +486,30 @@ pub fn parsePatchSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std
     return std.json.parseFromSlice(types.TableSchemaPatch, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Advance a resumable source-vector ownership migration
-pub const ExecuteTableStorageMigrationPathParams = struct {
+/// Create or resume a table storage migration job
+pub const CreateTableStorageMigrationPathParams = struct {
     table_name: []const u8,
 };
 
-/// Parse the JSON request body for executeTableStorageMigration.
-pub fn parseExecuteTableStorageMigrationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+/// Parse the JSON request body for createTableStorageMigration.
+pub fn parseCreateTableStorageMigrationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read a table storage migration receipt
+pub const GetTableStorageMigrationPathParams = struct {
+    table_name: []const u8,
+    job_id: []const u8,
+};
+
+/// Advance, publish or cancel a table storage migration job
+pub const AdvanceTableStorageMigrationPathParams = struct {
+    table_name: []const u8,
+    job_id: []const u8,
+};
+
+/// Parse the JSON request body for advanceTableStorageMigration.
+pub fn parseAdvanceTableStorageMigrationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
     return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
@@ -648,7 +665,9 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/tables/{tableName}/schema", .operation_id = "patchSchema", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/tables/{tableName}/storage-migration", .operation_id = "executeTableStorageMigration", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/storage/migrations", .operation_id = "createTableStorageMigration", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/storage/migrations/{jobId}", .operation_id = "getTableStorageMigration", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/storage/migrations/{jobId}", .operation_id = "advanceTableStorageMigration", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions", .request_body = .none, .streaming_response = false },
@@ -730,7 +749,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "restoreTable")) @compileError("ServerRouter: Impl missing required method 'restoreTable'");
         if (!@hasDecl(Impl, "updateSchema")) @compileError("ServerRouter: Impl missing required method 'updateSchema'");
         if (!@hasDecl(Impl, "patchSchema")) @compileError("ServerRouter: Impl missing required method 'patchSchema'");
-        if (!@hasDecl(Impl, "executeTableStorageMigration")) @compileError("ServerRouter: Impl missing required method 'executeTableStorageMigration'");
+        if (!@hasDecl(Impl, "createTableStorageMigration")) @compileError("ServerRouter: Impl missing required method 'createTableStorageMigration'");
+        if (!@hasDecl(Impl, "getTableStorageMigration")) @compileError("ServerRouter: Impl missing required method 'getTableStorageMigration'");
+        if (!@hasDecl(Impl, "advanceTableStorageMigration")) @compileError("ServerRouter: Impl missing required method 'advanceTableStorageMigration'");
         if (!@hasDecl(Impl, "listTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'listTransactionSessions'");
         if (!@hasDecl(Impl, "beginTransaction")) @compileError("ServerRouter: Impl missing required method 'beginTransaction'");
         if (!@hasDecl(Impl, "cleanupTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'cleanupTransactionSessions'");
@@ -810,7 +831,9 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/restore", httpx.Handler.bind(self.impl, restoreTable));
             try server.put("/tables/:tableName/schema", httpx.Handler.bind(self.impl, updateSchema));
             try server.patch("/tables/:tableName/schema", httpx.Handler.bind(self.impl, patchSchema));
-            try server.post("/tables/:tableName/storage-migration", httpx.Handler.bind(self.impl, executeTableStorageMigration));
+            try server.post("/tables/:tableName/storage/migrations", httpx.Handler.bind(self.impl, createTableStorageMigration));
+            try server.get("/tables/:tableName/storage/migrations/:jobId", httpx.Handler.bind(self.impl, getTableStorageMigration));
+            try server.post("/tables/:tableName/storage/migrations/:jobId", httpx.Handler.bind(self.impl, advanceTableStorageMigration));
             try server.get("/transactions", httpx.Handler.bind(self.impl, listTransactionSessions));
             try server.post("/transactions/begin", httpx.Handler.bind(self.impl, beginTransaction));
             try server.post("/transactions/cleanup", httpx.Handler.bind(self.impl, cleanupTransactionSessions));
@@ -1254,11 +1277,27 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.patchSchema(ctx, table_name);
         }
 
-        /// Advance a resumable source-vector ownership migration
-        /// POST /tables/{tableName}/storage-migration
-        fn executeTableStorageMigration(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+        /// Create or resume a table storage migration job
+        /// POST /tables/{tableName}/storage/migrations
+        fn createTableStorageMigration(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            return impl.executeTableStorageMigration(ctx, table_name);
+            return impl.createTableStorageMigration(ctx, table_name);
+        }
+
+        /// Read a table storage migration receipt
+        /// GET /tables/{tableName}/storage/migrations/{jobId}
+        fn getTableStorageMigration(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
+            return impl.getTableStorageMigration(ctx, table_name, job_id);
+        }
+
+        /// Advance, publish or cancel a table storage migration job
+        /// POST /tables/{tableName}/storage/migrations/{jobId}
+        fn advanceTableStorageMigration(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
+            return impl.advanceTableStorageMigration(ctx, table_name, job_id);
         }
 
         /// List transaction sessions
@@ -1411,7 +1450,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn executeTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn createTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn advanceTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response

@@ -4719,7 +4719,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /db/v1/tables/{tableName}/storage-migration:
+  /db/v1/tables/{tableName}/storage/migrations:
     parameters:
       - name: tableName
         in: path
@@ -4727,22 +4727,20 @@ paths:
         schema:
           type: string
     post:
-      operationId: executeTableStorageMigration
-      summary: Advance a resumable source-vector ownership migration
+      operationId: createTableStorageMigration
+      summary: Create or resume a table storage migration job
       description: >
-        Table-admin operation for local single-shard standalone tables. Changes
+        Table-admin operation for local single-shard standalone tables. Target
 
-        primary_lsm source ownership to vector_store without changing models,
+        vector_store changes primary_lsm source ownership without changing models,
 
-        dimensions, artifacts, or logical indexes. Send the same request and
+        dimensions, artifacts or logical indexes. Retry creation with the same
 
-        job_id on every retry. Each step commits bounded progress. Publish is
+        job_id, target and budgets. The job is advanced explicitly through its
 
-        accepted only at ready; complete additionally certifies reference-only
+        job endpoint; the server does not schedule an unattended migration loop.
 
-        primary artifacts and native ANN serving. Cancellation is allowed only
-
-        before publication. Offline migration uses the exclusive local command.
+        Offline migration uses antfly storage migrate against a stopped server.
       tags:
         - data_operations
       requestBody:
@@ -4751,52 +4749,147 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
+              required:
+                - job_id
+                - target
+              properties:
+                job_id:
+                  type: string
+                  pattern: ^[A-Za-z0-9_-]{1,128}$
+                target:
+                  type: string
+                  enum:
+                    - vector_store
+                budget:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    batch_bytes:
+                      type: integer
+                      format: int64
+                      minimum: 4096
+                      maximum: 67108864
+                      default: 4194304
+                    batch_rows:
+                      type: integer
+                      minimum: 1
+                      maximum: 65536
+                      default: 1024
+                    temporary_bytes:
+                      type: integer
+                      format: int64
+                      default: 68719476736
+                    disk_reserve_bytes:
+                      type: integer
+                      format: int64
+                      default: 1073741824
+      responses:
+        '200':
+          description: Durable migration receipt, or admitted receipt before DB preparation
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Conflicting job, lifecycle operation or publication state
+        '503':
+          description: Retryable resource or recovery admission failure
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/storage/migrations/{jobId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{1,128}$
+    get:
+      operationId: getTableStorageMigration
+      summary: Read a table storage migration receipt
+      description: >
+        Table-admin observation only. Does not admit, advance, or publish a job.
+
+        A phase of admitted means catalog admission is durable but DB preparation
+
+        has not begun; retry creation or send a job action to recover it. The
+
+        receipt is retained until a later migration replaces it; this endpoint
+
+        is not a permanent job history.
+      tags:
+        - data_operations
+      responses:
+        '200':
+          description: Durable migration receipt, or admitted receipt before DB preparation
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Conflicting job, lifecycle operation or publication state
+        '503':
+          description: Retryable resource or recovery admission failure
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      operationId: advanceTableStorageMigration
+      summary: Advance, publish or cancel a table storage migration job
+      description: >
+        Uses the job's durable configuration and budgets. Each step commits
+
+        bounded progress. Publish is accepted only at ready; complete additionally
+
+        certifies reference-only primary artifacts and native ANN serving.
+
+        Cancellation is allowed only before publication. Repeating an action
+
+        after an ambiguous response resumes the durable job.
+      tags:
+        - data_operations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
               required:
                 - action
-                - request
               properties:
                 action:
                   type: string
                   enum:
-                    - start
                     - step
                     - publish
                     - cancel
-                    - status
-                request:
-                  type: object
-                  required:
-                    - job_id
-                    - mode
-                  properties:
-                    job_id:
-                      type: string
-                      pattern: ^[A-Za-z0-9_-]{1,128}$
-                    mode:
-                      type: string
-                      enum:
-                        - online
-                    budget:
-                      type: object
-                      properties:
-                        batch_bytes:
-                          type: integer
-                          format: int64
-                          default: 4194304
-                        batch_rows:
-                          type: integer
-                          default: 1024
-                        temporary_bytes:
-                          type: integer
-                          format: int64
-                          default: 68719476736
-                        disk_reserve_bytes:
-                          type: integer
-                          format: int64
-                          default: 1073741824
       responses:
         '200':
-          description: Durable migration receipt with phase, ownership epoch, cursor and counters
+          description: Durable migration receipt, or admitted receipt before DB preparation
           content:
             application/json:
               schema:

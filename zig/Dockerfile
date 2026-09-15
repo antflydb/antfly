@@ -41,7 +41,7 @@ RUN case "${TARGETARCH}" in \
     python3 tools/run_bounded_zig_build.py --zig zig -- build \
       -Dtarget="${zig_target}" \
       -Doptimize="${ZIG_OPTIMIZE}" \
-      antfly vector-migrate \
+      antfly \
       --prefix /out
 
 FROM --platform=$BUILDPLATFORM alpine:3.21 AS wasmtime
@@ -73,7 +73,6 @@ RUN apk add --no-cache ca-certificates && \
 
 WORKDIR /
 COPY --from=builder /out/bin/antfly /antfly
-COPY --from=builder /out/bin/antfly-vector-migrate /antfly-vector-migrate
 COPY --from=builder /out/share/antfly /usr/share/antfly
 COPY --from=wasmtime /opt/wasmtime/lib/libwasmtime.so /usr/local/lib/libwasmtime.so
 

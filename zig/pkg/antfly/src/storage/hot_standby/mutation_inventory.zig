@@ -105,7 +105,8 @@ pub const entries = [_]Entry{
     .{ .surface = .cluster_restore, .disposition = .reject, .path_pattern = "/restore", .methods = post, .reason = "restore activation replaces local generation state outside the continuous stream" },
     .{ .surface = .table_restore, .disposition = .reject, .path_pattern = "/tables/{table}/restore", .methods = post, .reason = "table restore mutates both catalog and data outside one RemoteApply acknowledgement" },
     .{ .surface = .transaction_session, .disposition = .reject, .path_pattern = "/transactions[/... mutating operation]", .methods = post_put_delete, .reason = "durable transaction session state and savepoints are primary-local" },
-    .{ .surface = .storage_migration, .disposition = .reject, .path_pattern = "/tables/{table}/storage-migration", .methods = post_delete, .reason = "source ownership migration is qualified only for unreplicated local tables" },
+    .{ .surface = .storage_migration, .disposition = .reject, .path_pattern = "/tables/{table}/storage/migrations", .methods = post_delete, .reason = "source ownership migration is qualified only for unreplicated local tables" },
+    .{ .surface = .storage_migration, .disposition = .reject, .path_pattern = "/tables/{table}/storage/migrations/{job}", .methods = post_delete, .reason = "source ownership migration is qualified only for unreplicated local tables" },
     .{ .surface = .artifact_repair, .disposition = .reject, .path_pattern = "/tables/{table}/repair/{run|control-jobs|jobs/...}", .methods = post_delete, .reason = "repair job checkpoints and direct repair effects do not share one replicated acknowledgement" },
     .{ .surface = .artifact_reprocess, .disposition = .reject, .path_pattern = "/tables/{table}/.../reprocess[-jobs]", .methods = post_delete, .reason = "reprocess job checkpoints and derived effects do not share one replicated acknowledgement" },
     .{ .surface = .backup, .disposition = .reject, .path_pattern = "/backup | /tables/{table}/backup", .methods = post, .reason = "backup publication has an external side effect but no final HA authority recheck spanning snapshot and manifest publication" },
@@ -268,7 +269,8 @@ test "hot-standby mutation classifier covers acknowledged security catalog and w
         .{ .method = .POST, .path = "/tables/docs/restore", .surface = .table_restore },
         .{ .method = .POST, .path = "/transactions/begin", .surface = .transaction_session },
         .{ .method = .POST, .path = "/tables/docs/repair/run", .surface = .artifact_repair },
-        .{ .method = .POST, .path = "/tables/docs/storage-migration", .surface = .storage_migration },
+        .{ .method = .POST, .path = "/tables/docs/storage/migrations", .surface = .storage_migration },
+        .{ .method = .POST, .path = "/tables/docs/storage/migrations/job", .surface = .storage_migration },
         .{ .method = .POST, .path = "/tables/docs/artifacts/summary/reprocess", .surface = .artifact_reprocess },
     };
     for (cases) |case| {

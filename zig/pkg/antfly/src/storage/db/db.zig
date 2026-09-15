@@ -6280,6 +6280,10 @@ pub const DB = struct {
             defer alloc.free(raw);
             var prior = try std.json.parseFromSlice(vector_migration.contract.Job, alloc, raw, .{});
             defer prior.deinit();
+            if (command.action == .status) {
+                if (!std.mem.eql(u8, prior.value.job_id, command.request.job_id)) return error.VectorMigrationNotFound;
+                return try alloc.dupe(u8, raw);
+            }
             if (!std.mem.eql(u8, prior.value.job_id, command.request.job_id) or
                 prior.value.mode != command.request.mode or !std.meta.eql(prior.value.budget, command.request.budget))
                 return error.VectorMigrationIdempotencyConflict;
@@ -129528,6 +129532,14 @@ test "source vector migration catalog fences configurations topology and stale p
     try std.testing.expect(!std.mem.eql(u8, &catalog.tableDefinitionFingerprint(before), &catalog.tableDefinitionFingerprint(admitted)));
     try manager.upsertTable(admitted);
     try manager.upsertRange(range); // Normalized range ID is still idempotent.
+    // Restart/projected-catalog installation restores existing admission,
+    // while incremental topology changes remain fenced after reload.
+    try manager.replaceTopology(&.{admitted}, &.{range});
+    _ = try manager.replaceProjectedTopology(&.{admitted}, &.{range});
+    try manager.upsertRange(range);
+    var moved = range;
+    moved.start_key = "m";
+    try std.testing.expectError(error.VectorMigrationActive, manager.upsertRange(moved));
     try std.testing.expectError(error.VectorMigrationActive, manager.upsertTable(before));
     var edited = admitted;
     edited.schema_json = "{\"version\":2}";

@@ -47,7 +47,6 @@ def disk_bytes(root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--offline-binary", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--rows", type=int, default=50_000)
     parser.add_argument("--dimensions", type=int, default=768)
@@ -62,7 +61,6 @@ def main():
     args = parser.parse_args()
     args.root = args.root.resolve()
     args.binary = args.binary.resolve(strict=True)
-    args.offline_binary = args.offline_binary.resolve(strict=True)
     args.root.mkdir(parents=True, exist_ok=False)
     if args.rows < 4 * args.churn or args.dimensions < 3:
         parser.error(
@@ -84,9 +82,6 @@ def main():
             **{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
             "binary_sha256": hashlib.file_digest(
                 args.binary.open("rb"), "sha256"
-            ).hexdigest(),
-            "offline_sha256": hashlib.file_digest(
-                args.offline_binary.open("rb"), "sha256"
             ).hexdigest(),
             "metric": "cosine",
             "seed": 728,
@@ -287,7 +282,6 @@ def main():
                 "POST",
                 f"/tables/{table}/indexes/model",
                 {
-                    "name": "model",
                     "type": "embeddings",
                     "external": True,
                     "dimension": args.dimensions,
@@ -314,13 +308,13 @@ def main():
             if mode == "online":
                 migration_request = {
                     "job_id": "qualification",
-                    "mode": "online",
+                    "target": "vector_store",
                     "budget": {"batch_rows": 1024, "batch_bytes": 4194304},
                 }
                 state = api(
                     "POST",
-                    f"/tables/{table}/storage-migration",
-                    {"action": "start", "request": migration_request},
+                    f"/tables/{table}/storage/migrations",
+                    migration_request,
                 )
                 # Fixed mutations after capture admission, including deletions.
                 churn()
@@ -335,12 +329,11 @@ def main():
                             query(queries[step % len(queries)])
                         state = api(
                             "POST",
-                            f"/tables/{table}/storage-migration",
+                            f"/tables/{table}/storage/migrations/qualification",
                             {
                                 "action": "publish"
                                 if state["phase"] == "ready"
                                 else "step",
-                                "request": migration_request,
                             },
                         )
                     else:
@@ -354,7 +347,11 @@ def main():
                     with (arm / "migration.log").open("w") as progress:
                         subprocess.run(
                             [
-                                str(args.offline_binary),
+                                str(args.binary),
+                                "storage",
+                                "migrate",
+                                "--to",
+                                "vector-store",
                                 "--catalog",
                                 str(data / "metadata/local-metadata.json"),
                                 "--replica-root",

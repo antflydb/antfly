@@ -1427,6 +1427,18 @@ pub const TableManager = struct {
             if (!rangeRecordsEqual(existing, normalized)) return error.VectorMigrationActive;
         }
 
+        try self.installProjectedRange(normalized);
+    }
+
+    // Loading a complete durable projection reconstructs an already-admitted
+    // topology. It must not apply the live topology-change fence to its first
+    // range, while ordinary upserts still reject changes during migration.
+    fn installProjectedRange(self: *TableManager, record: RangeRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.table_id)) return error.UnknownTable;
+        var normalized = record;
+        if (normalized.range_id == 0) normalized.range_id = normalized.group_id;
+
         const owned = try cloneRange(self.alloc, normalized);
         errdefer freeRange(self.alloc, owned);
         if (self.ranges.getPtr(record.group_id)) |existing| {
@@ -1450,7 +1462,7 @@ pub const TableManager = struct {
     pub fn replaceTopology(self: *TableManager, tables: []const TableRecord, ranges: []const RangeRecord) !void {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
-        for (ranges) |record| try self.upsertRange(record);
+        for (ranges) |record| try self.installProjectedRange(record);
     }
 
     pub const ProjectedTopologyLoadResult = struct {
@@ -1467,7 +1479,7 @@ pub const TableManager = struct {
                 result.skipped_orphan_ranges += 1;
                 continue;
             }
-            try self.upsertRange(record);
+            try self.installProjectedRange(record);
         }
         return result;
     }

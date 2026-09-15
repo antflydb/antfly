@@ -15,8 +15,6 @@
 """Source ownership migration through the production compiled owner and catalog."""
 
 import json
-import os
-from pathlib import Path
 import subprocess
 import time
 
@@ -26,19 +24,24 @@ from helpers import wait_until
 from test_vector_store import hit_ids
 
 
-def request(job, action="start"):
-    return {
-        "action": action,
-        "request": {
-            "job_id": job,
-            "mode": "online",
-            "budget": {"batch_rows": 8, "batch_bytes": 4096, "disk_reserve_bytes": 0},
-        },
-    }
-
-
 def command(api, table, job, action="start"):
-    return api.post(f"/tables/{table}/storage-migration", request(job, action))
+    path = f"/tables/{table}/storage/migrations"
+    if action == "start":
+        return api.post(
+            path,
+            {
+                "job_id": job,
+                "target": "vector_store",
+                "budget": {
+                    "batch_rows": 8,
+                    "batch_bytes": 4096,
+                    "disk_reserve_bytes": 0,
+                },
+            },
+        )
+    if action == "status":
+        return api.get(f"{path}/{job}")
+    return api.post(f"{path}/{job}", {"action": action})
 
 
 def seed(api, table):
@@ -102,6 +105,11 @@ def test_online_vector_migration_restart_concurrent_models_and_rebuild(stateful_
     status = command(api, table, job)
     assert status["phase"] == "backfill"
     assert command(api, table, job) == status
+    assert command(api, table, job, "status") == status
+    assert command(api, table, job, "status") == status
+    with pytest.raises(requests.HTTPError) as missing:
+        command(api, table, "missing", "status")
+    assert missing.value.response.status_code == 404
     with pytest.raises(requests.HTTPError) as drop:
         api.delete_table(table)
     assert drop.value.response.status_code in (400, 409)
@@ -168,7 +176,34 @@ def test_online_vector_migration_cancellation_reopens_inline_authority(stateful_
     api.restart_server()
     assert api.get_table(table)["storage"]["dense_embeddings"] == "primary_lsm"
     assert nearest(api, table, "model_a", [1, 0, 0]) == ["a", "b"]
-    assert finish(api, table, "second")["phase"] == "complete"
+    # The packaged command drives the same authenticated HTTP contract.
+    server = api._server
+    completed = subprocess.run(
+        [
+            server.binary,
+            "storage",
+            "migrate",
+            "--to",
+            "vector-store",
+            "--url",
+            server.url,
+            "--table",
+            table,
+            "--job",
+            "second",
+            "--batch-rows",
+            "8",
+            "--batch-bytes",
+            "4096",
+            "--disk-reserve-bytes",
+            "0",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert command(api, table, "second", "status")["phase"] == "complete"
 
 
 def test_offline_vector_migration_lock_resume_catalog_and_native_queries(stateful_api):
@@ -177,17 +212,14 @@ def test_offline_vector_migration_lock_resume_catalog_and_native_queries(statefu
     seed(api, table)
     server = api._server
     assert server is not None and hasattr(server, "root")
-    binary = Path(
-        os.environ.get(
-            "ANTFLY_VECTOR_MIGRATE_BIN",
-            str(Path(server.binary).with_name("antfly-vector-migrate")),
-        )
-    )
-    assert binary.exists(), "build the offline command with zig build vector-migrate"
     argv = [
-        str(binary),
+        str(server.binary),
+        "storage",
+        "migrate",
+        "--to",
+        "vector-store",
         "--catalog",
-        str(server.root / "catalog.txt"),
+        str(server.root / "metadata/local-metadata.json"),
         "--replica-root",
         str(server.replica_root),
         "--table",
@@ -207,7 +239,7 @@ def test_offline_vector_migration_lock_resume_catalog_and_native_queries(statefu
             argv + ["--once"], capture_output=True, text=True, timeout=60
         )
         assert pending.returncode == 0, pending.stderr
-        catalog = json.loads((server.root / "catalog.txt").read_text())
+        catalog = json.loads((server.root / "metadata/local-metadata.json").read_text())
         record = next(t for t in catalog["tables"] if t["name"] == table)
         assert record["storage"]["dense_embeddings"] == "primary_lsm"
         assert record["storage_migration"]["request"]["job_id"] == "offline"
@@ -216,7 +248,7 @@ def test_offline_vector_migration_lock_resume_catalog_and_native_queries(statefu
         assert "migration complete" in complete.stderr
         retry = subprocess.run(argv, capture_output=True, text=True, timeout=30)
         assert retry.returncode == 0, retry.stderr
-        catalog = json.loads((server.root / "catalog.txt").read_text())
+        catalog = json.loads((server.root / "metadata/local-metadata.json").read_text())
         record = next(t for t in catalog["tables"] if t["name"] == table)
         assert record["storage"]["dense_embeddings"] == "vector_store"
         assert record.get("storage_migration") is None

@@ -5985,14 +5985,31 @@ pub const AntflyApiHandler = struct {
         return try self.listTableRepairIssues(ctx, table_name);
     }
 
-    pub fn executeTableStorageMigration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+    pub fn createTableStorageMigration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.storageMigrationResponse(ctx, table_name, null, false);
+    }
+
+    pub fn getTableStorageMigration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
+        return self.storageMigrationResponse(ctx, table_name, job_id, true);
+    }
+
+    pub fn advanceTableStorageMigration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
+        return self.storageMigrationResponse(ctx, table_name, job_id, false);
+    }
+
+    fn storageMigrationResponse(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_path: ?[]const u8, observe: bool) !httpx.Response {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*owned| owned.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return textResponse(ctx, 400, "invalid table name");
         defer ctx.allocator.free(name);
-        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing migration command");
-        const result = self.api_server.executeVectorMigration(name, body) catch |err| {
+        const job = if (job_path) |path| (try decodePathParamOrBadRequest(ctx, path)) orelse return textResponse(ctx, 400, "invalid job ID") else null;
+        defer if (job) |id| ctx.allocator.free(id);
+        const body = if (observe) "" else (try ctx.body()) orelse return textResponse(ctx, 400, "missing migration command");
+        const result = (if (job) |id|
+            if (observe) self.api_server.getStorageMigration(name, id) else self.api_server.advanceStorageMigration(name, id, body)
+        else
+            self.api_server.createStorageMigration(name, body)) catch |err| {
             const code: u16 = switch (err) {
                 error.TableNotFound, error.NotFound, error.VectorMigrationNotFound => 404,
                 error.VectorMigrationIdempotencyConflict, error.VectorMigrationAlreadyExists, error.VectorMigrationAlreadyPublished, error.VectorMigrationNotReady, error.VectorMigrationActive, error.VectorMigrationConfigurationChanged, error.TableGenerationChanged => 409,

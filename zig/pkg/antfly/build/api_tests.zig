@@ -297,6 +297,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_resolution_source_test_step.dependOn(&run_lib_resolution_source_tests.step);
 
     const lib_api_auth_default_filters = [_][]const u8{
+        "storage migration job observation preserves admitted and unpublished catalog state",
         "api http server requires auth on public routes when enabled",
         "continuous HA rejects non-replicated public mutations before handlers",
         "HA mutation middleware fails closed for unregistered HTTP methods",

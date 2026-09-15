@@ -128,6 +128,15 @@ pub const Command = struct {
     request: Request,
 };
 
+/// Public job creation is distinct from the internal replay command. Execution
+/// mode is selected by transport; the HTTP API admits online jobs only.
+pub const CreateRequest = struct {
+    job_id: []const u8,
+    target: enum { vector_store },
+    budget: Budget = .{},
+};
+pub const JobCommand = struct { action: enum { step, publish, cancel } };
+
 test "source vector migration validates durable identity and publication fencing" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidVectorMigrationId, (Request{ .job_id = "../other", .mode = .offline }).validate());

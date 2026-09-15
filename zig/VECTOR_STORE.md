@@ -105,25 +105,33 @@ discarded experimental formats do not gain compatibility decoders.
 Use the same binary for the server and its compiled runtime libraries:
 
 ```sh
-python3 zig/scripts/migrate_vector_storage.py \
-  --url http://127.0.0.1:8080 --table documents --job vectors-20260915
+zig/zig-out/bin/antfly storage migrate \
+  --url http://127.0.0.1:8080 --table documents --to vector-store --job vectors-20260915
 ```
 
-The driver calls `POST /db/v1/tables/{table}/storage-migration`, requiring table
-admin permission when authentication is enabled. `ANTFLY_API_KEY` supplies its
-Bearer token. The request is `{"action":"start","request":{"job_id":"...",
-"mode":"online","budget":{...}}}`. Actions are `start`, `step`, `publish`,
-`status` and `cancel`. The driver defaults to `run`, which advances bounded
-steps and publishes when verification reaches `ready`. `--action status` only
-observes/reconciles the admitted job. Ctrl-C stops the driver; durable capture
-continues, and running the identical command resumes it. The server does not
-schedule an unattended migration loop.
+The command creates a job with `POST /db/v1/tables/{table}/storage/migrations`,
+requiring table admin permission when authentication is enabled. `ANTFLY_API_KEY`
+supplies its Bearer token. Creation takes `{"job_id":"...","target":"vector_store",
+"budget":{...}}`. `GET /db/v1/tables/{table}/storage/migrations/{job}` observes the
+receipt; `POST` on that job takes `{"action":"step|publish|cancel"}` and uses its
+durable budgets. GET never admits work or reconciles catalog publication. An
+`admitted` receipt means the catalog marker exists but DB preparation has not
+begun; retry creation or send a job action to recover that boundary.
 
-Job ID, mode and budgets form the idempotency contract. Keep all of them equal
-on retries, including after a timeout. A catalog admission persisted before the
-DB job is recovered by the next command. DB publication is authoritative if its
-response or the catalog update is lost. Opening the DB can bridge that specific
-stale catalog setting using the matching durable job and table identity.
+The CLI defaults to `--action run`, which creates/resumes the job, advances
+bounded steps, and publishes when verification reaches `ready`. Actions `start`,
+`step`, `publish`, `status` and `cancel` provide explicit operator control. Ctrl-C
+stops the driver; durable capture continues, and running the identical command
+resumes it. The server does not schedule an unattended migration loop.
+
+Job ID, target and budgets form the creation idempotency contract. Keep them
+equal when retrying creation, including after a timeout. Job actions use the
+persisted configuration, so callers do not have to repeat budgets. DB publication
+is authoritative if its response or the catalog update is lost. Opening the DB
+can bridge that specific stale catalog setting using the matching durable job
+and table identity. A creation/action retry reconciles the catalog decision.
+The table retains its current receipt until a later job replaces it; this is
+not a permanent job-history service.
 
 Defaults are 4 MiB and 1,024 primary rows per step, a 64 GiB temporary allowance,
 and a 1 GiB free-space reserve in addition to normal resource admission. The
@@ -188,14 +196,14 @@ qualification; old inline payloads are not retained indefinitely for rollback.
 
 ### Offline operator
 
-Build the stopped-server command with `cd zig && zig build vector-migrate`.
+The same `antfly storage migrate` subcommand supports stopped-server migration.
 Stop standalone, then run:
 
 ```sh
-zig/zig-out/bin/antfly-vector-migrate \
+zig/zig-out/bin/antfly storage migrate \
   --catalog /data/metadata/local-metadata.json \
   --replica-root /data/data/replicas \
-  --table documents --job vectors-offline-20260915
+  --table documents --to vector-store --job vectors-offline-20260915
 ```
 
 Use the actual configured catalog and replica-root paths. The command and the
