@@ -47,7 +47,6 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           CHECK_ID: ${{ inputs.check_id }}
           COMMENT_ID: ${{ inputs.comment_id }}
-          PR_CI_MEMBERS_TOKEN: ${{ secrets.PR_CI_MEMBERS_TOKEN }}
         with:
           script: |
             const {main} = require('./.github/scripts/pr-ci.cjs');

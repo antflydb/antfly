@@ -19,8 +19,7 @@ function fixture() {
     ref: 'refs/heads/main', runId: 91, apiUrl: 'https://api.github.com',
     payload: {action: 'created', repository, issue: {number: 7, pull_request: {}, labels: []}, comment}};
   const checks = [], dispatches = [], cancelled = [], runs = [], outputs = {}, notices = [];
-  let membership = 'active';
-  const membershipRequests = [];
+  let permission = 'write';
   let files = [{filename: 'docs/guide.md'}];
   let jobs = [{name: 'PR CI result', conclusion: 'success'}];
   const github = {rest: {
@@ -41,10 +40,9 @@ function fixture() {
       },
     },
     issues: {getComment: async () => ({data: structuredClone(comment)})},
-    orgs: {getMembershipForUser: async args => {
-      membershipRequests.push(args);
-      if (typeof membership === 'number') throw Object.assign(new Error('Membership lookup failed'), {status: membership});
-      return {data: {state: membership}};
+    repos: {getCollaboratorPermissionLevel: async () => {
+      if (typeof permission === 'number') throw Object.assign(new Error('Permission lookup failed'), {status: permission});
+      return {data: {permission}};
     }},
     actions: {
       listWorkflowRuns: async ({status}) => runs.filter(r => r.status === status),
@@ -54,9 +52,9 @@ function fixture() {
     },
   }, paginate: async (method, args) => method(args)};
   const core = {setOutput: (k,v) => {outputs[k]=v;}, notice: msg => notices.push(msg)};
-  const env = {PR_NUMBER: '7', CHECK_ID: '1', COMMENT_ID: '17', HEAD_SHA: SHA, BASE_SHA: BASE, PR_CI_MEMBERS_TOKEN: 'test-members-read-token'};
-  return {pr, comment, context, checks, dispatches, cancelled, runs, outputs, env, github, membershipRequests,
-    membership: value => {membership = value;}, files: value => {files = value;},
+  const env = {PR_NUMBER: '7', CHECK_ID: '1', COMMENT_ID: '17', HEAD_SHA: SHA, BASE_SHA: BASE};
+  return {pr, comment, context, checks, dispatches, cancelled, runs, outputs, env, github,
+    permission: value => {permission = value;}, files: value => {files = value;},
     jobs: value => {jobs = value;},
     call: (mode='event') => main({github, context, core, mode, config, env}),
     finish: () => {
@@ -68,16 +66,16 @@ function fixture() {
   };
 }
 
-test('drafts, closed PRs, forks, bots, nonmembers, and stale SHAs never dispatch', async t => {
+test('drafts, closed PRs, forks, bots, readers, and stale SHAs never dispatch', async t => {
   for (const change of [
     f => {f.pr.draft=true;}, f => {f.pr.state='closed';},
     f => {f.pr.head.repo={full_name:'fork/project'};},
-    f => {f.comment.user.type='Bot';}, f => {f.membership(404);},
+    f => {f.comment.user.type='Bot';}, f => {f.permission('read');},
     f => {f.comment.body='/ci run '+BASE;},
-    f => {f.membership('pending');},
-    f => {f.membership(403);},
-    f => {f.membership(500);},
-    f => {delete f.env.PR_CI_MEMBERS_TOKEN;},
+    f => {f.permission('triage');},
+    f => {f.permission('none');},
+    f => {f.permission(403);},
+    f => {f.permission(500);},
     f => {f.comment.updated_at='2026-09-16T01:00:00Z';},
   ]) await t.test(change.toString(), async () => {
     const f=fixture(); change(f); await f.call();
@@ -100,36 +98,29 @@ test('approval is consumed once, uses the default branch, and publishes on the P
   await assert.rejects(f.call('verify'),/expired/);
 });
 
-test('active org members can approve without repository write access or public membership', async () => {
-  const f=fixture();
-  f.comment.author_association='NONE'; // A private member need not expose membership on the comment.
-  await f.call();
-  assert.equal(f.dispatches.length,1);
-  assert.deepEqual(f.membershipRequests,[{
-    org:'acme', username:'maintainer',
-    headers:{authorization:'Bearer test-members-read-token'},
-  }]);
-  // There is deliberately no repository permission API in this fixture.
-  assert.equal(f.github.rest.repos,undefined);
+test('writers, maintainers, and admins approve using the default token, including outside collaborators', async t => {
+  for (const permission of ['write','maintain','admin']) await t.test(permission,async()=>{
+    const f=fixture(); f.permission(permission);
+    f.comment.author_association='COLLABORATOR';
+    await f.call(); await f.call('admit'); await f.call('verify');
+    f.finish(); await f.call();
+    assert.equal(f.dispatches.length,1);
+    assert.equal(f.checks[0].conclusion,'success');
+    assert.equal(f.github.rest.orgs,undefined);
+    assert.ok(Object.keys(f.env).every(key=>!key.includes('TOKEN')));
+  });
 });
 
-test('outside collaborators are rejected even if their comment carries a collaborator badge', async () => {
-  const f=fixture(); f.comment.author_association='COLLABORATOR'; f.membership(404);
+test('organization membership does not authorize a repository reader', async () => {
+  const f=fixture(); f.comment.author_association='MEMBER'; f.permission('read');
   await f.call(); assert.equal(f.dispatches.length,0);
 });
 
-test('membership is rechecked at admission and completion; suite jobs do not receive its token', async () => {
-  const f=fixture(); await f.call();
-  f.membership(404);
-  await assert.rejects(f.call('admit'),/Membership lookup failed/);
-  f.membership('active'); await f.call('admit');
-  const lookups=f.membershipRequests.length;
-  delete f.env.PR_CI_MEMBERS_TOKEN;
-  await f.call('verify');
-  assert.equal(f.membershipRequests.length,lookups);
-  f.env.PR_CI_MEMBERS_TOKEN='test-members-read-token';
-  f.membership(404); f.finish(); await f.call();
-  assert.equal(f.checks[0].conclusion,'failure');
+test('permission revocation prevents run and suite admission', async () => {
+  const f=fixture(); await f.call(); f.permission('read');
+  await assert.rejects(f.call('admit'),/write access/);
+  f.permission('write'); await f.call('admit'); f.permission('read');
+  await assert.rejects(f.call('verify'),/write access/);
 });
 
 test('suites are a snapshot and optional labels never dispatch by themselves', async () => {
@@ -188,7 +179,7 @@ test('a fresh approval revokes the old run; a late completion cannot pass it', a
 
 test('unauthorized comments do not cancel legitimate runs', async () => {
   const f=fixture(); await f.call(); await f.call('admit');
-  f.comment.id=18; f.membership(404); await f.call();
+  f.comment.id=18; f.permission('read'); await f.call();
   assert.equal(f.checks[0].status,'in_progress'); assert.equal(f.cancelled.length,0);
 });
 
@@ -234,7 +225,7 @@ test('failed/cancelled/skipped CI, missing result, changed approval and changed 
     f=>{f.context.payload.workflow_run.conclusion='cancelled';},
     f=>{f.context.payload.workflow_run.conclusion='skipped';},
     f=>{f.jobs([]);}, f=>{f.pr.head.sha=BASE;},
-    f=>{f.comment.body='changed';}, f=>{f.membership(404);},
+    f=>{f.comment.body='changed';}, f=>{f.permission('read');},
     f=>{f.context.payload.workflow_run.run_attempt=2;},
   ]) await t.test(change.toString(),async()=>{
     const f=fixture(); await f.call(); await f.call('admit'); f.finish(); change(f); await f.call();
@@ -280,7 +271,6 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
   const root=path.resolve(__dirname,'../workflows');
   for (const suite of config.suites) {
     const text=fs.readFileSync(path.join(root,suite.workflow),'utf8');
-    assert.doesNotMatch(text,/PR_CI_MEMBERS_TOKEN/,suite.workflow);
     assert.doesNotMatch(text,/^  pull_request(?:_target)?:/m,suite.workflow);
     assert.match(text,/uses: \.\/\.github\/workflows\/pr-ci-admission.yml/);
     const blocks=text.split(/^  [\w-]+:\n/m).filter(s=>/^    runs-on:/m.test(s));
@@ -295,12 +285,12 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
       assert.match(checkout,/persist-credentials: false/);
     }
   }
-  const admission=fs.readFileSync(path.join(root,'pr-ci-admission.yml'),'utf8');
-  assert.doesNotMatch(admission,/PR_CI_MEMBERS_TOKEN/);
-  const orchestrator=fs.readFileSync(path.join(root,'pr-ci.yml'),'utf8');
-  assert.doesNotMatch(orchestrator,/secrets: inherit/);
   for (const file of fs.readdirSync(root)) {
     const text=fs.readFileSync(path.join(root,file),'utf8');
     if (file!=='pr-ci-controller.yml') assert.doesNotMatch(text,/^  pull_request(?:_target)?:/m,file);
+    if (file.startsWith('pr-ci')) {
+      assert.doesNotMatch(text,/PR_CI_MEMBERS_TOKEN|PR_CI_APPROVERS|create-github-app-token/,file);
+      assert.doesNotMatch(text,/secrets: inherit/,file);
+    }
   }
 });
