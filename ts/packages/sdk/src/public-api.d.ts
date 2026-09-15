@@ -1234,6 +1234,68 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/storage/migrations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create or resume a table storage migration job
+         * @description Table-admin operation for local single-shard standalone tables. Target
+         *     vector_store changes primary_lsm source ownership without changing models,
+         *     dimensions, artifacts or logical indexes. Retry creation with the same
+         *     job_id, target and budgets. The job is advanced explicitly through its
+         *     job endpoint; the server does not schedule an unattended migration loop.
+         *     Offline migration uses antfly storage migrate against a stopped server.
+         */
+        post: operations["createTableStorageMigration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/storage/migrations/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a table storage migration receipt
+         * @description Table-admin observation only. Does not admit, advance, or publish a job.
+         *     A phase of admitted means catalog admission is durable but DB preparation
+         *     has not begun; retry creation or send a job action to recover it. The
+         *     receipt is retained until a later migration replaces it; this endpoint
+         *     is not a permanent job history.
+         */
+        get: operations["getTableStorageMigration"];
+        put?: never;
+        /**
+         * Advance, publish or cancel a table storage migration job
+         * @description Uses the job's durable configuration and budgets. Each step commits
+         *     bounded progress. Publish is accepted only at ready; complete additionally
+         *     certifies reference-only primary artifacts and native ANN serving.
+         *     Cancellation is allowed only before publication. Repeating an action
+         *     after an ambiguous response resumes the durable job.
+         */
+        post: operations["advanceTableStorageMigration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/repair/run": {
         parameters: {
             query?: never;
@@ -18293,6 +18355,165 @@ export interface operations {
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    createTableStorageMigration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    job_id: string;
+                    /** @enum {string} */
+                    target: "vector_store";
+                    budget?: {
+                        /**
+                         * Format: int64
+                         * @default 4194304
+                         */
+                        batch_bytes?: number;
+                        /** @default 1024 */
+                        batch_rows?: number;
+                        /**
+                         * Format: int64
+                         * @default 68719476736
+                         */
+                        temporary_bytes?: number;
+                        /**
+                         * Format: int64
+                         * @default 1073741824
+                         */
+                        disk_reserve_bytes?: number;
+                    };
+                };
+            };
+        };
+        responses: {
+            /** @description Durable migration receipt, or admitted receipt before DB preparation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Conflicting job, lifecycle operation or publication state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Retryable resource or recovery admission failure */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getTableStorageMigration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Durable migration receipt, or admitted receipt before DB preparation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Conflicting job, lifecycle operation or publication state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Retryable resource or recovery admission failure */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    advanceTableStorageMigration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    action: "step" | "publish" | "cancel";
+                };
+            };
+        };
+        responses: {
+            /** @description Durable migration receipt, or admitted receipt before DB preparation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Conflicting job, lifecycle operation or publication state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Retryable resource or recovery admission failure */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     runTableRepair: {
