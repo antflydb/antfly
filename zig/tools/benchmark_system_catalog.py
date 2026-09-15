@@ -124,7 +124,11 @@ def concurrent_lookups(base: str, path: str, args) -> dict:
             durations = []
             requests = []
             started = time.perf_counter_ns()
-            for sequence in range(args.samples):
+            sequence = 0
+            while (
+                sequence < args.samples
+                or (time.perf_counter_ns() - started) / 1e9 < args.lookup_seconds
+            ):
                 start = time.perf_counter_ns()
                 value = api.request("GET", path)
                 finish = time.perf_counter_ns()
@@ -132,6 +136,7 @@ def concurrent_lookups(base: str, path: str, args) -> dict:
                     raise RuntimeError(f"lookup mismatch: {value}")
                 durations.append((finish - start) / 1e6)
                 requests.append((client, sequence, start, finish))
+                sequence += 1
             return started, time.perf_counter_ns(), durations, requests
         except BaseException:
             barrier.abort()
@@ -258,8 +263,8 @@ def wait_for_catalog_shards(
     return (time.perf_counter() - start) * 1000
 
 
-def listing_table_config(args):
-    table_config = {"num_shards": 1}
+def listing_table_config(args, num_shards: int = 1):
+    table_config = {"num_shards": num_shards}
     if args.schema_fields or args.storage_mode == "relational":
         table_config["schema"] = {
             "default_type": "default",
@@ -387,7 +392,7 @@ def catalog_scenario(args, binary: Path) -> dict:
             {"placement_policy_json": json.dumps({"desired_replica_count": 1})},
         )
         api.request("PUT", scope + "/tablespace", {"tablespace_name": "benchmark"})
-        table_config = listing_table_config(args)
+        table_config = listing_table_config(args, args.catalog_shards)
         previous = 0
         checkpoints = []
         for count in sorted(set(args.table_counts)):
@@ -1101,6 +1106,12 @@ def main():
     )
     parser.add_argument("--table-counts", nargs="+", type=positive, default=[10, 100])
     parser.add_argument(
+        "--catalog-shards",
+        type=positive,
+        default=1,
+        help="Shards per table in the catalog workload; use multiple shards to exercise query and join fanout",
+    )
+    parser.add_argument(
         "--catalog-ingress",
         choices=["first", "nonmember"],
         default="first",
@@ -1138,6 +1149,12 @@ def main():
     parser.add_argument("--documents", type=positive, default=5)
     parser.add_argument("--concurrency", type=positive, default=8)
     parser.add_argument("--samples", type=positive, default=30)
+    parser.add_argument(
+        "--lookup-seconds",
+        type=positive,
+        default=0,
+        help="Minimum concurrent lookup duration at each catalog checkpoint; use 30 or more to cover repeated routing refreshes (0 uses sample count)",
+    )
     parser.add_argument("--warmup", type=positive, default=2)
     parser.add_argument("--ndjson-lines", type=positive, default=20)
     parser.add_argument("--poll-ms", type=positive, default=20)

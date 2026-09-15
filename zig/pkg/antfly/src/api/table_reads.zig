@@ -4887,13 +4887,14 @@ pub const ProvisionedTableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const router = self.distributed_router orelse return null;
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
             .local => error.JoinWorkerOwnedLocally,
-            .remote => |remote| try joinPartitionRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
+            .remote => |remote| try joinPartitionRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs()),
         };
     }
 
@@ -4905,13 +4906,14 @@ pub const ProvisionedTableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const router = self.distributed_router orelse return null;
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
             .local => error.JoinWorkerOwnedLocally,
-            .remote => |remote| try joinRowsRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
+            .remote => |remote| try joinRowsRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs()),
         };
     }
 
@@ -4923,13 +4925,14 @@ pub const ProvisionedTableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const router = self.distributed_router orelse return null;
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
             .local => error.JoinWorkerOwnedLocally,
-            .remote => |remote| try joinUnmatchedRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
+            .remote => |remote| try joinUnmatchedRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs()),
         };
     }
 
@@ -4941,13 +4944,14 @@ pub const ProvisionedTableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const router = self.distributed_router orelse return null;
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
             .local => error.JoinWorkerOwnedLocally,
-            .remote => |remote| try joinFinalizeRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
+            .remote => |remote| try joinFinalizeRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs()),
         };
     }
 
@@ -5740,39 +5744,43 @@ pub const HostedProvisionedTableReadSource = struct {
     }
 
     fn joinPartitionGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned: RoutePinnedCatalog = undefined;
         var routed: HostedProvisionedTableReadSource = undefined;
         try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
-        return try joinPartitionGroupLocal(&routed, alloc, group_id, table_name, body, timeout_ms);
+        return try joinPartitionGroupLocal(&routed, alloc, group_id, table_name, body, try budget.remainingTimeoutMs());
     }
 
     fn joinRowsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned: RoutePinnedCatalog = undefined;
         var routed: HostedProvisionedTableReadSource = undefined;
         try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
-        return try joinRowsGroupLocal(&routed, alloc, group_id, table_name, body, timeout_ms);
+        return try joinRowsGroupLocal(&routed, alloc, group_id, table_name, body, try budget.remainingTimeoutMs());
     }
 
     fn joinUnmatchedGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned: RoutePinnedCatalog = undefined;
         var routed: HostedProvisionedTableReadSource = undefined;
         try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
-        return try joinUnmatchedGroupLocal(&routed, alloc, group_id, table_name, body, timeout_ms);
+        return try joinUnmatchedGroupLocal(&routed, alloc, group_id, table_name, body, try budget.remainingTimeoutMs());
     }
 
     fn joinFinalizeGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned: RoutePinnedCatalog = undefined;
         var routed: HostedProvisionedTableReadSource = undefined;
         try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
-        return try joinFinalizeGroupLocal(&routed, alloc, group_id, table_name, body, timeout_ms);
+        return try joinFinalizeGroupLocal(&routed, alloc, group_id, table_name, body, try budget.remainingTimeoutMs());
     }
 
     fn graphExpandGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: distributed_graph.GraphExpandRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphExpandResponse {
@@ -5884,7 +5892,7 @@ pub const HostedProvisionedTableReadSource = struct {
         const self = &routed_source;
         const group_id = fence.route.group_id;
         try checkLookupOptionsActive(opts);
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse {
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(opts)), group_id, routePolicyForConsistency(consistency))) orelse {
             return null;
         };
         defer route.deinit(alloc);
@@ -6001,7 +6009,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         initial_route: table_router.GroupRoute,
     ) !?LookupResponse {
-        const nodes = (try self.router.groupNodeIds(alloc, group_id)) orelse blk: {
+        const nodes = (try self.router.withBudget(.fromRequest(opts)).groupNodeIds(alloc, group_id)) orelse blk: {
             var snapshot = try self.catalog.adminSnapshot();
             defer self.catalog.freeAdminSnapshot(&snapshot);
             const placements = try metadata_admin.listGroupPlacement(alloc, &snapshot, group_id);
@@ -6032,7 +6040,7 @@ pub const HostedProvisionedTableReadSource = struct {
             if (self.router.nodeStatus(node_id, group_id)) |status| {
                 if (status != .active) continue;
             }
-            const base_uri = (try self.router.nodeBaseUriForGroup(alloc, group_id, node_id)) orelse continue;
+            const base_uri = (try self.router.withBudget(.fromRequest(opts)).nodeBaseUriForGroup(alloc, group_id, node_id)) orelse continue;
             defer alloc.free(base_uri);
             if (lookupRemote(self.internalExecutor(), alloc, base_uri, group_id, table_name, key, opts, consistency)) |result| {
                 return result;
@@ -6125,7 +6133,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 if (stream.lines >= opts.limit) break;
                 group_opts.limit = opts.limit - stream.lines;
             }
-            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return false;
+            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(opts)), group_id, routePolicyForConsistency(consistency))) orelse return false;
             defer route.deinit(alloc);
             switch (route) {
                 .local => {
@@ -6211,7 +6219,7 @@ pub const HostedProvisionedTableReadSource = struct {
         try rejectUnsupportedGraphQueryMode(group_ids.len, req);
         const start_ns = self.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
-            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
+            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
             defer route.deinit(alloc);
 
             if (route == .local)
@@ -6315,11 +6323,9 @@ pub const HostedProvisionedTableReadSource = struct {
         defer if (!keep_summary) {
             if (first_summary) |*summary| summary.deinit(alloc);
         };
-        for (group_ids) |group_id| {
-            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse {
-                return null;
-            };
-            defer route.deinit(alloc);
+        const routes = (try table_router.resolveGroupRoutes(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids, routePolicyForConsistency(consistency))) orelse return null;
+        defer deinitHostedShardRoutes(alloc, routes);
+        for (group_ids, routes) |group_id, route| {
             switch (route) {
                 .local => {
                     const summary = (try (try self.groupLocalSourceForGroup(alloc, group_id, table_name, req.execution_deadline_ns, req.cancellation)).preflightQueryGroupLocal(alloc, group_id, table_name, req, consistency, max_work)) orelse return null;
@@ -6517,7 +6523,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_id, routePolicyForConsistency(consistency))) orelse return null;
         defer route.deinit(alloc);
         switch (route) {
             .remote => |remote| return queryResponseRemote(
@@ -6569,7 +6575,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.SearchResult {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
@@ -6642,22 +6648,23 @@ pub const HostedProvisionedTableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(self.catalog, timeout_ms));
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, self.catalog.deadlineFrom(budget.clock));
         const fence = route_snapshot.fence() orelse return null;
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
         var routed = self.*;
         routed.catalog = pinned.source();
-        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
             .local => if (routed.local_read_source) |local|
-                try local.joinPartitionGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
+                try local.joinPartitionGroupLocalWithTimeout(alloc, group_id, table_name, body, try budget.remainingTimeoutMs())
             else
                 null,
-            .remote => |remote| joinPartitionRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinPartitionRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs()) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -6672,22 +6679,23 @@ pub const HostedProvisionedTableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(self.catalog, timeout_ms));
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, self.catalog.deadlineFrom(budget.clock));
         const fence = route_snapshot.fence() orelse return null;
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
         var routed = self.*;
         routed.catalog = pinned.source();
-        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
             .local => if (routed.local_read_source) |local|
-                try local.joinRowsGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
+                try local.joinRowsGroupLocalWithTimeout(alloc, group_id, table_name, body, try budget.remainingTimeoutMs())
             else
                 null,
-            .remote => |remote| joinRowsRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinRowsRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs()) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -6702,22 +6710,23 @@ pub const HostedProvisionedTableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(self.catalog, timeout_ms));
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, self.catalog.deadlineFrom(budget.clock));
         const fence = route_snapshot.fence() orelse return null;
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
         var routed = self.*;
         routed.catalog = pinned.source();
-        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
             .local => if (routed.local_read_source) |local|
-                try local.joinUnmatchedGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
+                try local.joinUnmatchedGroupLocalWithTimeout(alloc, group_id, table_name, body, try budget.remainingTimeoutMs())
             else
                 null,
-            .remote => |remote| joinUnmatchedRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinUnmatchedRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs()) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -6732,22 +6741,23 @@ pub const HostedProvisionedTableReadSource = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
+        const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(self.catalog, timeout_ms));
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, self.catalog.deadlineFrom(budget.clock));
         const fence = route_snapshot.fence() orelse return null;
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
         var routed = self.*;
         routed.catalog = pinned.source();
-        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
             .local => if (routed.local_read_source) |local|
-                try local.joinFinalizeGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
+                try local.joinFinalizeGroupLocalWithTimeout(alloc, group_id, table_name, body, try budget.remainingTimeoutMs())
             else
                 null,
-            .remote => |remote| joinFinalizeRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinFinalizeRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs()) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -6794,7 +6804,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphExpandResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_id, routePolicyForConsistency(consistency))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
@@ -6867,7 +6877,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphHydrateResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_id, routePolicyForConsistency(consistency))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
@@ -6914,7 +6924,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphEdgesResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_id, routePolicyForConsistency(consistency))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
@@ -7130,18 +7140,9 @@ fn resolveHostedShardRoutes(
     alloc: std.mem.Allocator,
     group_ids: []const u64,
     consistency: raft_mod.ReadConsistency,
+    budget: table_router.RouteBudget,
 ) ![]table_router.GroupRoute {
-    const routes = try alloc.alloc(table_router.GroupRoute, group_ids.len);
-    errdefer alloc.free(routes);
-    var initialized: usize = 0;
-    errdefer {
-        for (routes[0..initialized]) |*route| route.deinit(alloc);
-    }
-    for (group_ids, 0..) |group_id, i| {
-        routes[i] = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
-        initialized += 1;
-    }
-    return routes;
+    return (try table_router.resolveGroupRoutes(alloc, self.catalog, self.router.withBudget(budget), group_ids, routePolicyForConsistency(consistency))) orelse error.TableNotFound;
 }
 
 fn deinitHostedShardRoutes(alloc: std.mem.Allocator, routes: []table_router.GroupRoute) void {
@@ -7161,7 +7162,7 @@ fn collectHostedSearchRequestTextStatsParallel(
     consistency: raft_mod.ReadConsistency,
 ) ![]const distributed_stats_mod.TextFieldStats {
     const start_ns = platform_time.monotonicNs();
-    const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency);
+    const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency, .fromRequest(req));
     defer deinitHostedShardRoutes(alloc, routes);
 
     const slots = try initTextStatsFanoutSlots(alloc, group_ids.len);
@@ -7321,7 +7322,7 @@ fn queryHostedAcrossGroupsParallel(
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
     std.debug.assert(req.graph_queries.len == 0);
-    const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency);
+    const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency, .fromRequest(req));
     defer deinitHostedShardRoutes(alloc, routes);
 
     const slots = try initSearchFanoutSlots(alloc, group_ids.len);
@@ -7829,18 +7830,8 @@ fn preflightHostedGroupsParallel(
     max_work: u32,
 ) !?db_mod.RuntimePreflightSummary {
     const start_ns = platform_time.monotonicNs();
-    const routes = try alloc.alloc(table_router.GroupRoute, group_ids.len);
-    var initialized: usize = 0;
-    defer {
-        for (routes[0..initialized]) |*route| route.deinit(alloc);
-        alloc.free(routes);
-    }
-    for (group_ids, 0..) |group_id, i| {
-        routes[i] = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse {
-            return null;
-        };
-        initialized += 1;
-    }
+    const routes = (try table_router.resolveGroupRoutes(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids, routePolicyForConsistency(consistency))) orelse return null;
+    defer deinitHostedShardRoutes(alloc, routes);
 
     const slots = try initPreflightFanoutSlots(alloc, group_ids.len);
     defer deinitPreflightFanoutSlots(alloc, slots);
@@ -7981,7 +7972,7 @@ fn rejectHostedRemoteResolvedDocFilter(
     consistency: raft_mod.ReadConsistency,
 ) !void {
     if (!searchRequestHasResolvedDocFilter(req) or group_ids.len != 1) return;
-    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
+    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids[0], routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
     defer route.deinit(alloc);
     try validateResolvedDocFilterForRemoteRoute(alloc, self.catalog, table_name, group_ids[0], req, route);
 }
@@ -9471,6 +9462,8 @@ fn queryHostedAcrossGroupsPhase(
     }
     if (plan.reason == .no_io) recordParallelFanoutFallback(.query);
 
+    const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency, .fromRequest(req));
+    defer deinitHostedShardRoutes(alloc, routes);
     var shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     var initialized: usize = 0;
     var graph_accumulator: ?query_api.GraphSearchResultsAccumulator = if (req.graph_queries.len > 0)
@@ -9488,8 +9481,7 @@ fn queryHostedAcrossGroupsPhase(
         const lookup_keys = try selectLookupKeysForGroup(alloc, &group_req, group_id);
         defer if (lookup_keys) |keys| alloc.free(keys);
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
-        defer route.deinit(alloc);
+        const route = routes[i];
         shard_results[i] = switch (route) {
             .local => (try self.groupLocalSource().searchResultGroupLocal(
                 alloc,
@@ -9666,7 +9658,7 @@ fn executeProvisionedGraphExpand(
         var route = (try table_router.resolveGroupRoute(
             alloc,
             ctx.source.catalog,
-            router,
+            router.withBudget(.fromRequest(req)),
             group_id,
             routePolicyForConsistency(consistency),
         )) orelse return error.UnknownGroup;
@@ -9785,7 +9777,7 @@ fn executeProvisionedGraphHydrate(
         var route = (try table_router.resolveGroupRoute(
             alloc,
             ctx.source.catalog,
-            router,
+            router.withBudget(.fromRequest(req)),
             group_id,
             routePolicyForConsistency(consistency),
         )) orelse return error.UnknownGroup;
@@ -9884,7 +9876,7 @@ fn executeHostedGraphHydrate(
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphHydrateResponse {
     const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.UnknownGroup;
+    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_id, routePolicyForConsistency(consistency))) orelse return error.UnknownGroup;
     defer route.deinit(alloc);
 
     return switch (route) {
@@ -9920,7 +9912,7 @@ fn executeProvisionedGraphGetEdges(
         var route = (try table_router.resolveGroupRoute(
             alloc,
             ctx.source.catalog,
-            router,
+            router.withBudget(.fromRequest(req)),
             group_id,
             routePolicyForConsistency(consistency),
         )) orelse return error.UnknownGroup;
@@ -10016,7 +10008,7 @@ fn executeHostedGraphGetEdges(
     consistency: raft_mod.ReadConsistency,
 ) anyerror!distributed_graph.GraphEdgesResponse {
     const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.UnknownGroup;
+    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_id, routePolicyForConsistency(consistency))) orelse return error.UnknownGroup;
     defer route.deinit(alloc);
 
     return switch (route) {
@@ -11760,7 +11752,7 @@ fn applyHostedProvisionedQueryAggregations(
     if (req.aggregations_json.len == 0) return;
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
     if (comptime !control_only_storage_sources) if (group_ids.len == 1) {
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids[0], routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
 
         switch (route) {
@@ -11837,7 +11829,7 @@ fn tryApplyHostedAlgebraicDistributedAggregations(
     // per-group partial collection behind the group-local interface.
     const representative_group_id: ?u64 = if (self.local_read_source != null) null else blk: {
         for (group_ids) |group_id| {
-            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return false;
+            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_id, routePolicyForConsistency(consistency))) orelse return false;
             defer route.deinit(alloc);
             switch (route) {
                 .local => break :blk group_id,
@@ -12820,13 +12812,14 @@ fn collectHostedAlgebraicDistributedPartials(
         partials.deinit(alloc);
     }
 
+    const routes = (try table_router.resolveGroupRoutes(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids, routePolicyForConsistency(consistency))) orelse return null;
+    defer deinitHostedShardRoutes(alloc, routes);
     for (group_ids, 0..) |group_id, group_index| {
         var group_req = req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[group_index].?;
         const body = try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program);
         defer alloc.free(body);
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
-        defer route.deinit(alloc);
+        const route = routes[group_index];
         const shard_partials = switch (route) {
             .local => blk: {
                 var response = self.requireAlgebraicPartialsLocal(alloc, group_id, table_name, body) catch return null;
@@ -13731,6 +13724,8 @@ fn collectHostedSearchRequestTextStats(
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     try validateRequiredIdentityGenerations(group_ids.len, required_identity_generations);
     if (required_identity_generations) |generations| {
+        const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency, .fromRequest(req));
+        defer deinitHostedShardRoutes(alloc, routes);
         const shard_stats = try alloc.alloc([]const distributed_stats_mod.TextFieldStats, group_ids.len);
         var initialized: usize = 0;
         defer {
@@ -13742,8 +13737,7 @@ fn collectHostedSearchRequestTextStats(
             group_req.identity_read_generation = generation.?;
             const body = try encodeQueryTextStatsRequest(alloc, group_req);
             defer alloc.free(body);
-            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
-            defer route.deinit(alloc);
+            const route = routes[i];
             var response = switch (route) {
                 .local => (try self.groupLocalSource().textStatsGroupLocal(
                     alloc,
@@ -13769,6 +13763,8 @@ fn collectHostedSearchRequestTextStats(
     }
     if (plan.reason == .no_io) recordParallelFanoutFallback(.text_stats);
 
+    const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency, .fromRequest(req));
+    defer deinitHostedShardRoutes(alloc, routes);
     const shard_stats = try alloc.alloc([]const distributed_stats_mod.TextFieldStats, group_ids.len);
     var initialized: usize = 0;
     defer {
@@ -13777,8 +13773,7 @@ fn collectHostedSearchRequestTextStats(
     }
 
     for (group_ids, 0..) |group_id, i| {
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
-        defer route.deinit(alloc);
+        const route = routes[i];
         var response = switch (route) {
             .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
@@ -13899,13 +13894,14 @@ fn collectHostedAggregationTextStats(
         for (shard_stats[0..initialized]) |item| distributed_stats_mod.deinitTextFieldStats(alloc, item);
         alloc.free(shard_stats);
     }
+    const routes = (try table_router.resolveGroupRoutes(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
+    defer deinitHostedShardRoutes(alloc, routes);
     for (group_ids, 0..) |group_id, i| {
         var group_req = req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         const body = try encodeExplicitTextStatsRequestForSearchRequest(alloc, field_requests, group_req);
         defer alloc.free(body);
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
-        defer route.deinit(alloc);
+        const route = routes[i];
         var response = switch (route) {
             .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
@@ -13945,13 +13941,14 @@ fn collectHostedAggregationBackgroundTextStats(
         for (shard_stats[0..initialized]) |item| db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, item);
         alloc.free(shard_stats);
     }
+    const routes = (try table_router.resolveGroupRoutes(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
+    defer deinitHostedShardRoutes(alloc, routes);
     for (group_ids, 0..) |group_id, i| {
         var group_req = req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         const body = try encodeBackgroundTextStatsRequestForSearchRequest(alloc, field_requests, group_req);
         defer alloc.free(body);
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
-        defer route.deinit(alloc);
+        const route = routes[i];
         var response = switch (route) {
             .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
@@ -15300,6 +15297,23 @@ fn consumerTests() type {
             };
 
             const FakeRouter = struct {
+                var batch_calls: usize = 0;
+                fn routes(_: *anyopaque, allocator: std.mem.Allocator, groups: []const u64, _: table_router.RoutePolicy, budget: table_router.RouteBudget) !?[]table_router.GroupRoute {
+                    try budget.check();
+                    batch_calls += 1;
+                    try std.testing.expectEqualSlices(u64, &.{ 7, 8 }, groups);
+                    const result = try allocator.alloc(table_router.GroupRoute, groups.len);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (result[0..initialized]) |*route| route.deinit(allocator);
+                        allocator.free(result);
+                    }
+                    for (result) |*route| {
+                        route.* = .{ .remote = .{ .node_id = 2, .base_uri = try allocator.dupe(u8, "http://remote.test") } };
+                        initialized += 1;
+                    }
+                    return result;
+                }
                 fn iface() table_router.HostedGroupRouter {
                     return .{
                         .ptr = undefined,
@@ -15309,6 +15323,7 @@ fn consumerTests() type {
                             .group_leader_node_id = groupLeaderNodeId,
                             .node_status = nodeStatus,
                             .node_base_uri = nodeBaseUri,
+                            .resolve_group_routes = routes,
                         },
                     };
                 }
@@ -15337,22 +15352,23 @@ fn consumerTests() type {
             const Capture = struct {
                 keys_seen: std.atomic.Value(usize) = .init(0),
                 calls: std.atomic.Value(usize) = .init(0),
-                fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    const left = std.mem.indexOf(u8, req.body, "doc:a") != null;
-                    const right = std.mem.indexOf(u8, req.body, "doc:z") != null;
+                    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, req.body, .{});
+                    defer parsed.deinit();
+                    const keys = parsed.value.object.get("native_doc_id_constraints").?.object.get("include_doc_ids").?.array.items;
+                    try std.testing.expectEqual(@as(usize, 1), keys.len);
+                    const expected = if (std.mem.indexOf(u8, req.uri, "/groups/7/") != null) "doc:a" else "doc:z";
+                    try std.testing.expectEqualStrings(expected, keys[0].string);
                     _ = self.calls.fetchAdd(1, .monotonic);
-                    _ = self.keys_seen.fetchAdd(@as(usize, @intFromBool(left)) + @intFromBool(right), .monotonic);
-                    if (left == right) std.debug.print("unexpected candidate fanout payload uri={s} body={s}\n", .{ req.uri, req.body });
-                    try std.testing.expect(left != right);
-                    try std.testing.expectEqual(left, std.mem.indexOf(u8, req.uri, "/groups/7/") != null);
-                    try std.testing.expectEqual(right, std.mem.indexOf(u8, req.uri, "/groups/8/") != null);
+                    _ = self.keys_seen.fetchAdd(keys.len, .monotonic);
                     // Stop after wire capture; both fibers must still finish. This
                     // exercises the real parallel dispatch and serializer, not merely
                     // the partition helper or the final result set.
                     return error.InvalidQueryRequest;
                 }
             };
+            FakeRouter.batch_calls = 0;
             var capture = Capture{};
             var routing = try table_catalog.RoutingSession.init(alloc, FakeCatalog.iface(), null);
             defer routing.deinit();
@@ -15364,6 +15380,11 @@ fn consumerTests() type {
             try std.testing.expectError(error.InvalidQueryRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
             try std.testing.expectEqual(@as(usize, 2), capture.calls.load(.monotonic));
             try std.testing.expectEqual(@as(usize, 2), capture.keys_seen.load(.monotonic));
+            try std.testing.expectEqual(@as(usize, 1), FakeRouter.batch_calls);
+            // The sequential phase must also pin all routes before dispatch.
+            hosted.io_impl = null;
+            try std.testing.expectError(error.InvalidQueryRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
+            try std.testing.expectEqual(@as(usize, 2), FakeRouter.batch_calls);
         }
         test "provisioned observed dynamic capability merge preserves ownership under allocation failure" {
             const Case = struct {
@@ -17167,7 +17188,7 @@ fn consumerTests() type {
                 fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
                     return .absent;
                 }
-                fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+                fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
                     return alloc.alloc(u64, 0);
                 }
                 fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {

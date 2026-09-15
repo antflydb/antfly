@@ -874,11 +874,11 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var structural_wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
     defer structural_wait_io.deinit();
     var structural_wait_attempts: usize = 0;
-    while (structural_wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort("docs", 0)) : (structural_wait_attempts += 1) {
+    while (structural_wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (structural_wait_attempts += 1) {
         try svc.runRound();
         structural_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort("docs", 0));
+    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
     // This fixture performs data-group writes directly instead of running a
     // second Raft host. Model the data owner's normal lifecycle explicitly:
@@ -950,11 +950,11 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var owner_wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
     defer owner_wait_io.deinit();
     var owner_wait_attempts: usize = 0;
-    while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort("docs", group_id)) : (owner_wait_attempts += 1) {
+    while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
         try svc.runRound();
         owner_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort("docs", group_id));
+    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
     const finalized_tables = try svc.listProjectedTables(std.testing.allocator);
     defer svc.freeProjectedTables(std.testing.allocator, finalized_tables);
@@ -1452,11 +1452,11 @@ test "public api smoke e2e creates table inserts and queries documents" {
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
     owner_wait_attempts = 0;
-    while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort("docs", group_id)) : (owner_wait_attempts += 1) {
+    while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
         try svc.runRound();
         owner_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort("docs", group_id));
+    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchTableIndex(base_uri, "docs", "embed_idx"));
 

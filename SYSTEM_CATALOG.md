@@ -933,12 +933,18 @@ rules remain identical to the peer-aware placement rules.
 
 Control snapshot publication replaces the index under the same incarnation and
 mutation fences; retained readers finish against their original view. Invalidation
-removes the current view immediately. Cold refreshes share bounded admission and
-reuse the control snapshot refresh path. Peer freshness starts at publication, so
-a slow capture does not arrive already expired. They do not request independent diagnostic
-snapshot transfers. Single-group and fanout routing retain one view for leader,
-placement, and endpoint selection. Missing-document fallback uses readable peer
-IDs from the router, avoiding another administrative inventory capture.
+removes the current view immediately. Cold refreshes share admission under the
+request’s remaining deadline and cancellation token, translating between the
+request and metadata clocks without extending the budget. They reuse the control
+snapshot refresh path and return a
+retained peer view directly; they do not clone a full control snapshot merely to
+discard it. Replaced snapshots are freed after releasing the publication lock.
+Peer freshness starts at publication, so a slow capture does not arrive already
+expired. They do not request independent diagnostic snapshot transfers.
+Single-group routing and each parallel or sequential search fanout phase retain
+one view for leader, placement, and endpoint selection. Each fanout resolves all
+its destinations before dispatching shard work. Missing-document fallback uses
+readable peer IDs from the router, avoiding another administrative inventory capture.
 
 A local serving leader requires no endpoint discovery. A local Raft member's
 leader observation takes precedence over metadata hints; a non-member's retained

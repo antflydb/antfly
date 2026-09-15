@@ -8581,7 +8581,7 @@ pub const DataServer = struct {
             }
             return (self.peers.groups.get(group_id) orelse return null).leader;
         }
-        fn nodes(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u64 {
+        fn nodes(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, _: antfly.public_api.table_router.RouteBudget) ![]u64 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return alloc.dupe(u64, if (self.peers.groups.get(group_id)) |group| group.nodes.items else &.{});
         }
@@ -8593,7 +8593,7 @@ pub const DataServer = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.peers.nodeUri(alloc, node_id);
         }
-        fn groupUri(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64) !?[]u8 {
+        fn groupUri(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, _: antfly.public_api.table_router.RouteBudget) !?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.peers.readable(group_id, node_id)) return null;
             return self.peers.nodeUri(alloc, node_id);
@@ -8611,7 +8611,7 @@ pub const DataServer = struct {
         }
     };
 
-    fn dataReadRouterResolveGroupRoutes(ptr: *anyopaque, alloc: std.mem.Allocator, group_ids: []const u64, policy: antfly.public_api.table_router.RoutePolicy) !?[]antfly.public_api.table_router.GroupRoute {
+    fn dataReadRouterResolveGroupRoutes(ptr: *anyopaque, alloc: std.mem.Allocator, group_ids: []const u64, policy: antfly.public_api.table_router.RoutePolicy, budget: antfly.public_api.table_router.RouteBudget) !?[]antfly.public_api.table_router.GroupRoute {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         // Local serving leaders need no endpoint discovery. Keep an entirely
         // local read independent of the metadata routing cache's refresh TTL.
@@ -8632,20 +8632,20 @@ pub const DataServer = struct {
             }
         }
         if (self.remote_metadata) |metadata| {
-            const peers = try metadata.acquireReadPeerRouting();
+            const peers = try metadata.acquireReadPeerRouting(budget);
             defer peers.release();
             var pinned: PinnedReadPeerRouter = .{ .server = self, .peers = peers };
-            return antfly.public_api.table_router.resolveGroupRoutes(alloc, self.read_source.catalog, pinned.router(), group_ids, policy);
+            return antfly.public_api.table_router.resolveGroupRoutes(alloc, self.read_source.catalog, pinned.router().withBudget(budget), group_ids, policy);
         }
         var vtable = self.dataReadGroupRouter().vtable.*;
         vtable.resolve_group_routes = null;
-        return antfly.public_api.table_router.resolveGroupRoutes(alloc, self.read_source.catalog, .{ .ptr = self, .vtable = &vtable }, group_ids, policy);
+        return antfly.public_api.table_router.resolveGroupRoutes(alloc, self.read_source.catalog, .{ .ptr = self, .vtable = &vtable, .budget = budget }, group_ids, policy);
     }
 
-    fn dataReadRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u64 {
+    fn dataReadRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, budget: antfly.public_api.table_router.RouteBudget) ![]u64 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.remote_metadata) |metadata| {
-            const peers = try metadata.acquireReadPeerRouting();
+            const peers = try metadata.acquireReadPeerRouting(budget);
             defer peers.release();
             return alloc.dupe(u64, if (peers.groups.get(group_id)) |group| group.nodes.items else &.{});
         }
@@ -8684,7 +8684,7 @@ pub const DataServer = struct {
             return raft.host.http_host.host.leaderId(group_id);
 
         if (self.remote_metadata) |metadata| {
-            const peers = metadata.acquireReadPeerRouting() catch return null;
+            const peers = metadata.acquireReadPeerRouting(.{}) catch return null;
             defer peers.release();
             return (peers.groups.get(group_id) orelse return null).leader;
         }
@@ -8700,7 +8700,7 @@ pub const DataServer = struct {
     fn dataReadRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.remote_metadata) |metadata| {
-            const peers = try metadata.acquireReadPeerRouting();
+            const peers = try metadata.acquireReadPeerRouting(.{});
             defer peers.release();
             return peers.nodeUri(alloc, node_id);
         }
@@ -8712,15 +8712,10 @@ pub const DataServer = struct {
         return try alloc.dupe(u8, store.api_url);
     }
 
-    fn dataReadRouterNodeBaseUriForGroup(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        node_id: u64,
-    ) !?[]u8 {
+    fn dataReadRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, budget: antfly.public_api.table_router.RouteBudget) !?[]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.remote_metadata) |metadata| {
-            const peers = try metadata.acquireReadPeerRouting();
+            const peers = try metadata.acquireReadPeerRouting(budget);
             defer peers.release();
             if (!peers.readable(group_id, node_id)) return null;
             return peers.nodeUri(alloc, node_id);
@@ -20220,6 +20215,7 @@ const RemoteMetadataSource = struct {
         fetch_head_error: ?anyerror = null,
         fetch_head_mismatches_remaining: usize = 0,
         force_snapshot_cache_miss: bool = false,
+        snapshot_result_clones: usize = 0,
         lifecycle_linearizable_snapshot_calls: std.atomic.Value(u64) = .init(0),
     } else struct {};
 
@@ -20442,6 +20438,12 @@ const RemoteMetadataSource = struct {
         return (start + attempt) % self.base_uris.len;
     }
 
+    fn metadataReadApiIndexForAttemptWithBudget(self: *RemoteMetadataSource, attempt: usize, budget: ?antfly.metadata_http_client.RequestBudget) !usize {
+        try self.lockWithBudget(&self.cache_mutex, budget);
+        defer self.cache_mutex.unlock();
+        return (self.preferred_read_uri_index + attempt) % self.base_uris.len;
+    }
+
     fn metadataReadApiIndexForAttempt(self: *RemoteMetadataSource, attempt: usize) usize {
         lockAtomic(&self.cache_mutex);
         const start = self.preferred_read_uri_index % self.base_uris.len;
@@ -20457,6 +20459,12 @@ const RemoteMetadataSource = struct {
         // read affinity below.
         self.preferred_read_uri_index = index;
         self.cache_mutex.unlock();
+    }
+
+    fn noteMetadataReadSuccessWithBudget(self: *RemoteMetadataSource, index: usize, budget: ?antfly.metadata_http_client.RequestBudget) !void {
+        try self.lockWithBudget(&self.cache_mutex, budget);
+        defer self.cache_mutex.unlock();
+        self.preferred_read_uri_index = index;
     }
 
     fn noteMetadataReadSuccess(self: *RemoteMetadataSource, index: usize) void {
@@ -20628,6 +20636,13 @@ const RemoteMetadataSource = struct {
         self.metadata_incarnation = incarnation;
     }
 
+    fn acceptMetadataIdentityWithBudget(self: *RemoteMetadataSource, metadata_group_id: u64, candidate: ?antfly.metadata_api.MetadataClusterIncarnation, budget: ?antfly.metadata_http_client.RequestBudget) !void {
+        try self.lockWithBudget(&self.cache_mutex, budget);
+        defer self.cache_mutex.unlock();
+        const incarnation = try requireValidMetadataIncarnation(candidate);
+        try self.acceptMetadataIdentityLocked(metadata_group_id, incarnation);
+    }
+
     fn acceptMetadataIdentity(
         self: *RemoteMetadataSource,
         metadata_group_id: u64,
@@ -20649,7 +20664,7 @@ const RemoteMetadataSource = struct {
     ) !antfly.metadata_api.MetadataHead {
         try ensureBudgetActive(budget);
         const now_ms = self.awakeMs();
-        lockAtomic(&self.cache_mutex);
+        try self.lockWithBudget(&self.cache_mutex, budget);
         const observed_fence_generation = self.snapshot_fence_generation;
         if (@import("builtin").is_test) {
             if (self.test_faults.fetch_head_mismatches_remaining > 0) {
@@ -20671,7 +20686,7 @@ const RemoteMetadataSource = struct {
         self.cache_mutex.unlock();
 
         const head = try self.fetchRemoteHead(budget);
-        lockAtomic(&self.cache_mutex);
+        try self.lockWithBudget(&self.cache_mutex, budget);
         defer self.cache_mutex.unlock();
         if (self.snapshot_fence_generation != observed_fence_generation)
             return error.MetadataSnapshotHeadMismatch;
@@ -20756,19 +20771,44 @@ const RemoteMetadataSource = struct {
         self: *RemoteMetadataSource,
         budget: antfly.metadata_http_client.RequestBudget,
     ) !antfly.metadata_api.AdminSnapshot {
+        return self.fetchSnapshotResult(.snapshot, budget);
+    }
+
+    const SnapshotResultKind = enum { snapshot, peers };
+    fn SnapshotResult(comptime kind: SnapshotResultKind) type {
+        return if (kind == .snapshot) antfly.metadata_api.AdminSnapshot else *ReadPeerRouting;
+    }
+
+    fn snapshotResultLocked(self: *RemoteMetadataSource, comptime kind: SnapshotResultKind) !SnapshotResult(kind) {
+        if (kind == .snapshot) {
+            if (@import("builtin").is_test) self.test_faults.snapshot_result_clones += 1;
+            return try cloneAdminSnapshotOwned(self.alloc, self.cached_snapshot.?);
+        }
+        return (self.read_peer_routing orelse return error.MetadataSnapshotHeadMismatch).retain();
+    }
+
+    fn lockWithBudget(self: *RemoteMetadataSource, mutex: *std.atomic.Mutex, budget: ?antfly.metadata_http_client.RequestBudget) !void {
+        while (true) {
+            try ensureBudgetActive(budget);
+            if (mutex.tryLock()) return;
+            try self.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    fn fetchSnapshotResult(self: *RemoteMetadataSource, comptime kind: SnapshotResultKind, budget: antfly.metadata_http_client.RequestBudget) !SnapshotResult(kind) {
         try ensureBudgetActive(budget);
         const now_ms = self.awakeMs();
-        lockAtomic(&self.cache_mutex);
-        if (self.cached_snapshot) |snapshot| {
+        try self.lockWithBudget(&self.cache_mutex, budget);
+        if (self.cached_snapshot != null) {
             const force_cache_miss = if (@import("builtin").is_test)
                 self.test_faults.force_snapshot_cache_miss
             else
                 false;
             if (!force_cache_miss and
-                now_ms -| self.cached_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms)
+                now_ms -| (if (kind == .peers) self.read_peer_routing_at_ms else self.cached_snapshot_at_ms) <= metadata_snapshot_cache_ttl_ms)
             {
                 defer self.cache_mutex.unlock();
-                return try cloneAdminSnapshotOwned(self.alloc, snapshot);
+                return self.snapshotResultLocked(kind);
             }
         }
         self.cache_mutex.unlock();
@@ -20782,7 +20822,7 @@ const RemoteMetadataSource = struct {
                 if (err == error.MetadataSnapshotHeadMismatch) continue;
                 return err;
             };
-            return self.fetchSnapshotForHeadWithBudget(head, budget) catch |err| {
+            return self.fetchSnapshotForHeadResult(kind, head, budget) catch |err| {
                 if (err == error.MetadataSnapshotHeadMismatch) continue;
                 return err;
             };
@@ -20810,17 +20850,17 @@ const RemoteMetadataSource = struct {
         head: antfly.metadata_api.MetadataHead,
         budget: ?antfly.metadata_http_client.RequestBudget,
     ) !antfly.metadata_api.AdminSnapshot {
+        return self.fetchSnapshotForHeadResult(.snapshot, head, budget);
+    }
+
+    fn fetchSnapshotForHeadResult(self: *RemoteMetadataSource, comptime kind: SnapshotResultKind, head: antfly.metadata_api.MetadataHead, budget: ?antfly.metadata_http_client.RequestBudget) !SnapshotResult(kind) {
         // Coalesce concurrent control-plane cache misses. Waiting callers keep
         // their own deadline/cancellation and recheck the published generation;
         // authoritative reads retain their separate fencing semantics.
-        while (true) {
-            try ensureBudgetActive(budget);
-            if (self.snapshot_refresh_mutex.tryLock()) break;
-            try self.io.sleep(.fromMilliseconds(1), .awake);
-        }
+        try self.lockWithBudget(&self.snapshot_refresh_mutex, budget);
         defer self.snapshot_refresh_mutex.unlock();
         const now_ms = self.awakeMs();
-        lockAtomic(&self.cache_mutex);
+        try self.lockWithBudget(&self.cache_mutex, budget);
         if (self.cached_head) |current_head| {
             if (!std.meta.eql(current_head, head)) {
                 self.cache_mutex.unlock();
@@ -20833,21 +20873,25 @@ const RemoteMetadataSource = struct {
             if (self.cached_head != null and
                 std.meta.eql(self.cached_head.?, head) and
                 sameMetadataIncarnation(cached_snapshot_head, head) and
-                now_ms -| self.cached_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms)
+                now_ms -| (if (kind == .peers) self.read_peer_routing_at_ms else self.cached_snapshot_at_ms) <= metadata_snapshot_cache_ttl_ms)
             {
                 defer self.cache_mutex.unlock();
-                return try cloneAdminSnapshotOwned(self.alloc, snapshot);
+                return self.snapshotResultLocked(kind);
             }
         }
         self.cache_mutex.unlock();
 
         const fresh = try self.fetchSnapshotRemoteWithBudget(head, budget);
-        return self.acceptObservedSnapshot(fresh, head, observed_fence_generation, now_ms);
+        return self.acceptObservedSnapshotResult(kind, fresh, head, observed_fence_generation, now_ms, budget);
     }
 
     /// Takes ownership of the remote observation whether it is published,
     /// superseded by a fence, or rejected after mutation invalidation.
     fn acceptObservedSnapshot(self: *RemoteMetadataSource, incoming: antfly.metadata_api.AdminSnapshot, head: antfly.metadata_api.MetadataHead, observed_fence_generation: u64, now_ms: u64) !antfly.metadata_api.AdminSnapshot {
+        return self.acceptObservedSnapshotResult(.snapshot, incoming, head, observed_fence_generation, now_ms, null);
+    }
+
+    fn acceptObservedSnapshotResult(self: *RemoteMetadataSource, comptime kind: SnapshotResultKind, incoming: antfly.metadata_api.AdminSnapshot, head: antfly.metadata_api.MetadataHead, observed_fence_generation: u64, now_ms: u64, budget: ?antfly.metadata_http_client.RequestBudget) !SnapshotResult(kind) {
         var fresh = incoming;
         var fresh_owned = true;
         defer if (fresh_owned) freeAdminSnapshotOwned(self.alloc, &fresh);
@@ -20855,12 +20899,16 @@ const RemoteMetadataSource = struct {
         const peers = try ReadPeerRouting.create(self.alloc, incoming);
         var published = false;
         defer if (!published) peers.release();
-        lockAtomic(&self.cache_mutex);
+        var retired_snapshot: ?antfly.metadata_api.AdminSnapshot = null;
+        var retired_peers: ?*ReadPeerRouting = null;
+        defer if (retired_snapshot) |*old| freeAdminSnapshotOwned(self.alloc, old);
+        defer if (retired_peers) |old| old.release();
+        try self.lockWithBudget(&self.cache_mutex, budget);
         defer self.cache_mutex.unlock();
         // A fenced snapshot or mutation invalidation completed during I/O.
         // Never let the older in-flight request overwrite that transition.
         if (self.snapshot_fence_generation != observed_fence_generation) {
-            if (self.cached_snapshot) |snapshot| return try cloneAdminSnapshotOwned(self.alloc, snapshot);
+            if (self.cached_snapshot != null) return self.snapshotResultLocked(kind);
             return error.MetadataSnapshotHeadMismatch;
         }
         if (self.cached_head) |current_head| {
@@ -20870,9 +20918,9 @@ const RemoteMetadataSource = struct {
         // establish which peer has the newer catalog. The generation above
         // fences concurrent authoritative reads and mutations. Observations
         // remain non-authoritative for placement changes and name retirement.
-        if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
+        retired_snapshot = self.cached_snapshot;
         self.cached_snapshot = fresh;
-        if (self.read_peer_routing) |old| old.release();
+        retired_peers = self.read_peer_routing;
         self.read_peer_routing = peers;
         self.read_peer_routing_at_ms = self.awakeMs();
         published = true;
@@ -20880,7 +20928,7 @@ const RemoteMetadataSource = struct {
         self.cached_head = head;
         self.cached_head_at_ms = now_ms;
         self.cached_snapshot_at_ms = now_ms;
-        return try cloneAdminSnapshotOwned(self.alloc, self.cached_snapshot.?);
+        return self.snapshotResultLocked(kind);
     }
 
     fn catalogSource(self: *RemoteMetadataSource) antfly.public_api.table_catalog.CatalogSource {
@@ -21279,7 +21327,7 @@ const RemoteMetadataSource = struct {
     ) !antfly.metadata_api.MetadataHead {
         var last_err: anyerror = error.MissingMetadataApi;
         for (0..self.base_uris.len) |attempt| {
-            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const index = try self.metadataReadApiIndexForAttemptWithBudget(attempt, budget);
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
@@ -21289,11 +21337,11 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.acceptMetadataIdentity(head.metadata_group_id, head.metadata_incarnation) catch |err| {
+            self.acceptMetadataIdentityWithBudget(head.metadata_group_id, head.metadata_incarnation, budget) catch |err| {
                 last_err = err;
                 continue;
             };
-            self.noteMetadataReadSuccess(index);
+            try self.noteMetadataReadSuccessWithBudget(index, budget);
             return head;
         }
         return last_err;
@@ -21336,7 +21384,7 @@ const RemoteMetadataSource = struct {
     ) !antfly.metadata_api.AdminSnapshot {
         var last_err: anyerror = error.MissingMetadataApi;
         for (0..self.base_uris.len) |attempt| {
-            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const index = try self.metadataReadApiIndexForAttemptWithBudget(attempt, budget);
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
@@ -21347,9 +21395,10 @@ const RemoteMetadataSource = struct {
                 continue;
             };
             defer parsed.deinit();
-            self.acceptMetadataIdentity(
+            self.acceptMetadataIdentityWithBudget(
                 parsed.value.status.metadata_group_id,
                 parsed.value.status.metadata_incarnation,
+                budget,
             ) catch |err| {
                 last_err = err;
                 continue;
@@ -21362,7 +21411,7 @@ const RemoteMetadataSource = struct {
                 last_err = error.MetadataSnapshotHeadMismatch;
                 continue;
             }
-            self.noteMetadataReadSuccess(index);
+            try self.noteMetadataReadSuccessWithBudget(index, budget);
             return try cloneAdminSnapshotOwned(self.alloc, parsed.value);
         }
         return last_err;
@@ -21372,26 +21421,31 @@ const RemoteMetadataSource = struct {
         return remoteSystemCatalog(ptr, alloc, .{}, .export_snapshot);
     }
 
-    fn cachedReadPeerRouting(self: *RemoteMetadataSource, deadline_ns: u64) !?*ReadPeerRouting {
-        if (!self.lockBefore(&self.cache_mutex, deadline_ns)) return error.Timeout;
+    fn cachedReadPeerRouting(self: *RemoteMetadataSource, budget: antfly.metadata_http_client.RequestBudget) !?*ReadPeerRouting {
+        try self.lockWithBudget(&self.cache_mutex, budget);
         defer self.cache_mutex.unlock();
         if (self.awakeMs() -| self.read_peer_routing_at_ms > metadata_snapshot_cache_ttl_ms) return null;
         return if (self.read_peer_routing) |peers| peers.retain() else null;
     }
 
-    fn acquireReadPeerRouting(self: *RemoteMetadataSource) !*ReadPeerRouting {
-        const deadline_ns = self.awakeNs() +| remote_metadata_snapshot_timeout_ns;
-        if (try self.cachedReadPeerRouting(deadline_ns)) |peers| return peers;
-        // One bounded cold refresh feeds every lookup/fanout. Waiting readers
-        // retain their budget; they never compete for diagnostic transfer slots.
-        if (!self.lockBefore(&self.read_peer_refresh_mutex, deadline_ns)) return error.Timeout;
+    fn acquireReadPeerRouting(self: *RemoteMetadataSource, caller: antfly.public_api.table_router.RouteBudget) !*ReadPeerRouting {
+        try caller.check();
+        const clock = antfly.public_api.table_catalog.RoutingBudget.initIo(null, self.io);
+        const deadline_ns = @min(clock.deadlineFrom(caller.clock) orelse std.math.maxInt(u64), self.awakeNs() +| remote_metadata_snapshot_timeout_ns);
+        var cancellation = if (caller.cancellation) |token| antfly.common.http.http_common.RequestCancellation.fromToken(token) else antfly.common.http.http_common.RequestCancellation{};
+        const budget: antfly.metadata_http_client.RequestBudget = .{
+            .deadline_ns = deadline_ns,
+            .io = self.io,
+            .cancellation = if (caller.cancellation != null) &cancellation else null,
+        };
+        if (try self.cachedReadPeerRouting(budget)) |peers| return peers;
+        try self.lockWithBudget(&self.read_peer_refresh_mutex, budget);
         defer self.read_peer_refresh_mutex.unlock();
-        while (true) {
-            if (try self.cachedReadPeerRouting(deadline_ns)) |peers| return peers;
-            var snapshot = try self.fetchSnapshotWithBudget(.{ .deadline_ns = deadline_ns, .io = self.io });
-            freeAdminSnapshotOwned(self.alloc, &snapshot);
-            if (self.awakeNs() >= deadline_ns) return error.Timeout;
-        }
+        if (try self.cachedReadPeerRouting(budget)) |peers| return peers;
+        // Publish the control snapshot once and retain only its peer index.
+        // No full snapshot clone, or discarded table/schema allocation, is
+        // needed for endpoint discovery.
+        return self.fetchSnapshotResult(.peers, budget);
     }
 
     fn cachedDiagnosticSnapshot(self: *RemoteMetadataSource) !?antfly.metadata_api.AdminSnapshot {
@@ -26567,7 +26621,12 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 const parsed = try std.json.parseFromSlice(catalog.Call, response_alloc, request.body, .{});
                 defer parsed.deinit();
                 const body = switch (parsed.value) {
-                    .read, .list_tables, .export_snapshot, .table_status, .write_validation, .write_validation_revision => return error.UnexpectedCatalogRead,
+                    .read, .list_tables, .export_snapshot, .table_status => return error.UnexpectedCatalogRead,
+                    .write_validation_revision => try std.json.Stringify.valueAlloc(response_alloc, RemoteMetadataSource.snapshotHead(snapshot), .{}),
+                    .write_validation => |name| blk: {
+                        const table = antfly.public_api.tables.findTableByName(snapshot, name) orelse return .{ .status = 404 };
+                        break :blk try std.json.Stringify.valueAlloc(response_alloc, @import("../system_catalog/projection.zig").WriteValidation{ .schema_json = table.schema_json }, .{});
+                    },
                     .snapshot => try std.json.Stringify.valueAlloc(response_alloc, catalog.State{ .revision = snapshot.status.metadata_epoch }, .{}),
                     .resolve => |target| try std.json.Stringify.valueAlloc(response_alloc, resolve(snapshot, target), .{}),
                     .resolve_many => |input| blk: {
@@ -26951,7 +27010,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             return null;
         }
 
-        fn groupNodeIds(_: *anyopaque, candidate_alloc: std.mem.Allocator, _: u64) ![]u64 {
+        fn groupNodeIds(_: *anyopaque, candidate_alloc: std.mem.Allocator, _: u64, _: antfly.public_api.table_router.RouteBudget) ![]u64 {
             return try candidate_alloc.dupe(u64, &.{ 1, 2, 3 });
         }
 
@@ -26967,7 +27026,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             return try uri_alloc.dupe(u8, self.api_uris[node_id - 1]);
         }
 
-        fn nodeBaseUriForGroup(ptr: *anyopaque, uri_alloc: std.mem.Allocator, _: u64, node_id: u64) !?[]u8 {
+        fn nodeBaseUriForGroup(ptr: *anyopaque, uri_alloc: std.mem.Allocator, _: u64, node_id: u64, _: antfly.public_api.table_router.RouteBudget) !?[]u8 {
             return try nodeBaseUri(ptr, uri_alloc, node_id);
         }
 
@@ -37234,6 +37293,120 @@ fn consumerTests() type {
             try std.testing.expect(!server.backgroundMaintenanceDue(99));
         }
 
+        test "system catalog peer publication avoids schema copies workload" {
+            const alloc = std.testing.allocator;
+            const benchmark = std.c.getenv("ANTFLY_CATALOG_PEER_REFRESH_BENCH") != null;
+            const count: usize = if (benchmark) 1000 else 16;
+            const schema_bytes: usize = if (benchmark) 8192 else 128;
+            const schema = try alloc.alloc(u8, schema_bytes);
+            defer alloc.free(schema);
+            @memset(schema, ' ');
+            @memcpy(schema[0..2], "{}");
+            const tables = try alloc.alloc(antfly.metadata.table_manager.TableRecord, count);
+            defer alloc.free(tables);
+            const placements = try alloc.alloc(antfly.raft.PlacementIntent, count);
+            defer alloc.free(placements);
+            for (tables, placements, 0..) |*table, *placement, i| {
+                table.* = .{ .table_id = i + 1, .name = "tenant", .schema_json = schema };
+                placement.* = .{ .store_id = 10, .record = .{ .group_id = i + 100, .replica_id = 1, .local_node_id = 1 }, .serving_state = .serving };
+            }
+            var stores = [_]antfly.metadata.StoreRecord{.{ .store_id = 10, .node_id = 1, .api_url = "http://data", .health_class = "healthy", .live = true }};
+            const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 9, .metadata_incarnation = "11111111111111111111111111111111".*, .metrics = .{} },
+                .tables = tables,
+                .ranges = &.{},
+                .stores = &stores,
+                .placement_intents = placements,
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+            var backend = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+            defer backend.deinit();
+            var source = try RemoteMetadataSource.init(alloc, &.{"http://metadata.invalid"}, backend.ptr().apiIoImpl().?);
+            defer source.deinit();
+            var copied_ns: [7]u64 = @splat(0);
+            var retained_ns: [7]u64 = @splat(0);
+            for (0..if (benchmark) @as(usize, 8) else 1) |sample| {
+                // Remote decode/ownership construction is outside both timings.
+                // Compare only publication plus the caller's requested result.
+                inline for (.{ RemoteMetadataSource.SnapshotResultKind.snapshot, .peers }) |kind| {
+                    const incoming = try cloneAdminSnapshotOwned(alloc, snapshot);
+                    const started = platform_time.monotonicNs();
+                    const result = try source.acceptObservedSnapshotResult(kind, incoming, RemoteMetadataSource.snapshotHead(&snapshot), source.snapshot_fence_generation, source.awakeMs(), null);
+                    const elapsed = platform_time.monotonicNs() - started;
+                    if (kind == .snapshot) {
+                        var owned = result;
+                        try std.testing.expectEqual(count, owned.tables.len);
+                        freeAdminSnapshotOwned(alloc, &owned);
+                        if (sample > 0) copied_ns[sample - 1] = elapsed;
+                    } else {
+                        try std.testing.expectEqual(count, result.groups.count());
+                        result.release();
+                        if (sample > 0) retained_ns[sample - 1] = elapsed;
+                    }
+                }
+            }
+            if (benchmark) std.debug.print("READ_PEER_PUBLICATION_BENCH tables={d} schema_bytes={d} copied_ns={any} retained_ns={any}\n", .{ count, schema_bytes, copied_ns, retained_ns });
+        }
+
+        test "system catalog read peer routing honors expired and canceled admission budgets" {
+            const alloc = std.testing.allocator;
+            var backend = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+            defer backend.deinit();
+            var source = try RemoteMetadataSource.init(alloc, &.{"http://metadata.invalid"}, backend.ptr().apiIoImpl().?);
+            defer source.deinit();
+            source.test_faults.fetch_head_error = error.UnexpectedCatalogRead;
+            const RouteBudget = antfly.public_api.table_router.RouteBudget;
+            try std.testing.expectError(error.Timeout, source.acquireReadPeerRouting(.{ .clock = .{ .deadline_ns = 0 } }));
+            const Cancel = struct {
+                checks: usize = 0,
+                fn check(ptr: *const anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+                    self.checks += 1;
+                    return self.checks >= 4;
+                }
+            };
+            var cancel = Cancel{};
+            const token: antfly.public_api.table_router.RouteBudget = .{ .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check } };
+            // Force queued admission. The cancellation becomes visible while
+            // waiting, without relying on scheduler timing or network access.
+            lockAtomic(&source.read_peer_refresh_mutex);
+            try std.testing.expectError(error.Cancelled, source.acquireReadPeerRouting(token));
+            source.read_peer_refresh_mutex.unlock();
+            try std.testing.expect(cancel.checks >= 4);
+            lockAtomic(&source.cache_mutex);
+            const expires: RouteBudget = .{ .clock = antfly.public_api.table_catalog.RoutingBudget.initIo(source.awakeNs() + std.time.ns_per_ms, source.io) };
+            try std.testing.expectError(error.Timeout, source.acquireReadPeerRouting(expires));
+            source.cache_mutex.unlock();
+        }
+
+        test "system catalog read peer refresh forwards cancellation and remaining transport budget" {
+            const alloc = std.testing.allocator;
+            const Fake = struct {
+                canceled: std.atomic.Value(bool) = .init(false),
+                calls: usize = 0,
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expect(request.timeout_ms.? <= 250);
+                    try std.testing.expect(request.cancellation != null);
+                    try std.testing.expect(!request.cancellation.?.isCancelled());
+                    self.canceled.store(true, .release);
+                    try std.testing.expect(request.cancellation.?.isCancelled());
+                    return error.Cancelled;
+                }
+            };
+            var fake = Fake{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
+            try std.testing.expectError(error.Cancelled, source.acquireReadPeerRouting(.{
+                .clock = .{ .deadline_ns = platform_time.monotonicNs() + 250 * std.time.ns_per_ms },
+                .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&fake.canceled),
+            }));
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            try std.testing.expect(source.read_peer_routing == null);
+        }
+
         test "system catalog read peer routing retains healthy relocation views across publication and invalidation" {
             const alloc = std.testing.allocator;
             var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
@@ -37282,11 +37455,11 @@ fn consumerTests() type {
             // Slow control capture must not publish an already-expired peer
             // view and force every waiting reader through another refresh.
             source.cached_snapshot_at_ms = 0;
-            const published = (try source.cachedReadPeerRouting(source.awakeNs() + std.time.ns_per_s)).?;
+            const published = (try source.cachedReadPeerRouting(.{ .deadline_ns = source.awakeNs() + std.time.ns_per_s, .io = source.io })).?;
             published.release();
-            const retained = try source.acquireReadPeerRouting();
+            const retained = try source.acquireReadPeerRouting(.{});
             defer retained.release();
-            const second_reader = try source.acquireReadPeerRouting();
+            const second_reader = try source.acquireReadPeerRouting(.{});
             try std.testing.expect(retained == second_reader);
             second_reader.release();
             var server: DataServer = undefined;
@@ -37309,13 +37482,24 @@ fn consumerTests() type {
             stores[1].api_url = "http://restarted";
             const replacement = try cloneAdminSnapshotOwned(alloc, snapshot);
             try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(replacement, source.beginLinearizableSnapshot()));
-            const latest = try source.acquireReadPeerRouting();
+            const latest = try source.acquireReadPeerRouting(.{});
             defer latest.release();
             try std.testing.expectEqualStrings("http://restarted", latest.nodes.get(2).?);
             try std.testing.expectEqualStrings("http://new", retained.nodes.get(2).?);
             source.invalidateCache();
             try std.testing.expect(source.read_peer_routing == null);
             try std.testing.expectEqualStrings("http://restarted", latest.nodes.get(2).?);
+            const clone_count = source.test_faults.snapshot_result_clones;
+            const observed = try cloneAdminSnapshotOwned(alloc, snapshot);
+            const head = RemoteMetadataSource.snapshotHead(&observed);
+            const refreshed = try source.acceptObservedSnapshotResult(.peers, observed, head, source.snapshot_fence_generation, source.awakeMs(), null);
+            defer refreshed.release();
+            try std.testing.expectEqualStrings("http://restarted", refreshed.nodes.get(2).?);
+            try std.testing.expectEqual(clone_count, source.test_faults.snapshot_result_clones);
+            const cached = try source.fetchSnapshotResult(.peers, .{ .deadline_ns = source.awakeNs() + std.time.ns_per_s, .io = source.io });
+            defer cached.release();
+            try std.testing.expect(cached == refreshed);
+            try std.testing.expectEqual(clone_count, source.test_faults.snapshot_result_clones);
         }
 
         test "remote metadata source pins one cluster incarnation across cache invalidation" {

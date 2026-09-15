@@ -944,6 +944,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api http client preserves group doc identity conflicts",
             "api http client transports txn resolve cancellation and visibility reason",
             "resolve group routes uses one router-owned snapshot callback for fanout",
+            "system catalog parallel hosted candidate fanout sends only owned keys",
             "api http client preserves public batch retry safety classifications",
             "api http client forwards bounded raft batch routing context without allocation",
             "api http client preserves committed visibility outcomes for forwarded raft batches",
@@ -1114,6 +1115,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned table read source falls back from read_index to stale on not leader",
             "catalog backed router skips non-serving relocation placements",
             "resolve group routes uses one router-owned snapshot callback for fanout",
+            "system catalog parallel hosted candidate fanout sends only owned keys",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

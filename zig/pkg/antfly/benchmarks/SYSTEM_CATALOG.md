@@ -594,3 +594,24 @@ record a coordinator that has no placement for the target table. This makes remo
 endpoint discovery an explicit part of the workload instead of depending on where
 the last-created shard happens to land. Provisioning and membership observation
 remain outside the measured operations.
+
+For sustained routing-cache qualification, add `--lookup-seconds 30` (or longer)
+to the cluster catalog workload with `--catalog-ingress nonmember`. The concurrent
+phase continues until both the minimum duration and per-client `--samples` count
+are satisfied. This covers repeated one-second peer-view refreshes. Run the same
+configuration against both binaries, retain per-request timing records, and keep
+cluster provisioning outside measured work. Short sample-count-only runs do not
+qualify sustained refresh tails.
+
+To measure distributed query and join fanout, use `--catalog-shards 8` with
+`--table-counts 10 --deployment cluster`. Keep `--catalog-ingress first` for this
+case: shards may occupy every data node, so an entirely nonmember coordinator
+may not exist. The qualified query and join scenarios validate the returned
+results while exercising local and remote shard destinations.
+
+The component workload `system catalog peer publication avoids schema copies
+workload` can be run with `ANTFLY_CATALOG_PEER_REFRESH_BENCH=1`. It compares owned
+snapshot results with retained peer results at publication, using 1,000 tables
+with 8 KiB schema payloads. Incoming snapshot construction is excluded from both
+measurements. This isolates publication/result-copy cost; it is not an end-to-end
+network or throughput benchmark.
