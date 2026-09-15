@@ -424,6 +424,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.HAReadRequiresPrimary => status(.unavailable, .ha_read_requires_primary),
         error.HAReadWaitForApply => status(.retryable, .ha_read_wait_for_apply),
         error.HAReadWaitForMetadata => status(.retryable, .ha_read_wait_for_metadata),
+        error.StorageBusy => status(.retryable, .storage_busy),
         error.StorageReadTemporarilyUnavailable => status(.retryable, .storage_read_temporarily_unavailable),
         error.PersistentDescriptorAdmissionExhausted => status(.retryable, .persistent_descriptor_admission_exhausted),
         error.ResourceRequestTooLarge => status(.invalid_argument, .resource_request_too_large),
@@ -709,7 +710,6 @@ pub fn statusFromError(err: anyerror) Status {
         error.ImmutableTableStorageSettings => status(.conflict, .immutable_table_storage_settings),
         error.VectorStoreLifecycleUnsupported => status(.unsupported, .vector_store_lifecycle_unsupported),
         error.VectorStoreReferenceFormatRequired => status(.unsupported, .vector_store_reference_format_required),
-        error.StorageBusy => status(.retryable, .storage_busy),
         error.StorageKernelFailure => status(.internal, .storage_kernel_failure),
         else => status(.internal, .none),
     };
@@ -799,6 +799,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .write_unavailable => "WriteUnavailable",
         .read_unavailable => "ReadUnavailable",
         .read_requires_primary => "ReadRequiresPrimary",
+        .storage_busy => "StorageBusy",
         .storage_read_temporarily_unavailable => "StorageReadTemporarilyUnavailable",
         .resource_request_too_large => "ResourceRequestTooLarge",
         .resource_temporarily_unavailable => "ResourceTemporarilyUnavailable",
@@ -1069,7 +1070,6 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .provider_quota_registry_full => "ProviderQuotaRegistryFull",
         .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
         .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
-        .storage_busy => "StorageBusy",
         .storage_kernel_failure => "StorageKernelFailure",
     };
 }
@@ -1225,4 +1225,11 @@ test "ambiguous backup outcome survives runtime transport without rollback autho
     const wire = statusFromError(error.BackupOutcomeAmbiguous);
     try std.testing.expectEqual(@intFromEnum(Code.conflict), wire.code);
     try std.testing.expectEqual(error.BackupOutcomeAmbiguous, errorFromStatus(wire));
+}
+
+test "storage owner contention retains retryability and exact identity" {
+    const wire = statusFromError(error.StorageBusy);
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), wire.code);
+    try std.testing.expect(errorHasStableDetail(error.StorageBusy));
+    try std.testing.expectEqual(error.StorageBusy, errorFromStatus(wire));
 }

@@ -88,8 +88,14 @@ fn executeSearch(
         return fail(err, executeOperation(request.dialect), out_failure);
 
     // Capture the token and result under the same DB read lease.
-    const captured = db.searchWithCapturedRequest(alloc, owned.req) catch |err|
-        return fail(err, executeOperation(request.dialect), out_failure);
+    const captured: db_mod.SearchWithDenseProfileResult = if (owned.req.profile)
+        db.searchWithDenseProfile(alloc, owned.req) catch |err|
+            return fail(err, executeOperation(request.dialect), out_failure)
+    else blk: {
+        const unprofiled = db.searchWithCapturedRequest(alloc, owned.req) catch |err|
+            return fail(err, executeOperation(request.dialect), out_failure);
+        break :blk .{ .request = unprofiled.request, .result = unprofiled.result };
+    };
     var result = captured.result;
     defer result.deinit();
     @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err|
@@ -99,7 +105,10 @@ fn executeSearch(
         alloc,
         table_name,
         captured.request,
-        .{},
+        .{ .dense_search = if (captured.dense_profile) |profile|
+            @import("../api/dense_search_profile.zig").fromStorage(profile)
+        else
+            null },
         result,
     ) catch |err| return fail(err, encodeOperation(request.dialect), out_failure);
     @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err| {

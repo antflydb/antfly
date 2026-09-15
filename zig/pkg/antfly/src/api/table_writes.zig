@@ -6268,7 +6268,7 @@ pub const BoundTableWriteSource = struct {
         const db = try self.activeDb();
 
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-        try db.configureTableStorage(req.storage);
+        try db.configureTableStorage(req.storage orelse db.table_storage);
         const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
         const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, raw_indexes_json, schema_json);
         defer alloc.free(expanded_indexes_json);
@@ -14605,18 +14605,36 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
+            const busy_result = StartupCatchUpResult{
+                .had_debt = true,
+                .busy = true,
+                .index_repair_pending = metadata.advance_index_repairs,
+            };
+            self.invalidateRepairHandoffOwnerAuditBestEffort(table_name, group_id);
+            if (!self.tryBeginStartupCatchUpGroupOperation(table_name, group_id, metadata.advance_index_repairs)) {
+                return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
+            }
+            defer self.endGroupOperation(table_name, group_id);
             const publication_token = if (self.runtime_status_cache) |snapshot_cache|
                 try snapshot_cache.capturePublicationToken(table_name)
             else
                 null;
-            var observation = (try local_source.reconcileTableGroupLocalTransientObserved(
+            var observation = (try local_source.reconcileTableGroupLocalObserved(
                 alloc,
                 group_id,
                 table_name,
                 metadata.target_index_name,
                 metadata.advance_index_repairs,
+                false,
             )) orelse return error.StorageKernelOwnerUnavailable;
             defer observation.deinit(alloc);
+            if (observation.result.state == .busy) {
+                // The compiled owner has a separate admission fence. Keep the
+                // exact retry key when it yields, just as for group contention.
+                // Admission above clears the prior key so a stale scheduler
+                // snapshot cannot retire a newly deferred attempt.
+                return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
+            }
             if (publication_token) |token| {
                 if (observation.runtime_status) |status| {
                     _ = publishRuntimeStatusGroupAfterObservation(
@@ -15537,52 +15555,52 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
-    pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
+    pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !@import("../storage/posting_refresh_progress.zig").Progress {
         if (comptime control_only_storage_sources) {
-            const maintenance_source = self.storage_maintenance_source orelse return 0;
+            const maintenance_source = self.storage_maintenance_source orelse return .{};
             return try maintenance_source.runDensePostingRound();
         }
-        if (!self.local_db_mutex.tryLock()) return 0;
+        if (!self.local_db_mutex.tryLock()) return .{ .pending = true };
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
         var lease_alloc: std.mem.Allocator = std.heap.page_allocator;
         defer {
             for (leases.items) |*lease| lease.deinit(lease_alloc);
             leases.deinit(lease_alloc);
         }
+        var total: @import("../storage/posting_refresh_progress.zig").Progress = .{};
         {
             defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return 0;
+            const cache = self.write_cache orelse return .{};
             lease_alloc = cache.alloc;
             for (cache.entries.items) |entry| {
-                if (entry.bulk_ingest_session_open) continue;
-                if (entry.db.hasActiveDenseBulkWork()) continue;
+                if (entry.bulk_ingest_session_open or entry.db.hasActiveDenseBulkWork()) {
+                    total.pending = true;
+                    continue;
+                }
                 try cache.appendMaintenanceLease(&leases, entry);
             }
         }
-        var total_steps: usize = 0;
         for (leases.items) |lease| {
-            // A dependency chain can expose only one newly repairable posting
-            // per transaction. One pass per one-second timer wake made a
-            // settled 50K load spend minutes at 99.9% readiness even though
-            // each repair itself took little CPU. Drain a bounded burst while
-            // releasing the DB apply fence between passes. Foreground work can
-            // therefore become visible to shouldDeferOptionalPostingMaintenance
-            // on the next pass, while an idle corpus advances up to 64 links or
-            // 50 ms per wake instead of one.
+            // Release the apply fence between resumable pages. Count scanning
+            // as progress, and retain deferral separately from a clean sweep.
             const burst_start_ns = platform_time.monotonicNs();
             const max_passes: usize = 64;
             const max_elapsed_ns: u64 = 50 * std.time.ns_per_ms;
             var pass: usize = 0;
+            var pending = true;
             while (pass < max_passes and platform_time.monotonicNs() -| burst_start_ns < max_elapsed_ns) : (pass += 1) {
-                const progressed = lease.db.runDensePostingReadinessMaintenanceForIdle() catch |err| {
+                const page = lease.db.refreshDensePostingPayloadPageBestEffort() catch |err| {
                     std.log.warn("dense posting maintenance round failed: {}", .{err});
                     break;
                 };
-                total_steps += progressed;
-                if (progressed == 0) break;
+                total.repaired += page.repaired;
+                total.scanned += page.scanned;
+                pending = page.pending;
+                if (!pending or page.scanned == 0 or page.yield_after_page) break;
             }
+            total.pending = total.pending or pending;
         }
-        return total_steps;
+        return total;
     }
 
     pub fn runVectorBlockMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
@@ -19596,32 +19614,35 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            var observation = (try local_source.reconcileTableGroupLocalTransientObserved(
+            var observation = (try local_source.reconcileTableGroupLocalObserved(
                 alloc,
                 group_id,
                 table_name,
                 metadata.target_index_name,
                 false,
+                true,
             )) orelse return error.StorageKernelOwnerUnavailable;
             defer observation.deinit(alloc);
-            // The physical mutation alone cannot acknowledge an activation.
-            // Carry the observation sampled under the same exclusive owner
-            // lease into the existing catalog/root/target-fenced publisher.
-            // Busy observation retains the pending group for a later quantum.
-            const status = observation.runtime_status orelse return .busy;
-            try observations.append(alloc, .{
-                .status = status,
-                .opened_root_generation = status.metadata.lsm_root_generation,
-            });
-            observation.runtime_status = null;
-            const result = observation.result;
-            return switch (result.state) {
+            const outcome: StructuralReconcileGroupOutcome = switch (observation.result.state) {
                 .complete => .complete,
-                .repair_pending => .repair_pending,
-                .restore_repair_pending => .repair_pending,
-                .busy => .busy,
-                .degraded => error.StorageKernelReconcileDegraded,
+                .repair_pending, .restore_repair_pending => .repair_pending,
+                .busy => return .busy,
+                .degraded => return error.StorageKernelReconcileDegraded,
             };
+            // A successful reconcile is not a publication proof. Observe the
+            // same pinned owner before releasing it; if its nonblocking probe
+            // lost an apply race, retry without completing this plan group.
+            const status = observation.runtime_status orelse return .busy;
+            if (self.runtime_status_cache != null) {
+                std.debug.assert(observations.items.len < structural_reconcile_groups_per_quantum);
+                observations.appendAssumeCapacity(.{
+                    .status = status,
+                    .opened_root_generation = status.metadata.lsm_root_generation,
+                });
+                observation.runtime_status = null;
+            }
+            if (outcome == .repair_pending) self.ensureStructuralRepairHandoffStatus(table_name, group_id);
+            return outcome;
         }
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -20904,7 +20925,7 @@ pub const ProvisionedTableWriteSource = struct {
                         }
                         target_generations[group_index] = entry.lsm_root_generation;
                         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
-                        try cached.db.configureTableStorage(req.storage);
+                        try cached.db.configureTableStorage(req.storage orelse cached.db.table_storage);
                         try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                         // Catalog admission and local create can race an earlier
                         // startup/status open of this generation. The entry
@@ -21037,7 +21058,7 @@ pub const ProvisionedTableWriteSource = struct {
                 },
             );
             defer if (opened) |*db| db.close();
-            try opened.?.configureTableStorage(req.storage);
+            try opened.?.configureTableStorage(req.storage orelse opened.?.table_storage);
             try applyLocalTableSchemaJson(alloc, &opened.?, schema_json);
             // Register entity resolvers declared in the index config. Indexes
             // and enrichments are provisioned through the managed-open path, but
@@ -33100,6 +33121,117 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "compiled startup catch-up retains exact retries across owner contention" {
+            if (comptime !control_only_storage_sources) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            const Fake = struct {
+                busy: bool = true,
+                calls: usize = 0,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return error.UnexpectedBatch;
+                }
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: ?[]const u8, advance: bool, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(!advance and !retain);
+                    self.calls += 1;
+                    return .{ .result = .{ .state = if (self.busy) .busy else .complete } };
+                }
+            };
+            var fake = Fake{};
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-owner-catch-up", table_catalog.emptyCatalogSource());
+            defer source.deinit();
+            source.local_write_source = .{ .ptr = &fake, .vtable = &.{
+                .batch = Fake.batch,
+                .reconcile_table_group_local_observed = Fake.observe,
+            } };
+            const first = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{});
+            try std.testing.expect(first.busy and first.had_debt);
+            const old = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(old);
+            try std.testing.expectEqual(@as(usize, 1), old.len);
+            try std.testing.expect((try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{})).busy);
+            source.clearDeferredStartupCatchUpGroupIfUnchanged(old[0]);
+            const next = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(next);
+            try std.testing.expectEqual(@as(usize, 1), next.len);
+            try std.testing.expect(next[0].generation != old[0].generation);
+            fake.busy = false;
+            const complete = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{});
+            try std.testing.expect(!complete.busy and !complete.had_debt);
+            const cleared = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(cleared);
+            try std.testing.expectEqual(@as(usize, 0), cleared.len);
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+        }
+
+        test "compiled structural reconciliation publishes its owner observation and defers absent proof" {
+            if (comptime !control_only_storage_sources) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            const Fake = struct {
+                observed: bool = false,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return error.UnexpectedBatch;
+                }
+                fn reconcile(_: *anyopaque, _: u64, _: []const u8, _: ?[]const u8, _: bool) anyerror!?table_write_source.LocalStructuralReconcileResult {
+                    return .{ .state = .complete };
+                }
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, target: ?[]const u8, advance: bool, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table);
+                    try std.testing.expectEqualStrings("vec", target.?);
+                    try std.testing.expect(retain and !advance);
+                    return .{
+                        .result = .{ .state = .complete },
+                        .runtime_status = if (self.observed) .{
+                            .group_id = group,
+                            .stats = .{},
+                            .metadata = .{
+                                .lsm_root_generation = table_reads.backend_current_root_generation,
+                                .source = .live_writer_publish,
+                                .freshness = .fresh,
+                                .target_observation_revision = 123,
+                                .target_observation_complete = true,
+                            },
+                        } else null,
+                    };
+                }
+            };
+            var fake = Fake{};
+            var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-owner-structural-observation", table_catalog.emptyCatalogSource());
+            defer source.deinit();
+            source.runtime_status_cache = &cache;
+            source.local_write_source = .{ .ptr = &fake, .vtable = &.{
+                .batch = Fake.batch,
+                .reconcile_table_group_local = Fake.reconcile,
+                .reconcile_table_group_local_observed = Fake.observe,
+            } };
+            var observations = std.ArrayListUnmanaged(ProvisionedTableWriteSource.StructuralRuntimeObservation).empty;
+            defer {
+                for (observations.items) |*value| value.deinit(alloc);
+                observations.deinit(alloc);
+            }
+            try observations.ensureTotalCapacity(alloc, ProvisionedTableWriteSource.structural_reconcile_groups_per_quantum);
+            const metadata = StartupCatchUpMetadata{ .target_index_name = "vec" };
+            try std.testing.expectEqual(.busy, try source.reconcileTableGroupStructureWithRuntime(alloc, 7001, "docs", metadata, &observations));
+            try std.testing.expectEqual(@as(usize, 0), observations.items.len);
+            fake.observed = true;
+            source.reserveTargetedStructuralReconcileStatus("docs", "vec");
+            defer source.releaseTargetedStructuralReconcileStatus("docs", "vec");
+            try source.bindTargetedStructuralExpectation(alloc, "docs", "vec", "{}", &.{7001});
+            const token = try cache.capturePublicationToken("docs");
+            try std.testing.expectError(error.EmptyTargetedIndexObservation, publishStructuralRuntimeObservations(&source, "docs", "vec", token, observations.items, false));
+            try std.testing.expectEqual(.complete, try source.reconcileTableGroupStructureWithRuntime(alloc, 7001, "docs", metadata, &observations));
+            try std.testing.expectEqual(@as(usize, 1), observations.items.len);
+            try std.testing.expectEqual(@as(u64, 123), observations.items[0].status.metadata.target_observation_revision);
+            try publishStructuralRuntimeObservations(&source, "docs", "vec", token, observations.items, false);
+            var published = (try cache.snapshot(alloc, "docs")).?;
+            defer published.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), published.items.len);
+            try std.testing.expectEqual(@as(u64, 7001), published.items[0].group_id);
+        }
+
         test "graph metric group action envelope is typed and versioned" {
             const alloc = std.testing.allocator;
             const body = try graphMetricGroupActionBodyAlloc(alloc, "graph_idx", "pagerank", "refresh");

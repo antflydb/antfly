@@ -23,7 +23,8 @@ pub const Features = packed struct(u8) {
     arm_crc: bool = false,
     x86_crc: bool = false,
     pclmul: bool = false,
-    _reserved: u4 = 0,
+    sha256: bool = false,
+    _reserved: u3 = 0,
     initialized: bool = true,
 };
 
@@ -47,10 +48,11 @@ fn featuresCached(cache: *std.atomic.Value(u8)) Features {
 pub fn guaranteed() Features {
     if (comptime builtin.zig_backend == .stage2_c) return .{};
     return switch (builtin.cpu.arch) {
-        .aarch64 => .{ .arm_crc = builtin.cpu.has(.aarch64, .crc) },
+        .aarch64 => .{ .arm_crc = builtin.cpu.has(.aarch64, .crc), .sha256 = builtin.cpu.has(.aarch64, .sha2) },
         .x86_64 => .{
             .x86_crc = builtin.cpu.has(.x86, .crc32),
             .pclmul = builtin.cpu.has(.x86, .pclmul),
+            .sha256 = builtin.cpu.has(.x86, .sha),
         },
         else => .{},
     };
@@ -61,10 +63,17 @@ fn detect() Features {
     var result = guaranteed();
     switch (builtin.cpu.arch) {
         .aarch64 => switch (builtin.os.tag) {
-            .linux => result.arm_crc = result.arm_crc or fromArmHwcap(linuxHwcap()).arm_crc,
+            .linux => {
+                const detected = fromArmHwcap(linuxHwcap());
+                result.arm_crc = result.arm_crc or detected.arm_crc;
+                result.sha256 = result.sha256 or detected.sha256;
+            },
             // Every supported Apple Silicon macOS machine has ARM CRC, even
             // when the caller deliberately compiles with -mcpu=generic.
-            .macos => result.arm_crc = true,
+            .macos => {
+                result.arm_crc = true;
+                result.sha256 = true;
+            },
             else => {}, // Unsupported OS discovery retains the safe baseline.
         },
         .x86_64 => {
@@ -83,6 +92,26 @@ fn detect() Features {
             const native = fromX86Leaf1(ecx, edx);
             result.x86_crc = result.x86_crc or native.x86_crc;
             result.pclmul = result.pclmul or native.pclmul;
+            // SHA-NI uses baseline XMM state, without AVX or OSXSAVE.
+            asm volatile ("cpuid"
+                : [_] "={eax}" (eax),
+                  [_] "={ebx}" (ebx),
+                  [_] "={ecx}" (ecx),
+                  [_] "={edx}" (edx),
+                : [_] "{eax}" (@as(u32, 0)),
+                  [_] "{ecx}" (@as(u32, 0)),
+            );
+            if (eax >= 7) {
+                asm volatile ("cpuid"
+                    : [_] "={eax}" (eax),
+                      [_] "={ebx}" (ebx),
+                      [_] "={ecx}" (ecx),
+                      [_] "={edx}" (edx),
+                    : [_] "{eax}" (@as(u32, 7)),
+                      [_] "{ecx}" (@as(u32, 0)),
+                );
+                result.sha256 = result.sha256 or (ebx & (1 << 29) != 0);
+            }
         },
         else => {},
     }
@@ -103,7 +132,7 @@ fn linuxHwcap() usize {
 }
 
 fn fromArmHwcap(hwcap: usize) Features {
-    return .{ .arm_crc = hwcap & (1 << 7) != 0 }; // Linux AArch64 HWCAP_CRC32.
+    return .{ .arm_crc = hwcap & (1 << 7) != 0, .sha256 = hwcap & (1 << 6) != 0 }; // Linux AArch64 HWCAP_CRC32.
 }
 
 fn fromX86Leaf1(ecx: u32, edx: u32) Features {

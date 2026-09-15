@@ -14,6 +14,7 @@
 
 pub const provider_registry = @import("provider_registry.zig");
 pub const config = @import("config.zig");
+pub const table_storage = @import("table_storage.zig");
 pub const http = @import("http/mod.zig");
 pub const audio_runtime = @import("audio_runtime.zig");
 pub const secrets = @import("secrets.zig");
@@ -34,6 +35,7 @@ pub const threaded_connect_io = @import("threaded_connect_io.zig");
 test {
     _ = provider_registry;
     _ = config;
+    _ = table_storage;
     _ = http;
     _ = audio_runtime;
     _ = secrets;

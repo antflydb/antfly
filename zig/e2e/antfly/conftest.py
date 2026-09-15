@@ -3568,8 +3568,16 @@ def backup_api(request: pytest.FixtureRequest):
             num_shards: int = 1,
             description: str | None = None,
             indexes: dict[str, dict] | None = None,
+            storage: dict[str, str] | None = None,
         ) -> dict:
-            payload: dict[str, object] = {"num_shards": num_shards}
+            # Backup qualification still requires primary ownership until
+            # snapshots preserve source-vector reference closure.
+            payload: dict[str, object] = {
+                "num_shards": num_shards,
+                "storage": storage
+                if storage is not None
+                else {"dense_embeddings": "primary_lsm"},
+            }
             if description is not None:
                 payload["description"] = description
             if indexes is not None:
