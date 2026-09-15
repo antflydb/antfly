@@ -4,6 +4,48 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-15: runtime-bound apply locks delayed handoff by polling
+
+Review of #704 found that binding `ApplyRwLock` to the DB runtime selected
+50-microsecond to 1-millisecond sleeps, while unlock skipped the futex wake for
+bound locks. This affected ordinary native DBs as well as VOPR. A native
+ReleaseSafe handoff probe (30 fresh reader tasks, each parked behind a writer
+for two milliseconds) measured **617 microseconds average / 1,252 worst** from
+unlock to acquisition on `256bb99782`, versus 4 / 11 for the unbound native lock.
+These are local latency measurements, not production throughput estimates.
+
+Contended acquisition now captures the wake epoch before checking admission and
+parks on the owner's `std.Io` futex. Unlock advances the epoch and wakes that
+same runtime. Sequentially consistent waiter registration and epoch rechecking
+let uncontended unlock avoid the wake call without losing a concurrent waiter.
+The last priority reader signals unconditionally: checking a separate writer
+count could miss a concurrently registering writer on a weakly ordered CPU.
+DB apply and snapshot admission, plus HBC publication and cache locks, are bound
+before use. A caller's separate filesystem/request I/O lane cannot move the wait
+to a different scheduler. Writer intent, reader priority, and cancellation
+cleanup retain their existing admission rules.
+
+Backend task cancellation wakes its futex directly. Callback-only cancellation
+tokens lack wake registration, so their futex waits retain a one-millisecond
+cancellation recheck; unlock still wakes immediately. Dense-posting admission
+uses one absolute 50-millisecond deadline on the owning runtime clock, including
+VOPR, instead of polling the host clock. Timeout releases writer intent and the
+reader gate, leaving repair work pending.
+
+The deterministic regressions cover shared/exclusive handoff without advancing
+virtual time, an unlock between failed admission and parking, and deadline and
+callback cancellation after closing reader admission. The no-clock-advance
+regression fails against the old lock with `LockWaiterDidNotPark` and passes
+after the change. They run in
+`vopr-runtime-test` and production VOPR qualification. The native contention
+regression uses `std.Io.Group.concurrent` for both bound and unbound locks.
+The same handoff probe after the fix measured **6 microseconds average / 20 worst**
+for the bound lock (unbound: 7 / 29). Four snapshot admission tests pass. The
+14-test lock suite passed 200/200 fresh processes (2,800 test executions),
+including four million writes across the native bound/unbound exclusion test.
+`zig build vopr-runtime-test -Doptimize=ReleaseSafe -j1` also passes: 18
+storage/runtime adapter tests and seven DataServer tests, with no skips or leaks.
+
 ## 2026-09-15: multi-node Autograph promotion stalls with an untransportable read timeout
 
 [The base E2E shard](https://github.com/antflydb/antfly/actions/runs/34928784180/job/104259435053)
@@ -88,8 +130,14 @@ require that fence. The catalog regression holds each replay mutex in turn and
 requires an unchanged refresh to succeed while a changed refresh remains fenced.
 The compiled-owner suite passes all ten cases with no skips or leaks. The
 unchanged/changed resolver fence and both replay/reopen regressions also pass.
-Production validation of these additional fixes is pending; the 3/10 result
-is not a pass.
+The corrected production executable from `256bb99782` (SHA-256
+`58c637b81274785e5502f6f208fb45c2da90502295686e99c710b898ba54c99c`)
+passed ten restart probes and the full local 200-case Autograph soak: 100 normal
+and 100 under a 256-descriptor limit, with exactly 50 ordinary-resolution and
+50 data-restart cases per profile, zero failures/errors/skips, and the same
+executable hash after completion. These results precede the apply-lock handoff
+fix above; they do not qualify a later executable or establish the cause of the
+original CI read-timeout history.
 
 The E2E poller now stops on unexpected HTTP errors, including 500, instead of
 hiding them behind a generic promotion timeout. Only 503 with `Retry-After` and

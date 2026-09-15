@@ -4,8 +4,12 @@
 
 The first corrected local executable still failed 3/10 data-restart cases and
 exposed a promotion callback using a freed Raft service during shutdown. The
-compiled-owner shutdown barrier and resolver activation ordering are being
-corrected; production verification is pending. The restart test now rejects
+compiled-owner shutdown barrier and resolver activation ordering are corrected.
+Revision `256bb99782` passed ten restart probes and the full local 200-case
+Autograph soak: 100 normal and 100 descriptor-limited cases, with 50 ordinary
+and 50 restart cases per profile, zero failures/errors/skips, and an unchanged
+executable hash. This result precedes the subsequent apply-lock handoff fix;
+Linux CI and full VOPR qualification must validate the final revision. The restart test now rejects
 spontaneous assertion/segmentation crashes instead of silently replacing the
 process. See `../FLAKES.md` for exact executable hashes and evidence.
 

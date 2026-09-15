@@ -5907,6 +5907,8 @@ pub const DB = struct {
             errdefer db.deinitWrapperState(executor_ready);
             db.core.index_manager.setIo(db.backend_runtime.io());
             db.core.apply_mutex.io = db.backend_runtime.io();
+            db.core.snapshot_admission.lock.io = db.backend_runtime.io();
+            db.core.snapshot_replay_admission.lock.io = db.backend_runtime.io();
             db.core.index_manager.setPrimaryLsmBackend(db.core.primary_store_owner.lsmBackend());
             db.core.setIndexOpenParallelism(opts.index_open_parallelism);
             const init_async_started_ns = monotonicTimeNs();
@@ -28789,16 +28791,11 @@ pub const DB = struct {
         const admission_started = monotonicTimeNs();
         if (!self.core.tryLockApplyExclusive()) {
             const io = self.backend_runtime.io() orelse return .{ .pending = true, .scanned = scanned_page.scanned };
-            const Deadline = struct {
-                until_ns: u64,
-                pub fn isCancelled(token: @This()) bool {
-                    return monotonicTimeNs() >= token.until_ns;
-                }
-            };
-            self.core.apply_mutex.lockExclusiveIo(io, @as(?Deadline, .{
-                .until_ns = monotonicTimeNs() +| 50 * std.time.ns_per_ms,
+            self.core.apply_mutex.lockExclusiveDeadlineIo(io, .fromNow(io, .{
+                .raw = .fromMilliseconds(50),
+                .clock = .awake,
             })) catch |err| switch (err) {
-                error.Cancelled => return .{ .pending = true, .scanned = scanned_page.scanned },
+                error.Timeout => return .{ .pending = true, .scanned = scanned_page.scanned },
                 else => return err,
             };
         }
@@ -66548,6 +66545,8 @@ test "db apply fences wait through their borrowed runtime" {
     // Fail before attempting a blocking acquisition if DB.open loses ownership.
     try std.testing.expect(db.core.apply_mutex.io != null);
     try std.testing.expectEqual(io.userdata, db.core.apply_mutex.io.?.userdata);
+    try std.testing.expectEqual(io.userdata, db.core.snapshot_admission.lock.io.?.userdata);
+    try std.testing.expectEqual(io.userdata, db.core.snapshot_replay_admission.lock.io.?.userdata);
     const Work = struct {
         fn run(database: *DB, shared: bool, completed: *bool) !void {
             if (shared) {
@@ -66577,9 +66576,10 @@ test "db apply fences wait through their borrowed runtime" {
             _ = runtime_io.cancelAndDrainTasksForTeardown(alloc, 64) catch @panic("apply fence test cleanup failed");
             _ = future.cancel(io) catch {};
         }
+        const started_ns = std.Io.Clock.awake.now(io).nanoseconds;
         const scheduler = runtime_io.scheduler();
         for (0..16) |_| {
-            if (runtime_io.futureTaskSnapshot(future.any_future.?).?.sleep_deadline_ns != null) break;
+            if (runtime_io.futureTaskSnapshot(future.any_future.?).?.waiting_on_futex) break;
             enabled.items.clearRetainingCapacity();
             try scheduler.enumerateReady(&enabled, alloc);
             try enabled.canonicalize();
@@ -66587,13 +66587,9 @@ test "db apply fences wait through their borrowed runtime" {
             try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
         }
         try std.testing.expect(!completed);
-        const deadline = runtime_io.futureTaskSnapshot(future.any_future.?).?.sleep_deadline_ns orelse
-            return error.ExpectedBorrowedApplyFenceWait;
-        const expected_delay_us: i96 = 50 + @as(i96, @intCast(if (shared)
-            @as(u64, @intCast(runtime_io.monotonic_ns)) & 0x3f
-        else
-            (@as(u64, @intCast(runtime_io.monotonic_ns)) >> 6) & 0x3f));
-        try std.testing.expectEqual(runtime_io.monotonic_ns + expected_delay_us * std.time.ns_per_us, deadline);
+        const parked = runtime_io.futureTaskSnapshot(future.any_future.?).?;
+        try std.testing.expect(parked.waiting_on_futex);
+        try std.testing.expectEqual(null, parked.sleep_deadline_ns);
         if (shared) mutex.unlockExclusive() else mutex.unlockShared();
         held = false;
         for (0..32) |_| {
@@ -66607,6 +66603,7 @@ test "db apply fences wait through their borrowed runtime" {
         try std.testing.expect(scheduler.quiescent());
         try future.await(io);
         try std.testing.expect(completed);
+        try std.testing.expectEqual(started_ns, std.Io.Clock.awake.now(io).nanoseconds);
         try std.testing.expectEqual(@as(u64, 0), mutex.exclusive_waiters.load(.acquire));
         try std.testing.expectEqual(@as(u64, 0), mutex.shared_waiters.load(.acquire));
     }
