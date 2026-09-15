@@ -128757,6 +128757,29 @@ fn loadStoredSearchDocumentManyCallback(
     return try loadStoredSearchDocumentsMany(self, alloc, keys, null);
 }
 
+fn completeVectorMigrationForTest(db: *DB, job_id: []const u8) !void {
+    const deadline = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
+    while (true) {
+        var state = (try vector_migration.load(std.testing.allocator, db.core.store)).?;
+        defer state.deinit();
+        if (state.value.phase == .complete) return;
+        if (platform_time.monotonicNs() >= deadline) {
+            std.debug.print("migration deadline: phase={s} scanned={d} rewritten={d} reclamation={}\n", .{
+                @tagName(state.value.phase), state.value.scanned_rows, state.value.rewritten_artifacts, state.value.primary_reclamation_requested,
+            });
+            return error.VectorMigrationDidNotFinish;
+        }
+        if (state.value.phase == .ready) {
+            try db.publishVectorMigration(job_id);
+        } else try db.advanceVectorMigration(job_id);
+        // Reclamation retains ordinary timed admission retries. A fixed count
+        // of tight iterations can finish before a retry becomes due on a fast
+        // filesystem; yielding also lets admitted asynchronous work progress.
+        if (state.value.phase == .reclaiming)
+            try db.core.index_manager.checkpointIo().sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
 test "source vector migration progress pages sync the WAL without flushing tiny runs" {
     const alloc = std.testing.allocator;
     var tmp = try TestDirectory.init("vector-migration-page-wal");
@@ -128855,14 +128878,7 @@ test "source vector migration recovers each preparation commit and publication b
         for (0..3) |_| {
             var db = try DB.open(alloc, path, options);
             defer db.close();
-            for (0..256) |_| {
-                var state = (try vector_migration.load(alloc, db.core.store)).?;
-                defer state.deinit();
-                if (state.value.phase == .complete) break;
-                if (state.value.phase == .ready) {
-                    try db.publishVectorMigration(request.job_id);
-                } else try db.advanceVectorMigration(request.job_id);
-            } else return error.VectorMigrationDidNotFinish;
+            try completeVectorMigrationForTest(&db, request.job_id);
             const restored = try db.core.store.get(alloc, key);
             defer alloc.free(restored);
             try std.testing.expectEqualSlices(u8, value, restored);
@@ -129684,9 +129700,13 @@ test "source vector migration fences live probes admitted before activation" {
     for (0..128) |_| {
         var state = (try vector_migration.load(alloc, db.core.store)).?;
         defer state.deinit();
-        if (state.value.phase == .complete) break;
+        if (state.value.phase == .reclaiming and state.value.primary_reclamation_requested) break;
         if (state.value.phase == .ready) try db.publishVectorMigration(request.job_id) else try db.advanceVectorMigration(request.job_id);
     } else return error.VectorMigrationDidNotFinish;
+    // Reproduce the timed GC retry that a tight Linux test loop can outrun.
+    const backend = db.core.primary_store_owner.lsmBackend().?;
+    backend.tombstone_gc_retry_after_ns = backend.nowNs() + 250 * std.time.ns_per_ms;
+    try completeVectorMigrationForTest(&db, request.job_id);
     try std.testing.expectError(error.VectorMigrationReadEpochChanged, probe.get(key));
     try std.testing.expectError(error.VectorMigrationReadEpochChanged, probe.getLeased(key));
     var values: [1]?[]const u8 = undefined;

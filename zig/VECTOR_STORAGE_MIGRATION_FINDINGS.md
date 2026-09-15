@@ -269,3 +269,10 @@ it does not claim identical graph construction for legacy ANN rebuilding or
 equivalent recall for independently built million-vector tables.
 The complete production migration/vector-store suite, including these two
 checks, subsequently passed all 13 tests in 43.11 seconds.
+
+Linux CI exposed two unit fixtures that exhausted a fixed number of tight
+migration steps before ordinary timed GC admission retries became due. Their
+completion driver now uses a 30-second deadline, yields during reclamation,
+and reports the durable phase/counters on timeout. The old-reader fixture
+explicitly injects a 250 ms GC retry. All 12 focused DB migration tests pass
+with that case and no leaks. Production admission behavior is unchanged.
