@@ -426,7 +426,7 @@ def main():
                 response.raise_for_status()
                 return time.monotonic() - begin
 
-            def measure_workload():
+            def measure_workload(label):
                 cells = []
                 for concurrency in (1, 8, 32):
                     with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -442,6 +442,11 @@ def main():
                             "p99_ms": float(np.percentile(latencies, 99) * 1000),
                         }
                     )
+                    write_json(arm / f"{label}.json", cells)
+                    print(
+                        f"{mode} {label} c={concurrency} qps={cells[-1]['qps']:.1f}",
+                        flush=True,
+                    )
                 return cells
 
             for measurement, active_payloads in (
@@ -456,7 +461,7 @@ def main():
                     ],
                 ),
             ):
-                result[measurement] = measure_workload()
+                result[measurement] = measure_workload(measurement)
             result["after"] = api("GET", f"/tables/{table}")
             stop_server()
             started = time.monotonic()
@@ -466,7 +471,7 @@ def main():
             result["warm_restart_seconds"] = time.monotonic() - started
             result["restart"] = api("GET", f"/tables/{table}")
             active_payloads = payloads
-            result["restart_queries"] = measure_workload()
+            result["restart_queries"] = measure_workload("restart_queries")
             reclaim_started = time.monotonic()
             deadline = reclaim_started + 180
             result["source_reclamation_complete"] = False

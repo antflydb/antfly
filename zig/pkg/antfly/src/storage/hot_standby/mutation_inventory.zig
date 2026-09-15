@@ -192,7 +192,7 @@ pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
         std.mem.startsWith(u8, path, routes.Routes.transactions_prefix))
         return rejected(.transaction_session);
 
-    if (routes.Routes.matchTableStorageMigration(path) != null) return rejected(.storage_migration);
+    if (routes.Routes.matchTableStorageMigration(path) != null or routes.Routes.matchTableStorageMigrationJob(path) != null) return rejected(.storage_migration);
     if (routes.Routes.matchTableArtifactRepairRun(path) != null or
         routes.Routes.matchTableRepairJobs(path) != null or
         routes.Routes.matchTableRepairControlJobs(path) != null or

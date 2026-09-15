@@ -25,10 +25,10 @@ const internal_keys = @import("internal_keys.zig");
 const codec = @import("db/enrichment/artifact_codec.zig");
 const Allocator = std.mem.Allocator;
 
-pub const Boundary = enum { before_prepare, after_prepare, after_commit, after_sync, publication_commit, publication_sync };
+pub const Boundary = enum { before_prepare, after_prepare, after_commit, after_sync, publication_commit, publication_sync, reclamation_request, reclamation_receipt };
 pub var test_boundary: ?*const fn (Boundary) anyerror!void = null;
 
-fn boundary(point: Boundary) !void {
+pub fn boundary(point: Boundary) !void {
     if (@import("builtin").is_test) if (test_boundary) |hook| try hook(point);
 }
 
@@ -196,7 +196,7 @@ pub fn advance(alloc: Allocator, primary: *docstore.DocStore, source: payload.St
             .verifying => .ready,
             .draining => .final_verification,
             .final_verification => .serving,
-            .cleanup => .complete,
+            .cleanup => .reclaiming,
             .cancelling => .cancelled,
             else => unreachable,
         };

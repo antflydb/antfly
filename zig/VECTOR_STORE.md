@@ -123,6 +123,9 @@ bounded steps, and publishes when verification reaches `ready`. Actions `start`,
 `step`, `publish`, `status` and `cancel` provide explicit operator control. Ctrl-C
 stops the driver; durable capture continues, and running the identical command
 resumes it. The server does not schedule an unattended migration loop.
+Use a migration-capable server throughout the job; do not downgrade between
+admission and completion or cancellation. Older binaries do not maintain the
+candidate map required by an active job.
 
 Job ID, target and budgets form the creation idempotency contract. Keep them
 equal when retrying creation, including after a timeout. Job actions use the
@@ -156,15 +159,23 @@ The durable phases are:
 | `draining` | Ownership and the publication fence are durable. New writes use references; replace old inline values with already-prepared references. |
 | `final_verification` | Prove that every live dense artifact is a valid, resolvable reference. |
 | `serving` | Convert any legacy ANN generations and consolidate serving vectors into source references, retaining healthy query generations during replacement. |
-| `cleanup` / `complete` | Delete temporary candidate mappings. Normal source GC and primary compaction may then reclaim obsolete versions and inline SSTable bytes. |
+| `cleanup` | Delete temporary candidate mappings. |
+| `reclaiming` | Flush the final replacements once, durably request primary overlap rewrites, and advance bounded streaming compaction until those requests are discharged. |
+| `complete` | Reference, serving and primary rewrite closure are certified. Source GC and reader retirement can finish reclaiming retained versions. |
 | `cancelling` / `cancelled` | Before publication only: disable capture, remove candidate mappings, retain inline authority and a durable receipt. |
 
 Progress includes the ownership epoch, snapshot/publication fences, an exclusive
 hex-encoded primary cursor, scanned/prepared/verified/rewritten counts, preparation
 bytes, charged temporary allowance and the last admission error. Existing table
 and index status endpoints provide source-store accounting, index readiness and
-repair status. `complete` means reference and serving closure; it does not mean
-all old files or cache pages have already been reclaimed.
+repair status. `primary_reclamation_requested` records the durable primary
+rewrite request. `complete` includes discharge of those requests, but old readers,
+retention windows and source GC may still hold files; it does not mean all old
+files or cache pages have already been reclaimed. The request uses persistent
+run metadata and ordinary admitted streaming GC. Partial level jobs and splits
+carry the request even when their outputs contain no tombstones. Only a
+validated full overlap rewrite clears it. A crash between the manifest request
+and its job receipt safely repeats the request after reopening.
 
 ### Mutation, reader and recovery protocol
 

@@ -113,7 +113,7 @@ pub fn nextTombstoneGcDelay(backend: anytype) ?u64 {
     }
     for (0..run_store.count(backend)) |rank| {
         const run = run_store.at(backend, rank);
-        if (run.gc_requested and (run.tombstone_count orelse 0) != 0) return 0;
+        if (run.gc_requested) return 0;
     }
     if (comptime !@hasField(@TypeOf(backend.options), "tombstone_gc_max_age_ns")) return null;
     if (backend.options.tombstone_gc_max_age_ns == 0) return null;
@@ -1427,10 +1427,10 @@ fn gcComponentEligible(backend: anytype, indices: []const usize) bool {
         const deletes = run.tombstone_count orelse 0;
         tombstones +|= deletes;
         entries = @max(entries, run.entry_count);
-        if (deletes != 0) requested = requested or run.gc_requested or tombstoneAgeDue(backend, run);
+        requested = requested or run.gc_requested or (deletes != 0 and tombstoneAgeDue(backend, run));
     }
     const percent = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_min_percent")) @min(@as(u8, 100), backend.options.tombstone_gc_min_percent) else 50;
-    return tombstones != 0 and (requested or @as(u128, tombstones) * 100 >= @as(u128, entries) * percent);
+    return requested or (tombstones != 0 and @as(u128, tombstones) * 100 >= @as(u128, entries) * percent);
 }
 
 /// Persist the collection objective on every delete-bearing input, not just
@@ -1487,7 +1487,7 @@ fn tombstoneGcCandidate(backend: anytype, index: *const DomainIndex, max_bytes: 
 pub fn hasTombstoneGcDebt(backend: anytype) bool {
     if (comptime @hasField(@TypeOf(backend.*), "run_directory_dirty")) {
         if (!backend.run_directory_dirty) if (backend.run_directory) |directory| {
-            if (directory.tombstoneRunCount() == 0) return false;
+            if (directory.tombstoneRunCount() == 0 and !directory.hasGcRequest()) return false;
         };
     }
     if (comptime @hasField(@TypeOf(backend.*), "gc_debt_cache")) {
@@ -2046,7 +2046,7 @@ fn selectDirectoryGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
     const limit = if (max_bytes == 0) configured else if (configured == 0) max_bytes else @min(max_bytes, configured);
     if (backend.pending_gc == null) {
         const current_directory = try backend.planningDirectory();
-        if (current_directory.tombstoneRunCount() == 0) return null;
+        if (current_directory.tombstoneRunCount() == 0 and !current_directory.hasGcRequest()) return null;
         const directory = try current_directory.fork(allocator);
         errdefer backend.retireCheckpointDirectory(directory);
         var reservation: ?resource_manager_mod.Reservation = null;
@@ -2189,7 +2189,7 @@ fn selectGcProgress(backend: anytype, index: *const DomainIndex, limit: u64) !?S
         const runs = if (index.mixed) (try run_store.oracleItems(backend)) else index.runs[start..end];
         for (runs, 0..) |run, i| {
             const deletes = run.tombstone_count orelse 0;
-            if (deletes == 0 or run.level == std.math.maxInt(u32)) continue;
+            if ((deletes == 0 and !run.gc_requested) or run.level == std.math.maxInt(u32)) continue;
             const percent = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_min_percent")) backend.options.tombstone_gc_min_percent else 50;
             // The projection may predate the request bit; use the live input.
             const live_index = if (index.mixed) i else index.order[start + i];
@@ -6051,7 +6051,7 @@ test "bounded GC carries aggregate eligibility across windows and retries indepe
     outputs[1].tombstone_count = 0;
     inheritTombstoneAge(&outputs, &.{&runs[0]});
     try std.testing.expect(outputs[0].gc_requested);
-    try std.testing.expect(!outputs[1].gc_requested);
+    try std.testing.expect(outputs[1].gc_requested);
 }
 
 test "persistent planner ordering matches rebuilt domain and GC indexes after level moves" {
@@ -6129,7 +6129,7 @@ test "compaction installation preserves GC requests advanced during its build" {
     live[1].gc_requested = true;
     reconcileGcObjective(&live, plan, &outputs);
     try std.testing.expect(outputs[0].gc_requested);
-    try std.testing.expect(!outputs[1].gc_requested);
+    try std.testing.expect(outputs[1].gc_requested);
 }
 
 test "domain compaction maps interleaved inputs and revalidates concurrent publication" {
@@ -7808,22 +7808,24 @@ fn reconcileGcObjective(live: anytype, plan: CompactionPlan, outputs: []Run) voi
     var requested = false;
     for (0..plan.source_len) |i| requested = requested or run_store.planGet(live, plan, i).gc_requested;
     for (0..plan.target_len) |i| requested = requested or run_store.planGet(live, plan, plan.source_len + i).gc_requested;
-    if (requested) for (outputs) |*run| {
-        if ((run.tombstone_count orelse 0) != 0) run.gc_requested = true;
-    };
+    // Only a validated full overlap closure discharges a rewrite request.
+    // Partial level jobs and source splits must carry it even without deletes:
+    // their outputs can still hide obsolete values in deeper runs.
+    for (outputs) |*run| run.gc_requested = !plan.tombstone_gc and (requested or run.gc_requested);
 }
 
 fn inheritTombstoneAge(outputs: []Run, inputs: anytype) void {
     var oldest = gcNowNs();
     var requested = false;
-    for (@as([]const @TypeOf(inputs[0]), inputs)) |run| if ((inputRun(run).tombstone_count orelse 0) != 0) {
-        oldest = @min(oldest, inputRun(run).oldest_tombstone_unix_ns);
+    for (@as([]const @TypeOf(inputs[0]), inputs)) |run| {
+        if ((inputRun(run).tombstone_count orelse 0) != 0)
+            oldest = @min(oldest, inputRun(run).oldest_tombstone_unix_ns);
         requested = requested or inputRun(run).gc_requested;
-    };
+    }
     for (outputs) |*run| {
         const has_deletes = (run.tombstone_count orelse 0) != 0;
         run.oldest_tombstone_unix_ns = if (has_deletes) oldest else 0;
-        run.gc_requested = has_deletes and requested;
+        run.gc_requested = requested;
     }
 }
 

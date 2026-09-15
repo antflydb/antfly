@@ -6409,6 +6409,12 @@ pub const DB = struct {
             }
             _ = try self.publishVectorBlockBasesOnlineReported(.{ .require_quiescence = false, .require_storage_encoding = true });
         }
+        if (observed.value.phase == .reclaiming and observed.value.primary_reclamation_requested) {
+            // Offline operators have no maintenance worker. Online execution
+            // uses the same bounded scheduler without holding the table apply
+            // lock over streaming compaction I/O.
+            _ = try self.core.primary_store_owner.lsm.handle.backend.runValueReclamationStep();
+        }
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         var job = (try vector_migration.load(self.alloc, self.core.store)) orelse return error.VectorMigrationNotFound;
@@ -6417,11 +6423,37 @@ pub const DB = struct {
         try self.validateVectorMigrationIdentity(job.value);
         if (job.value.configuration_hash != try self.vectorMigrationConfigurationHash()) return error.VectorMigrationConfigurationChanged;
         if (!job.value.active() or job.value.phase == .ready) return;
-        errdefer |err| switch (err) {
+        errdefer |err| switch (@as(anyerror, err)) {
             error.VectorMigrationTemporaryBudgetExceeded, error.VectorMigrationDiskReserve, error.VectorMigrationRowExceedsBudget => {},
             else => self.requireVectorMigrationRecovery(),
         };
-        if (job.value.phase == .serving) {
+        if (job.value.phase == .reclaiming) {
+            const backend = self.core.primary_store_owner.lsm.handle.backend;
+            if (!job.value.primary_reclamation_requested) {
+                // One final flush includes all replacements and candidate
+                // deletes before requesting the old overlap closures. Persist
+                // the manifest request before its primary receipt. A crash
+                // between them safely repeats the request after reopening.
+                try self.core.store.runtime_store.sync(true);
+                try backend.requestValueReclamation();
+                try vector_migration.boundary(.reclamation_request);
+                job.value.primary_reclamation_requested = true;
+            } else {
+                if (try backend.hasValueReclamationRequests()) return;
+                // Fence the manifest that discharged the last request before
+                // reporting completion. Pinned readers may retain old files.
+                try backend.persistManifest();
+                job.value.phase = .complete;
+            }
+            var txn = try self.core.store.runtime_store.beginWrite();
+            var committed = false;
+            defer if (!committed) txn.abort();
+            try vector_migration.save(self.alloc, &txn, job.value);
+            try txn.commit();
+            committed = true;
+            try self.core.store.runtime_store.syncReplayState();
+            try vector_migration.boundary(.reclamation_receipt);
+        } else if (job.value.phase == .serving) {
             if (!self.core.index_manager.sourceMigrationServingComplete()) return;
             job.value.phase = .cleanup;
             var txn = try self.core.store.runtime_store.beginWrite();
@@ -109647,6 +109679,7 @@ test "db last dense catch-up lease finalizes every covered rebuilding generation
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
+        .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
@@ -109686,7 +109719,8 @@ test "db last dense catch-up lease finalizes every covered rebuilding generation
     // exact-vector file is shared by the table. Preserve the independently
     // certified sibling instead of projecting the owner's short fence onto
     // every dense index.
-    // This fixture disables index workers. Stage acceleration explicitly;
+    // This fixture disables index and optional runtime workers so checkpoint
+    // publication cannot race the manually installed certificates. Stage acceleration explicitly;
     // the finalization assertions below exercise certification only.
     _ = try db.publishVectorBlockBasesOnline(.{});
     {
@@ -128789,7 +128823,21 @@ test "source vector migration recovers each preparation commit and publication b
             Hook.selected = point;
             vector_migration.test_boundary = Hook.fail;
             defer vector_migration.test_boundary = null;
-            if (point == .publication_commit or point == .publication_sync) {
+            if (point == .reclamation_request or point == .reclamation_receipt) {
+                var crashed = false;
+                for (0..512) |_| {
+                    var state = (try vector_migration.load(alloc, db.core.store)).?;
+                    defer state.deinit();
+                    if (state.value.phase == .ready) {
+                        try db.publishVectorMigration(request.job_id);
+                    } else db.advanceVectorMigration(request.job_id) catch |err| {
+                        try std.testing.expectEqual(error.TestVectorMigrationCrash, err);
+                        crashed = true;
+                        break;
+                    };
+                }
+                try std.testing.expect(crashed);
+            } else if (point == .publication_commit or point == .publication_sync) {
                 for (0..256) |_| {
                     var state = (try vector_migration.load(alloc, db.core.store)).?;
                     defer state.deinit();

@@ -21,7 +21,7 @@ pub const job_key = "\x00\x00__metadata__:vector_migration";
 pub const accounting_key = "\x00\x00__metadata__:vector_migration_bytes";
 pub const candidate_prefix = "\x00\x00__metadata__:vector_migration_candidate:";
 pub const Mode = enum { offline, online };
-pub const Phase = enum { backfill, verifying, ready, draining, final_verification, serving, cleanup, complete, cancelling, cancelled };
+pub const Phase = enum { backfill, verifying, ready, draining, final_verification, serving, cleanup, reclaiming, complete, cancelling, cancelled };
 
 pub const Budget = struct {
     batch_bytes: u64 = 4 * 1024 * 1024,
@@ -92,10 +92,11 @@ pub const Job = struct {
     charged_temporary_bytes: u64 = 0,
     verified_artifacts: u64 = 0,
     rewritten_artifacts: u64 = 0,
+    primary_reclamation_requested: bool = false,
     last_error: ?[]const u8 = null,
 
     pub fn published(self: Job) bool {
-        return self.phase == .draining or self.phase == .final_verification or self.phase == .serving or self.phase == .cleanup or self.phase == .complete;
+        return self.phase == .draining or self.phase == .final_verification or self.phase == .serving or self.phase == .cleanup or self.phase == .reclaiming or self.phase == .complete;
     }
 
     pub fn active(self: Job) bool {

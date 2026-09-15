@@ -12,8 +12,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Exclusive stopped-server operator. The catalog lock is also acquired by
-//! standalone startup; do not invoke against an older running binary.
+//! Storage migration operator: drive online HTTP jobs or migrate a stopped
+//! table under the catalog lock shared with standalone startup. Offline mode
+//! must not run alongside an older binary that does not acquire that lock.
 const std = @import("std");
 const antfly = struct {
     const vector_migration = @import("../common/vector_migration.zig");

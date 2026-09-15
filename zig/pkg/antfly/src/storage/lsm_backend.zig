@@ -2083,6 +2083,67 @@ pub const Backend = struct {
         try self.finalizeDeferredStorageWorkLocked();
     }
 
+    /// Request reclamation of superseded values in the current persisted runs.
+    /// The caller flushes replacement values first. Only metadata is prepared
+    /// here; the regular admitted, streaming GC jobs rewrite overlap closures.
+    /// The manifest intent survives restart, partial compaction and old readers.
+    pub fn requestValueReclamation(self: *Backend) !void {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (self.options.backend.read_only) return error.ReadOnly;
+        const current = try self.planningDirectory();
+        var wire: u64 = 128;
+        var scratch: u64 = 8192;
+        const height: u64 = if (current.tree.root) |root| root.height else 1;
+        var cursor = self.runs.cursor();
+        while (cursor.next()) |run| {
+            if (run.gc_requested) continue;
+            const names = run.smallest_key.len + run.largest_key.len +
+                (if (run.path) |path| path.len else 0) +
+                (if (run.smallest_namespace_name) |name| name.len else 0) +
+                (if (run.largest_namespace_name) |name| name.len else 0);
+            wire +|= 192 +| names;
+            // Bound the administrative metadata clones before allocation.
+            scratch +|= (height + 1) * 16384 +| names * 2 +|
+                (if (run.state) |*state| state.estimatedMemoryBytes() else 0);
+        }
+        var reservation: ?resource_manager_mod.Reservation = null;
+        defer if (reservation) |*lease| lease.release();
+        if (self.options.resource_manager) |manager|
+            reservation = try manager.reserve(.lsm_table_builder_working_set, scratch);
+        var credit = try self.admitCompactionMetadataBytes(wire);
+        defer credit.release();
+        const directory = try current.fork(self.allocator);
+        var directory_owned = true;
+        defer if (directory_owned) directory.destroy(self.allocator);
+        const store = try self.allocator.create(RunStore);
+        store.* = self.runs.fork();
+        defer self.retireRunStore(store);
+        cursor = self.runs.cursor();
+        while (cursor.next()) |run| {
+            if (run.gc_requested) continue;
+            var revision = RunStore.revision(run, run.*);
+            revision.gc_requested = true;
+            try store.stageRevision(self.allocator, revision);
+            store.adopt(&revision);
+            try directory.put(self, revision);
+        }
+        std.mem.swap(RunStore, &self.runs, store);
+        self.invalidateReadVersion();
+        self.publishRunDirectory(directory);
+        directory_owned = false;
+        credit.commit();
+        self.markManifestDirty();
+        try self.persistManifestLocked();
+        self.notePotentialMaintenanceDebtLocked();
+    }
+
+    pub fn hasValueReclamationRequests(self: *Backend) !bool {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        return (try self.planningDirectory()).hasGcRequest();
+    }
+
     pub fn syncReplayState(self: *Backend) !void {
         _ = try self.syncReplayStateWithStats();
     }
@@ -3104,13 +3165,22 @@ pub const Backend = struct {
     pub fn runMaintenanceStep(self: *Backend) !bool {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
-        return try self.runMaintenanceStepLocked();
+        return try self.runMaintenanceStepLocked(false);
+    }
+
+    /// An explicitly requested rewrite must make progress under sustained
+    /// query traffic. It still uses ordinary I/O/memory admission and yields
+    /// inside streaming work; only the optional idle-grace deferral is bypassed.
+    pub fn runValueReclamationStep(self: *Backend) !bool {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        return try self.runMaintenanceStepLocked(true);
     }
 
     pub fn runMaintenanceStepBestEffort(self: *Backend) !bool {
         if (!self.mu.tryLock()) return false;
         defer self.unlockWithReclamation();
-        return try self.runMaintenanceStepLocked();
+        return try self.runMaintenanceStepLocked(false);
     }
 
     pub fn makeWalCheckpointRetryDueForTest(self: *Backend) void {
@@ -3121,7 +3191,7 @@ pub const Backend = struct {
         self.last_wal_retention_enforce_ns = 0;
     }
 
-    fn runMaintenanceStepLocked(self: *Backend) !bool {
+    fn runMaintenanceStepLocked(self: *Backend, required_gc: bool) !bool {
         // Cleanup is safe even after a durability fence or under pressure.
         // The unlock path executes one bounded FIFO reclamation turn.
         if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return true;
@@ -3226,10 +3296,10 @@ pub const Backend = struct {
             // pressure selection, so a 3.2x L0 backlog rewrote an 8.5x-overfull
             // L1 before L1 could be promoted. Use the soft L0 bound as the
             // pressure denominator while retaining overlap-triggered L0 work.
-            const defer_soft_compaction = self.optionalMaintenanceDeferredLocked();
+            const defer_soft_compaction = !required_gc and self.optionalMaintenanceDeferredLocked();
             if (!defer_soft_compaction) {
                 self.gc_maintenance_turn +%= 1;
-                var compacted = self.pending_directory_closure == null and self.pending_l0_directory_closure == null and self.gc_maintenance_turn % 8 == 0 and (compaction_mod.nextTombstoneGcDelay(self) orelse 1) == 0 and
+                var compacted = self.pending_directory_closure == null and self.pending_l0_directory_closure == null and (required_gc or self.gc_maintenance_turn % 8 == 0) and (compaction_mod.nextTombstoneGcDelay(self) orelse 1) == 0 and
                     try compaction_mod.compactTombstonesScheduled(Backend, self, score);
                 if (!compacted) {
                     compacted = if (self.l0SoftPressureLocked() and self.options.bulk_ingest_tiered_l0_fan_in >= 2)
@@ -21955,6 +22025,83 @@ fn implementationTests() type {
             const deadline = backend.tombstone_gc_retry_after_ns;
             try std.testing.expect(!try backend.runMaintenanceStep());
             try std.testing.expectEqual(deadline, backend.tombstone_gc_retry_after_ns);
+        }
+
+        test "lsm value reclamation survives partial progress restart and old readers without tombstones" {
+            const alloc = std.testing.allocator;
+            var storage = storage_io.MemoryStorage.init(alloc);
+            defer storage.deinit();
+            const root = "/value-reclamation";
+            const options: Options = .{
+                .storage = storage.storage(),
+                .compact_threshold_runs = 1000,
+                .l0_overlap_compact_threshold_runs = 0,
+                .level_target_bytes_base = 1024 * 1024,
+                .tombstone_gc_max_age_ns = 0,
+                .tombstone_gc_max_input_bytes = 24 * 1024,
+                .max_compaction_input_bytes = 24 * 1024,
+                .obsolete_retention_ns = 0,
+            };
+            var backend = try Backend.open(alloc, root, options);
+            var open = true;
+            defer if (open) backend.close();
+            var bytes: [16 * 1024]u8 = undefined;
+            var random = std.Random.DefaultPrng.init(42);
+            random.random().bytes(&bytes);
+            for (0..3) |i| {
+                var state: State = .{};
+                errdefer state.deinit(alloc);
+                try state.upsert(alloc, .{}, "key", &bytes, false);
+                const run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, @intCast(3 - i));
+                state = .{};
+                try backend.runs.append(alloc, run);
+            }
+            try backend.runs.reindexForTest(alloc);
+            try backend.persistManifest();
+            {
+                var old = try backend.beginRead();
+                defer old.abort();
+                try std.testing.expectEqualSlices(u8, &bytes, try old.get(.{}, "key"));
+                var state: State = .{};
+                errdefer state.deinit(alloc);
+                try state.upsert(alloc, .{}, "key", "reference", false);
+                const run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, 0);
+                state = .{};
+                backend.invalidateReadVersion();
+                try backend.runs.append(alloc, run);
+                try backend.runs.reindexForTest(alloc);
+                try backend.persistManifest();
+                try backend.requestValueReclamation();
+                try std.testing.expect(try backend.hasValueReclamationRequests());
+                try std.testing.expectEqual(@as(usize, 0), (try backend.planningDirectory()).tombstoneRunCount());
+                // Stop after one bounded rewrite, before the closure is done.
+                for (0..64) |_| {
+                    const before = backend.compaction_stats.input_bytes;
+                    _ = try backend.runMaintenanceStep();
+                    try std.testing.expect(backend.compaction_stats.input_bytes - before <= options.tombstone_gc_max_input_bytes);
+                    if (backend.compaction_stats.input_bytes != 0) break;
+                }
+                try std.testing.expect(backend.compaction_stats.input_bytes != 0);
+                try std.testing.expect(try backend.hasValueReclamationRequests());
+                try std.testing.expectEqualSlices(u8, &bytes, try old.get(.{}, "key"));
+            }
+            backend.close();
+            open = false;
+            backend = try Backend.open(alloc, root, options);
+            open = true;
+            try std.testing.expect(try backend.hasValueReclamationRequests());
+            for (0..256) |_| {
+                const before = backend.compaction_stats.input_bytes;
+                _ = try backend.runMaintenanceStep();
+                try std.testing.expect(backend.compaction_stats.input_bytes - before <= options.tombstone_gc_max_input_bytes);
+                if (!try backend.hasValueReclamationRequests()) break;
+            }
+            try std.testing.expect(!try backend.hasValueReclamationRequests());
+            try std.testing.expectEqualSlices(u8, "reference", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+            var physical: u64 = 0;
+            var runs = backend.runs.cursor();
+            while (runs.next()) |run| physical += run.size_bytes;
+            try std.testing.expect(physical < bytes.len);
         }
 
         test "lsm GC checkpoints bounded level progress while preserving old readers" {

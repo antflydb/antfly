@@ -164,24 +164,36 @@ def test_online_vector_migration_restart_concurrent_models_and_rebuild(stateful_
     )
 
 
-def test_online_vector_migration_page_receipt_survives_process_crash(stateful_api):
+@pytest.mark.parametrize("crash_phase", ["backfill", "reclaiming"])
+def test_online_vector_migration_page_receipt_survives_process_crash(
+    stateful_api, crash_phase
+):
     api = stateful_api
     table = f"crash_migrate_{time.time_ns()}"
     seed(api, table)
     job = "wal-page"
     state = command(api, table, job)
     for _ in range(256):
-        state = command(api, table, job, "step")
-        if state["prepared_artifacts"]:
+        action = "publish" if state["phase"] == "ready" else "step"
+        state = command(api, table, job, action)
+        if crash_phase == "backfill" and state["prepared_artifacts"]:
+            break
+        if crash_phase == "reclaiming" and state.get("primary_reclamation_requested"):
             break
     else:
-        pytest.fail("backfill never prepared a payload")
+        pytest.fail(f"migration never reached {crash_phase} receipt")
     # Do not allow graceful shutdown to flush the WAL-only page receipt.
     api._server.proc.kill()
     api._server.proc.wait(timeout=10)
     api.restart_server()
     recovered = command(api, table, job, "status")
-    for field in ("phase", "cursor", "scanned_rows", "prepared_artifacts"):
+    for field in (
+        "phase",
+        "cursor",
+        "scanned_rows",
+        "prepared_artifacts",
+        "primary_reclamation_requested",
+    ):
         assert recovered[field] == state[field]
     assert finish(api, table, job, status=recovered)["phase"] == "complete"
     assert nearest(api, table, "model_a", [1, 0, 0]) == ["a", "b"]
