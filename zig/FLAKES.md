@@ -4,6 +4,25 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-14: soak qualification exceeds declared compiler memory (#704)
+
+[Qualification job 104248350481](https://github.com/antflydb/antfly/actions/runs/34927431365/job/104248350481)
+on `0f56ccd77e` reports a Linux ReleaseSafe compilation peak of
+13,255,065,600 bytes against a declared upper bound of 7,516,192,768 bytes
+(7 GiB). The failing production DataServer VOPR artifact uses
+`productionVoprCompileMaxRss`; the separate background-adapter artifact has its
+own declaration. The eight standby lifecycle tests and seven DataServer runtime
+tests shown in the log passed with zero skips, failures, or leaks. Those passing
+test results do not override the build's compiler-budget failure.
+
+The shared production-owner compile reservation now uses 16 GiB on Linux, with
+headroom over the observed 12.35 GiB peak; macOS keeps its existing 18 GiB
+reservation. This allows Zig to account for the actual compiler footprint when
+admitting concurrent build steps. It does not alter production memory limits,
+suppress resource checks, reduce test coverage, or retry away the failure.
+Linux qualification and the required seeded full soak must pass after the fix;
+the interrupted qualification run is not a successful second soak.
+
 ## 2026-09-14: standby/scaling read fails after sibling merge (#704)
 
 [Adversarial scaling job 104181278895](https://github.com/antflydb/antfly/actions/runs/34899531048/job/104181278895)
