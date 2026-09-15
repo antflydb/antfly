@@ -181,7 +181,9 @@ def main():
                 stderr=subprocess.STDOUT,
                 env=env,
             )
-            deadline = time.monotonic() + 120
+            reclaim_started = time.monotonic()
+            deadline = reclaim_started + 180
+            result["source_reclamation_complete"] = False
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise RuntimeError(f"server exited: {arm / 'server.log'}")
@@ -375,6 +377,11 @@ def main():
                 actual = {
                     hit["_id"] for hit in response["responses"][0]["hits"]["hits"]
                 }
+                if any(
+                    args.churn <= int(key.removeprefix("doc:")) < 2 * args.churn
+                    for key in actual
+                ):
+                    raise AssertionError("deleted document returned after migration")
                 recalls.append(len(actual & expected) / 10)
             result["recall_at_10"] = float(np.mean(recalls))
             payloads = [
@@ -388,6 +395,17 @@ def main():
                 for vector in queries
             ]
             local = threading.local()
+            full_text_payload = json.dumps(
+                {
+                    "full_text_search": {"field": "text", "match": "qualification"},
+                    "limit": 10,
+                }
+            )
+            text_result = api(
+                "POST", f"/tables/{table}/query", json.loads(full_text_payload)
+            )
+            if not text_result["responses"][0]["hits"]["hits"]:
+                raise AssertionError("full-text corpus missing after migration")
 
             def measured(index):
                 if not hasattr(local, "session"):
@@ -395,28 +413,40 @@ def main():
                 begin = time.monotonic()
                 response = local.session.post(
                     url + f"/tables/{table}/query",
-                    data=payloads[index % len(payloads)],
+                    data=active_payloads[index % len(active_payloads)],
                     headers={"Content-Type": "application/json"},
                     timeout=120,
                 )
                 response.raise_for_status()
                 return time.monotonic() - begin
 
-            result["queries"] = []
-            for concurrency in (1, 8, 32):
-                with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                    list(pool.map(measured, range(128)))
-                    begin = time.monotonic()
-                    latencies = list(pool.map(measured, range(args.query_count)))
-                    seconds = time.monotonic() - begin
-                result["queries"].append(
-                    {
-                        "concurrency": concurrency,
-                        "qps": args.query_count / seconds,
-                        "p50_ms": float(np.percentile(latencies, 50) * 1000),
-                        "p99_ms": float(np.percentile(latencies, 99) * 1000),
-                    }
-                )
+            for measurement, active_payloads in (
+                ("queries", payloads),
+                ("full_text_queries", [full_text_payload]),
+                (
+                    "mixed_queries",
+                    [
+                        item
+                        for payload in payloads
+                        for item in (payload, full_text_payload)
+                    ],
+                ),
+            ):
+                result[measurement] = []
+                for concurrency in (1, 8, 32):
+                    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                        list(pool.map(measured, range(128)))
+                        begin = time.monotonic()
+                        latencies = list(pool.map(measured, range(args.query_count)))
+                        seconds = time.monotonic() - begin
+                    result[measurement].append(
+                        {
+                            "concurrency": concurrency,
+                            "qps": args.query_count / seconds,
+                            "p50_ms": float(np.percentile(latencies, 50) * 1000),
+                            "p99_ms": float(np.percentile(latencies, 99) * 1000),
+                        }
+                    )
             result["after"] = api("GET", f"/tables/{table}")
             stop_server()
             started = time.monotonic()
@@ -425,7 +455,9 @@ def main():
             query(queries[0])
             result["warm_restart_seconds"] = time.monotonic() - started
             result["restart"] = api("GET", f"/tables/{table}")
-            deadline = time.monotonic() + 120
+            reclaim_started = time.monotonic()
+            deadline = reclaim_started + 180
+            result["source_reclamation_complete"] = False
             while time.monotonic() < deadline:
                 state = api("GET", f"/tables/{table}")
                 stats = state.get("storage_status", {}).get("source_vectors", {})
@@ -434,8 +466,10 @@ def main():
                     and stats.get("retained_payloads") == args.rows - args.churn
                     and stats.get("collection_pending_bytes") == 0
                 ):
+                    result["source_reclamation_complete"] = True
                     break
                 time.sleep(1)
+            result["source_reclamation_seconds"] = time.monotonic() - reclaim_started
             result["reclamation"] = state
             result["peak_rss_bytes"] = peak[0]
             stop_server()
