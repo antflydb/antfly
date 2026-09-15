@@ -83,6 +83,32 @@ def suspended_tasks(fixture):
             gdb.invalidate_cached_frames()
 
 
+def application_error():
+    """Retain private error identity behind a generic public HTTP 500.
+
+    Test-linked VOPR executables suppress HTTP stderr to preserve Zig's test
+    protocol. Inspect the error at ingress, before its task unwinds or teardown
+    releases the request, without exposing internal details in the API body.
+    """
+    frame = gdb.newest_frame()
+    gdb.write(f"VOPR HTTP error boundary: {frame.name()}\n")
+    try:
+        gdb.write(f"  error={frame.read_var('err')}\n")
+    except (gdb.error, ValueError) as error:
+        gdb.write(f"  error identity unavailable: {error}\n")
+    try:
+        context = frame.read_var("ctx").dereference()
+        request = context["request"].dereference()
+        uri = request["uri"]["raw"]
+        raw = gdb.selected_inferior().read_memory(
+            int(uri["ptr"]), min(int(uri["len"]), 512)
+        )
+        gdb.write(f"  request={request['method']} {bytes(raw)!r}\n")
+    except (gdb.error, ValueError) as error:
+        gdb.write(f"  request unavailable: {error}\n")
+    gdb.execute("bt 12")
+
+
 def boundary():
     global production_fixture, inspection_failed, tasks_inspected
     frame = gdb.newest_frame()
@@ -149,6 +175,11 @@ for expression in (
     for breakpoint in gdb.rbreak(expression):
         breakpoint.silent = True
         breakpoint.commands = "silent\npython boundary()\ncontinue\n"
+
+for breakpoint in gdb.rbreak("AntflyApiHandler.mapIngressError"):
+    breakpoint.silent = True
+    breakpoint.commands = "silent\npython application_error()\ncontinue\n"
+
 
 gdb.execute("run")
 # GDB itself can exit successfully after an inferior crash; retain its final
