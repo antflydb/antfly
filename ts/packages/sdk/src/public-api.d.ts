@@ -4695,10 +4695,10 @@ export interface components {
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
-        /** @description Immutable source embedding storage selected when creating a table. */
+        /** @description Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required. */
         TableStorageSettings: {
             /**
-             * @description Experimental vector_store mode requires a fresh local single-shard table without HA or replication.
+             * @description Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
              * @default primary_lsm
              * @enum {string}
              */
@@ -5493,6 +5493,46 @@ export interface components {
              * @description Locked publication time including directory refresh, inventory, receipts and reclamation.
              */
             collection_publish_ns?: number;
+            /**
+             * Format: int64
+             * @description Time preparing and sorting immutable collection input outside source and DB apply locks.
+             */
+            collection_plan_outside_lock_ns?: number;
+            /**
+             * Format: int64
+             * @description Time validating staged immutable readers outside source and DB apply locks.
+             */
+            collection_reader_prepare_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest detached immutable reader validation step.
+             */
+            collection_max_reader_prepare_ns?: number;
+            /**
+             * Format: int64
+             * @description Staged immutable readers validated before publication.
+             */
+            collection_readers_prepared?: number;
+            /**
+             * Format: int64
+             * @description Time retiring old collection owners and known obsolete files outside source and DB apply locks.
+             */
+            collection_retire_outside_lock_ns?: number;
+            /**
+             * Format: int64
+             * @description Verified collections that deferred copying because reclamation benefit was small.
+             */
+            collection_copy_deferrals?: number;
+            /**
+             * Format: int64
+             * @description Verified obsolete payload bytes retained by the copy-cost policy.
+             */
+            collection_deferred_obsolete_bytes?: number;
+            /**
+             * Format: int64
+             * @description Process-monotonic reclamation scheduling deadline translated from the durable wall-clock deadline; not a completion guarantee.
+             */
+            collection_reclaim_deadline_ns?: number;
             /**
              * Format: int64
              * @description Longest locked publication step.

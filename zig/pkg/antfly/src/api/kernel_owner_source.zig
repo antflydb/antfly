@@ -110,6 +110,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     };
 
+    const LeaseAdmission = enum { shared, exclusive, exclusive_if_idle };
+
     const Entry = struct {
         group_id: u64,
         table_name: []u8,
@@ -370,7 +372,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .reconcile_table_group_local = reconcileTableGroupLocal,
                 .reconcile_table_group_local_transient = reconcileTableGroupLocalTransient,
                 .retire_table_group_local = retireTableGroupLocal,
-                .reconcile_table_group_local_transient_observed = reconcileTableGroupLocalTransientObserved,
+                .reconcile_table_group_local_observed = reconcileTableGroupLocalObserved,
                 .local_runtime_status_group_local = localRuntimeStatusGroupLocal,
             },
         };
@@ -1123,14 +1125,16 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !abi.ReconcileResult {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-        var lease = try self.acquireDescriptorExclusive(
+        var lease = (try self.acquireDescriptorForReconcile(
             group_id,
             table_name,
             descriptor.path,
             descriptor.view(),
+            retain_cold_owner or advance_index_repair,
             if (retain_cold_owner) .resident else .transient,
-        );
+        )) orelse return .{ .state = .busy };
         defer lease.deinit();
+        errdefer lease.requestTransientRetirement();
         const result = lease.owner().reconcile(
             table_name,
             descriptor.schema_json,
@@ -1208,24 +1212,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         return localStructuralReconcileResult(result);
     }
 
-    fn reconcileTableGroupLocalTransientObserved(
+    fn reconcileTableGroupLocalObserved(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
         target_index_name: ?[]const u8,
         advance_index_repair: bool,
+        retain_cold_owner: bool,
     ) !?table_write_source.LocalStructuralReconcileObservation {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-        var lease = try self.acquireDescriptorExclusive(
+        var lease = (try self.acquireDescriptorForReconcile(
             group_id,
             table_name,
             descriptor.path,
             descriptor.view(),
-            .transient,
-        );
+            retain_cold_owner or advance_index_repair,
+            if (retain_cold_owner) .resident else .transient,
+        )) orelse return .{ .result = .{ .state = .busy } };
         defer lease.deinit();
         errdefer lease.requestTransientRetirement();
 
@@ -1473,13 +1479,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
     }
 
-    fn runDensePostingMaintenanceRound(ptr: *anyopaque) !usize {
+    fn runDensePostingMaintenanceRound(ptr: *anyopaque) !@import("storage_maintenance_source.zig").PostingRefreshProgress {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         const maybe_leases = try self.snapshotOwnerLeases(true, true);
-        const leases = maybe_leases orelse return 0;
+        const leases = maybe_leases orelse return .{ .pending = true };
         defer self.releaseMaintenanceLeases(leases);
 
-        var total_steps: usize = 0;
+        var total: @import("storage_maintenance_source.zig").PostingRefreshProgress = .{};
         for (leases) |*lease| {
             const result = lease.owner().maintenance(
                 lease.entry.table_name,
@@ -1490,12 +1496,14 @@ pub const ProvisionedKernelOwnerSource = struct {
                     lease.entry.group_id,
                     @errorName(err),
                 });
+                total.pending = true;
                 continue;
             };
-            total_steps = std.math.add(usize, total_steps, @intCast(result.dense_steps)) catch
-                std.math.maxInt(usize);
+            total.repaired +|= @intCast(result.dense_steps);
+            total.scanned +|= @intCast(result.dense_scanned);
+            total.pending = total.pending or result.deferred != 0 or result.busy != 0;
         }
-        return total_steps;
+        return total;
     }
 
     fn targetAdvanced(
@@ -1960,7 +1968,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// The registry mutex and a validated descriptor pin this entry. Borrowing
     /// must neither adopt residency nor admit new work after transient cleanup.
     fn borrowEntryLocked(self: *ProvisionedKernelOwnerSource, entry: *Entry) !Lease {
-        if (entry.transient_retirement_pending or !tryReserveEntryLeaseLocked(entry, false))
+        if (entry.transient_retirement_pending or !tryReserveEntryLeaseLocked(entry, .shared))
             return error.StorageReadTemporarilyUnavailable;
         _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
         return .{ .source = self, .entry = entry };
@@ -1979,6 +1987,28 @@ pub const ProvisionedKernelOwnerSource = struct {
         return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, true, residency, .{});
     }
 
+    fn acquireDescriptorForReconcile(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        path: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        wait_for_readers: bool,
+        residency: Residency,
+    ) !?Lease {
+        if (wait_for_readers) return try self.acquireDescriptorExclusive(group_id, table_name, path, descriptor, residency);
+        // Periodic inspection must yield to admitted foreground/maintenance
+        // leases. Queueing a writer here closes foreground admission while an
+        // existing lease may itself be waiting for a long derived-index apply.
+        // Return busy without installing that gate; the startup scheduler
+        // retains the inspection debt and retries. Explicit structural changes
+        // and admitted repair work keep their writer-preference contract.
+        return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .exclusive_if_idle, residency) catch |err| switch (err) {
+            error.StorageKernelOwnerTransitionRequired => null,
+            else => return err,
+        };
+    }
+
     fn acquireDescriptorWithMode(
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
@@ -1990,7 +2020,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         controls: ReadControls,
     ) !Lease {
         try controls.check();
-        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, exclusive, residency) catch |err| switch (err) {
+        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency) catch |err| switch (err) {
             error.StorageKernelOwnerTransitionRequired => try self.acquireDescriptorAfterTransition(
                 group_id,
                 table_name,
@@ -2026,7 +2056,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try controls.check();
             try wait_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
             try controls.check();
-            return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, exclusive, residency) catch |err| switch (err) {
+            return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency) catch |err| switch (err) {
                 error.StorageKernelOwnerTransitionRequired => {
                     try controls.check();
                     if (platform_time.monotonicNs() >= deadline_ns) return error.StorageBusy;
@@ -2050,10 +2080,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     }
 
-    fn tryReserveEntryLeaseLocked(entry: *Entry, exclusive: bool) bool {
-        if (entry.exclusive_active or (!exclusive and entry.exclusive_pending)) return false;
+    fn tryReserveEntryLeaseLocked(entry: *Entry, admission: LeaseAdmission) bool {
+        const exclusive = admission != .shared;
+        if (entry.exclusive_active or (admission != .exclusive and entry.exclusive_pending)) return false;
         if (exclusive and entry.active_users != 0) {
-            entry.exclusive_pending = true;
+            if (admission == .exclusive) entry.exclusive_pending = true;
             return false;
         }
         entry.active_users += 1;
@@ -2070,9 +2101,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         path: []const u8,
         descriptor: descriptor_contract.Descriptor,
-        exclusive: bool,
+        admission: LeaseAdmission,
         residency: Residency,
     ) !Lease {
+        const exclusive = admission != .shared;
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
         defer self.mutex.unlock();
         var stale_index: ?usize = null;
@@ -2103,7 +2135,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 stale_index = index;
                 break;
             }
-            if (!tryReserveEntryLeaseLocked(entry, exclusive)) return error.StorageKernelOwnerTransitionRequired;
+            if (!tryReserveEntryLeaseLocked(entry, admission)) return error.StorageKernelOwnerTransitionRequired;
             if (residency == .resident) {
                 entry.resident = true;
                 entry.transient_retirement_pending = false;
@@ -2683,7 +2715,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.retired or entry.closing or entry.generation != generation or
-                !tryReserveEntryLeaseLocked(entry, false)) return error.RaftApplyWriterUnavailable;
+                !tryReserveEntryLeaseLocked(entry, .shared)) return error.RaftApplyWriterUnavailable;
             entry.resident = true;
             entry.transient_retirement_pending = false;
             return .{ .source = self, .entry = entry, .exclusive = false };
@@ -3822,22 +3854,47 @@ test "pending exclusive storage owner lease blocks new readers until drain" {
     entry.exclusive_pending = false;
     entry.exclusive_active = false;
 
-    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, true));
+    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, .exclusive));
     try std.testing.expect(entry.exclusive_pending);
     try std.testing.expectEqual(@as(usize, 1), entry.active_users);
 
     // Observational status reads arriving after the writer must not starve it.
-    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, false));
+    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, .shared));
     try std.testing.expectEqual(@as(usize, 1), entry.active_users);
 
     // Once the original reader drains, the waiting exclusive lease wins and
     // clears the pending gate while its active gate remains authoritative.
     entry.active_users = 0;
-    try std.testing.expect(ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, true));
+    try std.testing.expect(ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, .exclusive));
     try std.testing.expect(!entry.exclusive_pending);
     try std.testing.expect(entry.exclusive_active);
     try std.testing.expectEqual(@as(usize, 1), entry.active_users);
-    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, false));
+    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, .shared));
+}
+
+test "background storage owner lease inspection yields without gating readers" {
+    var entry: ProvisionedKernelOwnerSource.Entry = undefined;
+    entry.active_users = 1;
+    entry.exclusive_pending = false;
+    entry.exclusive_active = false;
+
+    // A long-lived query or maintenance lease must not turn periodic
+    // inspection into a barrier for later foreground requests.
+    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, .exclusive_if_idle));
+    try std.testing.expect(!entry.exclusive_pending and !entry.exclusive_active);
+    try std.testing.expect(ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, .shared));
+    try std.testing.expectEqual(@as(usize, 2), entry.active_users);
+
+    // Inspection can run once admitted users drain, with the same exclusion
+    // while actually reconciling. It cannot jump an explicit structural waiter.
+    entry.active_users = 0;
+    entry.exclusive_pending = true;
+    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, .exclusive_if_idle));
+    try std.testing.expect(entry.exclusive_pending);
+    entry.exclusive_pending = false;
+    try std.testing.expect(ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, .exclusive_if_idle));
+    try std.testing.expect(entry.exclusive_active and !entry.exclusive_pending);
+    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, .shared));
 }
 
 test "transient storage owner retirement drains borrowers and permits foreground adoption" {

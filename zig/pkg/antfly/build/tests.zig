@@ -1323,6 +1323,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "table storage creation intent survives",
         "model-directed",
         "tool query builder",
         "agent conversation",
@@ -2233,6 +2234,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "logical inference slices can charge only physical host memory",
         "batch release accounting errors fail closed",
         "single release and observer mismatch cannot debit unrelated memory",
+        "resource identity ledgers bound tombstones across churn and reject stale owners",
         "bounded oversized progress cannot bypass aggregate host memory",
         "resource manager observes over-budget external usage",
         "identity-aware cache admission rejects growth and always permits shrink",
@@ -3892,6 +3894,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
+            "standalone table storage defaults persist",
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
@@ -4074,6 +4077,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
 
+    const vector_payload_bench_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_bench.zig", target, .ReleaseFast, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    vector_payload_bench_mod.addImport("bloom", bloom_mod);
+    vector_payload_bench_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    vector_payload_bench_mod.addImport("antfly-json", json_mod);
+    vector_payload_bench_mod.addImport("structlog", structlog_mod);
+    const vector_payload_bench = b.addExecutable(.{ .name = "vector-payload-bench", .root_module = vector_payload_bench_mod });
+    const install_vector_payload_bench = b.addInstallArtifact(vector_payload_bench, .{});
+    b.step("vector-payload-bench", "Build real-file source payload and hash benchmarks").dependOn(&install_vector_payload_bench.step);
+
     const vector_payload_test_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     vector_payload_test_mod.addImport("bloom", bloom_mod);
     vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -4082,7 +4094,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const vector_payload_tests = b.addTest(.{
         .root_module = vector_payload_test_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
-        .filters = &.{ "source vector payloads", "vector references", "table storage settings" },
+        .filters = &.{ "source vector payloads", "vector references", "table storage settings", "table storage creation policy" },
     });
     const run_vector_payload_tests = b.addRunArtifact(vector_payload_tests);
     const vector_payload_test_step = b.step("vector-payload-test", "Run source vector payload ownership and recovery tests");
@@ -4278,6 +4290,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_test_mod.addImport("antfly-json", json_mod);
     index_manager_test_mod.addImport("antfly_scraping", scraping_mod);
     index_manager_test_mod.addImport("antfly_image", image_mod);
+    index_manager_test_mod.addImport("antfly_pdf", pdf_mod);
+    index_manager_test_mod.addImport("httpx", httpx_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     index_manager_test_mod.addImport("antfly_reader_config", reader_config_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);
@@ -5014,6 +5028,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.transaction_vopr.",
             "storage.ttl.",
             "storage.vector_block_store.",
+            "storage.vector_fetch_batches_bench.",
+            "storage.vector_member_bindings.",
+            "storage.vector_member_bindings_bench.",
             "storage.vopr_durable_job_lane.",
             "storage.wal.",
             "storage.wal_vopr.",

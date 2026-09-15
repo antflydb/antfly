@@ -13202,6 +13202,26 @@ fn searchDenseInternal(
             profile.hbc_rerank_vector_physical_reads = profiled.profile.rerank_vector_physical_reads;
             profile.hbc_rerank_vector_physical_bytes = profiled.profile.rerank_vector_physical_bytes;
             profile.hbc_rerank_vector_location_reuses = profiled.profile.rerank_vector_location_reuses;
+            profile.hbc_rerank_member_binding_hits = profiled.profile.rerank_member_binding_hits;
+            profile.hbc_rerank_member_binding_batches = profiled.profile.rerank_member_binding_batches;
+            profile.hbc_rerank_member_binding_mixed_batches = profiled.profile.rerank_member_binding_mixed_batches;
+            profile.hbc_rerank_member_binding_bytes = profiled.profile.rerank_member_binding_bytes;
+            profile.hbc_rerank_read_batches = profiled.profile.rerank_read_batches;
+            profile.hbc_rerank_read_requests = profiled.profile.rerank_read_requests;
+            profile.hbc_rerank_read_helpers = profiled.profile.rerank_read_helpers;
+            profile.hbc_rerank_read_denied = profiled.profile.rerank_read_denied;
+            profile.hbc_rerank_read_dispatch_ns = profiled.profile.rerank_read_dispatch_ns;
+            profile.hbc_rerank_read_caller_ns = profiled.profile.rerank_read_caller_ns;
+            profile.hbc_rerank_read_join_ns = profiled.profile.rerank_read_join_ns;
+            profile.hbc_rerank_read_worker_wall_ns = profiled.profile.rerank_read_worker_wall_ns;
+            profile.hbc_rerank_read_adaptive_inline_batches = profiled.profile.rerank_read_adaptive_inline_batches;
+            profile.hbc_rerank_read_adaptive_wide_batches = profiled.profile.rerank_read_adaptive_wide_batches;
+            profile.hbc_rerank_read_adaptive_probe_ns = profiled.profile.rerank_read_adaptive_probe_ns;
+
+            profile.hbc_rerank_read_worker_start_delay_ns = profiled.profile.rerank_read_worker_start_delay_ns;
+            profile.hbc_rerank_read_mapped_requests = profiled.profile.rerank_read_mapped_requests;
+            profile.hbc_rerank_read_mapped_bytes = profiled.profile.rerank_read_mapped_bytes;
+            profile.hbc_rerank_member_binding_misses = profiled.profile.rerank_member_binding_misses;
             profile.hbc_rerank_vector_block_misses = profiled.profile.rerank_vector_block_misses;
             profile.hbc_rerank_vector_block_fallbacks = profiled.profile.rerank_vector_block_fallbacks;
             profile.hbc_rerank_artifact_cache_hits = profiled.profile.rerank_artifact_cache_hits;

@@ -2978,6 +2978,7 @@ pub const OpenProfile = struct {
     primary_store_ns: u64 = 0,
     core_resources_ns: u64 = 0,
     init_async_infrastructure_ns: u64 = 0,
+    table_storage_ns: u64 = 0,
     init_optional_runtimes_ns: u64 = 0,
     load_indexes_ns: u64 = 0,
     replay_pending_derived_ns: u64 = 0,
@@ -3305,7 +3306,7 @@ fn nsToMs(ns: u64) u64 {
 
 fn logOpenProfile(path: []const u8, open_mode: OpenOptions.OpenMode, start_index_workers: bool, profile: OpenProfile) void {
     std.log.info(
-        "db_open_profile path={s} mode={s} start_index_workers={} primary_store_ns={} core_resources_ns={} init_async_infrastructure_ns={} init_optional_runtimes_ns={} load_indexes_ns={} replay_pending_derived_ns={} start_index_workers_ns={} start_optional_runtimes_ns={} total_ns={}",
+        "db_open_profile path={s} mode={s} start_index_workers={} primary_store_ns={} core_resources_ns={} init_async_infrastructure_ns={} table_storage_ns={} init_optional_runtimes_ns={} load_indexes_ns={} replay_pending_derived_ns={} start_index_workers_ns={} start_optional_runtimes_ns={} total_ns={}",
         .{
             path,
             @tagName(open_mode),
@@ -3313,6 +3314,7 @@ fn logOpenProfile(path: []const u8, open_mode: OpenOptions.OpenMode, start_index
             profile.primary_store_ns,
             profile.core_resources_ns,
             profile.init_async_infrastructure_ns,
+            profile.table_storage_ns,
             profile.init_optional_runtimes_ns,
             profile.load_indexes_ns,
             profile.replay_pending_derived_ns,
@@ -5841,6 +5843,7 @@ pub const DB = struct {
             );
             core_owned = false;
             core_owner_initialized = true;
+            core_owner.identity_visibility.summary = try doc_identity.visibilitySummaryFromStore(core_owner.store);
             var db = DB{
                 .alloc = alloc,
                 .runtime_alloc = runtime_alloc,
@@ -5909,7 +5912,9 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
+            const table_storage_started_ns = monotonicTimeNs();
             try db.initializeTableStorage(opts.table_storage);
+            profile.table_storage_ns = elapsedSince(table_storage_started_ns);
             if (!openModeRequiresReadOnlyBackends(opts.open_mode) and
                 opts.physical_root_mode == .filesystem_managed)
             {
@@ -6157,15 +6162,20 @@ pub const DB = struct {
             }
             self.table_storage = parsed.value;
             if (self.table_storage.dense_embeddings == .vector_store) {
+                const source_open_started = monotonicTimeNs();
                 try self.openSourceVectors(false);
-                // Primary recovery has selected the committed references and
-                // index workers have not started. Reclaim failed preparations
-                // and superseded versions at this initial quiescent boundary.
-                if (!openModeRequiresReadOnlyBackends(self.open_mode)) {
+                const source_open_ns = elapsedSince(source_open_started);
+                const source_recovery_started = monotonicTimeNs();
+                // Source/primary WAL recovery establishes durable authority.
+                // Reclamation is not a prerequisite for reading committed
+                // payloads: retain failed preparations and old versions until
+                // the stable DB maintenance owner completes a bounded mark.
+                if (!openModeRequiresReadOnlyBackends(self.open_mode))
                     try self.refreshSourceVectorOwnershipScopes();
-                    _ = try self.source_vectors.?.collect(&self.core.store.runtime_store);
-                }
+                const source_recovery_ns = elapsedSince(source_recovery_started);
+                const source_generation_started = monotonicTimeNs();
                 try self.core.index_manager.refreshSourcePayloadGeneration();
+                if (openProfileEnabled()) std.log.info("db_source_open_profile path={s} open_ns={} recovery_ns={} generation_ns={}", .{ self.core.path, source_open_ns, source_recovery_ns, elapsedSince(source_generation_started) });
             }
         } else if (requested) |settings| {
             if (openModeRequiresReadOnlyBackends(self.open_mode)) {
@@ -6197,6 +6207,7 @@ pub const DB = struct {
         errdefer self.alloc.destroy(source);
         source.* = try vector_payload_store_mod.Store.openManaged(self.alloc, self.core.index_manager.resource_manager, storage.storage(), root, openModeRequiresReadOnlyBackends(self.open_mode));
         errdefer source.deinit();
+        source.enableBackgroundCollection();
         source.ann_reference_root = try std.fs.path.join(source.alloc, &.{ self.core.index_manager.base_path, "vector-blocks" });
         self.source_vector_storage = storage;
         self.source_vectors = source;
@@ -6237,7 +6248,7 @@ pub const DB = struct {
         // source writes until reopen resolves that outcome; never continue
         // creating references under an unconfirmed table mode.
         errdefer if (self.source_vectors) |source| {
-            source.poisoned = true;
+            source.poison();
         };
         try self.core.store.put(&internal_keys.table_storage_settings_key, encoded);
         try self.core.store.sync(true);
@@ -27772,13 +27783,14 @@ pub const DB = struct {
         more = (try self.rebuildArtifactRepairSummaryIfMissing(self.alloc)) or more;
         more = (try self.rebuildArtifactRepairKindIndexIfMissing(self.alloc)) or more;
         if (self.source_vectors) |source| {
-            const step_bytes = vector_payload_store_mod.Store.collectionStepBytes();
+            const step_bytes = source.backgroundCollectionStepBytes();
             if (step_bytes != 0) {
                 try self.refreshSourceVectorOwnershipScopes();
                 const prior_generation = source.currentGeneration();
                 if (try source.collectBackgroundStepDeferredMark(&self.core.store.runtime_store, step_bytes)) {
                     if (source.currentGeneration() != prior_generation) try self.core.index_manager.refreshSourcePayloadGeneration();
-                } else if (source.collectionPending()) more = true;
+                }
+                if (source.collectionPending()) more = true;
             }
         }
         return more;
@@ -27834,6 +27846,7 @@ pub const DB = struct {
         const active = (platform_time.monotonicNs() >= self.artifact_metadata_retry_after_ns and artifact_active) or
             (self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire));
         const scan_pause = if (self.source_vectors) |source| source.activeScanPauseNs() else null;
+        if (self.source_vectors) |source| if (source.background_checkpoint and scan_pause == null and !active) return 50;
         return std.math.divCeil(u64, scan_pause orelse if (active) artifact_repair_metadata_active_poll_ns else artifact_repair_metadata_poll_ns, std.time.ns_per_ms) catch unreachable;
     }
 
@@ -28133,6 +28146,7 @@ pub const DB = struct {
     }
 
     fn runArtifactRepairMaintenanceTurn(self: *DB) !void {
+        if (self.source_vectors) |source| try source.checkpointMaintenance();
         const independent = if (self.source_vectors) |source| source.independent_scan else false;
         const now = monotonicTimeNs();
         if (!independent or now >= self.artifact_repair_metadata_due_ns)
@@ -28691,20 +28705,83 @@ pub const DB = struct {
         });
     }
 
-    /// Advance only query-readiness debt from the periodic serving lane.
-    /// Split/merge/boundary optimization is intentionally separate: it may
-    /// create fresh dirty dependencies and, without a settled objective plus
-    /// hysteresis, can oscillate between equally valid layouts. Readiness must
-    /// converge independently of that optional topology work.
-    pub fn runDensePostingReadinessMaintenanceForIdle(self: *DB) !usize {
-        lockApply(self);
+    pub const PostingRefreshProgress = hbc_mod.HBCIndex.PostingRefreshProgress;
+
+    pub fn refreshDensePostingPayloadPageBestEffort(self: *DB) !PostingRefreshProgress {
+        // Clean scanning needs only the catalog lifetime and per-index
+        // mutation owner. It must not close query admission or queue behind
+        // a sustained stream of readers simply to discover an empty backlog.
+        const scanned_page = blk: {
+            var lease = self.tryAcquireIndexCatalogReadLease() orelse return .{ .pending = true };
+            defer lease.release();
+            break :blk try self.core.index_manager.refreshDensePostingPayloadPage(false);
+        };
+        if (!scanned_page.needs_write) return scanned_page;
+        // Capture owns leaf/ancestor state and pins immutable input generations.
+        // Native input loading and computation need no DB/catalog/index lock.
+        // Unsupported input formats retain the coherent copied-input path.
+        const capture = blk: {
+            // Keep primary/source fallback reads at one revision while copying
+            // inputs. This shared lease admits queries; no writer fence is
+            // requested until the detached computation has completed.
+            if (!self.core.tryLockApplyShared()) return .{ .pending = true, .scanned = scanned_page.scanned };
+            defer self.core.unlockApplyShared();
+            var lease = self.tryAcquireIndexCatalogReadLease() orelse return .{ .pending = true };
+            defer lease.release();
+            break :blk self.core.index_manager.captureDensePostingRefreshWithOutcome() catch |err| switch (err) {
+                error.ResourceBudgetExceeded => return .{ .pending = true, .scanned = scanned_page.scanned },
+                else => return err,
+            };
+        };
+        const prepared: ?*hbc_mod.HBCIndex.PreparedPostingRefresh = switch (capture) {
+            .prepared => |value| value,
+            .deferred => return .{ .pending = true, .scanned = scanned_page.scanned },
+            .synchronous_required => null,
+        };
+        defer if (prepared) |value| value.deinit();
+        const preparation_started = monotonicTimeNs();
+        defer if (prepared) |value| {
+            if (benchMetricsEnabled()) std.log.info("dense posting prepared outcome leaf={} detached={} published={} elapsed_ns={} capture_ns={} input_ns={} metadata_ns={} read_ns={} input_rows={} binding_hits={}", .{ value.leaf_id, value.detached, value.published, elapsedSince(preparation_started), value.capture_ns, value.input_ns, value.metadata_ns, value.read_ns, value.input_rows, value.binding_hits });
+        };
+        if (prepared) |value| {
+            const started = monotonicTimeNs();
+            value.build() catch |err| switch (err) {
+                error.PreparedInputUnavailable, error.ResourceBudgetExceeded => return .{ .pending = true, .scanned = scanned_page.scanned },
+                else => return err,
+            };
+            value.build_ns = (monotonicTimeNs() -| started) -| value.input_ns;
+        }
+
+        // Upgrade only after finding actual debt, releasing the catalog lease
+        // first to avoid a cycle with a structural writer draining that lease.
+        // Writer-preferring admission makes progress under steady queries;
+        // cancellation reopens admission if existing readers take too long.
+        const admission_started = monotonicTimeNs();
+        if (!self.core.tryLockApplyExclusive()) {
+            const io = self.backend_runtime.io() orelse return .{ .pending = true, .scanned = scanned_page.scanned };
+            const Deadline = struct {
+                until_ns: u64,
+                pub fn isCancelled(token: @This()) bool {
+                    return monotonicTimeNs() >= token.until_ns;
+                }
+            };
+            self.core.apply_mutex.lockExclusiveIo(io, @as(?Deadline, .{
+                .until_ns = monotonicTimeNs() +| 50 * std.time.ns_per_ms,
+            })) catch |err| switch (err) {
+                error.Cancelled => return .{ .pending = true, .scanned = scanned_page.scanned },
+                else => return err,
+            };
+        }
         defer self.core.unlockApply();
-        return try self.core.index_manager.runDensePostingMaintenance(.{
-            .max_postings_per_index = densePostingIdleMaxPostingsPerIndex(),
-            .rebalance_layout = false,
-            .max_layout_changes_per_index = 0,
-            .max_boundary_reassignments_per_index = 0,
-        });
+        if (prepared) |value| value.admission_ns = monotonicTimeNs() -| admission_started;
+        // Recheck the current index state under the exclusive fence: a write
+        // or another refresh may have run between scanning and admission.
+        var repaired = if (prepared) |value|
+            try self.core.index_manager.publishPreparedDensePostingRefresh(value)
+        else
+            try self.core.index_manager.refreshDensePostingPayloadPage(true);
+        repaired.scanned += scanned_page.scanned;
+        return repaired;
     }
 
     pub fn publishCompletedDensePostingCheckpoints(self: *DB) !NativePublicationResult {
@@ -34967,8 +35044,20 @@ pub const DB = struct {
     /// with multiple dense lanes intentionally leave it unset rather than
     /// publishing an ambiguous aggregate.
     pub fn searchWithDenseProfile(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+        try self.enforcePortableRuntimeGate();
+        if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
+        defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
+        const snapshot_input = directSingleVectorRequest(req) orelse req;
+        const dense = snapshot_input.dense orelse if (snapshot_input.query == .dense_knn) snapshot_input.query.dense_knn else null;
+        if (dense) |query| if (try self.trySnapshotDenseSearch(alloc, snapshot_input, query, true)) |captured| {
+            var result = captured;
+            result.request = req;
+            result.request.identity_read_generation = captured.request.identity_read_generation;
+            return result;
+        };
         const search_access = self.beginDenseSearchAccess(req);
         defer self.endDenseSearchAccess(search_access);
+        try self.enforcePortableRuntimeGate();
         const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
         var dense_profile: db_query_search.DenseSearchProfile = .{};
         const result = try self.searchLockedWithExecutionContextImpl(alloc, snapshot_req, .{}, true, &dense_profile);
@@ -35011,6 +35100,15 @@ pub const DB = struct {
         // Keep degraded requests out of catalog/apply lock queues. Revalidate
         // after admission below to close publication's check-to-use race.
         try self.enforcePortableRuntimeGate();
+        if (std.meta.eql(exec_ctx, types.ExecutionContext{})) {
+            const snapshot_input = directSingleVectorRequest(req) orelse req;
+            const dense = snapshot_input.dense orelse if (snapshot_input.query == .dense_knn) snapshot_input.query.dense_knn else null;
+            if (dense) |query| if (try self.trySnapshotDenseSearch(alloc, snapshot_input, query, false)) |captured| {
+                var response_req = req;
+                response_req.identity_read_generation = captured.request.identity_read_generation;
+                return .{ .request = response_req, .result = captured.result };
+            };
+        }
         const bench_profile = benchQueryProfileEnabled();
         const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var generation_ns: u64 = 0;
@@ -35112,7 +35210,7 @@ pub const DB = struct {
         else if (selection_req.full_text) |text|
             try self.searchTextQuery(alloc, selection_req, text)
         else if (selection_req.dense) |dense|
-            try self.searchDense(alloc, selection_req, dense)
+            try self.searchDenseWithProfileSink(alloc, selection_req, dense, dense_profile_sink)
         else if (selection_req.sparse) |sparse|
             try self.searchSparse(alloc, selection_req, sparse)
         else switch (selection_req.query) {
@@ -35137,7 +35235,7 @@ pub const DB = struct {
             .wildcard,
             .regexp,
             => try self.searchText(alloc, selection_req),
-            .dense_knn => |dense| try self.searchDense(alloc, selection_req, dense),
+            .dense_knn => |dense| try self.searchDenseWithProfileSink(alloc, selection_req, dense, dense_profile_sink),
             .sparse_knn => |sparse| try self.searchSparse(alloc, selection_req, sparse),
             .graph => |graph| try self.searchGraph(alloc, selection_req, graph, null),
         };
@@ -36672,6 +36770,16 @@ pub const DB = struct {
         return result;
     }
 
+    fn searchDenseWithProfileSink(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery, sink: ?*db_query_search.DenseSearchProfile) !types.SearchResult {
+        const profile = sink orelse return self.searchDense(alloc, req, dense);
+        // The general search already owns its read lease and identity token.
+        // Direct dense lowering must retain telemetry just like a composed
+        // dense lane, without reacquiring the outer search lock.
+        const profiled = try self.searchDenseProfiledAtSnapshot(alloc, req, dense);
+        profile.* = profiled.profile;
+        return profiled.result;
+    }
+
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         return (try self.searchDenseProfiledWithCapturedRequest(alloc, req, dense)).profiled;
     }
@@ -36686,6 +36794,12 @@ pub const DB = struct {
     ) !ProfiledDenseSearchWithCapturedRequestResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         try self.enforcePortableRuntimeGate();
+        if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
+        defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
+        if (try self.trySnapshotDenseSearch(alloc, req, dense, true)) |captured| return .{
+            .request = captured.request,
+            .profiled = .{ .result = captured.result, .profile = captured.dense_profile.? },
+        };
         const search_access = self.beginDenseSearchAccess(req);
         defer self.endDenseSearchAccess(search_access);
         // Publication can begin after the optimistic retry above. Validate
@@ -37476,6 +37590,154 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         try self.failIfIndexQuarantined(index_name);
         return self.core.denseIndex(index_name);
+    }
+
+    fn snapshotDenseRequestEligible(req: types.SearchRequest) bool {
+        if (req.include_stored or (req.query != .dense_knn and !db_query_search.isDefaultMatchAll(req.query))) return false;
+        // Default-deny future request fields. This first snapshot path handles
+        // plain document-member score pages; filters, hydration, grouping and
+        // composed queries keep their existing synchronization.
+        var remaining = req;
+        const defaults: types.SearchRequest = .{};
+        inline for (.{ "query", "dense", "index_name", "primary_text_index_name", "profile", "limit", "offset", "include_stored", "include_all_fields", "defer_stored_projection", "search_effort", "identity_read_generation", "execution_deadline_ns", "cancellation" }) |field| {
+            @field(remaining, field) = @field(defaults, field);
+        }
+        // Empty slices from a decoded wire envelope need not share the
+        // static default's address. std.meta.eql compares slice pointers.
+        inline for (std.meta.fields(types.SearchRequest)) |field| {
+            switch (@typeInfo(field.type)) {
+                .pointer => |pointer| if (pointer.size == .slice) {
+                    if (@field(remaining, field.name).len == 0 and @field(defaults, field.name).len == 0)
+                        @field(remaining, field.name) = @field(defaults, field.name);
+                },
+                else => {},
+            }
+        }
+        return std.meta.eql(remaining, defaults);
+    }
+
+    const DenseSnapshotExecutor = struct {
+        snapshot: *index_manager_mod.IndexManager.DenseReadSnapshot,
+        identity_generation: u64,
+
+        fn from(ctx: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx.?));
+        }
+        fn text(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+        fn index(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
+            return from(ctx).snapshot.entry;
+        }
+        fn key(ctx: ?*anyopaque, _: []const u8, id: u64) anyerror!?[]u8 {
+            return from(ctx).snapshot.lookupDocKey(id);
+        }
+        fn vectorId(_: ?*anyopaque, _: []const u8, _: []const u8) anyerror!?u64 {
+            return error.UnsupportedQueryRequest;
+        }
+        fn allVisible(ctx: ?*anyopaque, generation: ?u64) anyerror!bool {
+            return generation == from(ctx).identity_generation;
+        }
+        fn visible(_: ?*anyopaque, _: Allocator, _: types.SearchHit) anyerror!bool {
+            return true;
+        }
+        fn parent(_: ?*anyopaque, _: Allocator, _: types.SearchHit) anyerror![]u8 {
+            return error.UnsupportedQueryRequest;
+        }
+        fn parentStored(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+            return error.UnsupportedQueryRequest;
+        }
+        fn stored(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!?[]u8 {
+            return error.UnsupportedQueryRequest;
+        }
+        fn projected(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror![]u8 {
+            return error.UnsupportedQueryRequest;
+        }
+        fn search(ctx: ?*anyopaque, entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.SearchResults {
+            return from(ctx).snapshot.source.context.manager.searchDenseEntryWithRequest(entry, req);
+        }
+        fn profiled(ctx: ?*anyopaque, entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.ProfiledSearchResults {
+            return from(ctx).snapshot.source.context.manager.searchDenseEntryProfiledWithRequest(entry, req);
+        }
+        fn postprocess(ctx: ?*anyopaque, alloc: Allocator, req: types.SearchRequest, raw: types.SearchResult, chunk_backed: bool) anyerror!types.SearchResult {
+            std.debug.assert(!chunk_backed);
+            return db_query_result_shape.postprocessVectorSearchResult(alloc, req, raw, false, .{
+                .ctx = ctx,
+                .is_visible = visible,
+                .resolve_parent_id = parent,
+                .load_parent_stored = parentStored,
+                .load_stored = stored,
+            });
+        }
+        fn executor(self: *@This()) db_query_search.DenseSearchExecutor {
+            return .{ .ctx = self, .text_index_entry = text, .dense_index = index, .lookup_doc_key = key, .lookup_vector_id = vectorId, .all_docs_visible_fast = allVisible, .load_projected_document = projected, .hbc_search = @This().search, .hbc_search_profiled = profiled, .postprocess = postprocess };
+        }
+    };
+
+    fn declineDenseSnapshot(reason: []const u8) ?SearchWithDenseProfileResult {
+        if (benchQueryProfileEnabled()) std.log.info("antfly_bench_db_snapshot declined={s}", .{reason});
+        return null;
+    }
+
+    fn trySnapshotDenseSearch(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery, include_profile: bool) !?SearchWithDenseProfileResult {
+        const manager = self.async_context.resource_manager orelse return null;
+        if (!manager.dense_query_snapshot) return null;
+        if (!snapshotDenseRequestEligible(req)) {
+            if (benchQueryProfileEnabled()) {
+                const defaults: types.SearchRequest = .{};
+                inline for (std.meta.fields(types.SearchRequest)) |field| {
+                    if (!std.meta.eql(@field(req, field.name), @field(defaults, field.name)))
+                        std.log.info("antfly_bench_db_snapshot nondefault_field={s}", .{field.name});
+                }
+            }
+            return declineDenseSnapshot("request");
+        }
+        lockApplyShared(self);
+        var apply_held = true;
+        defer if (apply_held) self.core.unlockApplyShared();
+        if (!self.beginPublishedDenseSearch()) return declineDenseSnapshot("catalog");
+        defer self.endPublishedDenseSearch();
+        // Publication can close admission while this query waits for apply.
+        // Recheck under the same fence as the ordinary dense search path.
+        try self.enforcePortableRuntimeGate();
+        if (ttlDurationNs(self) != 0) return declineDenseSnapshot("ttl");
+        const entry = (try denseIndexCallback(self, req.index_name)) orelse return error.IndexNotFound;
+        if (entry.chunk_name != null or entry.embedding_names.len != 0) return declineDenseSnapshot("result_shape");
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+        const summary = self.core.identity_visibility.summary orelse return declineDenseSnapshot("identity_summary");
+        if (!doc_identity.allVisibleFromSummary(summary, snapshot_req.identity_read_generation)) return declineDenseSnapshot("visibility");
+        try self.proveVectorSearchAccessPath(req.index_name, .dense_vector, false);
+        var captured = (try self.core.index_manager.captureDenseReadSnapshot(entry, self.core.nextDerivedSequence())) orelse return declineDenseSnapshot("generation_bundle");
+        defer captured.deinit();
+        // Every mutable input is now captured; index lifetime remains protected
+        // by the catalog lease until result metadata is fully materialized.
+        self.core.unlockApplyShared();
+        apply_held = false;
+        captured.activate();
+        defer captured.deactivate();
+        var context: DenseSnapshotExecutor = .{ .snapshot = &captured, .identity_generation = snapshot_req.identity_read_generation.? };
+        if (benchQueryProfileEnabled()) std.log.info("antfly_bench_db_snapshot captured=1 source_sequence={d} native_only={}", .{ captured.ann.sourceSequence(), captured.source.snapshot_native_only });
+        const metric_name = entry.config.name;
+        const started = platform_time.monotonicNs();
+        errdefer observeSearchFailureMetric(metric_name, .vector, platform_time.monotonicNs() -| started);
+        if (include_profile) {
+            var result = db_query_search.searchDenseProfiled(alloc, snapshot_req, dense, context.executor()) catch |err| switch (err) {
+                // Release the immutable bundle before retrying through the DB
+                // path that owns durable repair and current-generation checks.
+                error.IncompletePublishedSnapshot, error.DenseSnapshotNeedsPrimary => return null,
+                else => return err,
+            };
+            result.profile.search_route = if (captured.source.snapshot_native_only) "hbc_snapshot_native" else "hbc_snapshot";
+            return .{ .request = snapshot_req, .result = result.result, .dense_profile = result.profile };
+        }
+        var result = db_query_search.searchDense(alloc, snapshot_req, dense, context.executor()) catch |err| switch (err) {
+            error.IncompletePublishedSnapshot, error.DenseSnapshotNeedsPrimary => return null,
+            else => return err,
+        };
+        errdefer result.deinit();
+        db_query_metrics.observeSortProfile(metric_name, .vector, platform_time.monotonicNs() -| started, result.sort_profile);
+        try externalizeSearchResultArtifactIds(alloc, &result);
+        return .{ .request = snapshot_req, .result = result, .dense_profile = null };
     }
 
     fn publishedDenseRequestEligible(req: types.SearchRequest) bool {
@@ -89889,6 +90151,56 @@ test "db runUntilIdle drains lazy dense posting maintenance" {
     }
 }
 
+test "db posting refresh checks clean indexes without exclusive admission" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    db.core.lockApply();
+    const clean = try db.refreshDensePostingPayloadPageBestEffort();
+    db.core.unlockApply();
+    try std.testing.expect(!clean.pending);
+    try std.testing.expectEqual(@as(usize, 0), clean.scanned);
+}
+
+test "db posting refresh cancels dirty admission behind an existing reader" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" }},
+        .sync_level = .full_index,
+    });
+    const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    try entry.index.markNodePostingDirtyForTest(entry.index.metadata.root_node);
+    // Bypass the optional foreground-quiet guard for this lock test.
+    const manager = entry.index.resource_manager;
+    defer entry.index.resource_manager = manager;
+    entry.index.resource_manager = null;
+    db.core.lockApplyShared();
+    const began = monotonicTimeNs();
+    const deferred = try db.refreshDensePostingPayloadPageBestEffort();
+    db.core.unlockApplyShared();
+    try std.testing.expect(deferred.pending);
+    try std.testing.expect(monotonicTimeNs() -| began < std.time.ns_per_s);
+    try std.testing.expect(db.core.tryLockApplyShared());
+    db.core.unlockApplyShared();
+    const repaired = try db.refreshDensePostingPayloadPageBestEffort();
+    try std.testing.expect(repaired.repaired > 0);
+}
+
 test "db cooperative dense posting drain crosses more than one maintenance page" {
     const alloc = std.testing.allocator;
 
@@ -112394,6 +112706,42 @@ test "db search supports fused graph selectors for single-lane full-text searche
     try std.testing.expectEqualStrings("paper:2", result.graph_results[0].hits[0].id);
 }
 
+test "db general profiled search retains direct and lowered dense telemetry" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-direct-dense-profile");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "vec", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"vec\":[1,0,0]}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"vec\":[0,1,0]}}" },
+        },
+        .sync_level = .full_index,
+    });
+    const dense: types.DenseKnnQuery = .{ .vector = &.{ 1, 0, 0 }, .k = 2 };
+    for ([_]types.SearchRequest{
+        .{ .index_name = "vec", .dense = dense, .limit = 2, .profile = true },
+        .{ .index_name = "vec", .query = .{ .dense_knn = dense }, .limit = 2, .profile = true },
+        .{ .dense_queries = &.{.{ .name = "vec", .index_name = "vec", .query = dense }}, .limit = 2, .profile = true },
+    }) |req| {
+        var ordinary = try db.searchWithCapturedRequest(alloc, req);
+        defer ordinary.result.deinit();
+        var profiled = try db.searchWithDenseProfile(alloc, req);
+        defer profiled.result.deinit();
+        const profile = profiled.dense_profile orelse return error.MissingDenseProfile;
+        try std.testing.expect(profile.search_route.len > 0);
+        try std.testing.expectEqual(@as(u64, 2), profile.returned_hit_count);
+        try std.testing.expectEqual(ordinary.request.identity_read_generation, profiled.request.identity_read_generation);
+        try std.testing.expectEqual(ordinary.result.hits.len, profiled.result.hits.len);
+        for (ordinary.result.hits, profiled.result.hits) |expected, actual| {
+            try std.testing.expectEqualStrings(expected.id, actual.id);
+            try std.testing.expectEqual(expected.score, actual.score);
+        }
+    }
+}
+
 test "db search fuses full_text and dense named searches before graph expansion" {
     const alloc = std.testing.allocator;
 
@@ -115664,6 +116012,49 @@ test "db text compaction preserves ordinal filters across reopen" {
         try std.testing.expectEqual(@as(usize, 1), result.hits.len);
         try std.testing.expectEqualStrings("doc:8", result.hits[0].id);
         try std.testing.expectEqual(@as(?doc_set.DocOrdinal, expected_ordinal), result.hits[0].doc_ordinal);
+    }
+}
+
+test "db provisioning reopen preserves an older encoding of the same schema epoch" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-schema-format-retry");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}}}}
+    ;
+    var parsed = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    // The text projection still uses the deployed document-schema format.
+    // This default schema has no capability-only fields to exclude.
+    const original = try schema_mod.serializeTextProjectionSchema(alloc, runtime_schema);
+    defer alloc.free(original);
+    const versioned_key = try schema_mod.schemaVersionKeyAlloc(alloc, 0);
+    defer alloc.free(versioned_key);
+    const active_key = "\x00\x00__metadata__:schema";
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_json);
+        try db.core.store.put(active_key, original);
+        try db.core.store.put(versioned_key, original);
+    }
+    for (0..3) |_| {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_optional_runtimes = false,
+            .schema_before_index_load = .{ .runtime_schema = runtime_schema, .public_schema_json = schema_json },
+        });
+        defer db.close();
+        try std.testing.expect(try schema_mod.schemasEqual(alloc, runtime_schema, db.core.schema.?));
+        for ([_][]const u8{ active_key, versioned_key }) |key| {
+            const actual = try db.core.store.get(alloc, key);
+            defer alloc.free(actual);
+            try std.testing.expectEqualSlices(u8, original, actual);
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "doc:1", .value = "{\"text\":\"still writable\"}" }} });
     }
 }
 
@@ -128109,9 +128500,13 @@ test "source vector table persists references without an ANN index and reopens" 
     try std.testing.expectEqualSlices(u8, second, other);
     // Open schedules artifact cleanup even with index workers disabled. Its
     // metadata scans retain payload sessions, so join this owner's startup
-    // jobs before requiring a quiescent collection to complete in one call.
+    // jobs before driving the bounded collector to completion.
     reopened.backend_runtime.durable_jobs.drainOwner(reopened.repair_cleanup_owner_id);
-    try std.testing.expect(try reopened.collectSourceVectorGarbage());
+    var collection_turns: usize = 0;
+    while (!try reopened.collectSourceVectorGarbage()) : (collection_turns += 1) {
+        if (collection_turns == 1024) return error.CollectionDidNotFinish;
+        platform_time.yieldBriefly();
+    }
     try std.testing.expectEqual(@as(u64, 2), reopened.sourceVectorStats().?.live_payloads_at_collection);
 }
 
@@ -128138,6 +128533,14 @@ test "source vector table collection defers until an old read transaction releas
     defer alloc.free(replacement);
     try db.core.store.put(key, first);
     try db.sync(true);
+    // Full sync may start a bounded mark before the reader is admitted. Drain
+    // that cut first: the assertion below tests admission of a NEW collection
+    // while an old snapshot is active, not completion of its already-safe cut.
+    var initial_gc_turns: usize = 0;
+    while (!try db.collectSourceVectorGarbage()) : (initial_gc_turns += 1) {
+        if (initial_gc_turns == 1024) return error.CollectionDidNotFinish;
+        platform_time.yieldBriefly();
+    }
 
     {
         var reader = try db.core.store.beginReadTxn();
@@ -128155,7 +128558,11 @@ test "source vector table collection defers until an old read transaction releas
         try std.testing.expectEqualSlices(u8, first, try reader.get(key));
     }
 
-    try std.testing.expect(try db.collectSourceVectorGarbage());
+    var collection_turns: usize = 0;
+    while (!try db.collectSourceVectorGarbage()) : (collection_turns += 1) {
+        if (collection_turns == 1024) return error.CollectionDidNotFinish;
+        platform_time.yieldBriefly();
+    }
     try std.testing.expectEqual(@as(u64, 1), db.sourceVectorStats().?.live_payloads_at_collection);
     try std.testing.expectEqual(@as(u64, 1), db.sourceVectorStats().?.retained_payloads);
     const current = try db.core.store.get(alloc, key);
@@ -128317,4 +128724,203 @@ test "db dense artifact rebuild chunks retain nonzero posting capture coverage" 
     try std.testing.expectEqual(@as(?u64, covered), dense.index.experimentalPostingDurableAppliedSequence());
     try std.testing.expectEqual(covered, try db.core.loadAppliedSequence(alloc, name));
     try std.testing.expectEqual(@as(u64, 1), dense.index.stats().active_count);
+}
+
+test "db identity summary restored before reopened query admission" {
+    const alloc = std.testing.allocator;
+    var dir = try TestDirectory.init("identity-reopen");
+    defer dir.cleanup();
+    const path = dir.path().ptr;
+    defer cleanupTempDir(path);
+    const options: OpenOptions = .{ .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } }, .start_index_workers = false, .start_optional_runtimes = false };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), options);
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }}, .sync_level = .write });
+        try db.sync(true);
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(path), options);
+        defer db.close();
+        try std.testing.expect(db.core.identity_visibility.summary != null);
+        try std.testing.expect(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence()));
+        try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .write });
+        try db.sync(true);
+    }
+    var db = try DB.open(alloc, std.mem.span(path), options);
+    defer db.close();
+    try std.testing.expect(db.core.identity_visibility.summary != null);
+    try std.testing.expect(!(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence())));
+}
+
+test "query snapshot eligibility declines residual and future request features" {
+    const req: types.SearchRequest = .{ .dense = .{ .vector = &.{ 1, 2 }, .k = 1 }, .include_stored = false };
+    try std.testing.expect(DB.snapshotDenseRequestEligible(req));
+    var empty_fields = [_][]const u8{"unused"};
+    var empty_prefix = [_]u8{'x'};
+    var decoded = req;
+    decoded.fields = empty_fields[0..0];
+    decoded.filter_prefix = empty_prefix[0..0];
+    try std.testing.expect(DB.snapshotDenseRequestEligible(decoded));
+    var changed = req;
+    changed.include_stored = true;
+    try std.testing.expect(!DB.snapshotDenseRequestEligible(changed));
+    changed = req;
+    changed.filter_prefix = "tenant:";
+    try std.testing.expect(!DB.snapshotDenseRequestEligible(changed));
+    changed = req;
+    changed.filter_doc_ids = &.{"doc:a"};
+    try std.testing.expect(!DB.snapshotDenseRequestEligible(changed));
+    changed = req;
+    changed.filter_query_json = "{\"match_all\":{}}";
+    try std.testing.expect(!DB.snapshotDenseRequestEligible(changed));
+}
+
+test "db prepared posting refresh rejects index replacement and releases capture ownership" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const config: types.IndexConfig = .{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false}",
+    };
+    try db.addIndex(config);
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" }}, .sync_level = .full_index });
+    const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    try entry.index.markNodePostingDirtyForTest(entry.index.metadata.root_node);
+    const manager = entry.index.resource_manager;
+    entry.index.resource_manager = null;
+    const prepared = (try db.core.index_manager.captureDensePostingRefresh()).?;
+    defer prepared.deinit();
+    entry.index.resource_manager = manager;
+    // No capture lock survives into computation: both reader and writer
+    // admission are available, and replacement can retire the original index.
+    try std.testing.expect(db.core.tryLockApplyShared());
+    db.core.unlockApplyShared();
+    try std.testing.expect(entry.apply_mutex.tryLock());
+    entry.apply_mutex.unlock();
+    // Retire the document first so recreating the index does not invoke the
+    // independent backfill/projection-publication lifecycle in this test.
+    try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .full_index });
+    try std.testing.expect(try db.deleteIndex("dv_v1"));
+    for (0..1000) |_| {
+        if (try db.advanceGeneratedArtifactCleanupPage("dv_v1") == .idle) break;
+        db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    }
+    // Computation remains valid after the original index has been destroyed;
+    // only its attempt to publish must be rejected.
+    try prepared.build();
+    try db.addIndex(config);
+    const replacement = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    try std.testing.expect(replacement.capture_incarnation != prepared.identity);
+    // Force an equal epoch to prove incarnation, rather than accidental epoch
+    // inequality, is what rejects reuse of the same catalog name.
+    prepared.epoch = replacement.index.published_mutation_epoch.load(.acquire);
+    const result = try db.core.index_manager.publishPreparedDensePostingRefresh(prepared);
+    try std.testing.expect(result.pending);
+    try std.testing.expectEqual(@as(usize, 0), result.repaired);
+}
+
+test "source vector table defers reopen GC and bounded maintenance preserves readers writes and cancellation" {
+    const alloc = std.testing.allocator;
+    const payload = @import("../artifact_payload.zig");
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    const first = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(first);
+    const second = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 4, 5, 6 });
+    defer alloc.free(second);
+    const third = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 3, &.{ 7, 8, 9 });
+    defer alloc.free(third);
+    const opts: OpenOptions = .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    {
+        var create_opts = opts;
+        create_opts.table_storage = .{ .dense_embeddings = .vector_store };
+        var db = try DB.open(alloc, std.mem.span(path), create_opts);
+        defer db.close();
+        try db.core.store.put(key, first);
+        try db.core.store.put(key, second);
+        const source = db.source_vectors.?;
+        const iface = source.interface();
+        try iface.vtable.prepare(iface.ptr, &.{.{ .reference = try payload.Reference.forArtifact("uncommitted", first), .artifact = first }});
+        try db.core.store.sync(true);
+        try source.checkpoint();
+        try std.testing.expectEqual(@as(u64, 3), source.statsSnapshot().retained_payloads);
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(path), opts);
+        defer db.close();
+        const source = db.source_vectors.?;
+        try std.testing.expect(source.background_gc and source.mark_outside_lock and source.independent_scan);
+        try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().collections);
+        try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().collection_mark_rows);
+        try std.testing.expectEqual(@as(u64, 3), source.statsSnapshot().retained_payloads);
+        source.mark_step_rows = 1;
+        {
+            var old = try db.core.store.beginReadTxn();
+            defer old.abort();
+            try db.core.store.delete(key);
+            _ = try db.runArtifactRepairMetadataMaintenancePass();
+            try std.testing.expect(!source.collectionPending());
+            const retained = try old.get(key);
+            try std.testing.expectEqualSlices(u8, second, retained);
+        }
+        try db.core.store.put(key, third);
+        _ = try db.runArtifactRepairMetadataMaintenancePass();
+        try std.testing.expect(source.collectionPending());
+        _ = try db.runArtifactRepairMetadataMaintenancePass();
+        try std.testing.expect(source.collectionPending());
+        try std.testing.expectEqual(@as(u64, 1), source.statsSnapshot().collection_mark_max_step_rows);
+        // Close cancels the partial mark before its primary owner is destroyed.
+        // No uncommitted deletion/collection is published by this cancellation.
+    }
+    var db = try DB.open(alloc, std.mem.span(path), opts);
+    defer db.close();
+    const source = db.source_vectors.?;
+    try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().collection_mark_rows);
+    const current = try db.core.store.get(alloc, key);
+    defer alloc.free(current);
+    try std.testing.expectEqualSlices(u8, third, current);
+    source.mark_step_rows = 1;
+    var turns: usize = 0;
+    // Recovery may still own a short source session even with optional
+    // workers disabled. An idle pass can mean admission was deferred, not
+    // that verification completed. Drive the same later wakeups as the worker.
+    while (source.statsSnapshot().collections == 0 and source.statsSnapshot().collection_copy_deferrals == 0) : (turns += 1) {
+        const pending = try db.runArtifactRepairMetadataMaintenancePass();
+        const stats = source.statsSnapshot();
+        if (!pending and stats.collections == 0 and stats.collection_copy_deferrals == 0) {
+            try std.testing.expect(stats.collection_deferrals != 0);
+            platform_time.yieldBriefly();
+        }
+        try std.testing.expect(turns < 1024);
+    }
+    try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try std.testing.expect(turns > 1);
+    if (source.cost_based_gc) {
+        try std.testing.expect(source.statsSnapshot().collection_deferred_obsolete_bytes != 0);
+        source.garbage_deadline_seconds = 0;
+        try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    }
+    try std.testing.expectEqual(@as(u64, 1), source.statsSnapshot().retained_payloads);
+    try std.testing.expectEqual(@as(u64, 1), source.statsSnapshot().collection_mark_max_step_rows);
+    try std.testing.expect(source.statsSnapshot().collection_mark_outside_lock_ns > 0);
+    try db.core.store.delete(key);
+    turns = 0;
+    while (!try db.collectSourceVectorGarbage()) : (turns += 1)
+        try std.testing.expect(turns < 1024);
+    try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().retained_payloads);
 }

@@ -2955,6 +2955,12 @@ fn asyncMutexMetricValue(stats: antfly.db.types.DBMutexStats, field: AsyncMutexM
 
 fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.ResourceManager) !void {
     const snapshot = manager.snapshot();
+    try health_metrics.appendPromMetric(writer, "antfly_dense_read_helpers_active", "gauge", "Bounded vector read helpers active", snapshot.dense_read_tasks.active);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_read_helpers_peak_active", "gauge", "Bounded vector read helpers peak_active", snapshot.dense_read_tasks.peak_active);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_read_helpers_limit", "gauge", "Bounded vector read helpers limit", snapshot.dense_read_tasks.limit);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_read_helpers_denied", "counter", "Bounded vector read helpers denied", snapshot.dense_read_tasks.denied);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_physically_ordered_batches_total", "counter", "Rerank payload batches ordered by retained file and offset", snapshot.dense_read_tasks.physically_ordered_batches);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_physically_ordered_requests_total", "counter", "Rerank payload requests ordered by retained file and offset", snapshot.dense_read_tasks.physically_ordered_requests);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_used_bytes", "gauge", "Aggregate physical host memory currently charged to ResourceManager", snapshot.memory.used_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_peak_bytes", "gauge", "Peak aggregate physical host memory charged to ResourceManager", snapshot.memory.peak_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_soft_limit_bytes", "gauge", "Aggregate managed host-memory soft limit", snapshot.memory.soft_limit_bytes);
@@ -5126,8 +5132,10 @@ pub const DataServer = struct {
     // Dense posting repair is time-driven rather than score-driven: checking
     // the backlog requires a posting-state scan, so the worker probes on a
     // fixed cadence and retries quickly only while repairs are landing.
-    const dense_posting_maintenance_idle_interval_ns = 30 * std.time.ns_per_s;
-    const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
+    // Clean indexes use an epoch check, so polling need not impose a 30s
+    // optimization delay after churn. Deferred/partial scans retry promptly.
+    const dense_posting_maintenance_idle_interval_ns = 1 * std.time.ns_per_s;
+    const dense_posting_maintenance_retry_interval_ns = 100 * std.time.ns_per_ms;
     const vector_block_maintenance_interval_ns = 1 * std.time.ns_per_s;
     // Receiving and applying a fetched batch holds ha_state_mutex so promotion
     // cannot consume the standby while records are in flight. Bound both the
@@ -8136,14 +8144,19 @@ pub const DataServer = struct {
             // work alongside the regular LSM maintenance.
             const posting_now_ns = self.backgroundMonotonicNs();
             if (self.densePostingMaintenanceDue(posting_now_ns)) {
-                const posting_steps = live_write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
-                const next_delay_ns: u64 = if (posting_steps > 0)
+                const posting = live_write_source.runDensePostingMaintenanceRoundBestEffort() catch |err| blk: {
+                    std.log.warn("dense posting refresh deferred: {}", .{err});
+                    break :blk @import("../storage/posting_refresh_progress.zig").Progress{ .pending = true };
+                };
+                const next_delay_ns: u64 = if (posting.pending)
                     dense_posting_maintenance_retry_interval_ns
                 else
                     dense_posting_maintenance_idle_interval_ns;
                 self.dense_posting_maintenance_next_eligible_ns.store(posting_now_ns +| next_delay_ns, .release);
-                if (posting_steps > 0) {
-                    std.log.info("dense posting maintenance repaired steps={d}", .{posting_steps});
+                if (posting.repaired > 0) {
+                    std.log.info("dense posting maintenance repaired steps={d} scanned={d} pending={}", .{ posting.repaired, posting.scanned, posting.pending });
+                    self.runtime_status_dirty.store(true, .release);
+                    self.markStoreStatusDirtyImmediate();
                 }
             }
             self.lsm_maintenance_active.store(false, .release);

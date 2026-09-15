@@ -173,6 +173,66 @@ TREATMENTS["mark_planning_sparse"] = {
     **TREATMENTS["mark_planning"],
     **TREATMENTS["mark_sparse_batch"],
 }
+# Exact reference batches: only the ANN matrix fallback changes.
+CONTROLS["batch_reads"] = {"ANTFLY_SOURCE_VECTOR_BATCH_READS": "0"}
+TREATMENTS["batch_reads"] = {"ANTFLY_SOURCE_VECTOR_BATCH_READS": "1"}
+# Positional leases require sharing; hold catalog ownership constant to isolate I/O.
+CONTROLS["positional_reads"] = {
+    "ANTFLY_SOURCE_VECTOR_BATCH_READS": "1",
+    "ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS": "0",
+    "ANTFLY_SOURCE_VECTOR_SHARED_CATALOG": "1",
+}
+TREATMENTS["positional_reads"] = {
+    "ANTFLY_SOURCE_VECTOR_BATCH_READS": "1",
+    "ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS": "1",
+}
+# Matched configuration for comparisons between two pinned binaries.
+CONTROLS["batch_reads_enabled"] = TREATMENTS["batch_reads"].copy()
+TREATMENTS["batch_reads_enabled"] = TREATMENTS["batch_reads"].copy()
+CONTROLS["replay_reads"] = {
+    "ANTFLY_SOURCE_VECTOR_BATCH_READS": "1",
+    "ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS": "1",
+    "ANTFLY_SOURCE_VECTOR_SHARED_CATALOG": "1",
+    "ANTFLY_SOURCE_VECTOR_REPLAY_READS": "0",
+}
+TREATMENTS["replay_reads"] = {"ANTFLY_SOURCE_VECTOR_REPLAY_READS": "1"}
+CONTROLS["replay_segments"] = {
+    **CONTROLS["replay_reads"],
+    **TREATMENTS["replay_reads"],
+    "ANTFLY_SOURCE_VECTOR_APPEND_ONLY": "0",
+    "ANTFLY_SOURCE_VECTOR_SELECTIVE_GC": "0",
+    "ANTFLY_SOURCE_VECTOR_GC_STEP_BYTES": "8388608",
+}
+TREATMENTS["replay_segments"] = {"ANTFLY_SOURCE_VECTOR_APPEND_ONLY": "1"}
+CONTROLS["replay_selective_gc"] = {
+    **CONTROLS["replay_segments"],
+    **TREATMENTS["replay_segments"],
+}
+TREATMENTS["replay_selective_gc"] = {"ANTFLY_SOURCE_VECTOR_SELECTIVE_GC": "1"}
+# Independent source-checkpoint and page-cache qualification. The existing
+# published-read path already stages checkpoints outside the source mutex.
+_SOURCE_IO_BASE = {
+    "ANTFLY_SOURCE_VECTOR_BATCH_READS": "1",
+    "ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS": "1",
+    "ANTFLY_SOURCE_VECTOR_SHARED_CATALOG": "1",
+    "ANTFLY_SOURCE_VECTOR_REPLAY_READS": "1",
+}
+for name, flags in {
+    "source_checkpoint_background": {"ANTFLY_SOURCE_VECTOR_BACKGROUND_CHECKPOINT": "1"},
+    "source_checkpoint_tiered": {"ANTFLY_SOURCE_VECTOR_TIERED_CHECKPOINT": "1"},
+    "source_checkpoint_warm": {"ANTFLY_EXPERIMENT_VECTOR_WRITE_CACHE": "all"},
+    "source_checkpoint_warm_wal": {"ANTFLY_EXPERIMENT_VECTOR_WRITE_CACHE": "wal"},
+}.items():
+    CONTROLS[name] = dict(_SOURCE_IO_BASE)
+    TREATMENTS[name] = flags
+CONTROLS["source_checkpoint_unlocked"] = {
+    **_SOURCE_IO_BASE,
+    "ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS": "0",
+}
+TREATMENTS["source_checkpoint_unlocked"] = {
+    "ANTFLY_SOURCE_VECTOR_UNLOCKED_CHECKPOINT": "1"
+}
+
 ALL_FLAGS = sorted(
     {key for flags in [*TREATMENTS.values(), *CONTROLS.values()] for key in flags}
 )

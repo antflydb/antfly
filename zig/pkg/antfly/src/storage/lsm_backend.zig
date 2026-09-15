@@ -24578,3 +24578,98 @@ fn writeUnknownTombstoneFixture(allocator: Allocator, storage: Storage, root: []
     defer allocator.free(path);
     try storage.writeFileAbsolute(path, manifest);
 }
+
+test "lsm backend source vector payloads write batches pipeline reads with overlay precedence and owned values" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-write-async-sparse-point-batch";
+    const count = 256;
+    const large_value = try alloc.alloc(u8, 8 * 1024);
+    defer alloc.free(large_value);
+    @memset(large_value, 'v');
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        {
+            var txn = try runtime.beginWrite();
+            var key_buf: [64]u8 = undefined;
+            for (0..count) |i| {
+                const key = try std.fmt.bufPrint(&key_buf, "artifact:{d:0>8}:dense", .{i});
+                try txn.put(key, large_value);
+            }
+            try txn.commit();
+            try backend.sync(true);
+        }
+        {
+            var txn = try runtime.beginWrite();
+            try txn.delete("artifact:00000010:dense");
+            try txn.put("artifact:00000011:dense", "newest");
+            try txn.commit();
+            try backend.sync(true);
+        }
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+        .max_concurrent_point_block_reads = 4,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var key_storage: [count][64]u8 = undefined;
+    var keys: [count][]const u8 = undefined;
+    var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_storage[i], "artifact:{d:0>8}:dense", .{i});
+    }
+
+    // A concurrent committed mutable entry plus this transaction's own
+    // overwrite and tombstone must win over pinned immutable runs.
+    var committed = try runtime.beginWrite();
+    try committed.put(keys[12], "committed");
+    try committed.commit();
+    var writer = try runtime.beginWrite();
+    defer writer.abort();
+    try writer.put(keys[13], "overlay");
+    try writer.delete(keys[14]);
+    try writer.getManySorted(&keys, &values);
+    try std.testing.expectEqualStrings("committed", values[12].?);
+    try std.testing.expectEqualStrings("overlay", values[13].?);
+    try std.testing.expect(values[14] == null);
+    try std.testing.expectEqualSlices(u8, large_value, values[0].?);
+    try std.testing.expectEqual(@as(?[]const u8, null), values[10]);
+    try std.testing.expectEqualStrings("newest", values[11].?);
+    try std.testing.expectEqualSlices(u8, large_value, values[count - 1].?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_point);
+    try std.testing.expectEqual(@as(u64, count - 2), stats.get_many_sorted_hits);
+    try std.testing.expectEqual(@as(u64, 2), stats.get_many_sorted_misses);
+    try std.testing.expect(stats.point_run_async_batches > 0);
+    try std.testing.expect(stats.point_run_async_reads_issued >= 2);
+    // Returning from getManySorted has released its temporary probe. Values
+    // must still survive another writer's overwrite and flush/publication.
+    var replacement = try runtime.beginWrite();
+    try replacement.put(keys[0], "replacement");
+    try replacement.put(keys[12], "replacement");
+    try replacement.commit();
+    try backend.sync(true);
+    try std.testing.expectEqualSlices(u8, large_value, values[0].?);
+    try std.testing.expectEqualStrings("committed", values[12].?);
+    try std.testing.expectEqualStrings("overlay", values[13].?);
+}

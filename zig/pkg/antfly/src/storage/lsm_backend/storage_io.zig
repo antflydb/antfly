@@ -2064,7 +2064,10 @@ else
                 .len = len,
                 .io = read_runtime.io,
             };
-            self.future = try read_runtime.io.concurrent(run, .{self});
+            // Parallelism is optional for a range read. At the runtime's
+            // worker limit, async runs on the caller instead of turning
+            // temporary saturation into a failed query or indexing worker.
+            self.future = read_runtime.io.async(run, .{self});
             return .{
                 .ptr = self,
                 .vtable = &vtable,
@@ -4312,6 +4315,33 @@ test "storage range read future fallback waits and cancels" {
 
     var canceled = try storage.beginReadFileRangeAlloc(std.testing.allocator, "/future/a.txt", 0, 5);
     canceled.cancel();
+}
+
+test "native range reads progress without concurrency capacity" {
+    if (!supports_native_storage) return error.SkipZigTest;
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer io_impl.deinit();
+    const runtime = ReadRuntime.init(io_impl.io());
+    var test_tmp = try TestDirectory.init("range-read-saturation");
+    defer test_tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}-payload", .{test_tmp.path()});
+    defer native.storage().deleteFileAbsolute(path) catch {};
+    try native.storage().writeFileAbsolute(path, "hello");
+
+    var future = try NativeRangeReadFuture.create(runtime, native.state, std.testing.allocator, path, 1, 3);
+    const bytes = try future.wait();
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("ell", bytes);
+    var canceled = try NativeRangeReadFuture.create(runtime, native.state, std.testing.allocator, path, 0, 5);
+    canceled.cancel();
+    var missing = try NativeRangeReadFuture.create(runtime, native.state, std.testing.allocator, "/nonexistent/antfly-range-read-saturation", 0, 1);
+    try std.testing.expectError(error.FileNotFound, missing.wait());
 }
 
 test "cold sequential reader is isolated from foreground descriptor cache" {

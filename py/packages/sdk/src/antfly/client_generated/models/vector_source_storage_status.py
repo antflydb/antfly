@@ -74,6 +74,20 @@ class VectorSourceStorageStatus:
         collection_max_copy_ns (int | Unset): Longest locked collection copy step.
         collection_publish_ns (int | Unset): Locked publication time including directory refresh, inventory, receipts
             and reclamation.
+        collection_plan_outside_lock_ns (int | Unset): Time preparing and sorting immutable collection input outside
+            source and DB apply locks.
+        collection_reader_prepare_ns (int | Unset): Time validating staged immutable readers outside source and DB apply
+            locks.
+        collection_max_reader_prepare_ns (int | Unset): Longest detached immutable reader validation step.
+        collection_readers_prepared (int | Unset): Staged immutable readers validated before publication.
+        collection_retire_outside_lock_ns (int | Unset): Time retiring old collection owners and known obsolete files
+            outside source and DB apply locks.
+        collection_copy_deferrals (int | Unset): Verified collections that deferred copying because reclamation benefit
+            was small.
+        collection_deferred_obsolete_bytes (int | Unset): Verified obsolete payload bytes retained by the copy-cost
+            policy.
+        collection_reclaim_deadline_ns (int | Unset): Process-monotonic reclamation scheduling deadline translated from
+            the durable wall-clock deadline; not a completion guarantee.
         collection_max_publish_ns (int | Unset): Longest locked publication step.
         collection_active_scan_turns (int | Unset): Active scan turns scheduled using the experimental wall-time duty
             policy.
@@ -173,6 +187,14 @@ class VectorSourceStorageStatus:
     collection_copy_ns: int | Unset = UNSET
     collection_max_copy_ns: int | Unset = UNSET
     collection_publish_ns: int | Unset = UNSET
+    collection_plan_outside_lock_ns: int | Unset = UNSET
+    collection_reader_prepare_ns: int | Unset = UNSET
+    collection_max_reader_prepare_ns: int | Unset = UNSET
+    collection_readers_prepared: int | Unset = UNSET
+    collection_retire_outside_lock_ns: int | Unset = UNSET
+    collection_copy_deferrals: int | Unset = UNSET
+    collection_deferred_obsolete_bytes: int | Unset = UNSET
+    collection_reclaim_deadline_ns: int | Unset = UNSET
     collection_max_publish_ns: int | Unset = UNSET
     collection_active_scan_turns: int | Unset = UNSET
     collection_active_scan_pause_ns: int | Unset = UNSET
@@ -303,6 +325,22 @@ class VectorSourceStorageStatus:
         collection_max_copy_ns = self.collection_max_copy_ns
 
         collection_publish_ns = self.collection_publish_ns
+
+        collection_plan_outside_lock_ns = self.collection_plan_outside_lock_ns
+
+        collection_reader_prepare_ns = self.collection_reader_prepare_ns
+
+        collection_max_reader_prepare_ns = self.collection_max_reader_prepare_ns
+
+        collection_readers_prepared = self.collection_readers_prepared
+
+        collection_retire_outside_lock_ns = self.collection_retire_outside_lock_ns
+
+        collection_copy_deferrals = self.collection_copy_deferrals
+
+        collection_deferred_obsolete_bytes = self.collection_deferred_obsolete_bytes
+
+        collection_reclaim_deadline_ns = self.collection_reclaim_deadline_ns
 
         collection_max_publish_ns = self.collection_max_publish_ns
 
@@ -489,6 +527,22 @@ class VectorSourceStorageStatus:
             field_dict["collection_max_copy_ns"] = collection_max_copy_ns
         if collection_publish_ns is not UNSET:
             field_dict["collection_publish_ns"] = collection_publish_ns
+        if collection_plan_outside_lock_ns is not UNSET:
+            field_dict["collection_plan_outside_lock_ns"] = collection_plan_outside_lock_ns
+        if collection_reader_prepare_ns is not UNSET:
+            field_dict["collection_reader_prepare_ns"] = collection_reader_prepare_ns
+        if collection_max_reader_prepare_ns is not UNSET:
+            field_dict["collection_max_reader_prepare_ns"] = collection_max_reader_prepare_ns
+        if collection_readers_prepared is not UNSET:
+            field_dict["collection_readers_prepared"] = collection_readers_prepared
+        if collection_retire_outside_lock_ns is not UNSET:
+            field_dict["collection_retire_outside_lock_ns"] = collection_retire_outside_lock_ns
+        if collection_copy_deferrals is not UNSET:
+            field_dict["collection_copy_deferrals"] = collection_copy_deferrals
+        if collection_deferred_obsolete_bytes is not UNSET:
+            field_dict["collection_deferred_obsolete_bytes"] = collection_deferred_obsolete_bytes
+        if collection_reclaim_deadline_ns is not UNSET:
+            field_dict["collection_reclaim_deadline_ns"] = collection_reclaim_deadline_ns
         if collection_max_publish_ns is not UNSET:
             field_dict["collection_max_publish_ns"] = collection_max_publish_ns
         if collection_active_scan_turns is not UNSET:
@@ -677,6 +731,22 @@ class VectorSourceStorageStatus:
 
         collection_publish_ns = d.pop("collection_publish_ns", UNSET)
 
+        collection_plan_outside_lock_ns = d.pop("collection_plan_outside_lock_ns", UNSET)
+
+        collection_reader_prepare_ns = d.pop("collection_reader_prepare_ns", UNSET)
+
+        collection_max_reader_prepare_ns = d.pop("collection_max_reader_prepare_ns", UNSET)
+
+        collection_readers_prepared = d.pop("collection_readers_prepared", UNSET)
+
+        collection_retire_outside_lock_ns = d.pop("collection_retire_outside_lock_ns", UNSET)
+
+        collection_copy_deferrals = d.pop("collection_copy_deferrals", UNSET)
+
+        collection_deferred_obsolete_bytes = d.pop("collection_deferred_obsolete_bytes", UNSET)
+
+        collection_reclaim_deadline_ns = d.pop("collection_reclaim_deadline_ns", UNSET)
+
         collection_max_publish_ns = d.pop("collection_max_publish_ns", UNSET)
 
         collection_active_scan_turns = d.pop("collection_active_scan_turns", UNSET)
@@ -823,6 +893,14 @@ class VectorSourceStorageStatus:
             collection_copy_ns=collection_copy_ns,
             collection_max_copy_ns=collection_max_copy_ns,
             collection_publish_ns=collection_publish_ns,
+            collection_plan_outside_lock_ns=collection_plan_outside_lock_ns,
+            collection_reader_prepare_ns=collection_reader_prepare_ns,
+            collection_max_reader_prepare_ns=collection_max_reader_prepare_ns,
+            collection_readers_prepared=collection_readers_prepared,
+            collection_retire_outside_lock_ns=collection_retire_outside_lock_ns,
+            collection_copy_deferrals=collection_copy_deferrals,
+            collection_deferred_obsolete_bytes=collection_deferred_obsolete_bytes,
+            collection_reclaim_deadline_ns=collection_reclaim_deadline_ns,
             collection_max_publish_ns=collection_max_publish_ns,
             collection_active_scan_turns=collection_active_scan_turns,
             collection_active_scan_pause_ns=collection_active_scan_pause_ns,
