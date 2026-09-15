@@ -1744,3 +1744,140 @@ simulations and 12 reporting/runtime regressions without leaks. Three targeted
 repair-scheduler and sibling-isolation tests passed before the merge. Generated
 checks passed after the merge. The subsequent timing-source commit changes only
 benchmark step execution; server code is identical to the validated merge.
+
+## Resumable fair schema reconstruction — 2026-09-14
+
+Full-text repair now persists bounded snapshot pages and resumes its durable cursor
+across reopen. Structural configuration downgrades its exclusive owner lease before
+reconstruction, allowing foreground reads and Raft apply under the same storage
+generation. A fair queue retains completed proofs and rotates only started work.
+The 25 ms slice and 100 ms pass budgets are cooperative: storage I/O can exceed them.
+
+The completed-prefix component benchmark uses the production queue and a boolean-array
+reference, including allocation and destruction. One warmup and five samples used
+Debug mode with `c_allocator` on macOS ARM64; no compiler jobs were observed at start.
+
+| Groups | Prefix scan median | Queue median | Modeled owner inspections, before → after |
+| --- | ---: | ---: | ---: |
+| 1,000 | 0.584 ms | 1.803 ms | 500,500 → 1,000 |
+| 10,000 | 57.412 ms | 17.878 ms | 50,005,000 → 10,000 |
+
+The queue has higher CPU overhead at 1,000 groups in this cheap boolean reference.
+At 10,000 groups its measured CPU cost is 3.21× lower. The modeled inspection counts
+exclude actual owner I/O, HTTP, Raft, route discovery and the old one-second scheduling
+interval; this is not an end-to-end migration speedup.
+[Raw component samples](system_catalog_schema_queue_2026_09_14.json).
+
+The real workload uses fresh three-metadata/three-data-node clusters, a 10,000-document
+large tenant, five small tenants, and three replicas per shard. Schema changes run
+alongside closed-loop lookup, full-text search and write traffic. It checks every
+acknowledged write and the final search totals. Provisioning is outside the workload
+interval; raw request latencies and all failed runs are retained. This measures
+coexistence and cutover fairness, not a fixed-offered-load production SLO.
+
+Investigation found two additional failure causes: dropped ReadIndex requests could
+consume the entire read deadline, and concurrent control snapshot captures could
+exhaust retained-transfer admission. The implementation retransmits one read identity
+until its first quorum proof, coalesces control snapshot refreshes, retries capture
+admission under the caller's budget, and releases tokens under a separate bounded
+cleanup budget after cancellation. A capacity refusal during routed batch validation
+retains its pre-proposal outcome instead of becoming an ambiguous write.
+[Raw investigation runs](system_catalog_schema_investigation_2026_09_14.json) include
+failed baseline and intermediate candidate runs. The first baseline attempt used an
+incorrect executable basename and failed fixture routing during setup; it is excluded
+from comparisons. Repeated JSON printed by pytest failure assertions is deduplicated
+by exact canonical equality. None of these failed runs is a successful latency sample.
+
+A four-client intermediate run also exposed that the ordinary repair queue could
+select a schema-migration intent with its former 15-second quantum. Both queues now
+use the same 25 ms reconstruction quantum. That run had a forwarded-write timeout;
+a subsequent sample failed during setup with explicit `NoSpaceLeft` errors, after
+which the remaining sample was stopped. These are retained as investigation history,
+not final measurements. The harness now records free disk space and requires at least
+8 GiB before each cluster sample; this does not reserve space against other processes.
+
+The shared-quantum intermediate candidate had no foreground request failures in
+three four-client samples, but two failed final full-text totals: 11,148 vs 10,172
+and 10,801 vs 10,069. These overcounts were four and three 244-document pages.
+A deterministic regression reproduced the crash boundary between durable page data
+and its separate repair-intent cursor: three source documents left four live index
+entries. Query result deduplication masked this in the original small test, so the
+regression now checks physical live count and a one-hit query as well. Resumable
+pages upsert into the private candidate before publication, and defer compaction to
+the serving generation's normal merge scheduler. The original failed run remains
+in the investigation artifact with the expected/actual count assertions.
+
+### Four-client validation after page replay fix
+
+All six page-replay candidate samples use source `5dcf4b323` and executable SHA-256
+`67a0ccc697546f32e10a7c775ccc7137e7be8ac6b2f43a418a0b8df2d219a07d`.
+Five passed all request, acknowledged-write, and final-total checks. One failed with
+five forwarded-write transport timeouts on the large tenant; these retained their
+ambiguous outcomes and were not retried by the harness. Three follow-up diagnostic
+samples passed without reproducing that timeout. Their log watcher did not trigger
+any stack capture. This remaining intermittent timeout prevents claiming a clean
+four-client availability result; it is not evidence of data loss or a successful
+latency sample.
+
+| Sample | Result | Large cutover | Slowest small cutover |
+| --- | --- | ---: | ---: |
+| Primary 0 | Passed | 8.376 s | 8.031 s |
+| Primary 1 | Failed: write timeouts | 15.058 s | 15.245 s |
+| Primary 2 | Passed | 10.693 s | 7.431 s |
+| Diagnostic 0 | Passed | 9.746 s | 6.844 s |
+| Diagnostic 1 | Passed | 8.438 s | 31.462 s |
+| Diagnostic 2 | Passed | 9.014 s | 6.906 s |
+
+These are six fresh-cluster observations with no discarded warmups. The diagnostic
+runs include log polling and are functional validation, not an isolated timing
+comparison. The 31.462-second small-tenant observation also shows that queue fairness
+alone is not an end-to-end cutover latency bound: metadata publication and replica
+readiness remain on the completion path.
+[All page-replay stress samples](system_catalog_schema_stress_2026_09_14.json).
+
+### Paired comparison and native error transport
+
+A subsequent one-client comparison used the same `5dcf4b323` executable, one warmup
+and three measured runs per binary. The baseline passed two of three measured runs
+and failed its warmup; the candidate passed two of three measured runs and its warmup.
+Unrelated worktree compiler jobs ran concurrently, so this is not an isolated latency
+comparison and does not establish an end-to-end speedup.
+
+The failed candidate returned HTTP 500 because `CatalogRoutingSnapshotTimeout` was
+not classified by the native error ABI. The public write handler already distinguishes
+that admission failure from an unknown proposal outcome. The ABI now preserves the
+exact timeout, unavailable and projection-refresh identities, using appended detail
+values; it does not turn ambiguous writes into safe retries. A foreign-dispatch
+regression covers all three admission failures and both ambiguous write outcomes.
+This fixes error transport, not the availability of catalog routing under pressure.
+[All paired observations before the error-transport fix](system_catalog_schema_comparison_2026_09_14.json).
+
+### Post-merge qualification — 2026-09-15
+
+After merging `origin/main` at `0fb01a4ad` (#728) and adding stable native catalog
+routing error identities, the production source was `d9af5068f` (the subsequent
+`851f959fc` changes tests only). Three fresh four-client samples all failed
+availability assertions. No task-owned build or other workload ran concurrently;
+the host was shared and was not an isolated benchmark machine.
+
+| Sample | Failure |
+| --- | --- |
+| 0 | Two lookup requests exceeded their deadlines (HTTP 504). |
+| 1 | A public write exceeded the client's 10-second transport timeout. |
+| 2 | Two writes returned explicit retryable unavailability (HTTP 503). |
+
+The failed cluster roots were retained. Sample 0's metadata leader logged a
+linearizable-read timeout with equal commit and applied indexes. That observation
+does not prove the quorum request or response path was healthy, and does not
+establish a root cause. The current branch therefore has **no clean four-client
+availability qualification**. The repair and native-boundary regressions demonstrate
+their specific fixes; they do not resolve or excuse these remaining workload failures.
+Neither the harness nor the implementation retries ambiguous writes to make a sample
+pass. [All post-merge observations and binary identity](system_catalog_schema_post_merge_2026_09_15.json).
+
+Post-merge functional verification passed: 30 catalog/resilience/backup/migration
+E2Es (196.62 s), all 129 standalone runtime tests, eight compiled storage-owner
+source tests, and three compiled write-boundary/full-text replay regressions.
+Generated-file checks, regenerated Go SDK tests, Python lint/format, and patch
+whitespace checks passed. These checks cover correctness and integration separately
+from the failed four-client qualification above.

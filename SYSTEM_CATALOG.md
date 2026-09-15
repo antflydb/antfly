@@ -851,7 +851,8 @@ Structural configuration acquires the exact descriptor's exclusive lease, then
 atomically downgrades it for reconstruction. Shared generation ownership permits
 foreground reads and Raft apply while preventing concurrent reconfiguration.
 The compiled boundary carries borrowed cancellation, yield, activation and resource
-policy for the synchronous call. Full-text candidates persist a synced page cursor
+policy for the synchronous call. Cold-owner retention remains an explicit, independent
+choice; repair controls do not implicitly retain owners. Full-text candidates persist a synced page cursor
 in the existing durable repair intent; reopening retains the prefix and replays
 writes from the pinned build floor before bounded activation. Each resumable page
 upserts its document IDs into the private candidate: a crash after page persistence
@@ -872,3 +873,8 @@ move the apply target or revoke completion, and retired/cancelled waiters do not
 retransmit. Deadline exhaustion uses the compiled callback's canonical timeout
 classification. The production three-node simulation drops the first forwarded
 request and checks recovery without an application retry.
+
+Catalog routing timeout, unavailability and projection-refresh errors retain exact
+identities across compiled write callbacks. The public handler can therefore keep
+pre-proposal admission failures distinct from an unknown Raft or transaction commit
+outcome. These stable ABI details do not authorize replay of ambiguous writes.
