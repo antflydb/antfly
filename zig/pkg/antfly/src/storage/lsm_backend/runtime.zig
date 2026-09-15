@@ -3810,6 +3810,10 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
 
                 if (maybe_layout) |*layout| {
                     defer layout.deinitAfterUnlockedRead();
+                    // Writer batches use this probe path. Inject publication
+                    // or cancellation only after the exact tip is pinned and
+                    // the backend lock is released, as for single-key reads.
+                    if (builtin.is_test) if (test_current_point_unlocked_hook) |hook| try hook(self.backend);
 
                     const unresolved_keys = try self.metadata_allocator.alloc([]const u8, unresolved_count);
                     defer self.metadata_allocator.free(unresolved_keys);
