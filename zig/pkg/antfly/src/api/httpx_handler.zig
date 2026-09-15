@@ -5772,7 +5772,6 @@ pub const AntflyApiHandler = struct {
                 error.ResidentDbRetryRequired,
                 error.StorageReadTemporarilyUnavailable,
                 error.GenerationTransitionActive,
-                error.StorageBusy,
                 => {
                     var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                     return respondOwnedApiResponse(ctx, &response);
@@ -5866,7 +5865,6 @@ pub const AntflyApiHandler = struct {
             error.ResidentDbRetryRequired,
             error.StorageReadTemporarilyUnavailable,
             error.GenerationTransitionActive,
-            error.StorageBusy,
             => {
                 var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                 return respondOwnedApiResponse(ctx, &response);
