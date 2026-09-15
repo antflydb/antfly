@@ -29,6 +29,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .index_rebuilding, .err = error.IndexRebuilding },
     .{ .status = .invalid_abi, .err = error.InvalidAbiVersion },
     .{ .status = .invalid_argument, .err = error.InvalidArgument },
     .{ .status = .invalid_arguments, .err = error.InvalidArguments },
@@ -691,5 +692,10 @@ pub fn validateForTest() !void {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    // A newly created/rebuilt ANN index has no serving generation yet. This
+    // expected state must survive both compiled query boundaries as a retry,
+    // rather than becoming an unregistered StorageKernelFailure (HTTP 500).
+    try std.testing.expectEqual(abi.Status.index_rebuilding, statusFromError(error.IndexRebuilding));
+    try std.testing.expectError(error.IndexRebuilding, statusToError(.index_rebuilding));
     try validateForTest();
 }
