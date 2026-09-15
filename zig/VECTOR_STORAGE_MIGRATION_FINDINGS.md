@@ -271,8 +271,61 @@ The complete production migration/vector-store suite, including these two
 checks, subsequently passed all 13 tests in 43.11 seconds.
 
 Linux CI exposed two unit fixtures that exhausted a fixed number of tight
-migration steps before ordinary timed GC admission retries became due. Their
+migration steps. Step counts do not bound timed GC admission retries. Their
 completion driver now uses a 30-second deadline, yields during reclamation,
 and reports the durable phase/counters on timeout. The old-reader fixture
 explicitly injects a 250 ms GC retry. All 12 focused DB migration tests pass
 with that case and no leaks. Production admission behavior is unchanged.
+
+## Final 1M screen
+
+Receipts: `.benchmark-results/vector-migration-implementation/final-1m/`.
+The same final binary completed all three arms, including restart, source
+collection and the primary-size regression guard. Each retained exactly
+999,000 source payloads with zero pending source collection bytes.
+
+| Measurement | Fresh vector-store | Online migration | Offline migration |
+|---|---:|---:|---:|
+| Initial ready, seconds | 557.2 | 546.5 | 534.1 |
+| Churn plus migration, seconds | 4.3 | 449.4 | 530.7 |
+| Semantic QPS C1/C8/C32 | 63.0 / 150.8 / 130.0 | 19.7 / 91.8 / 90.3 | 18.7 / 90.4 / 92.6 |
+| Restarted semantic QPS C1/C8/C32 | 18.0 / 83.2 / 103.9 | 19.0 / 86.8 / 98.3 | 20.1 / 92.1 / 91.6 |
+| Restarted semantic C8 p99, ms | 140.0 | 120.7 | 120.2 |
+| Full-text QPS C8, before restart | 82.8 | 86.8 | 81.1 |
+| Mixed QPS C8, before restart | 98.0 | 89.3 | 89.6 |
+| Recall@10 | 0.1094 | 0.1063 | 0.0875 |
+| Warm restart, seconds | 15.55 | 2.46 | 2.47 |
+| Sampled peak process RSS, GiB | 6.84 | 11.67 | 7.14 |
+| Primary SSTable bytes, GB | 0.388 | 0.349 | 0.379 |
+| Allocated disk, GB | 3.980 | 3.977 | 4.006 |
+
+Both migrated tables finish within 1% of fresh total disk. Before queries,
+online primary SSTables were already down to 349 MB and offline to 450 MB;
+ordinary later maintenance reduced offline primary storage further. The
+earlier retained-inline results were 2.595 GB online and 3.614 GB offline.
+Explicit migration completion now includes removal of those superseded primary
+values, while source GC and reader retirement remain separate lifecycle work.
+
+Offline conversion plus churn fell from 1,792.6 to 530.7 seconds (29.9 to 8.85
+minutes), including the newly required primary reclamation. This measures the
+combined implementation changes, not the isolated effect of the block cache.
+Online completion rose from 351.1 to 449.4 seconds with that added reclamation
+work. Its sampled peak RSS is about 71% above fresh storage, so online operators
+still need temporary memory headroom within normal resource admission.
+
+After a matched restart, online semantic QPS is within about 6% of fresh across
+the three concurrencies; offline is within about 12%. Before restart, fresh
+still has the transient ingestion-time advantage. Offline recall is lower in
+this independently built arm, and all absolute recall scores are low. The
+small same-index preservation checks above do not establish unchanged recall
+at 1M. These results qualify conversion/recovery and reclamation for this
+screen, not equivalent query quality or performance. A quality comparison
+would need before/after measurements on the same large built index and repeated
+matched runs. The shared post-churn identity-lookup cost remains a separate
+query-engine follow-up.
+
+Focused test compilation overlapped part of the offline ingestion. There are
+no confidence intervals, cold-cache resets or quiet-host guarantees. The
+packaged Linux Antfly and inference E2E jobs passed for this engine revision;
+rerunning CI with the unit-driver fixes requires the repository's new human
+approval gate for the final PR commit.
