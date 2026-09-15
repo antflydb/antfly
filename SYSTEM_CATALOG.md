@@ -946,6 +946,12 @@ one view for leader, placement, and endpoint selection. Each fanout resolves all
 its destinations before dispatching shard work. Missing-document fallback uses
 readable peer IDs from the router, avoiding another administrative inventory capture.
 
+Exact-group queries issued by join coordinators use the same hosted routing
+adapter before entering local read admission. Remote typed-result probes defer
+to the fenced HTTP query path; local destinations bind their selected route and
+execute through the resident storage owner's routed callbacks. Worker admission
+must never attempt to open a foreign shard on the coordinator.
+
 A local serving leader requires no endpoint discovery. A local Raft member's
 leader observation takes precedence over metadata hints; a non-member's retained
 Raft hint does not. Routing hints never replace the destination's topology fence,

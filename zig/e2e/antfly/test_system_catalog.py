@@ -298,7 +298,10 @@ def test_catalog_literal_table_names(stateful_api, name):
         api.delete(path)
 
 
-def test_catalog_scoped_join_keeps_literal_lookalikes_separate(stateful_api):
+@pytest.mark.parametrize("num_shards", [1, 8])
+def test_catalog_scoped_join_keeps_literal_lookalikes_separate(
+    stateful_api, num_shards
+):
     api = stateful_api
     database = "joins_" + uuid.uuid4().hex[:12]
     root = f"/databases/{database}"
@@ -308,7 +311,7 @@ def test_catalog_scoped_join_keeps_literal_lookalikes_separate(stateful_api):
     literal_path = "/tables/" + literal
     docs = root + "/namespaces/public/tables/docs"
     for path in (scoped, literal_path, docs):
-        api.post(path, {"num_shards": 1})
+        api.post(path, {"num_shards": num_shards})
     try:
         for path, name in ((scoped, "scoped"), (literal_path, "literal")):
             api.post(

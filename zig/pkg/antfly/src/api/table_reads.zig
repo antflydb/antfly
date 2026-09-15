@@ -3276,9 +3276,9 @@ pub const ProvisionedTableReadSource = struct {
                 .scan_group_local_stream = scanGroupLocalStream,
                 .scan_group_local_routed = scanGroupLocalRouted,
                 .scan_group_local_routed_stream = scanGroupLocalRoutedStream,
-                .query_group_local = queryGroupLocal,
+                .query_group_local = queryGroupCoordinator,
                 .query_group_local_routed = queryGroupLocalRouted,
-                .search_result_group_local = searchResultGroupLocal,
+                .search_result_group_local = searchResultGroupCoordinator,
                 .search_result_group_local_routed = searchResultGroupLocalRouted,
                 .text_stats_group_local = textStatsGroupLocal,
                 .text_stats_group_local_routed = textStatsGroupLocalRouted,
@@ -4666,6 +4666,30 @@ pub const ProvisionedTableReadSource = struct {
             return true;
         }
         unreachable;
+    }
+
+    // Joins use exact-group reads at the coordinator as well as at workers.
+    // Route unfenced coordinator calls before local admission; hosted local
+    // routes bind a fence and dispatch through the existing routed callbacks,
+    // which retain this source's resident DB and read-admission owner.
+    fn queryGroupCoordinator(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
+        if (self.distributed_router != null) {
+            var hosted = self.routedHostedSource();
+            return HostedProvisionedTableReadSource.queryGroupLocal(&hosted, alloc, group_id, table_name, req, consistency);
+        }
+        return queryGroupLocal(ptr, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn searchResultGroupCoordinator(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
+        if (self.distributed_router != null) {
+            var hosted = self.routedHostedSource();
+            return HostedProvisionedTableReadSource.searchResultGroupLocal(&hosted, alloc, group_id, table_name, req, consistency);
+        }
+        return searchResultGroupLocal(ptr, alloc, group_id, table_name, req, consistency);
     }
 
     fn queryGroupLocal(
@@ -23577,6 +23601,42 @@ fn consumerTests() type {
             var response = try HostedProvisionedTableReadSource.executeInternalRequest(&hosted, std.testing.allocator, request);
             defer response.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 200), response.status);
+
+            const Router = struct {
+                fn localNodeId(_: *anyopaque) u64 {
+                    return 1;
+                }
+                fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+                    return .absent;
+                }
+                fn nodeUri(_: *anyopaque, allocator: std.mem.Allocator, _: u64) !?[]u8 {
+                    return try allocator.dupe(u8, "http://peer.test");
+                }
+                fn routes(_: *anyopaque, allocator: std.mem.Allocator, ids: []const u64, _: table_router.RoutePolicy, _: table_router.RouteBudget) !?[]table_router.GroupRoute {
+                    try std.testing.expectEqualSlices(u64, &.{7001}, ids);
+                    const result = try allocator.alloc(table_router.GroupRoute, 1);
+                    errdefer allocator.free(result);
+                    result[0] = .{ .remote = .{ .node_id = 2, .base_uri = try allocator.dupe(u8, "http://peer.test") } };
+                    return result;
+                }
+            };
+            var provisioned = ProvisionedTableReadSource.init("must-not-open", FakeCatalog.source(), raft_mod.read_gate.alreadyReadSafeBarrier());
+            _ = provisioned.withDistributedRouting(.{ .ptr = undefined, .vtable = &.{
+                .local_node_id = Router.localNodeId,
+                .local_status = Router.localStatus,
+                .node_base_uri = Router.nodeUri,
+                .resolve_group_routes = Router.routes,
+            } }, executor.iface(), null, null);
+            // Distributed joins first try the local typed result, then the
+            // wire response. A remote shard must never enter local admission.
+            const source = provisioned.source();
+            try std.testing.expect((try source.searchResultGroupLocal(std.testing.allocator, 7001, "docs", .{}, .read_index)) == null);
+            executor.acknowledge = false;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.queryGroupLocal(std.testing.allocator, 7001, "docs", .{}, .read_index));
+            executor.acknowledge = true;
+            var routed_response = (try source.queryGroupLocal(std.testing.allocator, 7001, "docs", .{}, .read_index)).?;
+            defer routed_response.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("{}", routed_response.json);
         }
 
         test "join job-state polling bypasses storage route fencing without weakening storage reads" {
