@@ -1092,6 +1092,13 @@ pub const InferenceRequestAdmissionSource = struct {
     }
 };
 
+pub const RuntimeIoViews = struct {
+    api: ?std.Io = null,
+    api_network: ?std.Io = null,
+    api_filesystem: ?std.Io = null,
+    durable: ?std.Io = null,
+};
+
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     experimental: bool = false,
@@ -1146,6 +1153,7 @@ pub const ApiHttpServerConfig = struct {
     internal_service_accept_legacy_unauthenticated: bool = false,
     deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    imported_runtime_io: ?RuntimeIoViews = null,
     storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
     /// Node-local Raft quarantine diagnostics and fenced recovery. The source
     /// owns runtime serialization; handlers never access a Raft host directly.
@@ -3174,8 +3182,8 @@ pub const ApiHttpServer = struct {
                 .repair_job_store_path = cfg.repair_job_store_path,
                 .repair_job_retention_ms = cfg.repair_job_retention_ms,
             }),
-            .restore_job_store = if (cfg.backend_runtime) |runtime|
-                if (runtime.io()) |io| restore_jobs.Store.initWithIo(owner_alloc, io) else restore_jobs.Store.init(owner_alloc)
+            .restore_job_store = if (configuredDurableIo(cfg)) |io|
+                restore_jobs.Store.initWithIo(owner_alloc, io)
             else
                 restore_jobs.Store.init(owner_alloc),
             .repair_job_owner_id = owner_ids.repair,
@@ -3210,8 +3218,31 @@ pub const ApiHttpServer = struct {
 
     fn queryEmbeddingCacheIo(cfg: ApiHttpServerConfig) std.Io {
         const fallback = std.Io.Threaded.global_single_threaded.io();
-        const runtime = cfg.backend_runtime orelse return fallback;
-        return runtime.apiIo() orelse fallback;
+        return configuredApiIo(cfg) orelse fallback;
+    }
+
+    fn configuredApiIo(cfg: ApiHttpServerConfig) ?std.Io {
+        if (cfg.imported_runtime_io) |views| return views.api;
+        const runtime = cfg.backend_runtime orelse return null;
+        return runtime.apiIo();
+    }
+
+    fn configuredApiNetworkIo(cfg: ApiHttpServerConfig) ?std.Io {
+        if (cfg.imported_runtime_io) |views| return views.api_network;
+        const runtime = cfg.backend_runtime orelse return null;
+        return runtime.apiNetworkIo();
+    }
+
+    fn configuredApiFilesystemIo(cfg: ApiHttpServerConfig) ?std.Io {
+        if (cfg.imported_runtime_io) |views| return views.api_filesystem;
+        const runtime = cfg.backend_runtime orelse return null;
+        return runtime.apiFilesystemIo();
+    }
+
+    fn configuredDurableIo(cfg: ApiHttpServerConfig) ?std.Io {
+        if (cfg.imported_runtime_io) |views| return views.durable;
+        const runtime = cfg.backend_runtime orelse return null;
+        return runtime.io();
     }
 
     fn protocolStoreNowNs() u64 {
@@ -3220,8 +3251,7 @@ pub const ApiHttpServer = struct {
 
     pub fn inferenceIo(self: *const ApiHttpServer) std.Io {
         const fallback = std.Io.Threaded.global_single_threaded.io();
-        const runtime = self.cfg.backend_runtime orelse return fallback;
-        return runtime.apiNetworkIo() orelse fallback;
+        return configuredApiNetworkIo(self.cfg) orelse fallback;
     }
 
     pub fn requestStats(self: *ApiHttpServer) RequestStats {
@@ -3769,8 +3799,8 @@ pub const ApiHttpServer = struct {
             .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
-            .network_io = if (self.cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null,
-            .filesystem_io = if (self.cfg.backend_runtime) |runtime| runtime.apiFilesystemIo() else null,
+            .network_io = self.sharedApiNetworkIo(),
+            .filesystem_io = self.sharedApiFilesystemIo(),
         }, &self.connections_cache, .{
             .include_models = connections_api.includeHasModels(include_param),
             .probe = connections_api.includeHasStatus(include_param),
@@ -3838,13 +3868,11 @@ pub const ApiHttpServer = struct {
     /// Shared asynchronous I/O runtime for short-lived API helpers. Borrowers
     /// must not retain it beyond the server lifetime.
     pub fn sharedApiIo(self: *ApiHttpServer) ?std.Io {
-        const runtime = self.cfg.backend_runtime orelse return null;
-        return runtime.apiIo();
+        return configuredApiIo(self.cfg);
     }
 
     pub fn sharedApiNetworkIo(self: *ApiHttpServer) ?std.Io {
-        const runtime = self.cfg.backend_runtime orelse return null;
-        return runtime.apiNetworkIo();
+        return configuredApiNetworkIo(self.cfg);
     }
 
     /// Local backup repositories need the API lane's native filesystem
@@ -3854,16 +3882,14 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         location: *const backups_api.BackupLocation,
     ) ?std.Io {
-        const runtime = self.cfg.backend_runtime orelse return null;
         return switch (location.*) {
-            .file => runtime.apiFilesystemIo(),
-            .remote => runtime.apiNetworkIo(),
+            .file => self.sharedApiFilesystemIo(),
+            .remote => self.sharedApiNetworkIo(),
         };
     }
 
     pub fn sharedApiFilesystemIo(self: *ApiHttpServer) ?std.Io {
-        const runtime = self.cfg.backend_runtime orelse return null;
-        return runtime.apiFilesystemIo();
+        return configuredApiFilesystemIo(self.cfg);
     }
 
     /// Native shard backup and restore always operate on local files, even
@@ -6018,10 +6044,8 @@ pub const ApiHttpServer = struct {
     }
 
     fn internalAuthRealtimeNs(self: *ApiHttpServer) i128 {
-        if (self.cfg.backend_runtime) |runtime| {
-            if (runtime.io()) |io|
-                return @intCast(std.Io.Clock.real.now(io).nanoseconds);
-        }
+        if (configuredDurableIo(self.cfg)) |io|
+            return @intCast(std.Io.Clock.real.now(io).nanoseconds);
         return nowNs();
     }
 
@@ -9129,11 +9153,25 @@ pub const ApiHttpServer = struct {
                 "reservation_ownership_lost",
             );
         }
-        var writer_lease_future = std.Io.async(
+        var writer_lease_future = std.Io.concurrent(
             io,
             TableBackupWriterLeaseHeartbeat.run,
             .{&writer_lease_heartbeat},
-        );
+        ) catch |err| {
+            return self.rollbackFailedTableBackupAttempt(
+                io,
+                backup_location,
+                location_uri,
+                connection,
+                backup_id,
+                artifact_backup_id,
+                format,
+                writer_lease_role.rollbackWriterStateCleanup(),
+                &operation_control,
+                err,
+                "writer_lease_heartbeat",
+            );
+        };
         var writer_lease_future_running = true;
         defer if (writer_lease_future_running) {
             writer_lease_heartbeat.stop_event.set(io);
@@ -9455,7 +9493,7 @@ pub const ApiHttpServer = struct {
             .expires_at_unix_ns = .init(writer_not_after),
         };
         try writer_lease.ensureOwned();
-        var writer_lease_future = std.Io.async(
+        var writer_lease_future = try std.Io.concurrent(
             io,
             TableBackupWriterLeaseHeartbeat.run,
             .{&writer_lease},
@@ -13967,11 +14005,11 @@ pub const ApiHttpServer = struct {
         // the stored lease, then keep it alive across long shard snapshots.
         trace.enter(.lease_heartbeat);
         lease_heartbeat.ensureOwned() catch |err| return trace.internal(err);
-        var lease_future = std.Io.async(
+        var lease_future = std.Io.concurrent(
             backup_io,
             ClusterBackupMutationLeaseHeartbeat.run,
             .{&lease_heartbeat},
-        );
+        ) catch |err| return trace.internal(err);
         var lease_future_running = true;
         defer if (lease_future_running) {
             lease_heartbeat.stop_event.set(backup_io);
@@ -15894,8 +15932,7 @@ pub const ApiHttpServer = struct {
 
         fn run(ptr: *anyopaque) !void {
             const self: *TableRepairJobHeartbeatWork = @ptrCast(@alignCast(ptr));
-            const runtime = self.server.cfg.backend_runtime orelse return;
-            const api_io = runtime.apiIo() orelse return;
+            const api_io = self.server.sharedApiIo() orelse return;
             var elapsed_ns: u64 = 0;
             while (!self.stop.load(.acquire)) {
                 api_io.sleep(std.Io.Duration.fromNanoseconds(@intCast(poll_ns)), .awake) catch {};
@@ -15956,7 +15993,7 @@ pub const ApiHttpServer = struct {
     fn submitTableRepairJobHeartbeat(self: *ApiHttpServer, job_id: u64, attempt_id: u64) !?*TableRepairJobHeartbeatWork {
         const runtime = self.cfg.backend_runtime orelse return null;
         if (runtime.threaded_jobs == null) return null;
-        if (runtime.apiIo() == null) return null;
+        if (self.sharedApiIo() == null) return null;
         if (self.repair_job_owner_id == 0) return null;
 
         const heartbeat = try self.alloc.create(TableRepairJobHeartbeatWork);
@@ -47882,4 +47919,251 @@ test "query builder dependency 503 responses preserve public retry contract" {
         }
         try std.testing.expect(retry_header);
     }
+}
+
+const BackupHeartbeatTestPath = enum { cluster, table, shard };
+
+fn testBackupHeartbeatCapacity(path: BackupHeartbeatTestPath, reject_concurrent: bool) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/heartbeat-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/heartbeat-backup", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+    var location: backups_api.BackupLocation = .{ .file = try alloc.dupe(u8, backup_root_abs) };
+    defer location.deinit(alloc);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{
+        .async_limit = if (reject_concurrent) .limited(8) else .nothing,
+        .concurrent_limit = if (reject_concurrent) .nothing else .limited(8),
+    });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = io, .api = io },
+    });
+    defer runtime.deinit();
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 1,
+    });
+    var writes = table_writes.BoundTableWriteSource.init("docs", &db);
+    const Source = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .linearizable_snapshot = linearizableSnapshot,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            return try adminSnapshot(ptr);
+        }
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 0,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var source = Source{};
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var server = ApiHttpServer.init(alloc, .{
+        .node_config = &node_config,
+        .backend_runtime = &runtime,
+    }, source.iface(), null, writes.source());
+    defer server.deinit();
+    const snapshot = try Source.adminSnapshot(&source);
+    var fence = backups_api.tableBackupFence(&snapshot, &snapshot.tables[0]);
+    const expiration = @as(u64, @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) + backups_api.table_backup_writer_lease_duration_ns;
+    fence.writer_not_after_unix_ns = expiration;
+    const logical_id = "heartbeat-snap";
+    const artifact_id = "afbg-0123456789abcdef0123456789abcdef";
+
+    if (path == .shard) {
+        try backups_api.reserveTableBackupWriterLeaseAtLocation(alloc, io, &location, artifact_id, expiration);
+        if (reject_concurrent) {
+            const outcome = server.executeInternalTableBackupShard(
+                0,
+                "docs",
+                artifact_id,
+                .portable,
+                fence,
+                &location,
+                .{},
+            );
+            const accepted = if (outcome) |unexpected| accepted: {
+                freeBackupShards(alloc, unexpected);
+                break :accepted true;
+            } else |err| accepted: {
+                try std.testing.expectEqual(error.ConcurrencyUnavailable, err);
+                break :accepted false;
+            };
+            std.debug.print("BACKUP_HEARTBEAT_SHARD expects rejected concurrent admission\n", .{});
+            try std.testing.expect(!accepted);
+            try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(alloc, io, &location, artifact_id, expiration));
+            io_impl.concurrent_limit = .limited(8);
+        }
+        const shards = try server.executeInternalTableBackupShard(0, "docs", artifact_id, .portable, fence, &location, .{});
+        defer freeBackupShards(alloc, shards);
+        try std.testing.expectEqual(@as(usize, 1), shards.len);
+        try std.testing.expectEqual(@as(u64, 0), shards[0].group_id);
+        try std.testing.expect(shards[0].artifact_size_bytes > 0);
+        try std.testing.expectEqual(@as(usize, 64), shards[0].artifact_sha256.len);
+        return;
+    }
+    if (path == .table and reject_concurrent) {
+        std.debug.print("BACKUP_HEARTBEAT_TABLE expects ConcurrencyUnavailable\n", .{});
+        try std.testing.expectError(error.ConcurrencyUnavailable, server.backupOwnedTableWithArtifactId(
+            io,
+            &snapshot.tables[0],
+            fence,
+            "docs",
+            &location,
+            location_uri,
+            logical_id,
+            artifact_id,
+            .portable,
+            "test-backups",
+            null,
+            .logical_create,
+            .{},
+        ));
+        const retained = try backups_api.tableBackupAttemptArtifactIdAlloc(alloc, io, &location, logical_id);
+        defer if (retained) |value| alloc.free(value);
+        try std.testing.expect(retained == null);
+        try std.testing.expect(!try backups_api.renewTableBackupWriterLeaseAtLocation(alloc, io, &location, artifact_id, expiration));
+        try std.testing.expect(!try backups_api.manifestExistsAtLocationWithIoAndCancellation(alloc, io, &location, logical_id, .none));
+        io_impl.concurrent_limit = .limited(8);
+    }
+    const body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"{s}\",\"location\":\"{s}\",\"connection\":\"test-backups\",\"format\":\"portable\"}}", .{ logical_id, location_uri });
+    defer alloc.free(body);
+    const uri = if (path == .cluster) "/backup" else "/tables/docs/backup";
+    if (path == .cluster and reject_concurrent) {
+        var failed = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer failed.deinit(alloc);
+        std.debug.print("BACKUP_HEARTBEAT_CLUSTER expects status 500\n", .{});
+        try std.testing.expectEqual(@as(u16, 500), failed.status);
+        try std.testing.expect(!try backups_api.clusterManifestExistsAtLocation(alloc, &location, logical_id));
+        io_impl.concurrent_limit = .limited(8);
+    }
+    var response = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = uri,
+        .content_type = "application/json",
+        .body = body,
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, if (path == .cluster) 200 else 201), response.status);
+    if (path == .cluster) {
+        try std.testing.expect(std.mem.indexOf(u8, response.body, "\"completed\"") != null);
+        var manifest = try backups_api.readClusterManifest(alloc, backup_root_abs, logical_id);
+        defer manifest.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), manifest.tables.len);
+        try std.testing.expectEqualStrings("docs", manifest.tables[0].name);
+    } else {
+        var manifest = try backups_api.readManifest(alloc, backup_root_abs, logical_id);
+        defer manifest.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), manifest.shards.len);
+        try std.testing.expect(manifest.shards[0].artifact_size_bytes > 0);
+    }
+}
+
+test "backup heartbeat public cluster progresses with exhausted async capacity" {
+    try testBackupHeartbeatCapacity(.cluster, false);
+}
+
+test "backup heartbeat public table progresses with exhausted async capacity" {
+    try testBackupHeartbeatCapacity(.table, false);
+}
+
+test "backup heartbeat internal shard progresses with exhausted async capacity" {
+    try testBackupHeartbeatCapacity(.shard, false);
+}
+
+test "backup heartbeat cluster admission failure permits same ID retry" {
+    @import("../test_error_logs.zig").expectErrorLogs(1);
+    try testBackupHeartbeatCapacity(.cluster, true);
+}
+
+test "backup heartbeat table admission failure retires owned writer and reservation" {
+    try testBackupHeartbeatCapacity(.table, true);
+}
+
+test "backup heartbeat shard admission failure preserves coordinator writer" {
+    try testBackupHeartbeatCapacity(.shard, true);
+}
+
+test "imported runtime I/O views override raw runtime including unavailable views" {
+    var tokens: [5]u8 = @splat(0);
+    const owner_io: std.Io = .{ .userdata = &tokens[0], .vtable = std.Io.failing.vtable };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = owner_io },
+    });
+    defer runtime.deinit();
+    var cfg: ApiHttpServerConfig = .{
+        .backend_runtime = runtime.ptr(),
+        .imported_runtime_io = .{
+            .api = .{ .userdata = &tokens[1], .vtable = std.Io.failing.vtable },
+            .api_network = .{ .userdata = &tokens[2], .vtable = std.Io.failing.vtable },
+            .api_filesystem = .{ .userdata = &tokens[3], .vtable = std.Io.failing.vtable },
+            .durable = .{ .userdata = &tokens[4], .vtable = std.Io.failing.vtable },
+        },
+    };
+    try std.testing.expect(ApiHttpServer.configuredApiIo(cfg).?.userdata == @as(?*anyopaque, &tokens[1]));
+    try std.testing.expect(ApiHttpServer.configuredApiNetworkIo(cfg).?.userdata == @as(?*anyopaque, &tokens[2]));
+    try std.testing.expect(ApiHttpServer.configuredApiFilesystemIo(cfg).?.userdata == @as(?*anyopaque, &tokens[3]));
+    try std.testing.expect(ApiHttpServer.configuredDurableIo(cfg).?.userdata == @as(?*anyopaque, &tokens[4]));
+    try std.testing.expect(ApiHttpServer.queryEmbeddingCacheIo(cfg).userdata == @as(?*anyopaque, &tokens[1]));
+    cfg.imported_runtime_io = .{};
+    try std.testing.expect(ApiHttpServer.configuredApiIo(cfg) == null);
+    try std.testing.expect(ApiHttpServer.configuredApiNetworkIo(cfg) == null);
+    try std.testing.expect(ApiHttpServer.configuredApiFilesystemIo(cfg) == null);
+    try std.testing.expect(ApiHttpServer.configuredDurableIo(cfg) == null);
+    cfg.imported_runtime_io = null;
+    try std.testing.expect(ApiHttpServer.configuredApiIo(cfg).?.userdata == owner_io.userdata);
+    try std.testing.expect(ApiHttpServer.configuredApiNetworkIo(cfg).?.userdata == owner_io.userdata);
+    try std.testing.expect(ApiHttpServer.configuredApiFilesystemIo(cfg).?.userdata == owner_io.userdata);
+    try std.testing.expect(ApiHttpServer.configuredDurableIo(cfg).?.userdata == owner_io.userdata);
+    cfg.backend_runtime = null;
+    try std.testing.expect(ApiHttpServer.configuredApiIo(cfg) == null);
+    try std.testing.expect(ApiHttpServer.configuredDurableIo(cfg) == null);
 }
