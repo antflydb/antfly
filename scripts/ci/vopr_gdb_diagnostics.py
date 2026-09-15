@@ -45,6 +45,27 @@ def request_details():
         frame = frame.older()
 
 
+def repair_attempt():
+    """Retain repair state behind a coarse materialization timeout."""
+    frame = gdb.newest_frame()
+    gdb.write(f"VOPR repair boundary: {frame.name()}\n")
+    for name in ("repair_id", "terminal", "err_name"):
+        try:
+            value = frame.read_var(name)
+            if name == "err_name":
+                length = min(int(value["len"]), 512)
+                value = bytes(gdb.selected_inferior().read_memory(int(value["ptr"]), length))
+            gdb.write(f"  {name}={value}\n")
+        except (gdb.error, ValueError):
+            pass
+    try:
+        intent = frame.read_var("entry").dereference()["intent"]
+        for name in ("phase", "attempt_count", "failure_streak", "next_retry_at_ms", "last_error"):
+            gdb.write(f"  {name}={intent[name]}\n")
+    except (gdb.error, ValueError):
+        pass
+
+
 def suspended_tasks(fixture):
     """Read saved fiber stacks before teardown destroys the retained owners."""
     runtime = fixture.dereference()["sim"].dereference()
@@ -184,6 +205,10 @@ gdb.execute("set pagination off")
 gdb.execute("set confirm off")
 gdb.execute("set print elements 12")
 gdb.execute("set breakpoint pending on")
+for expression in ("DB.recordIndexRepairAttemptFailure", "DB.advanceIndexRepairIntentOwned"):
+    for breakpoint in gdb.rbreak(expression):
+        breakpoint.silent = True
+        breakpoint.commands = "silent\npython repair_attempt()\ncontinue\n"
 # These are infrequent ownership/control boundaries, not scheduler steps.
 for expression in (
     "production_cluster.*[A-Za-z]+Reconcile",
