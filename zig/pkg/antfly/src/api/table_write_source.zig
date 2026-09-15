@@ -59,8 +59,8 @@ pub const LocalStructuralReconcileResult = struct {
     restore_repair_pending: u64 = 0,
 };
 
-/// One exact structural observation captured before a transient compiled
-/// owner is retired. The control plane publishes `runtime_status` under the
+/// One exact structural observation captured while the compiled owner lease
+/// still pins its generation. The control plane publishes `runtime_status` under the
 /// same table epoch that admitted the reconcile operation.
 pub const LocalStructuralReconcileObservation = struct {
     result: LocalStructuralReconcileResult,
@@ -552,7 +552,7 @@ pub const TableWriteSource = struct {
             req: db_mod.types.TransactionIntentRequest,
             context: distributed_txn.PreDecisionContext,
         ) anyerror!?void = null,
-        reconcile_table_group_local_transient_observed: ?*const fn (
+        reconcile_table_group_local_observed: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             group_id: u64,
@@ -560,6 +560,7 @@ pub const TableWriteSource = struct {
             target_index_name: ?[]const u8,
             advance_index_repair: bool,
             repair_options: db_mod.types.ArtifactRepairRunOptions,
+            retain_cold_owner: bool,
         ) anyerror!?LocalStructuralReconcileObservation = null,
         local_runtime_status_group_local: ?*const fn (
             ptr: *anyopaque,
@@ -1443,7 +1444,7 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("reconcile_table_group_local_transient", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, target_index_name, advance_index_repair });
     }
 
-    pub fn reconcileTableGroupLocalTransientObserved(
+    pub fn reconcileTableGroupLocalObserved(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
         group_id: u64,
@@ -1451,17 +1452,10 @@ pub const TableWriteSource = struct {
         target_index_name: ?[]const u8,
         advance_index_repair: bool,
         repair_options: db_mod.types.ArtifactRepairRunOptions,
+        retain_cold_owner: bool,
     ) !?LocalStructuralReconcileObservation {
-        const fn_ptr = self.vtable.reconcile_table_group_local_transient_observed orelse {
-            const result = (try self.reconcileTableGroupLocalTransient(
-                group_id,
-                table_name,
-                target_index_name,
-                advance_index_repair,
-            )) orelse return null;
-            return .{ .result = result };
-        };
-        return try BoundaryAbi.call("reconcile_table_group_local_transient_observed", self.boundary_dispatch, fn_ptr, .{
+        const fn_ptr = self.vtable.reconcile_table_group_local_observed orelse return null;
+        return try BoundaryAbi.call("reconcile_table_group_local_observed", self.boundary_dispatch, fn_ptr, .{
             self.ptr,
             alloc,
             group_id,
@@ -1469,6 +1463,7 @@ pub const TableWriteSource = struct {
             target_index_name,
             advance_index_repair,
             repair_options,
+            retain_cold_owner,
         });
     }
 
@@ -1594,6 +1589,7 @@ fn consumerTests() type {
             // admission failures retain their exact public classification,
             // while an ambiguous proposal must never become retryable.
             inline for (.{
+                error.StorageBusy,
                 error.CatalogRoutingSnapshotTimeout,
                 error.CatalogRoutingUnavailable,
                 error.CatalogProjectionRefreshRequired,

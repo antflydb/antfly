@@ -681,6 +681,16 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const hbc_isolate_step = b.step("hbc-isolate", "Build and install hbc_isolate");
     hbc_isolate_step.dependOn(&b.addInstallArtifact(hbc_isolate, .{}).step);
 
+    const build_quality_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench_build_quality.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    build_quality_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
+    const build_quality = b.addExecutable(.{ .name = "bench_build_quality", .root_module = build_quality_mod });
+    const build_quality_step = b.step("bench-build-quality", "Build bounded-bootstrap held-out recall benchmark");
+    build_quality_step.dependOn(&b.addInstallArtifact(build_quality, .{}).step);
+
     const dense_stack_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/dense_stack_bench.zig"),
         .target = target,

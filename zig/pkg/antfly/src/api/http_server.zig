@@ -11152,7 +11152,7 @@ pub const ApiHttpServer = struct {
             // the exact catalog incarnation is installed instead of leaking a
             // storage-layer IndexNotFound as an internal 500.
             error.IndexNotFound => return error.WriteUnavailable,
-            error.LeaderUnavailable => return error.WriteUnavailable,
+            error.StorageBusy, error.LeaderUnavailable => return error.WriteUnavailable,
             error.HASyncCommitWouldBlock,
             error.HASyncCommitWaitLimitExceeded,
             error.HASyncCommitWaitMissingContext,
@@ -16081,7 +16081,7 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
             error.DistributedQueryUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .distributed_query_unavailable),
-            error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable, error.StorageBusy => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
+            error.StorageBusy, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
@@ -33225,6 +33225,16 @@ test "api http server routes table batches through the batch commit hook" {
     try std.testing.expectEqual(@as(u16, 202), legacy_pending_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, legacy_pending_resp.body, "\"status\":\"committed_pending\"") != null);
     try std.testing.expectEqual(@as(usize, 10), writes.batch_commit_calls);
+    writes.commit_error = error.StorageBusy;
+    var busy_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer busy_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), busy_resp.status);
+    try std.testing.expectEqual(@as(usize, 11), writes.batch_commit_calls);
 }
 
 test "api http server serves table batch transforms" {

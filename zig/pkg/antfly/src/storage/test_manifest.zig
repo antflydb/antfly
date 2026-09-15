@@ -280,6 +280,9 @@ comptime {
     _ = @import("transaction_vopr.zig");
     _ = @import("ttl.zig");
     _ = @import("vector_block_store.zig");
+    _ = @import("vector_fetch_batches_bench.zig");
+    _ = @import("vector_member_bindings.zig");
+    _ = @import("vector_member_bindings_bench.zig");
     _ = @import("wal.zig");
     _ = @import("vopr_durable_job_lane.zig");
     _ = @import("wal_vopr.zig");

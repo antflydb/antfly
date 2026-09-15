@@ -366,6 +366,27 @@ pub const Reader = struct {
         const row = (try self.findRow(descriptor_value, id)) orelse return null;
         return try self.valueAt(descriptor_value, kind, row);
     }
+    /// Resolve a sorted batch with one descriptor/verification per touched
+    /// block. Views borrow this immutable reader; absent rows stay absent.
+    pub fn getManySorted(self: Reader, kind: Kind, ids: []const u64, values: []?[]const u8) !void {
+        if (ids.len != values.len) return error.InvalidArgument;
+        for (ids, 0..) |id, i| if (i != 0 and ids[i - 1] > id) return error.InvalidArgument;
+        @memset(values, null);
+        var position: usize = 0;
+        while (position < ids.len) {
+            const block = self.findBlock(ids[position]) orelse {
+                position += 1;
+                continue;
+            };
+            const descriptor_value = try self.descriptor(block);
+            try self.validateBlock(block, descriptor_value, kind);
+            while (position < ids.len and ids[position] <= descriptor_value.last_id) : (position += 1) {
+                const row = (try self.findRow(descriptor_value, ids[position])) orelse continue;
+                values[position] = try self.valueAt(descriptor_value, kind, row);
+            }
+        }
+    }
+
     pub fn contains(self: Reader, kind: Kind, id: u64) !bool {
         const block_index = self.findBlock(id) orelse return false;
         const descriptor_value = try self.descriptor(block_index);
@@ -1061,4 +1082,30 @@ test "HBC vector directory rejects unchecksummed bytes before root" {
     writeU32(footer, 32, Crc32.hash(footer[0..32]));
 
     try std.testing.expectError(error.CorruptedVectorDirectory, Reader.init(alloc, bytes));
+}
+
+test "HBC vector directory sorted batch preserves missing rows boundaries and checksums" {
+    const alloc = std.testing.allocator;
+    var writer = try Writer.init(alloc);
+    defer writer.deinit();
+    for (1..700) |id| try writer.appendRow(id * 3, "leaf-001", if (id % 5 == 0) null else "document");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+    var reader = try Reader.init(alloc, bytes);
+    defer reader.deinit();
+    const ids = [_]u64{ 0, 3, 3, 4, 15, 765, 768, 771, 1536, 2097, 3000 };
+    var results: [ids.len]?[]const u8 = undefined;
+    inline for (.{ Kind.leaf, Kind.metadata }) |kind| {
+        try reader.getManySorted(kind, &ids, &results);
+        for (ids, results) |id, result| {
+            const expected = try reader.get(kind, id);
+            if (expected) |value| try std.testing.expectEqualStrings(value, result.?) else try std.testing.expect(result == null);
+        }
+    }
+    try std.testing.expectError(error.InvalidArgument, reader.getManySorted(.metadata, &.{ 9, 3 }, results[0..2]));
+    const descriptor = try reader.descriptor(0);
+    bytes[descriptor.data_offset + reader.leafDataBytes(descriptor).len] ^= 1;
+    var corrupt = try Reader.init(alloc, bytes);
+    defer corrupt.deinit();
+    try std.testing.expectError(error.VectorDirectoryChecksumMismatch, corrupt.getManySorted(.metadata, &.{3}, results[0..1]));
 }

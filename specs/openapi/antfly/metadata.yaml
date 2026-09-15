@@ -3975,13 +3975,22 @@ components:
     TableStorageSettings:
       type: object
       additionalProperties: false
-      description: Immutable source embedding storage selected when creating a table.
+      description: >-
+        Immutable source embedding ownership. Omit storage when creating a table to
+        select vector_store for a local single-shard standalone table without HA or
+        replication, and primary_lsm for other deployments. Existing tables retain
+        their recorded ownership; changing the creation default does not migrate data.
+        Snapshot/backup and split operations currently reject vector_store tables;
+        explicitly select primary_lsm when these operations are required.
       properties:
         dense_embeddings:
           type: string
           enum: [primary_lsm, vector_store]
           default: primary_lsm
-          description: Experimental vector_store mode requires a fresh local single-shard table without HA or replication.
+          description: >-
+            Explicit ownership choice. vector_store requires a fresh local single-shard
+            standalone table without HA or replication. An explicit empty storage
+            object keeps primary_lsm; omit the storage object to use the deployment default.
     CreateTableRequest:
       type: object
       properties:
@@ -5051,6 +5060,38 @@ components:
           type: integer
           format: int64
           description: Locked publication time including directory refresh, inventory, receipts and reclamation.
+        collection_plan_outside_lock_ns:
+          type: integer
+          format: int64
+          description: Time preparing and sorting immutable collection input outside source and DB apply locks.
+        collection_reader_prepare_ns:
+          type: integer
+          format: int64
+          description: Time validating staged immutable readers outside source and DB apply locks.
+        collection_max_reader_prepare_ns:
+          type: integer
+          format: int64
+          description: Longest detached immutable reader validation step.
+        collection_readers_prepared:
+          type: integer
+          format: int64
+          description: Staged immutable readers validated before publication.
+        collection_retire_outside_lock_ns:
+          type: integer
+          format: int64
+          description: Time retiring old collection owners and known obsolete files outside source and DB apply locks.
+        collection_copy_deferrals:
+          type: integer
+          format: int64
+          description: Verified collections that deferred copying because reclamation benefit was small.
+        collection_deferred_obsolete_bytes:
+          type: integer
+          format: int64
+          description: Verified obsolete payload bytes retained by the copy-cost policy.
+        collection_reclaim_deadline_ns:
+          type: integer
+          format: int64
+          description: Process-monotonic reclamation scheduling deadline translated from the durable wall-clock deadline; not a completion guarantee.
         collection_max_publish_ns:
           type: integer
           format: int64

@@ -4425,7 +4425,12 @@ pub fn storageOwnerOpen(
     defer if (!success) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
-        .db = db_mod.DB.open(alloc, path, open_options) catch |err| return storageOwnerStatusFromError(err),
+        .db = db_mod.DB.open(alloc, path, open_options) catch |err| {
+            std.log.err("storage owner open failed table={s} group_id={} err={s}", .{
+                table_name, request.group_id, @errorName(err),
+            });
+            return storageOwnerStatusFromError(err);
+        },
         .storage_owner_path = owned_path,
         .storage_owner_table_name = owned_table_name,
         .storage_owner_group_id = request.group_id,
@@ -4455,6 +4460,10 @@ pub fn storageOwnerOpen(
         if (owner_context) |context| context.remoteContent() else null,
         &handle.storage_owner_managed_config,
     ) catch |err| return storageOwnerStatusFromError(err);
+    // The opaque handle now owns the DB at its final address. Match resident
+    // cache installation: source verification and other DB-owned maintenance
+    // must progress even when this owner receives no foreground requests.
+    handle.db.startResidentBackgroundWorkersIfNeeded();
     success = true;
     out_owner.* = handle;
     context_borrowed = false;
@@ -6468,16 +6477,22 @@ pub fn storageOwnerMaintenance(
                 return storageOwnerStatusFromError(err));
         },
         .dense_posting_idle => {
-            if (handle.db.hasActiveDenseBulkWork()) return .ok;
+            if (handle.db.hasActiveDenseBulkWork()) {
+                out_result.deferred = 1;
+                return .ok;
+            }
             const started = @import("antfly_platform").time.monotonicNs();
             var pass: usize = 0;
+            out_result.deferred = 1;
             while (pass < 64 and @import("antfly_platform").time.monotonicNs() -| started < 50 * std.time.ns_per_ms) : (pass += 1) {
-                const steps = handle.db.runDensePostingReadinessMaintenanceForIdle() catch |err|
+                const page = handle.db.refreshDensePostingPayloadPageBestEffort() catch |err|
                     return storageOwnerStatusFromError(err);
-                out_result.dense_steps += steps;
-                if (steps == 0) break;
+                out_result.dense_steps += page.repaired;
+                out_result.dense_scanned += page.scanned;
+                out_result.deferred = @intFromBool(page.pending);
+                if (!page.pending or page.scanned == 0 or page.yield_after_page) break;
             }
-            out_result.progressed = @intFromBool(out_result.dense_steps != 0);
+            out_result.progressed = @intFromBool(out_result.dense_steps != 0 or out_result.dense_scanned != 0);
         },
         .publish_dense_checkpoints => {
             const result = handle.db.publishCompletedDensePostingCheckpoints() catch |err|

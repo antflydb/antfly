@@ -1550,7 +1550,7 @@ const LocalStandaloneMetadata = struct {
                     const explicit = if (command.tablespace) |n| (state.find(.tablespace, 0, n) orelse return error.TablespaceNotFound).id else 0;
                     const policy = if (try state.effectiveTablespace(namespace, explicit)) |space| space.placement_policy else system_catalog.PlacementPolicy{};
                     if (req.num_shards == null) req.num_shards = policy.min_ranges;
-                    table = try deriveStandaloneTableRecord(self.storage_engine, name, req);
+                    table = try self.deriveCreatedTableRecord(name, req);
                     if (policy.placement_role) |role| table.?.placement_role = role;
                     // Standalone owns one local replica; policy metadata remains
                     // portable when a backup is restored into a cluster.
@@ -1586,12 +1586,17 @@ const LocalStandaloneMetadata = struct {
         }
     }
 
-    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
-        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+    fn deriveCreatedTableRecord(self: *LocalStandaloneMetadata, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !antfly.metadata.TableRecord {
         const replicated = !self.vector_source_storage_allowed or
             (if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
-        try req.storage.validateStandalone(req.num_shards orelse 1, replicated, self.storage_engine != .local);
-        const table = try deriveStandaloneTableRecord(self.storage_engine, table_name, req);
+        var resolved_req = req;
+        resolved_req.storage = try antfly.common.table_storage.Settings.resolveStandaloneCreate(req.storage, req.num_shards orelse 1, replicated, self.storage_engine != .local);
+        return deriveStandaloneTableRecord(self.storage_engine, table_name, resolved_req);
+    }
+
+    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        const table = try self.deriveCreatedTableRecord(table_name, req);
         const ranges = try antfly.public_api.tables.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
@@ -2566,11 +2571,13 @@ fn deriveStandaloneTableRecord(
     table_name: []const u8,
     req: antfly.public_api.tables.CreateTableRequest,
 ) !antfly.metadata.TableRecord {
-    try req.storage.validateStandalone(req.num_shards orelse 1, false, storage_engine != .local);
+    var resolved_req = req;
+    const replicated = if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false;
+    resolved_req.storage = try antfly.common.table_storage.Settings.resolveStandaloneCreate(req.storage, req.num_shards orelse 1, replicated, storage_engine != .local);
     if (storage_engine == .lite and (req.num_shards orelse 1) != 1) {
         return error.InvalidCreateTableRequest;
     }
-    var table = antfly.public_api.tables.deriveTableRecord(table_name, req);
+    var table = antfly.public_api.tables.deriveTableRecord(table_name, resolved_req);
     // A standalone process owns the only replica regardless of whether its
     // local persistence is directory-backed or Lite single-file storage.
     table.desired_replica_count = 1;
@@ -6782,6 +6789,57 @@ test "standalone Lite enforces one shard and one replica" {
     const local = try deriveStandaloneTableRecord(.local, "local", .{ .num_shards = 2 });
     try std.testing.expectEqual(@as(u32, 2), local.min_ranges);
     try std.testing.expectEqual(@as(u32, 1), local.desired_replica_count);
+}
+
+test "standalone table storage defaults persist without migrating legacy tables" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    {
+        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://127.0.0.1:8080", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        // Old catalog records have no storage field. Their interpretation is
+        // independent of the new-table creation policy.
+        var legacy = try std.json.parseFromSlice(antfly.metadata.TableRecord, alloc, "{\"table_id\":7,\"name\":\"legacy\"}", .{});
+        defer legacy.deinit();
+        try std.testing.expectEqual(.primary_lsm, legacy.value.storage.dense_embeddings);
+        try metadata.manager.upsertTable(legacy.value);
+        try LocalStandaloneMetadata.createTable(&metadata, alloc, "new", .{});
+        try LocalStandaloneMetadata.createTable(&metadata, alloc, "opt_out", .{ .storage = .{ .dense_embeddings = .primary_lsm } });
+        try LocalStandaloneMetadata.createTable(&metadata, alloc, "multiple_shards", .{ .num_shards = 2 });
+        const scoped = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{
+            .mutation = .{ .action = .create, .kind = .table, .name = "scoped" },
+            .physical_name = "table:scoped-default",
+            .create_table_json = "{}",
+        } });
+        alloc.free(scoped);
+        metadata.vector_source_storage_allowed = false;
+        const scoped_standby = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{
+            .mutation = .{ .action = .create, .kind = .table, .name = "scoped_standby" },
+            .physical_name = "table:scoped-standby",
+            .create_table_json = "{}",
+        } });
+        alloc.free(scoped_standby);
+        try std.testing.expectError(error.VectorStoreRequiresLocalSingleShardTable, metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{
+            .mutation = .{ .action = .create, .kind = .table, .name = "scoped_unsupported" },
+            .physical_name = "table:scoped-unsupported",
+            .create_table_json = "{\"storage\":{\"dense_embeddings\":\"vector_store\"}}",
+        } }));
+        try LocalStandaloneMetadata.createTable(&metadata, alloc, "ha", .{});
+        try std.testing.expectError(error.VectorStoreRequiresLocalSingleShardTable, LocalStandaloneMetadata.createTable(&metadata, alloc, "unsupported", .{ .storage = .{ .dense_embeddings = .vector_store } }));
+    }
+    var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://127.0.0.1:8080", ".", path, backend.ptr(), null, .local);
+    defer reopened.deinit();
+    try std.testing.expectEqual(.vector_store, reopened.findTableByNameLocked("new").?.storage.dense_embeddings);
+    try std.testing.expectEqual(.vector_store, reopened.findTableByNameLocked("table:scoped-default").?.storage.dense_embeddings);
+    try std.testing.expectEqual(.primary_lsm, reopened.findTableByNameLocked("table:scoped-standby").?.storage.dense_embeddings);
+    for ([_][]const u8{ "legacy", "opt_out", "multiple_shards", "ha" }) |name|
+        try std.testing.expectEqual(.primary_lsm, reopened.findTableByNameLocked(name).?.storage.dense_embeddings);
+    try std.testing.expect(reopened.findTableByNameLocked("unsupported") == null);
 }
 
 test "standalone Lite adoption preserves deterministic embedded document identity" {

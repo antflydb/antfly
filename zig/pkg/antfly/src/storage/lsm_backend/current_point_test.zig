@@ -81,6 +81,7 @@ test "current writer directory reads pin one tip and own values across publicati
 
 test "current writer directory batches keep a coherent tip during concurrent flush" {
     const Hook = struct {
+        var calls: usize = 0;
         fn publish(raw: *anyopaque) !void {
             runtime.test_current_point_unlocked_hook = null;
             const backend: *Backend = @ptrCast(@alignCast(raw));
@@ -89,6 +90,7 @@ test "current writer directory batches keep a coherent tip during concurrent flu
             backend.mu.unlock();
             try std.testing.expect(pinned);
             try write(backend, "new");
+            calls += 1;
         }
     };
     const alloc = std.testing.allocator;
@@ -113,9 +115,11 @@ test "current writer directory batches keep a coherent tip during concurrent flu
         defer txn.abort();
         const keys = [_][]const u8{ "a", "b", "missing" };
         var values: [3]?[]const u8 = undefined;
+        Hook.calls = 0;
         runtime.test_current_point_unlocked_hook = Hook.publish;
         defer runtime.test_current_point_unlocked_hook = null;
         try txn.getManySorted(&keys, &values);
+        try std.testing.expectEqual(@as(usize, 1), Hook.calls);
         try std.testing.expectEqualStrings("old", values[0].?);
         try std.testing.expectEqualStrings("old", values[1].?);
         try std.testing.expect(values[2] == null);
@@ -130,7 +134,12 @@ test "current writer directory batches keep a coherent tip during concurrent flu
 
 test "current writer directory reads restore lock and ownership on cancellation" {
     const Hook = struct {
-        fn cancel(_: *anyopaque) !void {
+        var calls: usize = 0;
+        fn cancel(raw: *anyopaque) !void {
+            const backend: *Backend = @ptrCast(@alignCast(raw));
+            try std.testing.expect(backend.mu.tryLock());
+            backend.mu.unlock();
+            calls += 1;
             return error.Canceled;
         }
     };
@@ -142,9 +151,11 @@ test "current writer directory reads restore lock and ownership on cancellation"
     try write(&backend, "old");
     var txn = try backend.beginWrite();
     defer txn.abort();
+    Hook.calls = 0;
     runtime.test_current_point_unlocked_hook = Hook.cancel;
     defer runtime.test_current_point_unlocked_hook = null;
     try std.testing.expectError(error.Canceled, txn.get(.{ .name = "docs" }, "a"));
+    try std.testing.expectEqual(@as(usize, 1), Hook.calls);
     runtime.test_current_point_unlocked_hook = null;
     try std.testing.expectEqualStrings("old", try txn.get(.{ .name = "docs" }, "a"));
     var bound = try runtime.BoundWriteTxn(Backend).open(&backend, .{ .name = "docs" });
@@ -153,6 +164,7 @@ test "current writer directory reads restore lock and ownership on cancellation"
     var values: [2]?[]const u8 = undefined;
     runtime.test_current_point_unlocked_hook = Hook.cancel;
     try std.testing.expectError(error.Canceled, bound.getManySorted(&keys, &values));
+    try std.testing.expectEqual(@as(usize, 2), Hook.calls);
     runtime.test_current_point_unlocked_hook = null;
     try bound.getManySorted(&keys, &values);
     try std.testing.expectEqualStrings("old", values[0].?);

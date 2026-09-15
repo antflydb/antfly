@@ -997,6 +997,12 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_vector_kernel_tests = b.addRunArtifact(vector_kernel_tests);
     b.step("lib-vector-kernel-test", "Run standalone quantizer kernel tests (no external recall fixtures)").dependOn(&run_vector_kernel_tests.step);
 
+    const packing_bench_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_query_packing.zig"), .target = target, .optimize = optimize });
+    packing_bench_mod.addImport("antfly_vector", vector_mod);
+    const packing_bench = b.addExecutable(.{ .name = "bench-query-packing", .root_module = packing_bench_mod });
+    const run_packing_bench = b.addRunArtifact(packing_bench);
+    b.step("bench-query-packing", "Compare exact query bitplane packing and complete scoring kernels").dependOn(&run_packing_bench.step);
+
     const subgroup_scan_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_subgroup_scan.zig"), .target = target, .optimize = optimize });
     subgroup_scan_mod.addImport("antfly_vector", vector_mod);
     subgroup_scan_mod.addImport("antfly_vector_index", vectorindex_mod);

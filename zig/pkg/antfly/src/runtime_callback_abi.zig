@@ -225,6 +225,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
             return error.ProposalDropped;
         }
 
+        fn storageBusy(_: *u32) anyerror!void {
+            return error.StorageBusy;
+        }
+
         fn indexGenerationMismatch(_: *u32) anyerror!void {
             return error.IndexGenerationMismatch;
         }
@@ -279,6 +283,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.ProposalDropped,
         TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.retryableFail, .{&base}),
+    );
+    try std.testing.expectError(
+        error.StorageBusy,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.storageBusy, .{&base}),
     );
     try std.testing.expectError(
         error.IndexGenerationMismatch,
