@@ -22396,7 +22396,7 @@ fn hasSingleRoleStore(
 ) bool {
     var matching_store_id: ?u64 = null;
     for (stores) |store| {
-        if (!std.mem.eql(u8, store.role, role)) continue;
+        if (!std.mem.eql(u8, store.role, role)) return false;
         if (matching_store_id == null) {
             matching_store_id = store.store_id;
             continue;
@@ -26776,6 +26776,24 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "data ownership fallback requires a single store across all roles" {
+            const stores = [_]antfly.metadata.table_manager.StoreRecord{
+                .{ .store_id = 1, .node_id = 1, .role = "hot" },
+                .{ .store_id = 2, .node_id = 2, .role = "cold" },
+            };
+            std.debug.print("DATA_OWNERSHIP_FALLBACK excludes cross-role stores\n", .{});
+            try std.testing.expect(!hasSingleRoleStore(&stores, "hot", 1));
+            try std.testing.expect(!hasSingleRoleStore(&stores, "cold", 2));
+            try std.testing.expect(hasSingleRoleStore(stores[0..1], "hot", 1));
+            try std.testing.expect(!hasSingleRoleStore(stores[0..1], "cold", 1));
+            try std.testing.expect(!hasSingleRoleStore(stores[0..1], "hot", 2));
+            try std.testing.expect(!hasSingleRoleStore(&.{}, "hot", 1));
+
+            var same_role = stores;
+            same_role[1].role = "hot";
+            try std.testing.expect(!hasSingleRoleStore(&same_role, "hot", 1));
+        }
+
         test "data raft stable placement refreshes changed peer transport endpoints" {
             const alloc = std.testing.allocator;
 
