@@ -387,6 +387,12 @@ pub const Detail = enum(c_int) {
     ha_seed_snapshot_runtime_busy,
     ha_seed_capture_already_in_progress,
     storage_kernel_owner_unavailable,
+    // Catalog admission outcomes must survive independently compiled write
+    // callbacks so the public layer can preserve its pre-proposal response.
+    // Append only: existing detail ordinals are part of the native contract.
+    catalog_routing_snapshot_timeout,
+    catalog_routing_unavailable,
+    catalog_projection_refresh_required,
 };
 
 pub const Status = extern struct {
@@ -411,6 +417,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.DatabaseNotFound => status(.not_found, .database_not_found),
         error.NamespaceNotFound => status(.not_found, .namespace_not_found),
         error.TablespaceNotFound => status(.not_found, .tablespace_not_found),
+        error.CatalogRoutingSnapshotTimeout => status(.timeout, .catalog_routing_snapshot_timeout),
+        error.CatalogRoutingUnavailable => status(.unavailable, .catalog_routing_unavailable),
+        error.CatalogProjectionRefreshRequired => status(.unavailable, .catalog_projection_refresh_required),
         error.CatalogNotFound => status(.not_found, .catalog_not_found),
         error.CatalogAlreadyExists => status(.conflict, .catalog_already_exists),
         error.CatalogGenerationChanged => status(.conflict, .catalog_generation_changed),
@@ -798,6 +807,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .database_not_found => "DatabaseNotFound",
         .namespace_not_found => "NamespaceNotFound",
         .tablespace_not_found => "TablespaceNotFound",
+        .catalog_routing_snapshot_timeout => "CatalogRoutingSnapshotTimeout",
+        .catalog_routing_unavailable => "CatalogRoutingUnavailable",
+        .catalog_projection_refresh_required => "CatalogProjectionRefreshRequired",
         .catalog_not_found => "CatalogNotFound",
         .catalog_already_exists => "CatalogAlreadyExists",
         .catalog_generation_changed => "CatalogGenerationChanged",

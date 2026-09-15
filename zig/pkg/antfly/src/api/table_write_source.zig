@@ -1590,6 +1590,25 @@ fn consumerTests() type {
                 source.commitBatchWithCancellation(std.testing.allocator, &.{}, .enrichments, db_mod.types.CancellationToken.fromAtomic(&canceled)),
             );
             try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            // Exercise the foreign dispatcher used by production archives:
+            // admission failures retain their exact public classification,
+            // while an ambiguous proposal must never become retryable.
+            inline for (.{
+                error.CatalogRoutingSnapshotTimeout,
+                error.CatalogRoutingUnavailable,
+                error.CatalogProjectionRefreshRequired,
+                error.RaftBatchWriteOutcomeUnknown,
+                error.CommitDecisionUnknown,
+            }) |failure| {
+                fake.failure = failure;
+                try std.testing.expectError(failure, source.commitBatchWithCancellation(
+                    std.testing.allocator,
+                    &.{},
+                    .write,
+                    .none,
+                ));
+            }
+            fake.failure = error.EnrichmentWorkerFailed;
             canceled.store(true, .release);
             try std.testing.expectError(
                 error.EnrichmentWaitCanceled,
