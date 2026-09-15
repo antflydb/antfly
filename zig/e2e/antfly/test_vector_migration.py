@@ -201,6 +201,40 @@ def test_vector_migration_preserves_native_ann_neighbors(stateful_api, mode):
     assert neighbors() == before
 
 
+def test_online_vector_migration_cancels_rejected_admission(stateful_api):
+    api = stateful_api
+    table = f"rejected_migrate_{time.time_ns()}"
+    api.create_table(table, storage={"dense_embeddings": "primary_lsm"})
+    path = f"/tables/{table}/storage/migrations"
+    request = {
+        "job_id": "rejected",
+        "target": "vector_store",
+        "budget": {"disk_reserve_bytes": 2**64 - 1},
+    }
+    with pytest.raises(requests.HTTPError) as rejected:
+        api.post(path, request)
+    assert rejected.value.response.status_code == 503
+    assert "VectorMigrationDiskReserve" in rejected.value.response.text
+    api.restart_server()
+    assert command(api, table, "rejected", "status")["phase"] == "admitted"
+    cancelled = command(api, table, "rejected", "cancel")
+    assert cancelled["phase"] == "cancelled"
+    api.restart_server()
+    assert command(api, table, "rejected", "cancel") == cancelled
+    assert api.post(path, request) == cancelled
+    # A second rejected admission encounters the previous cancelled DB receipt.
+    request["job_id"] = "second"
+    with pytest.raises(requests.HTTPError) as rejected:
+        api.post(path, request)
+    assert rejected.value.response.status_code == 503
+    assert command(api, table, "second", "status")["phase"] == "admitted"
+    assert command(api, table, "second", "cancel")["phase"] == "cancelled"
+    replacement = command(api, table, "replacement")
+    assert replacement["phase"] == "backfill"
+    assert finish(api, table, "replacement", status=replacement)["phase"] == "complete"
+    api.delete_table(table)
+
+
 def test_online_vector_migration_restart_concurrent_models_and_rebuild(stateful_api):
     api = stateful_api
     table = f"online_migrate_{time.time_ns()}"

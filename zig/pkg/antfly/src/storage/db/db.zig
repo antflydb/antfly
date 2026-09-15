@@ -6275,7 +6275,7 @@ pub const DB = struct {
 
     pub fn vectorMigrationCommand(self: *DB, alloc: Allocator, command: vector_migration.contract.Command) ![]u8 {
         try command.request.validate();
-        if (command.action != .start) {
+        if (command.action != .start and command.action != .cancel) {
             const raw = try self.vectorMigrationStatus(alloc) orelse return error.VectorMigrationNotFound;
             defer alloc.free(raw);
             var prior = try std.json.parseFromSlice(vector_migration.contract.Job, alloc, raw, .{});
@@ -6292,7 +6292,7 @@ pub const DB = struct {
             .start => try self.startVectorMigration(command.request),
             .step => try self.advanceVectorMigration(command.request.job_id),
             .publish => try self.publishVectorMigration(command.request.job_id),
-            .cancel => try self.cancelVectorMigration(command.request.job_id),
+            .cancel => try self.cancelVectorMigrationImpl(command.request.job_id, command.request),
             .status => {},
         }
         const result = try self.vectorMigrationStatus(alloc) orelse return error.VectorMigrationNotFound;
@@ -6509,11 +6509,54 @@ pub const DB = struct {
     }
 
     pub fn cancelVectorMigration(self: *DB, job_id: []const u8) !void {
+        return self.cancelVectorMigrationImpl(job_id, null);
+    }
+
+    fn cancelVectorMigrationImpl(self: *DB, job_id: []const u8, admitted: ?vector_migration.contract.Request) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        var job = (try vector_migration.load(self.alloc, self.core.store)) orelse return error.VectorMigrationNotFound;
-        defer job.deinit();
+        var prior = try vector_migration.load(self.alloc, self.core.store);
+        defer if (prior) |*value| value.deinit();
+        // A catalog admission can outlive a rejected/ambiguous DB start. Under
+        // the same apply lock as startup, save a terminal receipt before the
+        // caller releases the catalog fence. No source payload was committed
+        // without a DB job, so there is no candidate cleanup to drive here.
+        if (prior == null or (prior.?.value.phase == .cancelled and !std.mem.eql(u8, prior.?.value.job_id, job_id))) {
+            const request = admitted orelse return error.VectorMigrationNotFound;
+            if (self.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
+            if (prior) |value| try self.validateVectorMigrationIdentity(value.value);
+            const identity = try std.json.Stringify.valueAlloc(self.alloc, self.core.identity_namespace, .{});
+            defer self.alloc.free(identity);
+            const receipt: vector_migration.contract.Job = .{
+                .job_id = request.job_id,
+                .mode = request.mode,
+                .budget = request.budget,
+                .phase = .cancelled,
+                .table_identity = identity,
+                .configuration_hash = try self.vectorMigrationConfigurationHash(),
+                .ownership_epoch = if (prior) |value| try std.math.add(u64, value.value.ownership_epoch, 1) else 1,
+                .snapshot_fence = 0,
+                .replay_cursor = 0,
+            };
+            var txn = try self.core.store.runtime_store.beginWrite();
+            var committed = false;
+            defer if (!committed) txn.abort();
+            errdefer self.requireVectorMigrationRecovery();
+            try vector_migration.save(self.alloc, &txn, receipt);
+            try txn.put(vector_migration.contract.accounting_key, &(@as([8]u8, @splat(0))));
+            try txn.commit();
+            committed = true;
+            try self.core.store.runtime_store.sync(true);
+            self.installVectorMigrationRuntime(receipt);
+            return;
+        }
+        const job = &prior.?;
         if (!std.mem.eql(u8, job.value.job_id, job_id)) return error.VectorMigrationIdempotencyConflict;
+        if (admitted) |request| {
+            if (job.value.mode != request.mode or !std.meta.eql(job.value.budget, request.budget))
+                return error.VectorMigrationIdempotencyConflict;
+        }
         try self.validateVectorMigrationIdentity(job.value);
         if (job.value.published()) return error.VectorMigrationAlreadyPublished;
         if (job.value.phase == .cancelled or job.value.phase == .cancelling) return;
@@ -129568,6 +129611,67 @@ test "source vector migration budget rejection is retryable and cancellation sur
     var status = (try vector_migration.load(alloc, db.core.store)).?;
     defer status.deinit();
     try std.testing.expectEqual(@as(u64, 2), status.value.ownership_epoch);
+}
+
+test "source vector migration cancels rejected admission durably without a source store" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("migration-rejected-admission");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    const options: OpenOptions = .{ .table_storage = .{ .dense_embeddings = .primary_lsm }, .start_index_workers = false, .start_optional_runtimes = false };
+    const request: vector_migration.contract.Request = .{ .job_id = "disk-rejected", .mode = .online, .budget = .{ .disk_reserve_bytes = std.math.maxInt(u64) } };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.core.store.put("preserved", "value");
+        try std.testing.expectError(error.VectorMigrationDiskReserve, db.startVectorMigration(request));
+        try std.testing.expect((try vector_migration.load(alloc, db.core.store)) == null);
+    }
+    // Restart with a catalog admission but no DB job, then lose the cancel
+    // response (the catalog marker is intentionally not reconciled here).
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        const raw = try db.vectorMigrationCommand(alloc, .{ .action = .cancel, .request = request });
+        defer alloc.free(raw);
+        var receipt = try std.json.parseFromSlice(vector_migration.contract.Job, alloc, raw, .{});
+        defer receipt.deinit();
+        try receipt.value.validate();
+        try std.testing.expectEqual(.cancelled, receipt.value.phase);
+        try std.testing.expect(db.source_vectors.load(.acquire) == null);
+    }
+    var db = try DB.open(alloc, path, options);
+    defer db.close();
+    const cancelled = try db.vectorMigrationCommand(alloc, .{ .action = .cancel, .request = request });
+    defer alloc.free(cancelled);
+    const retried_start = try db.vectorMigrationCommand(alloc, .{ .action = .start, .request = request });
+    defer alloc.free(retried_start);
+    try std.testing.expectEqualSlices(u8, cancelled, retried_start);
+    var changed = request;
+    changed.budget.disk_reserve_bytes = 0;
+    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, db.vectorMigrationCommand(alloc, .{ .action = .cancel, .request = changed }));
+    try std.testing.expect(db.source_vectors.load(.acquire) == null);
+    try std.testing.expect(!db.vector_migration_active.load(.acquire));
+    const value = try db.core.store.get(alloc, "preserved");
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("value", value);
+    // A later admission can also fail while the previous cancelled receipt
+    // remains in the DB. Cancellation must create the new receipt in this case.
+    var second = request;
+    second.job_id = "second-rejection";
+    try std.testing.expectError(error.VectorMigrationDiskReserve, db.startVectorMigration(second));
+    const second_cancel = try db.vectorMigrationCommand(alloc, .{ .action = .cancel, .request = second });
+    defer alloc.free(second_cancel);
+    var second_job = try std.json.parseFromSlice(vector_migration.contract.Job, alloc, second_cancel, .{});
+    defer second_job.deinit();
+    try std.testing.expectEqualStrings(second.job_id, second_job.value.job_id);
+    try std.testing.expectEqual(@as(u64, 2), second_job.value.ownership_epoch);
+    try db.startVectorMigration(.{ .job_id = "replacement", .mode = .online, .budget = .{ .disk_reserve_bytes = 0 } });
+    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, db.vectorMigrationCommand(alloc, .{ .action = .cancel, .request = second }));
+    var active = (try vector_migration.load(alloc, db.core.store)).?;
+    defer active.deinit();
+    try std.testing.expectEqual(.backfill, active.value.phase);
+    try std.testing.expectEqual(@as(u64, 3), active.value.ownership_epoch);
 }
 
 test "source vector migration offline recovers every copy and publication boundary" {

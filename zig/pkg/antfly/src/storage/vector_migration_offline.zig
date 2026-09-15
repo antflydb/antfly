@@ -105,6 +105,51 @@ fn capacity(root: []const u8, budget: contract.Budget, needed: u64) !void {
     if (available.available_bytes < budget.disk_reserve_bytes +| needed) return error.VectorMigrationDiskReserve;
 }
 
+/// Copy and acknowledge one chunk. The durable cursor must never get ahead
+/// of either the payload bytes or any directory link used to reach them.
+fn copyChunk(alloc: Allocator, io: std.Io, live: []const u8, staging: []const u8, cursor_path: []const u8, entry: Entry, progress: *Progress, buffer: []u8, verify: []u8) !void {
+    const from = try std.fs.path.join(alloc, &.{ live, entry.path });
+    defer alloc.free(from);
+    const to = try std.fs.path.join(alloc, &.{ staging, entry.path });
+    defer alloc.free(to);
+    const count: usize = @intCast(@min(buffer.len, entry.size - progress.offset));
+    var input = try std.Io.Dir.cwd().openFile(io, from, .{});
+    defer input.close(io);
+    if ((try input.stat(io)).size != entry.size) return error.SourceFileChanged;
+    if (try input.readPositionalAll(io, buffer[0..count], progress.offset) != count) return error.SourceFileChanged;
+    const parent = std.fs.path.dirname(to).?;
+    try fs.createDirPathPortable(io, parent);
+    var output = try std.Io.Dir.cwd().createFile(io, to, .{ .read = true, .truncate = false });
+    defer output.close(io);
+    try output.writePositionalAll(io, buffer[0..count], progress.offset);
+    if (progress.offset + count == entry.size) try output.setLength(io, entry.size);
+    try output.sync(io);
+    try fs.syncDirPortable(io, parent);
+    if (progress.offset == 0) {
+        // Retry this even for existing directories: a prior attempt may have
+        // failed after mkdir, before its parent was synced. Later chunks may
+        // rely on the directory chain acknowledged by the preceding cursor.
+        var directory = parent;
+        while (!std.mem.eql(u8, directory, staging)) {
+            directory = std.fs.path.dirname(directory) orelse return error.InvalidVectorMigrationState;
+            try fs.syncDirPortable(io, directory);
+        }
+        // resumeStaging can itself have just created the shadow root.
+        try fs.syncDirPortable(io, std.fs.path.dirname(staging) orelse ".");
+    }
+    try boundary(.chunk_synced);
+    if (try output.readPositionalAll(io, verify[0..count], progress.offset) != count or
+        !std.mem.eql(u8, buffer[0..count], verify[0..count])) return error.VectorMigrationCopyMismatch;
+    progress.offset += count;
+    progress.copied_bytes += count;
+    if (progress.offset == entry.size) {
+        progress.file += 1;
+        progress.offset = 0;
+    }
+    try save(alloc, io, cursor_path, progress.*);
+    try boundary(.cursor_synced);
+}
+
 pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Request, options: Options) !Result {
     try request.validate();
     if (request.mode != .offline) return error.InvalidVectorMigrationState;
@@ -200,34 +245,9 @@ pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Req
         const entry = fence.value.entries[progress.file];
         if (std.fs.path.isAbsolute(entry.path) or std.mem.indexOf(u8, entry.path, "..") != null or progress.offset > entry.size)
             return error.InvalidVectorMigrationState;
-        const from = try std.fs.path.join(alloc, &.{ live, entry.path });
-        defer alloc.free(from);
-        const to = try std.fs.path.join(alloc, &.{ staged.path(), entry.path });
-        defer alloc.free(to);
         const count: usize = @intCast(@min(buffer.len, entry.size - progress.offset));
         try capacity(live, request.budget, count);
-        var input = try std.Io.Dir.cwd().openFile(io, from, .{});
-        defer input.close(io);
-        if ((try input.stat(io)).size != entry.size) return error.SourceFileChanged;
-        if (try input.readPositionalAll(io, buffer[0..count], progress.offset) != count) return error.SourceFileChanged;
-        if (std.fs.path.dirname(to)) |parent| try fs.createDirPathPortable(io, parent);
-        var output = try std.Io.Dir.cwd().createFile(io, to, .{ .read = true, .truncate = false });
-        defer output.close(io);
-        try output.writePositionalAll(io, buffer[0..count], progress.offset);
-        if (progress.offset + count == entry.size) try output.setLength(io, entry.size);
-        try output.sync(io);
-        try fs.syncDirPortable(io, std.fs.path.dirname(to).?);
-        try boundary(.chunk_synced);
-        if (try output.readPositionalAll(io, verify[0..count], progress.offset) != count or
-            !std.mem.eql(u8, buffer[0..count], verify[0..count])) return error.VectorMigrationCopyMismatch;
-        progress.offset += count;
-        progress.copied_bytes += count;
-        if (progress.offset == entry.size) {
-            progress.file += 1;
-            progress.offset = 0;
-        }
-        try save(alloc, io, cursor_path, progress);
-        try boundary(.cursor_synced);
+        try copyChunk(alloc, io, live, staged.path(), cursor_path, entry, &progress, buffer, verify);
         steps += 1;
     }
     var target_options = try plan.optionsForStagedGeneration(&staged);
@@ -343,4 +363,139 @@ pub fn cancel(alloc: Allocator, io: std.Io, root: []const u8, request: contract.
     try save(alloc, io, cancelled_path, Cancellation{ .request = request, .identity = fence.value.identity });
     try std.Io.Dir.cwd().deleteFile(io, fence_path);
     try fs.syncDirPortable(io, transition.path);
+}
+
+// VoprIo normally syncs the entire namespace on any directory fsync. Use a
+// stricter adapter here: each fsync persists only that directory's immediate
+// entries. File bytes and crash/reopen still use VoprIo's durability model.
+const CopyCrashTest = struct {
+    var fail_directory: ?[]const u8 = null;
+    var stop_at: ?Boundary = null;
+
+    fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        const sim: *@import("vopr").vopr_io.VoprIo = @ptrCast(@alignCast(userdata.?));
+        const handle = sim.files.handles.get(file.handle) orelse return error.AccessDenied;
+        if (!handle.directory) return sim.files.syncFile(file);
+        if (fail_directory) |path| if (std.mem.eql(u8, handle.node.path, path)) return error.InputOutput;
+        for (sim.files.nodes.items) |node| {
+            const parent = std.fs.path.dirname(node.path) orelse continue;
+            if (!std.mem.eql(u8, parent, handle.node.path)) continue;
+            const durable_path = sim.files.allocator.dupe(u8, node.path) catch return error.AccessDenied;
+            sim.files.allocator.free(node.durable_path);
+            node.durable_path = durable_path;
+            node.durable_exists = node.exists;
+        }
+    }
+
+    fn stop(point: Boundary) !void {
+        if (stop_at == point) return error.InjectedMigrationCrash;
+    }
+
+    fn crash(sim: *@import("vopr").vopr_io.VoprIo) !void {
+        // A child inode cannot remain reachable through an unpersisted parent
+        // link. VoprIo's flat path map needs that namespace rule modeled too.
+        var removed = true;
+        while (removed) {
+            removed = false;
+            for (sim.files.nodes.items) |node| {
+                if (!node.durable_exists or std.mem.eql(u8, node.durable_path, "/")) continue;
+                const parent = std.fs.path.dirname(node.durable_path).?;
+                const reachable = for (sim.files.nodes.items) |ancestor| {
+                    if (ancestor.durable_exists and std.mem.eql(u8, ancestor.durable_path, parent)) break true;
+                } else false;
+                if (!reachable) {
+                    node.durable_exists = false;
+                    removed = true;
+                }
+            }
+        }
+        try sim.crashFileSystem();
+    }
+};
+
+test "source vector migration copy crash model loses unsynced intermediate directories" {
+    const alloc = std.testing.allocator;
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    var vtable = sim.io().vtable.*;
+    vtable.fileSync = CopyCrashTest.sync;
+    const io = std.Io{ .userdata = &sim, .vtable = &vtable };
+    try fs.createDirPathPortable(io, "/stage/indexes/model/runs");
+    var file = try std.Io.Dir.cwd().createFile(io, "/stage/indexes/model/runs/data", .{});
+    try file.writeStreamingAll(io, "payload");
+    try file.sync(io);
+    file.close(io);
+    // Reproduce the old ordering, with a durable shadow root and cursor.
+    try fs.syncDirPortable(io, "/");
+    try fs.syncDirPortable(io, "/stage/indexes/model/runs");
+    try save(alloc, io, "/stage/" ++ progress_file, Progress{ .job_id = "copy", .file = 1 });
+    try CopyCrashTest.crash(&sim);
+    try std.testing.expect(try exists(io, "/stage/" ++ progress_file));
+    try std.testing.expect(!try exists(io, "/stage/indexes/model"));
+    try std.testing.expect(!try exists(io, "/stage/indexes/model/runs/data"));
+}
+
+test "source vector migration copy resumes durable chunks after directory sync failure and power loss" {
+    const alloc = std.testing.allocator;
+    const bytes = "first-second-third";
+    inline for (.{ "empty", "data" }) |name| {
+        inline for (.{ "parent_failure", "parent_retry", "chunk_synced", "cursor_synced" }) |fault| {
+            var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+            defer sim.deinit();
+            var vtable = sim.io().vtable.*;
+            vtable.fileSync = CopyCrashTest.sync;
+            const io = std.Io{ .userdata = &sim, .vtable = &vtable };
+            try fs.createDirPathPortable(io, "/live/indexes/model/runs");
+            const expected = if (std.mem.eql(u8, name, "empty")) "" else bytes;
+            var source = try std.Io.Dir.cwd().createFile(io, "/live/indexes/model/runs/" ++ name, .{});
+            try source.writeStreamingAll(io, expected);
+            try source.sync(io);
+            source.close(io);
+            try sim.files.syncNamespace(); // The fenced source predates copying.
+            try fs.createDirPathPortable(io, "/stage");
+            const entry = Entry{ .path = "indexes/model/runs/" ++ name, .size = expected.len };
+            var progress = Progress{ .job_id = "copy" };
+            var buffer: [6]u8 = undefined;
+            var verify: [6]u8 = undefined;
+            const fail_parent = std.mem.startsWith(u8, fault, "parent_");
+            CopyCrashTest.fail_directory = if (fail_parent) "/stage/indexes" else null;
+            CopyCrashTest.stop_at = if (std.mem.eql(u8, fault, "chunk_synced")) .chunk_synced else if (std.mem.eql(u8, fault, "cursor_synced")) .cursor_synced else null;
+            test_boundary = CopyCrashTest.stop;
+            defer {
+                test_boundary = null;
+                CopyCrashTest.fail_directory = null;
+                CopyCrashTest.stop_at = null;
+            }
+            try std.testing.expectError(if (fail_parent) error.InputOutput else error.InjectedMigrationCrash, copyChunk(alloc, io, "/live", "/stage", "/stage/" ++ progress_file, entry, &progress, &buffer, &verify));
+            CopyCrashTest.fail_directory = null;
+            CopyCrashTest.stop_at = null;
+            // Also retry without a crash: already-existing directories from a
+            // failed attempt must still be synced before publishing progress.
+            if (std.mem.eql(u8, fault, "parent_retry"))
+                try copyChunk(alloc, io, "/live", "/stage", "/stage/" ++ progress_file, entry, &progress, &buffer, &verify);
+            // Discard all volatile file data, directory entries and handles.
+            // Reload the acknowledged cursor after every subsequent chunk too.
+            while (true) {
+                try CopyCrashTest.crash(&sim);
+                progress = .{ .job_id = "copy" };
+                if (try exists(io, "/stage/" ++ progress_file)) {
+                    var saved = try readJson(Progress, alloc, io, "/stage/" ++ progress_file);
+                    defer saved.deinit();
+                    progress = saved.value;
+                    progress.job_id = "copy";
+                    inline for (.{ "/stage", "/stage/indexes", "/stage/indexes/model", "/stage/indexes/model/runs" }) |parent| {
+                        try std.testing.expect(try exists(io, parent));
+                    }
+                    const copied = try std.Io.Dir.cwd().readFileAlloc(io, "/stage/indexes/model/runs/" ++ name, alloc, .limited(1024));
+                    defer alloc.free(copied);
+                    const acknowledged = if (progress.file == 1) expected.len else progress.offset;
+                    try std.testing.expectEqualSlices(u8, expected[0..@intCast(acknowledged)], copied[0..@intCast(acknowledged)]);
+                    if (progress.file == 1) try std.testing.expectEqualSlices(u8, expected, copied);
+                }
+                if (progress.file == 1) break;
+                try copyChunk(alloc, io, "/live", "/stage", "/stage/" ++ progress_file, entry, &progress, &buffer, &verify);
+            }
+            try sim.ensureNoCapabilityViolation();
+        }
+    }
 }

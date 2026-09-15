@@ -4972,6 +4972,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.transform.",
             "storage.db.typed_doc_values_coverage.",
             "storage.db.types.",
+            "storage.vector_migration_offline.",
         },
         &.{"storage.hot_standby."},
         &.{
@@ -5193,7 +5194,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_storage_db_core_tests.step.dependOn(&unit_storage_shard_audit.step);
     @import("test_support.zig").addOwnerTestRuns(b, db_test_step, &.{
         .{ .artifact = unit_storage_support_tests, .filters = &.{"storage.db."} },
-        .{ .artifact = unit_storage_db_core_tests, .filters = &.{"storage.db."}, .skip_filters = unit_storage_support_compile_filters },
+        .{ .artifact = unit_storage_db_core_tests, .filters = &.{ "storage.db.", "storage.vector_migration_offline." }, .skip_filters = unit_storage_support_compile_filters },
     }, &release_scale_test_filters);
     const unit_storage_compile_step = b.step(
         "unit-storage-compile",

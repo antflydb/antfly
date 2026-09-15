@@ -15720,8 +15720,10 @@ pub const ApiHttpServer = struct {
             table = admitted;
         }
         // A durable marker with no DB job means admission committed before a
-        // crash. Starting its exact request is idempotent before each action.
-        if (table.storage_migration != null) {
+        // crash. Cancellation must also work when startup admission (for
+        // example its disk reserve) cannot succeed. The DB records that
+        // cancellation durably without preparing a source store.
+        if (table.storage_migration != null and command.value.action != .cancel) {
             var start = command.value;
             start.action = .start;
             const start_body = try std.json.Stringify.valueAlloc(self.alloc, start, .{});
@@ -20646,6 +20648,8 @@ test "storage migration job observation preserves admitted and unpublished catal
         job: ?migration.Job = null,
         mutations: usize = 0,
         publications: usize = 0,
+        reject_start: bool = false,
+        fail_publication: bool = false,
         fn from(ptr: *anyopaque) *@This() {
             return @ptrCast(@alignCast(ptr));
         }
@@ -20659,6 +20663,10 @@ test "storage migration job observation preserves admitted and unpublished catal
         fn publish(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
             const self = from(ptr);
             try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(self.table, expected));
+            if (self.fail_publication) {
+                self.fail_publication = false;
+                return error.InputOutput;
+            }
             self.table = replacement;
             self.publications += 1;
         }
@@ -20675,7 +20683,8 @@ test "storage migration job observation preserves admitted and unpublished catal
             } else {
                 self.mutations += 1;
                 try std.testing.expectEqual(@as(u32, 7), cmd.request.budget.batch_rows);
-                if (cmd.action == .start and self.job == null) self.job = .{
+                if (cmd.action == .start and self.reject_start) return error.VectorMigrationDiskReserve;
+                if ((cmd.action == .start or cmd.action == .cancel) and self.job == null) self.job = .{
                     .job_id = "job",
                     .mode = .online,
                     .budget = cmd.request.budget,
@@ -20685,6 +20694,7 @@ test "storage migration job observation preserves admitted and unpublished catal
                     .snapshot_fence = 1,
                     .replay_cursor = 1,
                 };
+                if (cmd.action == .cancel) self.job.?.phase = .cancelled;
                 if (cmd.action == .step and self.job.?.phase == .backfill) self.job.?.phase = .verifying;
             }
             return try std.json.Stringify.valueAlloc(allocator, self.job.?, .{});
@@ -20721,6 +20731,21 @@ test "storage migration job observation preserves admitted and unpublished catal
     defer alloc.free(reconciled);
     try std.testing.expectEqual(@as(usize, 1), fake.publications);
     try std.testing.expectEqual(.vector_store, fake.table.storage.dense_embeddings);
+
+    // Catalog admission exists but DB startup cannot pass its reserve check.
+    // Cancellation must reach the owner directly, retain its receipt if the
+    // catalog update fails, and reconcile that receipt on an exact retry.
+    fake = .{ .reject_start = true, .fail_publication = true };
+    try std.testing.expectError(error.InputOutput, server.advanceStorageMigration("docs", "job", "{\"action\":\"cancel\"}"));
+    try std.testing.expectEqual(.cancelled, fake.job.?.phase);
+    try std.testing.expect(fake.table.storage_migration != null);
+    const cancelled = try server.advanceStorageMigration("docs", "job", "{\"action\":\"cancel\"}");
+    defer alloc.free(cancelled);
+    try std.testing.expect(fake.table.storage_migration == null);
+    try std.testing.expectEqual(.primary_lsm, fake.table.storage.dense_embeddings);
+    const repeated = try server.advanceStorageMigration("docs", "job", "{\"action\":\"cancel\"}");
+    defer alloc.free(repeated);
+    try std.testing.expectEqualSlices(u8, cancelled, repeated);
 }
 
 test "document artifact routes declare read and admin permissions" {

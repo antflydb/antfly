@@ -329,3 +329,46 @@ no confidence intervals, cold-cache resets or quiet-host guarantees. The
 packaged Linux Antfly and inference E2E jobs passed for this engine revision;
 rerunning CI with the unit-driver fixes requires the repository's new human
 approval gate for the final PR commit.
+
+## PR recovery review follow-up
+
+Catalog-only admission can now be cancelled without starting the source store
+or passing the migration's disk reserve. The DB writes a durable cancelled
+receipt under the same apply lock as startup before the API clears admission.
+Exact retries return that receipt; a conflicting active job remains protected.
+The regression covers an impossible reserve, restart before cancellation, a
+lost cancellation response, a failed catalog reconciliation, another rejected
+admission with an older cancelled receipt, and a replacement job.
+
+Offline copying now syncs the whole directory chain, including publication of
+the shadow root, before acknowledging a file's first chunk. Retries sync existing
+directories too, because a failed attempt may have created them without making
+their parent entries durable. Later chunks rely on the directory chain already
+acknowledged by the cursor.
+
+The copy recovery tests use the production chunk function with a stricter
+VoprIo directory-sync adapter. The default model persists the entire namespace
+on any directory sync, which cannot expose this bug. The adapter persists only
+immediate entries and removes descendants whose parent links are lost on a
+simulated power failure. A negative control demonstrates the old sequence
+retaining its cursor while losing a copied subtree. Recovery cases cover empty
+and multi-chunk files, intermediate-directory sync failures, retry without a
+crash, and power loss before/after cursor publication and between later chunks.
+These simulated failures complement the production process-restart tests; they
+are not physical power-cut tests on a host filesystem.
+
+Validation: `vector-migration-test` passed 27/27; the focused API
+observation/cancellation test passed; the ReleaseFast executable built; the
+production migration/vector-store suite passed 14/14 on its complete rerun.
+
+The first production run hit an intermittent offline ANN-neighbor mismatch
+after restart. The preserved pre-fix executable reproduced the identical
+query-15 difference on the second additional control attempt: `doc:000221`
+disappeared from the top ten and `doc:002725` entered. The fixed run first
+matched after migration and differed after another restart; the control
+differed at the first post-migration check. Both logs record deferred posting
+maintenance, but this comparison does not establish its causal role. The
+assertions remain unchanged; this is an unresolved pre-existing ANN
+stability/qualification issue, not a clean repeated end-to-end result.
+Logs, both failed database roots, the tested binary, and a control runner are
+preserved under `.benchmark-results/vector-migration-review-20260915/`.
