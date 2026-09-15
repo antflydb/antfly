@@ -1,0 +1,60 @@
+name: PR CI Controller
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, closed, labeled, unlabeled, edited]
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_run:
+    # Match both workflow and dynamic run names; validate the path below.
+    workflows: [Approved PR CI, "PR CI #**"]
+    types: [completed]
+permissions:
+  contents: read
+jobs:
+  route:
+    if: >-
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request) &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.path == '.github/workflows/pr-ci.yml')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      number: ${{ steps.route.outputs.number }}
+    steps:
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        id: route
+        with:
+          script: |
+            const p = context.payload;
+            if (context.eventName === 'issue_comment' && p.action === 'created' &&
+                !p.comment.body.trim().startsWith('/ci run ')) return;
+            const match = p.workflow_run?.display_title.match(/^PR CI #(\d+) \/ check \d+ \/ approval \d+$/);
+            core.setOutput('number', p.pull_request?.number || p.issue?.number || match?.[1] || '');
+  control:
+    needs: route
+    if: needs.route.outputs.number != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Serialize state changes with admission without dropping pending events.
+    concurrency:
+      group: pr-ci-state-${{ needs.route.outputs.number }}
+      queue: max
+    permissions:
+      contents: read
+      actions: write
+      checks: write
+      pull-requests: read
+      issues: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          PR_NUMBER: ${{ needs.route.outputs.number }}
+        with:
+          script: |
+            const {main} = require('./.github/scripts/pr-ci.cjs');
+            await main({github, context, core, mode: 'event',
+              config: require('./.github/scripts/pr-ci-config.json')});
