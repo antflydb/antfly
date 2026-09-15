@@ -502,6 +502,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &.{
             "storage.db.db.test.db reopens persisted",
+            "storage.db.db.test.db split prepare and finalize work with durable lsm primary backend",
             "storage.db.db.test.db delete index persists",
             "storage.db.db.test.db indexed delete removes",
             "storage.db.db.test.db indexed overwrite replaces",

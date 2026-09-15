@@ -60383,13 +60383,17 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     // Replicated apply reopens prepared shards from their local manifest;
     // it cannot consult metadata while metadata is waiting for that apply.
     // Keep public validation/provenance alongside the internal runtime schema.
-    if (try self.core.getStoreValue(self.alloc, public_schema_json_key)) |schema_json| {
-        defer self.alloc.free(schema_json);
-        try dest_store.put(public_schema_json_key, schema_json);
-    }
+    const schema_json = try self.core.getStoreValue(self.alloc, public_schema_json_key);
+    defer if (schema_json) |value| self.alloc.free(value);
     const public_schema_versions = try self.core.store.scanPrefix(self.alloc, public_table_schema.versioned_schema_key_prefix);
     defer docstore_mod.DocStore.freeResults(self.alloc, public_schema_versions);
-    for (public_schema_versions) |entry| try dest_store.put(entry.key, entry.value);
+    if (schema_json != null or public_schema_versions.len != 0) {
+        var txn = try dest_store.beginWriteTxn();
+        errdefer txn.abort();
+        if (schema_json) |value| try txn.put(public_schema_json_key, value);
+        for (public_schema_versions) |entry| try txn.put(entry.key, entry.value);
+        try txn.commit();
+    }
     try dest_indexes.seedSplitArtifactCatalogsFrom(dest_store, self.core.index_manager);
 
     const configs = try self.core.listIndexes(self.alloc);
