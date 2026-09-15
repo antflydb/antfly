@@ -345,7 +345,7 @@ def main():
                 if mode == "offline":
                     stop_server()
                     with (arm / "migration.log").open("w") as progress:
-                        subprocess.run(
+                        process = subprocess.Popen(
                             [
                                 str(args.binary),
                                 "storage",
@@ -363,9 +363,13 @@ def main():
                             ],
                             stdout=progress,
                             stderr=subprocess.STDOUT,
-                            check=True,
-                            timeout=3600,
                         )
+                        code = process.wait(timeout=3600)
+                        if code != 0:
+                            raise RuntimeError(
+                                f"offline migration exited {code}: {arm / 'migration.log'}"
+                            )
+                        process = None
                     start_server()
             result["migration_and_churn_seconds"] = time.monotonic() - started
             ready(args.rows - args.churn)
