@@ -17119,6 +17119,24 @@ test "placement topology uses authoritative split peer set during partial projec
     try std.testing.expectEqual(@as(usize, 0), topology.learners(708).?.len);
 }
 
+test "data ownership fallback requires a single store across all roles" {
+    const stores = [_]antfly.metadata.table_manager.StoreRecord{
+        .{ .store_id = 1, .node_id = 1, .role = "hot" },
+        .{ .store_id = 2, .node_id = 2, .role = "cold" },
+    };
+    std.debug.print("DATA_OWNERSHIP_FALLBACK excludes cross-role stores\n", .{});
+    try std.testing.expect(!hasSingleRoleStore(&stores, "hot", 1));
+    try std.testing.expect(!hasSingleRoleStore(&stores, "cold", 2));
+    try std.testing.expect(hasSingleRoleStore(stores[0..1], "hot", 1));
+    try std.testing.expect(!hasSingleRoleStore(stores[0..1], "cold", 1));
+    try std.testing.expect(!hasSingleRoleStore(stores[0..1], "hot", 2));
+    try std.testing.expect(!hasSingleRoleStore(&.{}, "hot", 1));
+
+    var same_role = stores;
+    same_role[1].role = "hot";
+    try std.testing.expect(!hasSingleRoleStore(&same_role, "hot", 1));
+}
+
 test "placement peer collection preserves complete intent peers during partial projection" {
     const intents = [_]antfly.raft.PlacementIntent{.{
         .record = .{ .group_id = 703, .replica_id = 2, .local_node_id = 2 },
@@ -20249,7 +20267,7 @@ fn hasSingleRoleStore(
 ) bool {
     var matching_store_id: ?u64 = null;
     for (stores) |store| {
-        if (!std.mem.eql(u8, store.role, role)) continue;
+        if (!std.mem.eql(u8, store.role, role)) return false;
         if (matching_store_id == null) {
             matching_store_id = store.store_id;
             continue;
