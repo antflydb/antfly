@@ -112,7 +112,6 @@ class ZigValidationScopeTests(unittest.TestCase):
         )
 
 
-
 def embedded_helper() -> str:
     """Return the change-filter script exactly as the workflow writes it.
 
