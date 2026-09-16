@@ -1,0 +1,38 @@
+{
+  "scenario": "warm_join_planning_acquisition",
+  "date": "2026-09-15",
+  "source_commit": "9895b69c8",
+  "optimize": "Debug",
+  "allocator": "std.testing.allocator",
+  "table_count": 1000,
+  "ranges_per_table": 1,
+  "schema_bytes_per_table": 8192,
+  "warmup": 1,
+  "samples": 7,
+  "publication_ns": 32575000,
+  "copied_ns": [
+    371843000,
+    375351000,
+    371160000,
+    372304000,
+    372521000,
+    373056000,
+    376837000
+  ],
+  "retained_ns": [
+    7000,
+    7000,
+    7000,
+    6000,
+    7000,
+    7000,
+    7000
+  ],
+  "copied_median_ns": 372521000,
+  "retained_median_ns": 7000,
+  "notes": [
+    "Same binary for both paths; warm diagnostic snapshot clone/free versus retained planning acquire, indexed table/key lookup, release.",
+    "Cache freshness reset outside measured work. Publication measured separately; input construction excluded.",
+    "No task-owned concurrent compiler or workload. Shared host and Debug checking allocator; not production latency or throughput."
+  ]
+}

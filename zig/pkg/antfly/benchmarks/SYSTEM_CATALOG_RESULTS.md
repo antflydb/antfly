@@ -2143,3 +2143,79 @@ Raw observations: [baseline failure](system_catalog_fanout_baseline_2026_09_15.j
 [initial candidate failure](system_catalog_fanout_initial_candidate_2026_09_15.json),
 [missing-fence failure](system_catalog_fanout_unfenced_candidate_2026_09_15.json), and
 [complete candidate workload](system_catalog_fanout_candidate_2026_09_15.json).
+
+
+## Retained join planning and clock-safe fence narrowing (2026-09-15)
+
+The planner now acquires a compact immutable generation from the control-read
+cache, retaining it once per public query. Indexed table statistics, shard IDs,
+and sorted key ranges replace diagnostic snapshot copying and repeated full
+inventory scans. Generations contain no schemas or index definitions. Cold
+control refresh still transfers the existing control snapshot; these measurements
+do not claim to eliminate that transfer. Inherited admission fences preserve
+their clock when narrowed by a request using another clock.
+
+The same Debug test binary compared warm diagnostic snapshot clone/release with
+planning retain, indexed table/key lookup, and release. With 1,000 tables, one
+range per table, and 8 KiB schemas, seven samples after one warmup measured:
+
+| Component | Median | Minimum–maximum |
+| --- | ---: | ---: |
+| Copied diagnostic view | 372.521 ms | 371.160–376.837 ms |
+| Retained planning view | 0.007 ms | 0.006–0.007 ms |
+
+Initial control-generation publication took 32.575 ms, excluding construction of
+the incoming snapshot. Cache freshness was reset outside timing for both paths.
+The checking allocator amplifies allocation/free cost, and retained timings are
+near timer resolution; this is evidence of work removed, not a production latency
+ratio. No task-owned compiler or other workload ran concurrently.
+[Raw component samples](system_catalog_join_planning_component_2026_09_15.json).
+
+Validation after merging `fab41bb61` passed 45 join/planning tests, 81 read
+contracts, 20 control-read/deadline tests, the catalog-store suite (including
+main's retained-entry replay regressions), the production build, and the two
+standalone one/eight-shard scoped/literal join E2Es. The merged paginated transfer
+fixture preserves main's distinct-clock, cancellation, clone, and publication
+checks; its per-page transport timeout is five seconds inside the overall
+10-second read budget.
+
+The modeled `production-cluster-join-split-vopr-test` remains failing. A detached
+`3b4f803a9` baseline with only the same fixture compatibility repairs reproduces
+`TextProjectionProvenanceMismatch`, the resulting `IndexUnavailable` join failure,
+and exact replay divergence. The merged candidate reproduces these failures too.
+Thus the modeled active-split witness is an unresolved pre-existing qualification
+gap; passing unit and real-server workloads must not be described as passing that
+witness. The provenance guard remains enabled, and the test is not skipped.
+
+The high-level pair used fresh three-data-node clusters, ten tables with eight
+single-replica shards each, 32 schema fields, 20 samples and two warmups per
+operation, and 20-line NDJSON requests. Both runs verified five right-hand shards
+remote from coordinator 101 and validated all operation results. Provisioning was
+outside timing. The candidate binary is built from `c63cde8ab`, including main
+through `1faa190bd` (LSM key-bound buffer reuse); its production build and all six
+focused streaming/compaction regressions passed. The baseline is the saved
+`3b4f803a9` binary. This pair therefore includes upstream integration changes in
+addition to planning retention; the same-binary component isolates the latter.
+
+| Operation | Baseline p50 / p95 / max (ms) | Candidate p50 / p95 / max (ms) |
+| --- | ---: | ---: |
+| Qualified batch | 172.80 / 266.70 / 295.62 | 224.00 / 307.19 / 330.75 |
+| Qualified lookup | 28.74 / 56.49 / 61.44 | 26.48 / 52.44 / 57.09 |
+| Qualified query | 87.32 / 121.30 / 121.40 | 80.81 / 107.69 / 163.26 |
+| Qualified join | 263.68 / 294.74 / 299.14 | 287.08 / 338.61 / 395.99 |
+| 20-line NDJSON | 1456.72 / 1696.11 / 1743.86 | 1348.36 / 1479.67 / 1537.87 |
+| Scoped listing | 63.59 / 81.11 / 84.59 | 54.16 / 140.26 / 161.24 |
+| Concurrent lookup (8 clients) | 52.13 / 98.73 / 184.72 | 52.37 / 81.80 / 102.39 |
+| Rename | 32.36 / 102.39 / 140.35 | 31.24 / 115.36 / 136.98 |
+
+NDJSON and concurrent-lookup p95 improved in this pair, while join and batch
+latency increased. These observations do not establish an end-to-end join
+speedup or a uniform latency improvement. The small catalog does not reproduce
+the 1,000-table copying workload, and there is only one paired shared-host Debug
+run. No task-owned compiler, profiler, or second workload ran during either
+measurement. Tail qualification under sustained load remains separate work.
+
+[Baseline workload](system_catalog_join_planning_baseline_2026_09_15.json) and
+[candidate workload](system_catalog_join_planning_candidate_2026_09_15.json)
+retain exact binary hashes, settings, placements, and per-request concurrent
+lookup samples.
