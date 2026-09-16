@@ -798,7 +798,8 @@ pub fn encodeStoredCreateTableRequestAlloc(alloc: std.mem.Allocator, req: Create
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
     var root = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{}", .{});
-    try root.object.put(arena, "storage", try std.json.parseFromSliceLeaky(std.json.Value, arena, try std.json.Stringify.valueAlloc(arena, req.storage, .{}), .{}));
+    if (req.storage) |storage|
+        try root.object.put(arena, "storage", try std.json.parseFromSliceLeaky(std.json.Value, arena, try std.json.Stringify.valueAlloc(arena, storage, .{}), .{}));
     if (req.num_shards) |num_shards| {
         try root.object.put(arena, "num_shards", .{ .integer = @intCast(num_shards) });
     }
@@ -1188,7 +1189,7 @@ fn isAlgebraicInternalConfigField(field: []const u8) bool {
 pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metadata_table_manager.TableRecord {
     const min_ranges = req.num_shards orelse 1;
     return .{
-        .storage = req.storage,
+        .storage = req.storage orelse .{},
         .table_id = deriveId(table_name, 0x54424c45),
         .name = table_name,
         .description = req.description orelse "",
@@ -4990,14 +4991,14 @@ test "stored create table encoding round-trips a normalized public request" {
 test "stored create table encoding preserves empty requests" {
     const encoded = try encodeStoredCreateTableRequestAlloc(std.testing.allocator, .{});
     defer std.testing.allocator.free(encoded);
-    try std.testing.expectEqualStrings("{\"storage\":{\"dense_embeddings\":\"primary_lsm\"}}", encoded);
+    try std.testing.expectEqualStrings("{}", encoded);
 
     var decoded = try parseStoredCreateTableRequest(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u32, null), decoded.num_shards);
     try std.testing.expect(decoded.description == null);
     try std.testing.expect(decoded.schema_json == null);
-    try std.testing.expectEqual(.primary_lsm, decoded.storage.dense_embeddings);
+    try std.testing.expect(decoded.storage == null);
 }
 
 test "create table parser rejects schemas that cannot derive runtime mappings" {

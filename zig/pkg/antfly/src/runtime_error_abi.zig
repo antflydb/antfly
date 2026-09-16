@@ -374,7 +374,36 @@ pub const Detail = enum(c_int) {
     graph_metric_action_partial_outcome,
     index_generation_mismatch,
     generation_transition_active,
-    // Restore and integrity outcomes cross independently compiled owners.
+    storage_busy,
+    storage_kernel_failure,
+    invalid_vector_migration_budget,
+    invalid_vector_migration_id,
+    invalid_vector_migration_state,
+    unsupported_vector_migration_direction,
+    unsupported_vector_migration_version,
+    vector_migration_active,
+    vector_migration_already_exists,
+    vector_migration_already_published,
+    vector_migration_configuration_changed,
+    vector_migration_coverage_mismatch,
+    vector_migration_disk_reserve,
+    vector_migration_idempotency_conflict,
+    vector_migration_identity_mismatch,
+    vector_migration_inline_payload_remains,
+    vector_migration_not_found,
+    vector_migration_not_ready,
+    vector_migration_read_epoch_changed,
+    vector_migration_recovery_required,
+    vector_migration_row_exceeds_budget,
+    vector_migration_temporary_budget_exceeded,
+    vector_migration_offline_admission,
+    vector_migration_catalog_in_use,
+    vector_migration_copy_mismatch,
+    vector_migration_unsupported_file,
+    vector_store_requires_offline_command,
+    read_index_timeout,
+    incomplete_published_snapshot,
+    // Unpublished relational/restore identities follow every released main ID.
     backup_cohort_already_committed,
     backup_cohort_cancelled,
     backup_cohort_changed,
@@ -499,9 +528,6 @@ pub const Detail = enum(c_int) {
     relational_index_column_type_mismatch,
     relational_table_required,
     invalid_relational_index_forward_key,
-    // Online source, immutable artifact, and receiver control callbacks cross
-    // independent runtime units. Append stable identities; never expose
-    // compilation-local Zig error integers or silently erase recovery signals.
     invalid_online_source_command,
     online_source_corrupt,
     online_source_pin_missing,
@@ -550,7 +576,6 @@ pub const Detail = enum(c_int) {
     merge_receiver_projection_not_ready,
     merge_source_projection_not_ready,
     merge_source_projection_advanced,
-    storage_busy,
     restore_job_commit_not_applied,
     coordinated_standalone_ha_metadata_required,
     relational_rewrite_type_change,
@@ -563,7 +588,6 @@ pub const Detail = enum(c_int) {
     invalid_relational_expression_input,
     invalid_relational_generated_value,
     generated_column_rewrite_required,
-    read_index_timeout,
     catalog_routing_snapshot_timeout,
     intent_conflict,
     version_conflict,
@@ -853,6 +877,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.GenerationDurabilityUncertain => status(.retryable, .generation_durability_uncertain),
         error.GenerationTransitionActive => status(.retryable, .generation_transition_active),
         error.IndexRebuilding => status(.retryable, .index_rebuilding),
+        error.IncompletePublishedSnapshot => status(.retryable, .incomplete_published_snapshot),
         error.TableVisibilityTimeout => status(.timeout, .table_visibility_timeout),
         error.WriterLocked => status(.retryable, .writer_locked),
         error.LsmRootWriterAlreadyOpen => status(.retryable, .lsm_root_writer_already_open),
@@ -1100,6 +1125,32 @@ pub fn statusFromError(err: anyerror) Status {
         error.ImmutableTableStorageSettings => status(.conflict, .immutable_table_storage_settings),
         error.VectorStoreLifecycleUnsupported => status(.unsupported, .vector_store_lifecycle_unsupported),
         error.VectorStoreReferenceFormatRequired => status(.unsupported, .vector_store_reference_format_required),
+        error.InvalidVectorMigrationBudget => status(.invalid_argument, .invalid_vector_migration_budget),
+        error.InvalidVectorMigrationId => status(.invalid_argument, .invalid_vector_migration_id),
+        error.InvalidVectorMigrationState => status(.corrupt, .invalid_vector_migration_state),
+        error.UnsupportedVectorMigrationDirection => status(.unsupported, .unsupported_vector_migration_direction),
+        error.UnsupportedVectorMigrationVersion => status(.unsupported, .unsupported_vector_migration_version),
+        error.VectorMigrationActive => status(.conflict, .vector_migration_active),
+        error.VectorMigrationAlreadyExists => status(.conflict, .vector_migration_already_exists),
+        error.VectorMigrationAlreadyPublished => status(.conflict, .vector_migration_already_published),
+        error.VectorMigrationConfigurationChanged => status(.conflict, .vector_migration_configuration_changed),
+        error.VectorMigrationCoverageMismatch => status(.corrupt, .vector_migration_coverage_mismatch),
+        error.VectorMigrationDiskReserve => status(.retryable, .vector_migration_disk_reserve),
+        error.VectorMigrationIdempotencyConflict => status(.conflict, .vector_migration_idempotency_conflict),
+        error.VectorMigrationIdentityMismatch => status(.corrupt, .vector_migration_identity_mismatch),
+        error.VectorMigrationInlinePayloadRemains => status(.corrupt, .vector_migration_inline_payload_remains),
+        error.VectorMigrationNotFound => status(.not_found, .vector_migration_not_found),
+        error.VectorMigrationNotReady => status(.retryable, .vector_migration_not_ready),
+        error.VectorMigrationReadEpochChanged => status(.retryable, .vector_migration_read_epoch_changed),
+        error.VectorMigrationRecoveryRequired => status(.retryable, .vector_migration_recovery_required),
+        error.VectorMigrationRowExceedsBudget => status(.invalid_argument, .vector_migration_row_exceeds_budget),
+        error.VectorMigrationTemporaryBudgetExceeded => status(.retryable, .vector_migration_temporary_budget_exceeded),
+        error.VectorMigrationOfflineAdmission => status(.conflict, .vector_migration_offline_admission),
+        error.VectorMigrationCatalogInUse => status(.conflict, .vector_migration_catalog_in_use),
+        error.VectorMigrationCopyMismatch => status(.conflict, .vector_migration_copy_mismatch),
+        error.VectorMigrationUnsupportedFile => status(.conflict, .vector_migration_unsupported_file),
+        error.VectorStoreRequiresOfflineCommand => status(.conflict, .vector_store_requires_offline_command),
+        error.StorageKernelFailure => status(.internal, .storage_kernel_failure),
         else => status(.internal, .none),
     };
 }
@@ -1341,6 +1392,31 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .immutable_table_storage_settings => "ImmutableTableStorageSettings",
         .vector_store_lifecycle_unsupported => "VectorStoreLifecycleUnsupported",
         .vector_store_reference_format_required => "VectorStoreReferenceFormatRequired",
+        .invalid_vector_migration_budget => "InvalidVectorMigrationBudget",
+        .invalid_vector_migration_id => "InvalidVectorMigrationId",
+        .invalid_vector_migration_state => "InvalidVectorMigrationState",
+        .unsupported_vector_migration_direction => "UnsupportedVectorMigrationDirection",
+        .unsupported_vector_migration_version => "UnsupportedVectorMigrationVersion",
+        .vector_migration_active => "VectorMigrationActive",
+        .vector_migration_already_exists => "VectorMigrationAlreadyExists",
+        .vector_migration_already_published => "VectorMigrationAlreadyPublished",
+        .vector_migration_configuration_changed => "VectorMigrationConfigurationChanged",
+        .vector_migration_coverage_mismatch => "VectorMigrationCoverageMismatch",
+        .vector_migration_disk_reserve => "VectorMigrationDiskReserve",
+        .vector_migration_idempotency_conflict => "VectorMigrationIdempotencyConflict",
+        .vector_migration_identity_mismatch => "VectorMigrationIdentityMismatch",
+        .vector_migration_inline_payload_remains => "VectorMigrationInlinePayloadRemains",
+        .vector_migration_not_found => "VectorMigrationNotFound",
+        .vector_migration_not_ready => "VectorMigrationNotReady",
+        .vector_migration_read_epoch_changed => "VectorMigrationReadEpochChanged",
+        .vector_migration_recovery_required => "VectorMigrationRecoveryRequired",
+        .vector_migration_row_exceeds_budget => "VectorMigrationRowExceedsBudget",
+        .vector_migration_temporary_budget_exceeded => "VectorMigrationTemporaryBudgetExceeded",
+        .vector_migration_offline_admission => "VectorMigrationOfflineAdmission",
+        .vector_migration_catalog_in_use => "VectorMigrationCatalogInUse",
+        .vector_migration_copy_mismatch => "VectorMigrationCopyMismatch",
+        .vector_migration_unsupported_file => "VectorMigrationUnsupportedFile",
+        .vector_store_requires_offline_command => "VectorStoreRequiresOfflineCommand",
 
         .out_of_memory => "OutOfMemory",
         .invalid_argument => "InvalidArgument",
@@ -1404,6 +1480,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .generation_durability_uncertain => "GenerationDurabilityUncertain",
         .generation_transition_active => "GenerationTransitionActive",
         .index_rebuilding => "IndexRebuilding",
+        .incomplete_published_snapshot => "IncompletePublishedSnapshot",
         .table_visibility_timeout => "TableVisibilityTimeout",
         .writer_locked => "WriterLocked",
         .lsm_root_writer_already_open => "LsmRootWriterAlreadyOpen",
@@ -1648,6 +1725,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .provider_quota_registry_full => "ProviderQuotaRegistryFull",
         .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
         .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
+        .storage_kernel_failure => "StorageKernelFailure",
     };
 }
 
@@ -1683,6 +1761,13 @@ test "stable status preserves deterministic raft rejection and malformed respons
 }
 
 test "stable status preserves public boundary semantics" {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |err| {
+        const readiness = statusFromError(err);
+        try std.testing.expectEqual(@intFromEnum(Code.retryable), readiness.code);
+        try std.testing.expectEqual(err, errorFromStatus(readiness));
+    }
+    try std.testing.expectEqual(error.ReadIndexTimeout, errorFromStatus(statusFromError(error.ReadIndexTimeout)));
+    try std.testing.expectEqual(@intFromEnum(Code.timeout), statusFromError(error.ReadIndexTimeout).code);
     try std.testing.expectEqual(error.GenerationTransitionActive, errorFromStatus(statusFromError(error.GenerationTransitionActive)));
     try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
     try std.testing.expectEqual(error.IndexGenerationMismatch, errorFromStatus(statusFromError(error.IndexGenerationMismatch)));
@@ -1756,6 +1841,7 @@ test "stable detail detection distinguishes private errors" {
 test "every classified boundary outcome retains its identity" {
     @setEvalBranchQuota(10000);
     const classified = comptime blk: {
+        @setEvalBranchQuota(@typeInfo(Detail).@"enum".fields.len * 8);
         const details = std.meta.tags(Detail)[1..];
         var errors: [details.len]anyerror = undefined;
         for (details, 0..) |detail, index| {
@@ -1811,4 +1897,28 @@ test "ambiguous backup outcome survives runtime transport without rollback autho
     const wire = statusFromError(error.BackupOutcomeAmbiguous);
     try std.testing.expectEqual(@intFromEnum(Code.conflict), wire.code);
     try std.testing.expectEqual(error.BackupOutcomeAmbiguous, errorFromStatus(wire));
+}
+
+test "storage owner contention retains retryability and exact identity" {
+    const wire = statusFromError(error.StorageBusy);
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), wire.code);
+    try std.testing.expect(errorHasStableDetail(error.StorageBusy));
+    try std.testing.expectEqual(error.StorageBusy, errorFromStatus(wire));
+}
+
+test "released main Detail identifiers retain their exact names and numeric values" {
+    const std_test = @import("std");
+    var fingerprint: u64 = 14695981039346656037;
+    var count: usize = 0;
+    inline for (@typeInfo(Detail).@"enum".fields) |field| {
+        if (field.value <= 340) {
+            for (field.name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
+            var encoded: [4]u8 = undefined;
+            std_test.mem.writeInt(u32, &encoded, @intCast(field.value), .little);
+            for (encoded) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
+            count += 1;
+        }
+    }
+    try std_test.testing.expectEqual(@as(usize, 341), count);
+    try std_test.testing.expectEqual(@as(u64, 0x11e27a0c485aaa14), fingerprint);
 }

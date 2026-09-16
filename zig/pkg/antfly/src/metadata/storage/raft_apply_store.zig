@@ -3130,6 +3130,116 @@ fn deinitCommittedTransitionDelta(alloc: std.mem.Allocator, delta: *CommittedTra
     delta.* = undefined;
 }
 
+test "standalone metadata released JSON replay is atomic exact and checkpoint durable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/legacy-replay", .{tmp.sub_path});
+    const restored_root = try std.fmt.allocPrint(scratch, "{s}-restored", .{root});
+    const checkpoint = try std.fmt.allocPrint(scratch, "{s}.checkpoint", .{root});
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "legacy", .storage = .{ .dense_embeddings = .vector_store }, .storage_migration = .{ .request = .{ .job_id = "vectors", .mode = .online } } };
+    const ranges = [_]metadata.RangeRecord{.{ .table_id = 7, .group_id = 17, .range_id = 19, .start_key = "" }};
+    const payload = try std.json.Stringify.valueAlloc(scratch, RaftApplyStore.LegacyCatalogCreate{ .table = table, .ranges = &ranges }, .{});
+    var record: @import("../../storage/hot_standby/replication_record.zig").Record = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 5, .previous_lsn = 4, .payload = payload };
+    const group = group_ids.main_metadata_group_id;
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        try store.applyHARecord(record);
+        const revision = try store.standaloneRevision();
+        try std.testing.expectEqual(@as(u64, 1), revision);
+        try store.applyHARecord(record);
+        try std.testing.expectEqual(revision, try store.standaloneRevision());
+        const tables = try store.listTables(alloc, group);
+        defer store.freeTables(alloc, tables);
+        try std.testing.expectEqual(@as(usize, 1), tables.len);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, tables[0]));
+        const owned_ranges = try store.listRanges(alloc, group);
+        defer store.freeRanges(alloc, owned_ranges);
+        try std.testing.expectEqual(@as(usize, 1), owned_ranges.len);
+        try std.testing.expect(metadata_table_manager.rangeRecordsEqual(ranges[0], owned_ranges[0]));
+        const auxiliary = (try store.loadStandaloneCatalog(alloc)).?;
+        defer alloc.free(auxiliary);
+        try std.testing.expectEqualStrings("{\"epoch\":1,\"tables\":[],\"ranges\":[]}", auxiliary);
+        var altered_table = table;
+        altered_table.description = "conflicting";
+        record.payload = try std.json.Stringify.valueAlloc(scratch, RaftApplyStore.LegacyCatalogCreate{ .table = altered_table, .ranges = &ranges }, .{});
+        try std.testing.expectError(error.MetadataHASourceChanged, store.applyHARecord(record));
+        record.lsn = 9;
+        record.previous_lsn = 8;
+        try std.testing.expectError(error.TableLifecycleConflict, store.applyHARecord(record));
+        try std.testing.expectEqual(revision, try store.standaloneRevision());
+        record.payload = payload;
+        record.cluster_id = 8;
+        try std.testing.expectError(error.MetadataHASourceChanged, store.applyHARecord(record));
+        record.cluster_id = 7;
+        record.timeline_id = 2;
+        try std.testing.expectError(error.MetadataHASourceChanged, store.applyHARecord(record));
+        record.timeline_id = 1;
+        // Metadata effects may have document WAL entries between them.
+        try store.applyHARecord(record);
+        try std.testing.expectEqual(revision + 1, try store.standaloneRevision());
+    }
+    var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer reopened.deinit();
+    const artifact = try reopened.exportHACheckpoint(std.testing.io, checkpoint);
+    var restored = try RaftApplyStore.init(alloc, .{ .root_dir = restored_root });
+    defer restored.deinit();
+    try restored.importHACheckpoint(std.testing.io, checkpoint, artifact.size_bytes);
+    try restored.applyHARecord(record);
+    try std.testing.expectEqual(@as(u64, 2), try restored.standaloneRevision());
+    const receipt = try restored.store.get(alloc, RaftApplyStore.metadata_ha.replay_key);
+    defer alloc.free(receipt);
+    try std.testing.expectEqual(@as(u64, 9), std.mem.readInt(u64, receipt[24..32], .little));
+    const tables = try restored.listTables(alloc, group);
+    defer restored.freeTables(alloc, tables);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, tables[0]));
+}
+
+test "standalone metadata released JSON replay verifies imported ranges and preserves auxiliary state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/legacy-import", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "legacy" };
+    const ranges = [_]metadata.RangeRecord{.{ .table_id = 7, .group_id = 17, .range_id = 19, .start_key = "" }};
+    const auxiliary = "{\"epoch\":42,\"extension_packages\":[{\"name\":\"preserved\"}]}";
+    try store.replaceStandaloneCatalog(group, 0, &.{table}, &ranges, auxiliary);
+    var wrong_ranges = ranges;
+    wrong_ranges[0].range_id += 1;
+    const invalid_payload = try std.json.Stringify.valueAlloc(alloc, RaftApplyStore.LegacyCatalogCreate{ .table = table, .ranges = &wrong_ranges }, .{});
+    defer alloc.free(invalid_payload);
+    var record: @import("../../storage/hot_standby/replication_record.zig").Record = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = invalid_payload };
+    try std.testing.expectError(error.TableLifecycleConflict, store.applyHARecord(record));
+    try std.testing.expectError(error.NotFound, store.store.get(alloc, RaftApplyStore.metadata_ha.replay_key));
+    try std.testing.expectEqual(@as(u64, 1), try store.standaloneRevision());
+    const payload = try std.json.Stringify.valueAlloc(alloc, RaftApplyStore.LegacyCatalogCreate{ .table = table, .ranges = &ranges }, .{});
+    defer alloc.free(payload);
+    record.payload = payload;
+    try store.applyHARecord(record);
+    const loaded = (try store.loadStandaloneCatalog(alloc)).?;
+    defer alloc.free(loaded);
+    try std.testing.expectEqualStrings(auxiliary, loaded);
+    try std.testing.expectEqual(@as(u64, 2), try store.standaloneRevision());
+    // A binary producer identity forbids later legacy effects. Covered JSON
+    // records remain harmless even when the table has since changed.
+    var txn = try store.store.beginWriteTxn();
+    try txn.put(RaftApplyStore.metadata_ha.source_key, &([_]u8{1} ** 16));
+    try txn.commit();
+    try store.applyHARecord(record);
+    record.lsn = 2;
+    record.previous_lsn = 1;
+    try std.testing.expectError(error.MetadataHASourceChanged, store.applyHARecord(record));
+    try std.testing.expectEqual(@as(u64, 2), try store.standaloneRevision());
+}
+
 test "standalone metadata migration and listeners are failure atomic" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3303,7 +3413,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
         };
         var context: u8 = 0;
         try source.bindHA(.{ .primary = &primary }, .{ .primary = &primary, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait });
-        try std.testing.expectError(error.InjectedAfterMetadataHAAppend, source.replaceStandaloneCatalog(group, 0, &.{}, &.{}, value));
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, 0, &.{}, &.{}, value));
     }
     const final_lsn = primary.lastLsn();
     try std.testing.expect(final_lsn > 8);
@@ -3511,6 +3621,7 @@ pub const RaftApplyStore = struct {
     const metadata_chunks = @import("../../storage/hot_standby/metadata_effect_chunks.zig");
     const metadata_pending_key = metadata_ha.prefix ++ "pending";
     const metadata_chunk_prefix = metadata_ha.prefix ++ "chunk:";
+    const legacy_catalog_digest_key = metadata_ha.prefix ++ "legacy_catalog_digest";
 
     const MetadataPending = struct {
         descriptor: metadata_chunks.Descriptor,
@@ -3719,7 +3830,94 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn applyHARecord(self: *RaftApplyStore, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
+        if (record.payload_codec == .json) return self.applyLegacyCatalogCreate(record);
         return self.applyHAChunk(record);
+    }
+
+    // Released standalone primaries wrote this JSON envelope before atomic
+    // metadata effects existed. Read it only: all new producers use AFMC.
+    const LegacyCatalogCreate = struct {
+        schema_version: u32 = 3,
+        kind: enum { table_create } = .table_create,
+        table: metadata.TableRecord,
+        ranges: []const metadata.RangeRecord,
+    };
+
+    fn applyLegacyCatalogCreate(self: *RaftApplyStore, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
+        if (record.kind != .metadata_mutation or record.table_id != 0 or record.shard_id != 0 or record.lsn == 0 or record.previous_lsn >= record.lsn or record.payload.len > metadata_ha.max_effect_bytes) return error.InvalidMetadataHAEffect;
+        const parsed = std.json.parseFromSlice(LegacyCatalogCreate, self.alloc, record.payload, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidMetadataHAEffect,
+        };
+        defer parsed.deinit();
+        const create = parsed.value;
+        if (create.schema_version != 3) return error.InvalidMetadataHAEffect;
+        const mutation: TableTopologyMutation = .{ .create = .{ .table = create.table, .ranges = create.ranges, .expected_transition_generation = 0 } };
+        try validateTransitionCommandDataGroupIds(.{ .apply_table_topology = mutation });
+        if (create.table.storage_migration) |migration| try migration.request.validate();
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(record.payload, &digest, .{});
+
+        self.apply_mutex.lockUncancelable(self.io_impl.io());
+        defer self.apply_mutex.unlock(self.io_impl.io());
+        var outcome = CommittedApplyOutcome{ .alloc = self.alloc, .collect_transition_deltas = false };
+        defer outcome.deinit();
+        std.debug.assert(self.active_outcome == null);
+        self.active_outcome = &outcome;
+        defer self.active_outcome = null;
+        var txn = try self.store.beginWriteTxn();
+        var committed = false;
+        defer if (!committed) txn.abort();
+        if (try stagingGet(&txn, metadata_ha.outbox_key) != null) return error.MetadataHAOutboxPending;
+        if (try stagingGet(&txn, metadata_ha.replay_key)) |previous| {
+            if (previous.len != 40) return error.InvalidMetadataHAEffect;
+            if (std.mem.readInt(u64, previous[0..8], .little) != record.cluster_id) return error.MetadataHASourceChanged;
+            const previous_epoch = std.mem.readInt(u64, previous[16..24], .little);
+            const previous_timeline = std.mem.readInt(u64, previous[8..16], .little);
+            if (record.epoch < previous_epoch or (record.epoch == previous_epoch and record.timeline_id != previous_timeline)) return error.MetadataHASourceChanged;
+            if (record.epoch == previous_epoch) {
+                const previous_lsn = std.mem.readInt(u64, previous[24..32], .little);
+                if (record.lsn <= previous_lsn) {
+                    // A covered prefix must not resurrect a table modified or
+                    // removed by a later effect. Detect equivocation at the
+                    // current JSON receipt, including after checkpoint/reopen.
+                    if (record.lsn == previous_lsn and try stagingGet(&txn, metadata_ha.source_key) == null) {
+                        const previous_digest = (try stagingGet(&txn, legacy_catalog_digest_key)) orelse return error.InvalidMetadataHAEffect;
+                        if (!std.mem.eql(u8, previous_digest, &digest)) return error.MetadataHASourceChanged;
+                    }
+                    return;
+                }
+            }
+        }
+        // Once a producer has upgraded, a new JSON effect cannot bypass its
+        // ordered binary stream (nor interrupt an in-flight chunked effect).
+        if (try stagingGet(&txn, metadata_ha.source_key) != null or try stagingGet(&txn, metadata_pending_key) != null) return error.MetadataHASourceChanged;
+        const group = group_ids.main_metadata_group_id;
+        _ = try self.ensureDerivedCatalogIndexesTxn(&txn, group);
+        var table_key_buf: [160]u8 = undefined;
+        const table_key = try tableKeyForGroup(&table_key_buf, group, create.table.table_id);
+        if (try stagingGet(&txn, table_key) == null) try self.applyTableTopologyMutationTxn(&txn, group, mutation);
+        const encoded_table = (try stagingGet(&txn, table_key)) orelse return error.TableLifecycleConflict;
+        const table = try decodeTableRecord(self.alloc, encoded_table);
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        if (!metadata_table_manager.tableDefinitionsEqual(table, create.table)) return error.TableLifecycleConflict;
+        const ids = try self.indexedTableRangeIdsTxn(self.alloc, &txn, group, table.table_id);
+        defer self.alloc.free(ids);
+        if (ids.len != create.ranges.len) return error.TableLifecycleConflict;
+        for (create.ranges) |expected| {
+            var range_key_buf: [160]u8 = undefined;
+            const encoded_range = (try stagingGet(&txn, try rangeKeyForGroup(&range_key_buf, group, expected.group_id))) orelse return error.TableLifecycleConflict;
+            const actual = try decodeRangeRecord(self.alloc, encoded_range);
+            defer metadata_table_manager.freeRange(self.alloc, actual);
+            if (!metadata_table_manager.rangeRecordsEqual(expected, actual)) return error.TableLifecycleConflict;
+        }
+        if (try stagingGet(&txn, standalone_catalog_key) == null) try txn.put(standalone_catalog_key, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
+        try advanceStandaloneRevision(&txn);
+        try txn.put(legacy_catalog_digest_key, &digest);
+        try metadataReplayReceipt(&txn, record);
+        self.notifyMetadataSnapshotInstalled(group);
+        self.invalidateProjectedPlacementGroup(group);
+        try self.commitStandaloneTxn(&txn, &outcome, &committed);
     }
 
     fn metadataReplayReceipt(txn: *docstore.DocStore.Txn, record: @import("../../storage/hot_standby/replication_record.zig").RecordView) !void {
@@ -4039,10 +4237,11 @@ pub const RaftApplyStore = struct {
         if (self.hasHAMirror()) txn.mutation_capture = &capture;
         _ = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
         const bootstrap = try stagingGet(&txn, standalone_catalog_key) == null;
-        if (!bootstrap) {
-            const revision = (try stagingGet(&txn, standalone_revision_key)) orelse return error.InvalidStandaloneCatalog;
-            if (revision.len != 8 or std.mem.readInt(u64, revision[0..8], .little) != expected_revision) return error.TableLifecycleConflict;
-        }
+        const revision = try stagingGet(&txn, standalone_revision_key);
+        if (revision != null and revision.?.len != 8) return error.InvalidStandaloneCatalog;
+        if (revision == null and !bootstrap) return error.InvalidStandaloneCatalog;
+        const current_revision = if (revision) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else 0;
+        if (current_revision != expected_revision) return error.TableLifecycleConflict;
         const old_tables = try self.listTablesTxn(self.alloc, &txn, group_id);
         defer self.freeTables(self.alloc, old_tables);
         const old_ranges = try self.listRangesTxn(self.alloc, &txn, group_id);
@@ -4096,10 +4295,16 @@ pub const RaftApplyStore = struct {
         try advanceStandaloneRevision(&txn);
         try self.stageStandaloneHA(&txn, &capture, group_id);
         try self.checkHA();
-        try self.commitStandaloneTxn(&txn, &outcome, &committed);
+        self.commitStandaloneTxn(&txn, &outcome, &committed) catch |err| {
+            // Only this transaction's commit establishes an ambiguous write.
+            // A concurrent revision advance or an outbox preflight failure
+            // must not turn a rejected proposal into a committed mutation.
+            if (committed) return error.MetadataMutationOutcomeUnknown;
+            return err;
+        };
         self.unlockHATransition();
         transition_locked = false;
-        try self.flushHAOutboxLocked();
+        self.flushHAOutboxLocked() catch return error.MetadataMutationOutcomeUnknown;
     }
 
     fn commitStandaloneTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, outcome: *CommittedApplyOutcome, committed: *bool) !void {
@@ -6528,6 +6733,16 @@ pub const RaftApplyStore = struct {
         entries_bytes: []const u8,
         collect_transition_deltas: bool,
     ) !CommittedApplyOutcome {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        var apply_locked = true;
+        defer if (apply_locked) self.apply_mutex.unlock(io);
+        const applied_index = try self.durableAppliedIndex(group_id);
+        if (commit_index <= applied_index) return .{
+            .alloc = self.alloc,
+            .collect_transition_deltas = collect_transition_deltas,
+        };
+
         var value = try self.alloc.alloc(u8, @sizeOf(u64) + entries_bytes.len);
         defer self.alloc.free(value);
         std.mem.writeInt(u64, value[0..8], commit_index, .little);
@@ -6536,10 +6751,6 @@ pub const RaftApplyStore = struct {
         const owned_entries = try self.alloc.dupe(u8, entries_bytes);
         errdefer self.alloc.free(owned_entries);
 
-        const io = self.io_impl.io();
-        self.apply_mutex.lockUncancelable(io);
-        var apply_locked = true;
-        defer if (apply_locked) self.apply_mutex.unlock(io);
         try self.batches.ensureUnusedCapacity(self.alloc, 1);
         std.debug.assert(self.active_outcome == null);
         var outcome = CommittedApplyOutcome{
@@ -6555,7 +6766,7 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginWriteTxn();
         errdefer txn.abort();
         try txn.put(key, value);
-        try self.projectEntriesTxn(&txn, group_id, entries_bytes);
+        try self.projectEntriesTxn(&txn, group_id, entries_bytes, applied_index);
         if (outcome.failure) |err| return err;
         if (outcomeChangesCatalog(outcome.projection_signals.items)) {
             var catalog_revision_buf: [@sizeOf(u64)]u8 = undefined;
@@ -6597,6 +6808,18 @@ pub const RaftApplyStore = struct {
         return outcome;
     }
 
+    fn durableAppliedIndex(self: *RaftApplyStore, group_id: u64) !u64 {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [128]u8 = undefined;
+        const encoded = txn.get(try keyForGroup(&key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        if (encoded.len < @sizeOf(u64)) return error.InvalidMetadataApplyBatch;
+        return std.mem.readInt(u64, encoded[0..8], .little);
+    }
+
     fn ensureLoaded(self: *RaftApplyStore, group_id: u64) !?*OwnedBatch {
         if (self.batches.getPtr(group_id)) |batch| return batch;
 
@@ -6631,7 +6854,7 @@ pub const RaftApplyStore = struct {
         return false;
     }
 
-    fn projectEntriesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, entries_bytes: []const u8) !void {
+    fn projectEntriesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, entries_bytes: []const u8, applied_index: u64) !void {
         _ = try self.ensureDerivedCatalogIndexesTxn(txn, group_id);
         const decoded = raft_state_machine.decodeCommittedEntries(self.alloc, entries_bytes) catch |err| switch (err) {
             error.InvalidCommittedEntriesEncoding => return,
@@ -6640,7 +6863,7 @@ pub const RaftApplyStore = struct {
         defer self.alloc.free(decoded);
 
         for (decoded) |entry| {
-            if (entry.entry_type != .normal) continue;
+            if (entry.index <= applied_index or entry.entry_type != .normal) continue;
             var command = (try decodeTransitionCommand(self.alloc, entry.data)) orelse continue;
             defer command.deinit(self.alloc);
             try self.applyTransitionCommandTxn(txn, group_id, command);
@@ -12641,6 +12864,9 @@ fn appendPlacementIntent(
     }
 }
 
+const table_storage_metadata_magic: u32 = 0x31535441; // ATS1
+const table_storage_metadata_version: u16 = 1;
+
 fn appendTableRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -12670,6 +12896,28 @@ fn appendTableRecord(
     if (record.relational_retirement_json.len != 0) {
         try appendInt(alloc, out, u32, 0x31524941);
         try appendRequiredString(alloc, out, record.relational_retirement_json);
+    }
+    if (record.requiresStorageMetadataExtension()) {
+        try appendInt(alloc, out, u32, table_storage_metadata_magic);
+        try appendInt(alloc, out, u16, table_storage_metadata_version);
+        try out.append(alloc, switch (record.storage.dense_embeddings) {
+            .primary_lsm => 0,
+            .vector_store => 1,
+        });
+        try out.append(alloc, if (record.storage_migration != null) 1 else 0);
+        if (record.storage_migration) |migration| {
+            try migration.request.validate();
+            try appendInt(alloc, out, u16, @intCast(migration.request.job_id.len));
+            try out.appendSlice(alloc, migration.request.job_id);
+            try out.append(alloc, switch (migration.request.mode) {
+                .offline => 0,
+                .online => 1,
+            });
+            try appendInt(alloc, out, u64, migration.request.budget.batch_bytes);
+            try appendInt(alloc, out, u32, migration.request.budget.batch_rows);
+            try appendInt(alloc, out, u64, migration.request.budget.temporary_bytes);
+            try appendInt(alloc, out, u64, migration.request.budget.disk_reserve_bytes);
+        }
     }
 }
 
@@ -12956,7 +13204,10 @@ fn readTableRecord(
     pos: *usize,
 ) !metadata.TableRecord {
     const start = pos.*;
-    const newest_record = readTableRecordWithRestoreIntent(alloc, encoded, pos) catch null;
+    const newest_record = readTableRecordWithRestoreIntent(alloc, encoded, pos) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
     if (newest_record) |record| {
         if (pos.* == encoded.len) return record;
         metadata_table_manager.freeTable(alloc, record);
@@ -12965,7 +13216,10 @@ fn readTableRecord(
         pos.* = start;
     }
 
-    const old_record = readTableRecordLegacy(alloc, encoded, pos) catch null;
+    const old_record = readTableRecordLegacy(alloc, encoded, pos) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
     if (old_record) |record| {
         if (pos.* == encoded.len) return record;
         metadata_table_manager.freeTable(alloc, record);
@@ -13095,12 +13349,50 @@ fn readTableRecordWithRestoreIntent(
     errdefer alloc.free(restore_backup_id);
     const restore_location = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(restore_location);
-    const relational_retirement_json = if (pos.* < encoded.len) blk: {
-        if (try readInt(encoded, pos, u32) != 0x31524941) return error.InvalidMetadataTransitionEncoding;
+    const relational_retirement_json = if (encoded.len - pos.* >= @sizeOf(u32) and std.mem.readInt(u32, encoded[pos.*..][0..4], .little) == 0x31524941) blk: {
+        _ = try readInt(encoded, pos, u32);
         break :blk try readRequiredString(alloc, encoded, pos);
     } else try alloc.dupe(u8, "");
     errdefer alloc.free(relational_retirement_json);
+    var storage: @import("../../common/table_storage.zig").Settings = .{};
+    var storage_migration: ?@import("../../common/vector_migration.zig").Admission = null;
+    errdefer if (storage_migration) |migration| alloc.free(migration.request.job_id);
+    if (pos.* < encoded.len) {
+        if (try readInt(encoded, pos, u32) != table_storage_metadata_magic or
+            try readInt(encoded, pos, u16) != table_storage_metadata_version) return error.InvalidMetadataTransitionEncoding;
+        storage.dense_embeddings = switch (try readInt(encoded, pos, u8)) {
+            0 => .primary_lsm,
+            1 => .vector_store,
+            else => return error.InvalidMetadataTransitionEncoding,
+        };
+        switch (try readInt(encoded, pos, u8)) {
+            0 => {},
+            1 => {
+                const job_len = try readInt(encoded, pos, u16);
+                if (job_len == 0 or job_len > 128 or job_len > encoded.len - pos.*) return error.InvalidMetadataTransitionEncoding;
+                const job_id = try alloc.dupe(u8, encoded[pos.*..][0..job_len]);
+                storage_migration = .{ .request = .{ .job_id = job_id, .mode = .offline } };
+                pos.* += job_len;
+                storage_migration.?.request.mode = switch (try readInt(encoded, pos, u8)) {
+                    0 => .offline,
+                    1 => .online,
+                    else => return error.InvalidMetadataTransitionEncoding,
+                };
+                storage_migration.?.request.budget = .{
+                    .batch_bytes = try readInt(encoded, pos, u64),
+                    .batch_rows = try readInt(encoded, pos, u32),
+                    .temporary_bytes = try readInt(encoded, pos, u64),
+                    .disk_reserve_bytes = try readInt(encoded, pos, u64),
+                };
+                storage_migration.?.request.validate() catch return error.InvalidMetadataTransitionEncoding;
+            },
+            else => return error.InvalidMetadataTransitionEncoding,
+        }
+        if (pos.* != encoded.len or (storage.dense_embeddings == .primary_lsm and storage_migration == null)) return error.InvalidMetadataTransitionEncoding;
+    }
     return .{
+        .storage = storage,
+        .storage_migration = storage_migration,
         .relational_retirement_json = relational_retirement_json,
         .table_id = table_id,
         .name = name,
@@ -17558,6 +17850,105 @@ test "metadata raft apply store notifies committed key listeners for matched met
     try std.testing.expect(capture.saw_range);
 }
 
+test "metadata.table storage extension preserves ownership migration and legacy bytes" {
+    const alloc = std.testing.allocator;
+    const legacy: metadata.TableRecord = .{ .table_id = 7, .name = "rows" };
+    const legacy_bytes = try encodeTableRecord(alloc, legacy);
+    defer alloc.free(legacy_bytes);
+    const golden_hex = "070000000000000003000100000004000000726f7773000000000000000000000000020000007b7d020000005b5d04000000646174610000000000000000";
+    var golden: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&golden, golden_hex);
+    try std.testing.expectEqualSlices(u8, &golden, legacy_bytes);
+    inline for (.{ false, true }) |retirement| inline for (.{ false, true }) |migration| {
+        var table = legacy;
+        table.storage.dense_embeddings = .vector_store;
+        if (retirement) table.relational_retirement_json = "{\"phase\":\"retiring\"}";
+        if (migration) table.storage_migration = .{ .request = .{ .job_id = "migration_7", .mode = .online, .budget = .{ .batch_rows = 17, .batch_bytes = 8192, .temporary_bytes = 65536, .disk_reserve_bytes = 32768 } } };
+        const encoded = try encodeTableRecord(alloc, table);
+        defer alloc.free(encoded);
+        const decoded = try decodeTableRecord(alloc, encoded);
+        defer metadata_table_manager.freeTable(alloc, decoded);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, decoded));
+        const canonical = try encodeTableRecord(alloc, decoded);
+        defer alloc.free(canonical);
+        try std.testing.expectEqualSlices(u8, encoded, canonical);
+        const clone = try metadata_table_manager.cloneTable(alloc, decoded);
+        defer metadata_table_manager.freeTable(alloc, clone);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, clone));
+        if (migration) try std.testing.expect(clone.storage_migration.?.request.job_id.ptr != decoded.storage_migration.?.request.job_id.ptr);
+        const extension = std.mem.indexOf(u8, encoded, "ATS1").?;
+        const corrupt = try alloc.dupe(u8, encoded);
+        defer alloc.free(corrupt);
+        corrupt[extension + 4] = 2; // Unknown extension version.
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(alloc, corrupt));
+        @memcpy(corrupt, encoded);
+        corrupt[extension + 6] = 2; // Unknown physical ownership.
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(alloc, corrupt));
+        @memcpy(corrupt, encoded);
+        corrupt[extension + 7] = 2; // Invalid optional-admission discriminator.
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(alloc, corrupt));
+        for (extension + 1..encoded.len) |len| try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(alloc, encoded[0..len]));
+    };
+    const Fixture = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const table: metadata.TableRecord = .{ .table_id = 7, .name = "rows", .relational_retirement_json = "retiring", .storage_migration = .{ .request = .{ .job_id = "migration", .mode = .offline } } };
+            const encoded = try encodeTableRecord(allocator, table);
+            defer allocator.free(encoded);
+            const decoded = try decodeTableRecord(allocator, encoded);
+            defer metadata_table_manager.freeTable(allocator, decoded);
+            try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, decoded));
+            const clone = try metadata_table_manager.cloneTable(allocator, decoded);
+            defer metadata_table_manager.freeTable(allocator, clone);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Fixture.run, .{});
+}
+
+test "standalone metadata storage migration survives reopen checkpoint and exact CAS" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/migration", .{tmp.sub_path});
+    defer alloc.free(root);
+    const target = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restored", .{tmp.sub_path});
+    defer alloc.free(target);
+    const checkpoint = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata.bin", .{tmp.sub_path});
+    defer alloc.free(checkpoint);
+    const group = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "rows", .storage_migration = .{ .request = .{ .job_id = "move_vectors", .mode = .online } } };
+    const ranges = [_]metadata.RangeRecord{.{ .table_id = 7, .group_id = 17, .range_id = 19, .start_key = "" }};
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        try store.replaceStandaloneCatalog(group, 0, &.{table}, &ranges, "{\"schema_version\":3}");
+    }
+    var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer reopened.deinit();
+    const records = try reopened.listTables(alloc, group);
+    defer reopened.freeTables(alloc, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, records[0]));
+    const artifact = try reopened.exportHACheckpoint(std.testing.io, checkpoint);
+    var restored = try RaftApplyStore.init(alloc, .{ .root_dir = target });
+    defer restored.deinit();
+    try restored.importHACheckpoint(std.testing.io, checkpoint, artifact.size_bytes);
+    var replacement = table;
+    replacement.storage.dense_embeddings = .vector_store;
+    replacement.storage_migration = null;
+    var stale = table;
+    stale.storage_migration.?.request.job_id = "different";
+    try restored.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = stale, .replacement = replacement } });
+    {
+        const unchanged = try restored.listTables(alloc, group);
+        defer restored.freeTables(alloc, unchanged);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, unchanged[0]));
+    }
+    try restored.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = replacement } });
+    const published = try restored.listTables(alloc, group);
+    defer restored.freeTables(alloc, published);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(replacement, published[0]));
+}
+
 test "metadata.table record decoder accepts legacy table metadata encoding" {
     var encoded = std.ArrayListUnmanaged(u8).empty;
     defer encoded.deinit(std.testing.allocator);
@@ -19979,3 +20370,224 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
 const restore_job_logical_prefix = "\x00\x00__api_restore_jobs__:";
 const max_restore_job_logical_key_bytes: usize = 128;
 const max_restore_job_value_bytes: usize = 64 * 1024;
+
+const MetadataReplayTest = struct {
+    const alloc = std.testing.allocator;
+    const group_id: u64 = 41;
+    const incarnation = "11111111111111111111111111111111".*;
+
+    fn apply(store: *RaftApplyStore, group: u64, entries: []const raft_engine.core.Entry) !CommittedApplyOutcome {
+        const encoded = try raft_state_machine.encodeCommittedEntries(alloc, entries);
+        defer alloc.free(encoded);
+        return try store.applyCommittedBatch(group, entries[entries.len - 1].index, encoded);
+    }
+
+    fn seed(store: *RaftApplyStore) !void {
+        const initialize = try encodeTransitionCommand(alloc, .{ .initialize_metadata_incarnation = incarnation });
+        defer alloc.free(initialize);
+        const old_table = try encodeTransitionCommand(alloc, .{ .upsert_table = .{ .table_id = 7, .name = "replay-old" } });
+        defer alloc.free(old_table);
+        const new_table = try encodeTransitionCommand(alloc, .{ .upsert_table = .{ .table_id = 7, .name = "replay-new" } });
+        defer alloc.free(new_table);
+        var prefix = try apply(store, group_id, &.{
+            .{ .index = 1, .term = 1, .data = initialize },
+            .{ .index = 2, .term = 1, .data = old_table },
+            .{ .index = 3, .term = 1 },
+            .{ .index = 4, .term = 1, .data = new_table },
+        });
+        defer prefix.deinit();
+        var suffix = try apply(store, group_id, &.{.{ .index = 5, .term = 1 }});
+        defer suffix.deinit();
+    }
+
+    const Capture = struct {
+        projections: usize = 0,
+        keys: usize = 0,
+        begins: usize = 0,
+        ends: usize = 0,
+        barrier_active: bool = false,
+
+        fn register(self: *@This(), store: *RaftApplyStore) !void {
+            try store.addProjectionListener(.{
+                .ptr = self,
+                .commit_barrier_kind = .table,
+                .vtable = &.{ .on_projection_signal = onProjection, .before_projection_commit = begin, .after_projection_commit = end },
+            });
+            try store.addCommittedKeyListener(.{ .ptr = self, .vtable = &.{ .matches_key = matchesKey, .on_committed_key = onKey } });
+        }
+
+        fn begin(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(!self.barrier_active);
+            self.barrier_active = true;
+            self.begins += 1;
+        }
+
+        fn end(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.barrier_active);
+            self.barrier_active = false;
+            self.ends += 1;
+        }
+
+        fn onProjection(ptr: *anyopaque, signal: ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (signal.kind == .table) std.debug.assert(self.barrier_active);
+            self.projections += 1;
+        }
+
+        fn matchesKey(_: *anyopaque, _: CommittedKeySignal) bool {
+            return true;
+        }
+
+        fn onKey(ptr: *anyopaque, _: CommittedKeySignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.keys += 1;
+        }
+    };
+};
+
+test "metadata replay skips durable stale and equal batches after reopen" {
+    const T = MetadataReplayTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(T.alloc, ".zig-cache/tmp/{s}/metadata-durable-replay", .{tmp.sub_path});
+    defer T.alloc.free(root);
+    {
+        var initial = try RaftApplyStore.init(T.alloc, .{ .root_dir = root });
+        defer initial.deinit();
+        try T.seed(&initial);
+    }
+    {
+        var store = try RaftApplyStore.init(T.alloc, .{ .root_dir = root });
+        defer store.deinit();
+        var capture = T.Capture{};
+        try capture.register(&store);
+        const before = try store.snapshotBuilder().buildSnapshot(T.alloc, T.group_id);
+        defer T.alloc.free(before);
+        const old_table = try encodeTransitionCommand(T.alloc, .{ .upsert_table = .{ .table_id = 7, .name = "replay-old" } });
+        defer T.alloc.free(old_table);
+        var stale = try T.apply(&store, T.group_id, &.{.{ .index = 2, .term = 1, .data = old_table }});
+        defer stale.deinit();
+        std.debug.print("metadata-replay-stale expected_index=5 actual_index={d}\n", .{(try store.latestBatch(T.group_id)).?.commit_index});
+        try std.testing.expectEqual(@as(u64, 5), (try store.latestBatch(T.group_id)).?.commit_index);
+        try std.testing.expectEqual(@as(usize, 0), stale.projection_signals.items.len);
+        try std.testing.expectEqual(@as(usize, 0), stale.committed_keys.items.len);
+        try std.testing.expectEqual(@as(usize, 0), stale.transition_deltas.items.len);
+        var equal = try T.apply(&store, T.group_id, &.{.{ .index = 5, .term = 1 }});
+        defer equal.deinit();
+        try std.testing.expectEqual(@as(usize, 0), equal.projection_signals.items.len);
+        try std.testing.expectEqual(@as(usize, 0), equal.committed_keys.items.len);
+        try std.testing.expectEqual(@as(usize, 0), equal.transition_deltas.items.len);
+        try store.snapshotBuilder().applyBatch(.{ .group_id = T.group_id, .commit_index = 5, .entries_bytes = "obsolete opaque batch" });
+        const expected_entries = try raft_state_machine.encodeCommittedEntries(T.alloc, &.{.{ .index = 5, .term = 1 }});
+        defer T.alloc.free(expected_entries);
+        try std.testing.expectEqualSlices(u8, expected_entries, (try store.latestBatch(T.group_id)).?.entries_bytes);
+        try std.testing.expectEqualDeep(T.Capture{}, capture);
+        const after = try store.snapshotBuilder().buildSnapshot(T.alloc, T.group_id);
+        defer T.alloc.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
+    }
+    var reopened = try RaftApplyStore.init(T.alloc, .{ .root_dir = root });
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 5), (try reopened.latestBatch(T.group_id)).?.commit_index);
+    const cursor = try reopened.captureCatalogCursor(T.group_id);
+    try std.testing.expectEqual(@as(u64, 4), cursor.revision);
+    try std.testing.expectEqual(T.incarnation, cursor.metadata_incarnation.?);
+    const tables = try reopened.listTables(T.alloc, T.group_id);
+    defer reopened.freeTables(T.alloc, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqualStrings("replay-new", tables[0].name);
+}
+
+test "metadata replay skips only the durable prefix of mixed batches" {
+    const T = MetadataReplayTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(T.alloc, ".zig-cache/tmp/{s}/metadata-mixed-replay", .{tmp.sub_path});
+    defer T.alloc.free(root);
+    var store = try RaftApplyStore.init(T.alloc, .{ .root_dir = root });
+    defer store.deinit();
+    try T.seed(&store);
+    var capture = T.Capture{};
+    try capture.register(&store);
+    const next_table = try encodeTransitionCommand(T.alloc, .{ .upsert_table = .{ .table_id = 7, .name = "replay-next" } });
+    defer T.alloc.free(next_table);
+    std.debug.print("metadata-replay-mixed durable=5 obsolete_index=2 new_index=6 terminal_index=7\n", .{});
+    var outcome = try T.apply(&store, T.group_id, &.{
+        .{ .index = 2, .term = 1, .data = @constCast("afmd1\xff") },
+        .{ .index = 5, .term = 1, .data = @constCast("afmd1\xff") },
+        .{ .index = 6, .term = 1, .data = next_table },
+        .{ .index = 7, .term = 1 },
+    });
+    defer outcome.deinit();
+    try std.testing.expectEqual(@as(u64, 7), (try store.latestBatch(T.group_id)).?.commit_index);
+    try std.testing.expectEqual(@as(u64, 7), (try store.captureCatalogCursor(T.group_id)).revision);
+    try std.testing.expectEqual(@as(usize, 1), outcome.projection_signals.items.len);
+    try std.testing.expectEqual(@as(usize, 1), outcome.committed_keys.items.len);
+    try std.testing.expectEqual(@as(usize, 0), outcome.transition_deltas.items.len);
+    try std.testing.expectEqualDeep(T.Capture{ .projections = 1, .keys = 1, .begins = 1, .ends = 1 }, capture);
+    const tables = try store.listTables(T.alloc, T.group_id);
+    defer store.freeTables(T.alloc, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqualStrings("replay-next", tables[0].name);
+    const before = try store.snapshotBuilder().buildSnapshot(T.alloc, T.group_id);
+    defer T.alloc.free(before);
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, T.apply(&store, T.group_id, &.{
+        .{ .index = 8, .term = 1, .data = @constCast("afmd1\xff") },
+    }));
+    try std.testing.expectEqual(@as(u64, 7), (try store.latestBatch(T.group_id)).?.commit_index);
+    try std.testing.expectEqualDeep(T.Capture{ .projections = 1, .keys = 1, .begins = 1, .ends = 1 }, capture);
+    const after = try store.snapshotBuilder().buildSnapshot(T.alloc, T.group_id);
+    defer T.alloc.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "metadata replay advances new noops without changing catalog authority or other groups" {
+    const T = MetadataReplayTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(T.alloc, ".zig-cache/tmp/{s}/metadata-replay-noops", .{tmp.sub_path});
+    defer T.alloc.free(root);
+    var store = try RaftApplyStore.init(T.alloc, .{ .root_dir = root });
+    defer store.deinit();
+    try T.seed(&store);
+    var capture = T.Capture{};
+    try capture.register(&store);
+    const compete = try encodeTransitionCommand(T.alloc, .{ .initialize_metadata_incarnation = "22222222222222222222222222222222".* });
+    defer T.alloc.free(compete);
+    var noops = try T.apply(&store, T.group_id, &.{
+        .{ .index = 6, .term = 1 },
+        .{ .index = 7, .term = 1, .data = compete },
+    });
+    defer noops.deinit();
+    try std.testing.expectEqual(@as(u64, 7), (try store.latestBatch(T.group_id)).?.commit_index);
+    try std.testing.expectEqual(@as(usize, 0), noops.projection_signals.items.len);
+    try std.testing.expectEqual(@as(usize, 0), noops.committed_keys.items.len);
+    try std.testing.expectEqual(@as(usize, 0), noops.transition_deltas.items.len);
+    try std.testing.expectEqualDeep(T.Capture{}, capture);
+    const key = "\x00\x00__api_restore_jobs__:000000000000002a";
+    const restore = try encodeTransitionCommand(T.alloc, .{ .upsert_restore_job = .{ .key = key, .value = "retained" } });
+    defer T.alloc.free(restore);
+    var noncatalog = try T.apply(&store, T.group_id, &.{.{ .index = 8, .term = 1, .data = restore }});
+    defer noncatalog.deinit();
+    try std.testing.expectEqual(@as(usize, 1), noncatalog.projection_signals.items.len);
+    try std.testing.expectEqual(ProjectionSignalKind.restore_job, noncatalog.projection_signals.items[0].signal.kind);
+    try std.testing.expectEqual(@as(usize, 1), noncatalog.committed_keys.items.len);
+    try std.testing.expectEqualDeep(T.Capture{ .projections = 1, .keys = 1 }, capture);
+    const cursor = try store.captureCatalogCursor(T.group_id);
+    try std.testing.expectEqual(@as(u64, 4), cursor.revision);
+    try std.testing.expectEqual(T.incarnation, cursor.metadata_incarnation.?);
+    const other_table = try encodeTransitionCommand(T.alloc, .{ .upsert_table = .{ .table_id = 7, .name = "other-group" } });
+    defer T.alloc.free(other_table);
+    var other = try T.apply(&store, 42, &.{.{ .index = 1, .term = 1, .data = other_table }});
+    defer other.deinit();
+    try std.testing.expectEqual(@as(u64, 1), (try store.latestBatch(42)).?.commit_index);
+    try std.testing.expectEqual(@as(u64, 1), (try store.captureCatalogCursor(42)).revision);
+    try std.testing.expectEqual(@as(u64, 8), (try store.latestBatch(T.group_id)).?.commit_index);
+    try std.testing.expectEqual(@as(u64, 4), (try store.captureCatalogCursor(T.group_id)).revision);
+    try std.testing.expectEqualDeep(T.Capture{ .projections = 2, .keys = 2, .begins = 1, .ends = 1 }, capture);
+    const value = (try store.getRestoreJobValue(T.alloc, T.group_id, key)).?;
+    defer T.alloc.free(value);
+    try std.testing.expectEqualStrings("retained", value);
+}

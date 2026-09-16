@@ -2059,7 +2059,7 @@ pub const ProvisionedTableWriteCache = struct {
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror = null,
     table_eviction_hook: ?TableEvictionHook = null,
     state_mutex: ?*std.atomic.Mutex = null,
-    open_mutex: std.atomic.Mutex = .unlocked,
+    open_mutex: Io.Mutex = .init,
     entry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     hit_count: std.atomic.Value(u64) = .init(0),
     miss_count: std.atomic.Value(u64) = .init(0),
@@ -2312,7 +2312,7 @@ pub const ProvisionedTableWriteCache = struct {
         metadata: StartupCatchUpMetadata,
     ) bool {
         return entryManagedConfigMatches(entry, metadata.indexes_json) and
-            optionalMetadataBytesEqual(entry.schema_json, metadata.schema_json) and
+            optionalSchemaJsonEqual(entry.schema_json, metadata.schema_json) and
             entryIdentityMatchesMetadata(entry, metadata);
     }
 
@@ -2328,12 +2328,12 @@ pub const ProvisionedTableWriteCache = struct {
         };
     }
 
-    fn optionalMetadataBytesEqual(
+    fn optionalSchemaJsonEqual(
         lhs: ?[]const u8,
         rhs: ?[]const u8,
     ) bool {
         if (lhs == null or rhs == null) return lhs == null and rhs == null;
-        return std.mem.eql(u8, lhs.?, rhs.?);
+        return std.mem.eql(u8, tables_api.effectiveSchemaJson(lhs.?), tables_api.effectiveSchemaJson(rhs.?));
     }
 
     fn publishEntryManagedConfig(entry: *Entry, indexes_json: ?[]const u8) void {
@@ -2551,32 +2551,32 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     pub fn setResolutionCandidateSource(self: *ProvisionedTableWriteCache, source: ?db_mod.CandidateSource) void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         if (candidateSourcesEqual(self.resolution_candidate_source, source)) return;
         self.resolution_candidate_source = source;
         self.refreshRuntimeHooksLocked();
     }
 
     pub fn setEntitySink(self: *ProvisionedTableWriteCache, sink: ?db_mod.EntitySink) void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         if (entitySinksEqual(self.entity_sink, sink)) return;
         self.entity_sink = sink;
         self.refreshRuntimeHooksLocked();
     }
 
     pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSourceContract) void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         if (promotionLeadershipSourcesEqual(self.promotion_leadership_source, source)) return;
         self.promotion_leadership_source = source;
         self.refreshRuntimeHooksLocked();
     }
 
     fn setHAWriteGate(self: *ProvisionedTableWriteCache, gate: ?db_mod.HAWriteGate) !void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         if (haWriteGatesEqual(self.ha_write_gate, gate)) return;
         lockAtomic(&self.entry_lifecycle_mutex);
         self.reserveClearCapacityAssumeLifecycleLocked() catch |err| {
@@ -2590,8 +2590,8 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn setHAMirror(self: *ProvisionedTableWriteCache, mirror: ?db_mod.HAAsyncEffectMirror) !void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         if (haAsyncMirrorsEqual(self.ha_async_mirror, mirror)) return;
         lockAtomic(&self.entry_lifecycle_mutex);
         self.reserveClearCapacityAssumeLifecycleLocked() catch |err| {
@@ -2775,8 +2775,8 @@ pub const ProvisionedTableWriteCache = struct {
     /// lease release into a shutdown deadlock. Active leases are a violated
     /// quiescence contract and must never be converted into use-after-free.
     pub fn closeAllDbsLocked(self: *ProvisionedTableWriteCache) !void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
 
         lockAtomic(&self.entry_lifecycle_mutex);
         for (self.entries.items) |entry| {
@@ -4498,9 +4498,9 @@ pub const ProvisionedTableWriteCache = struct {
                     else
                         current.indexes_json.len == 0;
                     const schema_match = if (metadata.schema_json) |cached|
-                        std.mem.eql(u8, cached, current.schema_json)
+                        std.mem.eql(u8, tables_api.effectiveSchemaJson(cached), tables_api.effectiveSchemaJson(current.schema_json))
                     else
-                        current.schema_json.len == 0;
+                        false;
                     if (indexes_match and schema_match) return metadata;
                 } else if (metadata.indexes_json == null and metadata.schema_json == null) {
                     return metadata;
@@ -4516,7 +4516,7 @@ pub const ProvisionedTableWriteCache = struct {
         }
 
         const indexes_json = if (table) |current| current.indexes_json else null;
-        const schema_json = if (table) |current| current.schema_json else null;
+        const schema_json = if (table) |current| tables_api.effectiveSchemaJson(current.schema_json) else null;
         var replacement = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
         errdefer replacement.deinit(self.alloc);
 
@@ -4711,8 +4711,8 @@ pub const ProvisionedTableWriteCache = struct {
         group_id: u64,
         table_name: []const u8,
     ) void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         self.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
     }
 
@@ -4728,7 +4728,7 @@ pub const ProvisionedTableWriteCache = struct {
         open_mutex_held: bool,
     ) bool {
         if (!open_mutex_held and !self.open_mutex.tryLock()) return false;
-        defer if (!open_mutex_held) self.open_mutex.unlock();
+        defer if (!open_mutex_held) self.unlockOpenMutex();
         self.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
         lockAtomic(&self.entry_lifecycle_mutex);
         defer self.entry_lifecycle_mutex.unlock();
@@ -4737,7 +4737,7 @@ pub const ProvisionedTableWriteCache = struct {
 
     fn tryDrainRetiredGroup(self: *ProvisionedTableWriteCache, group_id: u64) bool {
         if (!self.open_mutex.tryLock()) return false;
-        defer self.open_mutex.unlock();
+        defer self.unlockOpenMutex();
         self.drainPendingClosesForGroupAssumeOpenMutexHeld(group_id);
         lockAtomic(&self.entry_lifecycle_mutex);
         defer self.entry_lifecycle_mutex.unlock();
@@ -4747,8 +4747,8 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn drainPendingClosesForGroup(self: *ProvisionedTableWriteCache, group_id: u64) void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         self.drainPendingClosesForGroupAssumeOpenMutexHeld(group_id);
     }
 
@@ -4801,9 +4801,22 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn drainPendingCloses(self: *ProvisionedTableWriteCache) void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         self.drainPendingClosesAssumeOpenMutexHeld();
+    }
+
+    fn openMutexIo(self: *ProvisionedTableWriteCache) Io {
+        if (self.backend_runtime) |runtime| if (runtime.io()) |io| return io;
+        return Io.Threaded.global_single_threaded.io();
+    }
+
+    fn lockOpenMutex(self: *ProvisionedTableWriteCache) void {
+        self.open_mutex.lockUncancelable(self.openMutexIo());
+    }
+
+    fn unlockOpenMutex(self: *ProvisionedTableWriteCache) void {
+        self.open_mutex.unlock(self.openMutexIo());
     }
 };
 
@@ -6132,6 +6145,7 @@ pub const BoundTableWriteSource = struct {
                 .repair_artifact_issues = repairArtifactIssues,
                 .repair_artifact_issues_controlled = repairArtifactIssuesControlled,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .vector_migration_group_local = vectorMigrationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
@@ -6228,6 +6242,15 @@ pub const BoundTableWriteSource = struct {
         return try (try self.activeDb()).repairArtifactIssuesWithRequestOptions(alloc, req, options);
     }
 
+    fn vectorMigrationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        _ = group_id;
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        var command = try std.json.parseFromSlice(@import("../common/vector_migration.zig").Command, alloc, request_json, .{});
+        defer command.deinit();
+        return try (try self.activeDb()).vectorMigrationCommand(alloc, command.value);
+    }
+
     fn listArtifactRepairIssuesGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6312,7 +6335,7 @@ pub const BoundTableWriteSource = struct {
         const db = try self.activeDb();
 
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-        try db.configureTableStorage(req.storage);
+        try db.configureTableStorage(req.storage orelse db.table_storage);
         const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
         const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, raw_indexes_json, schema_json);
         defer alloc.free(expanded_indexes_json);
@@ -7848,7 +7871,7 @@ pub const ProvisionedTableWriteSource = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     // Hosted storage shares a process-wide cache whose mutex must fence both
     // foreground opens and persistent dropped-table recovery jobs.
-    dropped_table_cleanup_outer_mutex: ?*std.atomic.Mutex = null,
+    dropped_table_cleanup_outer_mutex: ?*Io.Mutex = null,
     dropped_table_job_owner_mutex: std.atomic.Mutex = .unlocked,
     dropped_table_delete_owner_id: u64 = 0,
     dropped_table_recovery_started: std.atomic.Value(bool) = .init(false),
@@ -8179,8 +8202,8 @@ pub const ProvisionedTableWriteSource = struct {
                 second = null;
             }
 
-            if (first) |cache| lockAtomic(&cache.open_mutex);
-            if (second) |cache| lockAtomic(&cache.open_mutex);
+            if (first) |cache| cache.lockOpenMutex();
+            if (second) |cache| cache.lockOpenMutex();
             lockAtomic(&owner.local_db_mutex);
             if (first) |cache| lockAtomic(&cache.entry_lifecycle_mutex);
             if (second) |cache| lockAtomic(&cache.entry_lifecycle_mutex);
@@ -8231,8 +8254,8 @@ pub const ProvisionedTableWriteSource = struct {
 
         fn releaseOpenLocks(self: *WriteCacheTransitionLocks) void {
             if (!self.open_locked) return;
-            if (self.second) |cache| cache.open_mutex.unlock();
-            if (self.first) |cache| cache.open_mutex.unlock();
+            if (self.second) |cache| cache.unlockOpenMutex();
+            if (self.first) |cache| cache.unlockOpenMutex();
             self.open_locked = false;
         }
 
@@ -8640,8 +8663,8 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         cache: *ProvisionedTableWriteCache,
     ) void {
-        lockAtomic(&cache.open_mutex);
-        defer cache.open_mutex.unlock();
+        cache.lockOpenMutex();
+        defer cache.unlockOpenMutex();
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
         cache.setRuntimeHooksLocked(
@@ -11380,7 +11403,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn tryBeginReadCompatibleGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+    fn tryBeginReadCompatibleGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64, respect_waiters: bool) bool {
         if (self.retiring_replica_groups.contains(group_id)) return false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
@@ -11388,7 +11411,10 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.operation_active or entry.operation_waiters > 0 or entry.transition_waiters > 0 or entry.generation_preparation_active) return false;
+            // Committed apply may be the prerequisite for a read that queued
+            // structural work is waiting to drain. Only active owners fence it.
+            if (entry.operation_active or entry.generation_preparation_active or
+                (respect_waiters and (entry.operation_waiters > 0 or entry.transition_waiters > 0))) return false;
         }
         const entry = self.activityEntryLocked(table_name, group_id);
         entry.operation_active = true;
@@ -11398,7 +11424,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn beginReplicatedApplyOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.tableActivityIo();
-        while (!self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id)) {
+        while (!self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id, false)) {
             self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
         }
     }
@@ -11756,7 +11782,7 @@ pub const ProvisionedTableWriteSource = struct {
         const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
-        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
+        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id, true);
     }
 
     fn tryBeginStartupCatchUpGroupOperation(
@@ -11774,7 +11800,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const admitted = if (advance_index_repairs)
-            self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id)
+            self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id, true)
         else
             self.tryBeginGroupOperationLocked(table_name, group_id);
         if (!advance_index_repairs) {
@@ -11859,7 +11885,7 @@ pub const ProvisionedTableWriteSource = struct {
         // including contention on the activity bookkeeping mutex itself.
         if (!self.table_activity_mutex.tryLock()) return false;
         defer self.table_activity_mutex.unlock(self.tableActivityIo());
-        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
+        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id, false);
     }
 
     fn beginGroupTransitionOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
@@ -12198,7 +12224,7 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_ids: []const u64,
-        open_fence: ?*std.atomic.Mutex,
+        open_fence: ?*Io.Mutex,
         deadline: Io.Clock.Timestamp,
     ) !void {
         const io = self.tableActivityIo();
@@ -13222,9 +13248,9 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
 
-        lockAtomic(&cache.open_mutex);
+        cache.lockOpenMutex();
         var cache_open_locked = true;
-        defer if (cache_open_locked) cache.open_mutex.unlock();
+        defer if (cache_open_locked) cache.unlockOpenMutex();
 
         prepared_open_retry: while (true) {
             while (true) {
@@ -13311,6 +13337,11 @@ pub const ProvisionedTableWriteSource = struct {
                 .{}
             else
                 self.transactionRecoveryConfig();
+            const direct_schema = if (prepared_open.?.indexes_json == null)
+                try prepareManagedSchemaBeforeIndexLoad(cache.alloc, mode, prepared_open.?.schema_json)
+            else
+                null;
+            defer if (direct_schema) |schema| storage_schema.freeSchema(cache.alloc, schema.runtime_schema);
             var retry_prepared_open = false;
             var opened: ?db_mod.DB = while (true) {
                 // The initial identity lookup happens before cold-open
@@ -13350,6 +13381,7 @@ pub const ProvisionedTableWriteSource = struct {
                     )
                 else
                     db_mod.DB.open(cache.alloc, path, .{
+                        .schema_before_index_load = direct_schema,
                         .lsm_cache = cache.lsm_cache,
                         .hbc_cache = cache.hbc_cache,
                         .lsm_root_generation = lsm_root_generation,
@@ -13395,18 +13427,18 @@ pub const ProvisionedTableWriteSource = struct {
                             // coordinated slow path acquires both caches in address
                             // order, then revalidate this prepared open after the
                             // victim has synchronously released its lifetime FDs.
-                            cache.open_mutex.unlock();
+                            cache.unlockOpenMutex();
                             cache_open_locked = false;
                             const cross_cache_evicted = self.reclaimInactiveEntryAcrossWriteCachesForDescriptorPressure(
                                 cache,
                                 group_id,
                                 table_name,
                             ) catch |reclaim_err| {
-                                lockAtomic(&cache.open_mutex);
+                                cache.lockOpenMutex();
                                 cache_open_locked = true;
                                 return reclaim_err;
                             };
-                            lockAtomic(&cache.open_mutex);
+                            cache.lockOpenMutex();
                             cache_open_locked = true;
                             if (!cross_cache_evicted) return err;
                             retry_prepared_open = true;
@@ -14648,6 +14680,11 @@ pub const ProvisionedTableWriteSource = struct {
             return error.DocIdentityNamespaceUnavailable;
         const lsm_root_generation = self.visibleRootGeneration(group_id);
         const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default, self.ha_async_mirror);
+        const direct_schema = if (metadata.indexes_json == null)
+            try prepareManagedSchemaBeforeIndexLoad(alloc, .default, metadata.schema_json)
+        else
+            null;
+        defer if (direct_schema) |schema| storage_schema.freeSchema(alloc, schema.runtime_schema);
         var db = if (metadata.indexes_json) |indexes_json|
             try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 alloc,
@@ -14676,6 +14713,7 @@ pub const ProvisionedTableWriteSource = struct {
             )
         else
             try db_mod.DB.open(alloc, path, .{
+                .schema_before_index_load = direct_schema,
                 .lsm_root_generation = lsm_root_generation,
                 .backend_runtime = self.backend_runtime,
                 .secret_store = self.secret_store,
@@ -14847,18 +14885,36 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
+            const busy_result = StartupCatchUpResult{
+                .had_debt = true,
+                .busy = true,
+                .index_repair_pending = metadata.advance_index_repairs,
+            };
+            self.invalidateRepairHandoffOwnerAuditBestEffort(table_name, group_id);
+            if (!self.tryBeginStartupCatchUpGroupOperation(table_name, group_id, metadata.advance_index_repairs)) {
+                return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
+            }
+            defer self.endGroupOperation(table_name, group_id);
             const publication_token = if (self.runtime_status_cache) |snapshot_cache|
                 try snapshot_cache.capturePublicationToken(table_name)
             else
                 null;
-            var observation = (try local_source.reconcileTableGroupLocalTransientObserved(
+            var observation = (try local_source.reconcileTableGroupLocalObserved(
                 alloc,
                 group_id,
                 table_name,
                 metadata.target_index_name,
                 metadata.advance_index_repairs,
+                false,
             )) orelse return error.StorageKernelOwnerUnavailable;
             defer observation.deinit(alloc);
+            if (observation.result.state == .busy) {
+                // The compiled owner has a separate admission fence. Keep the
+                // exact retry key when it yields, just as for group contention.
+                // Admission above clears the prior key so a stale scheduler
+                // snapshot cannot retire a newly deferred attempt.
+                return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
+            }
             if (publication_token) |token| {
                 if (observation.runtime_status) |status| {
                     _ = publishRuntimeStatusGroupAfterObservation(
@@ -15779,52 +15835,52 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
-    pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
+    pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !@import("../storage/posting_refresh_progress.zig").Progress {
         if (comptime control_only_storage_sources) {
-            const maintenance_source = self.storage_maintenance_source orelse return 0;
+            const maintenance_source = self.storage_maintenance_source orelse return .{};
             return try maintenance_source.runDensePostingRound();
         }
-        if (!self.local_db_mutex.tryLock()) return 0;
+        if (!self.local_db_mutex.tryLock()) return .{ .pending = true };
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
         var lease_alloc: std.mem.Allocator = std.heap.page_allocator;
         defer {
             for (leases.items) |*lease| lease.deinit(lease_alloc);
             leases.deinit(lease_alloc);
         }
+        var total: @import("../storage/posting_refresh_progress.zig").Progress = .{};
         {
             defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return 0;
+            const cache = self.write_cache orelse return .{};
             lease_alloc = cache.alloc;
             for (cache.entries.items) |entry| {
-                if (entry.bulk_ingest_session_open) continue;
-                if (entry.db.hasActiveDenseBulkWork()) continue;
+                if (entry.bulk_ingest_session_open or entry.db.hasActiveDenseBulkWork()) {
+                    total.pending = true;
+                    continue;
+                }
                 try cache.appendMaintenanceLease(&leases, entry);
             }
         }
-        var total_steps: usize = 0;
         for (leases.items) |lease| {
-            // A dependency chain can expose only one newly repairable posting
-            // per transaction. One pass per one-second timer wake made a
-            // settled 50K load spend minutes at 99.9% readiness even though
-            // each repair itself took little CPU. Drain a bounded burst while
-            // releasing the DB apply fence between passes. Foreground work can
-            // therefore become visible to shouldDeferOptionalPostingMaintenance
-            // on the next pass, while an idle corpus advances up to 64 links or
-            // 50 ms per wake instead of one.
+            // Release the apply fence between resumable pages. Count scanning
+            // as progress, and retain deferral separately from a clean sweep.
             const burst_start_ns = platform_time.monotonicNs();
             const max_passes: usize = 64;
             const max_elapsed_ns: u64 = 50 * std.time.ns_per_ms;
             var pass: usize = 0;
+            var pending = true;
             while (pass < max_passes and platform_time.monotonicNs() -| burst_start_ns < max_elapsed_ns) : (pass += 1) {
-                const progressed = lease.db.runDensePostingReadinessMaintenanceForIdle() catch |err| {
+                const page = lease.db.refreshDensePostingPayloadPageBestEffort() catch |err| {
                     std.log.warn("dense posting maintenance round failed: {}", .{err});
                     break;
                 };
-                total_steps += progressed;
-                if (progressed == 0) break;
+                total.repaired += page.repaired;
+                total.scanned += page.scanned;
+                pending = page.pending;
+                if (!pending or page.scanned == 0 or page.yield_after_page) break;
             }
+            total.pending = total.pending or pending;
         }
-        return total_steps;
+        return total;
     }
 
     pub fn runVectorBlockMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
@@ -16658,20 +16714,10 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatus {
         if (comptime control_only_storage_sources) {
             const local_source = self.local_write_source orelse return null;
-            var statuses = (local_source.localRuntimeStatuses(alloc, table_name) catch |err| switch (err) {
-                // This probe is used by observational control loops such as
-                // schema-migration finalization. A resident owner can be
-                // momentarily retiring or publishing its generation; absence
-                // is the truthful best-effort result and must not terminate
-                // the node's control loop.
-                error.StorageReadTemporarilyUnavailable => return null,
-                else => return err,
-            }) orelse return null;
-            defer statuses.deinit(alloc);
-            for (statuses.items) |status| {
-                if (status.group_id == group_id) return try status.clone(alloc);
-            }
-            return null;
+            // Keep a group probe O(1) in resident-owner observations. Asking
+            // for the entire table here rescans every sibling once per group
+            // and lets an unrelated busy owner abort this group's refresh.
+            return try local_source.localRuntimeStatusGroupLocal(alloc, group_id, table_name);
         }
         return switch (self.probeManagedWriterGroupBestEffort(table_name, group_id)) {
             .absent, .unknown => null,
@@ -17726,12 +17772,12 @@ pub const ProvisionedTableWriteSource = struct {
                     continue;
                 }
             } else {
-                lockAtomic(&cache.open_mutex);
+                cache.lockOpenMutex();
             }
             lockAtomic(&self.local_db_mutex);
             const observed = self.snapshotResidentDbLocked(table_name, group_id, lsm_root_generation);
             self.local_db_mutex.unlock();
-            cache.open_mutex.unlock();
+            cache.unlockOpenMutex();
             if (observed.cached != null) return observed;
         }
         return .{ .open_contended = open_contended };
@@ -19926,19 +19972,35 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            const result = (try local_source.reconcileTableGroupLocal(
+            var observation = (try local_source.reconcileTableGroupLocalObserved(
+                alloc,
                 group_id,
                 table_name,
                 metadata.target_index_name,
                 false,
+                true,
             )) orelse return error.StorageKernelOwnerUnavailable;
-            return switch (result.state) {
+            defer observation.deinit(alloc);
+            const outcome: StructuralReconcileGroupOutcome = switch (observation.result.state) {
                 .complete => .complete,
-                .repair_pending => .repair_pending,
-                .restore_repair_pending => .repair_pending,
-                .busy => .busy,
-                .degraded => error.StorageKernelReconcileDegraded,
+                .repair_pending, .restore_repair_pending => .repair_pending,
+                .busy => return .busy,
+                .degraded => return error.StorageKernelReconcileDegraded,
             };
+            // A successful reconcile is not a publication proof. Observe the
+            // same pinned owner before releasing it; if its nonblocking probe
+            // lost an apply race, retry without completing this plan group.
+            const status = observation.runtime_status orelse return .busy;
+            if (self.runtime_status_cache != null) {
+                std.debug.assert(observations.items.len < structural_reconcile_groups_per_quantum);
+                observations.appendAssumeCapacity(.{
+                    .status = status,
+                    .opened_root_generation = status.metadata.lsm_root_generation,
+                });
+                observation.runtime_status = null;
+            }
+            if (outcome == .repair_pending) self.ensureStructuralRepairHandoffStatus(table_name, group_id);
+            return outcome;
         }
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -20938,6 +21000,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .vector_migration_group_local = vectorMigrationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
@@ -21223,7 +21286,7 @@ pub const ProvisionedTableWriteSource = struct {
                         }
                         target_generations[group_index] = entry.lsm_root_generation;
                         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
-                        try cached.db.configureTableStorage(req.storage);
+                        try cached.db.configureTableStorage(req.storage orelse cached.db.table_storage);
                         try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                         // Catalog admission and local create can race an earlier
                         // startup/status open of this generation. The entry
@@ -21356,7 +21419,7 @@ pub const ProvisionedTableWriteSource = struct {
                 },
             );
             defer if (opened) |*db| db.close();
-            try opened.?.configureTableStorage(req.storage);
+            try opened.?.configureTableStorage(req.storage orelse opened.?.table_storage);
             try applyLocalTableSchemaJson(alloc, &opened.?, schema_json);
             // Register entity resolvers declared in the index config. Indexes
             // and enrichments are provisioned through the managed-open path, but
@@ -21622,7 +21685,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         const open_fence = self.dropped_table_cleanup_outer_mutex;
         var open_fence_held = false;
-        defer if (open_fence_held) open_fence.?.unlock();
+        defer if (open_fence_held) open_fence.?.unlock(self.tableActivityIo());
         const group_ids = contract.group_ids;
         // A durable index repair owns group admission while it advances one
         // bounded build slice. Publish cancellation before waiting for the
@@ -21804,7 +21867,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (read_cache_exclusive) |*exclusive| exclusive.deinit();
         read_cache_exclusive = null;
         if (open_fence_held) {
-            open_fence.?.unlock();
+            open_fence.?.unlock(self.tableActivityIo());
             open_fence_held = false;
         }
         for (group_ids) |group_id| {
@@ -22784,7 +22847,13 @@ pub const ProvisionedTableWriteSource = struct {
             var transition = try self.beginLocalTableGenerationTransitionFromPreparation(table_name);
             errdefer transition.abort();
             defer transition.deinit();
-            try snapshot_source.retireGroupForPublication(group_id, table_name);
+            var publication = try snapshot_source.beginPublication(.{
+                .io = restore_io,
+                .group_id = group_id,
+                .table_name = table_name,
+                .cancellation = plan.cancellation,
+            });
+            defer publication.deinit();
             self.invalidateSharedPathCaches(path);
             try snapshot_source.reconcileRestore(request);
             self.invalidateSharedPathCaches(path);
@@ -22813,7 +22882,18 @@ pub const ProvisionedTableWriteSource = struct {
                 var transition = try self.beginLocalTableGenerationTransitionFromPreparation(table_name);
                 errdefer transition.abort();
                 defer transition.deinit();
-                try snapshot_source.retireGroupForPublication(group_id, table_name);
+                var publication = try snapshot_source.beginPublication(.{
+                    .io = restore_io,
+                    .group_id = group_id,
+                    .table_name = table_name,
+                    .cancellation = plan.cancellation,
+                });
+                defer {
+                    // Snapshot destruction can roll back a partial promotion.
+                    // Finish it before permitting a replacement owner to open.
+                    prepared.deinit();
+                    publication.deinit();
+                }
                 self.invalidateSharedPathCaches(path);
                 try prepared.promote();
 
@@ -23296,11 +23376,16 @@ pub const ProvisionedTableWriteSource = struct {
             defer self.local_db_mutex.unlock();
             self.invalidateReadCache(table_name);
         }
+        var preserve_writer_on_error = false;
         errdefer {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
             self.invalidateReadCache(table_name);
-            self.invalidateWriteCache(table_name);
+            // Graph ownership cleanup runs on the resident writer. A retry
+            // before mutation must leave that owner alive to clear its fence;
+            // retiring it on every retry cancels the work Raft is waiting for.
+            if (!preserve_writer_on_error)
+                self.invalidateWriteCache(table_name);
         }
         if (self.write_cache) |cache| {
             const target_generation = self.visibleRootGeneration(group_id);
@@ -23344,10 +23429,12 @@ pub const ProvisionedTableWriteSource = struct {
                         try applyReplicatedTransactionMutationAtRaftEntry(alloc, cached.db, table_name, group_id, apply_req, entry)
                     else
                         try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
-                } else if (raft_entry) |entry|
-                    try cached.db.batchRaftReplicatedApply(apply_req, entry)
-                else
-                    try cached.db.batchReplicatedApply(apply_req);
+                } else if (raft_entry) |entry| {
+                    cached.db.batchRaftReplicatedApply(apply_req, entry) catch |err| {
+                        preserve_writer_on_error = err == error.RaftApplyWriterUnavailable;
+                        return err;
+                    };
+                } else try cached.db.batchReplicatedApply(apply_req);
             }
             cache.publishCachedLeaseGeneration(&cached, target_generation);
             {
@@ -23670,7 +23757,15 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer transition.abort();
         defer transition.deinit();
 
-        try snapshot_source.retireGroupForPublication(group_id, table_name);
+        var publication = try snapshot_source.beginPublication(.{
+            .io = self.tableActivityIo(),
+            .group_id = group_id,
+            .table_name = table_name,
+        });
+        defer {
+            prepared.deinit();
+            publication.deinit();
+        }
         self.invalidateSharedPathCaches(path);
         try prepared.promote();
         const durability_uncertain = try prepared.publishPrepared();
@@ -25335,6 +25430,19 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
+    fn vectorMigrationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime !control_only_storage_sources) {
+            if (self.localWriteOwnerSource()) |owner_source| return try owner_source.vectorMigrationGroupLocal(alloc, group_id, table_name, request_json);
+        }
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+        const owner_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+        return try owner_source.vectorMigrationGroupLocal(alloc, group_id, table_name, request_json);
+    }
+
     fn listArtifactRepairIssuesGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -25946,8 +26054,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             // still participates in the publication fence. Take the same
             // open->state order as every structural cache transition so a
             // dropped path cannot be reopened between invalidation and rename.
-            lockAtomic(&cache.write_cache.open_mutex);
-            defer cache.write_cache.open_mutex.unlock();
+            cache.write_cache.lockOpenMutex();
+            defer cache.write_cache.unlockOpenMutex();
             while (true) {
                 lockAtomic(&cache.mutex);
                 var cached = cache.write_cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, .status_only) catch |err| switch (err) {
@@ -26008,8 +26116,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             }
         }
 
-        lockAtomic(&cache.write_cache.open_mutex);
-        defer cache.write_cache.open_mutex.unlock();
+        cache.write_cache.lockOpenMutex();
+        defer cache.write_cache.unlockOpenMutex();
 
         while (true) {
             lockAtomic(&cache.mutex);
@@ -26195,6 +26303,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .vector_migration_group_local = vectorMigrationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
@@ -28024,6 +28133,12 @@ pub const HostedProvisionedTableWriteSource = struct {
             self.invalidateManagedCache(table_name);
         }
         return result;
+    }
+
+    fn vectorMigrationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+        return try owner_source.vectorMigrationGroupLocal(alloc, group_id, table_name, request_json);
     }
 
     fn listArtifactRepairIssuesGroupLocal(
@@ -32691,7 +32806,9 @@ fn loadTableManagedMetadata(
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
     const indexes_json = if (table.indexes_json.len == 0) null else try alloc.dupe(u8, table.indexes_json);
     errdefer if (indexes_json) |value| alloc.free(value);
-    const schema_json = if (table.schema_json.len == 0) null else try alloc.dupe(u8, table.schema_json);
+    // This is a complete catalog contract. Persist the default schema for an
+    // empty contract so a later Raft apply can reopen without catalog access.
+    const schema_json = try alloc.dupe(u8, tables_api.effectiveSchemaJson(table.schema_json));
     return .{
         .indexes_json = indexes_json,
         .schema_json = schema_json,
@@ -33053,6 +33170,8 @@ fn validateSplitReplicationIdentityAgainstCatalog(
     if (!source_namespace.eql(replication.identity_namespace)) return error.DocIdentityNamespaceMismatch;
 }
 
+const prepareManagedSchemaBeforeIndexLoad = physical_local_write.prepareManagedSchemaBeforeIndexLoad;
+
 fn openManagedDbForReplicatedApply(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -33076,6 +33195,11 @@ fn openManagedDbForReplicatedApply(
     const indexes_json = if (metadata) |owned| owned.indexes_json else null;
     const schema_json = if (metadata) |owned| owned.schema_json else null;
     const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default_async, ha_async_mirror);
+    const direct_schema = if (indexes_json == null)
+        try prepareManagedSchemaBeforeIndexLoad(alloc, .default_async, schema_json)
+    else
+        null;
+    defer if (direct_schema) |schema| storage_schema.freeSchema(alloc, schema.runtime_schema);
     var db = if (indexes_json) |value|
         try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
             alloc,
@@ -33103,6 +33227,7 @@ fn openManagedDbForReplicatedApply(
         )
     else
         try db_mod.DB.open(alloc, path, .{
+            .schema_before_index_load = direct_schema,
             .backend_runtime = backend_runtime,
             .identity_namespace = namespace,
             .prefer_existing_identity_namespace = true,
@@ -33717,6 +33842,117 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "compiled startup catch-up retains exact retries across owner contention" {
+            if (comptime !control_only_storage_sources) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            const Fake = struct {
+                busy: bool = true,
+                calls: usize = 0,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return error.UnexpectedBatch;
+                }
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: ?[]const u8, advance: bool, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(!advance and !retain);
+                    self.calls += 1;
+                    return .{ .result = .{ .state = if (self.busy) .busy else .complete } };
+                }
+            };
+            var fake = Fake{};
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-owner-catch-up", table_catalog.emptyCatalogSource());
+            defer source.deinit();
+            source.local_write_source = .{ .ptr = &fake, .vtable = &.{
+                .batch = Fake.batch,
+                .reconcile_table_group_local_observed = Fake.observe,
+            } };
+            const first = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{});
+            try std.testing.expect(first.busy and first.had_debt);
+            const old = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(old);
+            try std.testing.expectEqual(@as(usize, 1), old.len);
+            try std.testing.expect((try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{})).busy);
+            source.clearDeferredStartupCatchUpGroupIfUnchanged(old[0]);
+            const next = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(next);
+            try std.testing.expectEqual(@as(usize, 1), next.len);
+            try std.testing.expect(next[0].generation != old[0].generation);
+            fake.busy = false;
+            const complete = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{});
+            try std.testing.expect(!complete.busy and !complete.had_debt);
+            const cleared = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(cleared);
+            try std.testing.expectEqual(@as(usize, 0), cleared.len);
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+        }
+
+        test "compiled structural reconciliation publishes its owner observation and defers absent proof" {
+            if (comptime !control_only_storage_sources) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            const Fake = struct {
+                observed: bool = false,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return error.UnexpectedBatch;
+                }
+                fn reconcile(_: *anyopaque, _: u64, _: []const u8, _: ?[]const u8, _: bool) anyerror!?table_write_source.LocalStructuralReconcileResult {
+                    return .{ .state = .complete };
+                }
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, target: ?[]const u8, advance: bool, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table);
+                    try std.testing.expectEqualStrings("vec", target.?);
+                    try std.testing.expect(retain and !advance);
+                    return .{
+                        .result = .{ .state = .complete },
+                        .runtime_status = if (self.observed) .{
+                            .group_id = group,
+                            .stats = .{},
+                            .metadata = .{
+                                .lsm_root_generation = table_reads.backend_current_root_generation,
+                                .source = .live_writer_publish,
+                                .freshness = .fresh,
+                                .target_observation_revision = 123,
+                                .target_observation_complete = true,
+                            },
+                        } else null,
+                    };
+                }
+            };
+            var fake = Fake{};
+            var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-owner-structural-observation", table_catalog.emptyCatalogSource());
+            defer source.deinit();
+            source.runtime_status_cache = &cache;
+            source.local_write_source = .{ .ptr = &fake, .vtable = &.{
+                .batch = Fake.batch,
+                .reconcile_table_group_local = Fake.reconcile,
+                .reconcile_table_group_local_observed = Fake.observe,
+            } };
+            var observations = std.ArrayListUnmanaged(ProvisionedTableWriteSource.StructuralRuntimeObservation).empty;
+            defer {
+                for (observations.items) |*value| value.deinit(alloc);
+                observations.deinit(alloc);
+            }
+            try observations.ensureTotalCapacity(alloc, ProvisionedTableWriteSource.structural_reconcile_groups_per_quantum);
+            const metadata = StartupCatchUpMetadata{ .target_index_name = "vec" };
+            try std.testing.expectEqual(.busy, try source.reconcileTableGroupStructureWithRuntime(alloc, 7001, "docs", metadata, &observations));
+            try std.testing.expectEqual(@as(usize, 0), observations.items.len);
+            fake.observed = true;
+            source.reserveTargetedStructuralReconcileStatus("docs", "vec");
+            defer source.releaseTargetedStructuralReconcileStatus("docs", "vec");
+            try source.bindTargetedStructuralExpectation(alloc, "docs", "vec", "{}", &.{7001});
+            const token = try cache.capturePublicationToken("docs");
+            try std.testing.expectError(error.EmptyTargetedIndexObservation, publishStructuralRuntimeObservations(&source, "docs", "vec", token, observations.items, false));
+            try std.testing.expectEqual(.complete, try source.reconcileTableGroupStructureWithRuntime(alloc, 7001, "docs", metadata, &observations));
+            try std.testing.expectEqual(@as(usize, 1), observations.items.len);
+            try std.testing.expectEqual(@as(u64, 123), observations.items[0].status.metadata.target_observation_revision);
+            try publishStructuralRuntimeObservations(&source, "docs", "vec", token, observations.items, false);
+            var published = (try cache.snapshot(alloc, "docs")).?;
+            defer published.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), published.items.len);
+            try std.testing.expectEqual(@as(u64, 7001), published.items[0].group_id);
+        }
+
         test "graph metric group action envelope is typed and versioned" {
             const alloc = std.testing.allocator;
             const body = try graphMetricGroupActionBodyAlloc(alloc, "graph_idx", "pagerank", "refresh");
@@ -36332,9 +36568,27 @@ fn consumerTests() type {
             var activity = source.readPreparation().beginRead("docs", .general).?;
             defer activity.deinit();
 
-            source.beginReplicatedApplyOperation("docs", 7001);
+            const io = source.tableActivityIo();
+            source.table_activity_mutex.lockUncancelable(io);
+            const queued = source.activityEntryLocked("docs", 7001);
+            queued.operation_waiters = 1;
+            queued.transition_waiters = 1;
+            source.table_activity_mutex.unlock(io);
+            defer {
+                source.table_activity_mutex.lockUncancelable(io);
+                defer source.table_activity_mutex.unlock(io);
+                const entry = source.activityEntryLocked("docs", 7001);
+                entry.operation_waiters = 0;
+                entry.transition_waiters = 0;
+                source.pruneTableActivityLocked("docs", 7001);
+            }
+            // A queued transition waits for this read; the read can itself
+            // be waiting for a committed entry. Preserve ordinary queue
+            // priority without fencing that entry behind its own reader.
+            try std.testing.expect(!source.tryBeginReadCompatibleGroupOperation("docs", 7001));
+            try std.testing.expect(source.tryBeginReplicatedApplyOperation("docs", 7001));
             defer source.endGroupOperation("docs", 7001);
-
+            try std.testing.expect(!source.tryBeginReplicatedApplyOperation("docs", 7001));
             try std.testing.expect(source.readCompatibleMaintenanceActiveBestEffort("docs", 7001));
         }
 
@@ -40494,6 +40748,69 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "replicated merge retains its resident writer while graph ownership cleanup is pending" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-graph-owner", .{tmp.sub_path});
+            defer alloc.free(root);
+            const Catalog = struct {
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogAccess;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn source() table_catalog.CatalogSource {
+                    return .{ .ptr = undefined, .vtable = &.{
+                        .admin_snapshot = snapshot,
+                        .free_admin_snapshot = free,
+                        .routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot,
+                        .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
+                        .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
+                    } };
+                }
+            };
+            var cache = ProvisionedTableWriteCache.init(alloc);
+            defer cache.deinit();
+            var source = ProvisionedTableWriteSource.init(root, Catalog.source());
+            defer source.deinit();
+            source.write_cache = &cache;
+            const namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+            var writer = (try source.leaseCachedGroupWriterWithMetadata(alloc, 1, "docs", .{
+                .indexes_json = "{}",
+                .schema_json = tables_api.default_schema_json,
+                .identity_namespace = namespace,
+            })) orelse return error.TestUnexpectedResult;
+            defer writer.deinit(alloc);
+            try writer.db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+            try writer.db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
+            try writer.db.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
+            const merge = db_mod.types.BatchRequest{ .merge_checkpoint = .{
+                .kind = .accept,
+                .transition_id = 10,
+                .donor_group_id = 2,
+                .receiver_group_id = 1,
+                .receiver_base_start = "",
+                .receiver_base_end = "m",
+                .merged_start = "",
+                .merged_end = "",
+            }, .merge_replication = .{
+                .transition_id = 10,
+                .donor_group_id = 2,
+                .receiver_group_id = 1,
+                .identity_namespace = namespace,
+            } };
+            try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", merge, .{ .term = 1, .index = 2 }));
+            try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+            try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+            try std.testing.expectEqual(@as(u64, 1), (try writer.db.raftAppliedEntry()).?.index);
+            // Unit tests explicitly drive the same maintenance pass; the borrowed-I/O
+            // regression separately proves its production scheduler advances it.
+            try writer.db.runArtifactRepairMetadataMaintenanceUntilIdle();
+            _ = try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", merge, .{ .term = 1, .index = 2 });
+            try std.testing.expectEqual(@as(u64, 2), (try writer.db.raftAppliedEntry()).?.index);
+            try std.testing.expectEqualStrings("", writer.db.getRange().end);
+        }
+
         test "hosted index lifecycle owner retries transient activation failure" {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});
@@ -43795,6 +44112,10 @@ fn implementationTests() type {
         }
 
         test "replicated split destination seeds inherited doc identity before range publication" {
+            inline for (.{ "", "{}" }) |indexes_json| try testReplicatedSplitDestinationAdmission(indexes_json);
+        }
+
+        fn testReplicatedSplitDestinationAdmission(comptime indexes_json: []const u8) !void {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
@@ -43825,8 +44146,8 @@ fn implementationTests() type {
                             .table_id = 7,
                             .name = "docs",
                             .placement_role = "data",
-                            .indexes_json = "{}",
-                            .schema_json = tables_api.default_schema_json,
+                            .indexes_json = indexes_json,
+                            .schema_json = "",
                         }})[0..]),
                         // The destination deliberately remains unpublished until cutover.
                         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -43888,10 +44209,21 @@ fn implementationTests() type {
                 var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
                     return error.TestUnexpectedResult;
                 defer destination.deinit(alloc);
-                // Production admission persists this manifest before the Raft group
-                // can accept writes. This focused test provisions the destination
-                // through the lower-level apply path, so establish the same invariant.
-                try applyLocalTableSchemaJson(alloc, destination.db, tables_api.default_schema_json);
+                // An empty catalog contract still has an authoritative default schema.
+                // Admission must persist it before any catalog-free Raft reopen.
+                const schema_json = (try loadLocalTableSchemaJson(alloc, destination.db)) orelse
+                    return error.TestExpectedLocalTableManifest;
+                defer alloc.free(schema_json);
+                try std.testing.expectEqualStrings(tables_api.default_schema_json, schema_json);
+                // Equivalent complete contracts must share the resident writer rather
+                // than retiring it while a transition still holds its lease.
+                var equivalent = (try source.leaseCachedGroupWriterWithMetadata(alloc, 7002, "docs", .{
+                    .indexes_json = indexes_json,
+                    .schema_json = "",
+                    .identity_namespace = namespace,
+                })) orelse return error.TestUnexpectedResult;
+                defer equivalent.deinit(alloc);
+                try std.testing.expect(equivalent.db == destination.db);
                 try std.testing.expect(destination.db.core.identity_namespace.eql(namespace));
                 var doc = (try destination.db.lookup(alloc, "doc:m", .{})) orelse return error.TestUnexpectedResult;
                 defer doc.deinit(alloc);
@@ -49550,7 +49882,9 @@ fn implementationTests() type {
                     "docs",
                     .{
                         .indexes_json = managed_indexes_json,
-                        .schema_json = "{}",
+                        // Reconcile the index change against the catalog's admitted
+                        // default schema; {} would change that schema at version zero.
+                        .schema_json = tables_api.default_schema_json,
                     },
                     &observations,
                 );
@@ -50186,8 +50520,8 @@ fn implementationTests() type {
 
             const FakeEmbeddingProvider = struct {
                 request_count: std.atomic.Value(u32) = .init(0),
-                rate_limited_count: std.atomic.Value(u32) = .init(0),
-                allow_all: std.atomic.Value(bool) = .init(false),
+                entered: std.Io.Event = .unset,
+                release: std.Io.Event = .unset,
 
                 fn vectorForInput(input: std.json.Value) []const u8 {
                     if (jsonValueContainsText(input, "alpha")) return "[1,0,0]";
@@ -50240,17 +50574,8 @@ fn implementationTests() type {
                     defer parsed_req.deinit();
 
                     _ = self.request_count.fetchAdd(1, .monotonic);
-                    if (!self.allow_all.load(.acquire)) {
-                        _ = self.rate_limited_count.fetchAdd(1, .monotonic);
-                        const body = try arena.dupe(u8,
-                            \\{"error":{"message":"rate limited","type":"rate_limit_exceeded"}}
-                        );
-                        return .{
-                            .status = 429,
-                            .content_type = try arena.dupe(u8, "application/json"),
-                            .body = body,
-                        };
-                    }
+                    self.entered.set(std.testing.io);
+                    self.release.waitUncancelable(std.testing.io);
 
                     const body = try successBody(arena, parsed_req.value.input);
                     return .{
@@ -50261,7 +50586,7 @@ fn implementationTests() type {
                 }
 
                 fn allowAll(self: *@This()) void {
-                    self.allow_all.store(true, .release);
+                    self.release.set(std.testing.io);
                 }
             };
 
@@ -50338,6 +50663,9 @@ fn implementationTests() type {
             source.read_cache = &read_cache;
             source.write_cache = &write_cache;
             source.backend_runtime = backend_runtime.ptr();
+            // Release blocked HTTP work before source/cache shutdown, including
+            // assertion failures while the initial cached reader is inspected.
+            defer embedding_provider.allowAll();
 
             _ = try source.source().batch(alloc, "docs", .{
                 .writes = &.{
@@ -50348,11 +50676,9 @@ fn implementationTests() type {
                 .sync_level = .write,
             });
 
-            var attempts: usize = 0;
-            while (attempts < 100 and embedding_provider.rate_limited_count.load(.monotonic) == 0) : (attempts += 1) {
-                sleepNs(50 * std.time.ns_per_ms);
-            }
-            try std.testing.expect(embedding_provider.rate_limited_count.load(.monotonic) > 0);
+            // Hold the response until the stale reader exists. Returning 429
+            // here couples cache invalidation to unrelated provider backoff.
+            try embedding_provider.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } });
 
             const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
             defer alloc.free(db_path);
@@ -50369,14 +50695,15 @@ fn implementationTests() type {
                     .limit = 3,
                 });
                 defer initial.deinit();
-                try std.testing.expect(initial.total_hits < 3);
+                try std.testing.expectEqual(@as(u32, 0), initial.total_hits);
             }
 
             embedding_provider.allowAll();
 
             var ready = false;
-            attempts = 0;
-            while (attempts < 200) : (attempts += 1) {
+            var last_total_hits: u32 = 0;
+            const deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
+            while (platform_time.monotonicNs() < deadline_ns) {
                 {
                     var read_lease = try read_cache.getOrOpen(db_path, FakeCatalog.iface(), 7001, 0, "docs");
                     defer read_lease.release();
@@ -50390,6 +50717,7 @@ fn implementationTests() type {
                         .limit = 3,
                     });
                     defer result.deinit();
+                    last_total_hits = result.total_hits;
                     if (result.total_hits == 3 and result.hits.len == 3) {
                         try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
                         ready = true;
@@ -50400,6 +50728,7 @@ fn implementationTests() type {
                 sleepNs(25 * std.time.ns_per_ms);
             }
 
+            if (!ready) std.debug.print("managed dense visibility timed out: provider_requests={d} cached_total_hits={d}\n", .{ embedding_provider.request_count.load(.monotonic), last_total_hits });
             try std.testing.expect(ready);
         }
 
@@ -52922,7 +53251,7 @@ fn implementationTests() type {
                     source: *ProvisionedTableWriteSource,
                     cache: *runtime_status.TableRuntimeSnapshotCache,
                     fenced: bool = false,
-                    clear_publications: usize = 0,
+                    enabled: bool = true,
 
                     fn run(ptr: *anyopaque) void {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -52933,14 +53262,12 @@ fn implementationTests() type {
                         else
                             false;
                         self.source.table_activity_mutex.unlock(io);
-                        if (!clear_observed) return;
-                        self.clear_publications += 1;
-                        // Fence both the clear callback's publication and the
-                        // caller's final consistent publication. The next scheduler
-                        // pass must own recovery of the still-pending handoff.
-                        if (self.clear_publications > 2) return;
+                        if (!self.enabled or !clear_observed) return;
+                        // Fence every actual publication in this repair quantum.
+                        // The best-effort clear callback can skip publication on
+                        // WriterLocked, so a fixed callback count is not a barrier.
                         self.cache.invalidateTable("docs");
-                        self.fenced = self.clear_publications == 2;
+                        self.fenced = true;
                     }
                 };
                 var publication_fence = PublicationFence{ .source = &source, .cache = &snapshot_cache };
@@ -52948,6 +53275,7 @@ fn implementationTests() type {
                     source: *ProvisionedTableWriteSource,
                     indexes_json: []const u8,
                     namespace: doc_identity.Namespace,
+                    publication_fence: *PublicationFence,
                     attempted_repair: bool = false,
                     repaired: bool = false,
                     repair_passes: usize = 0,
@@ -52970,6 +53298,18 @@ fn implementationTests() type {
                                 self.err = err;
                                 return;
                             };
+                            if (self.publication_fence.enabled and self.publication_fence.fenced) {
+                                // A fenced completion must retain the handoff for
+                                // another admitted owner, even if durable repair
+                                // itself completed in this quantum.
+                                if (!repair.index_repair_pending or
+                                    !self.source.structuralStatusSnapshotOnlyBestEffort("docs"))
+                                {
+                                    self.err = error.TestUnexpectedResult;
+                                    return;
+                                }
+                                self.publication_fence.enabled = false;
+                            }
                             if (repair.index_repair_repaired or repair.cleared_debt) {
                                 var resident = self.source.residentDbSource().leaseGroup(
                                     std.testing.allocator,
@@ -53003,6 +53343,7 @@ fn implementationTests() type {
                     .source = &source,
                     .indexes_json = indexes_json,
                     .namespace = namespace,
+                    .publication_fence = &publication_fence,
                 };
                 // Snapshot-only status is observational and cannot delay the cold
                 // repair owner. The repair's clear plus final cached publication must
@@ -57816,7 +58157,7 @@ fn implementationTests() type {
                 fn beforeStructural(ptr: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.before_structural_open_available = self.cache.open_mutex.tryLock();
-                    if (self.before_structural_open_available) self.cache.open_mutex.unlock();
+                    if (self.before_structural_open_available) self.cache.unlockOpenMutex();
                 }
 
                 fn onChange(
@@ -57827,7 +58168,7 @@ fn implementationTests() type {
                     if (kind != .structural) return;
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.callback_open_available = self.cache.open_mutex.tryLock();
-                    if (self.callback_open_available) self.cache.open_mutex.unlock();
+                    if (self.callback_open_available) self.cache.unlockOpenMutex();
                 }
             };
             var probe = Probe{ .cache = &write_cache };
@@ -58025,8 +58366,8 @@ fn implementationTests() type {
             // Even empty queues are inconclusive while another closer owns the open
             // mutex. Both cache roles must honor the same caller-owned deadline.
             for ([_]*ProvisionedTableWriteCache{ &primary, &startup }) |cache| {
-                lockAtomic(&cache.open_mutex);
-                defer cache.open_mutex.unlock();
+                cache.lockOpenMutex();
+                defer cache.unlockOpenMutex();
                 clock = .{};
                 const deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMicroseconds(2500), .clock = .awake });
                 try std.testing.expectError(error.TableWriteDrainTimeout, source.drainDroppedTableWriteCachesWithDeadline("docs", &.{7001}, null, deadline));
@@ -58038,8 +58379,8 @@ fn implementationTests() type {
             }
             // The externally-held fence path is also valid, and an exhausted budget
             // still permits a nonblocking successful drain.
-            lockAtomic(&primary.open_mutex);
-            defer primary.open_mutex.unlock();
+            primary.lockOpenMutex();
+            defer primary.unlockOpenMutex();
             try source.drainDroppedTableWriteCachesWithDeadline("docs", &.{7001}, &primary.open_mutex, Io.Clock.Timestamp.now(io, .awake));
         }
 
@@ -58195,7 +58536,7 @@ fn implementationTests() type {
             };
             // Test both ordinary and externally-fenced sources, including error
             // unwinding: neither may wait indefinitely for the blocked closer.
-            for ([_]?*std.atomic.Mutex{ null, &write_cache.open_mutex }) |fence| {
+            for ([_]?*Io.Mutex{ null, &write_cache.open_mutex }) |fence| {
                 source.dropped_table_cleanup_outer_mutex = fence;
                 defer source.dropped_table_cleanup_outer_mutex = null;
                 var attempt: DropAttempt = .{ .source = &source, .contract = contract };
@@ -59004,7 +59345,7 @@ fn implementationTests() type {
                             .table_id = 7,
                             .name = "docs",
                             .description = "docs table",
-                            .schema_json = tables_api.default_schema_json,
+                            .schema_json = "",
                             .read_schema_json = "",
                             .indexes_json = tables_api.default_indexes_json,
                             .replication_sources_json = "[]",
@@ -59048,6 +59389,10 @@ fn implementationTests() type {
                     .startup_catch_up,
                 );
                 defer startup_owner.deinit(alloc);
+                const local_schema = (try loadLocalTableSchemaJson(alloc, startup_owner.db)) orelse
+                    return error.TestUnexpectedResult;
+                defer alloc.free(local_schema);
+                try std.testing.expectEqualStrings(tables_api.default_schema_json, local_schema);
                 try startup_owner.db.batch(.{
                     .writes = &.{.{ .key = "doc:admitted", .value = "{\"title\":\"already provisioned\"}" }},
                     .timestamp_ns = 1,
@@ -61677,9 +62022,9 @@ fn implementationTests() type {
                 }
             };
 
-            lockAtomic(&startup_cache.open_mutex);
+            startup_cache.lockOpenMutex();
             var open_locked = true;
-            defer if (open_locked) startup_cache.open_mutex.unlock();
+            defer if (open_locked) startup_cache.unlockOpenMutex();
 
             var context = Context{ .source = &source };
             var thread = try std.testing.io.concurrent(Context.run, .{&context});
@@ -61703,7 +62048,7 @@ fn implementationTests() type {
                 return err;
             };
             source.local_db_mutex.unlock();
-            startup_cache.open_mutex.unlock();
+            startup_cache.unlockOpenMutex();
             open_locked = false;
 
             thread.await(std.testing.io);
@@ -61744,8 +62089,8 @@ fn implementationTests() type {
             source.startup_write_cache = &startup_cache;
             source.backend_runtime = &runtime;
 
-            lockAtomic(&startup_cache.open_mutex);
-            defer startup_cache.open_mutex.unlock();
+            startup_cache.lockOpenMutex();
+            defer startup_cache.unlockOpenMutex();
             try std.testing.expectError(
                 error.StorageReadTemporarilyUnavailable,
                 source.residentDbSource().prepareGroupForReadRetry(
@@ -61755,6 +62100,40 @@ fn implementationTests() type {
                     table_reads.backend_current_root_generation,
                 ),
             );
+        }
+
+        test "write cache pending closes yield to the borrowed scheduler" {
+            const Probe = struct {
+                threadlocal var active: ?*@This() = null;
+                cache: *ProvisionedTableWriteCache,
+                waits: usize = 0,
+
+                fn wait(_: ?*anyopaque, _: *const u32, _: u32) void {
+                    const self = active.?;
+                    self.waits += 1;
+                    self.cache.unlockOpenMutex();
+                }
+            };
+            const alloc = std.testing.allocator;
+            var cache = ProvisionedTableWriteCache.init(alloc);
+            var probe = Probe{ .cache = &cache };
+            Probe.active = &probe;
+            defer Probe.active = null;
+            var vtable = std.testing.io.vtable.*;
+            vtable.futexWaitUncancelable = Probe.wait;
+            const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+            var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{
+                .backend = .manual,
+                .borrowed_io = .{ .general = io },
+            });
+            defer runtime.deinit();
+            cache.backend_runtime = &runtime;
+            defer cache.deinit();
+            try std.testing.expect(cache.open_mutex.tryLock());
+            cache.drainPendingCloses();
+            try std.testing.expectEqual(@as(usize, 1), probe.waits);
+            try std.testing.expect(cache.open_mutex.tryLock());
+            cache.unlockOpenMutex();
         }
 
         test "write cache transition locks use stable cache roles instead of addresses" {
@@ -61794,8 +62173,8 @@ fn implementationTests() type {
             defer read_activity.deinit();
             try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
 
-            lockAtomic(&startup_cache.open_mutex);
-            defer startup_cache.open_mutex.unlock();
+            startup_cache.lockOpenMutex();
+            defer startup_cache.unlockOpenMutex();
             try std.testing.expectError(
                 error.ResidentDbRetryRequired,
                 source.residentDbSource().leaseGroup(

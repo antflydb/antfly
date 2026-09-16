@@ -57,6 +57,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     HierarchyCursorStale,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
+    ReadIndexTimeout,
     QueryCandidateBudgetExceeded,
     GraphExploredEdgesBudgetExceeded,
     GraphExploredEdgeBytesBudgetExceeded,
@@ -238,6 +239,10 @@ pub const Operations = struct {
             error.ReadUnavailable,
             => error.GroupLeaderUnavailable,
             error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
+            // A bounded Raft quorum/apply wait is a retryable availability
+            // outcome, independent of the caller's request deadline. Preserve
+            // its identity so remote and local reads have the same contract.
+            error.ReadIndexTimeout => error.ReadIndexTimeout,
             error.CatalogRoutingUnavailable,
             error.CatalogProjectionRefreshRequired,
             => error.Unavailable,
@@ -422,6 +427,10 @@ pub const Operations = struct {
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(table_name, input.writes) catch |err| switch (err) {
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            // The sender's catalog can lead this replica's projection during
+            // provisioning/restart. Validation has not called the writer, so
+            // preserve the explicit not-proposed availability response.
+            error.TableNotFound, error.MetadataSnapshotUnavailable => return error.Unavailable,
             else => {
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("routed Raft batch validation failed group_id={} table={s} err={s}", .{
@@ -1644,6 +1653,7 @@ fn consumerTests() type {
                 calls: usize = 0,
                 fail_identity: bool = false,
                 visibility_error: ?anyerror = null,
+                validation_error: ?anyerror = null,
                 saw_unfenced_split: bool = false,
                 saw_unfenced_merge: bool = false,
                 saw_unfenced_transaction: bool = false,
@@ -1651,7 +1661,7 @@ fn consumerTests() type {
 
                 fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    _ = self;
+                    if (self.validation_error) |err| return err;
                     try std.testing.expectEqualStrings("documents", table_name);
                     try std.testing.expectEqual(@as(usize, 0), writes.len);
                 }
@@ -1706,6 +1716,12 @@ fn consumerTests() type {
                 .catalog_route_fence_json = "{\"metadata_group_id\":1,\"catalog_revision\":2,\"table_id\":3,\"topology_epoch\":4,\"route\":{\"group_id\":17,\"range_id\":5,\"identity_namespace\":{\"table_id\":3,\"shard_id\":17,\"range_id\":5}}}",
             };
 
+            for ([_]anyerror{ error.TableNotFound, error.MetadataSnapshotUnavailable }) |err| {
+                state.validation_error = err;
+                try std.testing.expectError(error.Unavailable, operations.routedBatch(std.testing.allocator, request, 17, "documents", .{}, forwarding));
+                try std.testing.expectEqual(@as(usize, 0), state.calls);
+            }
+            state.validation_error = null;
             const result = try operations.routedBatch(
                 std.testing.allocator,
                 request,

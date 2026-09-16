@@ -1135,6 +1135,17 @@ their physical proofs match their storage engines:
   complete source outcomes and enough live sparse documents to cover produced
   sources; chunking may make the physical count larger.
 
+For repeatable ANN comparisons on an unchanged corpus, also wait for
+`status.hbc_posting.refresh_pending == false` on a fresh, complete index status.
+This is a separate optimization-convergence signal: a bounded clean sweep has
+verified the current mutation epoch. Writes invalidate it, and reopen starts
+pending until another sweep. Dirty postings can serve exact member scoring
+while clean postings use approximate quantized candidates, so ordinary idle
+refresh can change the neighbor list without a source-vector change. A status
+probe alone may inspect and retire a cold owner; activate the table with a query
+before waiting for its background work. This signal does not freeze the index
+against concurrent writes or change query readiness.
+
 Correctness and latency use separate verification gates. The 500-document
 regression requires complete coverage, idempotent replay, a complete second
 index, and a stable first index. A deterministic partial-publication test proves

@@ -1,4 +1,4 @@
-"""Experimental source-store ownership through the public standalone API."""
+"""Source-store defaults and ownership through the public standalone API."""
 
 import time
 
@@ -10,11 +10,13 @@ def hit_ids(result):
     return [hit["_id"] for hit in result["responses"][0]["hits"]["hits"]]
 
 
-@pytest.mark.parametrize("mode", ["primary_lsm", "vector_store"])
+@pytest.mark.parametrize("mode", [None, "primary_lsm", "vector_store"])
 def test_vector_source_models_updates_deletes_and_restart(stateful_api, mode):
     api = stateful_api
     table = f"vector_source_{mode}_{time.time_ns()}"
-    api.create_table(table, storage={"dense_embeddings": mode})
+    options = {} if mode is None else {"storage": {"dense_embeddings": mode}}
+    api.create_table(table, **options)
+    mode = mode or "vector_store"
     assert api.get_table(table)["storage"]["dense_embeddings"] == mode
     for name, dimensions in [("model_a", 3), ("model_b", 2)]:
         assert_created_index(

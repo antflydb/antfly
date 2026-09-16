@@ -33,11 +33,14 @@ const std = @import("std");
 /// Version 9 carries explicit Scope-v2 source authority in online transitions
 /// and rewrite plans. Registration, admission, and final append share this
 /// capability; a v8 metadata follower cannot interpret the new cut identity.
-pub const current_version: u16 = 9;
+/// Version 10 preserves table storage settings and storage migration admission
+/// in the authoritative table-record codec, including standby replay.
+pub const current_version: u16 = 10;
 // Registration/topology admission and the final append must acquire the same
 // decoder proof. A v8 preflight cannot satisfy the v9 coordinated append gate.
 pub const relational_integrity_topology_version: u16 = coordinated_lifecycle_version;
-pub const coordinated_lifecycle_version: u16 = source_scope_version;
+pub const coordinated_lifecycle_version: u16 = table_storage_metadata_version;
+pub const table_storage_metadata_version: u16 = 10;
 pub const source_scope_version: u16 = 9;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;

@@ -131,7 +131,7 @@ const Entry = struct {
         return .{
             .tombstone_runs = left.tombstone_runs + right.tombstone_runs + @intFromBool(deletes),
             .unknown_tombstone_runs = left.unknown_tombstone_runs + right.unknown_tombstone_runs + @intFromBool(entry.run.tombstone_count == null),
-            .gc_requested = left.gc_requested or right.gc_requested or (deletes and entry.run.gc_requested),
+            .gc_requested = left.gc_requested or right.gc_requested or entry.run.gc_requested,
             .oldest_tombstone = @min(left.oldest_tombstone, right.oldest_tombstone, if (deletes) entry.run.oldest_tombstone_unix_ns else std.math.maxInt(u64)),
             .newest_tombstone = @max(left.newest_tombstone, right.newest_tombstone, if (deletes) entry.run.oldest_tombstone_unix_ns else 0),
         };
@@ -836,11 +836,15 @@ pub const Directory = struct {
     /// retaining only the minimum timestamp would lose that condition.
     pub fn tombstoneGcDelay(self: *const Directory, age: u64, now: u64) ?u64 {
         const summary = (self.tree.root orelse return null).summary;
-        if (summary.tombstone_runs == 0) return null;
         if (summary.gc_requested) return 0;
+        if (summary.tombstone_runs == 0) return null;
         if (age == 0) return null;
         if (summary.oldest_tombstone == 0 or summary.newest_tombstone > now) return 0;
         return (summary.oldest_tombstone +| age) -| now;
+    }
+
+    pub fn hasGcRequest(self: *const Directory) bool {
+        return if (self.tree.root) |root| root.summary.gc_requested else false;
     }
 
     pub fn tombstoneRunCount(self: *const Directory) usize {
@@ -872,20 +876,21 @@ pub const Directory = struct {
     pub const TombstoneCursor = struct {
         directory: *const Directory,
         rank: usize = 0,
+        include_requests: bool = false,
 
         pub fn next(self: *@This()) ?Handle {
-            const found = nextMarked(self.directory.tree.root, self.rank, 0) orelse return null;
+            const found = nextMarked(self.directory.tree.root, self.rank, 0, self.include_requests) orelse return null;
             self.rank = found.rank + 1;
             return .{ .run = found.node.entry.run, .revision = found.node.entry.payload.? };
         }
         const Found = struct { node: *const Tree.Node, rank: usize };
-        fn nextMarked(root: ?*const Tree.Node, after: usize, base: usize) ?Found {
+        fn nextMarked(root: ?*const Tree.Node, after: usize, base: usize, requests: bool) ?Found {
             const node = root orelse return null;
-            if (node.summary.tombstone_runs == 0 or base + node.count <= after) return null;
+            if ((node.summary.tombstone_runs == 0 and !(requests and node.summary.gc_requested)) or base + node.count <= after) return null;
             const rank = base + (if (node.left) |left| left.count else 0);
-            if (nextMarked(node.left, after, base)) |found| return found;
-            if (rank >= after and (node.entry.run.tombstone_count orelse 0) != 0) return .{ .node = node, .rank = rank };
-            return nextMarked(node.right, after, rank + 1);
+            if (nextMarked(node.left, after, base, requests)) |found| return found;
+            if (rank >= after and ((node.entry.run.tombstone_count orelse 0) != 0 or (requests and node.entry.run.gc_requested))) return .{ .node = node, .rank = rank };
+            return nextMarked(node.right, after, rank + 1, requests);
         }
     };
 
@@ -1031,7 +1036,7 @@ test "run directory path copies preserve pinned epochs through inserts removals 
         old.tombstone_count = 0;
         old.gc_requested = true;
         try gc.put(&backend, old);
-        try std.testing.expectEqual(@as(?u64, null), gc.tombstoneGcDelay(100, 1000));
+        try std.testing.expectEqual(@as(?u64, 0), gc.tombstoneGcDelay(100, 1000));
         try std.testing.expectEqual(@as(?u64, null), snapshot.tombstoneGcDelay(100, 1000));
         var no_deletes = snapshot.tombstoneCursor();
         try std.testing.expect(no_deletes.next() == null);

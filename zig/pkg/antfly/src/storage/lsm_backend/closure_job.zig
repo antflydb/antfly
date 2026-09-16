@@ -16,6 +16,7 @@
 //! lifetime. Discovery never grows a flat vector or rehashes a global map:
 //! each selected run gets one arena node, indexed by ID and read precedence.
 const std = @import("std");
+const work_budget = @import("work_budget.zig");
 const Directory = @import("run_directory.zig").Directory;
 const Run = @import("repository.zig").Run;
 const state = @import("state.zig");
@@ -34,6 +35,34 @@ const TestFixture = struct {
         try directory.put(self, .{ .id = id, .visibility_id = 1, .level = level, .size_bytes = 1, .path = @constCast("frontier.sst"), .smallest_namespace_name = @constCast(lower_ns), .smallest_key = &first, .largest_namespace_name = @constCast(upper_ns), .largest_key = &last, .entry_count = 1, .bloom_filter = null, .state = null });
     }
 };
+
+test "compaction closure deadline follows the borrowed clock" {
+    const Clock = struct {
+        ns: i96 = 0,
+        fn now(ptr: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            return .{ .nanoseconds = self.ns };
+        }
+    };
+    var clock = Clock{};
+    var vtable: std.Io.VTable = undefined;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = &clock, .vtable = &vtable };
+    const allocator = std.testing.allocator;
+    var fixture = TestFixture{ .allocator = allocator };
+    const directory = try Directory.create(allocator);
+    defer directory.destroy(allocator);
+    for (0..8) |i| try fixture.put(directory, i + 1, 0, null, i, null, i + 1);
+    var job = try Job.init(allocator, directory, &.{directory.at(0)}, 0, false);
+    defer job.deinit(allocator);
+    const deadline = work_budget.after(io, 5);
+    clock.ns = 5;
+    try std.testing.expect(!try job.stepUntil(allocator, 1000, deadline));
+    try std.testing.expectEqual(@as(usize, 0), job.visits);
+    const resumed_deadline = work_budget.after(io, 5);
+    try std.testing.expect(try job.stepUntil(allocator, 1000, resumed_deadline));
+    try std.testing.expectEqual(@as(usize, 8), job.count);
+}
 
 test "closure frontier visits chained overlaps once in both directions" {
     const allocator = std.testing.allocator;
@@ -324,11 +353,11 @@ pub const Job = struct {
 
     /// A time deadline complements the node budget for long keys and slow
     /// allocators. Check between operations, never midway through an AVL edit.
-    pub fn stepUntil(self: *Job, allocator: std.mem.Allocator, credits: usize, deadline_ns: ?u64) !bool {
+    pub fn stepUntil(self: *Job, allocator: std.mem.Allocator, credits: usize, deadline_ns: anytype) !bool {
         if (self.phase == .done or self.phase == .oversized) return true;
         var remaining = credits;
         while (remaining != 0) {
-            if (deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return false;
+            if (!work_budget.before(deadline_ns)) return false;
             if ((self.phase == .discover or self.phase == .frontier) and self.max_bytes != 0 and self.bytes > self.max_bytes) {
                 self.phase = .oversized;
                 return true;

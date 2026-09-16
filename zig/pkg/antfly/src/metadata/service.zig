@@ -1770,6 +1770,8 @@ pub const MetadataServiceConfig = struct {
     },
     reconcile_lease: metadata_reconcile_lease.Config = .{},
     observe_local_replica_root: bool = true,
+    // Embedded services may cohost data; dedicated metadata runtimes opt out.
+    local_data_owner: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
@@ -2789,14 +2791,14 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.TransitionCommand) bool {
     return switch (command) {
         .apply_restore_staging, .create_restore_job_with_staging, .compare_and_set_backup_cohort, .compare_and_set_online_merge => true,
-        .upsert_table => |table| table.relational_retirement_json.len != 0,
-        .compare_and_replace_table => |cas| cas.expected.relational_retirement_json.len != 0 or cas.replacement.relational_retirement_json.len != 0,
+        .upsert_table => |table| table.relational_retirement_json.len != 0 or table.requiresStorageMetadataExtension(),
+        .compare_and_replace_table => |cas| cas.expected.relational_retirement_json.len != 0 or cas.replacement.relational_retirement_json.len != 0 or cas.expected.requiresStorageMetadataExtension() or cas.replacement.requiresStorageMetadataExtension(),
         .apply_table_topology => |mutation| switch (mutation) {
-            .create => |create| create.table.relational_retirement_json.len != 0,
+            .create => |create| create.table.relational_retirement_json.len != 0 or create.table.requiresStorageMetadataExtension(),
             .drop => false,
         },
         .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| blk: {
-            for (delta.upsert_tables) |table| if (table.relational_retirement_json.len != 0) break :blk true;
+            for (delta.upsert_tables) |table| if (table.relational_retirement_json.len != 0 or table.requiresStorageMetadataExtension()) break :blk true;
             break :blk false;
         },
         .register_store, .upsert_store => |record| record.relational_topology_protocol_version != 0,
@@ -4295,6 +4297,7 @@ pub const MetadataService = struct {
     metadata_group_id: u64,
     replica_root_dir: ?[]const u8,
     observe_local_replica_root: bool,
+    local_data_owner: bool,
     store_status_ticks: usize,
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
@@ -4389,6 +4392,7 @@ pub const MetadataService = struct {
             .metadata_group_id = metadata_group_id,
             .replica_root_dir = host_cfg.host.replica_root_dir,
             .observe_local_replica_root = cfg.observe_local_replica_root,
+            .local_data_owner = cfg.local_data_owner,
             .store_status_ticks = 0,
             .local_placement_epoch = null,
             .last_local_placement_refresh_at_ms = 0,
@@ -6350,6 +6354,7 @@ pub const MetadataService = struct {
         const local_node_id = self.raft.host.host.cfg.local_node_id;
         for (projected) |intent| {
             if (intent.record.local_node_id != local_node_id) continue;
+            if (!self.local_data_owner and intent.record.group_id != self.metadata_group_id) continue;
             try local.append(self.alloc, try raft_reconciler.cloneIntentOwned(self.alloc, intent));
         }
 
@@ -6525,6 +6530,7 @@ pub const MetadataService = struct {
     }
 
     fn refreshLocalTableProvisioning(self: *MetadataService) !metadata_table_provisioner.ProvisionSummary {
+        if (!self.local_data_owner) return .{};
         const replica_root_dir = self.replica_root_dir orelse return .{};
         const current_epoch = self.projection_epoch.load(.monotonic);
         const group_ids = try self.listLocalGroupIds(self.alloc);
@@ -6603,6 +6609,7 @@ pub const MetadataService = struct {
         tables: []const metadata_table_manager.TableRecord,
         ranges: []const metadata_table_manager.RangeRecord,
     ) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         // A control compilation unit obtains durable restore markers from the
         // resident data/storage owner. Until that adapter is installed, retain
@@ -6634,6 +6641,7 @@ pub const MetadataService = struct {
     }
 
     fn refreshLocalSchemaProgress(self: *MetadataService) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.host.cfg.local_node_id;
         const current_epoch = self.projection_epoch.load(.monotonic);
@@ -6713,12 +6721,14 @@ pub const MetadataService = struct {
         backfill_markers: ?[]const StoreStatusBackfillMarker,
         use_provider: bool,
     ) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.host.cfg.local_node_id;
         try syncLocalStoreStatus(self, local_node_id, replica_root_dir, backfill_markers, use_provider);
     }
 
     fn refreshStoreStatusBackfillMarkersForRound(self: *MetadataService) ![]const StoreStatusBackfillMarker {
+        if (!self.local_data_owner) return &.{};
         self.store_status_ticks += 1;
         self.store_status_backfill_probe_ticks += 1;
         const replica_root_dir = self.replica_root_dir orelse return &.{};
@@ -6734,6 +6744,7 @@ pub const MetadataService = struct {
     }
 
     fn refreshStoreStatusBackfillMarkersForLifecycleRound(self: *MetadataService) ![]const StoreStatusBackfillMarker {
+        if (!self.local_data_owner) return &.{};
         const replica_root_dir = self.replica_root_dir orelse return &.{};
         if (self.store_status_backfill_marker_cache.markers.len == 0 and self.store_status_backfill_marker_cache.scanned_at_ms == 0) {
             try refreshStoreStatusBackfillMarkerCacheNowWithIo(
@@ -6901,6 +6912,7 @@ pub const MetadataHttpService = struct {
     metadata_group_id: u64,
     replica_root_dir: ?[]const u8,
     observe_local_replica_root: bool,
+    local_data_owner: bool,
     reallocation_protocol_peers: []const ReallocationProtocolPeer,
     store_status_ticks: usize,
     projection_epoch: std.atomic.Value(u64) = .init(1),
@@ -7030,6 +7042,7 @@ pub const MetadataHttpService = struct {
             .metadata_group_id = metadata_group_id,
             .replica_root_dir = host_cfg.http.host.replica_root_dir,
             .observe_local_replica_root = cfg.observe_local_replica_root,
+            .local_data_owner = cfg.local_data_owner,
             .reallocation_protocol_peers = cfg.reallocation_protocol_peers,
             .store_status_ticks = 0,
             .local_placement_epoch = null,
@@ -10391,6 +10404,7 @@ pub const MetadataHttpService = struct {
 
         for (inputs.placement_intents) |intent| {
             if (intent.record.local_node_id != self.raft.host.http_host.host.cfg.local_node_id) continue;
+            if (!self.local_data_owner and intent.record.group_id != self.metadata_group_id) continue;
             try local.append(self.alloc, try raft_reconciler.cloneIntentOwned(self.alloc, intent));
         }
 
@@ -10586,6 +10600,7 @@ pub const MetadataHttpService = struct {
     }
 
     fn refreshLocalTableProvisioning(self: *MetadataHttpService, round_inputs: ?*const LocalProjectionInputs) !metadata_table_provisioner.ProvisionSummary {
+        if (!self.local_data_owner) return .{};
         const replica_root_dir = self.replica_root_dir orelse return .{};
         const current_epoch = self.projection_epoch.load(.monotonic);
         var owned_inputs: ?LocalProjectionInputs = null;
@@ -10664,6 +10679,7 @@ pub const MetadataHttpService = struct {
         ranges: []const metadata_table_manager.RangeRecord,
         projected_progress: []const metadata_table_manager.RestoreProgressRecord,
     ) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         // See the threaded service path above. Never reopen storage from the
         // control unit merely because the owner adapter has not arrived yet.
@@ -10692,6 +10708,7 @@ pub const MetadataHttpService = struct {
     }
 
     fn refreshLocalSchemaProgress(self: *MetadataHttpService, round_inputs: ?*const LocalProjectionInputs) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         const current_epoch = self.projection_epoch.load(.monotonic);
@@ -10771,12 +10788,14 @@ pub const MetadataHttpService = struct {
         backfill_markers: ?[]const StoreStatusBackfillMarker,
         use_provider: bool,
     ) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         try syncLocalStoreStatus(self, local_node_id, replica_root_dir, backfill_markers, use_provider);
     }
 
     fn refreshStoreStatusBackfillMarkersForRound(self: *MetadataHttpService) ![]const StoreStatusBackfillMarker {
+        if (!self.local_data_owner) return &.{};
         self.store_status_ticks += 1;
         self.store_status_backfill_probe_ticks += 1;
         const replica_root_dir = self.replica_root_dir orelse return &.{};
@@ -10792,6 +10811,7 @@ pub const MetadataHttpService = struct {
     }
 
     fn refreshStoreStatusBackfillMarkersForLifecycleRound(self: *MetadataHttpService) ![]const StoreStatusBackfillMarker {
+        if (!self.local_data_owner) return &.{};
         const replica_root_dir = self.replica_root_dir orelse return &.{};
         if (self.store_status_backfill_marker_cache.markers.len == 0 and self.store_status_backfill_marker_cache.scanned_at_ms == 0) {
             try refreshStoreStatusBackfillMarkerCacheNowWithIo(
@@ -11149,6 +11169,8 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     const plain: metadata_table_manager.TableRecord = .{ .table_id = 800, .name = "docs" };
     var retiring = plain;
     retiring.relational_retirement_json = "{}";
+    var vector_storage = plain;
+    vector_storage.storage.dense_embeddings = .vector_store;
     const legacy: metadata_storage.TransitionCommand = .{ .upsert_table = plain };
     const commands = [_]metadata_storage.TransitionCommand{
         .{ .apply_restore_staging = "{}" },
@@ -11158,6 +11180,10 @@ test "relational topology admission rejects lifecycle proposals before encoding 
         .{ .compare_and_replace_table = .{ .expected = retiring, .replacement = plain } },
         .{ .compare_and_replace_table = .{ .expected = plain, .replacement = retiring } },
         .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{retiring} } },
+        .{ .upsert_table = vector_storage },
+        .{ .compare_and_replace_table = .{ .expected = plain, .replacement = vector_storage } },
+        .{ .compare_and_replace_table = .{ .expected = vector_storage, .replacement = plain } },
+        .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{vector_storage} } },
     };
     for (commands) |command| {
         const required = metadata_topology_protocol.coordinated_lifecycle_version;

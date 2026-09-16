@@ -1392,6 +1392,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx restore owner accepts bounded rewrite source chunks above legacy control limit",
         "httpx schema patch merges at the authority and accepts version zero ETag",
         "httpx relational row query mutation endpoints enforce exact versions and schema epochs",
+        "backup heartbeat ",
+        "table storage creation intent survives",
         "model-directed",
         "tool query builder",
         "agent conversation",
@@ -1492,6 +1494,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db reverse graph probe rejects a deleted or replaced index incarnation",
         "api http client preserves group doc identity conflicts",
         "typed internal group reads preserve retryable resident storage failures",
+        "typed routed batch preserves forwarding cancellation and identity conflicts",
         "boundary dispatcher preserves local calls and maps cross-unit calls",
         "stable status preserves public boundary semantics",
         "db graph search filters result nodes and hidden traversal intermediates",
@@ -1508,6 +1511,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "runtime HTTP streaming carries policy headers before commitment across both adapters",
         "linked API route manifest preserves internal scan response streaming",
         "scan stream preserves chunk backpressure without buffered fallback",
+        "imported runtime I/O views override raw runtime including unavailable views",
+        "API imported runtime capability struct retains versioned C layout",
+        "API kernel create ",
+        "API kernel failed fallible create releases unpublished state",
+        "API kernel runtime I/O ",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const api_http_runtime_tests = b.addTest(.{
@@ -1732,9 +1740,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const raft_transport_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "raft integration module compiles", "raft.transport." },
+        .filters = &.{ "raft integration module compiles", "raft.transport.", "raft.reconciler.", "http host shares its borrowed clock" },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
+    // Queued delivery lives in the harness root, outside antfly_test_mod's
+    // reachable tests. Exercise its HTTP boundary in the transport gate too.
+    const raft_queued_transport_tests = b.addTest(.{
+        .root_module = raft_harness_test_mod,
+        .filters = &.{"virtual http network"},
+    });
+    const run_raft_queued_transport_tests = addFilteredTestRunArtifact(b, raft_queued_transport_tests);
+    const data_runtime_vopr_tests = b.addTest(.{
+        .root_module = data_implementation_module,
+        .filters = &.{
+            "DataServer LSM maintenance",
+            "DataServer store status",
+            "data runtime runRound backs off retryable provision metadata failures",
+            "data runtime provisioned root refresh worker backs off retryable metadata failures",
+            "data runtime split apply store seeding reuses cached source writer",
+        },
+        .max_rss = production_vopr_compile_max_rss,
+    });
+    const run_data_runtime_vopr_tests = addFilteredTestRunArtifact(b, data_runtime_vopr_tests);
 
     // Snapshot artifact storage has its own root because Zig does not collect
     // tests from the implementation behind the transport compatibility alias.
@@ -1883,7 +1910,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_lsm_vopr_tests = addFilteredTestRunArtifact(b, lib_lsm_vopr_tests);
     const lib_lsm_vopr_test_step = b.step("lsm-vopr-test", "Run replayable real-backend LSM VOPR campaigns");
     lib_lsm_vopr_test_step.dependOn(&run_lib_lsm_vopr_tests.step);
-    const lib_ha_chaos_default_filters = [_][]const u8{
+    const lib_standby_chaos_default_filters = [_][]const u8{
         "storage.hot_standby chaos crash during base backup preserves slot pin and catch-up boundary",
         "storage.hot_standby chaos crash after receive replays durable WAL before streaming resumes",
         "storage.hot_standby chaos rejects noncontiguous records and follows timeline switch across restart",
@@ -1893,20 +1920,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.hot_standby chaos lag retention forces reseed and former primary cannot rewind expired WAL",
         "storage.hot_standby chaos network partition requires fence before standby promotion",
     };
-    const lib_ha_chaos_tests = b.addTest(.{
+    const lib_standby_chaos_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = selectTestFilters(b, &lib_ha_chaos_default_filters),
+        .filters = selectTestFilters(b, &lib_standby_chaos_default_filters),
     });
-    const run_lib_ha_chaos_tests = addFilteredTestRunArtifact(b, lib_ha_chaos_tests);
-    const lib_ha_chaos_test_step = b.step("antfly-storage-hot-standby-chaos-test", "Run HA hot-standby crash and partition hardening tests");
-    lib_ha_chaos_test_step.dependOn(&run_lib_ha_chaos_tests.step);
-    const lib_ha_vopr_tests = b.addTest(.{
+    const run_lib_standby_chaos_tests = addFilteredTestRunArtifact(b, lib_standby_chaos_tests);
+    const lib_standby_chaos_test_step = b.step("antfly-storage-hot-standby-chaos-test", "Run hot-standby crash and partition hardening tests");
+    lib_standby_chaos_test_step.dependOn(&run_lib_standby_chaos_tests.step);
+    const lib_standby_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"HA VOPR"},
+        .filters = &.{"standby VOPR"},
     });
-    const run_lib_ha_vopr_tests = addFilteredTestRunArtifact(b, lib_ha_vopr_tests);
-    const lib_ha_vopr_test_step = b.step("ha-vopr-test", "Run replayable HA lifecycle VOPR campaigns");
-    lib_ha_vopr_test_step.dependOn(&run_lib_ha_vopr_tests.step);
+    const run_lib_standby_vopr_tests = addFilteredTestRunArtifact(b, lib_standby_vopr_tests);
+    const lib_standby_vopr_test_step = b.step("standby-vopr-test", "Run replayable standby lifecycle VOPR campaigns");
+    lib_standby_vopr_test_step.dependOn(&run_lib_standby_vopr_tests.step);
     const lib_ha_compat_default_filters = [_][]const u8{
         "storage.hot_standby compat decodes v1 replication record fixture",
         "storage.hot_standby compat keeps v1 replication record encoding stable",
@@ -1924,7 +1951,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = selectTestFilters(b, &lib_ha_compat_default_filters),
     });
     const run_lib_ha_compat_tests = addFilteredTestRunArtifact(b, lib_ha_compat_tests);
-    const lib_ha_compat_test_step = b.step("antfly-storage-hot-standby-compat-test", "Run HA replication format compatibility tests");
+    const lib_ha_compat_test_step = b.step("antfly-storage-hot-standby-compat-test", "Run standby replication format compatibility tests");
     lib_ha_compat_test_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
@@ -2252,7 +2279,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_ha_tests = addFilteredTestRunArtifact(b, ha_tests);
-    const ha_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby HA storage tests");
+    const ha_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby storage tests");
     ha_test_step.dependOn(&run_ha_tests.step);
 
     // cmd/standby.zig is owned by the distributed runtime unit. Keep its
@@ -2297,6 +2324,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
     lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
 
+    const vector_migration_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"source vector migration"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("vector-migration-test", "Run source ownership migration and recovery tests").dependOn(&b.addRunArtifact(vector_migration_tests).step);
+
     const resource_budget_runtime_filters = [_][]const u8{
         "default tokenizer cache budget is aligned with its resource slice",
         "default lake range cache queue budget is aligned with its terminal resource slice",
@@ -2313,6 +2347,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "logical inference slices can charge only physical host memory",
         "batch release accounting errors fail closed",
         "single release and observer mismatch cannot debit unrelated memory",
+        "resource identity ledgers bound tombstones across churn and reject stale owners",
         "bounded oversized progress cannot bypass aggregate host memory",
         "resource manager observes over-budget external usage",
         "identity-aware cache admission rejects growth and always permits shrink",
@@ -2690,8 +2725,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "production DataServer public HTTP",
             "production HTTP lifecycle runs chunked keep-alive pipeline and stream on VoprIo",
-            "DataServer LSM maintenance owner runs on borrowed VoprIo",
-            "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo",
             "DataServer VOPR background owner executes and cancels maintenance on VoprIo",
             "production DataServer replicated merge actions run on VoprIo",
         },
@@ -2715,9 +2748,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "Run production DataServer HTTP, ownership, and replicated merge/split actions on VoprIo",
     );
     data_server_vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
+    data_server_vopr_test_step.dependOn(&run_data_runtime_vopr_tests.step);
     data_server_vopr_test_step.dependOn(&run_data_server_transition_vopr_tests.step);
     data_server_vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
     data_plane_vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
+    data_plane_vopr_test_step.dependOn(&run_data_runtime_vopr_tests.step);
 
     const serverless_object_store_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -2834,8 +2869,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "metadata raft apply store catalog projection uses storage snapshot independently from apply mutex",
             "db modeled index repair adopts replacements with the serving allocator",
             "db implicit batch timestamps use the borrowed runtime clock",
+            "db replay truncation waits for repair pins through borrowed VoprIo",
+            "db apply fences wait through their borrowed runtime",
+            "apply rw lock VOPR",
+            "storage.db snapshot admission",
+            "async dense catch-up token",
             "graph workers report retired ranges as topology unavailability",
             "full cluster production data plane VOPR bounded cutoff exact replay",
+            "full cluster VOPR initializes teardown ownership on reused memory",
+            "full cluster VOPR bounded startup cleanup exact replay",
             "full cluster VOPR exact replays the composed deployment and recovery",
             "full cluster VOPR exact replays resource pressure recovery",
             "shared stateless batch retries borrow IO and preserve unknown outcomes",
@@ -2848,26 +2890,30 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     if (b.args) |args| run_vopr_runtime_regressions.addArgs(args);
     b.step("vopr-runtime-regression-test", "Run VOPR runtime ownership, clock, snapshot, and replay regressions").dependOn(&run_vopr_runtime_regressions.step);
 
-    const ha_production_vopr_tests = b.addTest(.{
+    const standby_production_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"production HA owners"},
+        .filters = &.{"production standby owners"},
         .max_rss = full_cluster_vopr_max_rss,
     });
-    const run_ha_production_vopr_tests = b.addRunArtifact(ha_production_vopr_tests);
-    b.step("ha-production-vopr-test", "Exercise production HA public writes, standby reads, and promotion on VoprIo").dependOn(&run_ha_production_vopr_tests.step);
+    const run_standby_production_vopr_tests = b.addRunArtifact(standby_production_vopr_tests);
+    b.step("standby-production-vopr-test", "Exercise production standby public writes, standby reads, and promotion on VoprIo").dependOn(&run_standby_production_vopr_tests.step);
 
-    const ha_scaling_vopr_tests = b.addTest(.{
+    const standby_scaling_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"production HA scaling VOPR exact replays"},
+        .filters = &.{"production standby scaling VOPR exact replays"},
         .max_rss = full_cluster_vopr_max_rss,
     });
-    const run_ha_scaling_vopr_tests = b.addRunArtifact(ha_scaling_vopr_tests);
-    run_ha_scaling_vopr_tests.step.dependOn(&run_ha_production_vopr_tests.step);
-    b.step("ha-scaling-vopr-test", "Replay production standby promotion with automatic split/merge and replica scale-out/drain").dependOn(&run_ha_scaling_vopr_tests.step);
+    const run_standby_scaling_vopr_tests = b.addRunArtifact(standby_scaling_vopr_tests);
+    run_standby_scaling_vopr_tests.step.dependOn(&run_standby_production_vopr_tests.step);
+    b.step("standby-scaling-vopr-test", "Replay production standby promotion with automatic split/merge and replica scale-out/drain").dependOn(&run_standby_scaling_vopr_tests.step);
 
     const full_cluster_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"full cluster VOPR exact replays"},
+        .filters = &.{
+            "full cluster VOPR exact replays",
+            "full cluster VOPR initializes teardown ownership on reused memory",
+            "full cluster VOPR bounded startup cleanup exact replay",
+        },
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_full_cluster_vopr_tests = b.addRunArtifact(full_cluster_vopr_tests);
@@ -3467,7 +3513,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const generation_reranking_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"generation and reranking chain VOPR exact replays"},
+        .filters = &.{"generation and reranking"},
     });
     const run_generation_reranking_vopr_tests = b.addRunArtifact(generation_reranking_vopr_tests);
     const generation_reranking_vopr_test_step = b.step(
@@ -3636,7 +3682,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     backup_restore_vopr_test_step.dependOn(&run_portable_backup_tests.step);
     backup_restore_vopr_test_step.dependOn(&run_raft_restore_tests.step);
     backup_restore_vopr_test_step.dependOn(&run_lib_api_standalone_backup_restore_tests.step);
-    backup_restore_vopr_test_step.dependOn(&run_lib_ha_vopr_tests.step);
+    backup_restore_vopr_test_step.dependOn(&run_lib_standby_vopr_tests.step);
 
     const clock_fault_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -3646,7 +3692,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const clock_fault_vopr_test_step = b.step("clock-fault-vopr-test", "Run wall-clock, monotonic-clock, lease, retention, and TTL fault VOPR campaigns");
     clock_fault_vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);
     clock_fault_vopr_test_step.dependOn(&run_lib_db_txn_tests.step);
-    clock_fault_vopr_test_step.dependOn(&run_lib_ha_vopr_tests.step);
+    clock_fault_vopr_test_step.dependOn(&run_lib_standby_vopr_tests.step);
 
     const domain_vopr_test_step = b.step("domain-vopr-test", "Run all cross-domain Antfly VOPR protocol campaigns");
     domain_vopr_test_step.dependOn(&run_distributed_transaction_vopr_tests.step);
@@ -3655,20 +3701,37 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     domain_vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
     domain_vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);
 
+    const vopr_runtime_adapter_filters = &.{
+        "VOPR durable job",
+        "backend runtime durable owner lifecycle",
+        "backend runtime borrows backend-agnostic std.Io lanes",
+        "ttl runtime executes production pass on borrowed VoprIo",
+        "transaction recovery executes production pass on borrowed VoprIo",
+        "background maintenance services lifecycle runs on borrowed VoprIo",
+        "generation publication replays durable identities on borrowed VoprIo",
+        "graph ownership cleanup runs on borrowed VoprIo before replicated merge",
+        "db replay truncation waits for repair pins through borrowed VoprIo",
+        "db apply fences wait through their borrowed runtime",
+        "apply rw lock VOPR",
+        "storage.db snapshot admission",
+        "async dense catch-up token",
+        "replicated split destination seeds inherited doc identity before range publication",
+        "replicated merge retains its resident writer while graph ownership cleanup is pending",
+        "table provisioner materializes metadata indexes into hosted group dbs",
+    };
     const vopr_runtime_adapter_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{
-            "VOPR durable job",
-            "backend runtime durable owner lifecycle",
-            "backend runtime borrows backend-agnostic std.Io lanes",
-            "ttl runtime executes production pass on borrowed VoprIo",
-            "transaction recovery executes production pass on borrowed VoprIo",
-            "background maintenance services lifecycle runs on borrowed VoprIo",
-        },
+        // The physical-owner adapter root peaks at 11.49 GB on native macOS
+        // ReleaseSafe; reserve enough memory before admitting compilation.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 10) * 1024 * 1024 * 1024,
+        // These named module tests make the schema admission regressions
+        // reachable; runtime filtering executes only the selected tests.
+        .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, vopr_runtime_adapter_filters),
     });
-    const run_vopr_runtime_adapter_tests = b.addRunArtifact(vopr_runtime_adapter_tests);
+    const run_vopr_runtime_adapter_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, vopr_runtime_adapter_tests, vopr_runtime_adapter_filters);
     const vopr_runtime_adapter_test_step = b.step("vopr-runtime-test", "Run Antfly background-service adapters on the deterministic VOPR runtime");
     vopr_runtime_adapter_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
+    vopr_runtime_adapter_test_step.dependOn(&run_data_runtime_vopr_tests.step);
     derived_workflow_vopr_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
 
     b.step("vopr-build", "Install the VOPR campaign and replay executable").dependOn(&b.addInstallArtifact(vopr_cli, .{}).step);
@@ -3762,6 +3825,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     vopr_test_step.dependOn(&run_supervision_vopr_tests.step);
     vopr_test_step.dependOn(&run_auth_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
+    vopr_test_step.dependOn(&run_data_runtime_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_object_store_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_workflow_vopr_tests.step);
     vopr_test_step.dependOn(&run_db_index_race_vopr_tests.step);
@@ -3770,7 +3834,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     vopr_test_step.dependOn(&run_composed_query_vopr_tests.step);
     vopr_test_step.dependOn(&run_query_embedding_cache_vopr_tests.step);
     vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
-    vopr_test_step.dependOn(&run_ha_scaling_vopr_tests.step);
+    vopr_test_step.dependOn(&run_standby_scaling_vopr_tests.step);
     vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     vopr_test_step.dependOn(&run_generation_reranking_vopr_tests.step);
     vopr_test_step.dependOn(&run_distributed_query_vopr_tests.step);
@@ -3793,7 +3857,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     vopr_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
     vopr_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);
     vopr_test_step.dependOn(&run_lib_raft_vopr_tests.step);
-    vopr_test_step.dependOn(&run_lib_ha_vopr_tests.step);
+    vopr_test_step.dependOn(&run_lib_standby_vopr_tests.step);
     vopr_test_step.dependOn(&run_lib_raft_harness_tests.step);
     vopr_test_step.dependOn(&run_vopr_cli_meta_tests.step);
     vopr_test_step.dependOn(&run_vopr_cli_registry_tests.step);
@@ -3824,20 +3888,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_raft_vopr_tests, "raft-vopr-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
-    chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
-    chaos_progress_tail = chainLabeledRun(b, lib_ha_vopr_tests, "ha-vopr-test", chaos_progress_tail);
+    chaos_progress_tail = chainLabeledRun(b, lib_standby_chaos_tests, "antfly-storage-hot-standby-chaos-test", chaos_progress_tail);
+    chaos_progress_tail = chainLabeledRun(b, lib_standby_vopr_tests, "standby-vopr-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
-    const vopr_soak_test_step = b.step("vopr-soak-test", "Run HA/scaling/Raft/data VOPR search campaigns and metadata/Raft native differentials");
+    const vopr_soak_test_step = b.step("vopr-soak-test", "Run standby/scaling/Raft/data VOPR search campaigns and metadata/Raft native differentials");
     const vopr_soak_histories = b.option(u64, "vopr-soak-histories", "Histories per VOPR soak campaign") orelse 100;
-    const vopr_soak_production_histories = b.option(u64, "vopr-soak-production-histories", "Histories in the production HA/scaling soak campaign") orelse 2;
+    const vopr_soak_production_histories = b.option(u64, "vopr-soak-production-histories", "Histories in the production standby/scaling soak campaign") orelse 2;
     const vopr_soak_seed = b.option(u64, "vopr-soak-seed", "Base seed for VOPR soak campaigns") orelse 0xa17f_5500;
     const vopr_soak_artifacts = b.option([]const u8, "vopr-soak-artifacts", "Persistent directory for VOPR soak reports and replay corpus") orelse "zig-out/vopr-soak";
     var vopr_soak_progress_tail: ?*std.Build.Step = null;
     // One worker makes corpus-guided selection reproducible as a campaign,
     // in addition to each history's independent exact-replay guarantee.
-    for ([_][]const u8{ "ha", "raft", "distributed-data", "ha-scaling" }) |scenario| {
-        const histories = if (std.mem.eql(u8, scenario, "ha-scaling")) vopr_soak_production_histories else vopr_soak_histories;
+    for ([_][]const u8{ "standby", "raft", "distributed-data", "standby-scaling" }) |scenario| {
+        const histories = if (std.mem.eql(u8, scenario, "standby-scaling")) vopr_soak_production_histories else vopr_soak_histories;
         const campaign = b.addRunArtifact(vopr_cli);
         campaign.addArgs(&.{
             "campaign",                      "--scenario",               scenario,
@@ -3923,7 +3987,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone CORS middleware",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
             "standalone runtime parses experimental flag",
-            "standalone runtime antfarm path guards keep api routes reserved",
+            "standalone runtime antfarm",
             "standalone startup checkpoint readiness requires applied and safe-read progress",
             "standalone activated seed bootstraps exact standby checkpoint and rejects older progress",
             "parse cli accepts config path",
@@ -3972,10 +4036,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
+            "standalone table storage defaults persist",
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
             "standalone shared catalog resumes private restore and publishes atomically",
+            "standalone standby catalog create rejects before contended locks",
+            "offline migration rejects authoritative metadata",
+            "standalone catalog remote apply outage preserves committed creation and retry authority",
+            "standalone metadata replay refreshes colliding revisions and only publishes complete effects",
             "standalone metadata advertises a linearizable owned snapshot",
             "standalone schema mutation supports atomic merge patch and version CAS",
             "standalone routing watch does not report absence after one probe",
@@ -4037,8 +4106,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_restore_test_step = b.step("antfly-raft-restore-test", "Run focused Raft restore authority and restart tests");
     raft_restore_test_step.dependOn(&run_raft_restore_tests.step);
 
-    const raft_transport_test_step = b.step("antfly-raft-transport-test", "Run raft transport unit tests");
+    const raft_transport_test_step = b.step("antfly-raft-transport-test", "Run raft transport and route reconciliation unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
+    raft_transport_test_step.dependOn(&run_raft_queued_transport_tests.step);
 
     const raft_storage_test_step = b.step("antfly-raft-storage-test", "Run Raft snapshot artifact storage tests");
     raft_storage_test_step.dependOn(&run_raft_storage_tests.step);
@@ -4182,6 +4252,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("docstore-transaction-reservations-test", "Run native transaction prepare, reserved retention and recovery regressions")
         .dependOn(&addFilteredTestRunArtifact(b, retained_transaction_tests).step);
 
+    const vector_payload_bench_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_bench.zig", target, .ReleaseFast, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    vector_payload_bench_mod.addImport("bloom", bloom_mod);
+    vector_payload_bench_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    vector_payload_bench_mod.addImport("antfly-json", json_mod);
+    vector_payload_bench_mod.addImport("structlog", structlog_mod);
+    const vector_payload_bench = b.addExecutable(.{ .name = "vector-payload-bench", .root_module = vector_payload_bench_mod });
+    const install_vector_payload_bench = b.addInstallArtifact(vector_payload_bench, .{});
+    b.step("vector-payload-bench", "Build real-file source payload and hash benchmarks").dependOn(&install_vector_payload_bench.step);
+
     const vector_payload_test_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     vector_payload_test_mod.addImport("bloom", bloom_mod);
     vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -4190,7 +4269,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const vector_payload_tests = b.addTest(.{
         .root_module = vector_payload_test_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
-        .filters = &.{ "source vector payloads", "vector references", "table storage settings" },
+        .filters = &.{ "source vector payloads", "vector references", "table storage settings", "table storage creation policy" },
     });
     const run_vector_payload_tests = b.addRunArtifact(vector_payload_tests);
     const vector_payload_test_step = b.step("vector-payload-test", "Run source vector payload ownership and recovery tests");
@@ -4293,6 +4372,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     storage_workload_soak_step.dependOn(&run_wal_soak_tests.step);
 
     const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    persistent_test_mod.addImport("antfly_pdf", pdf_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
     persistent_test_mod.addImport("antfly_vellum", vellum_mod);
     persistent_test_mod.addImport("antfly_regex", regex_mod);
@@ -4308,7 +4388,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const run_persistent_unit_tests = b.addRunArtifact(persistent_unit_tests);
+    const run_persistent_unit_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, persistent_unit_tests, selectTestFilters(b, &.{}));
 
     const persistent_test_step = b.step("persistent-test", "Run storage/persistent unit tests");
     persistent_test_step.dependOn(&run_persistent_unit_tests.step);
@@ -4385,6 +4465,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_test_mod.addImport("antfly-json", json_mod);
     index_manager_test_mod.addImport("antfly_scraping", scraping_mod);
     index_manager_test_mod.addImport("antfly_image", image_mod);
+    index_manager_test_mod.addImport("antfly_pdf", pdf_mod);
+    index_manager_test_mod.addImport("httpx", httpx_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     index_manager_test_mod.addImport("antfly_reader_config", reader_config_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);
@@ -5107,6 +5189,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.transform.",
             "storage.db.typed_doc_values_coverage.",
             "storage.db.types.",
+            "storage.vector_migration_offline.",
         },
         &.{"storage.hot_standby."},
         &.{
@@ -5175,6 +5258,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.transaction_vopr.",
             "storage.ttl.",
             "storage.vector_block_store.",
+            "storage.vector_fetch_batches_bench.",
+            "storage.vector_member_bindings.",
+            "storage.vector_member_bindings_bench.",
             "storage.vopr_durable_job_lane.",
             "storage.wal.",
             "storage.wal_vopr.",
@@ -5331,7 +5417,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_storage_db_core_tests.step.dependOn(&unit_storage_shard_audit.step);
     @import("test_support.zig").addOwnerTestRuns(b, db_test_step, &.{
         .{ .artifact = unit_storage_support_tests, .filters = &.{"storage.db."} },
-        .{ .artifact = unit_storage_db_core_tests, .filters = &.{"storage.db."}, .skip_filters = unit_storage_support_compile_filters },
+        .{ .artifact = unit_storage_db_core_tests, .filters = &.{ "storage.db.", "storage.vector_migration_offline." }, .skip_filters = unit_storage_support_compile_filters },
     }, &release_scale_test_filters);
     const unit_storage_compile_step = b.step(
         "unit-storage-compile",
@@ -5351,7 +5437,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage-derived-enrichment-baseline-tests",
         "storage-query-catalog-baseline-tests",
         "storage-db-core-baseline-tests",
-        "storage-ha-baseline-tests",
+        "storage-standby-baseline-tests",
         "storage-lsm-lite-baseline-tests",
         "storage-utility-baseline-tests",
     };

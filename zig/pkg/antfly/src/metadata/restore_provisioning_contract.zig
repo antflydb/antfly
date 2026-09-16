@@ -59,6 +59,7 @@ pub const ProvisioningProjection = struct {
 };
 
 pub fn freeTable(alloc: std.mem.Allocator, record: records.TableRecord) void {
+    if (record.storage_migration) |migration| alloc.free(migration.request.job_id);
     alloc.free(record.relational_retirement_json);
     alloc.free(record.name);
     alloc.free(record.description);

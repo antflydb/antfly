@@ -917,6 +917,9 @@ pub const AntflyApiHandler = struct {
         // and staging authority; handlers reject uncertified historical cuts.
         if ((mutation.surface == .cluster_restore or mutation.surface == .restore_job or mutation.surface == .table_restore or mutation.surface == .backup) and
             self.api_server.haCoordinatedRestoreAvailable()) return null;
+        if (policy.catalog_create_enabled and policy.remote_apply_mutations_enabled and
+            mutation.surface == .table_catalog and ctx.request.method == .POST)
+            return null;
         if (mutation.disposition != .reject and
             (mutation.disposition != .remote_apply or policy.remote_apply_mutations_enabled))
         {
@@ -1981,6 +1984,10 @@ pub const AntflyApiHandler = struct {
                 .status = 503,
                 .message = "GenerationTransitionActive",
             },
+            error.ReadIndexTimeout => .{
+                .status = 503,
+                .message = "ReadIndexTimeout",
+            },
             error.DocIdentityNamespaceMismatch => .{
                 .status = 409,
                 .message = "doc identity namespace mismatch",
@@ -2014,7 +2021,7 @@ pub const AntflyApiHandler = struct {
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
             error.IdentityReadGenerationChanged => textResponse(ctx, 409, "identity read generation changed"),
             error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
-            error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
+            error.StorageBusy, error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
             error.Unavailable => textResponse(ctx, 503, "temporarily unavailable"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
@@ -5590,6 +5597,7 @@ pub const AntflyApiHandler = struct {
         while (true) {
             metadata_drop_attempts += 1;
             drop_result = self.api_server.source.dropTableExact(alloc, decoded_table_name) catch |err| switch (err) {
+                error.VectorMigrationActive => return textResponse(ctx, 409, "table storage migration is active"),
                 error.TableNotFound => {
                     _ = ctx.status(404);
                     return ctx.text("not found");
@@ -6219,15 +6227,18 @@ pub const AntflyApiHandler = struct {
                 },
                 error.PersistentDescriptorAdmissionExhausted,
                 error.ResourceBudgetExceeded,
+                error.StorageBusy,
                 error.WriterLocked,
                 error.LsmRootWriterAlreadyOpen,
                 error.ResidentDbRetryRequired,
                 error.StorageReadTemporarilyUnavailable,
+                error.GenerationTransitionActive,
                 => {
                     var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                     return respondOwnedApiResponse(ctx, &response);
                 },
-                error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup => {
+                error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup, error.ReadIndexTimeout => {
+                    try ctx.setHeader("Retry-After", "1");
                     _ = ctx.status(503);
                     return ctx.text("group leader unavailable");
                 },
@@ -6301,17 +6312,21 @@ pub const AntflyApiHandler = struct {
             error.LeaderUnavailable,
             error.GroupLeaderUnavailable,
             error.UnknownGroup,
+            error.ReadIndexTimeout,
             => {
+                try ctx.setHeader("Retry-After", "1");
                 _ = ctx.status(503);
                 return ctx.text("group leader unavailable");
             },
             error.PersistentDescriptorAdmissionExhausted,
             error.ResourceBudgetExceeded,
+            error.StorageBusy,
             error.WriterLocked,
             error.LsmRootWriterAlreadyOpen,
             error.ResidentDbRetryRequired,
             error.StorageReadTemporarilyUnavailable,
             error.RestoreStagingInProgress,
+            error.GenerationTransitionActive,
             => {
                 var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                 return respondOwnedApiResponse(ctx, &response);
@@ -6438,6 +6453,44 @@ pub const AntflyApiHandler = struct {
 
     pub fn listArtifactRepairIssues(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         return try self.listTableRepairIssues(ctx, table_name);
+    }
+
+    pub fn createTableStorageMigration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.storageMigrationResponse(ctx, table_name, null, false);
+    }
+
+    pub fn getTableStorageMigration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
+        return self.storageMigrationResponse(ctx, table_name, job_id, true);
+    }
+
+    pub fn advanceTableStorageMigration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
+        return self.storageMigrationResponse(ctx, table_name, job_id, false);
+    }
+
+    fn storageMigrationResponse(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_path: ?[]const u8, observe: bool) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*owned| owned.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return textResponse(ctx, 400, "invalid table name");
+        defer ctx.allocator.free(name);
+        const job = if (job_path) |path| (try decodePathParamOrBadRequest(ctx, path)) orelse return textResponse(ctx, 400, "invalid job ID") else null;
+        defer if (job) |id| ctx.allocator.free(id);
+        const body = if (observe) "" else (try ctx.body()) orelse return textResponse(ctx, 400, "missing migration command");
+        const result = (if (job) |id|
+            if (observe) self.api_server.getStorageMigration(name, id) else self.api_server.advanceStorageMigration(name, id, body)
+        else
+            self.api_server.createStorageMigration(name, body)) catch |err| {
+            const code: u16 = switch (err) {
+                error.TableNotFound, error.NotFound, error.VectorMigrationNotFound => 404,
+                error.VectorMigrationIdempotencyConflict, error.VectorMigrationAlreadyExists, error.VectorMigrationAlreadyPublished, error.VectorMigrationNotReady, error.VectorMigrationActive, error.VectorMigrationConfigurationChanged, error.TableGenerationChanged => 409,
+                error.VectorMigrationRecoveryRequired, error.VectorMigrationDiskReserve, error.VectorMigrationTemporaryBudgetExceeded, error.ResourceBudgetExceeded, error.StorageBusy, error.GenerationTransitionActive => 503,
+                error.InvalidVectorMigrationId, error.InvalidVectorMigrationBudget, error.VectorMigrationRowExceedsBudget, error.VectorStoreLifecycleUnsupported, error.VectorStoreRequiresLocalSingleShardTable, error.VectorStoreRequiresOfflineCommand, error.UnsupportedOperation, error.SyntaxError, error.UnexpectedToken, error.UnknownField, error.MissingField, error.InvalidEnumTag => 400,
+                else => 500,
+            };
+            return textResponse(ctx, code, @errorName(err));
+        };
+        defer self.api_server.alloc.free(result);
+        return jsonResponse(ctx, 200, result);
     }
 
     pub fn runTableRepair(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -10170,31 +10223,39 @@ test "httpx antfly lookup route preserves projection and headers" {
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 
-test "httpx antfly reads map missing table errors to not found" {
+test "httpx antfly reads preserve availability and terminal failures" {
     const MissingTableReads = struct {
-        fn source() table_reads.TableReadSource {
-            return .{ .ptr = undefined, .vtable = &vtable };
+        failure: anyerror,
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &vtable };
         }
 
         const vtable = table_reads.TableReadSource.VTable{
             .lookup = lookup,
+            .lookup_group_local = lookupGroup,
             .scan = scan,
             .query = query,
         };
 
+        fn lookupGroup(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+
         fn lookup(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
             _: db_mod.types.LookupOptions,
             _: raft_mod.ReadConsistency,
         ) anyerror!?table_reads.LookupResponse {
-            return error.TableNotFound;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
         }
 
         fn scan(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
@@ -10202,7 +10263,8 @@ test "httpx antfly reads map missing table errors to not found" {
             _: db_mod.types.ScanOptions,
             _: raft_mod.ReadConsistency,
         ) anyerror!?table_reads.ScanResponse {
-            return error.TableNotFound;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
         }
 
         fn query(
@@ -10218,30 +10280,94 @@ test "httpx antfly reads map missing table errors to not found" {
 
     const alloc = std.testing.allocator;
     var status_source = LookupStatusSource{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), MissingTableReads.source(), null);
-    var handler = AntflyApiHandler{ .api_server = &api_server };
+    for ([_]anyerror{ error.TableNotFound, error.GenerationTransitionActive, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadIndexTimeout, error.DeadlineExceeded, error.CorruptInput }) |failure| {
+        var reads = MissingTableReads{ .failure = failure };
+        const missing = failure == error.TableNotFound;
+        const deadline = failure == error.DeadlineExceeded;
+        const expected_status: u16 = if (missing) 404 else if (deadline) 504 else 503;
+        var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), null);
+        var handler = AntflyApiHandler{ .api_server = &api_server };
 
-    var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/documents/doc:a");
-    defer request.deinit();
-    var ctx = httpx.Context.init(alloc, undefined, &request);
-    defer ctx.deinit();
+        var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/documents/doc:a");
+        defer request.deinit();
+        var ctx = httpx.Context.init(alloc, undefined, &request);
+        defer ctx.deinit();
 
-    var response = try handler.lookupKey(&ctx, "docs", "doc:a", .{});
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 404), response.status.code);
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", response.contentType().?);
-    try std.testing.expectEqualStrings("not found", response.body.?);
+        if (failure == error.CorruptInput) {
+            try std.testing.expectError(error.CorruptInput, handler.lookupKey(&ctx, "docs", "doc:a", .{}));
+            var corrupt_scan_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/documents");
+            defer corrupt_scan_request.deinit();
+            var corrupt_scan_ctx = httpx.Context.init(alloc, undefined, &corrupt_scan_request);
+            defer corrupt_scan_ctx.deinit();
+            try std.testing.expectError(error.CorruptInput, handler.scanKeys(&corrupt_scan_ctx, "docs"));
+            continue;
+        }
+        var response = try handler.lookupKey(&ctx, "docs", "doc:a", .{});
+        defer response.deinit();
+        try std.testing.expectEqual(expected_status, response.status.code);
+        if (missing) {
+            try std.testing.expectEqualStrings("not found", response.body.?);
+        } else if (deadline) {
+            try std.testing.expectEqualStrings("request deadline exceeded", response.body.?);
+            try std.testing.expect(response.header("Retry-After") == null);
+        } else {
+            try std.testing.expectEqualStrings("1", response.header("Retry-After").?);
+            const reason = if (failure == error.ReadIndexTimeout) "group leader unavailable" else "storage_read_temporarily_unavailable";
+            try std.testing.expect(std.mem.indexOf(u8, response.body.?, reason) != null);
+        }
 
-    var scan_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/documents");
-    defer scan_request.deinit();
-    var scan_ctx = httpx.Context.init(alloc, undefined, &scan_request);
-    defer scan_ctx.deinit();
+        var scan_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/documents");
+        defer scan_request.deinit();
+        var scan_ctx = httpx.Context.init(alloc, undefined, &scan_request);
+        defer scan_ctx.deinit();
 
-    var scan_response = try handler.scanKeys(&scan_ctx, "docs");
-    defer scan_response.deinit();
-    try std.testing.expectEqual(@as(u16, 404), scan_response.status.code);
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", scan_response.contentType().?);
-    try std.testing.expectEqualStrings("not found", scan_response.body.?);
+        var scan_response = try handler.scanKeys(&scan_ctx, "docs");
+        defer scan_response.deinit();
+        try std.testing.expectEqual(expected_status, scan_response.status.code);
+        if (missing) {
+            try std.testing.expectEqualStrings("not found", scan_response.body.?);
+        } else if (deadline) {
+            try std.testing.expectEqualStrings("request deadline exceeded", scan_response.body.?);
+            try std.testing.expect(scan_response.header("Retry-After") == null);
+        } else {
+            try std.testing.expectEqualStrings("1", scan_response.header("Retry-After").?);
+            const reason = if (failure == error.ReadIndexTimeout) "group leader unavailable" else "storage_read_temporarily_unavailable";
+            try std.testing.expect(std.mem.indexOf(u8, scan_response.body.?, reason) != null);
+        }
+
+        if (failure == error.ReadIndexTimeout) {
+            // Exercise the typed operation, internal HTTP projection, and
+            // client decoder. A peer must not turn quorum unavailability into
+            // an internal error or a missing document during topology changes.
+            var internal_request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/internal/v1/groups/7/tables/docs/documents/doc:a");
+            defer internal_request.deinit();
+            var internal_ctx = httpx.Context.init(alloc, undefined, &internal_request);
+            defer internal_ctx.deinit();
+            const params = [_]httpx.RouteParam{
+                .{ .name = "group_id", .value = "7" },
+                .{ .name = "table_name", .value = "docs" },
+                .{ .name = "key", .value = "doc:a" },
+            };
+            internal_ctx.params = &params;
+            var internal_response = try handler.internalGroupLookup(&internal_ctx);
+            defer internal_response.deinit();
+            try std.testing.expectEqual(@as(u16, 503), internal_response.status.code);
+            try std.testing.expectEqualStrings("ReadIndexTimeout", internal_response.body.?);
+
+            const WireResponse = struct {
+                status: u16,
+                body: []const u8,
+
+                fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    return .{ .status = self.status, .body = try allocator.dupe(u8, self.body) };
+                }
+            };
+            var wire = WireResponse{ .status = internal_response.status.code, .body = internal_response.body.? };
+            var client = http_client.ApiHttpClient.init(alloc, .{ .ptr = &wire, .vtable = &.{ .execute = WireResponse.execute } });
+            try std.testing.expectError(error.ReadIndexTimeout, client.fetchGroupLookup("http://127.0.0.1", 7, "docs", "doc:a", null));
+        }
+    }
 }
 
 test "httpx antfly scan honors optional body and documented bad requests" {

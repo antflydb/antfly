@@ -281,6 +281,8 @@ pub const WriteProfile = struct {
     save_node_ns: u64 = 0,
     refresh_quantized_ns: u64 = 0,
     quantized_vector_load_ns: u64 = 0,
+    matrix_metadata_lookup_ns: u64 = 0,
+    matrix_external_load_ns: u64 = 0,
     quantized_leaf_vector_load_ns: u64 = 0,
     quantized_internal_child_load_ns: u64 = 0,
     quantized_compute_ns: u64 = 0,
@@ -401,6 +403,10 @@ pub const BatchInsertOptions = struct {
     allow_quantized_routing: bool = false,
     assume_absent_ids: bool = false,
     coalesce_leaf_writes: bool = false,
+    /// Membership edits may rebuild centroids from already-committed external
+    /// updates. Such batches must finalize deferred updates from final members
+    /// instead of adding old-to-new deltas to an already refreshed mean.
+    recompute_coalesced_centroids: bool = false,
     skip_vector_store: bool = false,
     bulk_ingest: bool = false,
     defer_leaf_splits_to_batch_finish: bool = false,

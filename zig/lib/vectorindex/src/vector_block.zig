@@ -999,6 +999,8 @@ pub const Value = struct {
 /// lets storage owners binary-search mmap metadata while fetching the large
 /// vector/residual planes with bounded positional I/O.
 pub const ValueLocation = struct {
+    /// Row in the retained immutable reader; never a durable address.
+    index_row: usize = std.math.maxInt(usize),
     source_sequence: u64,
     revision: u64,
     dims: u32,
@@ -1226,18 +1228,27 @@ pub const Reader = struct {
             if (self.compareEntryKeyAssumeValidated(found, hash, key) == .lt) lo = mid + 1 else hi = mid;
         }
 
-        var selected: ?Entry = null;
+        var selected: ?usize = null;
         var pos = lo;
         while (pos < self.count) : (pos += 1) {
             const candidate = self.entryAssumeValidated(pos);
             if (self.compareEntryKeyAssumeValidated(candidate, hash, key) != .eq) break;
             if (candidate.source_sequence > max_source_sequence) break;
-            selected = candidate;
+            selected = pos;
         }
-        const found = selected orelse return .missing;
+        const index = selected orelse return .missing;
+        const found = self.entryAssumeValidated(index);
         if (expected_revision) |expected| {
             if (found.revision != expected) return error.VectorBlockRevisionMismatch;
         }
+        return self.locationAt(index);
+    }
+
+    /// O(1) metadata access under this reader's lease. Payload CRC validation
+    /// still occurs at read time, exactly as for a checked key lookup.
+    pub fn locationAt(self: Reader, index: usize) !LocatedLookup {
+        if (index >= self.count) return error.CorruptedVectorBlock;
+        const found = self.entryAssumeValidated(index);
         if ((found.flags & tombstone_flag) != 0) return .{ .tombstone = .{
             .source_sequence = found.source_sequence,
             .revision = found.revision,
@@ -1245,6 +1256,7 @@ pub const Reader = struct {
         const vector_len = encodedVectorBytesLen(self.encoding, found.dims) catch
             return error.CorruptedVectorBlock;
         return .{ .vector = .{
+            .index_row = index,
             .source_sequence = found.source_sequence,
             .revision = found.revision,
             .dims = found.dims,
@@ -1264,9 +1276,9 @@ pub const Reader = struct {
     /// Metadata-only access for immutable source mark bitmaps. Admission has
     /// validated index ordering and keys; payload checksums remain required
     /// when verifying/copying a marked value.
-    pub fn sourceIdentityAt(self: Reader, index: usize) struct { key: []const u8, dims: u32, vector: bool } {
+    pub fn sourceIdentityAt(self: Reader, index: usize) struct { key: []const u8, hash: u64, source_sequence: u64, revision: u64, dims: u32, vector: bool } {
         const found = self.entryAssumeValidated(index);
-        return .{ .key = self.data[found.key_offset..][0..found.key_len], .dims = found.dims, .vector = (found.flags & tombstone_flag) == 0 };
+        return .{ .key = self.data[found.key_offset..][0..found.key_len], .hash = found.hash, .source_sequence = found.source_sequence, .revision = found.revision, .dims = found.dims, .vector = (found.flags & tombstone_flag) == 0 };
     }
 
     pub fn sourceIndex(self: Reader, key: []const u8, hash: u64) ?usize {

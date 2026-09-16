@@ -2,8 +2,1872 @@
 
 > Paths under `.benchmark-results/` refer to local benchmark output that is not tracked in git.
 
+## September 14: scoped default promotion
 
-Status: experimental implementation, repeated 50K/1M measurements completed, 2026-09-09. The table setting,
+New local, single-shard standalone tables now select `vector_store` when the
+create request omits `storage`, provided HA and replication are disabled.
+Explicit `{"storage":{"dense_embeddings":"primary_lsm"}}` retains LSM source
+ownership. An explicitly supplied empty storage object also selects
+`primary_lsm`; omission selects the deployment's creation policy. Unsupported
+deployments retain `primary_lsm` on omission and reject explicit `vector_store`.
+Catalog persistence records the resolved choice before provisioning. Public and
+internal forwarding preserve omission until the authoritative creation boundary.
+Existing tables, including older catalog records without a storage field, keep
+`primary_lsm`; DB open does not reinterpret them using today's creation default.
+Snapshot/backup and split operations on vector-store tables currently reject
+with `VectorStoreLifecycleUnsupported`. Tables needing those operations must
+explicitly select `primary_lsm` until source-reference closure is supported.
+
+The completed [50K/1M ABBA qualification](../.benchmark-results/vector-store-owner-admission-20260914/RESULTS.md)
+supports this scoped promotion. Both 1M pairs reduced disk by about 43% and
+observed peak RSS by about 28%, with peak QPS up 5.8–7.3% and mixed QPS up
+10.2–19.1%. This is an overall tradeoff, not a win on every measurement: one
+50K peak-QPS arm regressed 22.5%, 1M churn took longer, and source GC settled
+in 149–155 seconds versus 33 seconds for LSM ownership. All eight arms passed
+workload, restart and reclamation gates. Keep these costs visible in follow-up
+work; broader deployment admission needs its own lifecycle qualification.
+
+Promotion includes the measured read settings, so ordinary launches obtain the
+qualified implementation without benchmark environment setup:
+
+| Default behavior | Retained qualification override |
+| --- | --- |
+| Float32 source and ANN payload encoding for fresh stores | `ANTFLY_HBC_VECTOR_BLOCK_ENCODING=float16` selects the residual-backed experiment |
+| Direct ANN member bindings | `ANTFLY_SOURCE_VECTOR_MEMBER_BINDINGS=0` disables |
+| Exact mapped reads | `ANTFLY_EXPERIMENT_EXACT_MAPPED=0` disables |
+| Reduction-based query packing | `ANTFLY_EXPERIMENT_QUERY_PACKING=lanes` restores the prior path |
+| One bounded vector-read helper | `ANTFLY_EXPERIMENT_VECTOR_READ_SINGLE_HELPER=0` disables |
+| Batched source reads and positional batches | `ANTFLY_SOURCE_VECTOR_BATCH_READS=0`, `ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS=0` disable |
+| Shared immutable source catalogs | `ANTFLY_SOURCE_VECTOR_SHARED_CATALOG=0` disables |
+| Replay-aware matrix loads | `ANTFLY_SOURCE_VECTOR_REPLAY_READS=0` disables |
+
+Existing source stores retain their persisted encoding, including float16;
+opening a source store does not migrate its encoding. Derived ANN serving
+projections retain the existing preferred-encoding rebuild policy. The
+qualification runner also defaults to float32, matching the completed ABBA arms
+and ordinary fresh-table launches.
+
+These read settings apply wherever their existing capability checks permit,
+including applicable LSM-serving paths; the ownership comparisons used the same
+settings in both arms. They do not change a persisted format or metric. Other
+experimental GC, admission, cache and read policies remain off. Historical
+entries below describe the defaults at the time of each experiment.
+
+Promotion fault injection also exposed a cache rollback gap: incremental
+inventory advanced to a candidate before read-view allocation, but an allocation
+failure there did not discard it. The next retry subtracted old WAL contributions
+from the candidate cache and raised `InvalidVectorInventory`. Both installation
+and collection now discard candidate inventory on every subsequent failure,
+including read-view preparation. The allocation-failure test explicitly enables
+published reads and checks foreground reads, retry and repeated reopen.
+
+[Promotion validation](../.benchmark-results/vector-store-default-20260914/README.md)
+passed 67 source tests, 43 native tests (two skipped), the standalone catalog
+suite, request-forwarding/policy and quantizer checks, and 11 public API tests
+with no experiment flags. The API gate covers omitted and explicit ownership,
+multiple models, updates/deletes, restart, last-index removal/rebuild, enrichment,
+full-text preservation and explicit-LSM backup/restore. Supported restore requests
+explicitly retain primary ownership rather than applying fresh-table policy.
+OpenAPI/generated-doc checks pass. These are correctness checks for promotion;
+the performance evidence remains the completed ABBA comparison above.
+
+The PR-review follow-up aligns fresh-store encoding with that float32
+qualification and closes an admission race in the optional query-snapshot path.
+A query now rechecks portable runtime activation after acquiring apply-shared
+and the catalog lease, so publication cannot leave a queued query searching a
+runtime whose activation is pending. The regression closes admission while each
+of three public query adapters waits for apply, in both snapshot modes.
+[Review-fix validation](../.benchmark-results/vector-store-pr-review-fixes-20260914/README.md)
+passed that regression, 68 source tests, 43 native tests (two skipped), seven
+owner tests, 13 benchmark-tool tests, and 11 API checks with vector/HBC overrides
+cleared. A separate float16 override/reopen check also passed. No new throughput
+measurement is claimed.
+
+## Existing-table migration
+
+Source ownership and ANN format are separate transitions. The logical index
+remains `embeddings`: migration preserves the table/document incarnation, every
+artifact/producer identity, exact vector bytes, models, dimensions, metrics,
+chunks and index definitions. It does not re-embed documents. Dense artifacts
+with no ANN consumers migrate too, and dropping the last consumer preserves
+source ownership.
+
+The first implementation supports local, single-shard, single-replica standalone
+tables moving from `primary_lsm` to `vector_store`. It is an explicit operation,
+not a setting PATCH or an automatic conversion on open. HA, replication, Lite,
+serverless, schema migration, restore and topology changes are not admitted.
+Index/producer/schema changes and table deletion are fenced while a job is
+active. Existing native generation repair handles legacy ANN conversion;
+discarded experimental formats do not gain compatibility decoders.
+
+### Online operator
+
+Use the same binary for the server and its compiled runtime libraries:
+
+```sh
+zig/zig-out/bin/antfly storage migrate \
+  --url http://127.0.0.1:8080 --table documents --to vector-store --job vectors-20260915
+```
+
+The command creates a job with `POST /db/v1/tables/{table}/storage/migrations`,
+requiring table admin permission when authentication is enabled. `ANTFLY_API_KEY`
+supplies its Bearer token. Creation takes `{"job_id":"...","target":"vector_store",
+"budget":{...}}`. `GET /db/v1/tables/{table}/storage/migrations/{job}` observes the
+receipt; `POST` on that job takes `{"action":"step|publish|cancel"}` and uses its
+durable budgets. GET never admits work or reconciles catalog publication. An
+`admitted` receipt means the catalog marker exists but DB preparation has not
+begun; retry creation or send a job action to recover that boundary.
+
+The CLI defaults to `--action run`, which creates/resumes the job, advances
+bounded steps, and publishes when verification reaches `ready`. Actions `start`,
+`step`, `publish`, `status` and `cancel` provide explicit operator control. Ctrl-C
+stops the driver; durable capture continues, and running the identical command
+resumes it. The server does not schedule an unattended migration loop.
+Use a migration-capable server throughout the job; do not downgrade between
+admission and completion or cancellation. Older binaries do not maintain the
+candidate map required by an active job.
+
+Job ID, target and budgets form the creation idempotency contract. Keep them
+equal when retrying creation, including after a timeout. Job actions use the
+persisted configuration, so callers do not have to repeat budgets. DB publication
+is authoritative if its response or the catalog update is lost. Opening the DB
+can bridge that specific stale catalog setting using the matching durable job
+and table identity. A creation/action retry reconciles the catalog decision.
+The table retains its current receipt until a later job replaces it; this is
+not a permanent job-history service.
+
+Defaults are 4 MiB and 1,024 primary rows per step, a 64 GiB temporary allowance,
+and a 1 GiB free-space reserve in addition to normal resource admission. The
+driver accepts `--batch-bytes`, `--batch-rows`, `--temporary-bytes` and
+`--disk-reserve-bytes`. Before publication, an individual dense artifact must
+fit the byte budget. Unrelated values contribute only their cursor keys to a
+page. Draining hashes borrowed inline vectors into compact references before
+retaining the page; an oversized vector captured after verification consumes
+one page by itself, without copying its payload into page memory.
+Preparation charges a conservative eight times payload/reference/metadata size,
+including concurrent embedding writes; the source also checks retained candidate
+bytes, covering failed preparations. This is an admission allowance, not a
+measurement of physical disk usage. It deliberately overestimates preparation
+cost and does not promise an exact filesystem quota. Free space is checked
+before preparation. Resource rejection preserves progress and reports the
+reason. Before publication, cancel and start a new ID if a larger allowance is
+needed; after publication, finish draining to retire the migration allowance.
+Reads/deletes continue when preparation is backpressured.
+
+The durable phases are:
+
+| Phase | Authority and work |
+| --- | --- |
+| `backfill` | Inline primary values remain authoritative; prepare candidate source payloads in bounded pages. |
+| `verifying` / `ready` | Verify exact identity/version bindings and byte equality for the cutover corpus. Concurrent writes keep the candidate current. |
+| `draining` | Ownership and the publication fence are durable. New writes use references; replace old inline values with already-prepared references. |
+| `final_verification` | Prove that every live dense artifact is a valid, resolvable reference. |
+| `serving` | Convert any legacy ANN generations and consolidate serving vectors into source references, retaining healthy query generations during replacement. |
+| `cleanup` | Delete temporary candidate mappings. |
+| `reclaiming` | Flush the final replacements once, durably request primary overlap rewrites, and advance bounded streaming compaction until those requests are discharged. |
+| `complete` | Reference, serving and primary rewrite closure are certified. Source GC and reader retirement can finish reclaiming retained versions. |
+| `cancelling` / `cancelled` | Before publication only: disable capture, remove candidate mappings, retain inline authority and a durable receipt. |
+
+Progress includes the ownership epoch, snapshot/publication fences, an exclusive
+hex-encoded primary cursor, scanned/prepared/verified/rewritten counts, preparation
+bytes, charged temporary allowance and the last admission error. Existing table
+and index status endpoints provide source-store accounting, index readiness and
+repair status. `primary_reclamation_requested` records the durable primary
+rewrite request. `complete` includes discharge of those requests, but old readers,
+retention windows and source GC may still hold files; it does not mean all old
+files or cache pages have already been reclaimed. The request uses persistent
+run metadata and ordinary admitted streaming GC. Partial level jobs and splits
+carry the request even when their outputs contain no tombstones. Only a
+validated full overlap rewrite clears it. A crash between the manifest request
+and its job receipt safely repeats the request after reopening.
+
+### Mutation, reader and recovery protocol
+
+A compacted candidate map replaces an additional payload replay journal. Each
+dense mutation prepares the payload and co-commits its full artifact-key/version
+reference with the authoritative inline primary value, reference epoch and
+allowance ledger. Deletes remove the candidate in the same transaction. There
+is no asynchronous capture lag. The backfill compares exact current bytes before
+installing a candidate, so it cannot overwrite an update or resurrect a deleted
+artifact. Normal enrichment producer/source-version fencing remains in force.
+
+Publication commits the table setting and migration decision in one primary
+transaction under write admission. Its candidate map covers the entire cutover
+corpus. Mixed readers continue accepting inline bytes until draining finishes;
+stable old snapshots retain their original payloads and source leases protect
+reference snapshots. A live probe admitted before activation retries if it
+encounters a reference without a source lease. An ambiguous preparation/commit
+fences the shared DocStore, including transaction-recovery owners, until reopen.
+
+Draining validates and reuses the durable candidate reference; it does not
+append the same payload again or create another permanent corpus. ANN format
+conversion uses native generation publication and coverage checks independently
+of the source rewrite. The healthy serving generation remains queryable while
+its replacement is staged. The source retains candidates throughout the active
+job, including cancellation, while checkpoints and memory admission continue.
+Once the job finishes, ordinary snapshot/ANN ownership and journal retirement
+control reclamation. Transaction and replay journals are included in total-disk
+qualification; old inline payloads are not retained indefinitely for rollback.
+After cancellation reaches `cancelled`, native and portable backups are eligible
+again without restarting. Retained source objects may still protect existing
+readers; snapshot eligibility checks durable cancellation and inline authority,
+and rechecks under capture admission before selecting a snapshot.
+
+### Offline operator
+
+The same `antfly storage migrate` subcommand supports stopped-server migration.
+The offline candidate uses a 64 MiB shared LSM block cache for repeated
+verification point reads when the caller has not supplied a cache. It shares the
+normal standalone memory budget and is released after the candidate closes.
+Stop standalone, then run:
+
+```sh
+zig/zig-out/bin/antfly storage migrate \
+  --catalog /data/metadata/local-metadata.json \
+  --replica-root /data/data/replicas \
+  --table documents --to vector-store --job vectors-offline-20260915
+```
+
+Use the actual configured catalog and replica-root paths. The command and the
+new standalone runtime lock the same stable catalog sibling inode. Older
+running binaries do not participate in this new operator lock: stop them first.
+The command preserves unknown catalog fields and extension records. It records
+offline admission before copying; standalone refuses to start while that marker
+is present. `--once` executes one bounded unit and leaves a resumable candidate;
+retry the same command and budgets to continue. `--cancel` discards only the
+unpublished candidate, persists a cancellation receipt and clears admission.
+It cannot cancel an already-published generation.
+
+Under exclusive generation admission, the command inventories and streams the
+whole physical database root into a durable sibling, recording a synced file and
+byte cursor. It preserves opaque internal namespaces, identity/version records,
+artifacts and ANN state; document-only export would lose required information.
+It rejects symlinks and storage configurations whose physical state is outside
+the lifecycle-owned root. The shadow replays committed derived work, runs the
+same source conversion/verifier and native ANN lifecycle, syncs, seals and
+publishes through the existing recoverable generation exchange. Repeated restart
+or a lost publication response resolves the same selected generation. Old roots
+are retired by the generation lifecycle after their readers release them.
+
+### Qualification and remaining scope
+
+Recovery checks cover preparation/commit/publication boundaries, interrupted
+physical copies, repeated restart, ambiguous retries, old readers, concurrent
+updates/deletes, distinct models, no ANN indexes, last-index drop/rebuild,
+resource rejection, cancellation and catalog fencing. The production HTTP and
+offline-command suites additionally check compiled-owner routing, admission,
+catalog recovery and queries across serving conversion.
+
+Performance qualification must compare migrated and fresh vector-store tables
+at 50K and then 1M, with fixed-count churn, restart, readiness, recall, QPS/tails,
+lock waits, memory and complete disk accounting. Report retained/orphan bytes and
+reclamation separately from logical completion. A passing migration correctness
+suite is not evidence of equivalent steady-state throughput.
+
+The [migration qualification findings](VECTOR_STORAGE_MIGRATION_FINDINGS.md)
+record the initial screen, the WAL-only page durability fix, and the shared
+restart cost found in both fresh and migrated tables. Page durability must not
+force one SSTable per progress update. Query comparisons include a matched
+restart in every arm so ingestion-time identity caches do not confound them.
+
+Reverse migration, migration-overlap backup/restore, HA/replication and broader
+topology remain separately qualified work. Migration-overlap backups/restores
+are rejected; a primary-only backup cannot capture reference closure. After
+publication, changing the setting or booting an older binary is not rollback.
+Returning to primary ownership requires a reverse conversion or a consistent
+pre-migration backup with an explicit data-loss boundary.
+
+## September 13: compiled-owner maintenance and fresh ownership comparison
+
+The post-merge 1M GC screen stopped before its first arm qualified: automatic
+source verification never completed. An idle reproduction recorded zero GC
+steps for three minutes. The compiled storage-owner open path omitted the
+shared resident-worker startup call after installing the DB at its final address.
+It now registers that maintenance after successful owner configuration, using
+the same stop/join lifecycle as resident cache entries. A compiled-owner regression
+reopens a source-backed table and requires automatic liveness verification without
+foreground traffic or an explicit maintenance drain; it fails on the old path
+and passes with the registration restored, with no test leaks.
+
+The incomplete screen's roughly 920 peak QPS was measured without functioning
+background source verification and must not be used as promotion evidence.
+The [fresh ownership comparison](../.benchmark-results/vector-store-promotion-20260913/README.md)
+requires working automatic GC and matching query results across saved-1M restarts
+before timing fresh primary_lsm/vector_store tables in AB/BA order at 50K and 1M.
+Both modes use the established common ANN/read settings. New GC-policy, adaptive
+read, and native-only snapshot experiments remain disabled pending independent
+fresh-workload qualification. No creation default is changed.
+
+## September 13: GC policy implementation and qualification
+
+The [GC policy experiment](../.benchmark-results/vector-store-gc-policy-20260913/README.md)
+implements detached reader preparation/retirement, explicit receipt scheduling,
+cost-based reclamation, and adaptive read dispatch as independent opt-in treatments.
+It preserves metadata validation and source/primary recovery fences. Full-copy
+input preparation and sorting move outside DB apply with immutable reader
+validation; publication binds the latest protected WAL tail. Reclamation exposes
+deferred bytes and persists its maximum-age scheduling deadline across restart.
+
+Background receipt reuse is a bounded retention hint, not permission to delete:
+ANN-only retirement may wait for the mandatory five-minute full verification.
+Startup and explicit collection still establish complete liveness. This avoids
+hashing the ANN WAL during background receipt checks. The previous zero dispatch
+counters came from leaving the detailed profiling flag disabled; diagnostic arms
+now enable it consistently, while clean throughput arms leave it disabled.
+
+Qualification is in progress. Source/native tests pass. The DB lifecycle gate
+exposed a test assumption about immediate GC admission while a recovery source
+session remained active; it now drives later wakeups and verifies completion.
+Pressure cleanup also now respects the detached reader-validation reservation.
+No ownership default or experimental-policy default is promoted here.
+
+After merging `origin/main`, the saved-1M gate exposed a schema-open failure
+before query timing: the fixture's ASCH V12 runtime schema and the current V13
+encoding represented the same logical epoch, but immutable-version validation
+compared raw bytes. Format-only retries now compare complete decoded runtime
+schemas and preserve the existing active/history bytes; changed runtime or
+public validation contracts remain rejected at the same logical version.
+This uses the schema decoder's existing supported formats, without adding
+vector-store format compatibility. The failed arm is retained as recovery
+evidence and is excluded from performance results.
+
+The next saved-fixture check opened successfully and matched the expected first
+hit set, but exposed missing dense telemetry in the compiled local-query provider.
+That provider now honors `profile: true` through the DB's captured profiled search
+and shares the public dense-profile mapping with in-process reads. Query identity
+still comes from the result's read lease. Diagnostic qualification requires the
+dense profile and adaptive decision counters; absent telemetry is a gate failure.
+
+## September 13 UTC: remaining GC costs investigated
+
+The [follow-up exploration](../.benchmark-results/vector-store-gc-followup-exploration-20260913/README.md)
+uses the same R32 binary for a receipt A/B/B/A and a separate sampled 1M churn run.
+No runtime behavior or ownership default changed during this exploration.
+
+The publication stall is now attributed: both samples put the dominant work in
+`PreparedPublication.openReaders`, especially index/key CRC validation. The loader
+also validates newly acquired blocks twice. Return a retained validated block/reader
+pair and prepare immutable reader catalogs outside both source and DB apply locks.
+Bind the latest protected WAL suffix and commit under a short final fence; retire
+old owners/files afterward. Merely unlocking SourceLock while blocking a writer
+that holds DB apply does not resolve foreground stalls. Preserve descriptor,
+metadata and payload integrity checks and ambiguous-publication recovery.
+
+Existing receipt reuse halves observed marking from 30.02 million rows / about
+10 seconds to 15.01 million rows / about 5 seconds, but does not consistently
+improve settled QPS or physical footprint. Receipt enablement is coupled to the
+explicit GC-step environment setting, and receipt hits do not advance the
+verification deadline. Introduce explicit open-time policy and proof-check
+scheduling; use validated primary/ANN/source authority identities, including
+orphan preparations and model/index lifecycle, rather than repeatedly hashing
+WAL files under the lock. Do not treat a reduced scan count as a measured memory win.
+
+Separate periodic verification from expensive copying: small churn still causes
+two full copies (6.144 GB read, 6.384 GB written). Choose reclamation by benefit,
+copy cost, disk pressure and maximum garbage age, then qualify independent segment
+retirement. The existing selective experiment cannot replace part of a physical
+base. Keep deferred bytes visible and require eventual reclamation. Wider reads
+remain a cold/warm tradeoff; wire source-mediated helper counters before designing
+adaptive dispatch based on observed cost and available concurrency.
+
+The sampled churn run reclaimed to one million live payloads with zero pending/
+unreferenced bytes and passed restart hit-set checks. Its maximum GC publication
+was 922 ms. Sampling also coincided with a 4.23-second foreground outlier; use
+these profiles for attribution, not as a new unsampled latency benchmark.
+
+## September 13 UTC: background table-owned GC qualification
+
+The [background-GC candidate](../.benchmark-results/vector-store-background-gc-20260913/README.md)
+removes ordinary source collection from synchronous writable open. Durable
+source/primary recovery and source generation installation still finish before
+serving. Uncommitted preparations and obsolete versions remain safe to retain
+until the stable DB maintenance owner completes a pinned liveness scan.
+
+Table-owned stores now use snapshot mark turns capped at 16,384 rows and 2 ms,
+with 25% scan duty, outside source/apply locks. These are cooperative bounds.
+Collection copy turns are capped at 8 MiB, including explicit sync collection.
+Debt schedules subsequent verification with a 30-second periodic fallback;
+it never certifies liveness. Setup, planning and publication retain their
+existing fences and can exceed a scan turn's time budget. Standalone Store
+collectors retain their existing policy, and the table creation ownership
+default remains primary_lsm.
+
+All 63 source tests and 12 focused DB/repair tests pass without leaks. The added
+DB regression covers zero ANN indexes, uncommitted preparations, updates/deletes,
+an old reader, cancellation during partial marking, and two reopens. Four fresh
+50K lifecycle arms pass with no consistent readiness/peak-throughput direction.
+Saved-index 1M activation improves from 12.7–12.9 seconds to 3.6–4.7 seconds with
+matching hit sets. Maximum all-live GC locked intervals fall from about four
+seconds to 43 ms. Cold latency is essentially unchanged by scheduling alone.
+
+The repeated read-policy screen finds a useful separate tradeoff: wider read
+dispatch raises cold QPS from 56 to 80 and lowers p99 from 49–51 ms to about
+27 ms. Mean cold vector loading falls from 9.6 to 4.0 ms. Changing mapped reads
+to positional reads adds little; wider dispatch does not improve already warm
+loading. A two-second training-query warmup lowers held-out cold p99 to 18–19 ms,
+but activation plus the first 1,000 queries takes longer. This is an experimental
+request/time bound, not an automatic product policy or a memory cap.
+
+Background GC is not yet a uniform performance win. Initial settled 1M throughput
+is roughly 2–5% lower, with a retained warm-pass latency outlier whose cause is
+unresolved. Repeated verification can retain an approximately 80 MB mark workspace.
+The large churn probe reclaims to one million payloads with no pending/orphan
+bytes and passes restart, but full copies read 6.1 GB, publication holds the
+source lock for about 0.9 seconds, and foreground maximum latency reaches 0.99 s.
+Next targets are reuse of authenticated unchanged-authority collection receipts
+and staging publication before its short commit fence. The ownership default
+remains unchanged. Final c1/10/20/30 A/B/B/A checks pass, but wider dispatch is
+0.3–3.9% lower in settled QPS. Prefer investigating a cold-work policy with narrow
+warm dispatch to assuming one fixed ceiling is best. All qualification stages
+and frozen-source/binary checks are complete; detailed results are in the bundle.
+
+## September 13 UTC: GC liveness and scan cache admission
+
+The [GC qualification](../.benchmark-results/vector-store-gc-liveness-20260913/README.md)
+implements two changes identified by the R30 memory attribution. GC opens its
+primary read snapshot with transient block-cache admission, preserving its
+version fence while avoiding one-pass scan pollution. The all-live fast path
+resolves source metadata in its pinned generation instead of reading and
+checksumming every payload. It still rejects missing/tombstoned identities,
+wrong dimensions or revisions, reference chains, and float16 payloads lacking
+an exact residual. Immutable reader open validates index/key metadata and bounds;
+exact consumption and GC copying retain payload and residual checksums. An
+all-live GC pass is a liveness check, not a full data-integrity scrub.
+
+All 63 source ownership/recovery tests and 42 native store tests pass with no
+leaks; two opt-in microbenchmarks are skipped. New regressions cover cache
+admission with a concurrent delete, retained old source generations, and corrupt
+float32/residual payloads that GC retains but reads and copies reject. A fixture
+abort-after-commit error was corrected; its failed run is preserved in the bundle.
+No configuration or scheduling default changes accompany these two fixes.
+The saved dirty 1M A/B/B/A passed all eight restarts, sixteen query windows and
+1,000-query hit-set checks. Resident activation falls from 33.1–36.7 seconds to
+12.0–12.8 seconds (64–65% faster). Primary block-cache residency falls from
+939.5 MB to 143.3 MB; 90-second idle physical footprint falls from 1.10–1.22 GB
+to 271–278 MB. The all-live source still retains exactly one million payloads,
+with no unreferenced/pending bytes. Second restarts remain about nine seconds.
+Settled throughput varies with order; c1 p99 is 5–8% higher in these observations,
+so there is no consistent query-speed or tail-latency win.
+
+A separate clean-index cold/warm A/B/B/A exposes the prewarming tradeoff. Cold
+serial p99 rises from 18–22 ms to 49 ms, and cold QPS falls from 97–111 to 56.
+Warm results are much closer and vary with order. Activation plus the first
+1,000 queries still finishes 29–34% sooner, but individual cold queries are
+slower. The full results retain all per-query latencies; these are process-cold
+starts with uncontrolled OS cache state on the available host.
+
+Keep liveness GC separate from payload warming. Next, move ordinary collection
+out of synchronous writable open into bounded snapshot maintenance: the candidate
+still performs two roughly four-second full mark passes while opening/activating.
+Durable source/primary WAL recovery and memory admission must remain active.
+Separately compare cold positional batch reads and read concurrency against this
+bundle's mapped exact reads/single-helper policy, and measure explicit bounded
+ANN warmup if needed. Those are follow-up targets, not implemented wins. Keep the
+creation default unchanged until the cold-latency/readiness tradeoff is qualified
+with intended shipping settings and the remaining mixed-workload comparisons.
+
+## September 13 UTC: detached repair input implementation
+
+[Implementation and qualification receipts](../.benchmark-results/vector-store-detached-repair-20260913/README.md)
+now cover a native repair input handle that retains immutable metadata/source
+generations and owns leaf, ancestor, artifact-family and transform state.
+Metadata resolution, exact batched reads and transforms run outside the shared
+apply/catalog/index locks. Sorted directory misses preserve overlay/delta and
+tombstone precedence; generation-scoped member bindings avoid repeated resolution.
+Captured native inputs never consult current primary data on a miss. Publication
+still rejects changed epochs and index incarnations through the maintenance WAL.
+Deferred capture is distinct from a required synchronous path, so it does not
+request an exclusive fence merely to discover foreground pressure.
+
+Fifteen focused repair/recovery tests (zero leaks), ten directory tests and
+thirteen qualification-validator tests pass. All four saved-index repair arms
+and eight fresh same-binary ownership arms passed, including updates/deletes,
+enrichment, restart recall and reclamation. Capture under index ownership falls
+from 5.3–5.5 ms to 3.6–3.8 microseconds. Total detached input still takes about
+5.4 ms, mostly metadata plus source-location resolution; repair-traffic p99 does
+not show a consistent improvement. Publication retains epoch/incarnation checks.
+
+At 50K, vector-store readiness is 21–28% faster, peak QPS 8–16% higher and disk
+about 49% lower. At 1M, readiness is 14–20% faster and disk about 43% lower;
+peak QPS is +7.7% / -2.4%, while saturated mixed query throughput is 1.5–4.2%
+lower. Sampled peak physical footprint improves 40–45% at 1M, but idle retained
+footprint is 824–1,207 MiB versus 254–258 MiB. Process-cold resident activation
+still takes 33–37 seconds versus about 3 seconds. Serial cold query tails alone
+do not expose this activation cost. Two pairs on a shared host are observed
+ranges, not confidence intervals; the complete concurrency and enrichment data
+are retained in the linked receipts.
+
+The next concrete targets are GC scan behavior. Its primary read snapshot admits
+one-pass scan blocks into the regular LSM cache: an isolated 90-second idle check
+retains 940 MB versus 149 MB in that cache. Its final liveness verification still
+calls `source.get` for every live digest, reading/checksumming payloads after the
+metadata-only inventory scan. Nearly the entire source mapping becomes resident.
+An 8 MiB GC output-step A/B/B/A leaves startup unchanged because it does not bound
+the roughly 15 million mark visits. These are identified costs, not fixes shipped
+in this candidate.
+
+Proceed with snapshot-preserving transient cache admission, metadata-only
+liveness validation with checksums retained on consumption/copy, and bounded
+background marking. Recheck missing/tombstoned references, snapshot/concurrent
+write protection and cold activation/memory, then measure paced 1M mixed traffic.
+Repair's remaining first-touch metadata/location work needs finer attribution
+before a format redesign. Keep the ownership default unchanged until these
+regressions are addressed and intended shipping settings are qualified. This
+comparison uses an explicit float32/native-read/member-binding/packing bundle on
+fresh standalone single-shard tables; it does not qualify every default setting
+or deployment mode. Old catalogs must retain absent-field semantics.
+
+## September 13 UTC: repair cost and default-promotion review
+
+The [follow-up review](../.benchmark-results/vector-store-repair-cost-review-20260913/README.md)
+uses an instrumentation-only R28 snapshot and separate uninstrumented paced
+comparisons; qualified runtime code and defaults are unchanged.
+
+Across 9,815 vector rows during 1M repair-under-traffic, metadata lookup consumes
+350.7 ms (60% of matrix loading), native lookup/read 221.6 ms (38%), and transforms
+3.1 ms (under 1%). There are no primary-payload fallback rows. The activated-idle
+follow-up shows the same dominant stages, with 171.1 ms metadata and 205.7 ms
+native reads across 9,571 rows. These timers include scheduling/page faults and
+checksumming; they are not measurements of device I/O alone.
+
+The metadata batch API loops over version-aware native point reads, and the
+matrix reader resolves artifact keys and source digests one row at a time. The
+next shape is a repair input handle retaining immutable ANN metadata and source
+generations, plus owned leaf/ancestor and transform state. Resolve/read/transform
+outside the shared apply lease. Reuse generation-scoped member bindings first,
+then a genuinely batched immutable metadata-miss path and bounded exact reads.
+The cache starts empty on generation replacement, so improving only cache hits
+would not solve first-touch costs. Preserve source/model/index version identity,
+tombstone precedence and publication validation; never switch to current primary
+data after releasing the captured fence. Count deferred and discarded attempts,
+and avoid exclusive fallback admission when capture was merely deferred.
+
+At matched 1,000 write rows/s on identical saved 50K files, R28 query QPS is
+1.16% / 1.42% lower than R27, with query p99 approximately unchanged. All four
+arms complete the same 20,100 rows without errors and retain approximately
+0.98485 recall. This narrows the saturated mixed-workload concern at one offered
+rate; it does not establish the result near saturation or compare ownership.
+
+A status-only idle diagnostic initially retains dirty payloads after 45 seconds,
+with correct hit sets. Activating the resident serving runtime first takes
+6.127 seconds for the initial query; all 114 repairs then publish within about
+two seconds idle and the full 1,000-query validation is clean. The initial
+incomplete-clean result remains preserved. Default qualification should separate
+status readiness, resident activation and first-query latency.
+
+The remaining promotion work is a fresh same-binary `primary_lsm`/`vector_store`
+comparison using the intended shipping settings at 50K and 1M, including matched
+write rates, cold-query tails and phase-aligned memory/reclamation accounting.
+The old ownership comparison's 50K peak-QPS and 1M cold-tail penalties need
+remeasurement; recent maintenance-only comparisons cannot establish that they
+persist or are fixed. The R28 RSS outlier appears during churn/enrichment, with
+only one physical-footprint ledger sample. It does not establish a heap leak or
+a memory win. Judge sustained non-reclaimable/retained memory and availability
+alongside RSS. A scoped creation default can be justified by balanced metrics;
+it does not require every noisy timing cell to improve. Existing catalogs and
+the local-single-shard deployment restriction must retain their meaning.
+
+## September 12: prepared posting replacement qualification
+
+Implementation and receipts are under
+[`vector-store-prepared-refresh-20260912`](../.benchmark-results/vector-store-prepared-refresh-20260912/README.md).
+One dirty leaf's transformed vectors and required ancestor metadata are copied
+under the index mutation owner and a short shared DB lease. The shared lease
+keeps primary/source fallback reads coherent and admits queries. An owned
+preparation object then recomputes centroids/radii, quantizes and encodes the
+replacement values without DB, catalog or index mutation locks.
+
+The exclusive publication step validates the index incarnation and mutation
+epoch before installing prepared values through the existing maintenance WAL
+capture and publication protocol. It preserves source coverage and requires a
+subsequent clean verification sweep. Updates, deletes, aborts, another mutation
+and same-name index replacement invalidate a preparation. Scratch reservations
+cover its lifetime and are released on rejection or completion. Existing fair
+admission and bounded idle bursts remain; query-pressure pages yield after one
+publication. The shared input copy and durable publication still have lock costs.
+Experimental row-delta payloads and flagged structural repair retain their prior
+path. This changes neither persistent formats nor payload ownership defaults.
+
+All fourteen focused/recovery checks pass, including byte-identical results
+versus synchronous repair for L2, cosine and inner product; update/delete/abort
+and equal-epoch incarnation rejection; scratch denial/cleanup; empty payload
+removal; old readers and WAL/restart recovery. The pinned service binary uses
+the v2 source snapshot; a later test-only fixture adjustment is retained as a
+separate patch. R27 is the control. All four saved-index 1M arms, four fresh 50K
+service arms, four normal enrichment arms and four reclamation gates pass.
+
+On the same saved dirty 1M index, repair-phase query p99 improves from
+29.83 to 24.06 ms and from 27.38 to 22.18 ms (about 19% in both run orders).
+Query counts are nearly unchanged, and the sampled debt clears slightly later.
+All sixteen settled concurrency windows preserve 1,000 query hit sets, with zero
+sampled stale payloads in final profiles. Settled QPS has no regression in either
+pair, but the second pair is nearly neutral. Initial cold responses still reach
+about six seconds in every arm.
+
+Successful preparations spend 5.6–5.9 ms on average copying inputs under shared
+admission, about 0.06–0.07 ms building without locks, and 0.53–0.57 ms publishing.
+Publication p99 is 4.6–4.8 ms and its maximum is 14.15 ms. Capture reaches
+49.64 ms. These counters exclude discarded preparations and cover payload-only
+leaf repairs. Input copying remains the dominant repair stage; a queued writer
+can still wait behind its shared lease.
+
+Fresh 50K peak QPS changes by -4.4% / +4.5%, and readiness is nearly neutral
+within each pair. Mixed query throughput is lower by 14.8% / 3.0% while write
+throughput rises 1.3% / 3.8%; query p99 remains about 208 ms. Fixed-count churn
+and peak RSS change direction, with a large RSS peak in the second candidate.
+These measurements support the repair-tail improvement, not a general throughput
+or memory improvement. Restart preserves per-arm recall and all lifecycle gates
+pass. Residual mixed-workload admission, cold responses and physical-memory
+variation remain investigation targets. A future input-copy optimization needs
+revision-pinned source/fallback snapshots; releasing the current locks without
+that ownership would be unsafe. Populated same-name index recreation remains
+outside the final focused incarnation test's qualification.
+
+## September 12: resumable posting refresh qualification
+
+The follow-up is recorded in
+[`vector-store-posting-refresh-20260912`](../.benchmark-results/vector-store-posting-refresh-20260912/README.md).
+A saved 1M post-churn index reproduced dirty quantized payloads after readiness;
+existing idle maintenance cleared the sampled debt between 32.6 and 37.7 seconds.
+Deferred rounds were treated as idle and backed off for 30 seconds. A continuous
+query stream can also prevent the old 25 ms quiet interval from occurring.
+
+The candidate retains a metadata scan cursor, bounds idle pages to 128 node IDs
+and eight repairs, and uses read transactions for clean prefixes. A completed
+clean mutation epoch makes repeated polling constant-cost. Changes behind the
+cursor and repaired pages require a complete clean verification sweep. Deferred
+or partial rounds remain pending and retry promptly. The first candidate's
+nonblocking apply-lock probe still starved during 45 seconds at concurrency 10.
+The revised candidate scans under a catalog lifetime lease, then requests fair
+writer admission only when it finds actual debt. Admission cancels after 50 ms;
+a mutating page rechecks current state and repairs at most one posting per index
+under query pressure before yielding. The admission limit does not bound payload
+rebuild time. Existing serving and publication fences remain in force.
+Flagged structural repair retains its separate existing idle policy.
+
+Twelve focused checks and four additional recovery checks pass, covering cursor
+resumption, mutation rechecking, foreground deferral, native WAL source
+coverage/reopen, and exact fallback. The work also fixes false payload debt when
+quantization is disabled; that failure reproduced on the pinned control first.
+All four fresh 50K service arms, four normal enrichment arms and four reclamation
+gates pass, including updates/deletes and cold/warm restart recall.
+
+On the saved dirty 1M index, candidates clear the sampled stale posting after
+13.6/14.0 seconds during sustained concurrency-10 traffic. Controls remain dirty
+through the entire 45-second stream and clear at about 63.5 seconds after idle
+gaps begin. The candidate's repair-phase p99 rises by 7–9 ms. Both comparisons
+use vector-store ownership and the same R26 streaming implementation; this is a
+maintenance comparison, not an ownership comparison.
+
+Fresh 50K peak QPS changes by +1.5% / −1.5%, with readiness around 12.7–13.0 s.
+The saved dirty-input comparison has lower settled concurrency-20 QPS in both
+candidate arms. A second 1M comparison starting every arm from identical repaired
+files changes that to +1.8% / −8.0%; concurrency-30 QPS remains lower by
+17.5% / 1.7%. All 32 windows across the two saved-index comparisons preserve
+1,000 query hit sets, with zero stale payloads in final sampled profiles. These
+results qualify maintenance progress and correctness, not a universal throughput
+win. The common-file run logs no repair/checkpoint work during measurement.
+
+A small-table restart timing difference reverses on identical files; HTTP traces
+show roughly one-second visibility-status steps, consistent with the existing
+status refresh cadence, while logged writer opens remain tens of milliseconds.
+This does not demonstrate slower vector loading. The next repair-tail target is
+preparing a version-checked immutable replacement outside the DB apply fence,
+then validating and publishing briefly under it. This is not implemented here.
+Residual store-phase write latency and physical-memory demand still need separate
+profiling. Ownership defaults and deployment qualification are unchanged.
+
+## September 12: full-service streaming qualification
+
+The completed comparison is recorded under
+[`vector-store-streaming-service-20260912`](../.benchmark-results/vector-store-streaming-service-20260912/README.md).
+Two pinned binaries differ only in the vector-block implementation files. All
+four normal enrichment arms, eight alternating fresh 50K/1M service arms and
+reclamation hooks passed. The candidate build passes 102 store/recovery tests.
+The table ownership default is unchanged.
+
+At 50K, readiness and QPS were broadly neutral. At 1M, readiness improved from
+270.1/309.2 s in controls to 246.5/263.8 s in candidates (8.7%/14.7%). Maximum
+delta staging fell from 4.15/4.62 s to 0.56/0.54 s. Largest ordinary write batches
+fell from 4.98/9.00 s to 0.91/2.33 s; remaining store-phase work is not covered by
+the vector merge budget. Live peak RSS was 11–15% lower in both 1M pairs, while
+ledger-backed memory-demand estimates were mixed. Final disk usage was similar.
+
+Fresh peak QPS changed direction across pairs, and fresh concurrency-10 QPS was
+about 5% lower in both candidate arms. A follow-up held the saved data and ANN
+index identical across binaries: all sixteen warmed concurrency windows passed
+with identical hit sets for 1,000 queries. Candidates had no QPS regression in
+that comparison. A runtime QPS penalty was not reproduced on the common clean
+index; fresh-index/lifecycle/host variability remains relevant, and these results
+do not establish a universal QPS speedup.
+
+The follow-up also identified dirty quantized postings after churn in both
+controls and one candidate. Queries safely fall back to exact vectors, but the
+extra work remains a maintenance target. The first saved input failed a strict
+zero-stale-payload probe before timing; the qualified follow-up uses a clean
+snapshot with that check retained. Refreshing dirty postings without withdrawing
+healthy query serving, and profiling residual store-phase latency and memory
+demand, are the next concrete investigations. All receipts and failed attempts
+remain in the worktree; these results do not qualify distributed deployment or
+change the payload-ownership default.
+
+## September 12: streaming merges and bounded checkpoint work
+
+Implemented receipts, source snapshots and runners are in
+[`vector-store-streaming-merge-20260911`](../.benchmark-results/vector-store-streaming-merge-20260911/README.md).
+Delta checkpoints now use the same streaming merge machinery as base compaction:
+one metadata cursor per selected run, newest-version selection, then validation
+and copying of the winning payload. Compatible encoding preserves the existing
+bytes, quantization bounds and exact residuals without requantization. Partial
+merges retain tombstones. Existing publication fences and old-reader leases apply.
+
+Streaming directly over interleaved mmap payloads regressed cold performance.
+Bounded positional read windows recovered locality and reduced resident payload
+pages. Read-ahead uses a 4 MiB target across inputs plus one shared oversized
+vector/residual pair; cached offsets are bound to the retained inode identity.
+Output continues through the existing streaming block writer.
+
+Ordinary scheduled merges exceeding 256 MiB of delta input plus incoming WAL
+now select a bounded newest suffix. Large delta backlogs also activate this
+selection before the generation limit. The policy applies during ingestion and
+after updates to an established base, respects explicit append-only mode, and
+uses the existing memory and durability settings. This automatic policy does
+not change the table's payload-ownership default or enable background/cache flags.
+The hard manifest limit retains a defensive full-merge fallback.
+
+At 1M × 768 dimensions, paired buffered-streaming runs reduced source ingest
+plus final checkpoint from 51.8 s to 34.5–36.8 s, and peak process RSS from
+3,633 MiB to 685 MiB with identical logical write volume. Isolating bounded
+selection then reduced the largest write batch from 5.77–6.26 s to 0.86–1.00 s
+and WAL-plus-checkpoint output from 12.322 to 10.752 GiB. The tradeoff was
+roughly 160 MiB more peak RSS and more final-consolidation work: total time was
+37.9–40.3 s versus 36.8–39.0 s with buffered streaming alone. These are separate
+sequential source-store comparisons, not end-to-end ANN readiness or QPS results.
+
+A final control/candidate and candidate/control update comparison over the same
+retained 1M base reduced the full update pass plus checkpoint from 50.0/59.8 s
+to 26.2/27.1 s, and the largest write batch from 5.64/10.03 s to 0.90/0.92 s.
+Logical writes fell from 16.579 to 7.922 GiB. The control already includes
+buffered streaming; this isolates the bounded policy and the corrected online
+merge boundary. More segment files remain (2,816 versus 1,024) for later
+maintenance. All updated and original references are checked after reopen.
+
+Full stable-tip consolidation still takes about 8–9 seconds. The ordinary merge
+input budget is not a universal latency guarantee. The 50K × 3072 check also
+showed extra early-merge writes and a small ingestion regression; receipt tables
+retain those results. Full service churn/query qualification remains necessary
+before claiming improvement across all workload metrics.
+
+The final implementation passes 60 source-store and 42 native-store tests (two
+optional benchmarks skipped), covering recovery, concurrent WAL tails, old
+leases, updates/deletes, winner corruption, exact encoded residuals and merge
+budget boundaries. The real-file update harness retains and verifies both old
+and updated artifact references after reopen; without primary-owner GC it is
+a source retention test, not a reclamation benchmark.
+
+## September 11: source payload costs and scratch admission
+
+The follow-up implementation and receipts live under
+[`vector-store-source-costs-20260911`](../.benchmark-results/vector-store-source-costs-20260911/README.md).
+Ordinary search scratch now admits growth before allocation. Bounded reranking
+checks the captured source capability before growing its decode matrix; a
+supported source generation is pinned for the later score pass. Posting-local
+bounds retain their complete-shell refinement. This addresses the ungated
+memory issue described below without reducing the candidate set.
+
+Source inventory, directory hints, ANN marking and GC planning read admitted
+metadata through `sourceIdentityAt`. Payload reads and copying still validate
+checksums, and artifact reconstruction still validates the complete key/header/
+vector digest. Runtime SHA-256 dispatch enables optional instructions in baseline
+binaries, while already accelerated compilation targets keep std's kernel.
+
+The new real-file `vector-payload-bench` and independent checkpoint/cache
+switches are documented in that receipt directory. Those switches remain off.
+Qualification includes forward/reverse source-store arms at 50K and 1M; restart
+must be assessed together with first-read latency because metadata-only reopen
+no longer preloads all payload pages. Tiering and background scheduling are
+experiments, not assumed improvements. Final service and workload results are
+recorded with their exact executable and settings.
+
+The final service build passed 32 ungated query windows at 50K/1M, preserving
+all 1,000 reference hit sets in each window. At 50K, observed retained search
+memory fell from 181 MB to 82 MB and allocation rejections fell from two to
+zero. Source-only 1M reopen fell from 6.87 s to 0.10 s; the first full scan now
+pays the deferred cold I/O. Runtime SHA measured about 6x over the forced
+portable kernel on ARM, with SHA-NI correctness checked under emulation; this
+is not an end-to-end speedup on already accelerated native builds.
+
+Retaining checkpoint output in cache passed fresh 50K ABBA and normal
+enrichment/update/restart checks. Ready times were 15.94/20.07 s in control
+versus 13.60/12.32 s with retention, while mixed query throughput varied.
+Tiered merging increased writes at 1M and remains experimental. Warm 1M query
+profiles attribute approximately 4.6 ms to leaf scoring and 0.4 ms to rerank
+loading; at concurrency 30, scan admission adds about 30 ms in both builds.
+The memory/recovery fixes stand independently of cache or checkpoint policy.
+Further performance work should measure scoring and admission together, and
+qualify cache/append-only combinations through full 1M churn before promotion.
+
+The delta-streaming follow-up is implemented in the September 12 entry above.
+Its buffered execution and bounded merge policy were measured separately from
+these earlier cache/background experiments.
+
+## September 11: snapshot synchronization, query packing and build-quality experiments
+
+The next qualification is isolated under
+[`vector-store-snapshot-packing-20260911`](../.benchmark-results/vector-store-snapshot-packing-20260911/).
+The new settings remain experimental and off by default:
+
+- `ANTFLY_EXPERIMENT_QUERY_SNAPSHOT=1` captures a catalog lease, identity
+  visibility generation, primary metadata read transaction, ANN generation and
+  exact float32 source generation at the same source sequence. The apply read
+  fence is released after capture; catalog and generation leases survive until
+  result materialization finishes. Admission currently requires an all-visible,
+  non-TTL document index with no chunk or multi-source result shaping, an
+  authenticated native tree or flat directory, and a plain score-only request. Unsupported or lagging cases
+  retain the existing synchronization. An incomplete snapshot releases the
+  bundle and retries through the existing DB repair path.
+- `ANTFLY_EXPERIMENT_QUERY_SNAPSHOT_NATIVE_ONLY=1`, together with the snapshot
+  flag, omits the full primary metadata snapshot. A short primary probe verifies
+  the committed sequence while the apply fence is held. ANN metadata and exact
+  vectors come from the retained native generations. Any need for primary data
+  aborts that attempt and retries the whole query through the ordinary DB path;
+  it must never open a current-tip primary transaction after releasing the
+  fence. The public single-dense query envelope uses the same eligibility gate.
+- `ANTFLY_EXPERIMENT_QUERY_PACKING=reduce` replaces scalar lane extraction with
+  vector shifts and a reduction into the four query bit planes. `mask` provides
+  an independent bit-cast packing variant. Float quantization, bit order,
+  scalar tails, exact reranking and the persistent format are unchanged.
+- `ANTFLY_EXPERIMENT_CONFIGURED_BULK_BUILD=1` lets empty-index bulk ingestion
+  honor the persisted `bulk_build_algo` choice. It retains the existing batch,
+  replay and publication boundary. This isolates bootstrap quality; it does not
+  implement a whole-table matrix build or imply that changing the first batch
+  alone will improve a mature incremental index.
+
+Identity visibility summaries now load once during DB open, before query
+admission. Ordinary mutations continue to publish them through the existing
+apply fence. Apply-lock reader admission uses an atomic reader count and a
+writer-closed bit. Synchronous waiters use an epoch and native wakeups;
+cooperative/cancellable I/O callers retain their owner's bounded wait protocol.
+Profiled DB entrypoints now account for foreground query activity like normal
+queries, so profiling does not silently alter that admission policy.
+
+Correctness checks cover old ANN membership/metadata after publication, a
+query bundle retaining primary metadata and exact source after replacement,
+identity visibility across restart/deletion, and cancellation/fairness in the
+apply lock. The native-only tests also force a missing source value with exact
+reranking and verify a whole-query primary fallback. Packing parity includes
+every eight-lane bit mask and dimensional tails. A table with retained identity
+tombstones continues through the ordinary path; this snapshot experiment does
+not yet provide an immutable visibility mask for general delete-heavy queries.
+Qualification results are recorded in the experiment directory; a kernel speedup
+must not be reported as a whole-query speedup.
+
+### Qualification result
+
+The frozen v4 runtime passed seven independent or combined retained-index
+comparisons: 174 service windows at 50K/1M, with all 1,000 reference query hit
+sets preserved in each window. Clean AB/BA and separate instrumented windows
+ran on the available host. Both arms used the existing aggregate-admission gate,
+float32 source ownership, exact mapped views, member bindings and single-helper
+policy. Two order reversals do not establish confidence bounds.
+
+The final 1M combined comparison is against the earlier frozen R22 binary:
+
+| Concurrency | QPS before → after | QPS change | p99 change | Server CPU/query before → after |
+|---|---:|---:|---:|---:|
+| 1 | 106 → 114 | +7.9% | +1.6% | 18.44 → 16.77 ms |
+| 10 | 630 → 790 | +25.5% | -43.2% | 12.19 → 9.56 ms |
+| 30 | 361 → 803 | +122.7% | -79.9% | 30.40 → 9.38 ms |
+
+These are medians of paired ratios; absolute QPS/CPU columns are arm medians.
+At C30, median p99 falls from about 213 ms to 43 ms. This is a substantial
+concurrency improvement, not a tenfold whole-query improvement.
+
+Independent controls locate the gains:
+
+- Synchronization/identity changes alone improve C30 QPS by 102% at 50K and
+  130% at 1M. Lower concurrency is mixed: 1M/C10 is -4.6% in that pair despite
+  lower CPU/query. Do not infer a universal throughput gain from C30.
+- Reduction packing improves QPS by 7–11% at 50K and 13–18% at 1M across
+  C1/2/4/10/20/30. The 50K/C30 p99 result is mixed. The kernel probe is 1.56–1.81x
+  faster for preparation plus a one-row score; that is not a service speedup.
+- Native-only snapshots versus ordinary synchronization at 1M add 4–6% QPS
+  and reduce p99 by 31–38% at C10–C30. C1 is -2.4%. At 50K, native-only versus
+  eager-primary snapshots is essentially flat in QPS at C10/C30. The earlier
+  eager-primary 50K snapshot experiment regressed C10 QPS by 8.7%.
+- Bootstrap and full-topology quality probes did not establish a large
+  reduction in scored vectors at comparable recall. At 256 probes, recursive
+  bootstrap reaches 95.15% recall with 22,953 rows/query; full global k-means
+  reaches 95.655% with 24,622 rows/query and adds about 71 seconds of rebuild
+  work. Hierarchical recall gains consume more scored rows. Complete curves
+  and measured recall-threshold crossings are retained; no automatic global
+  rebuild or 1M whole-matrix builder is promoted.
+
+The ungated series exposed a search-memory admission failure in both an old
+control and a new candidate. An exact-rerank allocation of about 49 KB failed
+with 194 MB charged against a 179 MB search slice, while aggregate memory was
+well below its limit. The gated comparisons had no query errors; the observed
+post-window search usage stayed around 103 MiB or less at 50K and 48 MiB or less
+at 1M. These observations are not peak process-memory qualification.
+
+A concrete remaining issue is eager decode-matrix growth for the full bounded
+candidate shell before the float32 source declines the float16-only capability.
+The subsequent exact pass uses bounded batches but retains the larger matrix.
+A source-sequence-bound capability check before scratch growth, plus admission
+for ordinary scratch growth, is the next memory fix. It is not part of this
+measured binary. The aggregate gate is a matched qualification condition, not
+proof that the ungated issue is fixed.
+
+All new experimental settings remain off. This work qualifies warm retained-index
+queries and bounded build-quality probes; it does not qualify fresh ingestion,
+cold paging, mixed churn, distributed lifecycle paths, or a default promotion.
+The implementation, frozen binaries, test receipts, failure stacks, raw windows
+and full tables are in the linked experiment directory.
+
+## September 11: unified fetching and exact views (not promoted)
+
+`ANTFLY_EXPERIMENT_UNIFIED_VECTOR_FETCH=1` adds a synchronous, transaction-owned
+metadata resolver to the HBC exact rerank callback. Within a bounded wave of at
+most 256 members, it resolves member-binding hits and only the missing artifact
+metadata before issuing one native payload batch. Original output positions
+travel with the requests, so physical sorting preserves result order without
+searching the candidate IDs again. This capability requires a sequence-matched
+float32 generation with member bindings; other cases retain the existing path.
+Missing/invalid native values retain authoritative fallback. The read arena is
+released before that fallback acquires its own scratch. Float16 projection and
+residual reuse are unchanged.
+
+Independent `ANTFLY_EXPERIMENT_EXACT_MAPPED=1` uses existing generation-leased
+exact views for float32 block requests, including CRC validation. It still uses
+the selected helper policy and retains existing scratch allocation, isolating
+payload access from a scratch-pool redesign. This is a mapped-view experiment,
+not a resident-page guarantee or a new user-space cache. New profile counters
+separate mapped requests/bytes from positional reads; a mapped request can cause
+page faults and must not be interpreted as zero physical device I/O. Helper
+submission-to-start delay is now measured separately from worker drain time.
+
+The new lifecycle checks exercise mixed binding hits/misses in one batch,
+reordered output, updates/deletes, older reader generations and restart. Exact
+view tests reject corrupt bytes and clear stale results when requests are reused.
+Both settings remain off by default; durable format and ownership are unchanged.
+
+The frozen source, build, replay matrix and independent retained-index service
+comparisons are under
+[`vector-store-unified-fetch-20260911`](../.benchmark-results/vector-store-unified-fetch-20260911/).
+Native tests passed (38, with two gated benchmarks skipped), as did four focused
+index/lifecycle tests and the complete real-file replay matrix. Independent
+service comparisons preserve all 1,000 settled query hit sets. Both settings
+remain off by default. Mapped access is the clearer warm-read improvement;
+unified batching consolidates mixed batches but is not a consistent throughput
+win. These are retained-index comparisons, not fresh ingestion qualification.
+
+Clean mapped/copy service changes below are medians of two paired ratios, AB
+and BA. C20/C30 are a separate extension using the same common settings. All
+outliers are retained; these small samples do not establish confidence bounds.
+
+| Scale | Metric | C1 | C2 | C4 | C10 | C20 | C30 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 50K | QPS | +4.2% | +6.5% | +8.1% | +19.2% | +21.2% | +34.1% |
+| 50K | p99 | +5.8% | +0.7% | -6.5% | -14.7% | -21.4% | -23.1% |
+| 1M | QPS | +24.3% | +4.0% | +5.8% | +8.8% | +8.2% | +8.6% |
+| 1M | p99 | -34.3% | -0.8% | -9.9% | -11.1% | -1.1% | -8.2% |
+
+C1's 1M control varies substantially, making the exact +24.3% magnitude weak.
+The 1M inline warm-fetch microbenchmark improves 48.19 → 3.39 microseconds per
+completed batch at C10 (14.2x), but excludes identity resolution, ANN scoring,
+HTTP and cold storage. Mapped process RSS grows while measured footprint remains
+similar; this is not memory-pressure qualification. Source ownership and durable
+format are unchanged. See the experiment's [report](../.benchmark-results/vector-store-unified-fetch-20260911/README.md)
+for raw-pair analysis, CPU/query changes, gates and limitations.
+
+## September 11: remaining bottlenecks and larger design opportunities
+
+The current 1M mapped C10 profile spends 5.823 ms scoring leaves, 1.247 ms routing,
+3.816 ms waiting for scan admission and 0.518 ms loading exact vectors within
+12.647 ms dense search. It scores approximately 243,535 vectors across 2,048
+leaves, reading 23.379 MB of codes to return 100 results. Eliminating the remaining
+exact-load interval alone yields only a 1.043x fixed-stage speedup; it cannot
+produce a 10x complete-query improvement. Queueing can respond nonlinearly.
+
+The concrete remaining targets are:
+
+1. **Complete query snapshots and the apply fence.**
+   `DB.beginDenseSearchAccess` still selects the apply shared lock whenever an
+   external loader exists. The lock spans search and lies outside the dense
+   profile timer. `ApplyRwLock.lockShared` spins and then polls with zero-duration
+   sleeps; sampled query stacks repeatedly wait here. Pin catalog/index lifetime,
+   identity/visibility, authoritative metadata, source payload and ANN generations
+   as one consistent query bundle before allowing eligible external-payload reads
+   to avoid the fence. Keep fallback synchronization for unsupported paths.
+   Generation-pinned vector files alone do not prove this safe. Event-driven
+   waits remain useful for the paths that need the fence.
+2. **Recall per scored vector and initial build quality.**
+   A 10x reduction in candidate work requires about 24K candidates at the same
+   recall; earlier 20K-candidate runs reached only about 83%, versus about 99.35%
+   with 241K. Better partition training or representative routing must improve
+   that curve. The normal insertion path bulk-builds only an empty index;
+   bulk-ingest explicitly selects recursive construction, and later batches
+   incrementally insert/split. Test a bounded snapshot-fed initial build using
+   existing builders, including catch-up and atomic publication. Do not turn this
+   into an unbounded larger batch or assume every bootstrap path has this limit.
+3. **Query preparation and block scoring.**
+   `quantizeQueryPlanes` vectorizes float arithmetic but packs extracted lanes
+   with four serial shift/OR updates per dimension. Distinct 2,048 × 768D origins
+   imply about 6.29 million packing updates per query. SIMD bit-transpose packing
+   is a specific parity-testable experiment. The AArch64 scorer also performs
+   four horizontal popcount reductions per pair of code words. Benchmark the
+   complete preparation/scoring/candidate pipeline; same-origin preparation
+   reuse and SIMD scoring already exist.
+4. **Useful concurrency rather than more admitted work.**
+   Clean mapped 1M throughput is 610–614 QPS at C10, 361–366 at C20 and 314–331
+   at C30; CPU/query rises from about 12.3 to 30–32 ms. At 50K, throughput also
+   declines after C10. Reduce scan work and broad synchronization before raising
+   worker limits. Existing aggregate admission holds a driver slot even while
+   waiting for scan capacity; a phase-aware policy needs independent qualification.
+5. **Durable work proportional to mutations.**
+   Shared origins, per-leaf revision debt and durable row-reference translation
+   could avoid repeated checkpoint encoding. They exist experimentally; an earlier
+   integrated row-store run wrote 3.8–4.0x checkpoint bytes and regressed queries.
+   Later fixes need fresh ingestion/churn/restart qualification. Remaining split
+   loading was already reduced to 22–23 seconds within roughly 280-second readiness;
+   another exact-load-only rewrite cannot make total readiness 10x faster.
+
+CPU samples identify active functions and wait call chains, not CPU percentages.
+High-concurrency sampling substantially perturbs throughput. There is also a
+profiling-path mismatch: the normal DB wrapper registers foreground-query activity,
+but the profiled dense wrapper omits that accounting. Fix that parity and instrument
+the actual provisioned endpoint before assigning all HTTP-minus-dense time to one
+component. Separate normal-request DB-wrapper diagnostics confirm apply-lock waits without
+the CPU sampler: at 1M/C30, mean acquisition is 36.006 ms and p99 is 196.575 ms,
+versus 1.642 / 13.749 ms at C10. Diagnostic throughput matches clean windows.
+At 50K/C30, identity-generation capture also averages 5.215 ms; absent an in-memory
+visibility summary, it reads metadata through the LSM and its snapshot locks.
+The query bundle should carry a correctly published identity token as well as
+payload generations. These last-1,000-wrapper diagnostics use logging and are
+kept separate from clean A/B timing; stage p99 values cannot be added.
+
+Storage has a different ceiling: 1M × 768 × float32 is 3.072 GB of authoritative
+payload alone, versus roughly 4.1 GB total in the earlier qualified store. Remaining
+metadata elimination cannot give 10x total disk savings at unchanged encoding.
+Memory, cold reads, enrichment/full text, multi-index use and mixed updates/deletes
+still require fresh qualification for these new read experiments. No complete-query
+10x improvement is established. Detailed evidence and rejection gates are in
+[BOTTLENECKS.md](../.benchmark-results/vector-store-unified-fetch-20260911/BOTTLENECKS.md).
+
+## September 11: fetch-batch dispatch investigation (not promoted)
+
+The next experiment replays complete, real-file float32 fetch batches through
+production exact reads, including CRC checks. It recovered the previous trace
+by matching retained immutable source copies and validating every logged range:
+128 batches per scale, 7,303 requests at 50K and 9,120 at 1M. Payload file hashes
+and explicit remapping are preserved. Identity resolution and ANN scoring are
+outside this replay; a controlled one-miss split tests the extra batch barrier.
+
+The expanded warm replay found that one optional helper reduced serial batch
+latency by 12.6% at 50K and 27.8% at 1M. Inline reads used substantially less CPU
+and reduced time per completed batch at ten concurrent callers by 6.1% / 7.5%,
+but increased serial time by 21.0% / 4.0%. Splitting off one miss did not produce
+a consistent large penalty. The shorter first replay showed larger concurrent
+inline gains. Neither result establishes service throughput or justifies a new
+file format or callback contract.
+
+`ANTFLY_EXPERIMENT_VECTOR_READ_INLINE=1` drains positional payload batches in the
+caller; `ANTFLY_EXPERIMENT_VECTOR_READ_SINGLE_HELPER=1` permits one helper per
+batch. Inline takes precedence. Defaults retain the existing bounded workers and
+all existing global admission/lifetime/cancellation rules. Separate
+`ANTFLY_EXPERIMENT_VECTOR_READ_PROFILE=1` runs expose exact-read physical batches,
+requests, admitted helpers, denied launches, dispatch/caller/join times and summed
+helper wall time. Summed helper wall time overlaps other work and is not CPU time.
+Logical binding batches, mixed batches and maximum observed binding-array bytes
+are also visible in query profiles; helper pressure is exported in metrics.
+
+Three clean replay rounds reverse order; the fourth attribution round is excluded
+from medians. Process CPU is measured separately. Descriptor-local `F_NOCACHE`
+experiments are included, with no claim that device caches or existing filesystem
+pages were cold. The replay helper limit was 16; the service's existing limit
+was 28 on this host. All 84 service windows and four additional serial-profile
+windows passed retained hit-set gates. Clean timing and attribution were separate;
+all timing outliers remain included. These are retained-index query comparisons
+against the existing vector-store path, not fresh ingestion or LSM ownership.
+
+| Workload | Candidate | C1 QPS | C10 QPS | C10 p99 | C10 CPU/query |
+|---|---|---:|---:|---:|---:|
+| 50K | Bindings + single | +16.9% | +21.6% | -15.0% | -20.3% |
+| 1M | Bindings + inline | -19.9% | +38.6% | -41.5% | -26.8% |
+
+The combined 50K candidate improved C10 throughput in all four pairs and C1 in
+both pairs. At 1M, inline plus bindings improved C10 in three pairs, regressed in
+the fourth, and regressed C1 in both pairs. Dimensions also differ between these
+workloads; these results do not establish a table-size crossover.
+
+Combined C10 profiling cut mean 1M vector-loading time from 3.865 to 0.921 ms.
+The focused C1 diagnostic instead measured 4.577 / 4.244 ms for the candidate
+versus 1.901 / 1.877 ms for the control, despite under 0.4% binding misses and
+similar ANN leaf-scoring time. Candidate caller reads accounted for 4.397 /
+4.055 ms. The serial tradeoff is therefore in the payload stage; binding/order
+and dispatch both differ in this comparison, so kernel I/O versus scheduling is
+not individually attributed. Some captured HTTP tails also substantially exceed
+the dense-search timer; their remaining time is not yet assigned to a component.
+
+Keep the settings off by default. A shared nonblocking helper budget is one
+component of the next candidate, not a complete new design: experimental
+aggregate caller/helper admission already exists. The architecture review below
+refines this direction. Preserve measurable batch-size/dimension/read-latency
+effects; do not hard-code a table-size threshold from two datasets.
+Native and focused index regressions passed. Fresh ingestion/churn/readiness and
+matched LSM-ownership qualification remain necessary before promotion.
+
+Artifacts: [`vector-store-fetch-batches-20260911`](../.benchmark-results/vector-store-fetch-batches-20260911/README.md).
+
+## September 11: long-term read-path review after dispatch experiments
+
+Retain one authoritative source payload and generation-safe indirection. The
+recommended next shape is **one bounded resolve → fetch → score pipeline per
+rerank wave**, with execution policy beneath it. This is a design direction,
+not a claim that its performance is already qualified. Changing worker counts
+alone has repeatedly exchanged concurrent throughput for serial latency.
+
+The code review establishes several useful boundaries:
+
+- `ResourceManager.tryAcquireDenseReadTask` already limits helpers globally.
+  `ANTFLY_EXPERIMENT_AGGREGATE_ADMISSION` additionally shares capacity with query
+  drivers, acquired before generation/scan admission and retained across both
+  query phases. Helpers cannot wait or bypass queued drivers. This is admitted
+  work accounting, not a measurement of executing CPU: drivers also retain
+  their slot while waiting for bandwidth or payload reads. Earlier recovery-v2
+  diagnostics improved C30 throughput by 11.8% / 3.9% at 50K / 1M while reducing
+  C1 by 12.7% / 5.5%. Those older workloads are not matched R21 comparisons.
+- `runPositionalReadBatchProfiled` uses the existing shared I/O thread pool;
+  it does not create OS threads per vector. It does create a group and attempt
+  up to seven helper submissions per batch, with one atomic claim per request.
+  A new persistent executor would need to beat this implementation, not merely
+  duplicate its persistent threads.
+- Member-binding hits are currently read and scored before HBC resolves misses
+  through metadata and the ordinary exact loader. R21's serial 1M candidate
+  performed about 5.3 physical batches for 4.0 logical binding batches/query.
+  The controlled singleton-miss replay did not show a consistent large penalty;
+  consolidation is a cleaner execution boundary, not yet a proven large win.
+- `exactVectorBlockDistance` already scores aligned float32 bytes directly.
+  The ordinary exact read still performs `pread` into scratch and validates the
+  payload. `viewExact` can borrow mapped bytes under a generation lease, and
+  the projection path already has bounded clean-page borrowing. Neither proves
+  that direct mapping or another cache improves float32 service performance.
+
+The proposed pipeline has these responsibilities:
+
+1. **Resolve without fetching.** Use the existing index incarnation/member ID
+   binding first; resolve only misses through authoritative artifact metadata.
+   Carry each result's original position and retained source location in one
+   bounded request array. Preserve the ANN/source sequence fence, missing-value
+   behavior, encoding/dimension checks and float16 projection/residual reuse.
+   Fetch hits and resolved misses together within the existing rerank wave;
+   do not eagerly fetch later waves that the exact stopping proof may exclude.
+   Explicit positions also avoid the current repeated member-ID output search.
+2. **Borrow verified hot bytes or issue bounded reads.** A borrowed value must
+   retain its immutable generation and any cache lease through scoring. Keep
+   CRC validation and the existing authoritative fallback. Test mapped views
+   and bounded cache borrowing separately: direct mmap can fault synchronously,
+   while a user cache adds memory and may amplify reads. Do not turn the entire
+   source into a second resident serving copy. Preserve bounded scratch for
+   misses, cross-page values, residuals and unsupported view alignment.
+3. **Make optional parallelism proportional to remaining work.** Reuse the
+   current nonblocking helper admission and caller-progress guarantee. Test a
+   small local cap and a minimum useful byte/request budget before attempting
+   adaptive control or another executor. Under load, spare helpers should yield
+   to query drivers; at low concurrency they may overlap slow reads. Keep
+   scan-bandwidth, scratch-memory and helper limits explicit: a CPU-count cap
+   alone does not describe memory bandwidth or useful in-flight I/O. Any future
+   phase-aware policy must preserve admission ordering and fairness. Cancellation
+   must drain issued work before releasing request buffers or source leases.
+
+Keep file layout and durable identity independent of this execution policy.
+An artifact-version directory shared across indexes remains a plausible later
+replacement for the disposable member cache. A parent docid alone still cannot
+identify different chunks, models or versions. Updates publish new versions,
+deletes change current visibility, and old-reader leases delay reclamation;
+dropping all ANN indexes must preserve source ownership. A new directory must
+earn its publication, recovery and memory cost: R21's serial candidate already
+had fewer than 0.4% binding misses, yet payload loading remained slow.
+
+Do not prioritize broad read coalescing from the current traces. Even allowing
+64 KiB gaps reduced modeled spans by only 1.63% / 0.20% while adding 8.3% / 1.8%
+bytes at 50K / 1M. This is bounded trace geometry, not measured device I/O, and
+does not rule out a different physical arrangement. Source placement must also
+serve multiple independently partitioned indexes without repeated full copies.
+
+The next discriminating experiments, in order, are:
+
+1. Hold bindings, physical order, query working-set cadence and encoding fixed;
+   compare zero, one and original helpers at C1, C2, C4 and C10. Independently
+   include the existing aggregate-admission setting. Sample helper start delay,
+   per-read wall versus thread CPU, faults and process footprint; retain clean
+   timing windows without that instrumentation. The combined R21 C1 comparison
+   changed binding order as well as dispatch and cannot isolate those causes.
+2. Add logical-wave IDs, result positions and binding hit/miss membership to
+   bounded replay traces. Compare unified resolution with the split path at
+   identical physical requests/order and dispatch. Preserve early termination,
+   updates/deletes, old readers, restart and corruption checks.
+3. Use those same requests to compare exact copied reads with existing mapped
+   views, then bounded borrowing if reuse justifies admission. Measure bytes,
+   CRC/scoring time, CPU, latency and memory under pressure; do not equate
+   `F_NOCACHE` replay with cold-device qualification. Measure chunked work claims
+   or a reusable executor only if dispatch remains material after these changes.
+4. Combine only independently useful changes, then repeat fresh ingestion,
+   churn/reclamation, readiness/restart and matched LSM ownership qualification.
+   No table-size heuristic, new durable format or default promotion follows
+   from the current two datasets. Remaining HTTP tails also need timing outside
+   dense search before attributing them to this payload pipeline.
+
+This review changes documentation only. It adds no benchmark result or runtime
+behavior beyond the recorded R21 experiments.
+
+## September 11: existing-member source bindings (not promoted)
+
+`ANTFLY_SOURCE_VECTOR_MEMBER_BINDINGS=1` connects the existing index-scoped ANN
+member identity to a compact source row under the retained ANN/source generation.
+A hit precedes ANN metadata loading and skips artifact-key construction, reference
+lookup and source digest lookup. It retains the ordinary bounded payload reads,
+CRC checks and exact scoring. This experiment currently accelerates float32;
+float16 keeps its projection/residual reuse path. WAL payloads and misses use the
+existing authoritative resolution. No persisted format or ownership default changes.
+
+A parent DocOrdinal alone cannot identify multiple chunks or model artifacts.
+The current ordinal-to-vector maps are also mutable and cover ordinary document
+embeddings, so borrowing those maps from an old query would be unsafe. This
+implementation uses the already assigned ANN member ID and the index's existing
+capture incarnation, inside one table's immutable vector generation. It allocates
+no new document IDs. Artifact identity/version is checked by the normal reference
+resolution before admitting a binding. Recreated indexes get new incarnations;
+new generations and restart start empty. Old query leases retain their original
+source files and bindings across updates, deletes and compaction.
+
+Each binding is 40 bytes: index incarnation, member ID, source reader/row, and
+logical source sequence/revision. It reconstructs scoring metadata directly from
+the validated immutable row; it stores neither payload bytes nor a duplicated
+full location/digest. Four-way buckets allocate lazily in 256 independent stripes.
+A busy stripe declines immediately. Arrays are admitted to
+`dense_source_payload_state` and can be reclaimed independently. Capacity follows
+immutable reader row counts, capped at 1,048,576 entries (40 MiB per live
+generation), shared across that table's indexes. There is no corpus scan at
+publication and no attempt to copy bindings to replacement generations.
+
+This is a disposable member-to-row acceleration layer, not yet a persistent
+ordinal/radix directory co-located in AFVD. It tests whether bypassing the entire
+identity lookup chain is valuable before adding durable format and lifecycle
+complexity. A working set larger than capacity can still miss; publication can
+also make it cold. The microbenchmark and retained 50K/1M comparisons must expose
+those costs, memory residency, hit rate and query latency. Explicit profile
+counters are `hbc_rerank_member_binding_hits` and
+`hbc_rerank_member_binding_misses`.
+
+The corrected metadata microbenchmark completed four forward/reverse rounds on
+64-shard, current-format source/reference files. For a repeated 10K-request
+working set, median full lookup versus binding-hit latency was 556 ns versus
+15 ns at 50K, and 1,385 ns versus 18 ns at 1M. It forces the complete location
+value to escape optimization. These are in-memory metadata measurements, not
+payload-I/O or query-throughput results. The original smoke fixture's recursive
+owner comparison and offset-only consumption were rejected before qualification.
+
+All eight retained-topology C10 arms passed activation and identical-hit-set
+gates. Despite removing over 99% of rerank metadata fetches, median paired peak
+throughput changed by **−4.6% at 50K and −7.8% at 1M**; p99 latency increased
+21.1% and 56.3%. Profiled vector-loading time fell 22.2%/35.5% in the 50K pairs;
+at 1M it changed +0.7%/−42.7%. Physical vector-read counts and bytes stayed
+essentially constant. Profile phases and clean timing phases have different
+host/scheduling conditions; these figures do not identify a single cause.
+Measured peak process footprint increased 16.5–22.3 MiB at 50K and 19.5–62.4 MiB
+at 1M. This is not a qualified peak-throughput improvement.
+
+The cache is therefore off by default. All eight serial (C1) diagnostic arms
+also passed activation and identical-hit-set gates. At 50K, throughput improved
+40.3% / 18.0%; at 1M it changed −17.8% / +24.2%. In the separate 1M profile
+phases, artifact-read time fell 62.8% / 66.1%, and dense-search time fell
+23.7% / 22.8%. Serial results therefore show a useful fetch-path benefit but
+also substantial timing variability; concurrency alone is not a proven cause.
+
+Before selecting another optimization, instrument logical versus physical batch
+counts, mixed hits/misses, worker admission/dispatch/join, read CPU/wall time and
+binding residency. Replay complete real fetch batches in microbenchmarks using
+real payload files, dimensions and CRC checks, with warm/cold and serial/concurrent
+conditions. Isolate preserving one payload batch for hits and misses and inline
+versus bounded worker dispatch. The current early scoring callback can issue hits
+before the fallback batch; this is a structural difference, not an established
+cause. Use shorter interleaved A/B blocks on the available host to reduce time
+drift, then repeat end-to-end qualification. A persistent document/artifact
+directory or a new payload layout should follow this evidence.
+
+Post-timing lifecycle copies passed two rounds of 2,000 updates/deletes/restores
+at both scales. Each of 1,000-query pre-restart, cold-restart and warm-restart
+checks measured the same recall: 0.98541 at 50K and 0.99060 at 1M. The first
+lifecycle harness attempt incorrectly treated search width as returned hit count;
+it made no mutations and remains preserved separately. Correctness suites passed
+57 source tests, 36 native tests and four focused manager tests, without failures
+or leaks; the gated microbenchmark was also run explicitly and passed.
+
+The exact-read path now participates in the bounded location trace, correcting
+the previous diagnostic's float32 coverage gap. Traced runs remain separate from
+clean timing. Scripts, frozen source, tests and results live under
+[`vector-store-member-bindings-20260911`](../.benchmark-results/vector-store-member-bindings-20260911/README.md).
+
+## September 11: reference lookup and physical locality
+
+The stable 50K diagnostic reproduced the query throughput gap: vector-store
+ownership was 10.6% / 15.1% slower than LSM ownership on retained, settled indexes.
+All hit sets stayed unchanged within each ownership topology. The original cache
+treatment was inactive: it allocated 8,922,208 bytes but recorded zero hits and
+misses. `Store.snapshot` cloned a published native view without rebinding its
+table-owned `reference_location_cache`. Native catalog clones intentionally omit
+that pointer. The fix binds it explicitly at the source snapshot ownership
+boundary, matching the writer-snapshot path and preserving generation/shard
+validation. The regression now exercises both paths through WAL checkpoint,
+source relocation, and old-reader access, with float32 and exact float16 payloads.
+
+Artifact references already live in the ANN serving artifact records. The source
+store holds the one full payload copy. The first fresh 1M comparison measured
+about 3.19 GB of full serving vectors under LSM ownership versus 150 MB of serving
+metadata/references under vector-store ownership, plus 3.19 GB in the shared source
+files. Source ownership also removes the full primary embedding values. The
+extra digest lookup is an implementation cost, not a required consequence of
+eliminating duplicate payloads.
+
+The independent locality treatment resolves identities first, then orders complete
+payload-read requests by retained source owner, file, and byte offset. Each request
+carries its result position, destination buffer, value, and error. Both projection
+and exact reads participate. Authoritative float32 reranking uses the exact-read
+API; the compact float16 path uses projection and residual reads. No persistent offsets or extra vector copies
+are introduced. `ANTFLY_SOURCE_VECTOR_PHYSICAL_RERANK_ORDER=1` enables it, and
+`antfly_dense_physically_ordered_{batches,requests}_total` metrics prove activation.
+It is off by default pending measurement. Focused validation passed 57 source
+ownership/recovery tests and 34 native storage tests, including reordered reads
+with a failing destination and successful siblings.
+
+A possible next format would co-locate an optional physical-location hint with
+the ANN artifact reference (or the already-read ANN vector metadata). Keep the
+artifact version/model identity and digest authoritative. A hint may contain a
+source segment generation, shard, offset, encoding/length, and integrity binding;
+it must validate against the retained source snapshot. If compaction relocates a
+payload, an older reader keeps its leased files, while a newer reader rejects a
+stale hint and resolves the digest. Build or refresh hints incrementally; a full
+payload-directory traversal on every publication would recreate ingestion costs.
+Different ANN indexes can carry different small hints while sharing the same
+model/version payload. Persistent memory addresses, unchecked offsets, and a
+second full serving payload corpus are not part of this proposal.
+
+The qualification completed all 18 arms, isolating cache-only, ordering-only,
+and their combination on the same binary at 50K and 1M, with forward/reverse
+order, activation checks, and unchanged hit sets. Median paired throughput
+changes versus shared control were −51.7% / −11.9% for cache-only, +11.4% / −15.5%
+for ordering-only, and −5.3% / −27.1% for both (50K / 1M). Neither option is promoted.
+The 50K LSM controls in this follow-up were slower than shared control, reversing
+the earlier ownership diagnostic; preserve both observations. Separate profile
+phases do not explain the full unprofiled throughput changes, so no single causal
+attribution follows from these ratios. Results and frozen inputs are retained under
+[`vector-store-reference-locality-20260911`](../.benchmark-results/vector-store-reference-locality-20260911/README.md).
+
+## File-format investigation: locate first, then fetch
+
+The ownership comparison is not a comparison between an SSTable vector read and
+an optimized vector-file read. With native ANN storage enabled, **both modes
+already use AFVBLK serving files**. LSM ownership gives an ANN artifact key a
+full serving vector. Shared ownership gives it an authenticated 32-byte digest,
+then resolves that digest in the retained source catalog before reading the
+payload. The latter saves a full serving copy and primary payload storage, but
+adds metadata work. Payload access uses retained descriptors and bounded `pread`
+workers in both modes. A recorded physical-read counter counts these application
+reads, not SSD operations: warm reads can be served by the OS cache.
+
+Current AFVBLK V4 has an 88-byte index entry, separate key and payload arenas,
+and bounded streaming publication. Float32 rows use four bytes per component.
+Float16 uses two-byte components plus a separate exact residual: ordinarily 13
+bits per component and a four-byte exception count, with an exception path for
+other IEEE-754 values. Thus ordinary full exact storage is about 29 bits per
+component, before metadata/exceptions, not a 50% reduction. Reading only the
+candidate plane saves bandwidth; reconstructing exact values adds residual I/O
+and decoding. The current ownership/locality experiment fixes encoding at
+float32, so it cannot establish a float16 format win. An environment change on
+an existing database is not a fresh encoding comparison.
+
+The identity prototype should start with the existing DocID machinery.
+`db/doc_identity.zig` already supplies namespace-scoped document ordinals,
+canonical identities and generation-aware document visibility. Dense indexes
+already map ordinals to ANN vector IDs, and the native vector directory carries
+member metadata. The missing connection is from those identities to a particular
+source artifact version and its leased location. A new parallel document-ID
+allocator is not the intended design.
+
+Conceptually, use `(identity namespace, DocOrdinal, artifact slot, artifact
+version)` to identify a source payload. The artifact slot distinguishes embedding
+families/models and derived chunk/extraction members; document visibility alone
+does not distinguish old/new embeddings or several embeddings on one document.
+This tuple describes logical identity, not a requirement to repeat every field
+in every row. Bind the existing ANN member metadata to that source identity when
+publishing a generation, and retain or resolve its location under the same
+snapshot. Keep artifact integrity and preparation/retry validation. Reuse the
+existing namespace/handoff rules and explicitly qualify ordinal remapping during
+shard movement. The prototype should remove the current member-metadata → string
+artifact key → digest → source lookup round trip, while preserving versioning and
+zero-index source ownership.
+
+The most useful format alternatives have different costs:
+
+| Alternative | Intended saving | Cost and constraint |
+|---|---|---|
+| Physical hint beside an ANN reference | Avoid repeated source digest lookup on a valid hint | Small per-index metadata; validate identity and generation; fall back after relocation. Incremental refresh only. |
+| Existing document/artifact identity plus snapshot-owned location directory | Direct array/radix lookup shared by every index, independent of physical placement | Reuse namespace/ordinal lifecycle; distinguish artifact slots and versions; bounded copy-on-write directory pages; preserve preparation/retry semantics and old-reader identity/integrity. |
+| Homogeneous dimension/encoding chunks with ordinal addressing | Smaller per-row metadata and predictable offsets | Mixed models/dimensions need separate chunk classes; variable residuals still need offsets; avoid tiny-chunk fragmentation. |
+| Source-owned spatial packing and selective adjacent coalescing | Fewer scattered reads without another vector copy | Source placement cannot depend on one index's changing topology; extra bytes and rewrite debt can exceed saved reads. |
+| Compact candidate plane with exact residual completion | Fetch fewer bytes for candidates safely excluded by score bounds | Bound checks, decode CPU, and residual reads; preserve exact reconstruction and the existing recall policy. |
+
+A handle derived from existing document/artifact identity is an alternative to putting a full physical locator in every
+posting, not an additional mandatory format layer. The source location directory
+would be shared across indexes and updated by changed pages when compaction
+moves payloads. Old readers keep their directory and segment leases. Updates
+allocate a new artifact-version identity; deletes remove current visibility,
+and reclamation waits for all current references and older leases. Dropping the
+last ANN index must not delete source objects. Artifact/model identity remains
+in the authoritative envelope; equal dimensions do not imply equal embeddings.
+Handle namespaces must also survive snapshot restore and shard movement without
+collisions; those lifecycle paths need explicit qualification before enabling a
+new handle format outside fresh standalone tables. Local warm-read measurements
+do not establish the best chunk size for cold or remote object storage.
+
+Avoid a blanket page-alignment or page-cache rewrite. Earlier source-only packing
+screens and borrowed-page experiments in `VECTORDBBENCH_FINDINGS.md` measured
+limited span reduction and extra fetched bytes. Posting-local float16 copies
+previously improved locality considerably but restored a large second plane;
+that is a space/throughput option, not single-copy consolidation. The next format
+must earn its complexity with actual request traces, bounded memory and write
+amplification, and fresh encoding comparisons. Reference-cache and request-order
+measurements are kept separate from these unimplemented alternatives.
+
+At 1M the clean profiled phases also report 5.17–6.55 ms of candidate-scan
+admission time, 7.68–10.26 ms of leaf scoring, and 2.93–6.39 ms of artifact-read
+work per query. The scan bandwidth cap is about 128 MiB, with approximately
+23.5 MB reserved per active scan and a measured peak of five active queries at
+C10. At 50K this gate did not queue requests. Native descriptor-admission wait
+counters remained zero. Do not confuse the small general admission timer with
+`hbc_scan_admission_wait_ns` or describe all of these delays as vector I/O.
+
+`ANTFLY_EXPERIMENT_PHASE_ADMISSION` already supports releasing scan bandwidth
+before acquiring a separate rerank lane; this comparison held it off. Prior
+experiments qualified useful high-concurrency tradeoffs but observed C1 costs.
+A location-format change will not automatically fix scan admission or scoring.
+Keep phase/aggregate admission, exact scan-byte accounting, and scoring work
+independently measurable alongside any source-format prototype.
+
+The follow-up completed eight separate CPU-sampled cache arms with unchanged
+hit sets and proven cache activity. The large 50K clean-QPS regression did not
+repeat at the same magnitude under sampling; visible metadata work fell, while
+payload I/O and ANN scoring remained substantial. This does not prove either a
+cache benefit or a cache-lock explanation for the original regression.
+
+A new location-layout estimate did **not** qualify: the existing trace hook only
+covers the compact projection API, and this float32 workload uses exact reads.
+No live trace rows were emitted. The analyzer rejected that empty capture. Before
+changing chunk layout, extend the hook to exact reads and require observed,
+complete, checksum-verified batches. Preserve the earlier float16 packing screens
+as separate evidence. Detailed results and excluded attempts are in
+[`attribution/README.md`](../.benchmark-results/vector-store-reference-locality-20260911/attribution/README.md).
+
+The next bounded prototype should separate source-reference resolution time from
+payload I/O and full request dispatch/response time, then compare generation-bound
+co-located hints with a compact stable-handle location directory. Keep cache-only,
+physical sorting, phase admission, and any encoding/layout rewrite independent.
+Qualify relocation, old readers, updates/deletes, restart, multiple model/index
+identities and zero-index source retention before measuring the winning shape.
+
+## September 11: fresh source-ownership comparison
+
+The admission/replay candidate passed fresh `primary_lsm` / `vector_store`
+comparisons in A/B and B/A order at both 50K and 1M, plus four enrichment arms.
+Every scale arm passed churn and unchanged before/cold/warm restart recall;
+vector-store reclamation checks passed. One frozen binary serves both ownership
+modes, with float32 encoding, native ANN storage, batch/positional reads, shared
+catalogs, replay reads, durability, concurrency, and memory admission held equal.
+Append-only segments, selective GC, and location caching remain off.
+
+| Median paired vector-store change versus primary LSM | 50K | 1M |
+|---|---:|---:|
+| Readiness time | −10.3% | −33.7% |
+| Peak query throughput (C10 in every arm) | −13.4% | +25.7% |
+| C30 query throughput | −1.5% | +1.1% |
+| Mixed query throughput | +5.2% | +25.7% |
+| Fixed-count churn time | +8.7% | −1.3% |
+| Total logical disk after restart | −49.2% | −42.4% |
+| Sampled process logical writes | −17.0% | −21.9% |
+| Process peak physical footprint | −44.6% | −55.7% |
+
+These are medians of within-pair ratios, not ratios of medians. The available
+host was shared; no competing diagnostic or build ran during timed arms. At 1M,
+readiness was 579.118 → 277.309 seconds in A/B and 347.151 → 294.118 seconds
+in B/A. Peak QPS was 299.246 → 432.166 and 365.066 → 390.471. The direction
+repeats, but the effect size varies substantially. Mixed QPS improved 54.8% in
+the first pair and fell 3.4% in the second. Memory and tails are also mixed:
+whole-process peak physical footprint fell, while the brief reopened serial-query
+phase showed greater mapped residency/footprint and sparse resource samples;
+1M cold-restart query p99 increased 24.7% by the median paired ratio. A process
+footprint reduction is not a claim that every query-phase memory metric improved.
+
+The 50K peak regression is under separate investigation using the same saved
+index topology with location caching off/on. Serial post-restart profiles load
+roughly the same number of rerank vectors but show additional artifact-read time
+under source ownership: about 0.71–0.72 versus 0.51–0.52 ms at 50K, and 1.31
+versus 0.91 ms in the first 1M pair. Reference resolution adds a source-key lookup;
+physical requests are ordered by ANN artifact keys rather than source payload
+locations. These are candidate costs, not yet a causal attribution of concurrent
+peak throughput. The completed locality diagnostic above does not justify a default change.
+
+Receipts, all results, and the isolated diagnostic are preserved in
+[`vector-store-ownership-compare-20260911`](../.benchmark-results/vector-store-ownership-compare-20260911/README.md).
+
+## September 10: admission, replay, and routing-cache follow-up
+
+The next candidate addresses the remaining admission and loading costs, together
+with correctness failures exposed by stricter recovery qualification. The previous
+50K candidate failed its final restart check. The replacement has passed twelve
+50K arms, six 1M loading arms, and a separate full 1M workload/recovery check.
+These are not fresh primary-LSM ownership comparisons, so table defaults remain
+unchanged.
+
+* Resource reservation, batch-reservation, and observer identity ledgers bound
+  deleted hash-table slots with allocation-free rehashing after capacity/8
+  successful removals. This prevents accumulated tombstones from turning a missing
+  identity lookup into a capacity-sized scan under the shared admission mutex.
+  Split workspaces cache their configured capacity and update residency accounting
+  only when allocated capacity changes, removing repeated manager calls per vector.
+* `ANTFLY_SOURCE_VECTOR_REPLAY_READS=1` lets ANN split/refresh matrices combine a
+  native generation certified at the capture's exact base sequence with the latest
+  captured mutations. Updated payloads override the base; tombstones never fall
+  through to old vectors. Metadata/model identity and dimensions must match. An
+  older/newer native generation or dirty projection falls back to authoritative
+  artifact reads. Captured vectors already belong to the replay window, so this
+  adds no second retained payload corpus and does not weaken query readiness.
+* External-vector updates obtain their previous centroid contribution from the
+  certified native base, never from the already-updated primary artifact. Missing
+  previous versions, repeated captures, or dirty centroid origins force a complete
+  recomputation. External update batches coalesce final leaf work so recomputing
+  against the committed source batch does not double-apply a later update. Deferred
+  ancestor work resolves surviving leaves' final parents after splits/merges.
+  Deltas are used only when membership stays unchanged throughout the batch:
+  a later removal can recompute the mean and already include an earlier update.
+  Membership-changing batches reconstruct final affected centroids once; leaves
+  that have been deleted or converted to internal nodes are skipped.
+* Quantized-cache replacement suppressed during publication now invalidates the
+  previous entry. Previously, a pinned internal node could retain old routing
+  scores when child count stayed constant, changing results when evicted or
+  reopened. A deterministic 512-vector update test reproduces the failure and
+  checks cached values, cache eviction, checkpoint byte preservation, and restart.
+  Cache reads also check the transaction's publication epoch before and after
+  retaining a node, quantized payload, vector, or metadata entry. An old snapshot
+  cannot consume a newer cache entry or refill current vector residency from old
+  values. Readers still reuse current caches; older readers fall back to their
+  leased storage without forcing the whole query to restart. Unbound cursors do
+  not read or fill the vector cache. A second regression covers old node/vector/
+  quantized reads, and a deterministic interleaving checks publication during
+  cache acquisition. Native search admission carries the epoch sampled before
+  retaining its generation into the query transaction; delayed admission cannot
+  pair an old generation with a newly sampled cache epoch. A regression reproduces
+  the old-generation read returning the newly published vector before this fix.
+* Deferred quantized rebuilds now publish payload freshness in the same transaction
+  as the rebuilt payload and update the cached node state. A focused regression
+  showed that completed rebuilds previously left `payload_dirty` set. Startup
+  validation then cleared 128 such records in the failed 50K control, changing
+  which leaves used quantized scoring at unchanged sequence 814. Missing payloads
+  remain dirty, and allocation/source errors propagate instead of certifying an
+  unsuccessful rebuild.
+* Posting-WAL patch preparation skips byte-identical packed/scoring values using
+  the base already resolved for encoding. These values create neither a copy-only
+  patch nor a live overlay that unnecessarily disables the native scan plane.
+  Coverage still advances durably, and unchanged generation leases remain valid.
+
+The harness now repeats the same serial recall pass immediately before shutdown
+and after cold/warm reopen. It rejects a change greater than one reported precision
+unit (0.0001), keeping churn effects separate from restart effects. This caught a
+50K control changing from 0.9590 to 0.9704 on unchanged source data and stopped
+the queued 1M runs. The cache regression above subsequently narrowed the failure
+to eviction alone. Three arms of the next candidate passed, but its last control
+changed from 0.9589 to 0.9691. The deferred-freshness regression above explains
+a further recovery-dependent change in serving behavior. The replacement candidate passed
+this gate in all twelve 50K arms before its larger comparisons. Earlier R10 pre-churn versus post-restart recall differences
+cannot by themselves be attributed to restart.
+
+Frozen sources, binaries, runners, and results are retained under
+[`vector-store-admission-epoch-20260910`](../.benchmark-results/vector-store-admission-epoch-20260910/README.md).
+The comparison isolates replay reads, then append-only segments and selective GC
+with matched GC limits. Fresh 1M load comparisons isolate the identity-ledger fix
+from the complete candidate in forward and reverse order; load-only runs do not
+qualify query tails, churn, or restart.
+
+The admission-epoch candidate has now passed all four 50K replay-read arms,
+including unchanged before/cold/warm recall, workload checks, and reclamation.
+Replay eliminated primary-store matrix fallbacks in these arms. Initial split
+vector loading dropped from 0.938/0.906 seconds to 0.162/0.356 seconds. Median
+paired mixed QPS improved 19.1% and C30 QPS improved 5.5%, but readiness was
+mixed (14.81 → 14.32 seconds in A/B; 14.40 → 17.01 in B/A). Profile p99 and
+read-only memory also regressed. The full measurements and receipts are in the
+candidate directory above. All twelve 50K arms subsequently passed. Append-only
+segments reduced sampled logical writes 15.5% but reduced mixed QPS 12.2%;
+selective GC reduced writes another 23.0% against its append-only control but
+reduced mixed QPS 8.5% and increased fixed-churn time 6.3%. Both remain
+experimental and off in the 1M loading candidate. Fresh 1M loading comparisons are complete:
+
+| 1M measurement | Prior A/B | Complete A/B | Complete B/A | Prior B/A |
+|---|---:|---:|---:|---:|
+| Readiness (s) | 523.179 | 286.749 | 279.243 | 694.012 |
+| Synchronization (s) | 278.131 | 108.271 | 104.273 | 447.321 |
+| Split vector loading (s) | 137.881 | 22.277 | 22.946 | 269.885 |
+| Primary matrix fallback vectors | 1,399,904 | 0 | 0 | 1,408,390 |
+
+The ledger-only treatment reached readiness in 326.577/286.556 seconds, with
+42.296/38.783 seconds of split-vector loading. This isolates a substantial
+admission bookkeeping cost before replay reads remove the primary fallback.
+The complete candidate improved readiness another 12.2%/2.6% over ledger-only.
+All six loads passed. These compare vector-store implementations, not storage
+ownership defaults. A separate fresh 1M query/churn/restart qualification also passed, with identical
+0.9906 recall before/cold/warm restart and no workload errors. A supplemental
+reclamation clone retained exactly 1M payloads / 3.072 GB of payload bytes and
+zero unreferenced bytes, with post-GC queries passing. The clone was ready after
+16.06 seconds and settled after 17.07 seconds. Peak sampled RSS did not improve:
+6.39/6.88 GiB for complete versus 6.28/6.68 GiB for prior in the loading pairs;
+this includes mapped-file residency. The configured 4 GiB admission budget is
+not a hard RSS ceiling. The remaining 22–23 seconds of split loading, routing
+work, and startup inventory/marking are still measured optimization opportunities.
+
+## September 10: fresh checkpoint-admission comparison
+
+The source-lock changes work, but the complete candidate is not ready for
+promotion. Fresh `vector_store` tables were run sequentially in A/B and B/A
+order against the original frozen vector-store executable, with matched data,
+encoding, ANN settings, durability, batching and concurrency.
+
+| Loading measurement | Original control | Complete candidate |
+|---|---:|---:|
+| 50K readiness, A/B | 14.635 s | 16.851 s |
+| 50K readiness, B/A | 14.179 s | 14.559 s |
+| 1M readiness, clean B/A | 404.782 s | 649.376 s |
+| 1M insertion, clean B/A | 358.279 s | 288.091 s |
+| 1M synchronization, clean B/A | 46.504 s | 361.285 s |
+| 1M split-vector loading, clean B/A | 90.344 s | 184.237 s |
+
+Readiness regressed by 8.9% across the two 50K pairs and 60.4% in the clean 1M
+pair. Faster insertion did not compensate for the synchronization tail. The
+first 1M control reached readiness in 302.405 seconds; its candidate paused at
+875K indexed vectors and was sampled after 479 seconds of arm elapsed time.
+That candidate eventually reached readiness in 655.003 seconds, but is excluded
+from clean paired ratios. The unsampled second candidate also paused, at 762.5K
+indexed vectors. These load-only runs do not qualify 1M query/churn/restart behavior.
+
+Both 1M candidates copied zero catalog bytes and recorded only 1.86/1.75 ms of
+total source read-lock waiting. Their longest final source checkpoint commits
+were 0.389/0.388 ms, while construction and reader preparation ran outside that
+commit. The earlier 34.6-second source-mutex wait is gone in these observations.
+The remaining delay appears around resource admission: the diagnostic sample
+places a maintenance thread in `ResourceManager.issueIdentityLocked`, with the
+ANN worker waiting in `bulkSplitVectorWorkspaceAdmit -> ResourceManager.sliceStats`.
+
+Reservation-identity bookkeeping is the next target. In a separate probe after
+timing completed, a heavily churned hash map with 128 live entries and capacity
+262,144 took 1.348 seconds for 10,000 absent-key lookups, versus 0.033 ms in a
+fresh map at the same capacity. Rehashing cost 0.136 ms and restored fast lookups.
+The identity allocator checks absent, monotonically issued IDs under a global
+mutex. This supports investigating deleted-entry accumulation and bounding
+ledger lookup/admission work; the live table's occupancy was not captured, so
+the probe is not proof of the sole cause or an end-to-end improvement estimate.
+
+The separate 50K comparison isolated the new read/checkpoint path in the same
+binary, with batching and shared catalogs enabled in both arms. It passed all
+four lifecycle/error/reclamation gates: median paired readiness improved 1.3%,
+mixed query throughput 4.0%, and mixed p99 8.7%, while mixed write throughput fell
+2.5%. Concurrency-30 throughput fell 7.5% and p99 increased 6.3%. Restart recall
+varied between arms, so restart latencies are not a matched-recall comparison.
+All 10 API cases and four enrichment arms passed; small enrichment readiness
+varied in both directions, while semantic throughput improved 20–24%.
+
+Full results, frozen source, executable, validation and diagnostic evidence are
+saved in
+[`vector-store-checkpoint-admission-20260910`](../.benchmark-results/vector-store-checkpoint-admission-20260910/README.md).
+No defaults were changed. Fix and measure resource-admission bookkeeping before
+considering promotion or broader performance qualification.
+
+## September 10: vector-loading root causes under qualification
+
+The current experimental implementation separates read publication from source
+writer exclusion. Enabling positional or snapshot source reads now maintains a
+reference-counted immutable read view. Acquiring it takes only a short publication
+mutex; point and batched payload reads allocate no lease metadata and never take
+the source writer mutex, including when recording completion. ANN callers that
+need an owned native snapshot clone it after releasing publication exclusion.
+Read counters and active-session counts are atomic. Sessions still retain the
+source before taking their primary snapshot; a read view is selected after the
+primary artifact reference, preserving version visibility and GC protection.
+GC fences its zero-session check with a session-start epoch across primary
+snapshot acquisition. If a session starts in that window, marking defers even
+if the session has already retired. This preserves the old-reader boundary
+without putting session admission behind the source writer mutex. External
+poisoning fences both the writer and published-reader paths.
+
+WAL checkpoints and stable-tip base construction reserve one generation, seal the
+committed WAL cut, then build immutable files outside the source writer mutex.
+Ordinary preparations may append during that build, subject to the bounded WAL
+admission window. Final preparation briefly fences new writers while constructing
+the replacement manifest and reader view outside the mutex. The fenced commit
+preserves later WAL extents without copying their payloads, publishes CURRENT,
+then swaps the prepared read view. Old leases retain their blocks and WAL nodes.
+GC and other checkpoint builders defer while that generation is reserved.
+Admission waits use an epoch notification; checkpoint success and failure both
+wake writers. Staged-file cleanup remains armed before publication and is disarmed
+after an ambiguous CURRENT result so recovery can determine which files won.
+
+The ANN compaction caller also releases its build mutex before source
+checkpointing. It first pins the sealed ANN generation and exact WAL prefix,
+then checkpoints the source and stages ANN shards in the existing optimistic
+publication section. Concurrent ANN captures can append; the original
+generation reservation, suffix validation, and final publication fence remain
+in force. Releasing only the inner source lock would leave this outer stall.
+
+Deterministic tests pause both checkpoint construction and publication, read while
+holding the writer mutex, append after the checkpoint cut, force WAL admission
+waiting, and reopen twice. Native tests include concurrent updates and tombstones,
+stale prepared publication rejection, and sealed/unsealed WAL suffixes. Source
+tests cover pre-publication failure, ambiguous CURRENT, and read-view allocation
+failure. A GC regression opens an old primary reader and deletes its artifact
+between the zero-session check and GC snapshot acquisition, verifying deferral
+and eventual reclamation in both read modes. A caller regression verifies ANN
+capture admission is open at the source checkpoint boundary. Checkpoint benchmark
+events separate staging, publication preparation,
+and commit time. Fresh loading qualification found the regression described above;
+table ownership and experiment defaults remain unchanged.
+
+Implementation validation passes 57 source tests, 34 native-store tests, the
+ANN admission regression, and five DB lifecycle tests in each of default,
+positional, and snapshot-read modes. These include independent models, stale
+chunk deletion, source-hash reuse, restart without an ANN index, and rebuilding
+after the last consumer is dropped. The final source and validation receipts
+are preserved in
+[`vector-store-checkpoint-admission-20260910`](../.benchmark-results/vector-store-checkpoint-admission-20260910/README.md).
+Its release build and fresh runtime comparison completed as described above. The preceding
+published-checkpoint experiment's completed API/enrichment checks and partial
+scale run predate the final ANN admission and GC epoch corrections.
+
+Source batching alone is not a demonstrated readiness improvement. In the first
+fresh 1M pair, the serialized control reached readiness in 395.9 seconds and the
+batched candidate in 457.6 seconds. Split-vector loading accounted for 99.4 and
+169.4 seconds respectively. The candidate recorded approximately 24 seconds
+inside source reads and 24 seconds waiting for the source lock; these source
+counters cover its initial server lifetime, including subsequent workload steps.
+They must not be subtracted from the initial-loading timer as an exact partition.
+The second 1M pair also regressed: 547.1 seconds batched versus 377.5 seconds
+control. That candidate includes two short stack samples and is not an
+uninstrumented paired observation. The small enrichment update test was about 150 ms (7%) slower in both pairs,
+which is insufficient evidence to dismiss the difference as fluctuation.
+
+The loading path contains more than vector I/O. ANN metadata selects artifact
+keys, primary values select immutable artifact versions, and source reads then
+validate, decode and copy those versions. Two inefficiencies have been corrected
+in the working implementation:
+
+- Prepared source payloads now use a transaction-owned contiguous hash index.
+  This replaces repeated full scans of the preparation list and suppresses
+  identical preparations within a transaction. The identity still includes the
+  complete artifact key, model namespace, source envelope and vector bytes.
+  Old versions remain addressable independently. Index growth releases its old
+  allocation; payload ownership ends with the transaction. An isolated 12,500-
+  preparation, 20,000-read test measured 123 ms scanning versus 0.32 ms indexed;
+  this is not an end-to-end readiness estimate.
+- Write-transaction batch reads resolve their pending overlay first, capture
+  mutable values and pin immutable generations together, then perform block I/O
+  outside the LSM writer lock. The previous path held that lock across reads and
+  decompression, explicitly disabling existing bounded parallel point reads.
+  Returned values remain owned by the write transaction after the temporary
+  probe retires. This improvement applies to both storage modes.
+
+Stack samples during a later 1M candidate caught primary reference reads in the
+serialized block-decoding path. A later sample attributed 29 split-loading
+samples to primary-reference reads and 26 to source lookup, of which 24 were in
+CRC validation. These are short diagnostic samples, not whole-run CPU percentages;
+the sampled arm is identified in the benchmark evidence. Hot-buffer CRC testing
+measured about 10 GiB/s, suggesting mapped-page access rather than checksum
+arithmetic as the next hypothesis to test; the sample alone cannot distinguish
+CPU work from page faults.
+
+The opt-in `ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS=1` path acquires a short
+immutable source lease, releases the publication mutex, and performs bounded positional
+reads directly into the caller's float32 batch. Both native CRC and the complete
+artifact SHA identity remain mandatory. Float16 decodes from the same immutable
+read view; retaining that view requires no optional allocation. Leases retain WAL versions and block readers
+through all I/O, and callbacks run after reads complete. Counters record positional
+bytes, batches, and admission fallbacks. This experiment requires source batching;
+the `positional_reads` comparison preset enables batching in both arms.
+
+Positional reads now also require shared immutable segment and manifest catalogs.
+Previously, every bounded read lease copied metadata for the whole segment set;
+the interrupted 1M candidate had copied 5.15 GB by 475K indexed vectors. Sharing
+is established at open and before successor publication, so reader acquisition
+retains catalog ownership instead of traversing all segments. WAL versions and
+old segment files remain pinned until leases retire. Regression tests verify zero
+additional catalog-copy bytes across repeated positional reads and old lease
+validity across WAL updates, checkpoint publication, and source destruction.
+The isolated `positional_reads` preset holds sharing enabled in both arms.
+
+The fresh comparison is preserved in
+[`vector-store-shared-read-leases-20260910`](../.benchmark-results/vector-store-shared-read-leases-20260910/README.md).
+Storage tests use the newly frozen source. Timing uses the preceding frozen
+ReleaseFast executable with its explicit sharing switch enabled, which executes
+the same ownership path now required automatically. The control is the original
+frozen executable, with fresh vector-store tables in A/B and B/A order at each
+scale. These load-only runs measure readiness and loading costs; they do not
+establish full query/churn/recovery qualification. The prior interrupted run and
+its 342.4-second control (103.1 seconds of split-vector loading) remain preserved.
+
+The completed sharing-only 50K pairs eliminated catalog-copy bytes but regressed
+measured readiness by 9.8% despite reducing split-vector loading by 21–23%. Its
+first 1M pair reached readiness in 513.6 seconds versus 349.7 seconds control;
+split-vector loading was 153.8 versus 96.8 seconds. One interval spent 34.6 seconds
+waiting for the source mutex, and the candidate accumulated 38.9 seconds of source
+lock waiting overall. This is why immutable read publication and staged checkpoints
+are necessary beyond catalog sharing. The reverse-order run was stopped at the
+user's request to implement those improvements first; it is not a completed
+comparison or evidence of a readiness improvement.
+
+End-to-end stress exposed an existing I/O assumption that became reachable from
+write-transaction reads: range futures required a concurrent worker and could
+fail indexing with `ConcurrencyUnavailable`. They now use optional asynchronous
+execution, which runs on the caller when worker capacity is exhausted. A regression
+test exercises zero worker capacity, successful reads, cancellation, and read
+errors. All 34 native storage I/O tests pass.
+
+The batched payload path uses at most 32 vectors and approximately 128 KiB of
+scratch (at least one vector for larger dimensions). It can borrow caller scratch
+when optional allocation is denied. Callbacks run after the source lock retires.
+Stage counters distinguish ANN metadata lookup, primary-reference lookup, source
+lock wait, locked source work, and total payload consumption.
+
+Qualification is preserved under `.benchmark-results/` in
+`vector-store-batch-reads-20260910`, `vector-store-prepared-index-20260910`, and
+`vector-store-unlocked-reads-20260910`. The unlocked-read comparison uses the
+prepared-index binary as its control, with batching enabled in both arms. Core
+source/recovery tests, preparation allocation-failure tests and the wider LSM
+suite pass; end-to-end performance qualification is still pending. The first
+unlocked comparison hit query memory admission failures in its control; its retry
+hit the worker-saturation failure during candidate churn. Both failed arms are
+preserved. The query-error checker now includes client framework logs, and the
+stricter audit passes all eight original table-mode arms and all eight batching
+arms. A positional-read diagnostic also reproduced query memory pressure during
+enrichment; its reservation owner is still under investigation. The corrected
+worker fallback and positional-read comparison are frozen in
+`vector-store-bounded-loads-20260910`, with 1M gated on 50K lifecycle checks. Neither table
+ownership defaults nor the opt-in batching default have changed.
+
+The memory investigation also reproduced an admission defect in a focused test:
+weighted reclamation could leave unused shares with empty cache owners and reject
+a query while another owner retained enough idle scratch. A bounded second pass
+redistributes those shares after a productive first pass. It retains the registry
+identity fence, skips busy owners, and does not raise limits; all 67 resource-manager
+tests pass. End-to-end confirmation is pending. `--load-only` on the qualification
+harness isolates initial ingestion and readiness when diagnosing loading; it
+deliberately omits the full qualification receipt and cannot satisfy a scale gate.
+
+Status: experimental implementation, fresh table-mode comparison completed, 2026-09-10. The table setting,
 reference-based source payload path, recovery/reader guards, and initial
 reclamation/accounting are implemented in this worktree. Recovery qualification
 passed; the 1M performance tradeoffs keep the settings opt-in.
@@ -14,6 +1878,53 @@ now default to no-copy (September 7, 2026). Set
 Existing planes remain readable without an eager rewrite. This does not change
 the table-level source-ownership setting or exact-score requirements. Frozen
 comparison catalogs and archive locations are in `benchmark-baselines/README.md`.
+
+## Fresh current table-mode comparison
+
+The [September 10 comparison](../.benchmark-results/vector-store-current-compare-20260910/RESULTS.md)
+uses frozen commit `e4db011603e2bf701aaecba6f580d99076b4635f`, one ReleaseFast
+binary and fresh standalone tables in A/B then B/A order on the available host.
+Only table source ownership changes. Float32 encoding, ANN settings, durability,
+batch size, concurrency and the 4 GiB process budget stay fixed; optional source
+experiments are unset. The 81 storage tests, five public API cases, eight scale
+arms, four source reclamation checks and four enrichment arms passed. There were
+no query errors. The binary, harness, client and dataset metadata were verified
+after completion. No defaults changed.
+
+| Median paired vector-store/LSM change | 50K | 1M |
+| --- | ---: | ---: |
+| Initial readiness time | +6.2% | +46.4% |
+| Peak query throughput | +5.0% | +8.6% |
+| Mixed query throughput | -0.9% | +18.1% |
+| Mixed writes/s | +2.2% | +10.7% |
+| Mixed query p99 | +12.9% | -12.8% |
+| Total logical disk | -49.7% | -42.6% |
+| Mixed sampled physical footprint | -43.0% | -69.9% |
+| Fixed-count churn logical write I/O | -24.1% | -23.6% |
+
+Throughput varies with run order. At 1M, source readiness takes 434/463 seconds
+versus 322/293 seconds for primary LSM. Fixed-count source churn takes 125/25
+seconds versus 28/41 seconds for primary LSM; an average obscures this tail.
+The slow restore waits 84.5 seconds for index synchronization, with 84.0 seconds
+in one worker's quantization loading timer and only 38 milliseconds in its
+quantization computation. The timer includes leaf-vector or internal-child reads
+and their waits; it does not establish raw source I/O as the cause.
+
+At 50K, live recall is about 98.3–98.4%, while cold restart recall is about
+95.8–96.1% in both modes. Post-restart latency is therefore not consistently a
+comparison at matched recall. The small enrichment workload also retains a
+readiness cost: initial readiness increases about 20%, updated readiness about
+10%, with 21% less disk. These results establish storage savings, not a universal
+loading or latency improvement.
+
+The [loader investigation](../.benchmark-results/vector-store-current-compare-20260910/SYNC_WAIT.md)
+identifies a concrete fallback cost: rejection of a whole immutable generation
+can send ANN leaf refreshes through primary artifact reads, individual source
+locks, serialized-envelope reconstruction and subsequent decoding. The next
+target is bounded direct reference batches into ANN scratch, preserving exact
+version identity, transaction visibility and reader protection. Separate leaf
+and internal loading timers and source lock accounting must distinguish an
+actual fix from an outlier that simply did not recur.
 
 ## Sparse fallback and bounded planning follow-up
 
@@ -927,7 +2838,7 @@ and failed gates are preserved in
 `scale/Performance1536D50K-comparison.json` (`.benchmark-results/vector-next-experiments/scale/Performance1536D50K-comparison.json`)
 (`qualified: false`) and the experiment report (`.benchmark-results/vector-next-experiments/RESULTS.md`).
 
-## Experimental implementation
+## Implemented ownership paths
 
 Create a fresh standalone table with:
 
@@ -935,7 +2846,8 @@ Create a fresh standalone table with:
 {"num_shards": 1, "storage": {"dense_embeddings": "vector_store"}}
 ```
 
-`primary_lsm` remains the default. The setting is persisted in the table catalog
+Omitting `storage` now selects `vector_store` for the qualified local standalone
+deployment described above. Explicit `primary_lsm` remains available. The setting is persisted in the table catalog
 and primary store, reported by table status, and immutable after creation.
 Existing populated roots cannot be switched in place. Local single-shard LSM
 tables are the initial supported deployment. Replication/HA, split and snapshot
@@ -1787,7 +3699,7 @@ not by themselves prove that all primary embedding payloads can be removed.
 Source ownership, transactions, repair, replication, and backup must first
 support the reference-only representation.
 
-## Experimental table setting
+## Table setting
 
 The optional, persisted setting at table creation lets fresh tables exercise
 either ownership model with the same binary and public API. Implemented request
@@ -1804,8 +3716,8 @@ shape:
 
 | Mode | Source embedding ownership |
 | --- | --- |
-| `primary_lsm` (default) | Preserve the current primary artifact representation and existing serving behavior |
-| `vector_store` (experimental) | Store exact payloads in the shared vector store and committed references in primary artifact records |
+| `primary_lsm` | Preserve the primary artifact representation; default for legacy records and unqualified deployments |
+| `vector_store` | Store exact payloads in the shared vector store and committed references in primary artifact records; default for fresh qualified standalone tables |
 
 These modes select source ownership. `primary_lsm` may still use shared vector
 files for serving; it does not mean disabling the existing vector read path.
@@ -1835,10 +3747,10 @@ for the experimental mode until their lifecycle contracts are implemented and
 validated. Supported backup/restore paths must preserve reference closure; any
 unimplemented path must reject the operation explicitly.
 
-Switching an existing table requires a separate migration protocol. For the
-initial experiment, returning to the default means creating a fresh default-mode
-table and reloading it from the benchmark source. A runtime toggle is not a
-rollback mechanism for reference-only artifacts.
+Switching an existing table uses the explicit offline or online protocol in
+[Existing-table migration](#existing-table-migration). Direct configuration
+changes remain rejected. A runtime toggle is not a rollback mechanism for
+reference-only artifacts.
 
 ## Implementation sequence and acceptance
 

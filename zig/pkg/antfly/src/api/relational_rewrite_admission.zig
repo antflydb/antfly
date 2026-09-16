@@ -131,6 +131,9 @@ const SourceSchemas = struct {
 /// leader-fenced read only. No source pins, parent schema writes, or hidden
 /// roots may be created until the returned plan is atomically admitted.
 pub fn build(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, table_name: []const u8, proposed: []const u8, observer: anytype) !stages.Plan {
+    // Source ownership must stay fixed throughout the rewrite cohort. Check
+    // every member before issuing any source reads or admitting a durable job.
+    for (selected) |table| if (table.storage_migration != null) return error.TableTransitionActive;
     const current = for (selected) |table| {
         if (std.mem.eql(u8, table.name, table_name)) break table;
     } else return error.TableNotFound;
@@ -263,6 +266,11 @@ test "distributed txn rewrite admission closes current and historical dependenci
     try std.testing.expect(plan.preparing_sources);
     try std.testing.expectEqual(@as(usize, 3), observer.calls);
     try std.testing.expectEqual(observer.calls, observer.released);
+    const migrating = try alloc.dupe(records.TableRecord, cohort);
+    migrating[migrating.len - 1].storage_migration = .{ .request = .{ .job_id = "vectors", .mode = .online } };
+    const calls_before_migration = observer.calls;
+    try std.testing.expectError(error.TableTransitionActive, build(alloc, plan.id, migrating, &ranges, "parents", proposed, &observer));
+    try std.testing.expectEqual(calls_before_migration, observer.calls);
     for (plan.targets) |target| {
         try std.testing.expect(target.replace != null);
         try std.testing.expectEqual(@as(usize, 0), target.source_artifacts.len);

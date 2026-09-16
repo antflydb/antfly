@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // Licensed under the Elastic License 2.0 (ELv2).
 
-//! Replayable HA lifecycle scenario over the real primary, standby, slot,
+//! Replayable standby lifecycle scenario over the real primary, standby, slot,
 //! replication-log, progress-WAL, fencing, retention, promotion, and rejoin
 //! implementations.
 
@@ -41,16 +41,17 @@ const applied_prefix_id = vopr.id.stable("property", "storage.hot_standby.applie
 const durability_sound_id = vopr.id.stable("property", "storage.hot_standby.remote_apply_ack_is_sound");
 const backup_pinned_id = vopr.id.stable("property", "storage.hot_standby.base_backup_pin_survives_restart");
 const fenced_promotion_id = vopr.id.stable("property", "storage.hot_standby.promotion_requires_durable_fence");
+const applied_promotion_id = vopr.id.stable("property", "storage.hot_standby.promotion_respects_applied_tail");
 const timeline_id = vopr.id.stable("property", "storage.hot_standby.timeline_and_epoch_are_monotonic");
 const rejoin_safe_id = vopr.id.stable("property", "storage.hot_standby.former_primary_never_rejoins_unsafely");
 const complete_id = vopr.id.stable("property", "storage.hot_standby.campaign_completed");
 
 const Paths = struct {
-    primary_log: [:0]const u8 = "/ha/primary/log",
-    primary_slots: [:0]const u8 = "/ha/primary/slots",
-    standby_log: [:0]const u8 = "/ha/standby/log",
-    standby_progress: [:0]const u8 = "/ha/standby/progress",
-    fence_wal: [:0]const u8 = "/ha/fence",
+    primary_log: [:0]const u8 = "/standby/primary/log",
+    primary_slots: [:0]const u8 = "/standby/primary/slots",
+    standby_log: [:0]const u8 = "/standby/standby/log",
+    standby_progress: [:0]const u8 = "/standby/standby/progress",
+    fence_wal: [:0]const u8 = "/standby/fence",
 };
 
 const ApplyModel = struct {
@@ -70,14 +71,15 @@ const ApplyModel = struct {
 
 pub fn Scenario(comptime action_budget: u64) type {
     return struct {
-        pub const name: []const u8 = "ha-lifecycle";
-        pub const version: u32 = 2;
+        pub const name: []const u8 = "standby-lifecycle";
+        pub const version: u32 = 3;
         pub const properties = &[_]vopr.property.Declaration{
             .{ .id = progress_ordered_id, .name = "storage.hot_standby.progress_is_ordered", .kind = .always },
             .{ .id = applied_prefix_id, .name = "storage.hot_standby.applied_payloads_are_primary_prefix", .kind = .always },
             .{ .id = durability_sound_id, .name = "storage.hot_standby.remote_apply_ack_is_sound", .kind = .always },
             .{ .id = backup_pinned_id, .name = "storage.hot_standby.base_backup_pin_survives_restart", .kind = .always },
             .{ .id = fenced_promotion_id, .name = "storage.hot_standby.promotion_requires_durable_fence", .kind = .always },
+            .{ .id = applied_promotion_id, .name = "storage.hot_standby.promotion_respects_applied_tail", .kind = .always },
             .{ .id = timeline_id, .name = "storage.hot_standby.timeline_and_epoch_are_monotonic", .kind = .always },
             .{ .id = rejoin_safe_id, .name = "storage.hot_standby.former_primary_never_rejoins_unsafely", .kind = .always },
             .{ .id = complete_id, .name = "storage.hot_standby.campaign_completed", .kind = .reachable },
@@ -107,6 +109,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             unfenced_rejections: u64 = 0,
             promoted: bool = false,
             promotion_fenced: bool = true,
+            promotion_applied_tail_safe: bool = true,
             timeline_monotonic: bool = true,
             rejoin_safe: bool = true,
             durability_sound: bool = true,
@@ -172,6 +175,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             state.unfenced_rejections = 0;
             state.promoted = false;
             state.promotion_fenced = true;
+            state.promotion_applied_tail_safe = true;
             state.timeline_monotonic = true;
             state.rejoin_safe = true;
             state.durability_sound = true;
@@ -304,7 +308,23 @@ pub fn Scenario(comptime action_budget: u64) type {
                 try events.emitNamed(allocator, .state_change, "storage.hot_standby.promotion_fence_acquired", state.receipt.?.generation);
             } else if (selected.id == promote_id) {
                 const receipt = state.receipt orelse return error.PromotionFenceMissing;
-                _ = try state.standby.promote(receipt.promotionRequest());
+                const before = state.standby.snapshot();
+                const needs_apply = !receipt.forced and
+                    (before.progress.received_lsn < receipt.required_lsn or
+                        before.progress.applied_lsn < before.progress.received_lsn or
+                        before.progress.applied_lsn < receipt.required_lsn);
+                // A receipt captures the fence boundary, not a promise that
+                // every later receive has been applied. Keep exploring early
+                // promotion attempts and observe the production rejection;
+                // never silently turn them into forced promotions.
+                _ = state.standby.promote(receipt.promotionRequest()) catch |err| {
+                    if (err != error.PromotionRequiresForce) return err;
+                    state.promotion_applied_tail_safe = state.promotion_applied_tail_safe and
+                        needs_apply and std.meta.eql(before, state.standby.snapshot());
+                    try events.emitNamed(allocator, .client_response, "storage.hot_standby.promotion_waiting_for_apply", before.progress.applied_lsn);
+                    return vopr.outcome.TransitionOutcome.rejected("storage.hot_standby.promotion_requires_apply", before.progress.applied_lsn);
+                };
+                state.promotion_applied_tail_safe = state.promotion_applied_tail_safe and !needs_apply;
                 state.promoted = true;
                 state.promotion_fenced = state.promotion_fenced and true;
                 const identity = state.standby.identitySnapshot();
@@ -362,6 +382,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             try sink.check(allocator, durability_sound_id, state.durability_sound);
             try sink.check(allocator, backup_pinned_id, state.backup_pin_valid);
             try sink.check(allocator, fenced_promotion_id, !state.promoted or (state.receipt != null and state.promotion_fenced));
+            try sink.check(allocator, applied_promotion_id, state.promotion_applied_tail_safe);
             try sink.check(allocator, timeline_id, state.timeline_monotonic);
             try sink.check(allocator, rejoin_safe_id, state.rejoin_safe);
             try sink.check(allocator, complete_id, state.finished);
@@ -381,7 +402,7 @@ pub fn record(allocator: std.mem.Allocator, seed: u64) !vopr.trace.Trace {
         .system = "antfly",
         .seed = seed,
         .transition_budget = 33,
-        .source_revision = "ha-vopr-cli",
+        .source_revision = "standby-vopr-cli",
         .target = "native",
         .optimize = @tagName(builtin.mode),
     });
@@ -574,12 +595,12 @@ fn expectEvent(artifact: *const vopr.trace.Trace, name: []const u8) !void {
     return error.ExpectedHaVoprEventMissing;
 }
 
-test "HA VOPR replays crash standby fencing retention backup and promotion lifecycles" {
+test "standby VOPR replays crash standby fencing retention backup and promotion lifecycles" {
     try runRecordReplay(32, 0xA17F_AA11);
     try runRecordReplay(32, 0xA17F_AA12);
 }
 
-test "HA VOPR bounded standby apply uses the virtual WAL clock" {
+test "standby VOPR bounded standby apply uses the virtual WAL clock" {
     const HaScenario = Scenario(32);
     var world = try HaScenario.init(std.testing.allocator);
     defer HaScenario.deinit(&world, std.testing.allocator);
@@ -608,7 +629,7 @@ test "HA VOPR bounded standby apply uses the virtual WAL clock" {
     try state.vopr_io.ensureNoCapabilityViolation();
 }
 
-test "HA VOPR preserves exact progress and property streams across fresh worlds" {
+test "standby VOPR preserves exact progress and property streams across fresh worlds" {
     const HaScenario = Scenario(20);
     var seeded = vopr.choice.Seeded.init(0xA17F_AA13);
     var artifact = try vopr.runner.run(HaScenario, std.testing.allocator, seeded.source(), .{
@@ -623,7 +644,7 @@ test "HA VOPR preserves exact progress and property streams across fresh worlds"
     }
 }
 
-test "HA VOPR scripted partition rejects unfenced promotion and safely fences promotes and rejoins" {
+test "standby VOPR scripted partition rejects unfenced promotion and safely fences promotes and rejoins" {
     const selections = [_]vopr.id.StableId{
         append_id,
         receive_id,
@@ -644,7 +665,54 @@ test "HA VOPR scripted partition rejects unfenced promotion and safely fences pr
     try expectEvent(&artifact, "storage.hot_standby.former_primary_assessed");
 }
 
-test "HA VOPR scripted receive apply report and backup crash windows recover durably" {
+test "standby VOPR promotion rejects a newly received tail then catches up across restart" {
+    const selections = [_]vopr.id.StableId{
+        append_id,
+        receive_id,
+        apply_id,
+        partitionSpec().startTransition().id,
+        acquire_fence_id,
+        partitionSpec().stopTransition().id,
+        append_id,
+        receive_id,
+        promote_id,
+        restart_standby_id,
+        promote_id,
+        apply_id,
+        promote_id,
+        rejoin_id,
+        finish_id,
+    };
+    var artifact = try runScripted(selections.len - 1, &selections);
+    defer artifact.deinit();
+    var rejections: usize = 0;
+    for (artifact.events.items) |event| {
+        if (std.mem.eql(u8, event.name, "storage.hot_standby.promotion_waiting_for_apply"))
+            rejections += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), rejections);
+    try expectEvent(&artifact, "storage.hot_standby.standby_promoted");
+    try expectEvent(&artifact, "storage.hot_standby.former_primary_assessed");
+}
+
+test "standby VOPR an explicitly forced fence permits promotion behind the required tail" {
+    const selections = [_]vopr.id.StableId{
+        append_id,
+        append_id,
+        receive_id,
+        partitionSpec().startTransition().id,
+        acquire_fence_id,
+        promote_id,
+        rejoin_id,
+        finish_id,
+    };
+    var artifact = try runScripted(selections.len - 1, &selections);
+    defer artifact.deinit();
+    try expectEvent(&artifact, "storage.hot_standby.standby_promoted");
+    try expectEvent(&artifact, "storage.hot_standby.former_primary_assessed");
+}
+
+test "standby VOPR scripted receive apply report and backup crash windows recover durably" {
     const selections = [_]vopr.id.StableId{
         append_id,
         receive_id,
@@ -664,7 +732,7 @@ test "HA VOPR scripted receive apply report and backup crash windows recover dur
     try expectEvent(&artifact, "storage.hot_standby.campaign_complete");
 }
 
-test "HA VOPR scripted retention expires lagging stream and persists reseed state" {
+test "standby VOPR scripted retention expires lagging stream and persists reseed state" {
     const selections = [_]vopr.id.StableId{
         append_id,
         append_id,

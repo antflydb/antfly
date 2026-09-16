@@ -3369,7 +3369,7 @@ def stateful_api(request: pytest.FixtureRequest):
                 "POST", f"/transactions/{transaction_id}/commit", payload or None
             )
             if response.status_code not in (200, 409):
-                response.raise_for_status()
+                self._check(response)
             return response.status_code, self._decode(response)
 
         def abort_transaction_session(self, transaction_id: str) -> dict:
@@ -3568,8 +3568,16 @@ def backup_api(request: pytest.FixtureRequest):
             num_shards: int = 1,
             description: str | None = None,
             indexes: dict[str, dict] | None = None,
+            storage: dict[str, str] | None = None,
         ) -> dict:
-            payload: dict[str, object] = {"num_shards": num_shards}
+            # Backup qualification still requires primary ownership until
+            # snapshots preserve source-vector reference closure.
+            payload: dict[str, object] = {
+                "num_shards": num_shards,
+                "storage": storage
+                if storage is not None
+                else {"dense_embeddings": "primary_lsm"},
+            }
             if description is not None:
                 payload["description"] = description
             if indexes is not None:

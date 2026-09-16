@@ -16,6 +16,8 @@
 //! code schedules whole maintenance quanta through this interface and never
 //! imports the DB, LSM, or index maintenance implementations.
 
+pub const PostingRefreshProgress = @import("../storage/posting_refresh_progress.zig").Progress;
+
 pub const RoundResult = struct {
     progressed: bool = false,
     group_id: ?u64 = null,
@@ -33,7 +35,7 @@ pub const Source = struct {
 
     pub const VTable = struct {
         run_lsm_round: *const fn (*anyopaque, bool) anyerror!RoundResult,
-        run_dense_posting_round: *const fn (*anyopaque) anyerror!usize,
+        run_dense_posting_round: *const fn (*anyopaque) anyerror!PostingRefreshProgress,
         publish_dense_checkpoints: *const fn (*anyopaque) anyerror!@import("../storage/db/types.zig").NativePublicationResult,
         run_vector_block_round: *const fn (*anyopaque) anyerror!usize,
         publish_runtime_statuses: ?*const fn (*anyopaque) void = null,
@@ -44,7 +46,7 @@ pub const Source = struct {
         return try self.vtable.run_lsm_round(self.ptr, best_effort);
     }
 
-    pub fn runDensePostingRound(self: Source) !usize {
+    pub fn runDensePostingRound(self: Source) !PostingRefreshProgress {
         return try self.vtable.run_dense_posting_round(self.ptr);
     }
 

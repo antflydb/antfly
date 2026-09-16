@@ -7,6 +7,8 @@ import {
   validateCreateIndexRequestRelationships,
 } from "../src/index-config.js";
 
+import { indexEmbedderProviders } from "../src/types.js";
+
 describe("relational index request validation", () => {
   const config = {
     type: "relational",
@@ -109,6 +111,16 @@ describe("relational index request validation", () => {
 });
 
 describe("artifact embedding index configuration", () => {
+  it("offers OpenRouter for managed embedding indexes", () => {
+    expect(indexEmbedderProviders).toContain("openrouter");
+    const config = artifactEmbeddingIndexConfig("router_vectors", {
+      sources: [{ artifact: "dense_v1", field: "body" }],
+      embedder: { provider: "openrouter", model: "openai/text-embedding-3-small" },
+      dimension: 1536,
+    });
+    expect(config.embedder?.provider).toBe("openrouter");
+  });
+
   it("builds a full-text index over multiple artifact streams", () => {
     expect(
       artifactFullTextIndexConfig("document_text", "document_text_v1", "document_chunks_v1")

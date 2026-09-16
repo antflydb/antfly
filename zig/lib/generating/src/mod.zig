@@ -90,6 +90,7 @@ pub const Provider = enum {
     gemini,
     vertex,
     openai,
+    openrouter,
     ollama,
     antfly,
     mock,
@@ -109,6 +110,8 @@ pub const OpenAIConfig = struct {
     url: []const u8 = "https://api.openai.com/v1",
     api_key: ?[]const u8 = null,
 };
+
+pub const openrouter_default_url = "https://openrouter.ai/api/v1";
 
 pub const OllamaConfig = struct {
     model: []const u8,
@@ -299,14 +302,17 @@ pub fn stringifyChainLinkAlloc(alloc: std.mem.Allocator, link: ChainLink) ![]u8 
 }
 
 pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorConfig) !GeneratorConfig {
+    const provider = try providerFromOpenApi(generated.provider);
     var cfg = GeneratorConfig{
         .rate_limit = generated.rate_limit,
-        .provider = try providerFromOpenApi(generated.provider),
+        .provider = provider,
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
         .url = if (generated.url) |url|
             try alloc.dupe(u8, url)
         else if (generated.api_url) |api_url|
             try alloc.dupe(u8, api_url)
+        else if (provider == .openrouter)
+            try alloc.dupe(u8, openrouter_default_url)
         else
             "",
         .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
@@ -331,7 +337,7 @@ pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
         .provider = providerToOpenApi(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .url = switch (cfg.provider) {
-            .openai, .ollama, .gemini, .vertex, .mock => if (cfg.url.len > 0) cfg.url else null,
+            .openai, .openrouter, .ollama, .gemini, .vertex, .mock => if (cfg.url.len > 0) cfg.url else null,
             .antfly => null,
         },
         .api_url = switch (cfg.provider) {
@@ -602,6 +608,7 @@ fn providerFromOpenApi(provider: ?[]const u8) !Provider {
     if (std.mem.eql(u8, name, "gemini")) return .gemini;
     if (std.mem.eql(u8, name, "vertex")) return .vertex;
     if (std.mem.eql(u8, name, "openai")) return .openai;
+    if (std.mem.eql(u8, name, "openrouter")) return .openrouter;
     if (std.mem.eql(u8, name, "ollama")) return .ollama;
     if (std.mem.eql(u8, name, "antfly")) return .antfly;
     return error.UnsupportedGeneratorProvider;
@@ -662,6 +669,22 @@ test "generator config preserves explicit max_tokens" {
         \\{"provider":"openai","model":"gpt-4.1","url":"https://api.openai.com/v1","max_tokens":0}
     ;
     try std.testing.expectError(error.InvalidGeneratorConfig, parseConfigFromSlice(alloc, invalid));
+}
+
+test "openrouter generator config defaults to its OpenAI-compatible endpoint" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"provider":"openrouter","model":"openai/gpt-4o-mini","api_key":"${secret:openrouter.api_key}"}
+    ;
+    var cfg = try parseConfigFromSlice(alloc, raw);
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(.openrouter, cfg.provider);
+    try std.testing.expectEqualStrings(openrouter_default_url, cfg.url);
+    try std.testing.expectEqualStrings("${secret:openrouter.api_key}", cfg.api_key orelse return error.TestUnexpectedResult);
+
+    const encoded = try stringifyConfigAlloc(alloc, cfg);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"provider\":\"openrouter\"") != null);
 }
 
 test "generator config preserves sampling controls" {

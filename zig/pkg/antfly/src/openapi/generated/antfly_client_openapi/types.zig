@@ -12897,6 +12897,7 @@ pub const GeneratorProvider = enum {
     vertex,
     ollama,
     openai,
+    openrouter,
     antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -12905,6 +12906,7 @@ pub const GeneratorProvider = enum {
             .vertex => "vertex",
             .ollama => "ollama",
             .openai => "openai",
+            .openrouter => "openrouter",
             .antfly => "antfly",
         };
         try jw.write(s);
@@ -12920,6 +12922,7 @@ pub const GeneratorProvider = enum {
             .{ "vertex", .vertex },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
+            .{ "openrouter", .openrouter },
             .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -18521,6 +18524,7 @@ pub const IndexConfig = struct {
 pub const IndexEmbedderConfig = union(enum) {
     ollama_embedder_config: OllamaEmbedderConfig,
     open_ai_embedder_config: OpenAIEmbedderConfig,
+    open_router_embedder_config: OpenRouterEmbedderConfig,
     bedrock_embedder_config: BedrockEmbedderConfig,
     cohere_embedder_config: CohereEmbedderConfig,
     google_embedder_config: GoogleEmbedderConfig,
@@ -18550,6 +18554,9 @@ pub const IndexEmbedderConfig = union(enum) {
         }
         if (std.mem.eql(u8, disc_str, "openai")) {
             return .{ .open_ai_embedder_config = try std.json.parseFromSliceLeaky(OpenAIEmbedderConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "openrouter")) {
+            return .{ .open_router_embedder_config = try std.json.parseFromSliceLeaky(OpenRouterEmbedderConfig, allocator, input, options) };
         }
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromSliceLeaky(BedrockEmbedderConfig, allocator, input, options) };
@@ -18589,6 +18596,9 @@ pub const IndexEmbedderConfig = union(enum) {
         if (std.mem.eql(u8, disc_str, "openai")) {
             return .{ .open_ai_embedder_config = try std.json.parseFromValueLeaky(OpenAIEmbedderConfig, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "openrouter")) {
+            return .{ .open_router_embedder_config = try std.json.parseFromValueLeaky(OpenRouterEmbedderConfig, allocator, source, options) };
+        }
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromValueLeaky(BedrockEmbedderConfig, allocator, source, options) };
         }
@@ -18611,6 +18621,7 @@ pub const IndexEmbedderConfig = union(enum) {
         switch (self) {
             .ollama_embedder_config => |v| try jw.write(v),
             .open_ai_embedder_config => |v| try jw.write(v),
+            .open_router_embedder_config => |v| try jw.write(v),
             .bedrock_embedder_config => |v| try jw.write(v),
             .cohere_embedder_config => |v| try jw.write(v),
             .google_embedder_config => |v| try jw.write(v),
@@ -25231,11 +25242,13 @@ pub const OpenAIGeneratorConfig = struct {
     }
 };
 
-/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
+/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. Antfly currently supports dense text embeddings through this provider. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
 pub const OpenRouterEmbedderConfig = struct {
     provider: []const u8,
     /// The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
     model: []const u8,
+    /// The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
+    url: ?[]const u8 = null,
     /// The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
     api_key: ?[]const u8 = null,
     /// Output dimension for the embedding (if supported by the model).
@@ -25245,6 +25258,7 @@ pub const OpenRouterEmbedderConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
         .{ "model", "model", false },
+        .{ "url", "url", true },
         .{ "api_key", "api_key", true },
         .{ "dimensions", "dimensions", true },
     };
@@ -25263,12 +25277,95 @@ pub const OpenRouterEmbedderConfig = struct {
         try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
             try jw.write(value);
         }
         if (self.dimensions) |value| {
             try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Configuration for the OpenRouter generative AI provider.
+pub const OpenRouterGeneratorConfig = struct {
+    provider: []const u8,
+    /// The OpenRouter model identifier to use.
+    model: []const u8,
+    /// The URL of the OpenRouter API endpoint.
+    url: ?[]const u8 = null,
+    /// The OpenRouter API key.
+    api_key: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", false },
+        .{ "url", "url", true },
+        .{ "api_key", "api_key", true },
+        .{ "temperature", "temperature", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "top_p", "top_p", true },
+        .{ "frequency_penalty", "frequency_penalty", true },
+        .{ "presence_penalty", "presence_penalty", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.frequency_penalty) |value| {
+            try jw.objectField("frequency_penalty");
+            try jw.write(value);
+        }
+        if (self.presence_penalty) |value| {
+            try jw.objectField("presence_penalty");
             try jw.write(value);
         }
         try jw.endObject();
@@ -33862,9 +33959,9 @@ pub const TableStorageMode = enum {
     }
 };
 
-/// Immutable source embedding storage selected when creating a table.
+/// Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required.
 pub const TableStorageSettings = struct {
-    /// Experimental vector_store mode requires a fresh local single-shard table without HA or replication.
+    /// Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
     dense_embeddings: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -35688,6 +35785,22 @@ pub const VectorSourceStorageStatus = struct {
     collection_max_copy_ns: ?i64 = null,
     /// Locked publication time including directory refresh, inventory, receipts and reclamation.
     collection_publish_ns: ?i64 = null,
+    /// Time preparing and sorting immutable collection input outside source and DB apply locks.
+    collection_plan_outside_lock_ns: ?i64 = null,
+    /// Time validating staged immutable readers outside source and DB apply locks.
+    collection_reader_prepare_ns: ?i64 = null,
+    /// Longest detached immutable reader validation step.
+    collection_max_reader_prepare_ns: ?i64 = null,
+    /// Staged immutable readers validated before publication.
+    collection_readers_prepared: ?i64 = null,
+    /// Time retiring old collection owners and known obsolete files outside source and DB apply locks.
+    collection_retire_outside_lock_ns: ?i64 = null,
+    /// Verified collections that deferred copying because reclamation benefit was small.
+    collection_copy_deferrals: ?i64 = null,
+    /// Verified obsolete payload bytes retained by the copy-cost policy.
+    collection_deferred_obsolete_bytes: ?i64 = null,
+    /// Process-monotonic reclamation scheduling deadline translated from the durable wall-clock deadline; not a completion guarantee.
+    collection_reclaim_deadline_ns: ?i64 = null,
     /// Longest locked publication step.
     collection_max_publish_ns: ?i64 = null,
     /// Active scan turns scheduled using the experimental wall-time duty policy.
@@ -35789,6 +35902,14 @@ pub const VectorSourceStorageStatus = struct {
         .{ "collection_copy_ns", "collection_copy_ns", true },
         .{ "collection_max_copy_ns", "collection_max_copy_ns", true },
         .{ "collection_publish_ns", "collection_publish_ns", true },
+        .{ "collection_plan_outside_lock_ns", "collection_plan_outside_lock_ns", true },
+        .{ "collection_reader_prepare_ns", "collection_reader_prepare_ns", true },
+        .{ "collection_max_reader_prepare_ns", "collection_max_reader_prepare_ns", true },
+        .{ "collection_readers_prepared", "collection_readers_prepared", true },
+        .{ "collection_retire_outside_lock_ns", "collection_retire_outside_lock_ns", true },
+        .{ "collection_copy_deferrals", "collection_copy_deferrals", true },
+        .{ "collection_deferred_obsolete_bytes", "collection_deferred_obsolete_bytes", true },
+        .{ "collection_reclaim_deadline_ns", "collection_reclaim_deadline_ns", true },
         .{ "collection_max_publish_ns", "collection_max_publish_ns", true },
         .{ "collection_active_scan_turns", "collection_active_scan_turns", true },
         .{ "collection_active_scan_pause_ns", "collection_active_scan_pause_ns", true },
@@ -36001,6 +36122,38 @@ pub const VectorSourceStorageStatus = struct {
         }
         if (self.collection_publish_ns) |value| {
             try jw.objectField("collection_publish_ns");
+            try jw.write(value);
+        }
+        if (self.collection_plan_outside_lock_ns) |value| {
+            try jw.objectField("collection_plan_outside_lock_ns");
+            try jw.write(value);
+        }
+        if (self.collection_reader_prepare_ns) |value| {
+            try jw.objectField("collection_reader_prepare_ns");
+            try jw.write(value);
+        }
+        if (self.collection_max_reader_prepare_ns) |value| {
+            try jw.objectField("collection_max_reader_prepare_ns");
+            try jw.write(value);
+        }
+        if (self.collection_readers_prepared) |value| {
+            try jw.objectField("collection_readers_prepared");
+            try jw.write(value);
+        }
+        if (self.collection_retire_outside_lock_ns) |value| {
+            try jw.objectField("collection_retire_outside_lock_ns");
+            try jw.write(value);
+        }
+        if (self.collection_copy_deferrals) |value| {
+            try jw.objectField("collection_copy_deferrals");
+            try jw.write(value);
+        }
+        if (self.collection_deferred_obsolete_bytes) |value| {
+            try jw.objectField("collection_deferred_obsolete_bytes");
+            try jw.write(value);
+        }
+        if (self.collection_reclaim_deadline_ns) |value| {
+            try jw.objectField("collection_reclaim_deadline_ns");
             try jw.write(value);
         }
         if (self.collection_max_publish_ns) |value| {

@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 61;
+pub const abi_version: u32 = 62;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1221,6 +1221,7 @@ pub const MaintenanceResult = extern struct {
     has_next_wake_delay: u8 = 0,
     _reserved0: [2]u8 = @splat(0),
     dense_steps: u64 = 0,
+    dense_scanned: u64 = 0,
     maintenance_score: u64 = 0,
     next_wake_delay_ns: u64 = 0,
 };
@@ -2004,6 +2005,14 @@ pub extern fn antfly_storage_owner_document_artifact_manifest_json(
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_document_artifact_manifests_json(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Versioned, table-wide source ownership migration control. Kept separate
+/// from artifact and ANN repair operations because it changes DB authority.
+pub extern fn antfly_storage_owner_vector_migration_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,

@@ -18,6 +18,7 @@
 
 pub const aggregation = @import("search/aggregation.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
+pub const vector_migration = @import("common/vector_migration.zig");
 pub const common_config = @import("common/config.zig");
 pub const common_secrets = @import("common/secrets.zig");
 pub const data_snapshot = @import("data/storage/shard_state_store.zig");

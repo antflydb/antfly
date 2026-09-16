@@ -1306,7 +1306,7 @@ const JsonTextMergeStats = struct {
     failed_merges: u64,
     quarantined_merges: u64,
     quarantined_segments: u64,
-    last_merge_error: []const u8,
+    last_merge_error: db_mod.types.RuntimeErrorName,
     backpressure_events: u64,
     backpressure_ns: u64,
     max_pending_segments: u64,
@@ -4517,6 +4517,9 @@ pub fn storageOwnerOpen(
         .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
         .entity_sink = if (runtime_hooks) |value| value.entitySink() else null,
         .promotion_owner = if (runtime_hooks) |value| value.promotionOwner() else null,
+        // Reconcile the authoritative resolver catalog before autonomous
+        // replay can hold its catalog fence or invoke distributed callbacks.
+        .start_resolver_workers = false,
         .index_backends = .{ .dense_native_migration_policy_source = if (runtime_hooks) |value| value.nativeMigrationPolicy() else null },
         .remote_content = if (owner_context) |context| context.remoteContent() else null,
         .start_optional_runtimes = restore_bootstrap == null,
@@ -4546,7 +4549,12 @@ pub fn storageOwnerOpen(
     defer if (!success) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
-        .db = db_mod.DB.open(alloc, path, open_options) catch |err| return storageOwnerStatusFromError(err),
+        .db = db_mod.DB.open(alloc, path, open_options) catch |err| {
+            std.log.err("storage owner open failed table={s} group_id={} err={s}", .{
+                table_name, request.group_id, @errorName(err),
+            });
+            return storageOwnerStatusFromError(err);
+        },
         .storage_owner_path = owned_path,
         .storage_owner_table_name = owned_table_name,
         .storage_owner_group_id = request.group_id,
@@ -4583,7 +4591,10 @@ pub fn storageOwnerOpen(
     // permanent address with configuration installed; use the same startup as
     // resident caches so relational builds, retirement and durable outboxes
     // make progress. Hidden restore owners must remain unpublished/quiescent.
-    if (restore_bootstrap == null) handle.db.startResidentBackgroundWorkersIfNeeded();
+    if (restore_bootstrap == null) {
+        handle.db.activateResolverReplayRuntimes() catch |err| return storageOwnerStatusFromError(err);
+        handle.db.startResidentBackgroundWorkersIfNeeded();
+    }
     success = true;
     out_owner.* = handle;
     context_borrowed = false;
@@ -6483,6 +6494,25 @@ fn storageOwnerArtifactJsonResponse(
     return .ok;
 }
 
+pub fn storageOwnerVectorMigrationJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(antfly.vector_migration.Command, handle.alloc, request.request_json.slice(), .{}) catch return .invalid_argument;
+    defer parsed.deinit();
+    // Offline publication owns a separate exclusive root transition; it may
+    // never run against a serving compiled owner through this online endpoint.
+    if (parsed.value.request.mode != .online) return .invalid_argument;
+    const result = handle.db.vectorMigrationCommand(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = result.ptr, .len = @intCast(result.len) };
+    return .ok;
+}
+
 pub fn storageOwnerArtifactOperationJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.ArtifactOperationRequest,
@@ -6647,7 +6677,7 @@ pub fn storageOwnerRuntimeStatusJson(
     };
     defer status.deinit(handle.alloc);
     status.replaceMetadata(.{
-        .updated_at_ns = @import("antfly_platform").time.monotonicNs(),
+        .updated_at_ns = antfly.platform_time.monotonicNs(),
         .source = .live_writer_publish,
         .freshness = .fresh,
         .lsm_root_generation = handle.storage_owner_root_generation,
@@ -6666,7 +6696,9 @@ pub fn storageOwnerRuntimeStatusJson(
 
 test "storage owner runtime status does not wait behind apply writer" {
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "storage-owner-runtime-status-busy");
+    var test_tmp = try TestDirectory.init("storage-owner-runtime-status-busy");
+    defer test_tmp.cleanup();
+    const path = try tempTestPath(alloc, test_tmp.path(), "db");
     defer alloc.free(path);
     cleanupTestDir(path);
     defer cleanupTestDir(path);
@@ -6817,16 +6849,22 @@ pub fn storageOwnerMaintenance(
                 return storageOwnerStatusFromError(err));
         },
         .dense_posting_idle => {
-            if (handle.db.hasActiveDenseBulkWork()) return .ok;
-            const started = @import("antfly_platform").time.monotonicNs();
-            var pass: usize = 0;
-            while (pass < 64 and @import("antfly_platform").time.monotonicNs() -| started < 50 * std.time.ns_per_ms) : (pass += 1) {
-                const steps = handle.db.runDensePostingReadinessMaintenanceForIdle() catch |err|
-                    return storageOwnerStatusFromError(err);
-                out_result.dense_steps += steps;
-                if (steps == 0) break;
+            if (handle.db.hasActiveDenseBulkWork()) {
+                out_result.deferred = 1;
+                return .ok;
             }
-            out_result.progressed = @intFromBool(out_result.dense_steps != 0);
+            const started = antfly.platform_time.monotonicNs();
+            var pass: usize = 0;
+            out_result.deferred = 1;
+            while (pass < 64 and antfly.platform_time.monotonicNs() -| started < 50 * std.time.ns_per_ms) : (pass += 1) {
+                const page = handle.db.refreshDensePostingPayloadPageBestEffort() catch |err|
+                    return storageOwnerStatusFromError(err);
+                out_result.dense_steps += page.repaired;
+                out_result.dense_scanned += page.scanned;
+                out_result.deferred = @intFromBool(page.pending);
+                if (!page.pending or page.scanned == 0 or page.yield_after_page) break;
+            }
+            out_result.progressed = @intFromBool(out_result.dense_steps != 0 or out_result.dense_scanned != 0);
         },
         .publish_dense_checkpoints => {
             const result = handle.db.publishCompletedDensePostingCheckpoints() catch |err|
@@ -6875,7 +6913,14 @@ pub fn storageOwnerBufferDestroy(buffer: *kernel_owner_abi.OwnedBytes) callconv(
 }
 
 fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
-    return kernel_error_identity.statusFromError(err);
+    const status = kernel_error_identity.statusFromError(err);
+    if (status == .internal) {
+        // This status-only boundary cannot carry undeclared error names.
+        // Preserve the originating diagnostic before consumers see the
+        // intentionally generic StorageKernelFailure control-flow status.
+        std.log.warn("storage owner returned undeclared error err={s}", .{@errorName(err)});
+    }
+    return status;
 }
 
 fn openDefaultDirectoryHandle(path: []const u8) !*Handle {

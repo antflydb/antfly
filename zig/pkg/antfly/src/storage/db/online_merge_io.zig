@@ -427,7 +427,7 @@ pub fn rowDerivedIndexesAssumeApply(db: *DB, alloc: Allocator) !bool {
 fn rowDerivedTransferIndexesAssumeApply(db: *DB, alloc: Allocator, coordinated: bool) !bool {
     // Protocol support alone does not prove that this owner's backend can
     // produce and retain the immutable native source pin.
-    if (db.backend_runtime.filesystemIo() == null or db.physical_root_mode != .filesystem_managed or db.source_vectors != null) return false;
+    if (db.backend_runtime.filesystemIo() == null or db.physical_root_mode != .filesystem_managed or db.source_vectors.load(.acquire) != null) return false;
     switch (db.core.primary_store_owner) {
         .lsm => |owner| {
             const backend = owner.handle.backend;

@@ -1,5 +1,8 @@
 """Contains all the data models used in inputs/outputs"""
 
+from .advance_table_storage_migration_body import AdvanceTableStorageMigrationBody
+from .advance_table_storage_migration_body_action import AdvanceTableStorageMigrationBodyAction
+from .advance_table_storage_migration_response_200 import AdvanceTableStorageMigrationResponse200
 from .agent_decision import AgentDecision
 from .agent_question import AgentQuestion
 from .agent_question_kind import AgentQuestionKind
@@ -139,6 +142,10 @@ from .create_relational_index_request import CreateRelationalIndexRequest
 from .create_relational_index_request_type import CreateRelationalIndexRequestType
 from .create_table_request import CreateTableRequest
 from .create_table_request_indexes import CreateTableRequestIndexes
+from .create_table_storage_migration_body import CreateTableStorageMigrationBody
+from .create_table_storage_migration_body_budget import CreateTableStorageMigrationBodyBudget
+from .create_table_storage_migration_body_target import CreateTableStorageMigrationBodyTarget
+from .create_table_storage_migration_response_200 import CreateTableStorageMigrationResponse200
 from .create_user_request import CreateUserRequest
 from .create_user_request_metadata_type_0 import CreateUserRequestMetadataType0
 from .created_algebraic_index import CreatedAlgebraicIndex
@@ -330,6 +337,7 @@ from .geo_shape_query import GeoShapeQuery
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
+from .get_table_storage_migration_response_200 import GetTableStorageMigrationResponse200
 from .global_stateful_query_request import GlobalStatefulQueryRequest
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_embedder_config_provider import GoogleEmbedderConfigProvider
@@ -793,6 +801,8 @@ from .open_ai_generator_config import OpenAIGeneratorConfig
 from .open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
 from .open_router_embedder_config import OpenRouterEmbedderConfig
 from .open_router_embedder_config_provider import OpenRouterEmbedderConfigProvider
+from .open_router_generator_config import OpenRouterGeneratorConfig
+from .open_router_generator_config_provider import OpenRouterGeneratorConfigProvider
 from .package_artifact import PackageArtifact
 from .package_artifact_kind import PackageArtifactKind
 from .package_dependency import PackageDependency
@@ -1111,6 +1121,9 @@ from .wildcard_query import WildcardQuery
 from .you_search_config import YouSearchConfig
 
 __all__ = (
+    "AdvanceTableStorageMigrationBody",
+    "AdvanceTableStorageMigrationBodyAction",
+    "AdvanceTableStorageMigrationResponse200",
     "AgentDecision",
     "AgentQuestion",
     "AgentQuestionKind",
@@ -1271,6 +1284,10 @@ __all__ = (
     "CreateRelationalIndexRequestType",
     "CreateTableRequest",
     "CreateTableRequestIndexes",
+    "CreateTableStorageMigrationBody",
+    "CreateTableStorageMigrationBodyBudget",
+    "CreateTableStorageMigrationBodyTarget",
+    "CreateTableStorageMigrationResponse200",
     "CreateUserRequest",
     "CreateUserRequestMetadataType0",
     "Credentials",
@@ -1439,6 +1456,7 @@ __all__ = (
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",
+    "GetTableStorageMigrationResponse200",
     "GlobalStatefulQueryRequest",
     "GoogleEmbedderConfig",
     "GoogleEmbedderConfigProvider",
@@ -1898,6 +1916,8 @@ __all__ = (
     "OpenAIGeneratorConfigProvider",
     "OpenRouterEmbedderConfig",
     "OpenRouterEmbedderConfigProvider",
+    "OpenRouterGeneratorConfig",
+    "OpenRouterGeneratorConfigProvider",
     "PackageArtifact",
     "PackageArtifactKind",
     "PackageDependency",

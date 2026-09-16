@@ -1,4 +1,4 @@
-import type { CreateIndexRequest, IndexConfig } from "@antfly/sdk";
+import type { CreateIndexRequest, IndexConfig, IndexEmbedderConfig } from "@antfly/sdk";
 
 export interface CreateIndexArguments {
   indexName: string;
@@ -24,5 +24,34 @@ export function createIndexArguments(config: IndexConfig): CreateIndexArguments 
       return { indexName, request: { ...request, type: "graph" } };
     case "algebraic":
       return { indexName, request: { ...request, type: "algebraic" } };
+  }
+}
+
+/** Convert the provider fields from the index form into the create request. */
+export function indexEmbedderConfigFromForm({
+  provider,
+  model,
+  api_key,
+  url,
+  region,
+}: {
+  provider: string;
+  model: string;
+  api_key?: string;
+  url?: string;
+  region?: string;
+}): IndexEmbedderConfig {
+  switch (provider) {
+    case "ollama":
+      return { provider, model, url };
+    case "openai":
+    case "openrouter":
+      return { provider, model, api_key, url };
+    case "bedrock":
+      return { provider, model, region };
+    case "antfly":
+      return { provider, model };
+    default:
+      throw new Error("Invalid provider");
   }
 }

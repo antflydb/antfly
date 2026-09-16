@@ -13757,6 +13757,9 @@ pub fn createTableRequestFromManifest(alloc: std.mem.Allocator, manifest: *const
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
     try tables_api.validateStoredIndexesJson(alloc, manifest.indexes_json);
     return .{
+        // Supported backup manifests contain primary-owned artifacts. Restore
+        // must preserve that authority instead of applying fresh-table policy.
+        .storage = .{ .dense_embeddings = .primary_lsm },
         .description = if (manifest.description.len > 0) try alloc.dupe(u8, manifest.description) else null,
         .indexes_json = try alloc.dupe(u8, manifest.indexes_json),
         .schema_json = if (manifest.schema_json.len > 0) try alloc.dupe(u8, manifest.schema_json) else null,
@@ -21891,6 +21894,7 @@ test "restore manifest preserves trusted coverage incarnation metadata" {
 
     var request = try createTableRequestFromManifest(std.testing.allocator, &manifest);
     defer request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(.primary_lsm, request.storage.?.dense_embeddings);
     try std.testing.expectEqualStrings(manifest.indexes_json, request.indexes_json.?);
 
     var invalid = manifest;

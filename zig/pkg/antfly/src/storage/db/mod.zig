@@ -88,6 +88,7 @@ pub const EntitySink = promotion_runtime.EntitySink;
 pub const EntityUpsert = promotion_runtime.EntityUpsert;
 pub const PromotionOwner = promotion_runtime.PromotionOwner;
 pub const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
+pub const SearchWithDenseProfileResult = @import("antfly_source_root").antfly_sources.physical_db.SearchWithDenseProfileResult;
 pub const RaftAppliedEntryIdentity = @import("antfly_source_root").antfly_sources.physical_db.RaftAppliedEntryIdentity;
 pub const LsmOwnerKind = DB.LsmOwnerKind;
 pub const LsmOwnerStats = DB.LsmOwnerStats;

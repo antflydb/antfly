@@ -1388,6 +1388,68 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/storage/migrations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create or resume a table storage migration job
+         * @description Table-admin operation for local single-shard standalone tables. Target
+         *     vector_store changes primary_lsm source ownership without changing models,
+         *     dimensions, artifacts or logical indexes. Retry creation with the same
+         *     job_id, target and budgets. The job is advanced explicitly through its
+         *     job endpoint; the server does not schedule an unattended migration loop.
+         *     Offline migration uses antfly storage migrate against a stopped server.
+         */
+        post: operations["createTableStorageMigration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/storage/migrations/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a table storage migration receipt
+         * @description Table-admin observation only. Does not admit, advance, or publish a job.
+         *     A phase of admitted means catalog admission is durable but DB preparation
+         *     has not begun; retry creation or send a job action to recover it. The
+         *     receipt is retained until a later migration replaces it; this endpoint
+         *     is not a permanent job history.
+         */
+        get: operations["getTableStorageMigration"];
+        put?: never;
+        /**
+         * Advance, publish or cancel a table storage migration job
+         * @description Uses the job's durable configuration and budgets. Each step commits
+         *     bounded progress. Publish is accepted only at ready; complete additionally
+         *     certifies reference-only primary artifacts and native ANN serving.
+         *     Cancellation is allowed only before publication. Repeating an action
+         *     after an ambiguous response resumes the durable job.
+         */
+        post: operations["advanceTableStorageMigration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/repair/run": {
         parameters: {
             query?: never;
@@ -3792,7 +3854,7 @@ export interface components {
          *     canonical provider configurations; it does not define a second provider
          *     namespace.
          */
-        IndexEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
+        IndexEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
         /**
          * @description Overall health status of the cluster
          * @enum {string}
@@ -4895,10 +4957,10 @@ export interface components {
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
-        /** @description Immutable source embedding storage selected when creating a table. */
+        /** @description Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required. */
         TableStorageSettings: {
             /**
-             * @description Experimental vector_store mode requires a fresh local single-shard table without HA or replication.
+             * @description Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
              * @default primary_lsm
              * @enum {string}
              */
@@ -5693,6 +5755,46 @@ export interface components {
              * @description Locked publication time including directory refresh, inventory, receipts and reclamation.
              */
             collection_publish_ns?: number;
+            /**
+             * Format: int64
+             * @description Time preparing and sorting immutable collection input outside source and DB apply locks.
+             */
+            collection_plan_outside_lock_ns?: number;
+            /**
+             * Format: int64
+             * @description Time validating staged immutable readers outside source and DB apply locks.
+             */
+            collection_reader_prepare_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest detached immutable reader validation step.
+             */
+            collection_max_reader_prepare_ns?: number;
+            /**
+             * Format: int64
+             * @description Staged immutable readers validated before publication.
+             */
+            collection_readers_prepared?: number;
+            /**
+             * Format: int64
+             * @description Time retiring old collection owners and known obsolete files outside source and DB apply locks.
+             */
+            collection_retire_outside_lock_ns?: number;
+            /**
+             * Format: int64
+             * @description Verified collections that deferred copying because reclamation benefit was small.
+             */
+            collection_copy_deferrals?: number;
+            /**
+             * Format: int64
+             * @description Verified obsolete payload bytes retained by the copy-cost policy.
+             */
+            collection_deferred_obsolete_bytes?: number;
+            /**
+             * Format: int64
+             * @description Process-monotonic reclamation scheduling deadline translated from the durable wall-clock deadline; not a completion guarantee.
+             */
+            collection_reclaim_deadline_ns?: number;
             /**
              * Format: int64
              * @description Longest locked publication step.
@@ -9973,6 +10075,8 @@ export interface components {
          *     OpenRouter provides a unified API for multiple embedding models from different providers.
          *     API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
          *
+         *     Antfly currently supports dense text embeddings through this provider.
+         *
          *     **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
          *     google/gemini-embedding-001, qwen/qwen3-embedding-8b
          *
@@ -9984,7 +10088,10 @@ export interface components {
          *     }
          */
         OpenRouterEmbedderConfig: {
-            /** @enum {string} */
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             provider: "openrouter";
             /**
              * @description The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
@@ -9992,6 +10099,11 @@ export interface components {
              * @example openai/text-embedding-3-small
              */
             model: string;
+            /**
+             * Format: uri
+             * @description The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
+             */
+            url?: string;
             /** @description The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable. */
             api_key?: string;
             /** @description Output dimension for the embedding (if supported by the model). */
@@ -10708,11 +10820,51 @@ export interface components {
              */
             presence_penalty?: number;
         };
+        /** @description Configuration for the OpenRouter generative AI provider. */
+        OpenRouterGeneratorConfig: {
+            /** @enum {string} */
+            provider: "openrouter";
+            /**
+             * @description The OpenRouter model identifier to use.
+             * @example openai/gpt-4.1
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the OpenRouter API endpoint.
+             * @default https://openrouter.ai/api/v1
+             */
+            url?: string;
+            /** @description The OpenRouter API key. */
+            api_key?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate in the response. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter (0.0-1.0).
+             */
+            top_p?: number;
+            /**
+             * Format: float
+             * @description Penalty for token frequency (-2.0 to 2.0).
+             */
+            frequency_penalty?: number;
+            /**
+             * Format: float
+             * @description Penalty for token presence (-2.0 to 2.0).
+             */
+            presence_penalty?: number;
+        };
         /**
          * @description Generator providers implemented by Antfly's generation runtime.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "antfly";
+        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "antfly";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -10722,7 +10874,7 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"]) & {
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["GeneratorProvider"];
         };
@@ -19302,6 +19454,165 @@ export interface operations {
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    createTableStorageMigration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    job_id: string;
+                    /** @enum {string} */
+                    target: "vector_store";
+                    budget?: {
+                        /**
+                         * Format: int64
+                         * @default 4194304
+                         */
+                        batch_bytes?: number;
+                        /** @default 1024 */
+                        batch_rows?: number;
+                        /**
+                         * Format: int64
+                         * @default 68719476736
+                         */
+                        temporary_bytes?: number;
+                        /**
+                         * Format: int64
+                         * @default 1073741824
+                         */
+                        disk_reserve_bytes?: number;
+                    };
+                };
+            };
+        };
+        responses: {
+            /** @description Durable migration receipt, or admitted receipt before DB preparation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Conflicting job, lifecycle operation or publication state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Retryable resource or recovery admission failure */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getTableStorageMigration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Durable migration receipt, or admitted receipt before DB preparation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Conflicting job, lifecycle operation or publication state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Retryable resource or recovery admission failure */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    advanceTableStorageMigration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    action: "step" | "publish" | "cancel";
+                };
+            };
+        };
+        responses: {
+            /** @description Durable migration receipt, or admitted receipt before DB preparation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Conflicting job, lifecycle operation or publication state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Retryable resource or recovery admission failure */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     runTableRepair: {

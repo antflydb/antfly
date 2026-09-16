@@ -267,6 +267,23 @@ pub fn schemasEqual(alloc: Allocator, a: TableSchema, b: TableSchema) !bool {
     return std.mem.eql(u8, encoded_a, encoded_b);
 }
 
+fn encodedSchemasEqual(alloc: Allocator, existing: []const u8, incoming: []const u8) !bool {
+    if (std.mem.eql(u8, existing, incoming)) return true;
+    if (existing.len < 12 or incoming.len < 12 or
+        !std.mem.eql(u8, existing[0..4], "ASCH") or
+        !std.mem.eql(u8, incoming[0..4], "ASCH")) return false;
+    // A logical epoch is independent of its durable encoding version. Decode
+    // only a format transition; ordinary retries retain the byte-comparison
+    // fast path. Compare every field, including the public-validator contract.
+    if (std.mem.eql(u8, existing[4..8], incoming[4..8]) or
+        !std.mem.eql(u8, existing[8..12], incoming[8..12])) return false;
+    const old_schema = try deserializeSchema(alloc, existing);
+    defer freeSchema(alloc, old_schema);
+    const next_schema = try deserializeSchema(alloc, incoming);
+    defer freeSchema(alloc, next_schema);
+    return schemasEqual(alloc, old_schema, next_schema);
+}
+
 /// Serialize only the schema state that changes a full-text generation's
 /// physical projection. This encoding is deliberately independent of the
 /// current schema storage format: schemas without executable exact mappings
@@ -1352,7 +1369,10 @@ pub fn saveEncodedSchemaWithMetadataAndStage(
             error.NotFound => null,
             else => return err,
         };
-        const changed = if (previous_data) |loaded| !std.mem.eql(u8, loaded, data) else true;
+        // Reopening an unchanged epoch with a newer serializer must not rewrite
+        // either its active or historical bytes. Other metadata can still be
+        // committed below, including an identical public-validator backfill.
+        const changed = if (previous_data) |loaded| !try encodedSchemasEqual(alloc, loaded, data) else true;
         if (!changed) break :changed_blk false;
 
         if (previous_data) |loaded| {
@@ -3010,6 +3030,49 @@ test "schema preserves versioned history in DocStore" {
     defer freeSchema(alloc, previous);
     try std.testing.expectEqual(@as(u32, 0), previous.version);
     try std.testing.expectEqualStrings("doc_v0", previous.default_type);
+}
+
+test "schema format-only retries preserve immutable epoch bytes and commit metadata" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "schema-format-retry");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    const schema: TableSchema = .{ .version = 4, .default_type = "doc" };
+    const versioned_key = try schemaVersionKeyAlloc(alloc, schema.version);
+    defer alloc.free(versioned_key);
+    for ([_]u32{ 11, 12 }) |format| {
+        const original = try serializeSchemaFormat(alloc, schema, format);
+        defer alloc.free(original);
+        try store.put(schema_key, original);
+        try store.put(versioned_key, original);
+        for (0..3) |_| {
+            try std.testing.expect(!try saveSchemaWithMetadata(&store, alloc, schema, &.{.{
+                .key = "retry-metadata",
+                .value = "published",
+            }}, &.{}));
+            for ([_][]const u8{ schema_key, versioned_key }) |key| {
+                const actual = try store.get(alloc, key);
+                defer alloc.free(actual);
+                try std.testing.expectEqualSlices(u8, original, actual);
+            }
+        }
+        const metadata = try store.get(alloc, "retry-metadata");
+        defer alloc.free(metadata);
+        try std.testing.expectEqualStrings("published", metadata);
+        var changed = schema;
+        changed.default_type = "other";
+        try std.testing.expectError(error.ImmutableSchemaVersionConflict, saveSchema(&store, alloc, changed));
+        changed = schema;
+        changed.requires_public_schema = true;
+        try std.testing.expectError(error.ImmutableSchemaVersionConflict, saveSchema(&store, alloc, changed));
+        const current = try serializeSchema(alloc, schema);
+        defer alloc.free(current);
+        try std.testing.expectError(error.InvalidFormat, encodedSchemasEqual(alloc, original[0 .. original.len - 1], current));
+    }
 }
 
 test "schema epochs reject version reuse and active regression" {

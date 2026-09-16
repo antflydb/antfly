@@ -5046,6 +5046,196 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/storage/migrations:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: createTableStorageMigration
+      summary: Create or resume a table storage migration job
+      description: >
+        Table-admin operation for local single-shard standalone tables. Target
+
+        vector_store changes primary_lsm source ownership without changing models,
+
+        dimensions, artifacts or logical indexes. Retry creation with the same
+
+        job_id, target and budgets. The job is advanced explicitly through its
+
+        job endpoint; the server does not schedule an unattended migration loop.
+
+        Offline migration uses antfly storage migrate against a stopped server.
+      tags:
+        - data_operations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - job_id
+                - target
+              properties:
+                job_id:
+                  type: string
+                  pattern: ^[A-Za-z0-9_-]{1,128}$
+                target:
+                  type: string
+                  enum:
+                    - vector_store
+                budget:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    batch_bytes:
+                      type: integer
+                      format: int64
+                      minimum: 4096
+                      maximum: 67108864
+                      default: 4194304
+                    batch_rows:
+                      type: integer
+                      minimum: 1
+                      maximum: 65536
+                      default: 1024
+                    temporary_bytes:
+                      type: integer
+                      format: int64
+                      default: 68719476736
+                    disk_reserve_bytes:
+                      type: integer
+                      format: int64
+                      default: 1073741824
+      responses:
+        '200':
+          description: Durable migration receipt, or admitted receipt before DB preparation
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Conflicting job, lifecycle operation or publication state
+        '503':
+          description: Retryable resource or recovery admission failure
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/storage/migrations/{jobId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{1,128}$
+    get:
+      operationId: getTableStorageMigration
+      summary: Read a table storage migration receipt
+      description: >
+        Table-admin observation only. Does not admit, advance, or publish a job.
+
+        A phase of admitted means catalog admission is durable but DB preparation
+
+        has not begun; retry creation or send a job action to recover it. The
+
+        receipt is retained until a later migration replaces it; this endpoint
+
+        is not a permanent job history.
+      tags:
+        - data_operations
+      responses:
+        '200':
+          description: Durable migration receipt, or admitted receipt before DB preparation
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Conflicting job, lifecycle operation or publication state
+        '503':
+          description: Retryable resource or recovery admission failure
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      operationId: advanceTableStorageMigration
+      summary: Advance, publish or cancel a table storage migration job
+      description: >
+        Uses the job's durable configuration and budgets. Each step commits
+
+        bounded progress. Publish is accepted only at ready; complete additionally
+
+        certifies reference-only primary artifacts and native ANN serving.
+
+        Cancellation is allowed only before publication. Repeating an action
+
+        after an ambiguous response resumes the durable job.
+      tags:
+        - data_operations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - action
+              properties:
+                action:
+                  type: string
+                  enum:
+                    - step
+                    - publish
+                    - cancel
+      responses:
+        '200':
+          description: Durable migration receipt, or admitted receipt before DB preparation
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Conflicting job, lifecycle operation or publication state
+        '503':
+          description: Retryable resource or recovery admission failure
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/repair/run:
     parameters:
       - name: tableName
@@ -9912,6 +10102,7 @@ components:
       oneOf:
         - $ref: '#/components/schemas/OllamaEmbedderConfig'
         - $ref: '#/components/schemas/OpenAIEmbedderConfig'
+        - $ref: '#/components/schemas/OpenRouterEmbedderConfig'
         - $ref: '#/components/schemas/BedrockEmbedderConfig'
         - $ref: '#/components/schemas/CohereEmbedderConfig'
         - $ref: '#/components/schemas/GoogleEmbedderConfig'
@@ -9922,6 +10113,7 @@ components:
         mapping:
           ollama: '#/components/schemas/OllamaEmbedderConfig'
           openai: '#/components/schemas/OpenAIEmbedderConfig'
+          openrouter: '#/components/schemas/OpenRouterEmbedderConfig'
           bedrock: '#/components/schemas/BedrockEmbedderConfig'
           cohere: '#/components/schemas/CohereEmbedderConfig'
           gemini: '#/components/schemas/GoogleEmbedderConfig'
@@ -11725,7 +11917,11 @@ components:
     TableStorageSettings:
       type: object
       additionalProperties: false
-      description: Immutable source embedding storage selected when creating a table.
+      description: Immutable source embedding ownership. Omit storage when creating a table to select
+        vector_store for a local single-shard standalone table without HA or replication, and primary_lsm
+        for other deployments. Existing tables retain their recorded ownership; changing the creation
+        default does not migrate data. Snapshot/backup and split operations currently reject vector_store
+        tables; explicitly select primary_lsm when these operations are required.
       properties:
         dense_embeddings:
           type: string
@@ -11733,8 +11929,9 @@ components:
             - primary_lsm
             - vector_store
           default: primary_lsm
-          description: Experimental vector_store mode requires a fresh local single-shard table without
-            HA or replication.
+          description: Explicit ownership choice. vector_store requires a fresh local single-shard standalone
+            table without HA or replication. An explicit empty storage object keeps primary_lsm; omit
+            the storage object to use the deployment default.
     CreateTableRequest:
       type: object
       properties:
@@ -12912,6 +13109,41 @@ components:
           type: integer
           format: int64
           description: Locked publication time including directory refresh, inventory, receipts and reclamation.
+        collection_plan_outside_lock_ns:
+          type: integer
+          format: int64
+          description: Time preparing and sorting immutable collection input outside source and DB apply
+            locks.
+        collection_reader_prepare_ns:
+          type: integer
+          format: int64
+          description: Time validating staged immutable readers outside source and DB apply locks.
+        collection_max_reader_prepare_ns:
+          type: integer
+          format: int64
+          description: Longest detached immutable reader validation step.
+        collection_readers_prepared:
+          type: integer
+          format: int64
+          description: Staged immutable readers validated before publication.
+        collection_retire_outside_lock_ns:
+          type: integer
+          format: int64
+          description: Time retiring old collection owners and known obsolete files outside source and
+            DB apply locks.
+        collection_copy_deferrals:
+          type: integer
+          format: int64
+          description: Verified collections that deferred copying because reclamation benefit was small.
+        collection_deferred_obsolete_bytes:
+          type: integer
+          format: int64
+          description: Verified obsolete payload bytes retained by the copy-cost policy.
+        collection_reclaim_deadline_ns:
+          type: integer
+          format: int64
+          description: Process-monotonic reclamation scheduling deadline translated from the durable wall-clock
+            deadline; not a completion guarantee.
         collection_max_publish_ns:
           type: integer
           format: int64
@@ -19682,6 +19914,9 @@ components:
         API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
 
 
+        Antfly currently supports dense text embeddings through this provider.
+
+
         **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
 
         google/gemini-embedding-001, qwen/qwen3-embedding-8b
@@ -19698,6 +19933,10 @@ components:
           description: The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
           default: openai/text-embedding-3-small
           example: openai/text-embedding-3-small
+        url:
+          type: string
+          format: uri
+          description: The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
         api_key:
           type: string
           writeOnly: true
@@ -20848,6 +21087,58 @@ components:
       required:
         - provider
         - model
+    OpenRouterGeneratorConfig:
+      type: object
+      description: >
+        Configuration for the OpenRouter generative AI provider.
+      properties:
+        provider:
+          type: string
+          enum:
+            - openrouter
+        model:
+          type: string
+          description: The OpenRouter model identifier to use.
+          example: openai/gpt-4.1
+        url:
+          type: string
+          format: uri
+          description: The URL of the OpenRouter API endpoint.
+          default: https://openrouter.ai/api/v1
+        api_key:
+          type: string
+          writeOnly: true
+          description: The OpenRouter API key.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-2.0).
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate in the response.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter (0.0-1.0).
+          minimum: 0.0
+          maximum: 1.0
+        frequency_penalty:
+          type: number
+          format: float
+          description: Penalty for token frequency (-2.0 to 2.0).
+          minimum: -2.0
+          maximum: 2.0
+        presence_penalty:
+          type: number
+          format: float
+          description: Penalty for token presence (-2.0 to 2.0).
+          minimum: -2.0
+          maximum: 2.0
+      required:
+        - provider
+        - model
     GeneratorProvider:
       type: string
       enum:
@@ -20855,6 +21146,7 @@ components:
         - vertex
         - ollama
         - openai
+        - openrouter
         - antfly
       description: Generator providers implemented by Antfly's generation runtime.
     GeneratorConfig:
@@ -20867,6 +21159,7 @@ components:
             - $ref: '#/components/schemas/OllamaGeneratorConfig'
             - $ref: '#/components/schemas/AntflyGeneratorConfig'
             - $ref: '#/components/schemas/OpenAIGeneratorConfig'
+            - $ref: '#/components/schemas/OpenRouterGeneratorConfig'
         - properties:
             rate_limit:
               x-go-type-skip-optional-pointer: false

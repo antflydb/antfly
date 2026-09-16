@@ -50,6 +50,7 @@ comptime {
     _ = @import("projection_page_cache.zig");
     _ = @import("projection_read_trace.zig");
     _ = @import("vector_payload_store.zig");
+    _ = @import("vector_migration_offline.zig");
     _ = @import("vector_wal_view.zig");
     _ = @import("backend_adapter.zig");
     _ = @import("backend_conformance_test.zig");
@@ -239,6 +240,7 @@ comptime {
     _ = @import("hot_standby/seed_capture.zig");
     _ = @import("hot_standby/seed_namespace_control.zig");
     _ = @import("hot_standby/seed_prefix_cleanup_test.zig");
+    _ = @import("hot_standby/seed_topology.zig");
     _ = @import("hot_standby/session.zig");
     _ = @import("hot_standby/slot_store.zig");
     _ = @import("hot_standby/standby.zig");
@@ -296,6 +298,7 @@ comptime {
     _ = @import("lsm_backend/run_store.zig");
     _ = @import("lsm_backend/gc_job.zig");
     _ = @import("lsm_backend/dependency_job.zig");
+    _ = @import("lsm_backend/dependency_validation.zig");
     _ = @import("lsm_backend/runtime.zig");
     _ = @import("lsm_backend/current_point_test.zig");
     _ = @import("lsm_backend/state.zig");
@@ -326,6 +329,9 @@ comptime {
     _ = @import("transaction_vopr.zig");
     _ = @import("ttl.zig");
     _ = @import("vector_block_store.zig");
+    _ = @import("vector_fetch_batches_bench.zig");
+    _ = @import("vector_member_bindings.zig");
+    _ = @import("vector_member_bindings_bench.zig");
     _ = @import("wal.zig");
     _ = @import("vopr_durable_job_lane.zig");
     _ = @import("wal_vopr.zig");

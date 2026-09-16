@@ -49,6 +49,10 @@ const current_name = "CURRENT";
 const max_manifest_bytes: usize = 4 * 1024 * 1024;
 const max_wal_bytes: usize = 512 * 1024 * 1024;
 const wal_checkpoint_bytes: usize = 64 * 1024 * 1024;
+// Ordinary WAL checkpoints should not recursively carry a multi-GiB
+// delta tier. Large backlogs merge bounded newest suffixes; complete base
+// publication/collection performs the full streaming consolidation.
+const checkpoint_merge_input_bytes: u64 = 4 * wal_checkpoint_bytes;
 const max_block_bytes: usize = if (@sizeOf(usize) >= 8) 8 * 1024 * 1024 * 1024 else std.math.maxInt(usize);
 var positional_read_test_nonce: std.atomic.Value(u64) = .init(0);
 var retained_block_identity: std.atomic.Value(u64) = .init(1);
@@ -252,6 +256,20 @@ pub const StagedBaseBuild = struct {
     }
 };
 
+/// A WAL-prefix checkpoint owns its staged files until CURRENT commits.
+pub const StagedWalCheckpoint = struct {
+    build: StagedBaseBuild,
+    boundary: WalPrefixBoundary,
+    previous_generation: u64,
+    compact_existing: bool,
+    selected: ?[]vector_manifest.Segment = null,
+
+    pub fn deinit(self: *StagedWalCheckpoint) void {
+        if (self.selected) |selected| self.build.alloc.free(selected);
+        self.build.deinit();
+    }
+};
+
 fn discardStagedBlocksAt(
     storage: lsm_backend.Storage,
     root_dir: []const u8,
@@ -415,7 +433,7 @@ pub const Store = struct {
 
     /// Reader opens never create missing authority or repair a writer's tail.
     pub fn openReadOnlyWithBlocks(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Opened {
-        return openInternalWithState(alloc, storage, root_dir, true, null, null, null, true);
+        return openInternalWithState(alloc, storage, root_dir, true, null, null, null, true, &.{});
     }
 
     /// Opens the latest CURRENT/WAL while sharing unchanged immutable mmap
@@ -816,7 +834,7 @@ pub const Store = struct {
         defer self.alloc.free(path);
         var sink = try self.storage.beginAtomicWrite(self.alloc, path);
         errdefer sink.abort();
-        sink.setCacheIntent(.cold_sequential);
+        sink.setCacheIntent(if (warmVectorWritePolicy("all")) .normal else .cold_sequential);
         var writer = try vector_block.StreamingWriter.init(self.alloc, &sink, generation, shard, shards, sequence, encoding);
         writer.cluster_projections = @import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_PROJECTION_CLUSTERING");
         return .{ .sink = sink, .writer = writer };
@@ -974,6 +992,11 @@ pub const Store = struct {
             self.next.deinit();
         }
         pub fn openReaders(self: *const PreparedPublication, alloc: Allocator, previous: ?*const Opened) !Opened {
+            return self.openReadersValidated(alloc, previous, &.{});
+        }
+        /// Validated immutable output leases may be prepared while source
+        /// writes continue. Only the latest WAL view is bound at publication.
+        pub fn openReadersValidated(self: *const PreparedPublication, alloc: Allocator, previous: ?*const Opened, validated: []const ValidatedBlock) !Opened {
             if (self.committed) return error.VectorBlockPublicationAlreadyCommitted;
             const reuse_after = if (previous) |old|
                 if (old.wal_tree_initialized and old.store.storage.ptr == self.next.storage.ptr and
@@ -981,7 +1004,7 @@ pub const Store = struct {
                     std.meta.eql(old.store.walPrefixBoundary(), self.boundary)) self.wal_reuse else null
             else
                 null;
-            return openInternalWithState(alloc, self.next.storage, self.next.root_dir, true, previous, &self.next, reuse_after, false);
+            return openInternalWithState(alloc, self.next.storage, self.next.root_dir, true, previous, &self.next, reuse_after, false, validated);
         }
         /// Only immutable names known obsolete at preparation time are
         /// reclaimed here. A directory sweep would race another staged build.
@@ -1004,6 +1027,22 @@ pub const Store = struct {
             },
             disposition == .reset_source_epoch,
             if (build.staged.len == 0) .{ .shard_count = build.logical_shard_count, .encoding = build.encoding } else null,
+        );
+    }
+
+    pub fn prepareStagedWalCheckpoint(self: *Store, checkpoint: *const StagedWalCheckpoint) !PreparedPublication {
+        const build = &checkpoint.build;
+        if (self.manifest == null or self.manifest.?.latest_generation != checkpoint.previous_generation)
+            return error.InvalidVectorBlockPublicationBoundary;
+        return self.prepareStagedGenerationMode(
+            build.generation,
+            build.covered_source_sequence,
+            build.staged,
+            if (checkpoint.selected) |selected| .{ .replace_selected = selected } else if (checkpoint.compact_existing) .replace_deltas else .append_delta,
+            null,
+            checkpoint.boundary,
+            false,
+            null,
         );
     }
 
@@ -1085,9 +1124,11 @@ pub const Store = struct {
         if (empty_base_layout != null and !replace_base) return error.InvalidVectorBlockGeneration;
         if (reset_source_epoch and (!replace_base or flattened_wal != null))
             return error.InvalidVectorBlockPublicationBoundary;
-        if (flattened_wal != null and !replace_base and mode != .replace_selected) return error.InvalidVectorBlockPublicationBoundary;
-        const authoritative_replacement = (replace_base or mode == .replace_selected) and
-            (!self.wal_has_mutations or flattened_wal != null or reset_source_epoch);
+        // A staged delta also captures an exact committed WAL prefix. Later
+        // batches remain in the retained tail; only complete base replacement
+        // may change the physical shard layout.
+        const authoritative_replacement = flattened_wal != null or
+            ((replace_base or mode == .replace_selected) and (!self.wal_has_mutations or reset_source_epoch));
         if (!authoritative_replacement and covered_source_sequence != self.covered_source_sequence) return error.InvalidVectorBlockPublicationBoundary;
         if (flattened_wal) |boundary| {
             if (boundary.generation != self.wal_generation or
@@ -1115,7 +1156,7 @@ pub const Store = struct {
             // physical shard layout atomically. Deltas and WAL-backed
             // generations must preserve shard identity or lookups could route
             // around an older committed record.
-            if (manifest.shard_count != shard_count and (!authoritative_replacement or mode == .replace_selected)) return error.InvalidVectorBlockGeneration;
+            if (manifest.shard_count != shard_count and (!authoritative_replacement or !replace_base)) return error.InvalidVectorBlockGeneration;
         }
         var previous_shard: ?u32 = null;
         for (staged, 0..) |receipt, i| {
@@ -1747,6 +1788,8 @@ pub const Store = struct {
 /// Generation-local handle for a vector whose key/revision lookup has already
 /// been validated. Immutable block handles retain physical offsets; WAL
 /// handles borrow the exact float32 record owned by the same Opened lease.
+pub const member_bindings = @import("vector_member_bindings.zig");
+
 pub const LocatedValue = union(enum) {
     wal: vector_block.Value,
     block: struct {
@@ -1966,6 +2009,7 @@ pub const ProjectionBorrowScope = struct {
 pub const ProjectionReadRequest = struct {
     located: LocatedValue,
     scratch: []u8,
+    result_position: usize = 0,
     value: ?vector_block.Value = null,
     err: ?anyerror = null,
     borrowed: bool = false,
@@ -1974,6 +2018,8 @@ pub const ProjectionReadRequest = struct {
 pub const ExactReadRequest = struct {
     located: LocatedValue,
     scratch: []u8,
+    /// Caller destination identity, carried with the request when I/O is sorted.
+    result_position: usize = 0,
     value: ?vector_block.Value = null,
     err: ?anyerror = null,
 };
@@ -1985,7 +2031,25 @@ pub const ResidualReadRequest = struct {
     err: ?anyerror = null,
 };
 
+pub const ReadDispatchStats = struct {
+    adaptive_inline_batches: u64 = 0,
+    adaptive_wide_batches: u64 = 0,
+    adaptive_probe_ns: u64 = 0,
+    worker_start_delay_ns: u64 = 0,
+    mapped_requests: u64 = 0,
+    mapped_bytes: u64 = 0,
+    batches: u64 = 0,
+    requests: u64 = 0,
+    helpers: u64 = 0,
+    denied: u64 = 0,
+    dispatch_ns: u64 = 0,
+    caller_ns: u64 = 0,
+    join_ns: u64 = 0,
+    worker_wall_ns: u64 = 0,
+};
+
 pub const ReadBatchStats = struct {
+    dispatch: ReadDispatchStats = .{},
     physical_reads: u64 = 0,
     physical_bytes: u64 = 0,
     cache_hits: u64 = 0,
@@ -2760,29 +2824,68 @@ pub const Opened = struct {
     }
 
     /// Checkpoints the committed mutation WAL into mmap-friendly sparse
-    /// blocks. Ordinary checkpoints contain only WAL-touched shards. At the
-    /// manifest's delta-chain limit, prior deltas and the WAL are coalesced
-    /// into one sparse generation, preserving tombstones against the base and
-    /// keeping both write amplification and query fan-out bounded.
+    /// blocks. WAL-only checkpoints contain only touched shards. Scheduled
+    /// merges coalesce prior deltas and the WAL, selecting a bounded newest
+    /// suffix when a full delta merge would exceed the ordinary input budget.
+    /// Tombstones continue to mask the base and unselected older runs.
     pub fn checkpointWalToDelta(self: *Opened, force: bool) !bool {
         return self.checkpointWalToDeltaWithPolicy(force, false);
     }
 
     pub fn checkpointWalToDeltaWithPolicy(self: *Opened, force: bool, append_only: bool) !bool {
-        if (!self.store.wal_has_mutations) return false;
-        if (!force and !self.store.shouldCheckpointWal()) return false;
+        var checkpoint = (try self.stageWalToDeltaWithPolicy(force, append_only)) orelse return false;
+        defer checkpoint.deinit();
+        var prepared = try self.store.prepareStagedWalCheckpoint(&checkpoint);
+        defer prepared.deinit();
+        self.store.commitPrepared(&prepared) catch |err| {
+            if (self.store.poisoned) checkpoint.build.disarmCleanup();
+            return err;
+        };
+        prepared.reclaimObsolete();
+        checkpoint.build.disarmCleanup();
+        return true;
+    }
+
+    pub fn stageWalToDeltaWithPolicy(self: *Opened, force: bool, append_only: bool) !?StagedWalCheckpoint {
+        if (!self.store.wal_has_mutations) return null;
+        var bounded = false;
+        if (!append_only) if (self.store.manifest) |manifest| {
+            var delta_bytes: u64 = 0;
+            var generations: usize = 0;
+            var previous = manifest.base_generation;
+            for (self.readers, self.blocks) |reader, block| {
+                if (reader.generation == manifest.base_generation) continue;
+                delta_bytes += block.bytes().len;
+                if (reader.generation != previous) generations += 1;
+                previous = reader.generation;
+            }
+            const limit = if (self.baseVectorCount() == 0) vector_manifest.max_bootstrap_delta_generations else vector_manifest.max_online_delta_generations;
+            bounded = checkpointNeedsBound(delta_bytes, self.store.wal_committed_bytes, generations, limit);
+        };
+        const tiered = bounded or @import("dense_perf_experiments.zig").enabled("ANTFLY_SOURCE_VECTOR_TIERED_CHECKPOINT");
+        return self.stageWalToDeltaWithTiers(force, append_only, tiered);
+    }
+
+    fn stageWalToDeltaWithTiers(self: *Opened, force: bool, append_only: bool, tiered: bool) !?StagedWalCheckpoint {
+        if (!self.store.wal_has_mutations) return null;
+        if (!force and !self.store.shouldCheckpointWal()) return null;
         const manifest = self.store.manifest orelse return error.MissingVectorBlockManifest;
         // Initial ingestion is an append-heavy, mostly disjoint workload over
         // the intentionally empty bootstrap base. Preserve those immutable
         // runs and merge them once at stable tip instead of repeatedly
         // rewriting every vector after each eight WAL checkpoints. Established
-        // bases keep the short online chain and its point-lookup bound.
+        // bases request merges earlier; the bounded policy above limits their
+        // input too, leaving larger consolidation to maintenance.
         const base_is_empty = (self.baseVectorCount() orelse 1) == 0;
         const delta_limit = if (base_is_empty)
             vector_manifest.max_bootstrap_delta_generations
         else
             vector_manifest.max_online_delta_generations;
-        const compact_existing = deltaGenerationCount(manifest) >= (if (append_only) vector_manifest.max_supported_delta_generations else delta_limit);
+        const hard_limit = deltaGenerationCount(manifest) >= vector_manifest.max_supported_delta_generations;
+        const selected = if (tiered and !hard_limit) try self.selectCheckpointTierSuffix(checkpoint_merge_input_bytes) else null;
+        errdefer if (selected) |segments| self.store.alloc.free(segments);
+        const compact_existing = selected != null or hard_limit or
+            (!tiered and !append_only and deltaGenerationCount(manifest) >= delta_limit);
         const generation = std.math.add(u64, manifest.latest_generation, 1) catch return error.VectorBlockGenerationOverflow;
         const encoding = self.baseEncoding() orelse return error.InconsistentVectorBlockEncoding;
         const shard_count: usize = @intCast(manifest.shard_count);
@@ -2795,30 +2898,19 @@ pub const Opened = struct {
 
         var staged = std.ArrayListUnmanaged(StagedBlock).empty;
         defer staged.deinit(self.store.alloc);
-        var records = std.ArrayListUnmanaged(CompactionRecord).empty;
-        defer records.deinit(self.store.alloc);
+        errdefer self.store.discardStagedBlocks(staged.items);
         var scratch = std.ArrayListUnmanaged(f32).empty;
         defer scratch.deinit(self.store.alloc);
 
         for (0..shard_count) |shard| {
-            records.clearRetainingCapacity();
-            if (compact_existing) {
-                const start = self.shard_offsets[shard];
-                const end = self.shard_offsets[shard + 1];
-                for (self.reader_order[start..end]) |reader_index| {
-                    const reader = self.readers[reader_index];
-                    if (reader.generation == manifest.base_generation) continue;
-                    for (0..reader.count) |entry_index| {
-                        const entry = try reader.entryAt(entry_index);
-                        try records.append(self.store.alloc, CompactionRecord.fromBlock(entry, reader.generation));
-                    }
-                }
-            }
-            for (wal_by_shard[shard].items) |record| {
-                try records.append(self.store.alloc, CompactionRecord.fromWal(record, generation));
-            }
-            if (records.items.len == 0) continue;
-            std.mem.sortUnstable(CompactionRecord, records.items, {}, CompactionRecord.lessThan);
+            var merge = try CompactionMerge.initSelected(self, shard, wal_by_shard[shard].items, generation, if (selected) |segments|
+                .{ .selected = segments }
+            else if (compact_existing)
+                .deltas
+            else
+                .none);
+            defer merge.deinit();
+            if (merge.heap.count() == 0) continue;
 
             var output = try self.store.beginStreamingBlock(
                 generation,
@@ -2827,25 +2919,89 @@ pub const Opened = struct {
                 manifest.shard_count,
                 encoding,
             );
+            if (!compact_existing and warmVectorWritePolicy("wal")) output.sink.setCacheIntent(.normal);
             defer output.deinit();
-            var pos: usize = 0;
-            while (pos < records.items.len) {
-                var end = pos + 1;
-                while (end < records.items.len and records.items[pos].sameKey(records.items[end])) : (end += 1) {}
-                try records.items[end - 1].appendTo(&output.writer.page, self.store.alloc, &scratch);
+            while (try merge.next()) |latest| {
+                // A partial merge must keep tombstones against the base and
+                // unselected runs. Compatible values keep their encoded bytes.
+                try latest.appendTo(&output.writer.page, self.store.alloc, &scratch);
                 try output.flushIfNeeded();
-                pos = end;
             }
-            try staged.append(self.store.alloc, try output.finish());
+            try staged.ensureUnusedCapacity(self.store.alloc, 1);
+            staged.appendAssumeCapacity(try output.finish());
             if (compact_existing) self.discardShardResidentPages(shard, false);
         }
         if (staged.items.len == 0) return error.EmptyVectorBlockGeneration;
-        if (compact_existing) {
-            try self.store.publishCompactedDeltaGeneration(generation, self.store.covered_source_sequence, staged.items);
-        } else {
-            try self.store.publishStagedGeneration(generation, self.store.covered_source_sequence, staged.items, false);
+        const root = try self.store.alloc.dupe(u8, self.store.root_dir);
+        errdefer self.store.alloc.free(root);
+        const coverages = try self.store.alloc.alloc(vector_manifest.Coverage, 0);
+        errdefer self.store.alloc.free(coverages);
+        return .{
+            .build = .{
+                .alloc = self.store.alloc,
+                .storage = self.store.storage,
+                .root_dir = root,
+                .generation = generation,
+                .covered_source_sequence = self.store.covered_source_sequence,
+                .logical_shard_count = manifest.shard_count,
+                .encoding = encoding,
+                .staged = try staged.toOwnedSlice(self.store.alloc),
+                .coverages = coverages,
+                .stats = .{},
+            },
+            .boundary = self.store.walPrefixBoundary(),
+            .previous_generation = manifest.latest_generation,
+            .compact_existing = compact_existing,
+            .selected = selected,
+        };
+    }
+
+    /// Merge only a newest contiguous suffix. New output generation numbers
+    /// must never resurrect values hidden by an unmerged newer run.
+    fn selectCheckpointTierSuffix(self: *const Opened, max_input_bytes: u64) !?[]vector_manifest.Segment {
+        const Run = struct {
+            generation: u64,
+            bytes: u64,
+        };
+        var runs: std.ArrayListUnmanaged(Run) = .empty;
+        defer runs.deinit(self.store.alloc);
+        const manifest = self.store.manifest.?;
+        for (self.readers, self.blocks) |reader, block| {
+            if (reader.generation == manifest.base_generation) continue;
+            // Reader arrays follow the validated manifest's generation order.
+            // Aggregate once, avoiding an O(runs² * shards) directory walk.
+            if (runs.items.len != 0 and runs.items[runs.items.len - 1].generation == reader.generation)
+                runs.items[runs.items.len - 1].bytes += block.bytes().len
+            else
+                try runs.append(self.store.alloc, .{ .generation = reader.generation, .bytes = block.bytes().len });
         }
-        return true;
+        var cut = runs.items.len;
+        var size = self.store.wal_committed_bytes;
+        while (cut >= 3) {
+            const group = runs.items[cut - 3 .. cut];
+            var total: u64 = 0;
+            for (group) |run| {
+                if (run.bytes > size *| 2) return try self.checkpointTierSegments(runs.items, cut);
+                total += run.bytes;
+            }
+            // Count the incoming WAL too. Stopping at this suffix preserves
+            // precedence without dragging older large runs into write admission.
+            if (total > max_input_bytes -| size) break;
+            size += total;
+            cut -= 3;
+        }
+        return try self.checkpointTierSegments(runs.items, cut);
+    }
+
+    fn checkpointTierSegments(self: *const Opened, runs: anytype, cut: usize) !?[]vector_manifest.Segment {
+        if (cut == runs.len) return null;
+        var selected: std.ArrayListUnmanaged(vector_manifest.Segment) = .empty;
+        errdefer selected.deinit(self.store.alloc);
+        for (self.store.manifest.?.segments) |segment| {
+            if (segment.generation >= runs[cut].generation and segment.generation != self.store.manifest.?.base_generation)
+                try selected.append(self.store.alloc, segment);
+        }
+        return try selected.toOwnedSlice(self.store.alloc);
     }
 
     fn discardShardResidentPages(self: *const Opened, shard: usize, include_base: bool) void {
@@ -3005,6 +3161,38 @@ pub const Opened = struct {
             },
         }
         return target;
+    }
+
+    /// Collapse an already authenticated reference resolution to a row token.
+    /// Tokens belong exclusively to this Opened + external_payloads lease.
+    pub fn sourceRow(self: *const Opened, located: LocatedValue) ?member_bindings.Row {
+        const source = self.external_payloads orelse return null;
+        if (located != .block or located.block.owner != source) return null;
+        const block = located.block;
+        return .{
+            .reader = std.math.cast(u32, block.reader_index) orelse return null,
+            .row = std.math.cast(u32, block.location.index_row) orelse return null,
+            .source_sequence = block.location.source_sequence,
+            .revision = block.location.revision,
+        };
+    }
+
+    pub fn bindSourceRow(self: *const Opened, row: member_bindings.Row) !LocatedValue {
+        const source = self.external_payloads orelse return error.InvalidVectorReference;
+        if (row.reader >= source.readers.len) return error.InvalidVectorReference;
+        const reader = source.readers[row.reader];
+        const found = try reader.locationAt(row.row);
+        if (found != .vector or found.vector.encoding == .artifact_reference) return error.InvalidVectorReference;
+        var location = found.vector;
+        location.source_sequence = row.source_sequence;
+        location.revision = row.revision;
+        return .{ .block = .{
+            .owner = source,
+            .reader_index = row.reader,
+            .reader_generation = reader.generation,
+            .reader_shard_id = reader.shard_id,
+            .location = location,
+        } };
     }
 
     fn locateRawHashed(
@@ -3525,10 +3713,51 @@ pub const Opened = struct {
     }
 
     fn runExactRead(self: *const Opened, request: *ExactReadRequest) std.Io.Cancelable!void {
+        request.value = null;
+        request.err = null;
+        if (self.exactMappedEnabled(request.located)) {
+            request.value = self.viewExact(request.located) catch |err| {
+                request.err = err;
+                return;
+            };
+            return;
+        }
         request.value = self.readExactInto(request.located, request.scratch) catch |err| {
             request.err = err;
             return;
         };
+    }
+
+    fn exactMappedEnabled(self: *const Opened, located: LocatedValue) bool {
+        const manager = self.resource_manager orelse return false;
+        return manager.dense_exact_mapped and located == .block and located.block.location.encoding == .float32;
+    }
+
+    /// Sort complete requests, including their destinations, by retained file
+    /// and offset. No payload copy or persistent physical address is introduced.
+    pub fn orderExactReadsByLocation(self: *const Opened, requests: []ExactReadRequest) void {
+        self.orderPayloadReadsByLocation(ExactReadRequest, requests);
+    }
+
+    pub fn orderProjectionReadsByLocation(self: *const Opened, requests: []ProjectionReadRequest) void {
+        self.orderPayloadReadsByLocation(ProjectionReadRequest, requests);
+    }
+
+    fn orderPayloadReadsByLocation(self: *const Opened, comptime Request: type, requests: []Request) void {
+        const Order = struct {
+            fn lessThan(opened: *const Opened, a: Request, b: Request) bool {
+                if (a.located == .wal) return b.located != .wal;
+                if (b.located == .wal) return false;
+                const left = a.located.block;
+                const right = b.located.block;
+                const left_owner = @intFromPtr(left.owner orelse opened);
+                const right_owner = @intFromPtr(right.owner orelse opened);
+                if (left_owner != right_owner) return left_owner < right_owner;
+                if (left.reader_index != right.reader_index) return left.reader_index < right.reader_index;
+                return left.location.vector_offset < right.location.vector_offset;
+            }
+        };
+        std.mem.sort(Request, requests, self, Order.lessThan);
     }
 
     pub fn readExactIntoBatch(
@@ -3536,11 +3765,23 @@ pub const Opened = struct {
         io: ?std.Io,
         requests: []ExactReadRequest,
     ) !ReadBatchStats {
-        try runPositionalReadBatch(ExactReadRequest, self, io, requests, runExactRead, self.resource_manager);
+        if (self.resource_manager) |manager| if (manager.dense_projection_trace_enabled)
+            @import("projection_read_trace.zig").record(self, requests);
         var stats: ReadBatchStats = .{};
+        const profile_reads = if (self.resource_manager) |manager| manager.dense_read_profile else false;
+        try runPositionalReadBatchProfiled(ExactReadRequest, self, io, requests, runExactRead, self.resource_manager, if (profile_reads) &stats.dispatch else null);
         for (requests) |request| switch (request.located) {
             .wal => {},
             .block => |block| {
+                if (self.exactMappedEnabled(request.located)) {
+                    // Mapped accesses can fault. These count requested views,
+                    // not resident-cache hits or measured device I/O.
+                    if (profile_reads) {
+                        stats.dispatch.mapped_requests += 1;
+                        stats.dispatch.mapped_bytes += block.location.vector_len;
+                    }
+                    continue;
+                }
                 stats.physical_reads += @as(u64, 1) + @intFromBool(block.location.residual_len != 0);
                 stats.physical_bytes +|= block.location.vector_len +| block.location.residual_len;
             },
@@ -3663,13 +3904,83 @@ fn runPositionalReadBatch(
     comptime run: anytype,
     resource_manager: ?*resource_manager_mod.ResourceManager,
 ) !void {
-    const io = maybe_io orelse {
+    return runPositionalReadBatchProfiled(Request, context, maybe_io, requests, run, resource_manager, null);
+}
+
+fn adaptiveReadWorkers(remaining: usize, per_read_ns: u64) usize {
+    // Dispatch has a fixed cost; require both expensive individual reads and
+    // enough remaining work to amortize it. The resource manager still admits
+    // every helper and the caller always participates.
+    return if (remaining >= 2 and per_read_ns >= 8 * std.time.ns_per_us and
+        per_read_ns *| remaining >= 40 * std.time.ns_per_us)
+        @min(remaining, Opened.positional_read_wave)
+    else
+        1;
+}
+
+fn runPositionalReadBatchProfiled(
+    comptime Request: type,
+    context: anytype,
+    maybe_io: ?std.Io,
+    requests: []Request,
+    comptime run: anytype,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    stats: ?*ReadDispatchStats,
+) !void {
+    const time = @import("antfly_platform").time;
+    if (stats) |p| {
+        p.batches += @intFromBool(requests.len != 0);
+        p.requests += requests.len;
+    }
+    const selected_io = if (resource_manager) |manager| (if (manager.dense_read_inline) null else maybe_io) else maybe_io;
+    const io = selected_io orelse {
+        const start = if (stats != null) time.monotonicNs() else 0;
+        defer if (stats) |p| {
+            p.caller_ns += time.monotonicNs() - start;
+        };
         for (requests) |*request| try run(context, request);
         return;
     };
     if (requests.len < 2) {
+        const start = if (stats != null) time.monotonicNs() else 0;
+        defer if (stats) |p| {
+            p.caller_ns += time.monotonicNs() - start;
+        };
         for (requests) |*request| try run(context, request);
         return;
+    }
+
+    // Sample actual reads again in every bounded batch. A previously warm
+    // generation can be evicted; its age is not a residency signal. Reprobe
+    // every 32 entries so a warm prefix cannot serialize a large cold suffix.
+    var completed: usize = 0;
+    const adaptive = if (resource_manager) |m| m.dense_read_adaptive else false;
+    if (adaptive) {
+        while (completed < requests.len) {
+            const end = @min(requests.len, completed + 2);
+            const probe_start = time.monotonicNs();
+            for (requests[completed..end]) |*request| try run(context, request);
+            const elapsed = time.monotonicNs() -| probe_start;
+            const measured = end - completed;
+            completed = end;
+            if (stats) |p| {
+                p.adaptive_probe_ns += elapsed;
+                p.caller_ns += elapsed;
+            }
+            if (adaptiveReadWorkers(requests.len - completed, elapsed / measured) > 1) {
+                if (stats) |p| p.adaptive_wide_batches += 1;
+                break;
+            }
+            const inline_end = @min(requests.len, completed + 30);
+            const inline_start = if (stats != null) time.monotonicNs() else 0;
+            for (requests[completed..inline_end]) |*request| try run(context, request);
+            if (stats) |p| p.caller_ns += time.monotonicNs() -| inline_start;
+            completed = inline_end;
+        }
+        if (completed == requests.len) {
+            if (stats) |p| p.adaptive_inline_batches += 1;
+            return;
+        }
     }
 
     // Keep the same bounded physical concurrency without allocating a task
@@ -3680,9 +3991,17 @@ fn runPositionalReadBatch(
         requests: []Request,
         next: std.atomic.Value(usize) = .init(0),
         manager: ?*resource_manager_mod.ResourceManager,
+        profiled: bool,
+        worker_wall_ns: std.atomic.Value(u64) = .init(0),
+        worker_start_delay_ns: std.atomic.Value(u64) = .init(0),
 
-        fn worker(work: *@This()) std.Io.Cancelable!void {
+        fn worker(work: *@This(), submitted: u64) std.Io.Cancelable!void {
             defer if (work.manager) |manager| manager.releaseDenseReadTask();
+            const start = if (work.profiled) time.monotonicNs() else 0;
+            if (work.profiled) _ = work.worker_start_delay_ns.fetchAdd(start - submitted, .monotonic);
+            defer if (work.profiled) {
+                _ = work.worker_wall_ns.fetchAdd(time.monotonicNs() - start, .monotonic);
+            };
             try work.drain();
         }
 
@@ -3694,21 +4013,108 @@ fn runPositionalReadBatch(
             }
         }
     };
-    var work: Work = .{ .context = context, .requests = requests, .manager = resource_manager };
+    var work: Work = .{ .context = context, .requests = requests[completed..], .manager = resource_manager, .profiled = stats != null };
     var group = std.Io.Group.init;
     // Drain all tasks even if the caller is cancelled while doing its share:
     // request buffers and the stack-owned queue must never escape this call.
     defer group.cancel(io);
-    const workers = @min(requests.len, Opened.positional_read_wave);
+    const dispatch_start = if (stats != null) time.monotonicNs() else 0;
+    const ceiling: usize = if (resource_manager) |m| (if (m.dense_read_single_helper and !adaptive) 2 else Opened.positional_read_wave) else Opened.positional_read_wave;
+    const workers = @min(requests.len - completed, ceiling);
     for (1..workers) |_| {
-        if (resource_manager) |manager| if (!manager.tryAcquireDenseReadTask()) break;
-        group.concurrent(io, Work.worker, .{&work}) catch {
-            if (resource_manager) |manager| manager.releaseDenseReadTask();
+        if (resource_manager) |manager| if (!manager.tryAcquireDenseReadTask()) {
+            if (stats) |p| p.denied += 1;
             break;
         };
+        group.concurrent(io, Work.worker, .{ &work, if (stats != null) time.monotonicNs() else 0 }) catch {
+            if (resource_manager) |manager| manager.releaseDenseReadTask();
+            if (stats) |p| p.denied += 1;
+            break;
+        };
+        if (stats) |p| p.helpers += 1;
     }
+    const caller_start = if (stats != null) time.monotonicNs() else 0;
+    if (stats) |p| p.dispatch_ns += caller_start - dispatch_start;
     try work.drain();
+    const join_start = if (stats != null) time.monotonicNs() else 0;
+    if (stats) |p| p.caller_ns += join_start - caller_start;
     try group.await(io);
+    if (stats) |p| {
+        p.join_ns += time.monotonicNs() - join_start;
+        p.worker_wall_ns += work.worker_wall_ns.load(.monotonic);
+        p.worker_start_delay_ns += work.worker_start_delay_ns.load(.monotonic);
+    }
+}
+
+test "storage.vector_block_store mapped exact batches validate CRC and retire stale results" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/mapped-exact");
+    defer store.deinit();
+    var writer = try vector_block.Writer.initWithEncoding(alloc, 1, 0, 1, 1, .float32);
+    defer writer.deinit();
+    try writer.appendVector("a", 1, 1, &.{ 2, 3 });
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+    store.covered_source_sequence = 1;
+    try store.publishGeneration(1, 1, &.{.{ .shard_id = 0, .bytes = bytes }}, true);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    manager.dense_exact_mapped = true;
+    manager.dense_read_profile = true;
+    var opened = try Store.openWithBlocks(alloc, memory.storage(), "/mapped-exact");
+    defer opened.deinit();
+    opened.resource_manager = &manager;
+    const located = (try opened.locateHashed("a", vector_block.keyHash("a"), 1, 1)).vector;
+    var requests = [_]ExactReadRequest{.{ .located = located, .scratch = &.{} }};
+    const stats = try opened.readExactIntoBatch(null, &requests);
+    try std.testing.expectEqual(@as(u64, 0), stats.physical_reads);
+    try std.testing.expectEqual(@as(u64, 1), stats.dispatch.mapped_requests);
+    var decoded: [2]f32 = undefined;
+    try std.testing.expectEqualSlices(f32, &.{ 2, 3 }, try requests[0].value.?.decodeExactInto(&decoded));
+    // Heap-backed test file permits corruption without modifying an mmap.
+    const payload = opened.blocks[0].shared.payload.heap;
+    payload[located.block.location.vector_offset] ^= 1;
+    _ = try opened.readExactIntoBatch(null, &requests);
+    try std.testing.expect(requests[0].err != null);
+    try std.testing.expect(requests[0].value == null);
+    payload[located.block.location.vector_offset] ^= 1;
+    _ = try opened.readExactIntoBatch(null, &requests);
+    try std.testing.expect(requests[0].err == null);
+    try std.testing.expect(requests[0].value != null);
+    manager.dense_exact_mapped = false;
+    _ = try opened.readExactIntoBatch(null, &requests);
+    try std.testing.expectEqual(error.BufferTooSmall, requests[0].err.?);
+    try std.testing.expect(requests[0].value == null);
+}
+
+test "storage.vector_block_store read dispatch profiling preserves request ownership and inline policy" {
+    const Request = struct { visits: usize = 0 };
+    const Runner = struct {
+        fn run(_: void, request: *Request) std.Io.Cancelable!void {
+            request.visits += 1;
+        }
+    };
+    var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
+    defer runtime.deinit();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .dense_read_extra_task_limit = 4 });
+    defer manager.deinit(std.testing.allocator);
+    for (0..4) |mode| {
+        manager.dense_read_adaptive = mode == 3;
+        const inline_reads = mode == 1;
+        manager.dense_read_inline = inline_reads;
+        manager.dense_read_single_helper = mode == 2;
+        var requests: [257]Request = @splat(.{});
+        var stats: ReadDispatchStats = .{};
+        try runPositionalReadBatchProfiled(Request, {}, runtime.io(), &requests, Runner.run, &manager, &stats);
+        for (requests) |request| try std.testing.expectEqual(@as(usize, 1), request.visits);
+        try std.testing.expectEqual(@as(u64, 1), stats.batches);
+        try std.testing.expectEqual(@as(u64, requests.len), stats.requests);
+        if (inline_reads) try std.testing.expectEqual(@as(u64, 0), stats.helpers);
+        if (manager.dense_read_single_helper) try std.testing.expect(stats.helpers <= 1);
+        try std.testing.expectEqual(@as(u32, 0), manager.denseReadTaskStats().active);
+    }
 }
 
 test "storage.vector_block_store bounded read workers process every request once with unavailable lanes" {
@@ -3755,61 +4161,153 @@ test "storage.vector_block_store governed read workers release permits on comple
 }
 
 /// One cursor per already-sorted immutable run plus the sorted, deduplicated
-/// WAL stream. Payloads remain borrowed from the source generation. Scratch is
-/// O(number of runs), independent of the number of vectors in a shard.
+/// WAL stream. Returned payloads borrow cursor buffers until the next call.
+/// Cursor scratch is O(number of runs); read-ahead is capped at 4 MiB plus one
+/// oversized value/residual pair, independent of the vectors in a shard.
 const CompactionMerge = struct {
+    // Read-ahead is bounded across all selected inputs and allocated only for
+    // winning payloads. Retained inode descriptors require no new fd permits.
+    const ReadWindow = struct {
+        bytes: []u8 = &.{},
+        identity: u64 = 0,
+        start: usize = 0,
+        valid: usize = 0,
+
+        fn read(self: *ReadWindow, alloc: Allocator, block: RetainedBlock, offset: usize, len: usize, target: usize) ![]const u8 {
+            if (self.identity == block.shared.identity and offset >= self.start and offset - self.start <= self.valid and len <= self.valid - (offset - self.start))
+                return self.bytes[offset - self.start ..][0..len];
+            const block_len = block.bytes().len;
+            if (offset > block_len or len > block_len - offset) return error.EndOfStream;
+            const start = std.mem.alignBackward(usize, offset, 4096);
+            const needed = offset - start + len;
+            const capacity = @max(target, needed);
+            if (self.bytes.len < capacity) self.bytes = try alloc.realloc(self.bytes, capacity);
+            self.valid = 0;
+            const count = @min(self.bytes.len, block_len - start);
+            try block.readAllAt(self.bytes[0..count], start);
+            self.identity = block.shared.identity;
+            self.start = start;
+            self.valid = count;
+            return self.bytes[offset - start ..][0..len];
+        }
+    };
+    const InputWindows = struct {
+        vector: ReadWindow = .{},
+        residual: ReadWindow = .{},
+    };
+    const Selection = union(enum) {
+        all,
+        none,
+        deltas,
+        selected: []const vector_manifest.Segment,
+
+        fn includes(self: Selection, reader: vector_block.Reader, base: u64) bool {
+            return switch (self) {
+                .all => true,
+                .none => false,
+                .deltas => reader.generation != base,
+                .selected => |segments| blk: {
+                    for (segments) |segment| {
+                        if (segment.generation == reader.generation and segment.shard_id == reader.shard_id) break :blk true;
+                    }
+                    break :blk false;
+                },
+            };
+        }
+    };
+    const Identity = struct {
+        hash: u64,
+        key: []const u8,
+        source_sequence: u64,
+        revision: u64,
+        generation: u64,
+
+        fn fromBlock(reader: vector_block.Reader, position: usize) Identity {
+            const row = reader.sourceIdentityAt(position);
+            return .{ .hash = row.hash, .key = row.key, .source_sequence = row.source_sequence, .revision = row.revision, .generation = reader.generation };
+        }
+        fn fromWal(row: vector_wal.Record, generation: u64) Identity {
+            return .{ .hash = row.key_hash, .key = row.key, .source_sequence = row.source_sequence, .revision = row.revision, .generation = generation };
+        }
+        fn sameKey(self: Identity, other: Identity) bool {
+            return self.hash == other.hash and std.mem.eql(u8, self.key, other.key);
+        }
+    };
     const Head = struct {
         reader: ?usize,
         position: usize,
-        record: CompactionRecord,
+        identity: Identity,
+        window: ?usize = null,
         fn order(_: void, lhs: @This(), rhs: @This()) std.math.Order {
-            if (CompactionRecord.lessThan({}, lhs.record, rhs.record)) return .lt;
-            if (CompactionRecord.lessThan({}, rhs.record, lhs.record)) return .gt;
-            return .eq;
+            return compactionOrder(lhs.identity, rhs.identity);
         }
     };
     source: *const Opened,
     wal_indices: []const vector_wal.Record,
     generation: u64,
     heap: std.PriorityQueue(Head, void, Head.order) = .empty,
+    windows: std.ArrayListUnmanaged(InputWindows) = .empty,
+    window_bytes: usize = 0,
+    oversized: InputWindows = .{},
 
     fn init(source: *const Opened, shard: usize, wal_indices: []const vector_wal.Record, generation: u64) !CompactionMerge {
+        return initSelected(source, shard, wal_indices, generation, .all);
+    }
+
+    fn initSelected(source: *const Opened, shard: usize, wal_indices: []const vector_wal.Record, generation: u64, selection: Selection) !CompactionMerge {
         var self = CompactionMerge{ .source = source, .wal_indices = wal_indices, .generation = generation };
         errdefer self.deinit();
         const readers = source.reader_order[source.shard_offsets[shard]..source.shard_offsets[shard + 1]];
-        try self.heap.ensureUnusedCapacity(source.store.alloc, readers.len + 1);
+        var input_count: usize = 0;
+        for (readers) |index| {
+            const reader = source.readers[index];
+            if (reader.count != 0 and selection.includes(reader, source.store.manifest.?.base_generation)) input_count += 1;
+        }
+        try self.heap.ensureUnusedCapacity(source.store.alloc, input_count + 1);
+        try self.windows.ensureTotalCapacity(source.store.alloc, input_count);
+        self.window_bytes = @min(64 * 1024, (4 * 1024 * 1024) / @max(1, input_count * 2));
         for (readers) |reader_index| {
             const reader = source.readers[reader_index];
-            if (reader.count == 0) continue;
+            if (reader.count == 0 or !selection.includes(reader, source.store.manifest.?.base_generation)) continue;
+            const window = self.windows.items.len;
+            self.windows.appendAssumeCapacity(.{});
             try self.heap.push(source.store.alloc, .{
                 .reader = reader_index,
                 .position = 0,
-                .record = CompactionRecord.fromBlock(try reader.entryAt(0), reader.generation),
+                .identity = Identity.fromBlock(reader, 0),
+                .window = window,
             });
         }
         if (wal_indices.len != 0) try self.heap.push(source.store.alloc, .{
             .reader = null,
             .position = 0,
-            .record = CompactionRecord.fromWal(wal_indices[0], generation),
+            .identity = Identity.fromWal(wal_indices[0], generation),
         });
         return self;
     }
 
     fn deinit(self: *CompactionMerge) void {
+        self.source.store.alloc.free(self.oversized.vector.bytes);
+        self.source.store.alloc.free(self.oversized.residual.bytes);
+        for (self.windows.items) |*window| {
+            self.source.store.alloc.free(window.vector.bytes);
+            self.source.store.alloc.free(window.residual.bytes);
+        }
+        self.windows.deinit(self.source.store.alloc);
         self.heap.deinit(self.source.store.alloc);
     }
 
-    fn pop(self: *CompactionMerge) !?CompactionRecord {
+    fn pop(self: *CompactionMerge) !?Head {
         var head = self.heap.pop() orelse return null;
-        const value = head.record;
+        const value = head;
         head.position += 1;
         if (head.reader) |index| {
             const reader = self.source.readers[index];
             if (head.position >= reader.count) return value;
-            head.record = CompactionRecord.fromBlock(try reader.entryAt(head.position), reader.generation);
+            head.identity = Identity.fromBlock(reader, head.position);
         } else {
             if (head.position >= self.wal_indices.len) return value;
-            head.record = CompactionRecord.fromWal(self.wal_indices[head.position], self.generation);
+            head.identity = Identity.fromWal(self.wal_indices[head.position], self.generation);
         }
         try self.heap.push(self.source.store.alloc, head);
         return value;
@@ -3818,12 +4316,60 @@ const CompactionMerge = struct {
     fn next(self: *CompactionMerge) !?CompactionRecord {
         var latest = (try self.pop()) orelse return null;
         while (self.heap.peek()) |head| {
-            if (!latest.sameKey(head.record)) break;
+            if (!latest.identity.sameKey(head.identity)) break;
             latest = (try self.pop()).?;
         }
-        return latest;
+        // Immutable index/key admission establishes ordering. Only the winner
+        // is read and CRC-validated, immediately before copying its payload.
+        if (latest.reader) |index| {
+            const reader = self.source.readers[index];
+            const located = try reader.locationAt(latest.position);
+            const entry: vector_block.EntryView = .{
+                .key = latest.identity.key,
+                .value = switch (located) {
+                    .missing => unreachable,
+                    .tombstone => |value| .{ .tombstone = value },
+                    .vector => |location| blk: {
+                        const window = &self.windows.items[latest.window.?];
+                        const block = self.source.blocks[index];
+                        // Oversized values share one pair of buffers per merge.
+                        const vector_window = if (location.vector_len + location.vector_offset % 4096 > self.window_bytes) &self.oversized.vector else &window.vector;
+                        const residual_window = if (location.residual_len + location.residual_offset % 4096 > self.window_bytes) &self.oversized.residual else &window.residual;
+                        const bytes = try vector_window.read(self.source.store.alloc, block, location.vector_offset, location.vector_len, self.window_bytes);
+                        const residual = if (location.residual_len == 0) &.{} else try residual_window.read(self.source.store.alloc, block, location.residual_offset, location.residual_len, self.window_bytes);
+                        break :blk .{ .vector = try location.valueFromPayload(bytes, residual) };
+                    },
+                },
+            };
+            return CompactionRecord.fromBlock(entry, latest.identity.generation);
+        }
+        return CompactionRecord.fromWal(self.wal_indices[latest.position], self.generation);
     }
 };
+
+fn checkpointNeedsBound(delta_bytes: u64, wal_bytes: u64, generations: usize, limit: usize) bool {
+    return delta_bytes >= 2 * checkpoint_merge_input_bytes or
+        (generations >= limit and delta_bytes +| wal_bytes > checkpoint_merge_input_bytes);
+}
+
+test "vector block scheduled online merge is bounded before the large backlog threshold" {
+    const mib = 1024 * 1024;
+    try std.testing.expect(checkpointNeedsBound(8 * 48 * mib, 48 * mib, 8, 8));
+    try std.testing.expect(!checkpointNeedsBound(7 * 48 * mib, 48 * mib, 7, 8));
+    try std.testing.expect(!checkpointNeedsBound(6 * 48 * mib, 16 * mib, 6, 24));
+    try std.testing.expect(checkpointNeedsBound(512 * mib, 1, 10, 24));
+    try std.testing.expect(!checkpointNeedsBound(checkpoint_merge_input_bytes - 48 * mib, 48 * mib, 8, 8));
+    try std.testing.expect(checkpointNeedsBound(checkpoint_merge_input_bytes - 48 * mib, 48 * mib + 1, 8, 8));
+}
+
+fn compactionOrder(lhs: anytype, rhs: anytype) std.math.Order {
+    if (lhs.hash != rhs.hash) return std.math.order(lhs.hash, rhs.hash);
+    const key_order = std.mem.order(u8, lhs.key, rhs.key);
+    if (key_order != .eq) return key_order;
+    if (lhs.source_sequence != rhs.source_sequence) return std.math.order(lhs.source_sequence, rhs.source_sequence);
+    if (lhs.revision != rhs.revision) return std.math.order(lhs.revision, rhs.revision);
+    return std.math.order(lhs.generation, rhs.generation);
+}
 
 const CompactionRecord = struct {
     hash: u64,
@@ -3874,24 +4420,11 @@ const CompactionRecord = struct {
         };
     }
 
-    fn sameKey(self: CompactionRecord, other: CompactionRecord) bool {
-        return self.hash == other.hash and std.mem.eql(u8, self.key, other.key);
-    }
-
     fn isLive(self: CompactionRecord) bool {
         return switch (self.payload) {
             .tombstone => false,
             .block_vector, .wal_vector => true,
         };
-    }
-
-    fn lessThan(_: void, lhs: CompactionRecord, rhs: CompactionRecord) bool {
-        if (lhs.hash != rhs.hash) return lhs.hash < rhs.hash;
-        const key_order = std.mem.order(u8, lhs.key, rhs.key);
-        if (key_order != .eq) return key_order == .lt;
-        if (lhs.source_sequence != rhs.source_sequence) return lhs.source_sequence < rhs.source_sequence;
-        if (lhs.revision != rhs.revision) return lhs.revision < rhs.revision;
-        return lhs.generation < rhs.generation;
     }
 
     fn appendTo(
@@ -3903,10 +4436,8 @@ const CompactionRecord = struct {
         switch (self.payload) {
             .tombstone => try writer.appendTombstone(self.key, self.source_sequence, self.revision),
             .block_vector => |value| {
-                if (value.encoding == .artifact_reference) {
-                    if (writer.encoding != .artifact_reference) return error.InconsistentVectorBlockEncoding;
-                    return writer.appendEncodedVector(self.key, self.source_sequence, self.revision, value.dims, value.bytes, 1);
-                }
+                if (value.encoding == writer.encoding)
+                    return self.appendLiveBlockVectorTo(writer, writer.encoding);
                 try scratch.resize(alloc, value.dims);
                 const vector = try value.decodeExactInto(scratch.items);
                 try writer.appendVector(self.key, self.source_sequence, self.revision, vector);
@@ -3936,6 +4467,8 @@ const CompactionRecord = struct {
             .tombstone => {},
             .block_vector => |value| {
                 if (value.encoding != encoding) return error.InconsistentVectorBlockEncoding;
+                if (encoding == .artifact_reference)
+                    return writer.appendEncodedVector(self.key, self.source_sequence, self.revision, value.dims, value.bytes, 1);
                 if (value.quantization_error_norm) |error_norm| {
                     const quantization: vector_block.QuantizationStats = .{
                         .error_norm = error_norm,
@@ -3995,7 +4528,7 @@ fn openInternal(
     retain_blocks: bool,
     previous: ?*const Opened,
 ) !Opened {
-    return openInternalWithState(alloc, storage, root_dir, retain_blocks, previous, null, null, false);
+    return openInternalWithState(alloc, storage, root_dir, retain_blocks, previous, null, null, false, &.{});
 }
 
 fn openInternalWithState(
@@ -4007,6 +4540,7 @@ fn openInternalWithState(
     prepared: ?*const Store,
     reuse_wal: ?Store.WalReuse,
     read_only: bool,
+    validated: []const ValidatedBlock,
 ) !Opened {
     var store: Store = if (prepared) |state| try state.clone(alloc) else blk: {
         const owned_root = try alloc.dupe(u8, root_dir);
@@ -4069,9 +4603,15 @@ fn openInternalWithState(
                 continue;
             }
         }
-        blocks[block_count] = try readBlockRetained(&store, descriptor);
+        var found: ?ValidatedBlock = null;
+        for (validated) |item| if (item.matches(descriptor)) {
+            found = .{ .block = item.block.retain(), .reader = item.reader };
+            break;
+        };
+        const item = found orelse try readBlockValidated(&store, descriptor);
+        blocks[block_count] = item.block;
+        readers[block_count] = item.reader;
         block_count += 1;
-        readers[block_count - 1] = try vector_block.Reader.init(blocks[block_count - 1].bytes());
     };
 
     const shard_count: usize = if (store.manifest) |manifest| @intCast(manifest.shard_count) else 0;
@@ -4340,7 +4880,27 @@ fn parseSpoolEntries(
     return entries;
 }
 
-fn readBlockRetained(store: *const Store, descriptor: vector_manifest.Segment) !RetainedBlock {
+pub const ValidatedBlock = struct {
+    block: RetainedBlock,
+    reader: vector_block.Reader,
+
+    fn matches(self: @This(), descriptor: vector_manifest.Segment) bool {
+        return self.block.bytes().len == descriptor.bytes and
+            self.reader.generation == descriptor.generation and self.reader.shard_id == descriptor.shard_id and
+            self.reader.covered_source_sequence == descriptor.covered_source_sequence and
+            self.reader.admissionChecksum() == descriptor.admission_checksum;
+    }
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.block.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub fn validateStagedBlock(store: *const Store, staged: StagedBlock) !ValidatedBlock {
+    return readBlockValidated(store, stagedDescriptor(staged));
+}
+
+fn readBlockValidated(store: *const Store, descriptor: vector_manifest.Segment) !ValidatedBlock {
     const path = try store.blockPathAlloc(descriptor.generation, descriptor.shard_id);
     defer store.alloc.free(path);
     if (mapBlockFile(path)) |mapped| {
@@ -4349,11 +4909,12 @@ fn readBlockRetained(store: *const Store, descriptor: vector_manifest.Segment) !
                 if (reader.generation == descriptor.generation and reader.shard_id == descriptor.shard_id and
                     reader.covered_source_sequence == descriptor.covered_source_sequence and reader.admissionChecksum() == descriptor.admission_checksum)
                 {
-                    return RetainedBlock.init(store.alloc, .{ .mapped = mapped }) catch |err| {
+                    const retained = RetainedBlock.init(store.alloc, .{ .mapped = mapped }) catch |err| {
                         std.posix.munmap(mapped.bytes);
                         _ = std.posix.system.close(mapped.fd);
                         return err;
                     };
+                    return .{ .block = retained, .reader = reader };
                 }
             } else |_| {}
         }
@@ -4372,7 +4933,7 @@ fn readBlockRetained(store: *const Store, descriptor: vector_manifest.Segment) !
     {
         return error.VectorBlockDescriptorMismatch;
     }
-    return try RetainedBlock.init(store.alloc, .{ .heap = bytes });
+    return .{ .block = try RetainedBlock.init(store.alloc, .{ .heap = bytes }), .reader = reader };
 }
 
 fn mapBlockFile(path: []const u8) !RetainedBlock.MappedPayload {
@@ -4732,6 +5293,20 @@ test "vector block positional lookup reads mmap payload through retained descrip
     for (projection_requests) |request| expected_projection_bytes += @intCast(request.located.block.location.vector_len);
     try std.testing.expectEqual(expected_projection_bytes, projection_read_stats.physical_bytes);
 
+    var ordered_projections = projection_requests;
+    for (&ordered_projections, 0..) |*request, i| {
+        request.result_position = i;
+        request.value = null;
+    }
+    std.mem.reverse(ProjectionReadRequest, &ordered_projections);
+    opened.orderProjectionReadsByLocation(&ordered_projections);
+    _ = try opened.readProjectionsIntoBatch(io_impl.io(), &ordered_projections);
+    for (ordered_projections) |request| {
+        try std.testing.expect(request.err == null);
+        try std.testing.expectEqual(revisions[request.result_position], request.value.?.revision);
+        try std.testing.expectEqualSlices(u8, projection_requests[request.result_position].value.?.bytes, request.value.?.bytes);
+    }
+
     {
         var manager = resource_manager_mod.ResourceManager.init(.{});
         defer manager.deinit(alloc);
@@ -4800,7 +5375,7 @@ test "vector block positional lookup reads mmap payload through retained descrip
     var exact_scratch: [keys.len][256]u8 = undefined;
     var exact_requests: [keys.len]ExactReadRequest = undefined;
     for (projection_requests, 0..) |request, i| {
-        exact_requests[i] = .{ .located = request.located, .scratch = &exact_scratch[i] };
+        exact_requests[i] = .{ .located = request.located, .scratch = &exact_scratch[i], .result_position = i };
     }
     const exact_read_stats = try opened.readExactIntoBatch(io_impl.io(), &exact_requests);
     try std.testing.expectEqual(@as(u64, keys.len * 2), exact_read_stats.physical_reads);
@@ -4815,6 +5390,26 @@ test "vector block positional lookup reads mmap payload through retained descrip
         try std.testing.expect(request.err == null);
         const exact_value = request.value orelse return error.TestExpectedExactVector;
         try std.testing.expectEqualSlices(f32, &expected_vector, try exact_value.decodeExactInto(&exact_decoded));
+    }
+    // Reordering preserves caller destinations and per-request failures. A bad
+    // destination must not discard successful siblings or attach their values
+    // to the wrong candidate.
+    for (&exact_requests) |*request| {
+        request.value = null;
+        request.err = null;
+        if (request.result_position == 0) request.scratch = request.scratch[0..0];
+    }
+    std.mem.reverse(ExactReadRequest, &exact_requests);
+    opened.orderExactReadsByLocation(&exact_requests);
+    _ = try opened.readExactIntoBatch(io_impl.io(), &exact_requests);
+    for (exact_requests) |request| {
+        if (request.result_position == 0) {
+            try std.testing.expectEqual(error.BufferTooSmall, request.err.?);
+            try std.testing.expect(request.value == null);
+        } else {
+            try std.testing.expect(request.err == null);
+            try std.testing.expectEqualSlices(f32, &expected_vectors[request.result_position], try request.value.?.decodeExactInto(&exact_decoded));
+        }
     }
     var residual_scratch: [keys.len][256]u8 = undefined;
     var residual_requests: [keys.len]ResidualReadRequest = undefined;
@@ -5922,4 +6517,203 @@ test "source vector payloads adaptive location cache admits repeats and releases
     // Reclamation also resets admission history; a fresh scan stays unallocated.
     cache.put(&digest, 42, located);
     try std.testing.expectEqual(@as(u64, 0), cache.resident_bytes.load(.monotonic));
+}
+
+test "vector block store staged WAL checkpoint preserves concurrent updates tombstones and old leases" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |sealed| {
+        var memory = lsm_backend.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        var store = try Store.open(alloc, memory.storage(), "/staged-wal-suffix");
+        defer store.deinit();
+        try store.publishEmptyBase(1, 0, .{ .shard_count = 1, .encoding = .float32 });
+        try store.appendBatch(1, &.{
+            .{ .kind = .upsert, .key = "a", .source_sequence = 1, .revision = 1, .vector = &.{1} },
+            .{ .kind = .upsert, .key = "b", .source_sequence = 1, .revision = 1, .vector = &.{2} },
+        }, 1, .{});
+        if (sealed) try std.testing.expect(try store.sealWal());
+        var old = try Store.openWithBlocks(alloc, memory.storage(), "/staged-wal-suffix");
+        defer old.deinit();
+        var staged = (try old.stageWalToDeltaWithPolicy(true, false)).?;
+        defer staged.deinit();
+        try store.appendBatch(2, &.{
+            .{ .kind = .upsert, .key = "a", .source_sequence = 2, .revision = 2, .vector = &.{3} },
+            .{ .kind = .tombstone, .key = "b", .source_sequence = 2, .revision = 2 },
+        }, 2, .{});
+        var raced = try store.prepareStagedWalCheckpoint(&staged);
+        defer raced.deinit();
+        try store.appendBatch(3, &.{.{ .kind = .upsert, .key = "c", .source_sequence = 3, .revision = 1, .vector = &.{4} }}, 3, .{});
+        try std.testing.expectError(error.InvalidVectorBlockPublicationBoundary, store.commitPrepared(&raced));
+        var prepared = try store.prepareStagedWalCheckpoint(&staged);
+        defer prepared.deinit();
+        try store.commitPrepared(&prepared);
+        staged.build.disarmCleanup();
+        prepared.reclaimObsolete();
+        try std.testing.expectEqualSlices(f32, &.{1}, (try old.get("a", 1, 1)).vector.vectorView().?);
+        try std.testing.expectEqualSlices(f32, &.{2}, (try old.get("b", 1, 1)).vector.vectorView().?);
+        for (0..2) |_| {
+            var reopened = try Store.openWithBlocks(alloc, memory.storage(), "/staged-wal-suffix");
+            defer reopened.deinit();
+            try std.testing.expectEqualSlices(f32, &.{3}, (try reopened.get("a", 3, 2)).vector.vectorView().?);
+            try std.testing.expect((try reopened.get("b", 3, 2)) == .tombstone);
+            try std.testing.expectEqualSlices(f32, &.{4}, (try reopened.get("c", 3, 1)).vector.vectorView().?);
+        }
+    }
+}
+
+fn warmVectorWritePolicy(policy: []const u8) bool {
+    if (comptime !builtin.link_libc) return false;
+    const value = std.c.getenv("ANTFLY_EXPERIMENT_VECTOR_WRITE_CACHE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), policy);
+}
+
+test "vector block tiered checkpoints preserve updates tombstones suffix and repeated reopen" {
+    const a = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(a);
+    defer memory.deinit();
+    const root = "/tiered-checkpoints";
+    var initial = try Store.open(a, memory.storage(), root);
+    defer initial.deinit();
+    var writer = try vector_block.Writer.init(a, 1, 0, 1, 0);
+    defer writer.deinit();
+    try writer.appendVector("base", 0, 1, &.{0});
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    try initial.publishGeneration(1, 0, &.{.{ .shard_id = 0, .bytes = bytes }}, true);
+    var opened = try Store.openWithBlocks(a, memory.storage(), root);
+    defer opened.deinit();
+    var old = try opened.clone(a);
+    defer old.deinit();
+    var merges: usize = 0;
+    for (1..41) |round| {
+        const sequence: u64 = @intCast(round * 2);
+        const value = [_]f32{@floatFromInt(round)};
+        try opened.store.appendBatch(try opened.store.nextBatchId(), &.{
+            .{ .kind = .upsert, .key = "latest", .source_sequence = sequence, .revision = 1, .vector = &value },
+            .{ .kind = if (round % 2 == 0) .tombstone else .upsert, .key = "toggle", .source_sequence = sequence, .revision = 1, .vector = if (round % 2 == 0) &.{} else &value },
+        }, sequence, .{});
+        var next = try Store.openWithBlocks(a, memory.storage(), root);
+        opened.deinit();
+        opened = next;
+        var checkpoint = (try opened.stageWalToDeltaWithTiers(true, false, true)).?;
+        defer checkpoint.deinit();
+        if (checkpoint.selected != null) merges += 1;
+        // The concurrent suffix is newer than the sealed checkpoint cut.
+        try opened.store.appendBatch(try opened.store.nextBatchId(), &.{.{ .kind = .upsert, .key = "suffix", .source_sequence = sequence + 1, .revision = 1, .vector = &value }}, sequence + 1, .{});
+        var prepared = try opened.store.prepareStagedWalCheckpoint(&checkpoint);
+        defer prepared.deinit();
+        try opened.store.commitPrepared(&prepared);
+        checkpoint.build.disarmCleanup();
+        prepared.reclaimObsolete();
+        next = try Store.openWithBlocks(a, memory.storage(), root);
+        opened.deinit();
+        opened = next;
+        try std.testing.expectEqualSlices(f32, &value, (try opened.get("latest", sequence + 1, 1)).vector.vectorView().?);
+        try std.testing.expectEqualSlices(f32, &value, (try opened.get("suffix", sequence + 1, 1)).vector.vectorView().?);
+        const toggle = try opened.get("toggle", sequence + 1, 1);
+        if (round % 2 == 0) try std.testing.expect(toggle != .vector) else try std.testing.expectEqualSlices(f32, &value, toggle.vector.vectorView().?);
+        try std.testing.expectEqualSlices(f32, &.{0}, (try old.get("base", 0, 1)).vector.vectorView().?);
+    }
+    try std.testing.expect(merges > 3);
+}
+
+test "vector block streaming delta merge skips superseded corruption and preserves exact encoded winners" {
+    const a = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(a);
+    defer memory.deinit();
+    const root = "/streaming-delta-winners";
+    var store = try Store.open(a, memory.storage(), root);
+    defer store.deinit();
+    for (1..11) |generation| {
+        var writer = try vector_block.Writer.initWithEncoding(a, generation, 0, 1, 0, .float16);
+        defer writer.deinit();
+        const value = [_]f32{ @floatFromInt(generation), 1.1234567, -250_000.125 };
+        var names = [_][]const u8{ "shared", "encoded", "deleted" };
+        std.mem.sort([]const u8, &names, {}, struct {
+            fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return vector_block.keyHash(lhs) < vector_block.keyHash(rhs);
+            }
+        }.less);
+        for (names) |name| {
+            if (std.mem.eql(u8, name, "shared")) try writer.appendVector(name, 0, generation, &value);
+            if (std.mem.eql(u8, name, "deleted")) {
+                if (generation == 1) try writer.appendVector(name, 0, 1, &.{7});
+                if (generation == 10) try writer.appendTombstone(name, 0, 2);
+            }
+            if (std.mem.eql(u8, name, "encoded") and generation == 2) try writer.appendVector(name, 0, 2, &value);
+        }
+        const bytes = try writer.build();
+        defer a.free(bytes);
+        try store.publishGeneration(generation, 0, &.{.{ .shard_id = 0, .bytes = bytes }}, generation == 1);
+    }
+    const padding = [_]f32{0.25} ** 256;
+    try store.appendBatch(try store.nextBatchId(), &.{
+        .{ .kind = .upsert, .key = "wal", .source_sequence = 11, .revision = 1, .vector = &.{3.125} },
+        .{ .kind = .upsert, .key = "padding", .source_sequence = 11, .revision = 1, .vector = &padding },
+    }, 11, .{});
+    var old = try Store.openWithBlocks(a, memory.storage(), root);
+    defer old.deinit();
+    var input_budget = old.store.wal_committed_bytes;
+    for (old.blocks[old.blocks.len - 3 ..]) |block| input_budget += block.bytes().len;
+    const selected = (try old.selectCheckpointTierSuffix(input_budget)).?;
+    defer a.free(selected);
+    try std.testing.expectEqual(@as(usize, 3), selected.len);
+    for (selected) |segment| try std.testing.expect(segment.generation >= 8);
+    try std.testing.expect((try old.selectCheckpointTierSuffix(input_budget - 1)) == null);
+    const expected = (try old.get("encoded", 11, 2)).vector;
+    // This obsolete payload must never be loaded by the merge cursor.
+    const obsolete = (try old.readers[1].get("shared", 11, null)).vector;
+    const obsolete_bytes = @constCast(obsolete.bytes);
+    obsolete_bytes[0] ^= 1;
+    defer obsolete_bytes[0] ^= 1;
+    // A corrupt winner still fails before a replacement can be published.
+    const winner_bytes = @constCast(expected.bytes);
+    winner_bytes[0] ^= 1;
+    try std.testing.expectError(error.VectorBlockPayloadChecksumMismatch, old.stageWalToDeltaWithTiers(true, false, false));
+    winner_bytes[0] ^= 1;
+    var checkpoint = (try old.stageWalToDeltaWithTiers(true, false, false)).?;
+    defer checkpoint.deinit();
+    try std.testing.expect(checkpoint.compact_existing);
+    var prepared = try store.prepareStagedWalCheckpoint(&checkpoint);
+    defer prepared.deinit();
+    try store.commitPrepared(&prepared);
+    checkpoint.build.disarmCleanup();
+    prepared.reclaimObsolete();
+    var reopened = try Store.openWithBlocks(a, memory.storage(), root);
+    defer reopened.deinit();
+    const actual = (try reopened.get("encoded", 11, 2)).vector;
+    try std.testing.expectEqualSlices(u8, expected.bytes, actual.bytes);
+    try std.testing.expectEqual(expected.scale, actual.scale);
+    try std.testing.expectEqual(expected.quantization_error_norm, actual.quantization_error_norm);
+    try std.testing.expectEqual(expected.decoded_norm_lower_bound, actual.decoded_norm_lower_bound);
+    try std.testing.expectEqualSlices(u8, expected.exact_residual.?, actual.exact_residual.?);
+    try std.testing.expect((try reopened.get("deleted", 11, null)) == .tombstone);
+    var exact: [3]f32 = undefined;
+    try std.testing.expectEqualSlices(f32, &.{ 10, 1.1234567, -250_000.125 }, try (try reopened.get("shared", 11, 10)).vector.decodeExactInto(&exact));
+    try std.testing.expectEqualSlices(f32, &.{3.125}, try (try reopened.get("wal", 11, 1)).vector.decodeExactInto(exact[0..1]));
+}
+
+test "vector block merge read windows bind reused offsets to retained inode identity" {
+    const a = std.testing.allocator;
+    const first_bytes = try a.alloc(u8, 8192);
+    @memset(first_bytes, 17);
+    var first = try RetainedBlock.init(a, .{ .heap = first_bytes });
+    defer first.deinit(a);
+    const next_bytes = try a.alloc(u8, 8192);
+    @memset(next_bytes, 93);
+    var next = try RetainedBlock.init(a, .{ .heap = next_bytes });
+    defer next.deinit(a);
+    var window: CompactionMerge.ReadWindow = .{};
+    defer a.free(window.bytes);
+    try std.testing.expectEqual(@as(u8, 17), (try window.read(a, first, 15, 5000, 4096))[0]);
+    try std.testing.expectEqual(@as(u8, 93), (try window.read(a, next, 15, 5000, 4096))[0]);
+    try std.testing.expectEqual(@as(u8, 17), (try window.read(a, first, 4090, 100, 4096))[99]);
+    try std.testing.expectError(error.EndOfStream, window.read(a, first, 8190, 4, 4096));
+}
+
+test "storage.vector_block_store adaptive read cost and available work gate helpers" {
+    try std.testing.expectEqual(@as(usize, 1), adaptiveReadWorkers(200, 1000));
+    try std.testing.expectEqual(@as(usize, 1), adaptiveReadWorkers(1, 100000));
+    try std.testing.expectEqual(@as(usize, 1), adaptiveReadWorkers(2, 8000));
+    try std.testing.expectEqual(@as(usize, 8), adaptiveReadWorkers(30, 50000));
 }

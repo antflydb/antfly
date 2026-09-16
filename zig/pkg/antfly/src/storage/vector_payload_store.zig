@@ -73,8 +73,27 @@ pub const SegmentSizing = struct {
 };
 
 pub const Store = struct {
+    /// Candidate references are protected by the durable migration job until
+    /// all primary rows and their final reference coverage have been verified.
+    migration_retention: std.atomic.Value(bool) = .init(false),
+    migration_disk_reserve: std.atomic.Value(u64) = .init(0),
+    migration_temporary_limit: std.atomic.Value(u64) = .init(0),
+
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
+    publication_mutex: std.atomic.Mutex = .unlocked,
+    published: ?*ReadView = null,
+    published_poisoned: bool = false,
+    checkpoint_running: bool = false,
+    unlocked_checkpoint: bool = false,
+    background_checkpoint: bool = false,
+    checkpoint_publishing: bool = false,
+    checkpoint_write_waiters: std.atomic.Value(usize) = .init(0),
+    checkpoint_epoch: std.atomic.Value(u32) = .init(0),
+    checkpoint_test_hook: if (@import("builtin").is_test) ?*const fn (*Store, CheckpointPhase) anyerror!void else void = if (@import("builtin").is_test) null else {},
+    active_sessions: std.atomic.Value(u64) = .init(0),
+    session_start_epoch: std.atomic.Value(u64) = .init(0),
+    read_stats: ReadStats = .{},
     opened: native.Opened,
     stats: Stats = .{},
     read_only: bool,
@@ -86,12 +105,17 @@ pub const Store = struct {
     location_cache: ?*native.ReferenceLocationCache = null,
     segment_sizing: SegmentSizing = .{},
     collection: ?*Collection = null,
+    retiring: ?*Collection = null,
+    detached_collection: bool = false,
+    collection_reader_test_hook: if (@import("builtin").is_test) ?*const fn (*Store) anyerror!void else void = if (@import("builtin").is_test) null else {},
     marking: ?*Marking = null,
+    background_gc: bool = false,
     mark_step_rows: usize = 0,
     mark_step_ns: u64 = 0,
     mark_outside_lock: bool = false,
     scan_duty_percent: u8 = 0,
     last_scan_ns: u64 = 0,
+    last_copy_ns: u64 = 0,
     rescue_reappends: bool = false,
     shared_catalog: bool = false,
     independent_scan: bool = false,
@@ -105,14 +129,22 @@ pub const Store = struct {
     inventory_min_payloads: u64 = 0,
     inventory_requested: bool = false,
     last_mark_completed_ns: u64 = 0,
+    next_authority_check_ns: u64 = 0,
+    cost_based_gc: bool = false,
+    garbage_since_ns: u64 = 0,
+    garbage_deadline_seconds: ?u64 = null,
+    capacity_observation: ?resources.CapacityObservation = null,
+    garbage_max_age_ns: u64 = 5 * std.time.ns_per_min,
     obsolete_debt: u64 = 0,
     inventory: Inventory = .{},
     // Test-only pause/clock injection exercises an actual in-flight scan.
     mark_test_hook: if (@import("builtin").is_test) ?*const fn (*Store) void else void = if (@import("builtin").is_test) null else {},
+    mark_snapshot_test_hook: if (@import("builtin").is_test) ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) anyerror!void } else void = if (@import("builtin").is_test) null else {},
     coalesce_directory: bool = false,
     receipt: ?CheckpointReceipt = null,
     checkpoint_receipts: bool = false,
     snapshot_reads: bool = false,
+    positional_batch_reads: bool = false,
     append_only: bool = false,
     selective_gc: bool = false,
     group_commit: bool = false,
@@ -125,6 +157,140 @@ pub const Store = struct {
     prepare_requests: std.atomic.Value(u64) = .init(0),
 
     directory: ?*@import("source_location_directory.zig").Directory = null,
+
+    const CheckpointPhase = enum { stage, publication };
+
+    fn waitCheckpointLocked(self: *Store) void {
+        while (self.checkpoint_running) {
+            const observed = self.checkpoint_epoch.load(.acquire);
+            self.mutex.unlock();
+            self.waitCheckpointChange(observed);
+            self.lock();
+        }
+    }
+
+    fn waitWriteAdmissionLocked(self: *Store) void {
+        const suffix_limit = self.wal_admission_bytes + @max(16 * 1024, self.wal_admission_bytes / 4);
+        var waiting = false;
+        defer if (waiting) {
+            _ = self.checkpoint_write_waiters.fetchSub(1, .release);
+        };
+        while (self.checkpoint_publishing or (self.checkpoint_running and self.opened.store.wal_committed_bytes >= suffix_limit)) {
+            if (!waiting) {
+                waiting = true;
+                _ = self.checkpoint_write_waiters.fetchAdd(1, .release);
+            }
+            const observed = self.checkpoint_epoch.load(.acquire);
+            self.mutex.unlock();
+            self.waitCheckpointChange(observed);
+            self.lock();
+        }
+    }
+
+    fn waitCheckpointChange(self: *Store, observed: u32) void {
+        if (comptime @import("builtin").os.tag == .freestanding) {
+            std.atomic.spinLoopHint();
+            return;
+        }
+        std.Io.Threaded.global_single_threaded.io().futexWaitUncancelable(u32, &self.checkpoint_epoch.raw, observed);
+    }
+
+    fn notifyCheckpointFinished(self: *Store) void {
+        _ = self.checkpoint_epoch.fetchAdd(1, .release);
+        if (comptime @import("builtin").os.tag != .freestanding)
+            std.Io.Threaded.global_single_threaded.io().futexWake(u32, &self.checkpoint_epoch.raw, std.math.maxInt(u32));
+    }
+
+    const ReadStats = struct {
+        resolved_payloads: std.atomic.Value(u64) = .init(0),
+        resolved_bytes: std.atomic.Value(u64) = .init(0),
+        snapshot_read_ns: std.atomic.Value(u64) = .init(0),
+        catalog_metadata_bytes_shared: std.atomic.Value(u64) = .init(0),
+        catalog_metadata_bytes_copied: std.atomic.Value(u64) = .init(0),
+    };
+
+    const ReadView = struct {
+        refs: std.atomic.Value(usize) = .init(1),
+        alloc: Allocator,
+        opened: native.Opened,
+
+        fn retain(self: *ReadView) *ReadView {
+            _ = self.refs.fetchAdd(1, .monotonic);
+            return self;
+        }
+        fn release(self: *ReadView) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const alloc = self.alloc;
+            self.opened.deinit();
+            alloc.destroy(self);
+        }
+    };
+
+    fn usesPublishedReads(self: *const Store) bool {
+        return self.positional_batch_reads or self.snapshot_reads;
+    }
+
+    fn lockPublication(self: *Store) void {
+        while (!self.publication_mutex.tryLock()) std.Thread.yield() catch {};
+    }
+
+    // Allocate before durability. Publication itself cannot fail and never
+    // destroys an old catalog while excluding readers.
+    fn prepareReadPublication(self: *Store, next: *native.Opened) !?*ReadView {
+        if (!self.usesPublishedReads()) return null;
+        try self.prepareReadCatalog(next);
+        const view = try self.alloc.create(ReadView);
+        errdefer self.alloc.destroy(view);
+        view.* = .{ .alloc = self.alloc, .opened = try next.clone(self.alloc) };
+        view.opened.resource_manager = self.preparation_manager;
+        view.opened.reference_location_cache = self.location_cache;
+        return view;
+    }
+
+    fn exchangeReadView(self: *Store, next: ?*ReadView) ?*ReadView {
+        if (next == null) return null;
+        self.lockPublication();
+        const old = self.published;
+        self.published = next;
+        self.publication_mutex.unlock();
+        return old;
+    }
+
+    fn publishReadView(self: *Store, next: ?*ReadView) void {
+        if (self.exchangeReadView(next)) |view| view.release();
+    }
+
+    fn setPoisoned(self: *Store, poisoned: bool) void {
+        self.poisoned = poisoned;
+        self.lockPublication();
+        self.published_poisoned = poisoned;
+        self.publication_mutex.unlock();
+    }
+
+    pub fn beginMigrationRetention(self: *Store) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        // A collector may be staging outside the mutex. Admit only after its
+        // owner retires; atomic publication then prevents the next collector.
+        if (self.marking != null or self.collection != null or self.retiring != null or self.checkpoint_running)
+            return error.StorageBusy;
+        self.migration_retention.store(true, .release);
+    }
+
+    pub fn setMigrationRetention(self: *Store, active: bool) void {
+        self.migration_retention.store(active, .release);
+    }
+
+    pub fn poison(self: *Store) void {
+        self.lock();
+        defer self.mutex.unlock();
+        self.setPoisoned(true);
+    }
+
+    fn countRead(self: *Store, count: usize, bytes: usize) void {
+        _ = self.read_stats.resolved_payloads.fetchAdd(count, .monotonic);
+        _ = self.read_stats.resolved_bytes.fetchAdd(bytes, .monotonic);
+    }
 
     /// Rebuildable physical occurrence cache, never commit/ownership authority.
     /// WAL membership is refreshed at installation, not on every preparation.
@@ -244,9 +410,9 @@ pub const Store = struct {
                 for (previous.?.readers) |reader| {
                     if (next_segments.contains(id(reader))) continue;
                     for (0..reader.count) |i| {
-                        const row = try reader.entryAt(i);
+                        const row = reader.sourceIdentityAt(i);
                         rows.* += 1;
-                        if (row.value != .vector or row.key.len != 32) return error.InvalidVectorReference;
+                        if (!row.vector or row.key.len != 32) return error.InvalidVectorReference;
                         try self.remove(row.key[0..32].*);
                     }
                 }
@@ -254,10 +420,10 @@ pub const Store = struct {
             for (next.readers) |reader| {
                 if (self.segments.contains(id(reader))) continue;
                 for (0..reader.count) |i| {
-                    const row = try reader.entryAt(i);
+                    const row = reader.sourceIdentityAt(i);
                     rows.* += 1;
-                    if (row.value != .vector or row.key.len != 32) return error.InvalidVectorReference;
-                    try self.add(alloc, row.key[0..32].*, row.value.vector.dims);
+                    if (!row.vector or row.key.len != 32) return error.InvalidVectorReference;
+                    try self.add(alloc, row.key[0..32].*, row.dims);
                 }
             }
             if (!use_delta) {
@@ -274,6 +440,13 @@ pub const Store = struct {
         }
     };
 
+    fn prepareReadCatalog(self: *const Store, opened: *native.Opened) !void {
+        // Positional batches retain a read lease outside SourceLock. Copying
+        // every segment's metadata for each bounded batch makes lease creation
+        // grow with the entire table instead of the requested vectors.
+        if (self.shared_catalog or self.usesPublishedReads()) try opened.shareSegmentCatalog();
+    }
+
     fn prepareOpened(self: *Store, next: *native.Opened) !void {
         if (self.inventory_min_payloads != 0) {
             const desired = self.inventory_requested and self.stats.retained_payloads >= self.inventory_min_payloads;
@@ -283,7 +456,7 @@ pub const Store = struct {
                 self.stats.inventory_policy_switches += 1;
             }
         }
-        if (self.shared_catalog) try next.shareSegmentCatalog();
+        try self.prepareReadCatalog(next);
         if (self.incremental_inventory) {
             const started = time.monotonicNs();
             defer self.stats.inventory_update_ns += time.monotonicNs() -| started;
@@ -294,8 +467,11 @@ pub const Store = struct {
 
     fn installOpened(self: *Store, next: *native.Opened) !void {
         try self.prepareOpened(next);
+        errdefer if (self.incremental_inventory) self.inventory.deinit(self.alloc);
+        const publication = try self.prepareReadPublication(next);
         self.opened.deinit();
         self.opened = next.*;
+        self.publishReadView(publication);
     }
 
     const PrepareRequest = struct {
@@ -316,6 +492,7 @@ pub const Store = struct {
         retained_payload_bytes: u64,
         primary_epoch: ?u64 = null,
         ann: ?payload.Digest = null,
+        background_hint: bool = false,
     };
 
     fn sourceAuthorityDigest(self: *Store) !payload.Digest {
@@ -345,6 +522,14 @@ pub const Store = struct {
         const scopes = self.ann_scopes orelse return true;
         const scope = @import("internal_keys.zig").embeddingArtifactScopeHash(key) orelse return true;
         return std.mem.indexOfScalar(u64, scopes, scope) != null;
+    }
+
+    fn annScopeDigest(self: *const Store) payload.Digest {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("source-retention-hint-v1");
+        if (self.ann_reference_root) |root| hash.update(root);
+        if (self.ann_scopes) |scopes| hash.update(std.mem.sliceAsBytes(scopes));
+        return hash.finalResult();
     }
 
     fn annAuthorityDigest(self: *Store) !payload.Digest {
@@ -411,8 +596,13 @@ pub const Store = struct {
     }
 
     fn saveCheckpointReceipt(self: *Store, epoch: ?u64, ann: ?payload.Digest) !void {
+        return self.saveCheckpointReceiptWithPolicy(epoch, ann, false);
+    }
+
+    fn saveCheckpointReceiptWithPolicy(self: *Store, epoch: ?u64, ann: ?payload.Digest, background: bool) !void {
         if (!self.checkpoint_receipts) return;
         const receipt = CheckpointReceipt{
+            .background_hint = background,
             .source = try self.sourceAuthorityDigest(),
             .retained_payloads = self.stats.retained_payloads,
             .retained_payload_bytes = self.stats.retained_payload_bytes,
@@ -446,6 +636,8 @@ pub const Store = struct {
     };
 
     const Collection = struct {
+        plan_ready: bool = true,
+        background_hint: bool = false,
         input: native.Opened,
         live: LiveSet,
         tail: std.AutoHashMap(payload.Digest, u32),
@@ -468,8 +660,23 @@ pub const Store = struct {
         rescued: bool = false,
         debt_at_cut: u64 = 0,
         selected: ?[]@import("antfly_vectorindex").vector_block_manifest.Segment = null,
+        validated: std.ArrayListUnmanaged(native.ValidatedBlock) = .empty,
+        validation_running: bool = false,
+        validation_error: ?anyerror = null,
+        retired_opened: ?native.Opened = null,
+        retired_view: ?*ReadView = null,
+        retirement: ?native.Store.PreparedPublication = null,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
+            std.debug.assert(!self.validation_running);
+            if (self.retirement) |*prepared| {
+                prepared.reclaimObsolete();
+                prepared.deinit();
+            }
+            if (self.retired_opened) |*opened| opened.deinit();
+            if (self.retired_view) |view| view.release();
+            for (self.validated.items) |*item| item.deinit(alloc);
+            self.validated.deinit(alloc);
             if (self.output) |*output| output.deinit();
             if (!self.publication_attempted) self.input.store.discardStagedBlocks(self.staged.items);
             self.staged.deinit(alloc);
@@ -486,6 +693,11 @@ pub const Store = struct {
     // Own the primary snapshot and ANN generation across maintenance turns.
     // No cursor key/value is retained after advancing its cursor.
     const Marking = struct {
+        cost_policy: bool = false,
+        // Writer-owned override: an unlocked scanner may read cost_policy, so
+        // an explicit collection must not mutate that policy mid-scan.
+        force_copy: bool = false,
+        background_hint: bool = false,
         txn: erased.ReadTxn,
         cursor: erased.Cursor,
         indexed: bool,
@@ -587,6 +799,32 @@ pub const Store = struct {
         return false;
     }
 
+    // Liveness proves that the pinned source generation can resolve every
+    // committed identity. Opening that generation already validates index/key
+    // metadata and payload bounds. Do not turn a no-copy GC pass into a full
+    // integrity scrub: exact reads and collection copies still validate payload
+    // and residual checksums before consuming or republishing those bytes.
+    fn verifyLiveLocation(source: *const native.Opened, digest: payload.Digest, dims: u32) !void {
+        const found = try source.locateHashed(&digest, vector_block.keyHash(&digest), std.math.maxInt(u64), 1);
+        if (found != .vector) return error.MissingCommittedVectorPayload;
+        switch (found.vector) {
+            .wal => |value| {
+                if (value.dims != dims) return error.MissingCommittedVectorPayload;
+                if (value.encoding != .float32 or value.bytes.len != try vector_block.encodedVectorBytesLen(.float32, dims))
+                    return error.InvalidVectorReference;
+            },
+            .block => |block| {
+                const location = block.location;
+                if (location.dims != dims) return error.MissingCommittedVectorPayload;
+                switch (location.encoding) {
+                    .float32 => {},
+                    .float16 => if (location.residual_len == 0) return error.ExactVectorResidualMissing,
+                    .artifact_reference => return error.InvalidVectorReference,
+                }
+            },
+        }
+    }
+
     fn scanMarking(marking: *Marking, started: u64, budget_ns: u64, limit: usize, allow_verification: bool, progress: *ScanProgress) !void {
         while (marking.live.locatorPending()) {
             if (markBudgetExpired(started, budget_ns, limit, progress)) return;
@@ -623,7 +861,7 @@ pub const Store = struct {
                 while (marking.ann_row < reader.count) : (marking.ann_row += 1) {
                     if (markBudgetExpired(started, budget_ns, limit, progress)) return;
                     progress.rows += 1;
-                    const row = try reader.entryAt(marking.ann_row);
+                    const row = reader.sourceIdentityAt(marking.ann_row);
                     try markAnnKey(marking, row.key, progress);
                 }
                 marking.ann_row = 0;
@@ -636,14 +874,13 @@ pub const Store = struct {
                 if (record.kind == .reference or record.kind == .tombstone) try markAnnKey(marking, record.key, progress);
             }
         }
-        if (allow_verification and marking.live.count() == marking.retained_at_cut) {
+        if (marking.cost_policy or (allow_verification and marking.live.count() == marking.retained_at_cut)) {
             if (marking.verification == null) marking.verification = marking.live.iterator();
             while (true) {
                 if (markBudgetExpired(started, budget_ns, limit, progress)) return;
                 const item = marking.verification.?.next() orelse break;
                 progress.rows += 1;
-                const found = try marking.source.get(&item.key_ptr.*, std.math.maxInt(u64), 1);
-                if (found != .vector or found.vector.dims != item.value_ptr.*) return error.MissingCommittedVectorPayload;
+                try verifyLiveLocation(&marking.source, item.key_ptr.*, item.value_ptr.*);
                 marking.verified_bytes += @as(u64, item.value_ptr.*) * 4;
             }
             marking.verification_done = true;
@@ -771,6 +1008,10 @@ pub const Store = struct {
         defer self.mutex.unlock();
         if (self.scan_duty_percent == 0 or !self.mark_outside_lock or self.poisoned or
             self.stats.unresolved_primary_commits != 0) return null;
+        if (self.detached_collection) if (self.collection) |collection| {
+            if (!collection.plan_ready or collection.validated.items.len < collection.staged.items.len) return 0;
+            return @min(100 * std.time.ns_per_ms, scanPauseNs(self.last_copy_ns, self.scan_duty_percent));
+        };
         const marking = self.marking orelse return null;
         if (marking.running or marking.scan_done) return null;
         const pause = scanPauseNs(self.last_scan_ns, self.scan_duty_percent);
@@ -794,6 +1035,13 @@ pub const Store = struct {
     /// No primary publication or catalog access: safe before taking DB.apply.
     /// Only immutable leases and scanner-private state are accessed unlocked.
     pub fn advanceMarkingSnapshot(self: *Store) !void {
+        if (self.cost_based_gc) if (self.preparation_manager) |manager| if (manager.capacitySource()) |probe| {
+            const observation = probe.current() catch null;
+            self.lock();
+            self.capacity_observation = observation;
+            self.mutex.unlock();
+        };
+        try self.advanceCollectionReaders();
         if (!self.mark_outside_lock) return;
         self.lock();
         defer self.mutex.unlock();
@@ -809,6 +1057,100 @@ pub const Store = struct {
             if (!self.marking.?.scan_done) return false;
         } else if (!try self.scanMarkingLocked(false)) return false;
         return self.finishMarkingLocked(budget_bytes);
+    }
+
+    /// Maintenance enters without DB.apply. The collection reservation keeps
+    /// staged filenames exclusive while ordinary preparations append to its tail.
+    /// Build one immutable reader per turn; neither a corpus validation nor old
+    /// generation destruction belongs inside the publication fence.
+    pub fn advanceCollectionReaders(self: *Store) !void {
+        self.lock();
+        if (self.retiring) |retired| {
+            self.retiring = null;
+            self.mutex.unlock();
+            const start = time.monotonicNs();
+            retired.deinit(self.alloc);
+            self.lock();
+            self.stats.collection_retire_outside_lock_ns += time.monotonicNs() -| start;
+        }
+        defer self.mutex.unlock();
+        if (!self.detached_collection or self.poisoned) return;
+        const collection = self.collection orelse return;
+        if (collection.validation_running or collection.validation_error != null) return;
+        if (!collection.plan_ready) {
+            collection.validation_running = true;
+            self.mutex.unlock();
+            const start = time.monotonicNs();
+            var it = collection.live.iterator();
+            var pos: usize = 0;
+            while (it.next()) |item| : (pos += 1) {
+                const hash = vector_block.keyHash(&item.key_ptr.*);
+                collection.items[pos] = .{ .digest = item.key_ptr.*, .dims = item.value_ptr.*, .hash = hash, .shard = @intCast(hash & (collection.shards - 1)) };
+            }
+            std.debug.assert(pos == collection.items.len);
+            std.mem.sort(CollectionItem, collection.items, {}, CollectionItem.less);
+            const elapsed = time.monotonicNs() -| start;
+            self.lock();
+            collection.plan_ready = true;
+            collection.validation_running = false;
+            self.stats.collection_plan_outside_lock_ns += elapsed;
+            return;
+        }
+        if (collection.validated.items.len == collection.staged.items.len) return;
+        collection.validated.ensureUnusedCapacity(self.alloc, 1) catch |err| {
+            collection.validation_error = err;
+            return err;
+        };
+        const staged = collection.staged.items[collection.validated.items.len];
+        collection.validation_running = true;
+        self.mutex.unlock();
+        const start = time.monotonicNs();
+        const result = blk: {
+            if (comptime @import("builtin").is_test) if (self.collection_reader_test_hook) |hook| {
+                hook(self) catch |err| break :blk @as(anyerror!native.ValidatedBlock, err);
+            };
+            break :blk native.validateStagedBlock(&collection.input.store, staged);
+        };
+        const elapsed = time.monotonicNs() -| start;
+        self.lock();
+        collection.validation_running = false;
+        recordDuration(&self.stats.collection_reader_prepare_ns, &self.stats.collection_max_reader_prepare_ns, elapsed);
+        if (result) |validated| {
+            collection.validated.appendAssumeCapacity(validated);
+            self.stats.collection_readers_prepared += 1;
+        } else |err| {
+            // The serialized collector owns abort/cleanup. It will discard
+            // unpublished files before another builder may reuse the generation.
+            collection.validation_error = err;
+            return err;
+        }
+    }
+
+    /// Table-owned stores reclaim after activation through the stable DB's
+    /// maintenance owner. Explicit standalone Store collectors retain their
+    /// existing policy; a table's scanner always yields and releases apply.
+    pub fn enableBackgroundCollection(self: *Store) void {
+        self.background_gc = true;
+        self.cost_based_gc = experimentEnabled("ANTFLY_SOURCE_VECTOR_GC_COST_POLICY");
+        if (self.cost_based_gc) self.loadGarbageDeadline() catch {
+            // A corrupt/unavailable scheduling hint cannot prolong retention.
+            self.garbage_deadline_seconds = 0;
+        };
+        self.detached_collection = experimentEnabled("ANTFLY_SOURCE_VECTOR_GC_PREPARE_READERS");
+        self.mark_outside_lock = true;
+        self.independent_scan = true;
+        self.mark_step_rows = if (self.mark_step_rows == 0) 16384 else @min(16384, self.mark_step_rows);
+        self.mark_step_ns = if (self.mark_step_ns == 0) 2 * std.time.ns_per_ms else @min(2 * std.time.ns_per_ms, self.mark_step_ns);
+        self.scan_duty_percent = if (self.scan_duty_percent == 0) 25 else @min(50, self.scan_duty_percent);
+        // This only schedules verification; it never establishes reachability.
+        // Reference commits still notify debt even without the optional index.
+        self.debt_scheduling = true;
+    }
+
+    pub fn backgroundCollectionStepBytes(self: *const Store) u64 {
+        const requested = collectionStepBytes();
+        if (!self.background_gc) return requested;
+        return if (requested == 0) 8 * 1024 * 1024 else @min(requested, 8 * 1024 * 1024);
     }
 
     pub fn collectionStepBytes() u64 {
@@ -845,7 +1187,7 @@ pub const Store = struct {
     pub fn collectionPending(self: *Store) bool {
         self.lock();
         defer self.mutex.unlock();
-        return self.collection != null or self.marking != null;
+        return self.collection != null or self.marking != null or self.retiring != null;
     }
 
     pub fn currentGeneration(self: *Store) u64 {
@@ -871,10 +1213,13 @@ pub const Store = struct {
 
     fn configureDirectory(self: *Store) !void {
         self.preparation_alloc = self.alloc;
+        self.unlocked_checkpoint = experimentEnabled("ANTFLY_SOURCE_VECTOR_UNLOCKED_CHECKPOINT");
+        self.background_checkpoint = experimentEnabled("ANTFLY_SOURCE_VECTOR_BACKGROUND_CHECKPOINT");
+        self.positional_batch_reads = @import("dense_perf_experiments.zig").enabledDefault("ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS", true);
         self.coalesce_directory = experimentEnabled("ANTFLY_SOURCE_VECTOR_COALESCE_DIRECTORY");
         self.mark_outside_lock = experimentEnabled("ANTFLY_SOURCE_VECTOR_MARK_OUTSIDE_LOCK");
         self.rescue_reappends = experimentEnabled("ANTFLY_SOURCE_VECTOR_RESCUE_REAPPENDS");
-        self.shared_catalog = experimentEnabled("ANTFLY_SOURCE_VECTOR_SHARED_CATALOG");
+        self.shared_catalog = @import("dense_perf_experiments.zig").enabledDefault("ANTFLY_SOURCE_VECTOR_SHARED_CATALOG", true);
         self.independent_scan = experimentEnabled("ANTFLY_SOURCE_VECTOR_INDEPENDENT_SCAN");
         self.incremental_inventory = experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY");
         self.delta_inventory = experimentEnabled("ANTFLY_SOURCE_VECTOR_DELTA_INVENTORY");
@@ -894,7 +1239,8 @@ pub const Store = struct {
         if (self.inventory_min_payloads != 0 and self.inventory_requested and self.receipt == null) try self.inventoryRetainedPayloads();
         if (self.stats.retained_payloads < self.inventory_min_payloads) self.incremental_inventory = false;
         self.debt_scheduling = experimentEnabled("ANTFLY_SOURCE_VECTOR_DEBT_SCHEDULING") and payload.ownershipEnabled();
-        if (self.shared_catalog) try self.opened.shareSegmentCatalog();
+        try self.prepareReadCatalog(&self.opened);
+        self.publishReadView(try self.prepareReadPublication(&self.opened));
         if (self.incremental_inventory) try self.initializeInventory(experimentEnabled("ANTFLY_SOURCE_VECTOR_LAZY_INVENTORY"));
         // Existing tables always verify on their first maintenance turn.
         if (self.stats.retained_payloads == 0) self.last_mark_completed_ns = time.monotonicNs();
@@ -939,17 +1285,29 @@ pub const Store = struct {
         if (count != 0) self.location_cache = try native.ReferenceLocationCache.createWithPolicy(self.alloc, count, experimentEnabled("ANTFLY_SOURCE_VECTOR_ADAPTIVE_CACHE"));
     }
 
+    pub const OpenPolicy = struct {
+        checkpoint_receipts: bool = false,
+        pub fn fromEnvironment() OpenPolicy {
+            return .{ .checkpoint_receipts = experimentEnabled("ANTFLY_SOURCE_VECTOR_GC_RECEIPTS") };
+        }
+    };
+
     pub fn openManaged(alloc: Allocator, manager: ?*resources.ResourceManager, storage: lsm.Storage, root: []const u8, read_only: bool) !Store {
-        const resource_manager = manager orelse return openWithEncoding(alloc, storage, root, read_only, preferredEncoding());
+        return openManagedWithPolicy(alloc, manager, storage, root, read_only, OpenPolicy.fromEnvironment());
+    }
+
+    pub fn openManagedWithPolicy(alloc: Allocator, manager: ?*resources.ResourceManager, storage: lsm.Storage, root: []const u8, read_only: bool, policy: OpenPolicy) !Store {
+        const resource_manager = manager orelse return openWithPolicy(alloc, storage, root, read_only, preferredEncoding(), policy);
         const budget = try alloc.create(resources.BudgetedAllocator);
         errdefer alloc.destroy(budget);
         budget.* = resources.BudgetedAllocator.initReclaiming(resource_manager, .dense_source_payload_state, alloc, 1);
         errdefer budget.deinit();
-        var store = try openWithEncoding(budget.threadSafeAllocator(), storage, root, read_only, preferredEncoding());
+        var store = try openWithPolicy(budget.threadSafeAllocator(), storage, root, read_only, preferredEncoding(), policy);
         errdefer store.deinit();
         if (store.location_cache) |cache| try cache.attachManager(alloc, resource_manager);
         store.preparation_alloc = alloc;
         store.preparation_manager = resource_manager;
+        if (store.published) |view| view.opened.resource_manager = resource_manager;
         store.budget = budget;
         const limit = resource_manager.sliceStats(.dense_source_payload_state).hard_limit_bytes;
         if (limit != 0) store.wal_admission_bytes = @min(store.wal_admission_bytes, @max(256 * 1024, limit / 8));
@@ -958,7 +1316,9 @@ pub const Store = struct {
 
     fn preferredEncoding() vector_block.Encoding {
         const raw = if (@import("builtin").link_libc) std.c.getenv("ANTFLY_HBC_VECTOR_BLOCK_ENCODING") else null;
-        const value = if (raw) |z| std.mem.span(z) else return .float16;
+        // Fresh stores use the qualified exact-mapped float32 path. Open
+        // continues to honor the encoding in an existing manifest.
+        const value = if (raw) |z| std.mem.span(z) else return .float32;
         return if (std.ascii.eqlIgnoreCase(value, "float16") or std.ascii.eqlIgnoreCase(value, "f16")) .float16 else .float32;
     }
 
@@ -967,10 +1327,14 @@ pub const Store = struct {
     }
 
     fn openWithEncoding(alloc: Allocator, storage: lsm.Storage, root: []const u8, read_only: bool, encoding: vector_block.Encoding) !Store {
+        return openWithPolicy(alloc, storage, root, read_only, encoding, OpenPolicy.fromEnvironment());
+    }
+
+    fn openWithPolicy(alloc: Allocator, storage: lsm.Storage, root: []const u8, read_only: bool, encoding: vector_block.Encoding, policy: OpenPolicy) !Store {
         const sizing = try SegmentSizing.fromEnvironment();
         const snapshot_reads = experimentEnabled("ANTFLY_SOURCE_VECTOR_SNAPSHOT_READS");
         if (read_only) {
-            var result: Store = .{ .alloc = alloc, .opened = try native.Store.openReadOnlyWithBlocks(alloc, storage, root), .read_only = true, .segment_sizing = sizing, .snapshot_reads = snapshot_reads, .checkpoint_receipts = collectionStepBytes() != 0 };
+            var result: Store = .{ .alloc = alloc, .opened = try native.Store.openReadOnlyWithBlocks(alloc, storage, root), .read_only = true, .segment_sizing = sizing, .snapshot_reads = snapshot_reads, .checkpoint_receipts = policy.checkpoint_receipts };
             errdefer result.deinit();
             if (!try result.loadCheckpointReceipt() and !experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY")) try result.inventoryRetainedPayloads();
             try result.configureLocationCache();
@@ -983,7 +1347,7 @@ pub const Store = struct {
             if (read_only) return error.MissingVectorPayloadStore;
             try writer.publishEmptyBase(1, 0, .{ .shard_count = if (sizing.target_bytes == 0) 128 else sizing.min_shards, .encoding = encoding });
         }
-        var result: Store = .{ .alloc = alloc, .opened = try native.Store.openWithBlocks(alloc, storage, root), .read_only = read_only, .segment_sizing = sizing, .snapshot_reads = snapshot_reads, .checkpoint_receipts = collectionStepBytes() != 0 };
+        var result: Store = .{ .alloc = alloc, .opened = try native.Store.openWithBlocks(alloc, storage, root), .read_only = read_only, .segment_sizing = sizing, .snapshot_reads = snapshot_reads, .checkpoint_receipts = policy.checkpoint_receipts };
         errdefer result.deinit();
         if (!try result.loadCheckpointReceipt() and !experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY")) try result.inventoryRetainedPayloads();
         // This is the table's writable startup owner, before any builder can
@@ -1042,9 +1406,9 @@ pub const Store = struct {
             if (self.bitmap_marking) try unique.enableBitmapsMode(opened, self.bitmap_locator);
         }
         for (opened.readers) |reader| for (0..reader.count) |i| {
-            const entry = try reader.entryAt(i);
+            const entry = reader.sourceIdentityAt(i);
             self.stats.inventory_rows_scanned += 1;
-            if (entry.value == .vector) try FullInventory.put(unique, entry.key, entry.value.vector.dims);
+            if (entry.vector) try FullInventory.put(unique, entry.key, entry.dims);
         };
         for (opened.wal.records.items) |record| {
             if (record.kind == .upsert) try FullInventory.put(unique, record.key, record.dims);
@@ -1057,9 +1421,12 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store) void {
-        std.debug.assert(self.stats.active_sessions == 0);
+        std.debug.assert(self.active_sessions.load(.acquire) == 0);
+        std.debug.assert(!self.checkpoint_running);
+        if (self.published) |view| view.release();
         if (self.marking) |marking| marking.deinit(self.alloc);
         if (self.collection) |collection| collection.deinit(self.alloc);
+        if (self.retiring) |retired| retired.deinit(self.alloc);
         self.inventory.deinit(self.alloc);
         self.opened.deinit();
         if (self.directory) |directory| directory.deinit();
@@ -1076,6 +1443,16 @@ pub const Store = struct {
     /// Immutable ANN leases share native blocks and persistent WAL nodes.
     /// Queries never acquire the source writer mutex or reassemble envelopes.
     pub fn snapshot(self: *Store, alloc: Allocator) !native.Opened {
+        if (self.usesPublishedReads()) {
+            const view = try self.acquireReadView(null);
+            defer view.release();
+            var lease = try view.opened.clone(alloc);
+            // Native catalog clones deliberately omit table-owned hints.
+            // Bind the cache at the same ownership boundary as writer snapshots;
+            // its entries still validate generation/shard against this lease.
+            lease.reference_location_cache = self.location_cache;
+            return lease;
+        }
         self.lock();
         defer self.mutex.unlock();
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
@@ -1083,6 +1460,23 @@ pub const Store = struct {
         self.recordCatalogSuccessor();
         lease.reference_location_cache = self.location_cache;
         return lease;
+    }
+
+    fn acquireReadView(self: *Store, timings: ?*payload.DenseReadStats) !*ReadView {
+        const started = time.monotonicNs();
+        self.lockPublication();
+        const locked = time.monotonicNs();
+        defer {
+            self.publication_mutex.unlock();
+            if (timings) |stats| {
+                stats.lock_wait_ns += locked -| started;
+                stats.locked_ns += time.monotonicNs() -| locked;
+            }
+        }
+        if (self.published_poisoned) return error.VectorPayloadStorePoisoned;
+        const view = self.published orelse return error.MissingVectorPayloadReadView;
+        _ = self.read_stats.catalog_metadata_bytes_shared.fetchAdd(view.opened.catalogMetadataBytes(), .monotonic);
+        return view.retain();
     }
 
     fn recordCatalogSuccessor(self: *Store) void {
@@ -1093,8 +1487,8 @@ pub const Store = struct {
     }
 
     pub fn interface(self: *Store) payload.Store {
-        const normal: payload.Store.VTable = .{ .retain = retain, .release = release, .prepare = prepare, .resolve = resolve, .unresolved_commit = unresolvedCommit };
-        const scheduled: payload.Store.VTable = .{ .retain = retain, .release = release, .prepare = prepare, .resolve = resolve, .unresolved_commit = unresolvedCommit, .retired_payloads = retiredPayloads };
+        const normal: payload.Store.VTable = .{ .retain = retain, .release = release, .prepare = prepare, .resolve = resolve, .resolve_dense_batch = resolveDenseBatch, .unresolved_commit = unresolvedCommit };
+        const scheduled: payload.Store.VTable = .{ .retain = retain, .release = release, .prepare = prepare, .resolve = resolve, .resolve_dense_batch = resolveDenseBatch, .unresolved_commit = unresolvedCommit, .retired_payloads = retiredPayloads };
         return .{ .ptr = self, .vtable = if (self.debt_scheduling) &scheduled else &normal };
     }
 
@@ -1106,16 +1500,15 @@ pub const Store = struct {
     }
     fn retain(ptr: *anyopaque) void {
         const self = cast(ptr);
-        self.lock();
-        defer self.mutex.unlock();
-        self.stats.active_sessions += 1;
+        _ = self.active_sessions.fetchAdd(1, .acq_rel);
+        // This completes before the caller can select its primary snapshot.
+        // GC checks the epoch across selecting its own primary cut.
+        _ = self.session_start_epoch.fetchAdd(1, .acq_rel);
     }
     fn release(ptr: *anyopaque) void {
         const self = cast(ptr);
-        self.lock();
-        defer self.mutex.unlock();
-        std.debug.assert(self.stats.active_sessions > 0);
-        self.stats.active_sessions -= 1;
+        const previous = self.active_sessions.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
     }
 
     fn retiredPayloads(ptr: *anyopaque, bytes: u64) void {
@@ -1218,7 +1611,7 @@ pub const Store = struct {
             self.stats.collection_deferrals += 1;
         }
         if (self.collection) |collection| {
-            if (collection.publication_attempted) return false;
+            if (collection.publication_attempted or collection.validation_running) return false;
             collection.deinit(self.alloc);
             self.collection = null;
             self.stats.collection_deferrals += 1;
@@ -1234,18 +1627,38 @@ pub const Store = struct {
         for (prepared) |item| bytes = try std.math.add(usize, bytes, try std.math.add(usize, try std.math.mul(usize, item.reference.dims, 12), 2048));
         return budget.reserveScratch(bytes) catch |err| {
             if (err != error.ResourceBudgetExceeded or !self.discardCollectionForPressureLocked()) return err;
+            if (self.checkpoint_running) self.waitCheckpointLocked();
+            if (self.poisoned) return error.VectorPayloadStorePoisoned;
             // A cancelled mark no longer prevents flushing its growing WAL.
             if (self.walNeedsAdmissionCheckpoint()) try self.checkpointLocked();
             return try budget.reserveScratch(bytes);
         };
     }
 
-    fn walNeedsAdmissionCheckpoint(self: *const Store) bool {
+    fn walAtCheckpointTarget(self: *const Store) bool {
         return self.opened.store.wal_has_mutations and self.opened.store.wal_committed_bytes >= self.wal_admission_bytes;
+    }
+
+    fn walNeedsAdmissionCheckpoint(self: *const Store) bool {
+        // Background scheduling changes who performs the checkpoint, not its
+        // target run size. Give the maintenance owner the existing bounded
+        // overlap window before a writer must perform the work itself.
+        const limit = if (self.background_checkpoint)
+            self.wal_admission_bytes + @max(16 * 1024, self.wal_admission_bytes / 4)
+        else
+            self.wal_admission_bytes;
+        return self.opened.store.wal_has_mutations and self.opened.store.wal_committed_bytes >= limit;
     }
 
     fn prepareBatch(self: *Store, prepared: []const payload.Prepared) !void {
         if (self.read_only) return error.ReadOnly;
+        const reserve = self.migration_disk_reserve.load(.acquire);
+        if (reserve != 0) {
+            var bytes: u64 = 0;
+            for (prepared) |item| bytes +|= @as(u64, item.artifact.len) *| 8;
+            const capacity = try @import("antfly_platform").filesystem.capacity(self.opened.store.root_dir);
+            if (capacity.available_bytes < reserve +| bytes) return error.VectorMigrationDiskReserve;
+        }
         // Decode independent artifact envelopes before entering source writer
         // exclusion. Each request has its own allocator reservation.
         var local_budget: ?resources.BudgetedAllocator = if (self.group_commit and self.preparation_manager != null)
@@ -1263,7 +1676,14 @@ pub const Store = struct {
         const lock_started = time.monotonicNs();
         self.lock();
         defer self.mutex.unlock();
+        self.waitWriteAdmissionLocked();
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        const limit = self.migration_temporary_limit.load(.acquire);
+        if (limit != 0) {
+            var retained = self.stats.retained_payload_bytes;
+            for (prepared) |item| retained +|= item.artifact.len;
+            if (retained > limit / 8) return error.VectorMigrationTemporaryBudgetExceeded;
+        }
         const started = time.monotonicNs();
         self.stats.prepare_lock_wait_ns += started -| lock_started;
         if (self.group_commit) self.stats.decode_outside_lock_ns += lock_started -| decode_started;
@@ -1271,7 +1691,7 @@ pub const Store = struct {
         defer self.stats.preparation_ns += time.monotonicNs() -| started;
         // The checkpoint threshold is a bound during marking as well. A mark
         // is retryable from a newer cut; an ever-growing resident WAL is not.
-        if (self.walNeedsAdmissionCheckpoint() and (self.marking != null or self.collection != null)) {
+        if (self.walAtCheckpointTarget() and (self.marking != null or self.collection != null)) {
             if (!self.discardCollectionForPressureLocked()) {
                 // The scanner rejoins without DB.apply. Give it one bounded
                 // suffix window to cancel; do not wait under a primary write
@@ -1338,6 +1758,8 @@ pub const Store = struct {
         defer encoded.deinit();
         var successor = try self.opened.prepareWalSuccessor(self.alloc, &encoded, true);
         errdefer successor.deinit();
+        const publication = try self.prepareReadPublication(&successor);
+        errdefer if (publication) |view| view.release();
         self.recordCatalogSuccessor();
         // Update this rebuildable cache before durability too. If admission or
         // publication fails, discard it and rebuild from the authoritative view.
@@ -1352,12 +1774,13 @@ pub const Store = struct {
         // or asynchronous primary checkpoint can persist its reference.
         const append_started = time.monotonicNs();
         self.opened.store.appendEncodedBatch(&encoded, records.items, .{ .sync = true }) catch |err| {
-            self.poisoned = self.opened.store.poisoned;
+            self.setPoisoned(self.opened.store.poisoned);
             return err;
         };
         self.stats.durable_append_ns += time.monotonicNs() -| append_started;
         self.opened.deinit();
         self.opened = successor;
+        self.publishReadView(publication);
         if (self.collection) |collection| {
             for (records.items) |record| collection.tail.putAssumeCapacity(record.key[0..32].*, @intCast(record.vector.len));
         }
@@ -1376,34 +1799,115 @@ pub const Store = struct {
 
     fn resolve(ptr: *anyopaque, alloc: Allocator, key: []const u8, reference: payload.Reference) ![]u8 {
         const self = cast(ptr);
-        if (self.snapshot_reads) {
+        if (self.usesPublishedReads()) {
             const started = time.monotonicNs();
-            // Acquire after selecting the primary value: a lease taken before
-            // the primary snapshot could miss a concurrently committed ref.
-            // The result allocator may be a long-lived transaction arena;
-            // transient lease metadata must be freed after this one read.
-            var lease_budget: ?resources.BudgetedAllocator = if (self.preparation_manager) |manager|
-                resources.BudgetedAllocator.initReclaiming(manager, .dense_source_payload_state, self.preparation_alloc, 1)
-            else
-                null;
-            defer if (lease_budget) |*budget| budget.deinit();
-            var lease = try self.snapshot(if (lease_budget) |*budget| budget.allocator() else self.preparation_alloc);
-            defer lease.deinit();
-            const result = try resolveFrom(&lease, alloc, key, reference);
-            self.lock();
-            self.stats.snapshot_read_ns += time.monotonicNs() -| started;
-            self.stats.resolved_payloads += 1;
-            self.stats.resolved_bytes += @as(u64, reference.dims) * 4;
-            self.mutex.unlock();
+            // Select the immutable source view after the primary reference.
+            // Retention and completion neither allocate nor acquire SourceLock.
+            const view = try self.acquireReadView(null);
+            defer view.release();
+            const result = try resolveFrom(&view.opened, alloc, key, reference);
+            _ = self.read_stats.snapshot_read_ns.fetchAdd(time.monotonicNs() -| started, .monotonic);
+            self.countRead(1, @as(usize, reference.dims) * 4);
             return result;
         }
         self.lock();
         defer self.mutex.unlock();
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
         const result = try resolveFrom(&self.opened, alloc, key, reference);
-        self.stats.resolved_payloads += 1;
-        self.stats.resolved_bytes += @as(u64, reference.dims) * 4;
+        self.countRead(1, @as(usize, reference.dims) * 4);
         return result;
+    }
+
+    fn resolveDenseBatch(ptr: *anyopaque, reads: []const payload.DenseRead, dims: usize, vectors: []f32, io: ?std.Io) !payload.DenseReadStats {
+        if (dims == 0 or vectors.len != try std.math.mul(usize, reads.len, dims)) return error.InvalidVectorDimensions;
+        const self = cast(ptr);
+        var lease_fallbacks: u64 = 0;
+        if (self.usesPublishedReads() and reads.len <= 32) {
+            if (try self.resolveDensePositionalBatch(reads, dims, vectors, io)) |stats| return stats;
+            lease_fallbacks = 1;
+        }
+        const started = time.monotonicNs();
+        self.lock();
+        const locked = time.monotonicNs();
+        defer self.mutex.unlock();
+        if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        for (reads, 0..) |read, i| {
+            if (read.reference.dims != dims) return error.InvalidVectorDimensions;
+            const found = try self.opened.get(&read.reference.digest, std.math.maxInt(u64), 1);
+            if (found != .vector) return error.MissingCommittedVectorPayload;
+            if (found.vector.dims != dims) return error.VectorReferenceIdentityMismatch;
+            const destination = vectors[i * dims ..][0..dims];
+            const exact = try found.vector.decodeExactInto(destination);
+            // decodeExactInto may borrow aligned float32 storage.
+            if (exact.ptr != destination.ptr) @memcpy(destination, exact);
+            try read.reference.validateVector(read.key, destination);
+        }
+        self.countRead(reads.len, vectors.len * @sizeOf(f32));
+        return .{
+            .batches = 1,
+            .vectors = reads.len,
+            .bytes = vectors.len * @sizeOf(f32),
+            .lock_wait_ns = locked -| started,
+            .locked_ns = time.monotonicNs() -| locked,
+            .lease_fallbacks = lease_fallbacks,
+        };
+    }
+
+    /// Float32 output doubles as positional-read scratch. The immutable lease
+    /// keeps file and WAL views alive after the source writer lock retires;
+    /// every payload still passes native CRC and complete artifact identity.
+    /// Retaining the published view requires no allocation or writer lock.
+    fn resolveDensePositionalBatch(self: *Store, reads: []const payload.DenseRead, dims: usize, vectors: []f32, io: ?std.Io) !?payload.DenseReadStats {
+        var timings: payload.DenseReadStats = .{};
+        const view = try self.acquireReadView(&timings);
+        defer view.release();
+        const lease = &view.opened;
+        if (!self.positional_batch_reads or lease.payloadEncoding() != .float32) {
+            for (reads, 0..) |read, i| {
+                if (read.reference.dims != dims) return error.InvalidVectorDimensions;
+                const found = try lease.get(&read.reference.digest, std.math.maxInt(u64), 1);
+                if (found != .vector) return error.MissingCommittedVectorPayload;
+                if (found.vector.dims != dims) return error.VectorReferenceIdentityMismatch;
+                const destination = vectors[i * dims ..][0..dims];
+                const exact = try found.vector.decodeExactInto(destination);
+                if (exact.ptr != destination.ptr) @memcpy(destination, exact);
+                try read.reference.validateVector(read.key, destination);
+            }
+            self.countRead(reads.len, vectors.len * @sizeOf(f32));
+            timings.batches = 1;
+            timings.vectors = reads.len;
+            timings.bytes = vectors.len * @sizeOf(f32);
+            return timings;
+        }
+        var requests: [32]native.ExactReadRequest = undefined;
+        for (reads, 0..) |read, i| {
+            if (read.reference.dims != dims) return error.InvalidVectorDimensions;
+            const found = try lease.locateHashed(&read.reference.digest, vector_block.keyHash(&read.reference.digest), std.math.maxInt(u64), 1);
+            if (found != .vector) return error.MissingCommittedVectorPayload;
+            const required = try found.vector.exactScratchBytes();
+            if (required > dims * @sizeOf(f32)) return error.InvalidVectorDimensions;
+            requests[i] = .{ .located = found.vector, .scratch = std.mem.sliceAsBytes(vectors[i * dims ..][0..dims]) };
+        }
+        const physical = try lease.readExactIntoBatch(io, requests[0..reads.len]);
+        for (requests[0..reads.len], reads, 0..) |request, read, i| {
+            if (request.err) |err| return err;
+            const value = request.value orelse return error.MissingCommittedVectorPayload;
+            if (value.dims != dims) return error.VectorReferenceIdentityMismatch;
+            const destination = vectors[i * dims ..][0..dims];
+            const exact = value.vectorView() orelse try value.decodeExactInto(destination);
+            if (exact.ptr != destination.ptr) @memcpy(destination, exact);
+            try read.reference.validateVector(read.key, destination);
+        }
+        self.countRead(reads.len, vectors.len * @sizeOf(f32));
+        timings.batches = 1;
+        timings.vectors = reads.len;
+        timings.bytes = vectors.len * @sizeOf(f32);
+        timings.positional_batches = 1;
+        timings.positional_bytes = physical.physical_bytes;
+        inline for (std.meta.fields(native.ReadDispatchStats)) |field| {
+            @field(timings, "read_" ++ field.name) = @field(physical.dispatch, field.name);
+        }
+        return timings;
     }
 
     fn resolveFrom(opened: *const native.Opened, alloc: Allocator, key: []const u8, reference: payload.Reference) ![]u8 {
@@ -1429,10 +1933,22 @@ pub const Store = struct {
         return result;
     }
 
+    /// Called by the existing lifecycle-owned maintenance worker, outside
+    /// DB.apply. Hard WAL admission remains the synchronous backstop.
+    pub fn checkpointMaintenance(self: *Store) !void {
+        if (!self.background_checkpoint or self.read_only) return;
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        if (self.checkpoint_running or self.marking != null or self.collection != null) return;
+        if (!self.walAtCheckpointTarget()) return;
+        try self.checkpointSnapshotLocked(null);
+    }
+
     pub fn checkpoint(self: *Store) !void {
         self.lock();
         defer self.mutex.unlock();
-        if (self.collection != null or self.marking != null) return;
+        if (self.collection != null or self.marking != null or self.checkpoint_running) return;
         try self.checkpointLocked();
         // Initial ingest deliberately accumulates disjoint runs. Once ANN
         // publishes a stable tip, establish the source base as well so every
@@ -1453,11 +1969,12 @@ pub const Store = struct {
         // Grow geometrically at stable publication boundaries. Shrinking an
         // established source belongs to collection, not every small update.
         if (!bootstrap and target_shards <= current_shards) return;
+        if (self.usesPublishedReads() or self.unlocked_checkpoint) return self.checkpointSnapshotLocked(target_shards);
         const started = time.monotonicNs();
         defer self.stats.checkpoint_ns += time.monotonicNs() -| started;
         const prior_generation = self.opened.store.manifest.?.latest_generation;
         errdefer if (self.opened.store.poisoned or self.opened.store.manifest.?.latest_generation != prior_generation) {
-            self.poisoned = true;
+            self.setPoisoned(true);
         };
         if (!try self.opened.compactDeltasToBaseWithShardCount(target_shards, 1024 * 1024)) return;
         var next = try native.Store.openWithBlocksReusing(self.alloc, self.opened.store.storage, self.opened.store.root_dir, &self.opened);
@@ -1473,6 +1990,7 @@ pub const Store = struct {
     fn checkpointLocked(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        if (self.checkpoint_running) return;
         if (self.marking != null) {
             if (self.stats.unresolved_primary_commits != 0) return;
             _ = try self.advanceMarkingLocked(@max(1024 * 1024, collectionStepBytes()));
@@ -1485,11 +2003,12 @@ pub const Store = struct {
             _ = try self.advanceCollectionLocked(@max(1024 * 1024, collectionStepBytes()));
             if (self.collection != null) return;
         }
+        if (self.usesPublishedReads() or self.unlocked_checkpoint) return self.checkpointSnapshotLocked(null);
         const started = time.monotonicNs();
         defer self.stats.checkpoint_ns += time.monotonicNs() -| started;
         const prior_generation = self.opened.store.manifest.?.latest_generation;
         errdefer if (self.opened.store.poisoned or self.opened.store.manifest.?.latest_generation != prior_generation) {
-            self.poisoned = true;
+            self.setPoisoned(true);
         };
         const input_bytes = self.opened.store.wal_committed_bytes;
         if (!try self.opened.checkpointWalToDeltaWithPolicy(true, self.append_only)) return;
@@ -1503,6 +2022,112 @@ pub const Store = struct {
         for (self.opened.readers, self.opened.blocks) |reader, block| {
             if (reader.generation > prior_generation) self.stats.checkpoint_bytes_written += block.bytes().len;
         }
+    }
+
+    /// Called with SourceLock held, and returns with it held on every path.
+    /// One reserved generation excludes GC/checkpoint builders, but ordinary
+    /// preparations can append while encoding and file I/O run on the cut.
+    fn checkpointSnapshotLocked(self: *Store, base_shards: ?u32) !void {
+        if (self.checkpoint_running) return;
+        if (base_shards == null and !self.opened.store.wal_has_mutations) return;
+        // Seal the cut so publication can retain later WAL extents without
+        // reading and copying their payloads. This is an authority update,
+        // not a new artifact version, and existing read views remain valid.
+        _ = self.opened.store.sealWal() catch |err| {
+            self.setPoisoned(self.opened.store.poisoned);
+            return err;
+        };
+        var input = try self.opened.clone(self.alloc);
+        const cut = input.store.walPrefixBoundary();
+        const generation = input.store.manifest.?.latest_generation;
+        const input_bytes = if (base_shards != null) blk: {
+            var total = input.store.wal_committed_bytes;
+            for (input.blocks) |block| total += block.bytes().len;
+            break :blk total;
+        } else input.store.wal_committed_bytes;
+        self.checkpoint_running = true;
+        var locked = true;
+        const started = time.monotonicNs();
+        defer {
+            if (locked) self.mutex.unlock();
+            input.deinit();
+            self.lock();
+            self.checkpoint_publishing = false;
+            self.checkpoint_running = false;
+            self.notifyCheckpointFinished();
+            self.stats.checkpoint_ns += time.monotonicNs() -| started;
+        }
+        self.mutex.unlock();
+        locked = false;
+        if (@import("builtin").is_test) if (self.checkpoint_test_hook) |hook| try hook(self, .stage);
+        var base_build: ?native.StagedBaseBuild = null;
+        defer if (base_build) |*build| build.deinit();
+        var wal_build: ?native.StagedWalCheckpoint = null;
+        defer if (wal_build) |*build| build.deinit();
+        if (base_shards) |shards| {
+            base_build = try input.stageDeltasToBaseWithShardCount(shards, 1024 * 1024);
+            if (base_build == null) return;
+        } else {
+            wal_build = try input.stageWalToDeltaWithPolicy(true, self.append_only);
+            if (wal_build == null) return;
+        }
+        const staged_at = time.monotonicNs();
+        self.lock();
+        locked = true;
+        if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        if (self.opened.store.manifest.?.latest_generation != generation) return error.InvalidVectorBlockPublicationBoundary;
+        // Fence the final WAL snapshot. New writers wait without holding
+        // SourceLock; read acquisition and completion remain independent.
+        self.checkpoint_publishing = true;
+        var latest = try self.opened.clone(self.alloc);
+        defer latest.deinit();
+        self.mutex.unlock();
+        locked = false;
+        if (@import("builtin").is_test) if (self.checkpoint_test_hook) |hook| try hook(self, .publication);
+        var prepared = if (base_build) |*build|
+            try latest.store.prepareStagedBaseBuild(build, .{ .flatten_prefix = cut })
+        else
+            try latest.store.prepareStagedWalCheckpoint(&wal_build.?);
+        defer prepared.deinit();
+        var next = try prepared.openReaders(self.alloc, &latest);
+        var next_owned = true;
+        defer if (next_owned) next.deinit();
+        const publication = try self.prepareReadPublication(&next);
+        var publication_owned = true;
+        defer if (publication_owned) if (publication) |view| view.release();
+        const prepared_at = time.monotonicNs();
+        self.lock();
+        locked = true;
+        if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        try self.prepareOpened(&next);
+        errdefer if (self.incremental_inventory) self.inventory.deinit(self.alloc);
+        const build = if (base_build) |*value| value else &wal_build.?.build;
+        self.opened.store.commitPrepared(&prepared) catch |err| {
+            if (self.opened.store.poisoned) {
+                build.disarmCleanup();
+                self.setPoisoned(true);
+            }
+            return err;
+        };
+        build.disarmCleanup();
+        var previous = self.opened;
+        self.opened = next;
+        next_owned = false;
+        self.publishReadView(publication);
+        publication_owned = false;
+        self.refreshDirectory(false, false);
+        self.stats.checkpoint_bytes_read += input_bytes;
+        for (build.staged) |block| self.stats.checkpoint_bytes_written += block.bytes;
+        const committed_at = time.monotonicNs();
+        // Retire files and old owners outside SourceLock too. The published
+        // generation is already usable; retained readers own their old files.
+        self.mutex.unlock();
+        locked = false;
+        previous.deinit();
+        prepared.reclaimObsolete();
+        if (experimentEnabled("ANTFLY_BENCH_METRICS")) std.log.info("antfly_bench_source_checkpoint base={any} stage_ns={d} prepare_ns={d} commit_ns={d}", .{
+            base_shards != null, staged_at -| started, prepared_at -| staged_at, committed_at -| prepared_at,
+        });
     }
 
     pub fn statsSnapshot(self: *Store) Stats {
@@ -1519,6 +2144,10 @@ pub const Store = struct {
 
     fn statsLocked(self: *Store) Stats {
         var stats = self.stats;
+        stats.active_sessions = self.active_sessions.load(.acquire);
+        inline for (std.meta.fields(ReadStats)) |field| {
+            @field(stats, field.name) += @field(self.read_stats, field.name).load(.monotonic);
+        }
         stats.prepare_requests = self.prepare_requests.load(.monotonic);
         stats.source_segments = self.opened.readers.len;
         stats.inventory_incremental_active = @intFromBool(self.incremental_inventory);
@@ -1570,7 +2199,7 @@ pub const Store = struct {
     /// This conservative collector reports deferral instead of waiting for
     /// readers. Its serialized cost is included in experiment measurements.
     pub fn collectDeferredMark(self: *Store, primary: *erased.Store) !bool {
-        const budget = collectionStepBytes();
+        const budget = if (self.background_gc) self.backgroundCollectionStepBytes() else collectionStepBytes();
         return self.collectStepDeferredMark(primary, if (budget == 0) std.math.maxInt(u64) else budget);
     }
 
@@ -1583,25 +2212,27 @@ pub const Store = struct {
         if (defer_scan) self.stats.collection_debt_deferrals += 1;
         self.mutex.unlock();
         if (defer_scan) return false;
-        return self.collectStepDeferredMark(primary, budget_bytes);
+        return self.collectStepWithPolicy(primary, budget_bytes, true);
     }
 
     fn shouldDeferMark(self: *const Store, now: u64) bool {
+        if (self.cost_based_gc) if (self.garbage_deadline_seconds) |deadline| if ((time.realtimeNs() / std.time.ns_per_s) >= deadline) return false;
         return self.debt_scheduling and !self.poisoned and self.marking == null and self.collection == null and
             self.stats.unresolved_primary_commits == 0 and self.last_mark_completed_ns != 0 and
-            now -| self.last_mark_completed_ns < 30 * std.time.ns_per_s and
+            (now < self.next_authority_check_ns or now -| self.last_mark_completed_ns < 30 * std.time.ns_per_s) and
             self.obsolete_debt < @max(8 * 1024 * 1024, self.stats.retained_payload_bytes / 20) and
-            self.stats.unreferenced_payload_bytes_at_collection == 0;
+            (self.stats.unreferenced_payload_bytes_at_collection == 0 or
+                (self.cost_based_gc and self.garbage_since_ns != 0 and now -| self.garbage_since_ns < self.garbage_max_age_ns));
     }
 
     pub fn collect(self: *Store, primary: *erased.Store) !bool {
-        const budget = collectionStepBytes();
+        const budget = if (self.background_gc) self.backgroundCollectionStepBytes() else collectionStepBytes();
         return self.collectStep(primary, if (budget == 0) std.math.maxInt(u64) else budget);
     }
 
     pub fn collectStep(self: *Store, primary: *erased.Store, budget_bytes: u64) !bool {
         if (try self.collectStepDeferredMark(primary, budget_bytes)) return true;
-        if (!self.mark_outside_lock) return false;
+        if (!self.mark_outside_lock and !self.detached_collection) return false;
         try self.advanceMarkingSnapshot();
         self.lock();
         defer self.mutex.unlock();
@@ -1612,26 +2243,41 @@ pub const Store = struct {
     /// Caller may hold DB.apply. The experimental scan must be advanced by
     /// advanceMarkingSnapshot before that outer lock is acquired.
     pub fn collectStepDeferredMark(self: *Store, primary: *erased.Store, budget_bytes: u64) !bool {
+        return self.collectStepWithPolicy(primary, budget_bytes, false);
+    }
+
+    fn collectStepWithPolicy(self: *Store, primary: *erased.Store, budget_bytes: u64, background: bool) !bool {
         self.lock();
         defer self.mutex.unlock();
         const locked_started = time.monotonicNs();
         defer recordDuration(&self.stats.collection_locked_ns, &self.stats.collection_max_locked_ns, time.monotonicNs() -| locked_started);
+        if (!background) if (self.marking) |mark| {
+            mark.force_copy = true;
+        };
         const had_mark = self.marking != null;
-        const done = try self.collectStepLocked(primary, budget_bytes);
-        if (!had_mark and self.marking != null) return self.advanceMarkingLocked(@max(1, budget_bytes));
+        const done = try self.collectStepLocked(primary, budget_bytes, background);
+        if (!had_mark) if (self.marking) |mark| {
+            mark.cost_policy = background and self.cost_based_gc;
+            return self.advanceMarkingLocked(@max(1, budget_bytes));
+        };
         return done;
     }
 
-    fn collectStepLocked(self: *Store, primary: *erased.Store, budget_bytes: u64) !bool {
+    fn collectStepLocked(self: *Store, primary: *erased.Store, budget_bytes: u64, background: bool) !bool {
         if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
-        if ((self.collection == null and self.marking == null and self.stats.active_sessions != 0) or self.stats.unresolved_primary_commits != 0) {
+        if (self.migration_retention.load(.acquire)) return false;
+        if (self.checkpoint_running or self.retiring != null) {
+            self.stats.collection_deferrals += 1;
+            return false;
+        }
+        if ((self.collection == null and self.marking == null and self.active_sessions.load(.acquire) != 0) or self.stats.unresolved_primary_commits != 0) {
             self.stats.collection_deferrals += 1;
             return false;
         }
         if (self.collection != null) return self.advanceCollectionLocked(@max(1, budget_bytes));
         if (self.marking != null) return self.advanceMarkingLocked(@max(1, budget_bytes));
-        return self.startMarkingLocked(primary) catch |err| switch (err) {
+        return self.startMarkingWithPolicyLocked(primary, background) catch |err| switch (err) {
             // Setup has released every temporary snapshot before we defer.
             // A budget rejection is scheduling pressure; backing allocation
             // failures and durable I/O errors still propagate to the caller.
@@ -1663,8 +2309,17 @@ pub const Store = struct {
     }
 
     fn startMarkingLocked(self: *Store, primary: *erased.Store) !bool {
+        return self.startMarkingWithPolicyLocked(primary, false);
+    }
+
+    fn startMarkingWithPolicyLocked(self: *Store, primary: *erased.Store, background: bool) !bool {
         const setup_started = time.monotonicNs();
         defer recordDuration(&self.stats.collection_setup_ns, &self.stats.collection_max_setup_ns, time.monotonicNs() -| setup_started);
+        const session_epoch = self.session_start_epoch.load(.acquire);
+        if (self.active_sessions.load(.acquire) != 0) {
+            self.stats.collection_deferrals += 1;
+            return false;
+        }
         // Reclamation must follow durable primary publication. An in-memory
         // update alone cannot retire the payload selected by the older WAL
         // tip: recovery might still need it after a power loss.
@@ -1680,17 +2335,40 @@ pub const Store = struct {
         // Seal the cut before selecting segments; later preparations remain
         // in the WAL suffix preserved by publication.
         if (self.selective_gc) try self.checkpointLocked();
-        var txn = try primary.beginRead();
+        if (@import("builtin").is_test) if (self.mark_snapshot_test_hook) |hook| try hook.call(hook.ctx);
+        // This is a one-pass ownership scan, not foreground working-set data.
+        // Keep the same read snapshot while bypassing ordinary cache admission.
+        var txn = try primary.beginReadWithBlockCacheAdmission(.transient);
         var transferred = false;
         defer if (!transferred) txn.abort();
+        // Retaining a source session no longer waits for SourceLock. A reader
+        // could have selected an older primary version after the zero-reader
+        // check above. Abandon this cut if any session began in that window,
+        // even if it has already retired. Sessions starting after this fence
+        // select a snapshot at least as new as the mark and are protected by
+        // its live set plus the conservatively retained preparation suffix.
+        if (self.session_start_epoch.load(.acquire) != session_epoch) {
+            self.stats.collection_deferrals += 1;
+            return false;
+        }
         const epoch = try primaryReferenceEpoch(&txn);
-        const ann_digest = if (self.checkpoint_receipts) try self.annAuthorityDigest() else [_]u8{0} ** 32;
+        // Background hints can only postpone reclamation, never authorize
+        // deletion. Bind primary/source/scopes cheaply and require a full mark
+        // at least every five minutes. ANN-only retirement may leave garbage
+        // during that bounded interval; never hash an entire ANN WAL under
+        // DB.apply merely to avoid a scan. Startup and explicit collection
+        // require the complete proof and cannot trust this process-local lease.
+        const now = time.monotonicNs();
+        const ann_digest = if (!self.checkpoint_receipts) [_]u8{0} ** 32 else if (background) self.annScopeDigest() else try self.annAuthorityDigest();
         if (self.receipt) |receipt| {
-            if (receipt.primary_epoch == epoch and receipt.ann != null and
+            const hint_valid = !background or (self.last_mark_completed_ns != 0 and
+                now -| self.last_mark_completed_ns < 5 * std.time.ns_per_min);
+            if (hint_valid and receipt.background_hint == background and receipt.primary_epoch == epoch and receipt.ann != null and
                 std.mem.eql(u8, &receipt.ann.?, &ann_digest) and
                 std.mem.eql(u8, &receipt.source, &try self.sourceAuthorityDigest()))
             {
                 self.stats.checkpoint_receipt_hits += 1;
+                self.next_authority_check_ns = time.monotonicNs() +| 30 * std.time.ns_per_s;
                 self.stats.live_payloads_at_collection = receipt.retained_payloads;
                 self.stats.live_payload_bytes_at_collection = receipt.retained_payload_bytes;
                 self.stats.unreferenced_payload_bytes_at_collection = 0;
@@ -1730,7 +2408,7 @@ pub const Store = struct {
             var successor_owned = true;
             defer if (successor_owned) successor.deinit();
             const sealed = successor.store.sealWal() catch |err| {
-                self.poisoned = successor.store.poisoned;
+                self.setPoisoned(successor.store.poisoned);
                 return err;
             };
             if (sealed) {
@@ -1759,6 +2437,7 @@ pub const Store = struct {
         if (segment_stats) |stats| @memset(stats, .{});
         const marking = try self.alloc.create(Marking);
         marking.* = .{
+            .background_hint = background,
             .source = source_snapshot,
             .segment_stats = segment_stats,
             .retained_at_cut = self.stats.retained_payloads,
@@ -1797,9 +2476,9 @@ pub const Store = struct {
         live_rows: u64 = 0,
 
         fn add(self: *@This(), reader: anytype, index: usize, live: *const LiveSet) !void {
-            const row = try reader.entryAt(index);
-            if (row.value != .vector or row.key.len != 32) return;
-            const bytes = @as(u64, row.value.vector.dims) * 4;
+            const row = reader.sourceIdentityAt(index);
+            if (!row.vector or row.key.len != 32) return;
+            const bytes = @as(u64, row.dims) * 4;
             self.total += bytes;
             if (!live.contains(row.key[0..32].*)) self.dead += bytes else self.live_rows += 1;
         }
@@ -1819,6 +2498,57 @@ pub const Store = struct {
         self.stats.collection_deferrals += 1;
         self.marking.?.deinit(self.alloc);
         self.marking = null;
+    }
+
+    fn loadGarbageDeadline(self: *Store) !void {
+        const path = try std.fs.path.join(self.alloc, &.{ self.opened.store.root_dir, "GC_DEADLINE" });
+        defer self.alloc.free(path);
+        const bytes = self.opened.store.storage.readFileAlloc(self.alloc, path, 20) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer self.alloc.free(bytes);
+        if (bytes.len != 20 or !std.mem.eql(u8, bytes[0..8], "AFVSGC01") or
+            @import("antfly_hash").Crc32.hash(bytes[0..16]) != std.mem.readInt(u32, bytes[16..20], .little)) return error.InvalidGarbageDeadline;
+        self.garbage_deadline_seconds = std.mem.readInt(u64, bytes[8..16], .little);
+        // Clock rollback or an unrelated future hint must not renew the age.
+        if (self.garbage_deadline_seconds.? > (time.realtimeNs() / std.time.ns_per_s) +| self.garbage_max_age_ns / std.time.ns_per_s)
+            self.garbage_deadline_seconds = 0;
+    }
+
+    fn establishGarbageDeadline(self: *Store) !void {
+        if (self.garbage_deadline_seconds != null) return;
+        const deadline = (time.realtimeNs() / std.time.ns_per_s) +| self.garbage_max_age_ns / std.time.ns_per_s;
+        var bytes: [20]u8 = undefined;
+        @memcpy(bytes[0..8], "AFVSGC01");
+        std.mem.writeInt(u64, bytes[8..16], deadline, .little);
+        std.mem.writeInt(u32, bytes[16..20], @import("antfly_hash").Crc32.hash(bytes[0..16]), .little);
+        const path = try std.fs.path.join(self.alloc, &.{ self.opened.store.root_dir, "GC_DEADLINE" });
+        defer self.alloc.free(path);
+        try generation_publication.publishControlFile(self.alloc, self.opened.store.storage, path, &bytes);
+        self.garbage_deadline_seconds = deadline;
+    }
+
+    fn clearGarbageDeadline(self: *Store) void {
+        self.garbage_since_ns = 0;
+        self.garbage_deadline_seconds = null;
+        self.stats.collection_deferred_obsolete_bytes = 0;
+        self.stats.collection_reclaim_deadline_ns = 0;
+        const path = std.fs.path.join(self.alloc, &.{ self.opened.store.root_dir, "GC_DEADLINE" }) catch return;
+        defer self.alloc.free(path);
+        self.opened.store.storage.deleteFileAbsolute(path) catch {};
+    }
+
+    fn shouldDeferCopy(self: *const Store, now: u64, live_bytes: u64, obsolete: u64) bool {
+        if (self.garbage_deadline_seconds) |deadline| if ((time.realtimeNs() / std.time.ns_per_s) >= deadline) return false;
+        // Bound write amplification for a full copy. A periodic ownership
+        // verification alone is not a reason to rewrite an almost-live corpus.
+        if (self.capacity_observation) |observation| if (observation.available_bytes) |available| {
+            if (now -| observation.observed_at_ns <= 5 * std.time.ns_per_s and
+                available < live_bytes +| 1024 * 1024 * 1024) return false;
+        };
+        return obsolete < @max(8 * 1024 * 1024, live_bytes / 10) and
+            now -| self.garbage_since_ns < self.garbage_max_age_ns;
     }
 
     fn finishMarkingLocked(self: *Store, budget_bytes: u64) !bool {
@@ -1845,8 +2575,9 @@ pub const Store = struct {
             self.stats.live_payloads_at_collection = live.count();
             self.stats.live_payload_bytes_at_collection = live_bytes;
             self.stats.unreferenced_payload_bytes_at_collection = 0;
+            if (self.cost_based_gc or self.garbage_deadline_seconds != null) self.clearGarbageDeadline();
             self.stats.collections += 1;
-            try self.saveCheckpointReceipt(if (marking.rescued_any) null else epoch, if (marking.rescued_any) null else ann_digest);
+            try self.saveCheckpointReceiptWithPolicy(if (marking.rescued_any) null else epoch, if (marking.rescued_any) null else ann_digest, marking.background_hint);
             self.last_mark_completed_ns = time.monotonicNs();
             self.obsolete_debt -|= marking.debt_at_cut;
             marking.deinit(self.alloc);
@@ -1867,6 +2598,28 @@ pub const Store = struct {
         var live_bytes: u64 = 0;
         var dimensions = live.valueIterator();
         while (dimensions.next()) |dims| live_bytes += @as(u64, dims.*) * 4;
+        const now = time.monotonicNs();
+        var tail_bytes: u64 = 0;
+        var tail_dimensions = marking.tail.valueIterator();
+        while (tail_dimensions.next()) |dims| tail_bytes += @as(u64, dims.*) * 4;
+        const obsolete = self.stats.retained_payload_bytes -| live_bytes -| tail_bytes;
+        if (marking.cost_policy and !marking.force_copy and marking.verification_done and obsolete != 0) {
+            if (self.garbage_since_ns == 0) self.garbage_since_ns = now;
+            try self.establishGarbageDeadline();
+            if (self.shouldDeferCopy(now, live_bytes, obsolete)) {
+                self.stats.collection_copy_deferrals += 1;
+                self.stats.collection_deferred_obsolete_bytes = obsolete;
+                self.stats.collection_reclaim_deadline_ns = now +| ((self.garbage_deadline_seconds.? -| (time.realtimeNs() / std.time.ns_per_s)) *| std.time.ns_per_s);
+                self.stats.live_payloads_at_collection = live.count() + marking.tail.count();
+                self.stats.live_payload_bytes_at_collection = live_bytes + tail_bytes;
+                self.stats.unreferenced_payload_bytes_at_collection = obsolete;
+                self.last_mark_completed_ns = now;
+                self.obsolete_debt -|= marking.debt_at_cut;
+                marking.deinit(self.alloc);
+                self.marking = null;
+                return true;
+            }
+        }
         // Reclamation is also the stable boundary at which an adaptive layout
         // may shrink after churn. The target is a bound, not equal-sized shards.
         const shards = if (self.selective_gc) manifest.shard_count else self.segment_sizing.shardCount(live_bytes, manifest.shard_count);
@@ -1976,7 +2729,7 @@ pub const Store = struct {
             for (selected_indices.items) |index| {
                 const reader = self.opened.readers[index];
                 for (0..reader.count) |i| {
-                    const row = try reader.entryAt(i);
+                    const row = reader.sourceIdentityAt(i);
                     if (row.key.len != 32) continue;
                     if (live.get(row.key[0..32].*)) |dims| try copy_live.put(row.key[0..32].*, dims);
                 }
@@ -1988,13 +2741,16 @@ pub const Store = struct {
         while (copy_dims.next()) |dims| copy_bytes += @as(u64, dims.*) * 4;
         const items = try self.alloc.alloc(CollectionItem, copying.count());
         errdefer if (constructing) self.alloc.free(items);
-        var it = copying.iterator();
-        var pos: usize = 0;
-        while (it.next()) |item| : (pos += 1) {
-            const hash = vector_block.keyHash(&item.key_ptr.*);
-            items[pos] = .{ .digest = item.key_ptr.*, .dims = item.value_ptr.*, .hash = hash, .shard = @intCast(hash & (shards - 1)) };
+        const detached_plan = self.detached_collection and !partial;
+        if (!detached_plan) {
+            var it = copying.iterator();
+            var pos: usize = 0;
+            while (it.next()) |item| : (pos += 1) {
+                const hash = vector_block.keyHash(&item.key_ptr.*);
+                items[pos] = .{ .digest = item.key_ptr.*, .dims = item.value_ptr.*, .hash = hash, .shard = @intCast(hash & (shards - 1)) };
+            }
+            std.mem.sort(CollectionItem, items, {}, CollectionItem.less);
         }
-        std.mem.sort(CollectionItem, items, {}, CollectionItem.less);
         const generation = try std.math.add(u64, manifest.latest_generation, 1);
         const selected_owned = if (partial) try selected.toOwnedSlice(self.alloc) else null;
         errdefer if (constructing) {
@@ -2003,6 +2759,8 @@ pub const Store = struct {
         const collection = try self.alloc.create(Collection);
         errdefer if (constructing) self.alloc.destroy(collection);
         collection.* = .{
+            .plan_ready = !detached_plan,
+            .background_hint = marking.background_hint,
             .input = try self.opened.clone(self.alloc),
             .live = live,
             .tail = marking.tail,
@@ -2029,11 +2787,13 @@ pub const Store = struct {
     }
 
     fn advanceCollectionLocked(self: *Store, budget_bytes: u64) !bool {
+        if (self.collection.?.validation_running or !self.collection.?.plan_ready) return false;
         self.stats.collection_steps += 1;
         const copy_started = time.monotonicNs();
         var publication_started: ?u64 = null;
         defer {
-            recordDuration(&self.stats.collection_copy_ns, &self.stats.collection_max_copy_ns, (publication_started orelse time.monotonicNs()) -| copy_started);
+            self.last_copy_ns = (publication_started orelse time.monotonicNs()) -| copy_started;
+            recordDuration(&self.stats.collection_copy_ns, &self.stats.collection_max_copy_ns, self.last_copy_ns);
             if (publication_started) |start| recordDuration(&self.stats.collection_publish_ns, &self.stats.collection_max_publish_ns, time.monotonicNs() -| start);
         }
         const collection = self.collection.?;
@@ -2041,10 +2801,11 @@ pub const Store = struct {
         // After a failed step, discard unpublished files and restart marking.
         // An ambiguous CURRENT is instead fenced and its files are preserved.
         errdefer {
-            if (collection.publication_attempted) self.poisoned = true;
+            if (collection.publication_attempted) self.setPoisoned(true);
             collection.deinit(self.alloc);
             self.collection = null;
         }
+        if (collection.validation_error) |err| return err;
         const initial_bytes = collection.bytes_read;
         while (collection.shard < collection.shards) {
             if (collection.selected != null and collection.output == null and
@@ -2073,7 +2834,8 @@ pub const Store = struct {
                 collection.bytes_read += exact.len * 4;
                 self.stats.collection_bytes_read += exact.len * 4;
                 collection.pos += 1;
-                if (collection.bytes_read - initial_bytes >= budget_bytes) return false;
+                if (collection.bytes_read - initial_bytes >= budget_bytes or
+                    (self.detached_collection and time.monotonicNs() -| copy_started >= 2 * std.time.ns_per_ms)) return false;
             }
             try collection.staged.ensureUnusedCapacity(self.alloc, 1);
             const receipt = try output.finish();
@@ -2083,7 +2845,9 @@ pub const Store = struct {
             output.deinit();
             collection.output = null;
             collection.shard += 1;
+            if (self.detached_collection and time.monotonicNs() -| copy_started >= 2 * std.time.ns_per_ms) return false;
         }
+        if (self.detached_collection and collection.validated.items.len != collection.staged.items.len) return false;
         publication_started = time.monotonicNs();
         const publication_scratch = if (self.budget) |budget|
             try budget.reserveScratch(try std.math.add(usize, 64 * 1024, try std.math.add(usize, try std.math.mul(usize, @intCast(self.opened.catalogMetadataBytes()), 2), try std.math.mul(usize, collection.staged.items.len, 1024))))
@@ -2091,8 +2855,9 @@ pub const Store = struct {
             null;
         defer if (publication_scratch) |reservation| reservation.release();
         var prepared = try self.opened.store.prepareSourceCollection(collection.generation, collection.staged.items, collection.selected, collection.boundary);
-        defer prepared.deinit();
-        var next = try prepared.openReaders(self.alloc, &self.opened);
+        var prepared_owned = true;
+        defer if (prepared_owned) prepared.deinit();
+        var next = try prepared.openReadersValidated(self.alloc, &self.opened, collection.validated.items);
         var next_owned = true;
         defer if (next_owned) next.deinit();
         // The mark is no longer needed once copying completes. Reuse its
@@ -2103,9 +2868,12 @@ pub const Store = struct {
         else
             null;
         try self.prepareOpened(&next);
-        // Inventory is a cache: a failed commit leaves old authority intact
-        // and must discard any precomputed cache for the unpublished view.
+        // Inventory describes next already. Any subsequent failure, including
+        // read-view allocation before commit, must discard that unpublished
+        // cache so a retry reconstructs it from the still-current authority.
         errdefer if (self.incremental_inventory) self.inventory.deinit(self.alloc);
+        const publication = try self.prepareReadPublication(&next);
+        errdefer if (publication) |view| view.release();
         collection.publication_attempted = true;
         self.opened.store.commitPrepared(&prepared) catch |err| {
             collection.publication_attempted = self.opened.store.poisoned;
@@ -2114,9 +2882,10 @@ pub const Store = struct {
         if (self.coalesce_directory) {
             if (self.directory) |directory| directory.removeRetired(&self.opened, &next) catch {};
         }
-        self.opened.deinit();
+        if (self.detached_collection) collection.retired_opened = self.opened else self.opened.deinit();
         self.opened = next;
         next_owned = false;
+        if (self.detached_collection) collection.retired_view = self.exchangeReadView(publication) else self.publishReadView(publication);
         if (self.coalesce_directory) {
             self.refreshDirectory(false, false);
             if (self.directory) |directory| directory.saveCoalesced(self.opened.store.storage, self.opened.store.root_dir) catch {};
@@ -2149,22 +2918,27 @@ pub const Store = struct {
         self.stats.live_payloads_at_collection = live_count + collection.tail.count();
         self.stats.live_payload_bytes_at_collection = marked_live_bytes;
         self.stats.collections += 1;
+        if (self.cost_based_gc or self.garbage_deadline_seconds != null) self.clearGarbageDeadline();
         self.last_mark_completed_ns = time.monotonicNs();
         self.obsolete_debt -|= collection.debt_at_cut;
         const receipt_epoch: ?u64 = if (collection.tail.count() == 0 and collection.selected == null and !collection.rescued) collection.primary_epoch else null;
         const receipt_ann: ?payload.Digest = if (collection.tail.count() == 0 and collection.selected == null and !collection.rescued) collection.ann else null;
         // Authority and its serving view are installed. Cleanup and receipt
         // caching may retry later; neither can invalidate a healthy writer.
-        _ = self.opened.store.reclaimUnreferencedFiles() catch |err| blk: {
+        if (!self.detached_collection) _ = self.opened.store.reclaimUnreferencedFiles() catch |err| blk: {
             std.log.warn("source collection cleanup deferred: {s}", .{@errorName(err)});
             break :blk 0;
         };
-        self.saveCheckpointReceipt(receipt_epoch, receipt_ann) catch |err| {
+        self.saveCheckpointReceiptWithPolicy(receipt_epoch, receipt_ann, collection.background_hint) catch |err| {
             self.receipt = null;
             std.log.warn("source collection receipt deferred: {s}", .{@errorName(err)});
         };
-        collection.deinit(self.alloc);
         self.collection = null;
+        if (self.detached_collection) {
+            collection.retirement = prepared;
+            prepared_owned = false;
+            self.retiring = collection;
+        } else collection.deinit(self.alloc);
         return true;
     }
 };
@@ -2307,7 +3081,7 @@ test "source vector payloads primary references preserve snapshot and cursor iso
     var old = try store.beginReadTxn();
     defer old.abort();
     try store.put(key, second);
-    const resolved_before_metadata = source.stats.resolved_payloads;
+    const resolved_before_metadata = source.statsSnapshot().resolved_payloads;
     const old_metadata = try old.getArtifactMetadata(key);
     const current_metadata = try store.getArtifactMetadata(key);
     try std.testing.expectEqual(@as(?u64, 1), old_metadata.sourceHash());
@@ -2326,7 +3100,7 @@ test "source vector payloads primary references preserve snapshot and cursor iso
     try std.testing.expectEqual(@as(usize, 1), prefix_keys.len);
     try std.testing.expectEqual(@as(usize, 1), range_keys.len);
     try std.testing.expectEqualStrings(key, prefix_keys[0]);
-    try std.testing.expectEqual(resolved_before_metadata, source.stats.resolved_payloads);
+    try std.testing.expectEqual(resolved_before_metadata, source.statsSnapshot().resolved_payloads);
     try std.testing.expectEqualSlices(u8, first, try old.get(key));
     {
         var current = try store.beginProbeTxn();
@@ -2351,6 +3125,162 @@ test "source vector payloads primary references preserve snapshot and cursor iso
     try std.testing.expectEqualSlices(u8, second, (try cursor.seekAtOrAfter(key)).?.value);
     try source.checkpoint();
     try std.testing.expectEqualSlices(u8, first, try old.get(key));
+}
+
+test "source vector payloads batch reads preserve versions preparation and bounded unlocked callbacks" {
+    try checkDenseBatchReads(false, .float32);
+    try checkDenseBatchReads(true, .float32);
+    try checkDenseBatchReads(true, .float16);
+}
+
+fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.openWithEncoding(alloc, memory.storage(), "/batch-source", false, encoding);
+    defer source.deinit();
+    source.positional_batch_reads = positional;
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw_store.deinit();
+    var store = try docs.DocStore.openRuntime(alloc, &raw_store);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model-a");
+    defer alloc.free(key);
+    const other_key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model-b");
+    defer alloc.free(other_key);
+    const first = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, -0.0, 3 });
+    defer alloc.free(first);
+    const second = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 4, 5, 6 });
+    defer alloc.free(second);
+    const Sink = struct {
+        source: *Store,
+        expected: []const f32,
+        count: usize = 0,
+        fn put(ptr: *anyopaque, _: usize, vector: []const f32) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.source.mutex.tryLock());
+            self.source.mutex.unlock();
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(self.expected), std.mem.sliceAsBytes(vector));
+            self.count += 1;
+        }
+        fn sink(self: *@This()) payload.DenseSink {
+            return .{ .ptr = self, .put = put, .io = std.testing.io };
+        }
+    };
+    var sink: Sink = .{ .source = &source, .expected = &.{ 1, -0.0, 3 } };
+    try store.put(key, first);
+    var old = try store.beginReadTxn();
+    defer old.abort();
+    try store.put(key, second);
+    try source.checkpoint();
+    if (positional) try std.testing.expect(source.opened.shared_catalog != null);
+    const copied_before_reads = source.statsSnapshot().catalog_metadata_bytes_copied;
+    const shared_before_reads = source.statsSnapshot().catalog_metadata_bytes_shared;
+    const repeated = [_][]const u8{key} ** 70;
+    var values: [70]?[]const u8 = undefined;
+    const stats = try old.consumeDenseManySorted(alloc, &repeated, &values, 3, sink.sink());
+    try std.testing.expectEqual(@as(u64, 3), stats.batches);
+    try std.testing.expectEqual(@as(u64, 70), stats.vectors);
+    try std.testing.expectEqual(@as(u64, if (positional and encoding == .float32) 3 else 0), stats.positional_batches);
+    try std.testing.expectEqual(@as(usize, 70), sink.count);
+    if (positional) {
+        try std.testing.expectEqual(copied_before_reads, source.statsSnapshot().catalog_metadata_bytes_copied);
+        try std.testing.expect(source.statsSnapshot().catalog_metadata_bytes_shared > shared_before_reads);
+    }
+    for (values) |raw| try std.testing.expectEqual(@as(usize, payload.reference_len), raw.?.len);
+    var no_space: [1]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&no_space);
+    try std.testing.expectError(error.OutOfMemory, old.consumeDenseManySorted(bounded.allocator(), &.{key}, values[0..1], 3, sink.sink()));
+    var reserved_scratch: [3]f32 = undefined;
+    var bounded_sink = sink.sink();
+    bounded_sink.scratch = &reserved_scratch;
+    const low_memory = try old.consumeDenseManySorted(bounded.allocator(), repeated[0..2], values[0..2], 3, bounded_sink);
+    try std.testing.expectEqual(@as(u64, 1), low_memory.scratch_fallbacks);
+    try std.testing.expectEqual(@as(u64, 2), low_memory.batches);
+    try std.testing.expectEqual(@as(u64, 2), low_memory.vectors);
+    {
+        var budgets = resources.Options.defaultBudgets();
+        budgets[@intFromEnum(resources.Slice.dense_apply_working_set)] = .{ .soft_limit_bytes = 24, .hard_limit_bytes = 24 };
+        var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(alloc);
+        // Model an already-full cache/scratch claim. Optional batching must
+        // not turn a previously admitted ANN operation into a failed write.
+        var resident = try manager.reserve(.dense_apply_working_set, 24);
+        defer resident.release();
+        var batch_budget = resources.BudgetedAllocator.initReclaiming(&manager, .dense_apply_working_set, alloc, 1);
+        defer batch_budget.deinit();
+        const admitted = try old.consumeDenseManySorted(batch_budget.allocator(), repeated[0..2], values[0..2], 3, bounded_sink);
+        try std.testing.expectEqual(@as(u64, 1), admitted.scratch_fallbacks);
+        try std.testing.expect(batch_budget.denied());
+        try std.testing.expectEqual(@as(u64, 24), manager.sliceStats(.dense_apply_working_set).used_bytes);
+    }
+    if (positional and encoding == .float32) {
+        var budgets = resources.Options.defaultBudgets();
+        budgets[@intFromEnum(resources.Slice.dense_source_payload_state)] = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1 };
+        var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(alloc);
+        var resident = try manager.reserve(.dense_source_payload_state, 1);
+        defer resident.release();
+        source.preparation_manager = &manager;
+        defer source.preparation_manager = null;
+        const fallback = try old.consumeDenseManySorted(alloc, repeated[0..2], values[0..2], 3, sink.sink());
+        try std.testing.expectEqual(@as(u64, 0), fallback.lease_fallbacks);
+        try std.testing.expectEqual(@as(u64, 1), fallback.positional_batches);
+        try std.testing.expectEqual(@as(u64, 1), manager.sliceStats(.dense_source_payload_state).used_bytes);
+    }
+    const first_ref = (try payload.Reference.forArtifact(key, first)).encode();
+    {
+        const reference = try payload.Reference.decode(&first_ref);
+        const located = try source.opened.locateHashed(&reference.digest, vector_block.keyHash(&reference.digest), std.math.maxInt(u64), 1);
+        const block = located.vector.block;
+        const bytes = @constCast(source.opened.blocks[block.reader_index].bytes());
+        bytes[block.location.vector_offset] ^= 1;
+        defer bytes[block.location.vector_offset] ^= 1;
+        try std.testing.expectError(error.VectorBlockPayloadChecksumMismatch, old.consumeDenseManySorted(alloc, &.{key}, values[0..1], 3, sink.sink()));
+    }
+    // Mixed inline/reference values use the same callback contract.
+    _ = try old.payload_session.?.consumeDenseMany(alloc, &.{ key, key }, &.{ first, &first_ref }, 3, sink.sink());
+    {
+        var current = try store.beginProbeTxn();
+        defer current.abort();
+        sink.expected = &.{ 4, 5, 6 };
+        _ = try current.consumeDenseManySorted(alloc, &.{key}, values[0..1], 3, sink.sink());
+        try std.testing.expectError(error.InvalidVectorDimensions, current.consumeDenseManySorted(alloc, &.{key}, values[0..1], 2, sink.sink()));
+        // A valid payload digest cannot be transplanted to another model key.
+        try std.testing.expectError(error.VectorReferenceIdentityMismatch, current.payload_session.?.consumeDenseMany(alloc, &.{other_key}, values[0..1], 3, sink.sink()));
+    }
+    {
+        try store.put(other_key, first);
+        var write = try store.beginWriteBatch();
+        defer write.abort();
+        try write.put(key, first);
+        sink.expected = &.{ 1, -0.0, 3 };
+        const pending = try write.asTxn().consumeDenseManySorted(alloc, &.{key}, values[0..1], 3, sink.sink());
+        try std.testing.expectEqual(@as(u64, 0), pending.batches);
+        const mixed = try write.asTxn().consumeDenseManySorted(alloc, &.{ key, other_key }, values[0..2], 3, sink.sink());
+        try std.testing.expectEqual(@as(u64, 1), mixed.vectors);
+        try write.payload_session.?.prepareCommit();
+        _ = try write.asTxn().consumeDenseManySorted(alloc, &.{key}, values[0..1], 3, sink.sink());
+    }
+    try store.delete(key);
+    {
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectError(error.NotFound, current.consumeDenseManySorted(alloc, &.{key}, values[0..1], 3, sink.sink()));
+    }
+    try std.testing.expect(!try source.collect(&raw_store));
+    _ = try old.consumeDenseManySorted(alloc, &.{key}, values[0..1], 3, sink.sink());
+    // Corrupt or absent references remain errors, including on the batch path.
+    var reference = try payload.Reference.forArtifact(key, first);
+    reference.digest[0] ^= 1;
+    var scratch: [3]f32 = undefined;
+    try std.testing.expectError(error.MissingCommittedVectorPayload, Store.resolveDenseBatch(&source, &.{.{ .key = key, .reference = reference }}, 3, &scratch, std.testing.io));
 }
 
 test "source vector payloads collect obsolete versions only after readers retire" {
@@ -2557,13 +3487,57 @@ test "source vector payloads recover both outcomes of an ambiguous primary commi
     }
 }
 
+test "source vector payloads fresh managed encoding preserves persisted float16 on reopen" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    {
+        var fresh = try Store.openManaged(alloc, null, memory.storage(), "/fresh-source", false);
+        defer fresh.deinit();
+        try std.testing.expectEqual(Store.preferredEncoding(), fresh.opened.payloadEncoding());
+        if (!@import("builtin").link_libc or std.c.getenv("ANTFLY_HBC_VECTOR_BLOCK_ENCODING") == null)
+            try std.testing.expectEqual(.float32, fresh.opened.payloadEncoding());
+    }
+    const key = try @import("internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, "doc:existing", "model");
+    defer alloc.free(key);
+    const vector = [_]f32{ 1.234567, -9.876543 };
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 17, &vector);
+    defer alloc.free(artifact);
+    var reference: payload.Reference = undefined;
+    {
+        var existing = try Store.openWithEncoding(alloc, memory.storage(), "/existing-source", false, .float16);
+        defer existing.deinit();
+        const session = try payload.Session.create(alloc, existing.interface());
+        defer session.release();
+        reference = try payload.Reference.decode(try session.put(key, artifact));
+        try session.prepareCommit();
+        session.committed = true;
+        try existing.checkpoint();
+    }
+    var reopened = try Store.openWithEncoding(alloc, memory.storage(), "/existing-source", false, .float32);
+    defer reopened.deinit();
+    try std.testing.expectEqual(.float16, reopened.opened.payloadEncoding());
+    const session = try payload.Session.create(alloc, reopened.interface());
+    defer session.release();
+    const resolved = try session.getAlloc(alloc, key, &reference.encode());
+    defer alloc.free(resolved);
+    try std.testing.expectEqualSlices(u8, artifact, resolved);
+}
+
 test "source vector payloads ANN references share bytes across WAL checkpoint and immutable leases" {
+    try testAnnReferenceLeases(false);
+    try testAnnReferenceLeases(true);
+}
+
+fn testAnnReferenceLeases(published: bool) !void {
     for ([_]vector_block.Encoding{ .float32, .float16 }) |encoding| {
         const alloc = std.testing.allocator;
         var memory = lsm.MemoryStorage.init(alloc);
         defer memory.deinit();
         var source = try Store.openWithEncoding(alloc, memory.storage(), "/shared-source", false, encoding);
         defer source.deinit();
+        source.positional_batch_reads = false;
+        source.snapshot_reads = published;
         if (source.location_cache) |cache| cache.deinit();
         source.location_cache = try native.ReferenceLocationCache.create(alloc, 1);
         const keys = @import("internal_keys.zig");
@@ -2614,6 +3588,16 @@ test "source vector payloads ANN references share bytes across WAL checkpoint an
         try std.testing.expectEqual(encoding, checkpointed.payloadEncoding());
         const block_location = try checkpointed.locateHashed(key, vector_block.keyHash(key), 1, 71);
         try std.testing.expect(block_location.vector == .block);
+        const bound_row = checkpointed.sourceRow(block_location.vector).?;
+        const rebound = try checkpointed.bindSourceRow(bound_row);
+        try std.testing.expectEqualDeep(block_location.vector, rebound);
+        try std.testing.expectError(error.CorruptedVectorBlock, checkpointed.bindSourceRow(.{
+            .reader = bound_row.reader,
+            .row = std.math.maxInt(u32),
+            .source_sequence = 1,
+            .revision = 71,
+        }));
+        try std.testing.expect(checkpointed.sourceRow(location.vector) == null); // source WAL
         const hits_before = source.location_cache.?.hits.load(.monotonic);
         _ = try checkpointed.locateHashed(key, vector_block.keyHash(key), 1, 71);
         try std.testing.expectEqual(hits_before + 1, source.location_cache.?.hits.load(.monotonic));
@@ -2627,6 +3611,7 @@ test "source vector payloads ANN references share bytes across WAL checkpoint an
         const relocated = try native.Store.openWithBlocksReusing(alloc, memory.storage(), "/shared-source", &source.opened);
         source.opened.deinit();
         source.opened = relocated;
+        source.publishReadView(try source.prepareReadPublication(&source.opened));
         var new_source = try source.snapshot(alloc);
         defer new_source.deinit();
         checkpointed.external_payloads = &new_source;
@@ -2638,6 +3623,11 @@ test "source vector payloads ANN references share bytes across WAL checkpoint an
         const old_value = try checkpointed.viewExact((try checkpointed.locateHashed(key, vector_block.keyHash(key), 1, 71)).vector);
         try std.testing.expectEqualSlices(f32, &vector, try old_value.decodeExactInto(&scratch));
         try std.testing.expectEqual(misses_before + 2, source.location_cache.?.misses.load(.monotonic));
+        // A retained generation's direct row survives compaction/publication,
+        // with logical artifact version intact. Never transplant it to new_source.
+        const bound_old = try checkpointed.viewExact(try checkpointed.bindSourceRow(bound_row));
+        try std.testing.expectEqual(@as(u64, 71), bound_old.revision);
+        try std.testing.expectEqualSlices(f32, &vector, try bound_old.decodeExactInto(&scratch));
     }
 }
 
@@ -2750,7 +3740,7 @@ test "source vector payloads adaptive segments retain mixed dimensions through g
 }
 
 test "source vector payloads incremental collection retains updates retries deletes and old readers" {
-    for ([_]usize{ 0, 1, 2 }) |mark_rows| {
+    for ([_]usize{ 0, 1, 2, 3 }) |mark_rows| {
         const alloc = std.testing.allocator;
         const docs = @import("docstore.zig");
         const backend_mod = @import("lsm_backend.zig");
@@ -2764,7 +3754,14 @@ test "source vector payloads incremental collection retains updates retries dele
         var source = try Store.open(alloc, memory.storage(), "/incremental", false);
         defer source.deinit();
         source.mark_step_rows = @min(mark_rows, 1);
-        source.mark_outside_lock = mark_rows == 2;
+        source.mark_outside_lock = mark_rows >= 2;
+        source.detached_collection = mark_rows == 3;
+        source.collection_reader_test_hook = struct {
+            fn run(owner: *Store) !void {
+                try std.testing.expect(owner.mutex.tryLock());
+                owner.mutex.unlock();
+            }
+        }.run;
         source.append_only = false;
         source.selective_gc = false;
         var store = try docs.DocStore.openRuntime(alloc, &raw);
@@ -2809,7 +3806,9 @@ test "source vector payloads incremental collection retains updates retries dele
         old_active = false;
         if (mark_rows != 0) try std.testing.expectEqual(@as(u64, 1), source.stats.collection_mark_max_step_rows);
         source.mark_step_rows = 0;
-        try std.testing.expect(try source.collectStep(&raw, std.math.maxInt(u64)));
+        while (!try source.collectStep(&raw, std.math.maxInt(u64))) {}
+        try source.advanceCollectionReaders();
+        if (source.detached_collection) try std.testing.expect(source.stats.collection_readers_prepared != 0);
         try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
         try std.testing.expectEqual(@as(u64, 16), source.stats.retained_payload_bytes);
         var reopened = try Store.open(alloc, memory.storage(), "/incremental", false);
@@ -2819,6 +3818,80 @@ test "source vector payloads incremental collection retains updates retries dele
         const restored = try Store.resolve(&reopened, alloc, other, ref);
         defer alloc.free(restored);
         try std.testing.expectEqualSlices(u8, second, restored);
+    }
+}
+
+test "source vector payloads lock-free session admission invalidates a racing GC cut" {
+    const alloc = std.testing.allocator;
+    const docs = @import("docstore.zig");
+    const backend_mod = @import("lsm_backend.zig");
+    const keys = @import("internal_keys.zig");
+    for ([_]bool{ false, true }) |published| {
+        for ([_]bool{ false, true }) |retire| {
+            var memory = lsm.MemoryStorage.init(alloc);
+            defer memory.deinit();
+            var backend = try backend_mod.Backend.open(alloc, "/session-epoch-primary", .{ .storage = memory.storage() });
+            defer backend.close();
+            var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+            defer raw.deinit();
+            var source = try Store.open(alloc, memory.storage(), "/session-epoch-source", false);
+            defer source.deinit();
+            source.positional_batch_reads = published;
+            var store = try docs.DocStore.openRuntime(alloc, &raw);
+            defer store.close();
+            store.payload_store = source.interface();
+            const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+            defer alloc.free(key);
+            const other = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "keep", "model");
+            defer alloc.free(other);
+            const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+            defer alloc.free(artifact);
+            try store.put(key, artifact);
+            try store.put(other, artifact);
+            const Probe = struct {
+                store: *docs.DocStore,
+                raw: *erased.Store,
+                key: []const u8,
+                retire: bool,
+                old: ?docs.DocStore.Txn = null,
+                fn run(ptr: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.old = try self.store.beginReadTxn();
+                    // Delete primary ownership after the reader selects its
+                    // version, before GC selects its newer primary snapshot.
+                    var mutation = try self.raw.beginWrite();
+                    mutation.delete(self.key) catch |err| {
+                        mutation.abort();
+                        return err;
+                    };
+                    try mutation.commit();
+                    if (self.retire) {
+                        self.old.?.abort();
+                        self.old = null;
+                    }
+                }
+            };
+            var probe: Probe = .{ .store = &store, .raw = &raw, .key = key, .retire = retire };
+            defer if (probe.old) |*old| old.abort();
+            source.mark_snapshot_test_hook = .{ .ctx = &probe, .call = Probe.run };
+            try std.testing.expect(!try source.collect(&raw));
+            try std.testing.expect(!source.collectionPending());
+            try std.testing.expectEqual(@as(u64, 2), source.stats.retained_payloads);
+            if (probe.old) |*old| {
+                try std.testing.expectEqualSlices(u8, artifact, try old.get(key));
+                old.abort();
+                probe.old = null;
+            }
+            source.mark_snapshot_test_hook = null;
+            try std.testing.expect(try source.collect(&raw));
+            try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+            var lease = try source.snapshot(alloc);
+            defer lease.deinit();
+            source.poison();
+            try std.testing.expectError(error.VectorPayloadStorePoisoned, store.get(alloc, other));
+            const reference = try payload.Reference.forArtifact(other, artifact);
+            try std.testing.expect((try lease.get(&reference.digest, std.math.maxInt(u64), 1)) == .vector);
+        }
     }
 }
 
@@ -3432,9 +4505,7 @@ test "source vector payloads unlocked marking admits writers fences cancellation
                 } else if (outcome == .ambiguous) {
                     Store.unresolvedCommit(&source);
                 } else if (outcome == .poisoned) {
-                    source.lock();
-                    source.poisoned = true;
-                    source.mutex.unlock();
+                    source.poison();
                 }
                 MarkInterleaving.resume_scan.store(true, .release);
                 thread.join();
@@ -3719,14 +4790,21 @@ test "source vector payloads failed planning discards the consumed mark before r
 }
 
 test "source vector payloads shared catalogs preserve old leases across WAL and segment publication" {
+    try checkSharedCatalogLeases(false);
+    try checkSharedCatalogLeases(true);
+}
+
+fn checkSharedCatalogLeases(positional: bool) !void {
     const alloc = std.testing.allocator;
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     var source = try Store.open(alloc, memory.storage(), "/shared-catalog", false);
     var source_live = true;
     defer if (source_live) source.deinit();
-    source.shared_catalog = true;
-    try source.opened.shareSegmentCatalog();
+    source.shared_catalog = !positional;
+    source.positional_batch_reads = positional;
+    try source.prepareReadCatalog(&source.opened);
+    try std.testing.expect(source.opened.shared_catalog != null);
     const first = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
     defer alloc.free(first);
     const first_ref = try payload.Reference.forArtifact("model-a", first);
@@ -4064,6 +5142,9 @@ test "source vector payloads publication allocation failures preserve usable aut
         defer raw.deinit();
         var source = try Store.open(alloc, memory.storage(), "/publication-failure", false);
         defer source.deinit();
+        // Include fallible read-view preparation after inventory has already
+        // advanced to the candidate, even when an environment override is off.
+        source.positional_batch_reads = true;
         source.append_only = true;
         source.selective_gc = true;
         source.mark_outside_lock = true;
@@ -4675,4 +5756,765 @@ test "source vector payloads sparse batches amortize one mark with bounded selec
         try std.testing.expectEqual(expected, source.stats.retained_payloads);
         try std.testing.expectEqual(expected * 12, source.stats.retained_payload_bytes);
     }
+}
+
+test "source vector payloads transaction index preserves versions and deduplicates preparations" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/prepared-index", false);
+    defer source.deinit();
+    const session = try payload.Session.create(alloc, source.interface());
+    defer session.release();
+    const count = 12_500;
+    const references = try alloc.alloc(payload.Reference, count);
+    defer alloc.free(references);
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 17, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    for (references, 0..) |*reference, i| {
+        const doc = try std.fmt.allocPrint(alloc, "{d}", .{i});
+        defer alloc.free(doc);
+        const key = try @import("internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, doc, "model-a");
+        defer alloc.free(key);
+        reference.* = try payload.Reference.decode(try session.put(key, artifact));
+        try std.testing.expectEqualSlices(u8, artifact, try session.get(key, &reference.encode()));
+    }
+    try std.testing.expectEqual(count, session.prepared.count());
+    for (references) |reference| try std.testing.expectEqualSlices(u8, artifact, session.findPrepared(reference).?);
+    const key = try @import("internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, "0", "model-a");
+    defer alloc.free(key);
+    _ = try session.put(key, artifact);
+    try std.testing.expectEqual(count, session.prepared.count());
+    const changed = try codec.encodeDenseEmbeddingAlloc(alloc, 18, &.{ 4, 5, 6 });
+    defer alloc.free(changed);
+    const next = try payload.Reference.decode(try session.put(key, changed));
+    try std.testing.expectEqual(count + 1, session.prepared.count());
+    try std.testing.expectEqualSlices(u8, artifact, try session.get(key, &references[0].encode()));
+    try std.testing.expectEqualSlices(u8, changed, try session.get(key, &next.encode()));
+    const wrong_key = try @import("internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, "0", "model-b");
+    defer alloc.free(wrong_key);
+    try std.testing.expectError(error.VectorReferenceIdentityMismatch, session.get(wrong_key, &next.encode()));
+    const missing = try payload.Reference.forArtifact(wrong_key, artifact);
+    try std.testing.expect(session.findPrepared(missing) == null);
+    if (std.c.getenv("ANTFLY_BENCH_PREPARED_LOOKUP") != null) {
+        const iterations = 20_000;
+        var linear_hits: usize = 0;
+        var comparisons: usize = 0;
+        const linear_start = time.monotonicNs();
+        for (0..iterations) |i| {
+            const reference = if (i % 2 == 0) references[(i * 7919) % count] else missing;
+            for (session.prepared.keys()) |pending| {
+                comparisons += 1;
+                if (std.mem.eql(u8, &pending.reference.digest, &reference.digest)) {
+                    linear_hits += 1;
+                    break;
+                }
+            }
+        }
+        const linear_ns = time.monotonicNs() -| linear_start;
+        var indexed_hits: usize = 0;
+        const indexed_start = time.monotonicNs();
+        for (0..iterations) |i| {
+            const reference = if (i % 2 == 0) references[(i * 7919) % count] else missing;
+            indexed_hits += @intFromBool(session.findPrepared(reference) != null);
+        }
+        const indexed_ns = time.monotonicNs() -| indexed_start;
+        try std.testing.expectEqual(linear_hits, indexed_hits);
+        std.debug.print("prepared_lookup_benchmark preparations={d} reads={d} comparisons={d} linear_ns={d} indexed_ns={d} metadata_capacity={d}\n", .{ count, iterations, comparisons, linear_ns, indexed_ns, session.prepared.capacity() });
+    }
+}
+
+test "source vector payloads transaction index allocation failures retain prior preparations" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/prepared-index-failure", false);
+    defer source.deinit();
+    const Check = struct {
+        fn run(failing: Allocator, store: payload.Store) !void {
+            const session = try payload.Session.create(failing, store);
+            defer session.release();
+            const key = try @import("internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(failing, "doc", "model");
+            defer failing.free(key);
+            var refs: [32]payload.Reference = undefined;
+            var done: usize = 0;
+            defer for (refs[0..done]) |reference| {
+                const raw = session.findPrepared(reference) orelse @panic("lost earlier preparation after allocation failure");
+                const actual = payload.Reference.forArtifact(key, raw) catch @panic("invalid preparation");
+                std.debug.assert(std.mem.eql(u8, &reference.digest, &actual.digest));
+            };
+            for (&refs, 0..) |*reference, i| {
+                const raw = try codec.encodeDenseEmbeddingAlloc(failing, @intCast(i), &.{ 1, 2, 3 });
+                defer failing.free(raw);
+                reference.* = try payload.Reference.decode(try session.put(key, raw));
+                done += 1;
+                _ = try session.put(key, raw);
+                try std.testing.expectEqual(done, session.prepared.count());
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{source.interface()});
+}
+
+test "source vector payloads published readers and WAL suffix progress during checkpoint staging" {
+    try checkPublishedCheckpointProgress(false, .stage, false);
+    try checkPublishedCheckpointProgress(true, .stage, false);
+    try checkPublishedCheckpointProgress(false, .publication, false);
+    try checkPublishedCheckpointProgress(false, .stage, true);
+}
+
+fn checkPublishedCheckpointProgress(base: bool, pause_phase: Store.CheckpointPhase, admission: bool) !void {
+    const alloc = std.testing.allocator;
+    const Interleave = struct {
+        var entered: std.atomic.Value(bool) = .init(false);
+        var resume_work: std.atomic.Value(bool) = .init(false);
+        var phase: Store.CheckpointPhase = .stage;
+        var build_base: bool = false;
+        var failure: ?anyerror = null;
+        fn hook(_: *Store, current: Store.CheckpointPhase) !void {
+            if (current != phase) return;
+            entered.store(true, .release);
+            while (!resume_work.load(.acquire)) std.Thread.yield() catch {};
+        }
+        fn run(source: *Store) void {
+            source.lock();
+            defer source.mutex.unlock();
+            source.checkpointSnapshotLocked(if (build_base) 128 else null) catch |err| {
+                failure = err;
+            };
+        }
+    };
+    Interleave.entered.store(false, .monotonic);
+    Interleave.resume_work.store(false, .monotonic);
+    Interleave.phase = pause_phase;
+    Interleave.build_base = base;
+    Interleave.failure = null;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/published-checkpoint-progress", false);
+    defer source.deinit();
+    source.positional_batch_reads = true;
+    const first = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+    defer alloc.free(first);
+    const second = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 3, 4 });
+    defer alloc.free(second);
+    const ref1 = try payload.Reference.forArtifact("model-a", first);
+    const ref2 = try payload.Reference.forArtifact("model-b", second);
+    try Store.prepare(&source, &.{.{ .reference = ref1, .artifact = first }});
+    if (admission) {
+        const large = try alloc.alloc(f32, 5000);
+        defer alloc.free(large);
+        @memset(large, 1);
+        const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, large);
+        defer alloc.free(artifact);
+        try Store.prepare(&source, &.{.{ .reference = try payload.Reference.forArtifact("bulk", artifact), .artifact = artifact }});
+        source.wal_admission_bytes = 1;
+    }
+    var old = try source.snapshot(alloc);
+    defer old.deinit();
+    source.checkpoint_test_hook = Interleave.hook;
+    const thread = try std.Thread.spawn(.{}, Interleave.run, .{&source});
+    var joined = false;
+    defer if (!joined) {
+        Interleave.resume_work.store(true, .release);
+        thread.join();
+    };
+    try MarkInterleaving.awaitFlag(&Interleave.entered);
+    // Holding the writer mutex cannot obstruct read acquisition, I/O,
+    // accounting, or session lifetime. This would deadlock the former path.
+    source.lock();
+    {
+        defer source.mutex.unlock();
+        Store.retain(&source);
+        defer Store.release(&source);
+        var vector: [2]f32 = undefined;
+        const stats = try Store.resolveDenseBatch(&source, &.{.{ .key = "model-a", .reference = ref1 }}, 2, &vector, std.testing.io);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, &vector);
+        try std.testing.expectEqual(@as(u64, 1), stats.positional_batches);
+        const artifact = try Store.resolve(&source, alloc, "model-a", ref1);
+        defer alloc.free(artifact);
+        try std.testing.expectEqualSlices(u8, first, artifact);
+        try std.testing.expect(source.checkpoint_running);
+    }
+    const Write = struct {
+        source: *Store,
+        prepared: payload.Prepared,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            Store.prepare(self.source, &.{self.prepared}) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var write: Write = .{ .source = &source, .prepared = .{ .reference = ref2, .artifact = second } };
+    var writer: ?std.Thread = null;
+    defer if (writer) |pending| {
+        Interleave.resume_work.store(true, .release);
+        pending.join();
+    };
+    if (pause_phase == .publication or admission) {
+        writer = try std.Thread.spawn(.{}, Write.run, .{&write});
+        const wait_started = time.monotonicNs();
+        while (source.checkpoint_write_waiters.load(.acquire) == 0) {
+            if (time.monotonicNs() -| wait_started > 10 * std.time.ns_per_s) return error.InterleavingTimedOut;
+            std.Thread.yield() catch {};
+        }
+        // A blocked writer releases SourceLock so publication can finish.
+        while (!source.mutex.tryLock()) {
+            if (time.monotonicNs() -| wait_started > 10 * std.time.ns_per_s) return error.InterleavingTimedOut;
+            std.Thread.yield() catch {};
+        }
+        source.mutex.unlock();
+    } else {
+        // The staged prefix cannot include this later artifact. Publication
+        // must preserve its WAL extent and reuse its immutable payload bytes.
+        try Store.prepare(&source, &.{.{ .reference = ref2, .artifact = second }});
+        const after_append = try Store.resolve(&source, alloc, "model-b", ref2);
+        defer alloc.free(after_append);
+        try std.testing.expectEqualSlices(u8, second, after_append);
+    }
+    Interleave.resume_work.store(true, .release);
+    thread.join();
+    joined = true;
+    if (writer) |pending| {
+        pending.join();
+        writer = null;
+        if (write.failure) |err| return err;
+    }
+    if (Interleave.failure) |err| return err;
+    try std.testing.expect(!source.checkpoint_running and !source.checkpoint_publishing);
+    try std.testing.expect((try old.get(&ref2.digest, std.math.maxInt(u64), 1)) == .missing);
+    var scratch: [2]f32 = undefined;
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, try (try old.get(&ref1.digest, std.math.maxInt(u64), 1)).vector.decodeInto(&scratch));
+    for (0..2) |_| {
+        var reopened = try Store.open(alloc, memory.storage(), "/published-checkpoint-progress", false);
+        defer reopened.deinit();
+        const artifact = try Store.resolve(&reopened, alloc, "model-a", ref1);
+        defer alloc.free(artifact);
+        try std.testing.expectEqualSlices(u8, first, artifact);
+        const later = try Store.resolve(&reopened, alloc, "model-b", ref2);
+        defer alloc.free(later);
+        try std.testing.expectEqualSlices(u8, second, later);
+    }
+}
+
+test "source vector payloads staged checkpoint failures preserve authority and recover ambiguous publication" {
+    const alloc = std.testing.allocator;
+    const Fault = struct {
+        var ambiguous: bool = false;
+        fn hook(_: *Store, phase: Store.CheckpointPhase) !void {
+            if (phase != .publication) return;
+            if (ambiguous) {
+                generation_publication.injectPostPublishFailuresForTest(2);
+            } else return error.InjectedCheckpointFailure;
+        }
+    };
+    for ([_]bool{ false, true }) |ambiguous| {
+        var memory = lsm.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        var source = try Store.open(alloc, memory.storage(), "/checkpoint-failure", false);
+        defer source.deinit();
+        source.positional_batch_reads = true;
+        const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+        defer alloc.free(artifact);
+        const ref = try payload.Reference.forArtifact("model", artifact);
+        try Store.prepare(&source, &.{.{ .reference = ref, .artifact = artifact }});
+        var old = try source.snapshot(alloc);
+        defer old.deinit();
+        Fault.ambiguous = ambiguous;
+        source.checkpoint_test_hook = Fault.hook;
+        if (ambiguous) @import("../test_error_logs.zig").expectErrorLogs(1);
+        try std.testing.expectError(if (ambiguous) error.GenerationPublicationDurabilityUncertain else error.InjectedCheckpointFailure, source.checkpoint());
+        try std.testing.expect(!source.checkpoint_running and !source.checkpoint_publishing);
+        try std.testing.expectEqual(ambiguous, source.poisoned);
+        if (ambiguous) {
+            try std.testing.expectError(error.VectorPayloadStorePoisoned, source.snapshot(alloc));
+        } else {
+            const current = try Store.resolve(&source, alloc, "model", ref);
+            defer alloc.free(current);
+            try std.testing.expectEqualSlices(u8, artifact, current);
+            source.checkpoint_test_hook = null;
+            try source.checkpoint();
+        }
+        try std.testing.expect((try old.get(&ref.digest, std.math.maxInt(u64), 1)) == .vector);
+        for (0..2) |_| {
+            var reopened = try Store.open(alloc, memory.storage(), "/checkpoint-failure", false);
+            defer reopened.deinit();
+            const current = try Store.resolve(&reopened, alloc, "model", ref);
+            defer alloc.free(current);
+            try std.testing.expectEqualSlices(u8, artifact, current);
+        }
+    }
+}
+
+test "source vector payloads read publication allocation failures leave the committed view usable" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/read-publication-allocation", false);
+    defer source.deinit();
+    source.positional_batch_reads = true;
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+    defer alloc.free(artifact);
+    const ref = try payload.Reference.forArtifact("model", artifact);
+    try Store.prepare(&source, &.{.{ .reference = ref, .artifact = artifact }});
+    const original = source.published.?;
+    var failures: usize = 0;
+    var successes: usize = 0;
+    for (0..4) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        source.alloc = failing.allocator();
+        const result = source.prepareReadPublication(&source.opened);
+        source.alloc = alloc;
+        if (result) |view| {
+            successes += 1;
+            view.?.release();
+        } else |err| {
+            failures += 1;
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        try std.testing.expect(source.published.? == original);
+        const current = try Store.resolve(&source, alloc, "model", ref);
+        defer alloc.free(current);
+        try std.testing.expectEqualSlices(u8, artifact, current);
+    }
+    try std.testing.expect(failures > 0 and successes > 0);
+}
+
+test "source vector payloads metadata inventory does not validate cold payload but reads do" {
+    const a = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(a);
+    defer memory.deinit();
+    var store = try Store.open(a, memory.storage(), "/metadata-only", false);
+    defer store.deinit();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(a, 1, &.{ 1, 2, 3 });
+    defer a.free(artifact);
+    const ref = try payload.Reference.forArtifact("model", artifact);
+    try Store.prepare(&store, &.{.{ .reference = ref, .artifact = artifact }});
+    try store.checkpoint();
+    const found = try store.opened.locateHashed(&ref.digest, vector_block.keyHash(&ref.digest), std.math.maxInt(u64), 1);
+    const block = found.vector.block;
+    const bytes = @constCast(store.opened.blocks[block.reader_index].bytes());
+    bytes[block.location.vector_offset] ^= 1;
+    defer bytes[block.location.vector_offset] ^= 1;
+    try store.inventoryRetainedPayloads();
+    try std.testing.expectEqual(@as(u64, 1), store.stats.retained_payloads);
+    try std.testing.expectError(error.VectorBlockPayloadChecksumMismatch, Store.resolve(&store, a, "model", ref));
+}
+
+test "source vector payloads background checkpoint starts below hard admission without published reads" {
+    const a = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(a);
+    defer memory.deinit();
+    var store = try Store.open(a, memory.storage(), "/soft-checkpoint", false);
+    defer store.deinit();
+    store.background_checkpoint = true;
+    const artifact = try codec.encodeDenseEmbeddingAlloc(a, 1, &.{ 1, 2, 3 });
+    defer a.free(artifact);
+    const ref = try payload.Reference.forArtifact("model", artifact);
+    try Store.prepare(&store, &.{.{ .reference = ref, .artifact = artifact }});
+    const wal_bytes = store.opened.store.wal_committed_bytes;
+    store.wal_admission_bytes = wal_bytes * 2;
+    try store.checkpointMaintenance();
+    try std.testing.expect(store.opened.store.wal_has_mutations);
+    store.wal_admission_bytes = wal_bytes;
+    try std.testing.expect(store.walAtCheckpointTarget()); // cancel a competing mark before hard admission
+    try std.testing.expect(!store.walNeedsAdmissionCheckpoint());
+    try store.checkpointMaintenance();
+    try std.testing.expect(!store.opened.store.wal_has_mutations);
+    const resolved = try Store.resolve(&store, a, "model", ref);
+    defer a.free(resolved);
+    try std.testing.expectEqualSlices(u8, artifact, resolved);
+}
+
+test "source vector payloads reopen validates metadata and defers payload CRC to reads" {
+    const a = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(a);
+    defer memory.deinit();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(a, 1, &.{ 1, 2, 3 });
+    defer a.free(artifact);
+    const ref = try payload.Reference.forArtifact("model", artifact);
+    {
+        var store = try Store.open(a, memory.storage(), "/lazy-crc-reopen", false);
+        defer store.deinit();
+        try Store.prepare(&store, &.{.{ .reference = ref, .artifact = artifact }});
+        try store.checkpoint();
+        const found = try store.opened.locateHashed(&ref.digest, vector_block.keyHash(&ref.digest), std.math.maxInt(u64), 1);
+        const block = found.vector.block;
+        const corrupt = try a.dupe(u8, store.opened.blocks[block.reader_index].bytes());
+        defer a.free(corrupt);
+        corrupt[block.location.vector_offset] ^= 1;
+        const path = try std.fmt.allocPrint(a, "/lazy-crc-reopen/block-{d}-{d}.afvb", .{ block.reader_generation, block.reader_shard_id });
+        defer a.free(path);
+        try memory.storage().writeFileAbsolute(path, corrupt);
+    }
+    var reopened = try Store.open(a, memory.storage(), "/lazy-crc-reopen", true);
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 1), reopened.stats.retained_payloads);
+    try std.testing.expectError(error.VectorBlockPayloadChecksumMismatch, Store.resolve(&reopened, a, "model", ref));
+}
+
+test "source vector payloads GC scan preserves snapshots without admitting primary blocks" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("lsm_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    var primary_memory = lsm.MemoryStorage.init(a);
+    defer primary_memory.deinit();
+    var source_memory = lsm.MemoryStorage.init(a);
+    defer source_memory.deinit();
+    var cache = backend_mod.Cache.init(a, 16 * 1024 * 1024);
+    defer cache.deinit();
+    var backend = try backend_mod.Backend.open(a, "/gc-transient-primary", .{
+        .storage = primary_memory.storage(),
+        .cache = &cache,
+        .flush_threshold = 1024,
+    });
+    defer backend.close();
+    var raw = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(a, source_memory.storage(), "/gc-transient-source", false);
+    defer source.deinit();
+    var store = try docs.DocStore.openRuntime(a, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "model");
+    defer a.free(key);
+    const artifact = try codec.encodeDenseEmbeddingAlloc(a, 1, &.{ 1, 2, 3 });
+    defer a.free(artifact);
+    const ref = try payload.Reference.forArtifact(key, artifact);
+    try store.put(key, artifact);
+    {
+        var txn = try raw.beginWrite();
+        errdefer txn.abort();
+        for (0..96) |i| {
+            var buf: [32]u8 = undefined;
+            try txn.put(try std.fmt.bufPrint(&buf, "scalar-{d:0>8}", .{i}), "x" ** 1024);
+        }
+        try txn.commit();
+    }
+    try backend.sync(true);
+    try source.checkpoint();
+    try std.testing.expect(!try source.startMarkingLocked(&raw));
+    // A delete after capture must not erase the old mark's ownership.
+    try store.delete(key);
+    const before = cache.snapshotStats();
+    var progress: Store.ScanProgress = .{};
+    try Store.scanMarking(source.marking.?, time.monotonicNs(), 0, std.math.maxInt(usize), true, &progress);
+    try std.testing.expect(source.marking.?.verification_done);
+    try std.testing.expectEqual(@as(u64, 12), source.marking.?.verified_bytes);
+    const after = cache.snapshotStats();
+    try std.testing.expectEqual(before.run_table_block.inserts + before.run_table_physical_block.inserts, after.run_table_block.inserts + after.run_table_physical_block.inserts);
+    try std.testing.expect(after.run_table_block.transient_serves + after.run_table_physical_block.transient_serves >
+        before.run_table_block.transient_serves + before.run_table_physical_block.transient_serves);
+    try std.testing.expect(try source.finishMarkingLocked(std.math.maxInt(u64)));
+    try Store.verifyLiveLocation(&source.opened, ref.digest, 3);
+    try std.testing.expect(try source.collectStep(&raw, std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(u64, 0), source.stats.retained_payloads);
+}
+
+test "source vector payloads GC liveness defers payload checksums but reads and copies reject corruption" {
+    const a = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    for ([_]vector_block.Encoding{ .float32, .float16 }) |encoding| {
+        var memory = lsm.MemoryStorage.init(a);
+        defer memory.deinit();
+        var backend = mem.Backend.init(a, .{});
+        defer backend.close();
+        var raw = try backend.runtimeStore(a, .{ .name = "docs" });
+        defer raw.deinit();
+        var source = try Store.openWithEncoding(a, memory.storage(), "/gc-lazy-crc", false, encoding);
+        defer source.deinit();
+        var store = try docs.DocStore.openRuntime(a, &raw);
+        defer store.close();
+        store.payload_store = source.interface();
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "model");
+        defer a.free(key);
+        const artifact = try codec.encodeDenseEmbeddingAlloc(a, 1, &.{ 1.1234567, -2.345678, 3.456789 });
+        defer a.free(artifact);
+        const ref = try payload.Reference.forArtifact(key, artifact);
+        try store.put(key, artifact);
+        try source.checkpoint();
+        const found = try source.opened.locateHashed(&ref.digest, vector_block.keyHash(&ref.digest), std.math.maxInt(u64), 1);
+        const block = found.vector.block;
+        const bytes = @constCast(source.opened.blocks[block.reader_index].bytes());
+        const offset = if (encoding == .float32) block.location.vector_offset else block.location.residual_offset;
+        const expected_error = if (encoding == .float32) error.VectorBlockPayloadChecksumMismatch else error.VectorBlockResidualChecksumMismatch;
+        bytes[offset] ^= 1;
+        defer bytes[offset] ^= 1;
+        const generation = source.currentGeneration();
+        try std.testing.expect(try source.collectStep(&raw, std.math.maxInt(u64)));
+        try std.testing.expectEqual(generation, source.currentGeneration());
+        try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+        try std.testing.expectError(expected_error, Store.resolve(&source, a, key, ref));
+        // An orphan forces a copy plan. GC may skip checksums only when it
+        // retains existing immutable files; it must not republish corrupt data.
+        const orphan = try payload.Reference.forArtifact("orphan", artifact);
+        try Store.prepare(&source, &.{.{ .reference = orphan, .artifact = artifact }});
+        try std.testing.expectError(expected_error, source.collectStep(&raw, std.math.maxInt(u64)));
+        try std.testing.expect(!source.poisoned);
+    }
+}
+
+test "source vector payloads GC identity validation rejects missing tombstone dimensions and reference chains" {
+    const a = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(a);
+    defer memory.deinit();
+    var writer = try native.Store.open(a, memory.storage(), "/gc-identities");
+    defer writer.deinit();
+    try writer.publishEmptyBase(1, 0, .{ .shard_count = 16, .encoding = .float32 });
+    const digest = [_]u8{1} ** 32;
+    const missing = [_]u8{2} ** 32;
+    try writer.appendBatch(1, &.{.{ .kind = .upsert, .key = &digest, .source_sequence = 1, .revision = 1, .vector = &.{ 1, 2, 3 } }}, 1, .{});
+    var old = try native.Store.openReadOnlyWithBlocks(a, memory.storage(), "/gc-identities");
+    defer old.deinit();
+    try Store.verifyLiveLocation(&old, digest, 3);
+    try std.testing.expectError(error.MissingCommittedVectorPayload, Store.verifyLiveLocation(&old, missing, 3));
+    try std.testing.expectError(error.MissingCommittedVectorPayload, Store.verifyLiveLocation(&old, digest, 2));
+    try writer.appendBatch(2, &.{.{ .kind = .tombstone, .key = &digest, .source_sequence = 2, .revision = 1 }}, 2, .{});
+    var deleted = try native.Store.openReadOnlyWithBlocks(a, memory.storage(), "/gc-identities");
+    defer deleted.deinit();
+    try std.testing.expectError(error.MissingCommittedVectorPayload, Store.verifyLiveLocation(&deleted, digest, 3));
+    try Store.verifyLiveLocation(&old, digest, 3);
+    try writer.appendBatch(3, &.{.{ .kind = .upsert, .key = &digest, .source_sequence = 3, .revision = 2, .vector = &.{ 4, 5, 6 } }}, 3, .{});
+    var replaced = try native.Store.openReadOnlyWithBlocks(a, memory.storage(), "/gc-identities");
+    defer replaced.deinit();
+    try std.testing.expectError(error.VectorBlockRevisionMismatch, Store.verifyLiveLocation(&replaced, digest, 3));
+    try writer.appendBatch(4, &.{.{ .kind = .upsert, .key = &missing, .source_sequence = 4, .revision = 1, .reference = .{ .digest = digest, .dims = 3 } }}, 4, .{});
+    var chained = try native.Store.openReadOnlyWithBlocks(a, memory.storage(), "/gc-identities");
+    defer chained.deinit();
+    try std.testing.expectError(error.InvalidVectorReference, Store.verifyLiveLocation(&chained, missing, 3));
+}
+
+test "source vector payloads background verification defers small copies but explicit collection reclaims" {
+    const a = std.testing.allocator;
+    const docs = @import("docstore.zig");
+    const backend_mod = @import("lsm_backend.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(a);
+    defer memory.deinit();
+    var backend = try backend_mod.Backend.open(a, "/copy-policy-primary", .{ .storage = memory.storage() });
+    defer backend.close();
+    var raw = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(a, memory.storage(), "/copy-policy-source", false);
+    defer source.deinit();
+    source.cost_based_gc = true;
+    var store = try docs.DocStore.openRuntime(a, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "model");
+    defer a.free(key);
+    const first = try codec.encodeDenseEmbeddingAlloc(a, 1, &.{ 1, 2, 3 });
+    defer a.free(first);
+    const second = try codec.encodeDenseEmbeddingAlloc(a, 2, &.{ 4, 5, 6 });
+    defer a.free(second);
+    try store.put(key, first);
+    try store.put(key, second);
+    while (!try source.collectBackgroundStepDeferredMark(&raw, std.math.maxInt(u64))) {}
+    try std.testing.expectEqual(@as(u64, 2), source.stats.retained_payloads);
+    try std.testing.expectEqual(@as(u64, 12), source.stats.collection_deferred_obsolete_bytes);
+    try std.testing.expectEqual(@as(u64, 0), source.stats.collection_bytes_written);
+    const deadline = source.garbage_deadline_seconds.?;
+    try std.testing.expect(deadline > time.realtimeNs() / std.time.ns_per_s);
+    source.garbage_deadline_seconds = null;
+    try source.loadGarbageDeadline();
+    try std.testing.expectEqual(deadline, source.garbage_deadline_seconds.?);
+    const since = source.garbage_since_ns;
+    try std.testing.expect(source.shouldDeferCopy(since + 1, 12, 12));
+    try std.testing.expect(!source.shouldDeferCopy(since + source.garbage_max_age_ns, 12, 12));
+    source.capacity_observation = .{ .available_bytes = 1, .observed_at_ns = since };
+    try std.testing.expect(!source.shouldDeferCopy(since + 1, 12, 12));
+    try std.testing.expect(source.shouldDeferCopy(since + 6 * std.time.ns_per_s, 12, 12));
+    while (!try source.collectStep(&raw, std.math.maxInt(u64))) {}
+    try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+    try std.testing.expectEqual(@as(u64, 0), source.stats.collection_deferred_obsolete_bytes);
+
+    // Explicit collection must also override a background scan already in
+    // progress, without changing the policy read by its unlocked scanner.
+    try store.put(key, first);
+    source.mark_outside_lock = true;
+    source.mark_step_rows = 1;
+    try std.testing.expect(!try source.collectBackgroundStepDeferredMark(&raw, 1));
+    try std.testing.expect(source.marking != null);
+    try std.testing.expect(source.marking.?.cost_policy);
+    const deferrals = source.stats.collection_copy_deferrals;
+    var steps: usize = 0;
+    while (!try source.collectStep(&raw, 1)) : (steps += 1) {
+        try std.testing.expect(steps < 100);
+    }
+    try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+    try std.testing.expectEqual(deferrals, source.stats.collection_copy_deferrals);
+}
+
+test "source vector payloads background receipt is bounded retention and never an explicit deletion proof" {
+    const a = std.testing.allocator;
+    const docs = @import("docstore.zig");
+    const mem = @import("mem_backend.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(a);
+    defer memory.deinit();
+    var backend = mem.Backend.init(a, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(a, memory.storage(), "/hint-source", false);
+    defer source.deinit();
+    source.checkpoint_receipts = true;
+    source.ann_reference_root = try a.dupe(u8, "/hint-ann");
+    var store = try docs.DocStore.openRuntime(a, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "model");
+    defer a.free(key);
+    const first = try codec.encodeDenseEmbeddingAlloc(a, 1, &.{ 1, 2, 3 });
+    defer a.free(first);
+    const second = try codec.encodeDenseEmbeddingAlloc(a, 2, &.{ 4, 5, 6 });
+    defer a.free(second);
+    try store.put(key, first);
+    const ref = try payload.Reference.forArtifact(key, first);
+    var ann = try native.Store.open(a, memory.storage(), "/hint-ann");
+    defer ann.deinit();
+    try ann.publishEmptyBase(1, 0, .{ .shard_count = 1, .encoding = .artifact_reference });
+    try ann.appendBatch(1, &.{.{ .kind = .upsert, .key = key, .source_sequence = 1, .revision = 1, .reference = .{ .digest = ref.digest, .dims = 3 } }}, 1, .{});
+    try store.put(key, second);
+    while (!try source.collectBackgroundStepDeferredMark(&raw, std.math.maxInt(u64))) {}
+    try std.testing.expectEqual(@as(u64, 2), source.stats.retained_payloads);
+    const completed = source.last_mark_completed_ns;
+    try ann.appendBatch(2, &.{.{ .kind = .tombstone, .key = key, .source_sequence = 2, .revision = 2 }}, 2, .{});
+    try std.testing.expect(try source.collectBackgroundStepDeferredMark(&raw, std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(u64, 1), source.stats.checkpoint_receipt_hits);
+    try std.testing.expect(source.next_authority_check_ns > completed);
+    try std.testing.expectEqual(completed, source.last_mark_completed_ns);
+    // An explicit operation cannot use the background lease to hide garbage.
+    while (!try source.collectStep(&raw, std.math.maxInt(u64))) {}
+    try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+    // Reopen may restore physical counts, but must establish liveness again.
+    var reopened = try Store.open(a, memory.storage(), "/hint-source", false);
+    defer reopened.deinit();
+    reopened.checkpoint_receipts = true;
+    try std.testing.expect(try reopened.loadCheckpointReceipt());
+    try std.testing.expectEqual(@as(u64, 0), reopened.last_mark_completed_ns);
+}
+
+test "source vector payloads detached collection fences ambiguous CURRENT and recovers" {
+    @import("../test_error_logs.zig").expectErrorLogs(1);
+    const alloc = std.testing.allocator;
+    const docs = @import("docstore.zig");
+    const mem = @import("mem_backend.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/ambiguous-collection", false);
+    defer source.deinit();
+    source.detached_collection = true;
+    source.append_only = false;
+    source.selective_gc = false;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    const first = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(first);
+    const second = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 4, 5, 6 });
+    defer alloc.free(second);
+    try store.put(key, first);
+    try store.put(key, second);
+    try std.testing.expect(!try source.collectStep(&raw, 1));
+    try store.put(key, first);
+    generation_publication.injectPostPublishFailuresForTest(2);
+    defer generation_publication.injectPostPublishFailuresForTest(0);
+    const outcome = blk: {
+        for (0..1024) |_| {
+            _ = source.collectStep(&raw, std.math.maxInt(u64)) catch |err| break :blk err;
+        }
+        break :blk error.ExpectedPublicationFailure;
+    };
+    try std.testing.expectEqual(error.GenerationPublicationDurabilityUncertain, outcome);
+    try std.testing.expect(source.poisoned);
+    try std.testing.expectError(error.VectorPayloadStorePoisoned, store.get(alloc, key));
+    var reopened = try Store.open(alloc, memory.storage(), "/ambiguous-collection", false);
+    defer reopened.deinit();
+    try std.testing.expect(try reopened.collectStep(&raw, std.math.maxInt(u64)));
+    const ref = try payload.Reference.forArtifact(key, first);
+    const value = try Store.resolve(&reopened, alloc, key, ref);
+    defer alloc.free(value);
+    try std.testing.expectEqualSlices(u8, first, value);
+}
+
+test "source vector payloads detached reader failure retains authority and retries with a concurrent preparation" {
+    const a = std.testing.allocator;
+    const docs = @import("docstore.zig");
+    const backend_mod = @import("lsm_backend.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(a);
+    defer memory.deinit();
+    var backend = try backend_mod.Backend.open(a, "/copy-policy-primary", .{ .storage = memory.storage() });
+    defer backend.close();
+    var raw = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(a, memory.storage(), "/copy-policy-source", false);
+    defer source.deinit();
+    source.detached_collection = true;
+    source.segment_sizing = .{ .target_bytes = 1024 * 1024, .min_shards = 1, .max_shards = 1 };
+    var store = try docs.DocStore.openRuntime(a, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "model");
+    defer a.free(key);
+    const first = try codec.encodeDenseEmbeddingAlloc(a, 1, &.{ 1, 2, 3 });
+    defer a.free(first);
+    const second = try codec.encodeDenseEmbeddingAlloc(a, 2, &.{ 4, 5, 6 });
+    defer a.free(second);
+    try store.put(key, first);
+    try store.put(key, second);
+
+    source.collection_reader_test_hook = struct {
+        fn fail(owner: *Store) !void {
+            try std.testing.expect(owner.mutex.tryLock());
+            owner.mutex.unlock();
+            return error.InjectedReaderFailure;
+        }
+    }.fail;
+    const outcome = blk: {
+        for (0..1024) |_| {
+            _ = source.collectStep(&raw, 1) catch |err| break :blk err;
+        }
+        break :blk error.ExpectedReaderFailure;
+    };
+    try std.testing.expectEqual(error.InjectedReaderFailure, outcome);
+    try std.testing.expectError(error.InjectedReaderFailure, source.collectStepDeferredMark(&raw, 1));
+    try std.testing.expect(source.collection == null);
+    try std.testing.expect(!source.poisoned);
+    const current = try store.get(a, key);
+    defer a.free(current);
+    try std.testing.expectEqualSlices(u8, second, current);
+    source.collection_reader_test_hook = struct {
+        fn prepare(owner: *Store) !void {
+            owner.lock();
+            const discarded = owner.discardCollectionForPressureLocked();
+            owner.mutex.unlock();
+            try std.testing.expect(!discarded);
+            owner.collection_reader_test_hook = null;
+            const artifact = try codec.encodeDenseEmbeddingAlloc(owner.alloc, 3, &.{ 7, 8, 9 });
+            defer owner.alloc.free(artifact);
+            const ref = try payload.Reference.forArtifact("orphan", artifact);
+            // The real preparation path acquires the source mutex and appends
+            // durably while immutable readers are being prepared outside it.
+            try Store.prepare(owner, &.{.{ .reference = ref, .artifact = artifact }});
+        }
+    }.prepare;
+    while (!try source.collectStep(&raw, 1)) {}
+    try source.advanceCollectionReaders();
+    try std.testing.expectEqual(@as(u64, 2), source.stats.retained_payloads);
+    while (!try source.collectStep(&raw, 1)) {}
+    try source.advanceCollectionReaders();
+    try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
 }

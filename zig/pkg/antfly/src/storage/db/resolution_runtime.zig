@@ -1610,6 +1610,9 @@ pub const ResolutionRuntime = struct {
         var store_handle = try initRuntimeStore(alloc, store);
         errdefer store_handle.deinit();
         const applied = try enrichment_state.loadAppliedSequence(alloc, store_handle.store, scope_name);
+        // Notifications are volatile. Recover durable work even when the
+        // graph has caught up and no new write will wake this reopened owner.
+        const target = @max(applied, try replay_source.latestMatchingSequence(alloc, applied, .resolution));
         return .{
             .alloc = alloc,
             .store_handle = store_handle,
@@ -1622,7 +1625,7 @@ pub const ResolutionRuntime = struct {
             .candidate_source = candidate_source,
             .embedder = embedder,
             .applied_sequence = .init(applied),
-            .target_sequence = .init(applied),
+            .target_sequence = .init(target),
             .shutdown_flag = .init(false),
             .backfill_pending = .init((try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_resume_key)) or
                 (try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_repair_resume_key))),

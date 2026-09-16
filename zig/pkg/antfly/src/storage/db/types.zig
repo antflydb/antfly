@@ -2964,6 +2964,11 @@ pub const TransactionRecoveryStats = struct {
     error_count: u64 = 0,
 };
 
+// Error identifiers cross the storage ABI and survive allocation-free cache merges.
+// Keep their bytes in the value, as for enrichment model/backend diagnostics.
+// JSON decoding rejects identifiers exceeding the wire bound.
+pub const RuntimeErrorName = InlineStatusText(256);
+
 pub const TextMergeStats = struct {
     enabled: bool = false,
     active_indexes: u64 = 0,
@@ -2993,7 +2998,7 @@ pub const TextMergeStats = struct {
     last_merge_peak_task_alloc_bytes: u64 = 0,
     quarantined_merges: u64 = 0,
     quarantined_segments: u64 = 0,
-    last_merge_error: []const u8 = "",
+    last_merge_error: RuntimeErrorName = .{},
     retry_after_ns: u64 = 0,
     deferred_for_pressure: u64 = 0,
     backpressure_events: u64 = 0,
@@ -3037,7 +3042,7 @@ pub const GraphMetricRuntimeStats = struct {
     durable_progress_ticks: u64 = 0,
     idle_ticks: u64 = 0,
     error_ticks: u64 = 0,
-    last_error_name: ?[]const u8 = null,
+    last_error_name: ?RuntimeErrorName = null,
     total_metrics_scanned: u64 = 0,
     total_active_builds: u64 = 0,
     total_builds_started: u64 = 0,
@@ -4221,6 +4226,9 @@ pub fn freeAlgebraicAdaptiveProgress(alloc: Allocator, progress: []AlgebraicAdap
 }
 
 pub const HbcPostingStats = struct {
+    /// False only after a clean bounded sweep at the current mutation epoch.
+    /// Defaults conservatively when a runtime observation is unavailable.
+    refresh_pending: bool = true,
     scanned_nodes: u64 = 0,
     scanned_postings: u64 = 0,
     dirty_postings: u64 = 0,
