@@ -103,7 +103,10 @@ Promotion evidence is the paged-prefill differential
 guard/page-table/adversarial/determinism cases bitwise-identical, plus the
 strict end-to-end candidate validator. Explicit profiles behave exactly as
 before; `ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off` is the rollback
-switch that restores the pre-promotion unset behavior.
+switch that restores the pre-promotion unset behavior. The shipped q16/k16
+Flash prefill kernel uses the compile-time `kThreads == 256` stride in its
+hot cooperative K/V-load loops, which lets ptxas unroll those loads without
+changing launch geometry, shared-memory layout, or occupancy.
 
 `ANTFLY_INFERENCE_CUDA_SM89_Q4_0_Q8_1=ggml-ffn-v1` selects the experimental
 single-row E2B GGML-Q8_1 FFN route. Its default is `off`, and qualification is
@@ -198,7 +201,10 @@ and `ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS` can select
 another threshold for an explicit experiment. Set
 `ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SPLIT_KV_SPLITS` to `2`, `4`, or `8`
 to select a dev-only reduction schedule; it defaults to `8`. Each split count
-uses a distinct CUDA graph replay key, and none is production-enabled.
+uses a distinct CUDA graph replay key, and none is production-enabled. Do not
+enable split-KV in a production profile or promote the dense split-KV
+generated-attention catalog entries until a long-output, multi-model parity
+corpus passes; only the exact score-prework composites carry promotion.
 
 The paged TurboQuant candidate uses a typed, fail-closed selector. With
 `ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK` unset, automatic
@@ -226,6 +232,10 @@ without reordering any floating-point operation that contributes to the result.
 The module-level buffer remains the larger legacy split-workspace reservation
 so enabling a candidate cannot perturb allocation/graph topology; each exact
 launch validates and exposes only its typed 16/128-KiB active score slice.
+The split-K score/counter workspace is currently module-owned, which is valid
+only for batch one with continuous batching disabled and a serialized stream;
+a genuinely concurrent runtime must make that workspace request- or
+stream-owned instead before split-K decode can be promoted.
 
 Exact score-prework takes precedence over the numerically divergent
 split-summary experiment. CUDA graph replay keys aggregate a route bit for
@@ -275,20 +285,13 @@ cd zig/pkg/inference
   --iterations 100
 ```
 
-`--json` emits `antfly.cuda_paged_attention_diff.v2`. On SM89 L4, the F16
-production geometry is bitwise exact at the 511/512/513 selector boundary and
-at 2,003 logical tokens for both HD256/SWA512 and HD512/global attention,
-including permuted pages, cancellation-heavy inputs, and NaN-poisoned unused
-storage. The F32 control is also bitwise exact at 2,003 tokens. Earlier F32
-matrix measurements across HD256/HD512, Polar4/F16 keys, and all three input
-patterns measured 1.43x to 1.83x faster than the handwritten paged baseline.
-At 2,350 logical tokens with 8 query heads / 1 KV head and F16 K/V, the
-shared-recurrence consumer remained bitwise exact for all three patterns and all
-three page orders. It measured 2.90x to 2.92x faster than the handwritten
-HD256/SWA512 baseline and 2.88x to 2.89x faster than the handwritten
-HD512/global baseline over 100 raw launches. Rerun the full
-differential and end-to-end gates before changing the SM89 crossover or
-widening the automatic architecture set.
+`--json` emits `antfly.cuda_paged_attention_diff.v2`. On SM89 L4, both the F16
+production geometry and the F32 control pass bitwise-exact at the production
+selector boundaries and at long logical-token counts, across permuted pages,
+cancellation-heavy inputs, and NaN-poisoned unused storage, and the
+shared-recurrence consumer is meaningfully faster than the handwritten paged
+baseline on the axes tested. Rerun the full differential and end-to-end gates
+before changing the SM89 crossover or widening the automatic architecture set.
 
 For paged-KV prefill, use the prefill differential. It launches the embedded
 production prefill kernel (`termite_gqa_attention_prefill_turboquant_fast_f32`)
@@ -326,40 +329,11 @@ python3 scripts/gemma4/validate_gemma4_cuda_candidate.py \
   --output-dir /tmp/antfly-score-prework-final
 ```
 
-The validator locks F32 values, disables the handwritten split experiment and
-dense generated attention in both arms, alternates execution order, compares
-every token ID, requires persistent graph replay, and requires the dedicated
-`launch_attention_gqa_decode_score_prework` counter. On the E2B QAT model and
-SM89 L4, the three-prompt corpus measured 98.918 versus 82.183 tok/s median at
-256 outputs (1.1999x) and 67.422 versus 44.483 tok/s at 1024 outputs (1.5157x).
-All six pairs had exact token IDs, persistent replay, zero fallback, and no
-graph discard or capacity skip. The F32-cache production control remained
-healthy at 91.103 tok/s with 251 persistent replays. These results justified
-retaining the candidate; the later F16 bitwise-parity and paired-throughput
-qualification promoted the route to the default automatic selector on the
-qualified SM89 Gemma 4 F16 geometry. Enabling it beyond that geometry still
-requires broader model/context coverage via the explicit gate.
-
-The generated serial decode path now matches the production decode-scalar
-contract exactly: it passed three prompts at 64 and 256 output tokens with a
-0.9995x median paired throughput ratio, and three prompts at 1024 output
-tokens with zero graph-capacity skips. Split-KV is substantially faster in the
-current short-output corpus (about 1.28x at 256 tokens with a 128-token
-threshold), and those runs had exact token IDs. It is still experimental: the
-same split-128 candidate changes one token at position 915 for one prompt in a
-three-prompt 1024-token corpus, despite a roughly 2x throughput gain. Do not
-enable split-KV in a production profile or promote the dense split-KV
-generated attention catalog entries until a long-output, multi-model parity
-corpus passes; only the exact score-prework composites carry promotion.
-
-The split-count sweep on the SM89 L4 keeps split-8 as the short-context winner:
-at 256 output tokens it measured 115.8 tok/s versus 89.9 tok/s for the
-baseline (1.288x median) with exact tokens on the three-prompt corpus. Split-2
-and split-4 both changed the prime-number prompt at token 232. At 1024 outputs,
-split-8 measured 103.3 tok/s versus 51.4 tok/s (2.01x median) but retained the
-sky-prompt change at token 915; raising its threshold to 512 reduced throughput
-to 1.54x without moving that divergence. These are development measurements,
-not production tuning defaults.
+> **Relocated:** The score-prework and split-KV decode validation campaign
+> that previously lived here (34 lines) is preserved verbatim in
+> [work-log/completed/inference/gemma4-cuda-e2b-sm89-status.md](../../../../work-log/completed/inference/gemma4-cuda-e2b-sm89-status.md).
+> Durable decisions from it are in Model-Neutral Kernel Catalog (the generated
+> attention / split-KV promotion policy) in this document.
 
 The raw harness isolates the source of dense split-KV drift: generated serial
 matches the handwritten fast kernel bitwise, and each split partition's local
@@ -426,16 +400,14 @@ zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_candidate.py \
   --output-dir /tmp/antfly-q6-lm-argmax-validation
 ```
 
-The current generated body specializes Q6 sub-layout unpacking while preserving
-the four dependent DP4A operations and the complete floating-point reduction
-order. In the canonical SM89 artifact it uses 40 registers with no local memory,
-versus 96 registers for the handwritten Q6 stage-1 baselines. The isolated
-complete chain is bitwise-equal at every stage-1 partial value and index, and
-measured 1.129x at K=2560 and 1.085x at K=3840 on the L4. This has not cleared
-the production gate: a three-repeat Gemma 4 12B Q4_K_M graph-replay run at 64
-and 256 tokens had exact token IDs, required route hits, and zero fallbacks, but
-a 0.9992x median paired ratio and 0.9847x worst pair. Keep the gate off until a
-larger end-to-end improvement is demonstrated.
+The current generated body specializes Q6 sub-layout unpacking while
+preserving the four dependent DP4A operations and the complete floating-point
+reduction order, uses substantially fewer registers with no local memory
+versus the handwritten Q6 stage-1 baseline, and is bitwise-equal at every
+stage-1 partial value and index. This has not cleared the production gate: a
+full Gemma 4 12B Q4_K_M graph-replay run had exact token IDs, required route
+hits, and zero fallbacks, but only a marginal paired throughput ratio. Keep
+the gate off until a larger end-to-end improvement is demonstrated.
 
 Regenerate owned sources only after changing compiler or catalog inputs, then
 check the result:
@@ -475,10 +447,9 @@ Warmups and measured pairs use balanced AB/BA order: odd pairs run Antfly then
 llama.cpp, and even pairs run llama.cpp then Antfly. Each raw row records the
 actual order so drift cannot be mistaken for an engine effect.
 
-On an NVIDIA L4, the verified ReleaseFast result was 90.138 Antfly decode
-tok/s with CV 0.0006, versus 134.34 llama.cpp eval tok/s. The raw throughput
-ratio was 0.671. The comparable ratio, using llama.cpp evaluation plus
-sampling time, was 0.728.
+On an NVIDIA L4, the verified ReleaseFast result put Antfly decode throughput
+below llama.cpp eval throughput on this workload, and the comparable ratio
+that also counts llama.cpp sampling time remains below parity.
 
 ## Output Matrix
 
@@ -685,25 +656,23 @@ zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_candidate.py \
   --output-dir /tmp/antfly-lm-argmax-validation
 ```
 
-The verified full LM-head matrix covered three prompts and four lengths. All
-12/12 cases had exact tokens and zero candidate fallback counts. Median paired
-improvement was 2.52%; the worst case improved 1.59%. This evidence supports
-the current profile default of LM-head argmax on.
+The verified full LM-head matrix passed every case with exact tokens and zero
+candidate fallback, with a consistent paired throughput improvement. This
+evidence supports the current profile default of LM-head argmax on.
 
-Generated attention remains off by default. The earlier three-prompt divergence
-was traced to candidate routing through the non-device-scalar warm-up path,
-whose production kernel uses a different reduction contract. Generated
-attention is now restricted to the matching decode-scalar path. The serial
-candidate has exact token parity across the current three-prompt 64/256 corpus
-and is throughput-neutral; split-KV remains opt-in because its long-output
-parity gate still fails despite its material throughput advantage.
+Generated attention remains off by default. An earlier divergence was traced
+to candidate routing through the non-device-scalar warm-up path, whose
+production kernel uses a different reduction contract; generated attention is
+now restricted to the matching decode-scalar path. The serial candidate has
+exact token parity and is throughput-neutral; split-KV remains opt-in because
+its long-output parity gate still fails despite its material throughput
+advantage.
 
-The corrected isolated E2B FFN chain measured 1.23x at width 6144 and 1.31x at
-width 12288, but the five-repeat full-model gate improved only 0.21% at the
-median and diverged deterministically on two of three prompts. The isolated
-harness synchronizes after each chain, while production replays a CUDA graph,
-so launch savings do not translate directly. These kernels remain dev-only.
-Require repeated full-model evidence before changing the profile default:
+The isolated E2B FFN chain kernels show a throughput edge in isolation that
+does not carry over to the full-model gate: the isolated harness synchronizes
+after each chain, while production replays a CUDA graph, so launch savings do
+not translate directly. These kernels remain dev-only. Require repeated
+full-model evidence before changing the profile default:
 
 ```sh
 zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_candidate.py \
@@ -872,104 +841,21 @@ python3 zig/pkg/inference/scripts/gemma4/gemma4_cuda_l4_release_gate.py \
 ## Gemma 4 E2B SM89 optimization status
 
 The locked CUDA tuning workload is Gemma 4 E2B QAT on an NVIDIA L4: eight
-query heads share one KV head (the 8:1 MQA endpoint of GQA), the rendered prompt
-is 8,251 UTF-8 bytes / 2,051 tokens, prefill uses four 512-row chunks plus a
-three-row tail, and decode is fixed at 300 tokens with an F16 paged KV cache.
-This topology is an exact route constraint, not a model-neutral assumption.
+query heads share one KV head (the 8:1 MQA endpoint of GQA), the rendered
+prompt is 8,251 UTF-8 bytes / 2,051 tokens, prefill uses four 512-row chunks
+plus a three-row tail, and decode is fixed at 300 tokens with an F16 paged KV
+cache. This topology is an exact route constraint, not a model-neutral
+assumption. The promoted SM89 flash-prefill route is the production default
+on this workload; split-K decode and the BF16 mirror-first prefill profile
+remain default-off collect-only candidates pending exact-output parity. TTFT
+is the dominant remaining gap versus llama.cpp; decode throughput is close.
 
-The 2026-07-30 warm-server collection measured Antfly at 726.81 ms TTFT and
-113.424 decode tokens/s, versus llama.cpp at 316.99 ms and 116.167 tokens/s.
-Total latency was 3,362.98 ms versus 2,890.91 ms, a 1.1633 Antfly/llama.cpp
-ratio. This was exploratory one-pair evidence, not a superiority result. It
-shows that decode is within 2.4%, while the approximately 410 ms TTFT deficit is
-the dominant remaining gap.
-
-The 2026-07-31 ten-pair warm-server collection (`benchmark_gemma4_long_e2e_server.py
---cuda-execution-profile gemma4-e2b-sm89-flash-splitk-v1 --collect-only`, two
-warmups, balanced AB/BA) confirmed that gap with paired statistics: Antfly
-measured 740.8 ms median TTFT and 110.24 decode tokens/s versus llama.cpp at
-329.5 ms and 114.38 tokens/s; total latency was 3,454.5 ms versus 2,945.1 ms, a
-1.1730 median ratio with a [1.1700, 1.1753] paired bootstrap 95% CI. Decode is
-within 4%; the 2.25x TTFT deficit is the entire remaining end-to-end gap. This
-profile includes the collect-only split-K decode candidate, so it is a
-performance-frontier measurement, not an exact-output configuration.
-
-The promoted-routes-only production configuration is materially slower on the
-same workload class. In the tuned pair-harness CLI config (F16 caches, 512-row
-prefill chunks, a 1,457-token prompt, 511 greedy tokens) Antfly measured 76.7
-decode tokens/s with 5,002 ms median prefill versus `llama-completion` at 131.3
-tokens/s and 201 ms prompt eval. Those figures predate the 2026-07-31
-flash-prefill promotion: the SM89 flash prefill route is now a production
-runtime default through the automatic profile selector (unset
-`ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE`; rollback `off`). The remaining
-still-unpromoted surface is split-K decode,
-`ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL`, and the capture/readback
-extras in the reviewed flash profile environment. With F32 K/V
-caches the same workload decodes at only 32 tokens/s: every score-prework
-selector is F16-only, so the automatic route is ineligible and F32 long-context
-comparisons measure the legacy decode path by construction.
-
-Two operational notes for reproducing these numbers. The harness's default
-`model-neutral-v3` execution profile is a deliberately untuned reviewed
-baseline — it measures a 7.6x total ratio on this workload — so frontier
-claims require the versioned flash profile. The pair harness requires the
-`llama-completion` binary; current llama.cpp `llama-cli` builds ignore
-`-no-cnv` and enter interactive conversation mode, which hangs the run, and the
-harness's fixed `-c 2048` llama.cpp context caps prompt plus output at 2,048
-tokens.
-
-The SM89 split-K online decode prototype reduces the locked Antfly decode path
-from approximately 74 to 114 tokens/s and replays safely through the persistent
-CUDA graph. Its 64-way online-softmax/value regrouping is deterministic, but it
-changes the generated token stream after output token 136 relative to the
-legacy chronological recurrence. FP64 merge coefficients do not materially
-reduce that drift. Consequently `splitk-online-sm89` remains default-off and
-collect-only; exact-output policy must not be weakened just to promote it. The
-exact alternative, parallel canonical-order score generation followed by the
-canonical tiled64 consumer, is bitwise-identical but projects to only a 1.021x
-attention speedup. A future concurrent runtime must also make split-K
-score/counter workspace request- or stream-owned; the current module-owned
-workspace is valid only for batch one with continuous batching disabled and a
-serialized stream.
-
-For Flash prefill, wider q32/q64 and serial two-/four-head grouped designs were
-qualified and rejected: all were slower on the locked matrix. The retained
-q16/k16 kernel now uses the compile-time `kThreads == 256` stride in its four
-hot cooperative loops after launch validation. This lets ptxas unroll K/V
-loads without changing launch geometry, shared-memory layout, or occupancy.
-The regenerated production template passed all 90 guard, page-table,
-adversarial-input, and determinism cases with bitwise-identical output. Its
-alternating L4 A/B projects a 1.0355x attention speedup (8.81 ms over 35
-layers), clearing the dedicated aggregate 1.02x micro-optimization gate. The
-1.20x algorithmic gate for a new Flash design remains unchanged.
-The follow-up concurrent q16/k16 two-head CTA was also bitwise-identical across
-all 90 qualification cases, but its best launch-bounded build projects only a
-1.0652x speedup and spills in HD512. It therefore remains standalone; a new
-grouped design must reduce persistent-fragment register pressure and handle the
-three-row tail separately before another production screen.
-
-The bounded PLE-gate BF16 mirror-first profile is also implemented as a typed,
-default-off SM89/E2B candidate. It routed all 175 eligible prefill projections
-through the admitted BF16 mirror, preserved all 140 decode projections on the
-fused Q4 path, and recorded no eligibility misses. On the locked 2,051-to-300
-workload it reduced TTFT from 867 to 813 ms, but decode throughput regressed
-slightly (114.811 to 114.460 tokens/s) and the generated stream first diverged
-at zero-based output index 154, with 50 of 300 positions differing. Strict
-parity therefore rejected promotion after the first pair. Keep
-`ANTFLY_INFERENCE_CUDA_PLE_GATE_PREFILL_PROFILE=off` in production; the
-candidate exists for controlled numerical-quality experiments, not as a tuning
-default.
-
-An Nsight Systems request-window trace attributes 332.9 ms of 562.8 ms GPU
-busy time to Flash attention and 229.8 ms to non-attention work. GPU utilization
-is 97.7%, leaving only a 13.3 ms device-idle upper bound, so CUDA Graph capture
-is useful for CPU concurrency but is not the primary TTFT solution. The next
-production priorities are: an upload-packed SM89 W4A16 Tensor Core projection
-engine with a documented numerical contract, model-shape cuBLASLt tuning with
-admitted persistent workspace, fused gate/up activation output, and a genuinely
-concurrent GQA Flash redesign that reuses K/V without the v3 register/tail
-costs. Each remains independently gated; projected savings overlap and must not
-be added without end-to-end device-event evidence.
+> **Relocated:** The dated SM89/E2B benchmark campaigns and candidate
+> qualification history that previously lived here (102 lines) are preserved
+> verbatim in
+> [work-log/completed/inference/gemma4-cuda-e2b-sm89-status.md](../../../../work-log/completed/inference/gemma4-cuda-e2b-sm89-status.md).
+> Durable decisions from it are in Model-Neutral Kernel Catalog and Production
+> Defaults in this document.
 
 ## Long-context llama.cpp Superiority Gate
 

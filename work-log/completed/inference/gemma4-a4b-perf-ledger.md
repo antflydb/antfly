@@ -1,5 +1,7 @@
 # Gemma 4 26B-A4B Performance Analysis
 
+> Relocated verbatim from `zig/pkg/inference/PERF.md` (lines 1–900 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`CUDA.md`](../../../zig/pkg/inference/CUDA.md) (Gemma 4 A4B defaults and rollback) and [`METAL.md`](../../../zig/pkg/inference/METAL.md) (TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH bundle). Durable decisions from this log were folded into those documents before the move.
+
 ## 2026-08-25 CUDA resident Q4_0 lane
 
 CUDA qualifies one fail-closed Gemma 4 26B-A4B configuration: NVIDIA SM89,

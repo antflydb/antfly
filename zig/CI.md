@@ -164,13 +164,15 @@ actionlint 1.7.12 does not yet recognize.
    controller does not publish it on merge-group SHAs. Do not enable a ruleset
    that requires a missing check on the merge queue.
 
-At inspection on 2026-09-15, Antfly was public with no main-branch protection and
-no repository rulesets. Colony was private and the organization reported GitHub
-Free. The workflow cost gate works without a paid approval environment, but
-GitHub's private-repository protection features require an eligible paid plan
-before Colony can enforce the check at merge time. Native environment required
-reviewers are also unavailable for private repositories on Free, Pro, and Team.
-Repository settings and plan changes are separate from these source changes.
+Main-branch protection and repository rulesets on public repositories such as
+Antfly are a repository setting, not something these workflow changes enforce
+on their own; verify they are configured rather than assuming they are. Private
+repositories such as Colony have a narrower gap: the workflow cost gate works
+without a paid approval environment, but GitHub's private-repository protection
+features, including native environment required reviewers, are unavailable on
+the Free, Pro, and Team plans, so Colony needs an eligible paid plan before it
+can enforce the check at merge time. Repository settings and plan changes are
+separate from these source changes.
 
 ## Local verification
 

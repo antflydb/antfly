@@ -210,6 +210,15 @@ Near-term goals:
 - Put subsystem implementation detail in the subsystem roadmap/plan.
 - If a task is mostly about one directory, update that subsystem plan first.
 - If a task changes project priorities or ordering, update this file too.
+- Design docs hold the living contract: invariants, defaults, flag and env-var
+  names, decisions with rationale, a short undated `Status:` line, and an
+  `Open work` list. Dated session narrative, pass counts, commit hashes, and
+  single-host benchmark tables do not belong in them. Put that material in
+  [`../work-log/completed/`](../work-log/README.md), in a sibling
+  `*_FINDINGS.md`/`*_EXPERIMENTS.md` ledger, or in a `RESULTS-<date>.md`
+  beside the bench script that produced it, and leave a one-line pointer.
+  Before moving a log out of a design doc, lift every standing rule it
+  contains into the design sections first.
 
 ## Design documents
 
@@ -276,6 +285,12 @@ file's own title and a one-line description taken from its first paragraph.
   qualification runs tracked in the file.
 - [GRAPH.md](GRAPH.md) — Graph Indexing Design: graph indexes consuming
   enrichment artifacts through the managed-index replay path.
+- [GRAPH_METRICS.md](GRAPH_METRICS.md) — Graph Metrics Design: graph-index
+  metric configuration, storage layout, PageRank algorithm, and distributed
+  execution contract.
+- [DERIVED_DOCUMENT_HIERARCHY.md](DERIVED_DOCUMENT_HIERARCHY.md) — Derived
+  Document Hierarchy: canonical extraction artifacts, child ranges, and the
+  artifacts API surface.
 - [RESOLUTION.md](RESOLUTION.md) — Entity Resolution Design (Resolver,
   Promoter, Fusion): turning per-document extraction artifacts into canonical
   entities and an entity graph.
