@@ -21,6 +21,8 @@ const Allocator = std.mem.Allocator;
 pub const Provider = openapi.EmbedderProvider;
 pub const OpenApiConfig = openapi.EmbedderConfig;
 
+pub const openrouter_default_url = "https://openrouter.ai/api/v1";
+
 const RetrievalCapabilities = struct {
     legacy_input_type: bool = false,
     role_input_types: bool = false,
@@ -139,6 +141,7 @@ pub const Config = struct {
         if (self.url.len > 0) return self.url;
         return switch (self.provider) {
             .openai => "https://api.openai.com",
+            .openrouter => openrouter_default_url,
             .ollama => "http://127.0.0.1:11434",
             .antfly => "http://127.0.0.1:8082",
             else => "",

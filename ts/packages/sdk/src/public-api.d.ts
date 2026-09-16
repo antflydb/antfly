@@ -3592,7 +3592,7 @@ export interface components {
          *     canonical provider configurations; it does not define a second provider
          *     namespace.
          */
-        IndexEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
+        IndexEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
         /**
          * @description Overall health status of the cluster
          * @enum {string}
@@ -9636,6 +9636,8 @@ export interface components {
          *     OpenRouter provides a unified API for multiple embedding models from different providers.
          *     API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
          *
+         *     Antfly currently supports dense text embeddings through this provider.
+         *
          *     **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
          *     google/gemini-embedding-001, qwen/qwen3-embedding-8b
          *
@@ -9647,7 +9649,10 @@ export interface components {
          *     }
          */
         OpenRouterEmbedderConfig: {
-            /** @enum {string} */
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             provider: "openrouter";
             /**
              * @description The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
@@ -9655,6 +9660,11 @@ export interface components {
              * @example openai/text-embedding-3-small
              */
             model: string;
+            /**
+             * Format: uri
+             * @description The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
+             */
+            url?: string;
             /** @description The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable. */
             api_key?: string;
             /** @description Output dimension for the embedding (if supported by the model). */

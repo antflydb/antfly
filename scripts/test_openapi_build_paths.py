@@ -38,7 +38,9 @@ class OpenApiBuildPathsTest(unittest.TestCase):
         source = yaml.safe_load(
             (root / "specs/openapi/shared/generating.yaml").read_text()
         )["components"]["schemas"]
-        public = yaml.safe_load((root / "openapi.yaml").read_text())["components"]["schemas"]
+        public = yaml.safe_load((root / "openapi.yaml").read_text())["components"][
+            "schemas"
+        ]
         for schemas in (source, public):
             with self.subTest(source=schemas is source):
                 schema = schemas["OpenRouterGeneratorConfig"]
@@ -73,6 +75,35 @@ class OpenApiBuildPathsTest(unittest.TestCase):
                 self.assertIn(
                     {"$ref": "#/components/schemas/OpenRouterGeneratorConfig"},
                     schemas["GeneratorConfig"]["allOf"][0]["oneOf"],
+                )
+
+    def test_openrouter_is_accepted_by_index_embedder_schema(self):
+        root = Path(__file__).resolve().parent.parent
+        for path in ("specs/openapi/antfly/embeddings.yaml", "openapi.yaml"):
+            with self.subTest(path=path):
+                schemas = yaml.safe_load((root / path).read_text())["components"][
+                    "schemas"
+                ]
+                validator = Draft4Validator(
+                    {
+                        "$ref": "#/components/schemas/IndexEmbedderConfig",
+                        "components": {"schemas": schemas},
+                    }
+                )
+                config = {
+                    "provider": "openrouter",
+                    "model": "openai/text-embedding-3-small",
+                    "url": "https://gateway.example/api/v1",
+                    "dimensions": 3,
+                }
+                self.assertTrue(validator.is_valid(config))
+                del config["model"]
+                self.assertFalse(validator.is_valid(config))
+                self.assertEqual(
+                    schemas["IndexEmbedderConfig"]["discriminator"]["mapping"][
+                        "openrouter"
+                    ],
+                    "#/components/schemas/OpenRouterEmbedderConfig",
                 )
 
     def test_relative_build_outputs_and_comparison(self):

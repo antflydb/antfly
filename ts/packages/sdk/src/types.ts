@@ -366,7 +366,7 @@ export const embedderProviderCapabilities = {
   gemini: { index: false },
   ollama: { index: true },
   openai: { index: true },
-  openrouter: { index: false },
+  openrouter: { index: true },
   vertex: { index: false },
 } as const satisfies Record<EmbedderProvider, { index: boolean }>;
 export const embedderProviders = Object.keys(embedderProviderCapabilities) as EmbedderProvider[];
