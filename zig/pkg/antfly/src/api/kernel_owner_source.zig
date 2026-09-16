@@ -371,6 +371,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .vector_migration_group_local = vectorMigrationGroupLocal,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
@@ -3100,6 +3101,19 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn documentChildRangeDispatchStatusFromError(err: anyerror) abi.Status {
         return kernel_error_identity.statusFromError(err);
+    }
+
+    fn vectorMigrationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = lease.owner().vectorMigrationJson(table_name, request_json) catch |err| {
+            if (err == error.VectorMigrationRecoveryRequired or err == error.VectorPayloadStorePoisoned)
+                lease.retireAfterConfigurationFailure();
+            return err;
+        };
+        defer response.deinit();
+        return try alloc.dupe(u8, response.bytes());
     }
 
     fn executeArtifactOperation(

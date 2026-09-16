@@ -837,6 +837,13 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn vectorMigrationJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        const request = operationRequest(table_name, request_json);
+        try statusToError(abi.antfly_storage_owner_vector_migration_json(self.handle, &request, &response.buffer));
+        return response;
+    }
+
     pub fn artifactOperationJson(
         self: *Owner,
         table_name: []const u8,

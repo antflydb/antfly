@@ -2032,7 +2032,7 @@ const AggregatedIndexStatus = struct {
     catch_up_target_sequence: u64 = 0,
     text_merge: db_mod.types.TextMergeStats = .{},
     hbc_cache: db_mod.types.HbcCacheStats = .{},
-    hbc_posting: db_mod.types.HbcPostingStats = .{},
+    hbc_posting: db_mod.types.HbcPostingStats = .{ .refresh_pending = false },
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
     enrichment: db_mod.types.EnrichmentStats = .{},
     enrichment_observation_count: u64 = 0,
@@ -3040,6 +3040,7 @@ fn aggregateHbcCacheStats(dst: *db_mod.types.HbcCacheStats, src: db_mod.types.Hb
 }
 
 fn aggregateHbcPostingStats(dst: *db_mod.types.HbcPostingStats, src: db_mod.types.HbcPostingStats) void {
+    dst.refresh_pending = dst.refresh_pending or src.refresh_pending;
     dst.scanned_nodes += src.scanned_nodes;
     dst.scanned_postings += src.scanned_postings;
     dst.dirty_postings += src.dirty_postings;
@@ -4855,6 +4856,8 @@ fn appendHbcPostingStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     try appendIntValue(alloc, out, stats.lazy_payload_deferrals);
     try out.appendSlice(alloc, ",\"lazy_ancestor_deferrals\":");
     try appendIntValue(alloc, out, stats.lazy_ancestor_deferrals);
+    try out.appendSlice(alloc, ",\"refresh_pending\":");
+    try out.appendSlice(alloc, if (stats.refresh_pending) "true" else "false");
     try out.append(alloc, '}');
 }
 
@@ -10618,4 +10621,22 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "posting refresh status aggregates unknown and pending shards conservatively" {
+    const alloc = std.testing.allocator;
+    var aggregate: AggregatedIndexStatus = .{};
+    aggregateHbcPostingStats(&aggregate.hbc_posting, .{ .refresh_pending = false });
+    try std.testing.expect(!aggregate.hbc_posting.refresh_pending);
+    // A missing observation has the same conservative default as old senders.
+    aggregateHbcPostingStats(&aggregate.hbc_posting, .{});
+    aggregateHbcPostingStats(&aggregate.hbc_posting, .{ .refresh_pending = false });
+    try std.testing.expect(aggregate.hbc_posting.refresh_pending);
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    defer encoded.deinit(alloc);
+    try appendHbcPostingStatus(alloc, &encoded, aggregate.hbc_posting);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"refresh_pending\":true") != null);
+    encoded.clearRetainingCapacity();
+    try appendHbcPostingStatus(alloc, &encoded, .{ .refresh_pending = false });
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"refresh_pending\":false") != null);
 }

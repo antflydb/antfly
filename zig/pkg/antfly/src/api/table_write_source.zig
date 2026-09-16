@@ -78,6 +78,8 @@ pub const TableWriteSource = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
+        vector_migration_group_local: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) anyerror!?[]u8 = null,
+
         /// Committed replication has distinct transaction and entry-identity
         /// semantics from an ordinary request batch. Prepared application may
         /// only borrow an already configured owner, never consult the catalog.
@@ -1194,6 +1196,11 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const fn_ptr = self.vtable.reprocess_document_artifact_range orelse return null;
         return try BoundaryAbi.call("reprocess_document_artifact_range", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, artifact_name, req });
+    }
+
+    pub fn vectorMigrationGroupLocal(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const callback = self.vtable.vector_migration_group_local orelse return null;
+        return try BoundaryAbi.call("vector_migration_group_local", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, request_json });
     }
 
     pub fn listArtifactRepairIssues(

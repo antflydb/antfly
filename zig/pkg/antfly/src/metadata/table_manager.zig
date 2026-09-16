@@ -44,7 +44,8 @@ pub const TableRecord = topology_records.TableRecord;
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
+    return @import("../common/vector_migration.zig").admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
+        lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
         lhs.table_id == rhs.table_id and
         std.mem.eql(u8, lhs.name, rhs.name) and
         std.mem.eql(u8, lhs.description, rhs.description) and
@@ -71,6 +72,16 @@ fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const 
 pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-table-definition-v1");
+    if (table.storage_migration) |migration| {
+        hashTableDefinitionPart(&hasher, "vector-migration-v1");
+        hashTableDefinitionPart(&hasher, migration.request.job_id);
+        hashTableDefinitionPart(&hasher, @tagName(migration.request.mode));
+        inline for (std.meta.fields(@TypeOf(migration.request.budget))) |field| {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, @field(migration.request.budget, field.name), .little);
+            hasher.update(&bytes);
+        }
+    }
     // Preserve fingerprints of existing default-mode tables.
     if (table.storage.dense_embeddings != .primary_lsm)
         hashTableDefinitionPart(&hasher, @tagName(table.storage.dense_embeddings));
@@ -1390,6 +1401,33 @@ pub const TableManager = struct {
     }
 
     pub fn upsertTable(self: *TableManager, record: TableRecord) !void {
+        if (self.tables.get(record.table_id)) |existing| {
+            if (existing.storage_migration != null and !tableDefinitionsEqual(existing, record))
+                return error.VectorMigrationActive;
+        }
+        return self.upsertTableUnchecked(record);
+    }
+
+    pub fn publishVectorMigrationTable(self: *TableManager, expected: TableRecord, record: TableRecord) !void {
+        const current = self.tables.get(expected.table_id) orelse return error.UnknownTable;
+        if (!tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+        var contract = record;
+        contract.storage = expected.storage;
+        contract.storage_migration = expected.storage_migration;
+        if (!tableDefinitionsEqual(contract, expected)) return error.VectorMigrationConfigurationChanged;
+        if (record.storage_migration) |admission| try admission.request.validate();
+        if (expected.storage.dense_embeddings == .vector_store and record.storage.dense_embeddings != .vector_store)
+            return error.UnsupportedVectorMigrationDirection;
+        if (expected.storage_migration) |active| {
+            if (record.storage_migration) |next| if (!active.eql(next)) return error.VectorMigrationIdempotencyConflict;
+        } else if (!tableDefinitionsEqual(expected, record)) {
+            if (expected.storage.dense_embeddings != .primary_lsm or record.storage.dense_embeddings != .primary_lsm or
+                record.storage_migration == null) return error.InvalidVectorMigrationState;
+        }
+        return self.upsertTableUnchecked(record);
+    }
+
+    fn upsertTableUnchecked(self: *TableManager, record: TableRecord) !void {
         if (self.table_names.get(record.name)) |id| if (id != record.table_id) return error.TableAlreadyExists;
         const owned = try cloneTable(self.alloc, record);
         errdefer freeTable(self.alloc, owned);
@@ -1408,10 +1446,25 @@ pub const TableManager = struct {
     pub fn upsertRange(self: *TableManager, record: RangeRecord) !void {
         try group_ids.requireDataGroupId(record.group_id);
         const table = self.tables.get(record.table_id) orelse return error.UnknownTable;
-        _ = table;
-
         var normalized = record;
         if (normalized.range_id == 0) normalized.range_id = normalized.group_id;
+        if (table.storage_migration != null) {
+            const existing = self.ranges.get(record.group_id) orelse return error.VectorMigrationActive;
+            if (!rangeRecordsEqual(existing, normalized)) return error.VectorMigrationActive;
+        }
+
+        try self.installProjectedRange(normalized);
+    }
+
+    // Loading a complete durable projection reconstructs an already-admitted
+    // topology. It must not apply the live topology-change fence to its first
+    // range, while ordinary upserts still reject changes during migration.
+    fn installProjectedRange(self: *TableManager, record: RangeRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.table_id)) return error.UnknownTable;
+        var normalized = record;
+        if (normalized.range_id == 0) normalized.range_id = normalized.group_id;
+
         const owned = try cloneRange(self.alloc, normalized);
         errdefer freeRange(self.alloc, owned);
         if (self.ranges.getPtr(record.group_id)) |existing| {
@@ -1436,7 +1489,7 @@ pub const TableManager = struct {
     pub fn replaceTopology(self: *TableManager, tables: []const TableRecord, ranges: []const RangeRecord) !void {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
-        for (ranges) |record| try self.upsertRange(record);
+        for (ranges) |record| try self.installProjectedRange(record);
     }
 
     pub const ProjectedTopologyLoadResult = struct {
@@ -1453,7 +1506,7 @@ pub const TableManager = struct {
                 result.skipped_orphan_ranges += 1;
                 continue;
             }
-            try self.upsertRange(record);
+            try self.installProjectedRange(record);
         }
         return result;
     }
@@ -1535,6 +1588,7 @@ pub const TableManager = struct {
     }
 
     pub fn requestSplit(self: *TableManager, intent: SplitIntent) !void {
+        if (self.tables.get(intent.table_id)) |table| if (table.storage_migration != null) return error.VectorMigrationActive;
         try group_ids.requireDataGroupId(intent.source_group_id);
         try group_ids.requireDataGroupId(intent.destination_group_id);
         const source = self.ranges.getPtr(intent.source_group_id) orelse return error.UnknownSourceRange;
@@ -2119,6 +2173,9 @@ fn freeOwnedOptional(alloc: std.mem.Allocator, value: ?[]const u8) void {
 }
 
 pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
+    var storage_migration = record.storage_migration;
+    if (storage_migration) |*migration| migration.request.job_id = try alloc.dupe(u8, migration.request.job_id);
+    errdefer if (storage_migration) |migration| alloc.free(migration.request.job_id);
     const name = try alloc.dupe(u8, record.name);
     errdefer alloc.free(name);
     const description = try alloc.dupe(u8, record.description);
@@ -2139,6 +2196,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     errdefer alloc.free(restore_location);
     return .{
         .storage = record.storage,
+        .storage_migration = storage_migration,
         .table_id = record.table_id,
         .name = name,
         .description = description,
@@ -2194,6 +2252,7 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
 }
 
 pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
+    if (record.storage_migration) |migration| alloc.free(migration.request.job_id);
     alloc.free(record.name);
     alloc.free(record.description);
     alloc.free(record.schema_json);

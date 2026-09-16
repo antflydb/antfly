@@ -6151,6 +6151,25 @@ fn storageOwnerArtifactJsonResponse(
     return .ok;
 }
 
+pub fn storageOwnerVectorMigrationJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(antfly.vector_migration.Command, handle.alloc, request.request_json.slice(), .{}) catch return .invalid_argument;
+    defer parsed.deinit();
+    // Offline publication owns a separate exclusive root transition; it may
+    // never run against a serving compiled owner through this online endpoint.
+    if (parsed.value.request.mode != .online) return .invalid_argument;
+    const result = handle.db.vectorMigrationCommand(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = result.ptr, .len = @intCast(result.len) };
+    return .ok;
+}
+
 pub fn storageOwnerArtifactOperationJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.ArtifactOperationRequest,
@@ -6315,7 +6334,7 @@ pub fn storageOwnerRuntimeStatusJson(
     };
     defer status.deinit(handle.alloc);
     status.replaceMetadata(.{
-        .updated_at_ns = @import("antfly_platform").time.monotonicNs(),
+        .updated_at_ns = antfly.platform_time.monotonicNs(),
         .source = .live_writer_publish,
         .freshness = .fresh,
         .lsm_root_generation = handle.storage_owner_root_generation,
@@ -6334,7 +6353,9 @@ pub fn storageOwnerRuntimeStatusJson(
 
 test "storage owner runtime status does not wait behind apply writer" {
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "storage-owner-runtime-status-busy");
+    var test_tmp = try TestDirectory.init("storage-owner-runtime-status-busy");
+    defer test_tmp.cleanup();
+    const path = try tempTestPath(alloc, test_tmp.path(), "db");
     defer alloc.free(path);
     cleanupTestDir(path);
     defer cleanupTestDir(path);
@@ -6489,10 +6510,10 @@ pub fn storageOwnerMaintenance(
                 out_result.deferred = 1;
                 return .ok;
             }
-            const started = @import("antfly_platform").time.monotonicNs();
+            const started = antfly.platform_time.monotonicNs();
             var pass: usize = 0;
             out_result.deferred = 1;
-            while (pass < 64 and @import("antfly_platform").time.monotonicNs() -| started < 50 * std.time.ns_per_ms) : (pass += 1) {
+            while (pass < 64 and antfly.platform_time.monotonicNs() -| started < 50 * std.time.ns_per_ms) : (pass += 1) {
                 const page = handle.db.refreshDensePostingPayloadPageBestEffort() catch |err|
                     return storageOwnerStatusFromError(err);
                 out_result.dense_steps += page.repaired;

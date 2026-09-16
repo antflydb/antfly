@@ -28,6 +28,7 @@ comptime {
     _ = @import("projection_page_cache.zig");
     _ = @import("projection_read_trace.zig");
     _ = @import("vector_payload_store.zig");
+    _ = @import("vector_migration_offline.zig");
     _ = @import("vector_wal_view.zig");
     _ = @import("backend_adapter.zig");
     _ = @import("backend_conformance_test.zig");

@@ -2764,7 +2764,7 @@ test "metadata ownership excludes colliding data placements across control round
         try server.bootstrapLocal(svc.metadata_group_id, 3);
         if (boot == 0) {
             try svc.upsertNode(.{ .node_id = 3 });
-            try svc.raft.runRaftRoundOnly();
+            try svc.runRaftRoundOnly();
             try svc.upsertStore(.{
                 .store_id = 3,
                 .node_id = 3,
@@ -2779,7 +2779,7 @@ test "metadata ownership excludes colliding data placements across control round
                 .store_id = 3,
                 .peer_node_ids = &.{},
             }, null, 0, false);
-            for (0..8) |_| try svc.raft.runRaftRoundOnly();
+            for (0..8) |_| try svc.runRaftRoundOnly();
         }
         for (0..8) |_| try server.runRound();
         std.debug.print("OWNERSHIP_RED placements boot={d} expects absent foreign group\n", .{boot});
@@ -2902,7 +2902,7 @@ fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !v
         try server.bootstrapLocal(svc.metadata_group_id, 3);
         if (boot == 0) {
             try svc.upsertNode(.{ .node_id = 3 });
-            try svc.raft.runRaftRoundOnly();
+            try svc.runRaftRoundOnly();
             var groups = [_]antfly.metadata.table_manager.GroupStatusReport{.{
                 .group_id = data_group_id,
                 .doc_count = 1,
@@ -2946,7 +2946,9 @@ fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !v
                 });
             }
         }
-        for (0..8) |_| try svc.raft.runRaftRoundOnly();
+        // start() also runs the restore supervisor, which requests ReadIndex.
+        // Drive Raft through the service so both share its runtime mutex.
+        for (0..8) |_| try svc.runRaftRoundOnly();
         switch (case) {
             .progress => {
                 try expectMetadataOwnershipRemoteProgress(svc, boot, "before_control");

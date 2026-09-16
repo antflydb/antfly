@@ -733,6 +733,7 @@ const UnifiedServerLifecycle = antfly.common.runtime_lifecycle.HttpServerLifecyc
 const LocalStandaloneMetadata = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
+    vector_migration_commands: @import("../common/vector_migration.zig").CommandAdmissions = .{},
     manager: antfly.metadata.TableManager,
     extension_catalog: antfly.extensions.ExtensionCatalog,
     local_node_id: u64,
@@ -740,6 +741,7 @@ const LocalStandaloneMetadata = struct {
     api_url: []const u8,
     replica_root_dir: []const u8,
     catalog_path: []const u8,
+    operator_lock: ?std.Io.File = null,
     catalog_store: ?*antfly.storage_backend_erased.Store,
     owned_catalog_backend: ?antfly.lsm_backend.BackendHandle = null,
     owned_catalog_cache: ?*antfly.lsm_backend.Cache = null,
@@ -892,6 +894,11 @@ const LocalStandaloneMetadata = struct {
         owned_replica_root_dir = null;
         owned_catalog_path = null;
         errdefer self.deinit();
+        if (catalog_store == null) self.operator_lock = try @import("../common/migration_files.zig").lockCatalog(
+            alloc,
+            backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo,
+            catalog_path,
+        );
         if (catalog_store == null) {
             const root = try std.fmt.allocPrint(alloc, "{s}.store", .{catalog_path});
             defer alloc.free(root);
@@ -917,6 +924,8 @@ const LocalStandaloneMetadata = struct {
         }
         if (self.routing_generation) |generation| generation.release();
         if (self.system_catalog_state) |*state| state.deinit();
+        self.vector_migration_commands.deinit(self.alloc);
+        if (self.operator_lock) |file| file.close(self.backend_runtime.filesystemIo().?);
         self.extension_catalog.deinit();
         self.manager.deinit();
         self.alloc.free(self.catalog_path);
@@ -968,6 +977,9 @@ const LocalStandaloneMetadata = struct {
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
+                .publish_vector_migration_table = publishVectorMigrationTable,
+                .begin_vector_migration_command = beginVectorMigrationCommand,
+                .end_vector_migration_command = endVectorMigrationCommand,
                 .restore_table = restoreTable,
                 .drop_table = dropTable,
                 .drop_table_exact = dropTableExact,
@@ -1763,6 +1775,8 @@ const LocalStandaloneMetadata = struct {
 
         const current = self.findTableByNameLocked(replacement.name) orelse return error.TableNotFound;
         if (!antfly.metadata.table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+        if (current.storage_migration != null and !antfly.metadata.table_manager.tableDefinitionsEqual(current.*, replacement))
+            return error.TableTransitionActive;
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(self.alloc, replacement.indexes_json);
         try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(self.alloc, replacement.indexes_json);
         var mutation = try self.beginCatalogMutationLocked();
@@ -1770,6 +1784,30 @@ const LocalStandaloneMetadata = struct {
         try mutation.upsertTable(self, replacement);
         self.epoch +|= 1;
         try mutation.commit(self);
+    }
+
+    fn publishVectorMigrationTable(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (!self.vector_source_storage_allowed or self.storage_engine != .local)
+            return error.VectorStoreRequiresLocalSingleShardTable;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
+        try mutation.captureTable(self, replacement.table_id);
+        try self.manager.publishVectorMigrationTable(expected, replacement);
+        self.epoch +|= 1;
+        try mutation.commit(self);
+    }
+
+    fn beginVectorMigrationCommand(ptr: *anyopaque, table_name: []const u8) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try self.vector_migration_commands.begin(self.alloc, table_name);
+    }
+
+    fn endVectorMigrationCommand(ptr: *anyopaque, table_name: []const u8) void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        self.vector_migration_commands.end(self.alloc, table_name);
     }
 
     fn restoreTable(
@@ -1836,6 +1874,7 @@ const LocalStandaloneMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
+        if (table.storage_migration != null) return error.VectorMigrationActive;
         const table_id = table.table_id;
         const ranges = try self.manager.listRanges(alloc);
         defer self.manager.freeRanges(alloc, ranges);
@@ -2367,6 +2406,9 @@ const LocalStandaloneMetadata = struct {
         });
         defer parsed.deinit();
 
+        for (parsed.value.tables) |table| if (table.storage_migration) |admission| {
+            if (admission.request.mode == .offline) return error.VectorMigrationOfflineAdmission;
+        };
         _ = try self.manager.replaceProjectedTopology(parsed.value.tables, parsed.value.ranges);
         try self.extension_catalog.loadProjectedRows(
             parsed.value.extension_packages,

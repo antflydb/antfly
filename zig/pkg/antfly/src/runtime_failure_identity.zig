@@ -29,6 +29,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .index_rebuilding, .err = error.IndexRebuilding },
     .{ .status = .catalog_already_exists, .err = error.CatalogAlreadyExists },
     .{ .status = .catalog_command_too_large, .err = error.CatalogCommandTooLarge },
     .{ .status = .catalog_generation_changed, .err = error.CatalogGenerationChanged },
@@ -464,6 +465,33 @@ const mappings = [_]Mapping{
     .{ .status = .restore_dense_checkpoint_incomplete, .err = error.RestoreDenseCheckpointIncomplete },
     .{ .status = .restore_index_availability_incomplete, .err = error.RestoreIndexAvailabilityIncomplete },
     .{ .status = .provider_internal, .err = error.Internal },
+    .{ .status = .invalid_vector_migration_budget, .err = error.InvalidVectorMigrationBudget },
+    .{ .status = .invalid_vector_migration_id, .err = error.InvalidVectorMigrationId },
+    .{ .status = .invalid_vector_migration_state, .err = error.InvalidVectorMigrationState },
+    .{ .status = .unsupported_vector_migration_direction, .err = error.UnsupportedVectorMigrationDirection },
+    .{ .status = .unsupported_vector_migration_version, .err = error.UnsupportedVectorMigrationVersion },
+    .{ .status = .vector_migration_active, .err = error.VectorMigrationActive },
+    .{ .status = .vector_migration_already_exists, .err = error.VectorMigrationAlreadyExists },
+    .{ .status = .vector_migration_already_published, .err = error.VectorMigrationAlreadyPublished },
+    .{ .status = .vector_migration_configuration_changed, .err = error.VectorMigrationConfigurationChanged },
+    .{ .status = .vector_migration_coverage_mismatch, .err = error.VectorMigrationCoverageMismatch },
+    .{ .status = .vector_migration_disk_reserve, .err = error.VectorMigrationDiskReserve },
+    .{ .status = .vector_migration_idempotency_conflict, .err = error.VectorMigrationIdempotencyConflict },
+    .{ .status = .vector_migration_identity_mismatch, .err = error.VectorMigrationIdentityMismatch },
+    .{ .status = .vector_migration_inline_payload_remains, .err = error.VectorMigrationInlinePayloadRemains },
+    .{ .status = .vector_migration_not_found, .err = error.VectorMigrationNotFound },
+    .{ .status = .vector_migration_not_ready, .err = error.VectorMigrationNotReady },
+    .{ .status = .vector_migration_read_epoch_changed, .err = error.VectorMigrationReadEpochChanged },
+    .{ .status = .vector_migration_recovery_required, .err = error.VectorMigrationRecoveryRequired },
+    .{ .status = .vector_migration_row_exceeds_budget, .err = error.VectorMigrationRowExceedsBudget },
+    .{ .status = .vector_migration_temporary_budget_exceeded, .err = error.VectorMigrationTemporaryBudgetExceeded },
+    .{ .status = .vector_migration_offline_admission, .err = error.VectorMigrationOfflineAdmission },
+    .{ .status = .vector_migration_catalog_in_use, .err = error.VectorMigrationCatalogInUse },
+    .{ .status = .vector_migration_copy_mismatch, .err = error.VectorMigrationCopyMismatch },
+    .{ .status = .vector_migration_unsupported_file, .err = error.VectorMigrationUnsupportedFile },
+    .{ .status = .vector_store_requires_empty_table, .err = error.VectorStoreRequiresEmptyTable },
+    .{ .status = .vector_store_requires_local_single_shard_table, .err = error.VectorStoreRequiresLocalSingleShardTable },
+    .{ .status = .vector_store_requires_offline_command, .err = error.VectorStoreRequiresOfflineCommand },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {
@@ -701,5 +729,10 @@ pub fn validateForTest() !void {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    // A newly created/rebuilt ANN index has no serving generation yet. This
+    // expected state must survive both compiled query boundaries as a retry,
+    // rather than becoming an unregistered StorageKernelFailure (HTTP 500).
+    try std.testing.expectEqual(abi.Status.index_rebuilding, statusFromError(error.IndexRebuilding));
+    try std.testing.expectError(error.IndexRebuilding, statusToError(.index_rebuilding));
     try validateForTest();
 }

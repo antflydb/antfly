@@ -2356,6 +2356,47 @@ pub const Client = struct {
         return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
     }
 
+    /// Create or resume a table storage migration job
+    /// POST /db/v1/tables/{tableName}/storage/migrations
+    pub fn createTableStorageMigration(self: *@This(), table_name: []const u8, body: std.json.Value) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/storage/migrations", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Read a table storage migration receipt
+    /// GET /db/v1/tables/{tableName}/storage/migrations/{jobId}
+    pub fn getTableStorageMigration(self: *@This(), table_name: []const u8, job_id: []const u8) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/storage/migrations/{s}", .{ self.base_url, encoded_table_name, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Advance, publish or cancel a table storage migration job
+    /// POST /db/v1/tables/{tableName}/storage/migrations/{jobId}
+    pub fn advanceTableStorageMigration(self: *@This(), table_name: []const u8, job_id: []const u8, body: std.json.Value) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/storage/migrations/{s}", .{ self.base_url, encoded_table_name, encoded_job_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
     /// List tablespaces
     /// GET /db/v1/tablespaces
     pub fn listTablespaces(self: *@This()) !ApiResponse([]const types.TablespaceCatalogRecord) {
