@@ -23806,7 +23806,7 @@ fn consumerTests() type {
             const source = provisioned.source();
             try std.testing.expect((try source.searchResultGroupLocal(std.testing.allocator, 7001, "docs", .{}, .read_index)) == null);
             executor.acknowledge = false;
-            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.queryGroupLocal(std.testing.allocator, 7001, "docs", .{}, .read_index));
+            try std.testing.expectError(error.DistributedQueryUnavailable, source.queryGroupLocal(std.testing.allocator, 7001, "docs", .{}, .read_index));
             executor.acknowledge = true;
             var routed_response = (try source.queryGroupLocal(std.testing.allocator, 7001, "docs", .{}, .read_index)).?;
             defer routed_response.deinit(std.testing.allocator);

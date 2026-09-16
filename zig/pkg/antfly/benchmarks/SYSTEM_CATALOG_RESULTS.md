@@ -2318,7 +2318,7 @@ including bounded cancellation and exact replay, with the original 11,000- and
 metadata driver; qualification of the subsequent compact identity callback is
 reported separately below. Assertions and fault coverage are unchanged.
 
-The final main merge through `c4b4728fa` updates CI admission and documentation;
+The main merge through `c4b4728fa` updates CI admission and documentation;
 it does not change production code or the measured binary.
 
 The compact-identity binary completed the same two-table/eight-shard workload
@@ -2344,3 +2344,13 @@ lookup completed 80 requests with eight readers in 0.427 s (p50/p95
 No task-owned build, model, profiler, or second workload overlapped measurement.
 [Final raw observation](system_catalog_join_topology_final_2026_09_16.json)
 records the settings, binary hash, placements, and concurrent request samples.
+
+The compact-identity revision also passed all 16 join/split model tests, including
+exact replay and the bounded cancellation history, in an 18-minute Debug run.
+The subsequent merge of `6f7df8233` (#704) brings storage publication, transport,
+and VOPR hardening from main. The measurements above predate that merge and are
+not timing claims for the merged binary. Integration retains main's stable error
+ordinals, the catalog's host-owned retry queue, and one retry policy for scheduled
+and explicitly awaited store reports. A newly included virtual-HTTP fiber test
+uses leak-checked allocation without native stack capture, matching the other
+fiber fixtures and avoiding macOS unwinding across switched stacks.

@@ -699,9 +699,12 @@ def _wait_for_entities(
     )
 
 
-def test_entity_deadline_retains_diagnostics_below_request_floor(monkeypatch):
+def test_entity_deadline_retains_diagnostics_below_request_floor(monkeypatch, tmp_path):
     class Server:
-        def native_stack_dumps(self):
+        root = tmp_path
+
+        def native_stack_dumps(self, *, per_process_timeout_s):
+            assert per_process_timeout_s == 5.0
             return "captured native stacks"
 
     class Api:

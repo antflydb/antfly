@@ -1466,7 +1466,6 @@ fn consumerTests() type {
                 fail_identity: bool = false,
                 validation_error: ?anyerror = null,
                 visibility_error: ?anyerror = null,
-                validation_error: ?anyerror = null,
                 saw_unfenced_split: bool = false,
                 saw_unfenced_merge: bool = false,
                 saw_unfenced_transaction: bool = false,
