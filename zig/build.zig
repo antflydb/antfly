@@ -4945,6 +4945,7 @@ pub fn build(b: *std.Build) void {
         "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
+        "remote metadata deadline ",
     };
     const lib_data_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
