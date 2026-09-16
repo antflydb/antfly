@@ -31,9 +31,10 @@ class SoakTests(unittest.TestCase):
             "Soak public overwrite restore with concurrent readers and status",
             "Soak cross-shard Autograph resolution, promotion, and hydration",
         ):
-            with self.subTest(
-                step=step_name
-            ), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(step=step_name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 (root / "production-e2e-soak").mkdir()
                 (root / "scripts/ci").mkdir(parents=True)
