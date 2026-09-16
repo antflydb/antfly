@@ -52323,7 +52323,7 @@ fn implementationTests() type {
                     source: *ProvisionedTableWriteSource,
                     cache: *runtime_status.TableRuntimeSnapshotCache,
                     fenced: bool = false,
-                    clear_publications: usize = 0,
+                    enabled: bool = true,
 
                     fn run(ptr: *anyopaque) void {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -52334,14 +52334,12 @@ fn implementationTests() type {
                         else
                             false;
                         self.source.table_activity_mutex.unlock(io);
-                        if (!clear_observed) return;
-                        self.clear_publications += 1;
-                        // Fence both the clear callback's publication and the
-                        // caller's final consistent publication. The next scheduler
-                        // pass must own recovery of the still-pending handoff.
-                        if (self.clear_publications > 2) return;
+                        if (!self.enabled or !clear_observed) return;
+                        // Fence every actual publication in this repair quantum.
+                        // The best-effort clear callback can skip publication on
+                        // WriterLocked, so a fixed callback count is not a barrier.
                         self.cache.invalidateTable("docs");
-                        self.fenced = self.clear_publications == 2;
+                        self.fenced = true;
                     }
                 };
                 var publication_fence = PublicationFence{ .source = &source, .cache = &snapshot_cache };
@@ -52349,6 +52347,7 @@ fn implementationTests() type {
                     source: *ProvisionedTableWriteSource,
                     indexes_json: []const u8,
                     namespace: doc_identity.Namespace,
+                    publication_fence: *PublicationFence,
                     attempted_repair: bool = false,
                     repaired: bool = false,
                     repair_passes: usize = 0,
@@ -52371,6 +52370,18 @@ fn implementationTests() type {
                                 self.err = err;
                                 return;
                             };
+                            if (self.publication_fence.enabled and self.publication_fence.fenced) {
+                                // A fenced completion must retain the handoff for
+                                // another admitted owner, even if durable repair
+                                // itself completed in this quantum.
+                                if (!repair.index_repair_pending or
+                                    !self.source.structuralStatusSnapshotOnlyBestEffort("docs"))
+                                {
+                                    self.err = error.TestUnexpectedResult;
+                                    return;
+                                }
+                                self.publication_fence.enabled = false;
+                            }
                             if (repair.index_repair_repaired or repair.cleared_debt) {
                                 var resident = self.source.residentDbSource().leaseGroup(
                                     std.testing.allocator,
@@ -52404,6 +52415,7 @@ fn implementationTests() type {
                     .source = &source,
                     .indexes_json = indexes_json,
                     .namespace = namespace,
+                    .publication_fence = &publication_fence,
                 };
                 // Snapshot-only status is observational and cannot delay the cold
                 // repair owner. The repair's clear plus final cached publication must
