@@ -103473,12 +103473,12 @@ test "db root generation rollover preserves activated repair debt fail closed" {
         };
         try std.testing.expectError(
             error.TestCrashAfterPointerActivation,
-            db.repairArtifactIssuesWithRequest(alloc, .{
+            db.repairArtifactIssuesWithRequestOptions(alloc, .{
                 .target = .index,
                 .artifact_kind = .embedding,
                 .index_name = "dense_idx",
                 .limit = 1,
-            }),
+            }, repair_completion_test_options),
         );
         db.shadow_index_repair_hook = null;
     }
@@ -103505,7 +103505,8 @@ test "db root generation rollover preserves activated repair debt fail closed" {
     try std.testing.expectEqual(@as(u64, 2), replacement.intent.root_generation);
     try std.testing.expect(replacement.intent.candidate_relative_path == null);
 
-    const repaired = try reopened.advanceIndexRepairIntent(alloc, new_repair_id, .{});
+    // This checks generation rollover recovery, not the production pause SLA.
+    const repaired = try reopened.advanceIndexRepairIntent(alloc, new_repair_id, repair_completion_test_options);
     try std.testing.expect(repaired.attempted);
     try std.testing.expect(repaired.repaired);
     try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
