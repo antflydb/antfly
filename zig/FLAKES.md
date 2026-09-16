@@ -4,6 +4,46 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-16: metadata ownership fixtures bypassed Raft serialization
+
+PR #704's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35052615288/job/104656431732)
+at `fadf936c29` aborted in
+`metadata ownership preserves same-id remote backfill observations`.
+The restore supervisor's `ensureLinearizableRead` called Raft `readIndex` while
+`Scheduler.ready_pass_active` was true, failing the scheduler's non-reentrancy
+assertion. The graph-repair and resolver-reopen regressions from the preceding
+failure both passed; the SDK, ARM codec, and base E2E suites also passed.
+
+The ownership fixtures added in [#737](https://github.com/antflydb/antfly/pull/737)
+start a real metadata server, including its asynchronous restore supervisor, but
+four calls in two fixtures advanced
+`svc.raft.runRaftRoundOnly()` directly. The supervisor uses the owning
+`MetadataHttpService` runtime mutex; those raw-host calls bypassed it. Production
+service round and read-barrier entrypoints already share that mutex.
+
+The fixtures now advance through `svc.runRaftRoundOnly()`, preserving the live
+supervisor and serializing Ready processing with its read barriers through the
+existing `std.Io.Mutex`. This fixes the invalid concurrent caller, without
+weakening the scheduler assertion, disabling background work, or adding another
+lock to the Raft hot path. Both the placement/restart fixture and all four
+ownership-projection cases use the same service boundary.
+
+With native localhost socket access, the unchanged `fadf936c29` binary reproduced
+the same backfill-test abort in repetition 32 of a four-process runner: the
+restore supervisor entered `resumeGroupOnActivity` through ReadIndex during an
+active Ready pass. The runner stopped scheduling new work after that failure;
+34 other processes completed successfully. Sandbox-only runs skipped all eight
+listener-dependent tests and are not counted as validation.
+
+After the fix, the failed CI shard's exact runtime filter/skip selection passed
+all **207 tests** locally with native sockets, zero skips, failures, or leaks.
+The separate read-cadence regression also passed, verifying linearizable reads
+do not take over the election/heartbeat clock.
+All eight ownership cases then passed **200/200 fresh processes (1,600 test
+executions)** with four concurrent processes and native sockets, with no skips,
+failures, or leaks. Formatting and diff checks passed. These are local results;
+standard CI and full-soak qualification must be checked for the pushed commit.
+
 ## 2026-09-15: graph repair yield accounting and independent resolver completion
 
 PR #704's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35044256661/job/104631027746)
