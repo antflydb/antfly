@@ -23,12 +23,14 @@ class ExtractionRelation:
         source (ExtractionRelationEndpoint | Unset):
         target (ExtractionRelationEndpoint | Unset):
         score (float | Unset):
+        derived (bool | Unset): Version 2 inverse or symmetric companion derived from a selected relation.
     """
 
     type_: str
     source: ExtractionRelationEndpoint | Unset = UNSET
     target: ExtractionRelationEndpoint | Unset = UNSET
     score: float | Unset = UNSET
+    derived: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,6 +46,8 @@ class ExtractionRelation:
 
         score = self.score
 
+        derived = self.derived
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -57,6 +61,8 @@ class ExtractionRelation:
             field_dict["target"] = target
         if score is not UNSET:
             field_dict["score"] = score
+        if derived is not UNSET:
+            field_dict["derived"] = derived
 
         return field_dict
 
@@ -83,11 +89,14 @@ class ExtractionRelation:
 
         score = d.pop("score", UNSET)
 
+        derived = d.pop("derived", UNSET)
+
         extraction_relation = cls(
             type_=type_,
             source=source,
             target=target,
             score=score,
+            derived=derived,
         )
 
         extraction_relation.additional_properties = d

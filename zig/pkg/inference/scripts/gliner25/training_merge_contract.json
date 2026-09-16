@@ -1,0 +1,96 @@
+{
+  "classification_objective": "recorded_not_a_decision",
+  "classification_probabilities": "all_labels_same_absolute_bound_as_confidence",
+  "comparison_phases": [
+    "unmerged",
+    "peft_merged",
+    "native_merged"
+  ],
+  "default_limits": {
+    "event_deadline_seconds": 180,
+    "max_events": 128,
+    "max_output_bytes": 33554432,
+    "max_report_bytes": 8388608,
+    "max_rss_mib": 6144,
+    "max_runtime_copy_bytes": 4294967296,
+    "max_stderr_bytes": 8388608,
+    "max_tensor_comparison_chunk_bytes": 1048576,
+    "runtime_deadline_seconds": 600
+  },
+  "frozen_helpers": {
+    "../paired_benchmark.py": {
+      "sha256": "09612b67c2eeac5de17703088cb790c70d674a476053868f588699c5ca6e8411",
+      "size_bytes": 6183
+    },
+    "benchmark_cpu.py": {
+      "sha256": "277fd7f16371ff055be07142a9d32e10f54c4e4fa90aff6011c21995044b4b9d",
+      "size_bytes": 27929
+    },
+    "capture_inventory.py": {
+      "sha256": "bb3eda1f8b2d1f2b2d49932e0d6aad991fd47f7e0fc8472fb1d2d7eebdf13350",
+      "size_bytes": 7325
+    },
+    "check_bundles.py": {
+      "sha256": "4c58f89ea38065223696752743aa5db89d4fa6f430fe21765e0d729c21dc8b74",
+      "size_bytes": 24424
+    },
+    "check_training_export.py": {
+      "sha256": "929737a7bcb127408872b3d0234fbba4f8b60c125394956ac7afae8c44028679",
+      "size_bytes": 35606
+    },
+    "generate_pipeline_cases.py": {
+      "sha256": "fea2e43265bab863094566c126db8252fd8b462231f59f665701eb956e6ba16f",
+      "size_bytes": 11490
+    },
+    "oracle.py": {
+      "sha256": "61bbf4544a21111dbfbd643ed2392b1d9723498493b3fa6832154d6e1dc42752",
+      "size_bytes": 28555
+    },
+    "oracle_manifest.json": {
+      "sha256": "918005508a57d2c558c18a78167637f39c54e7c2c6d67814be15fc6714c4152f",
+      "size_bytes": 4097
+    },
+    "training_export_contract.json": {
+      "sha256": "b164ae2fe9aef1506f179fc554ae956826d782c0ff0ca7d4685d747882687978",
+      "size_bytes": 1311
+    },
+    "training_export_peft018.json": {
+      "sha256": "08905e3428c9d4a45a5e6a2c54677427f727cee1aa605647bc0b613567000968",
+      "size_bytes": 31851
+    },
+    "training_export_runtime.py": {
+      "sha256": "b6d15a935454a84f7df18eb394e4d6dd9c1dc8a988426e93169d596236d42d63",
+      "size_bytes": 10121
+    }
+  },
+  "native_receipt": {
+    "architecture_version": 1,
+    "config_version": 3,
+    "family": "gliner_boundary_merge/v1",
+    "math_policy": "f32_lora_delta_f64_dora_row_norm_v1",
+    "tensor_policy_version": 1,
+    "version": 1
+  },
+  "qualification": false,
+  "report_scope": "integrity_and_numerical_equivalence_only_no_quality_or_performance",
+  "request_count": 10,
+  "requests": {
+    "sha256": "030c979419cee5fd209ba6a6f23f2e0cc7744e396d4bf3357925651293f5fe5f",
+    "size_bytes": 3467
+  },
+  "runtime_profile": "peft-0.18.0-export-v1",
+  "scope": "gliner25_training_merge_compatibility/v1",
+  "tensor_count": 334,
+  "tolerances": {
+    "adapted_absolute": 1e-06,
+    "adapted_relative": 1e-05,
+    "bias": "exact_bytes",
+    "confidence_absolute": 0.0005,
+    "decisions": "exact",
+    "sidecars": "exact_bytes",
+    "token_ids": "exact",
+    "untouched": "exact_bytes"
+  },
+  "upstream_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+  "version": 1
+}

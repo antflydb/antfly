@@ -113,11 +113,10 @@ pub const HardCancellationWatchdog = struct {
                 };
             }
             self.mutex.unlock();
-            if (fatal) |err| {
-                std.log.err(
-                    "uninterruptible inference request expired; terminating supervised worker err={s}",
-                    .{@errorName(err)},
-                );
+            if (fatal != null) {
+                // A wedged worker may own stderr's lock, or its log consumer
+                // may have stopped reading. Exit86 is the parent diagnostic;
+                // no logging or other blocking IO may precede termination.
                 platform.inference_process_supervisor.restartWorker();
             }
             try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);

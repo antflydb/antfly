@@ -1,0 +1,1138 @@
+{
+  "format_version": 2,
+  "source_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+  "model": "base",
+  "model_id": "fastino/gliner2.5-base-v1",
+  "revision": "72ac19b486cd4557424c8d61114e7530c243e9b0",
+  "model_files": {
+    "config.json": {
+      "sha256": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+      "size_bytes": 3150
+    },
+    "encoder_config/config.json": {
+      "sha256": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+      "size_bytes": 857
+    },
+    "model.safetensors": {
+      "sha256": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+      "size_bytes": 774366564
+    },
+    "tokenizer.json": {
+      "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+      "size_bytes": 8341713
+    },
+    "tokenizer_config.json": {
+      "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+      "size_bytes": 645
+    }
+  },
+  "model_sha256": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+  "tokenizer_sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+  "reference_sha256": "86aedec78fe1e81ee8efc010b4b4f857886bff9f10ae9194bbb401fb957e06ac",
+  "requests_sha256": "030c979419cee5fd209ba6a6f23f2e0cc7744e396d4bf3357925651293f5fe5f",
+  "offset_unit": "unicode_codepoints",
+  "cases": [
+    {
+      "id": "mixed_tasks",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "entities": [
+          "person",
+          "organization"
+        ],
+        "classifications": [
+          {
+            "name": "sentiment",
+            "labels": [
+              "positive",
+              "negative"
+            ]
+          }
+        ],
+        "relations": [
+          {
+            "type": "works_for"
+          }
+        ]
+      },
+      "expected": {
+        "entities": [
+          {
+            "name": "person",
+            "values": [
+              {
+                "text": "John",
+                "confidence": 0.9969325065612793,
+                "source": {
+                  "start": 0,
+                  "end": 4
+                },
+                "attributes": []
+              },
+              {
+                "text": "Alice",
+                "confidence": 0.9779892563819885,
+                "source": {
+                  "start": 21,
+                  "end": 26
+                },
+                "attributes": []
+              }
+            ]
+          },
+          {
+            "name": "organization",
+            "values": [
+              {
+                "text": "Apple",
+                "confidence": 0.999278724193573,
+                "source": {
+                  "start": 14,
+                  "end": 19
+                },
+                "attributes": []
+              },
+              {
+                "text": "Google",
+                "confidence": 0.9990744590759277,
+                "source": {
+                  "start": 36,
+                  "end": 42
+                },
+                "attributes": []
+              }
+            ]
+          }
+        ],
+        "classifications": [
+          {
+            "name": "sentiment",
+            "labels": [
+              {
+                "label": "positive",
+                "confidence": 0.9477832913398743
+              }
+            ]
+          }
+        ],
+        "structures": [],
+        "relations": [
+          {
+            "name": "works_for",
+            "head": {
+              "text": "John",
+              "confidence": 0.8720568418502808,
+              "source": {
+                "start": 0,
+                "end": 4
+              },
+              "attributes": []
+            },
+            "tail": {
+              "text": "Apple",
+              "confidence": 0.8720568418502808,
+              "source": {
+                "start": 14,
+                "end": 19
+              },
+              "attributes": []
+            },
+            "confidence": 0.8720568418502808
+          },
+          {
+            "name": "works_for",
+            "head": {
+              "text": "Alice",
+              "confidence": 0.5069210529327393,
+              "source": {
+                "start": 21,
+                "end": 26
+              },
+              "attributes": []
+            },
+            "tail": {
+              "text": "Apple",
+              "confidence": 0.5069210529327393,
+              "source": {
+                "start": 14,
+                "end": 19
+              },
+              "attributes": []
+            },
+            "confidence": 0.5069210529327393
+          },
+          {
+            "name": "works_for",
+            "head": {
+              "text": "Alice",
+              "confidence": 0.7726740837097168,
+              "source": {
+                "start": 21,
+                "end": 26
+              },
+              "attributes": []
+            },
+            "tail": {
+              "text": "Google",
+              "confidence": 0.7726740837097168,
+              "source": {
+                "start": 36,
+                "end": 42
+              },
+              "attributes": []
+            },
+            "confidence": 0.7726740837097168
+          }
+        ]
+      }
+    },
+    {
+      "id": "unicode_offsets",
+      "text": "İpek works at Apple in 東京. 🙂 Alice visits café é.",
+      "schema": {
+        "entities": [
+          "person",
+          "location"
+        ],
+        "entity_definitions": {
+          "person": {
+            "description": "A named person"
+          },
+          "location": {
+            "description": "A named place"
+          }
+        }
+      },
+      "expected": {
+        "entities": [
+          {
+            "name": "person",
+            "values": [
+              {
+                "text": "İpek",
+                "confidence": 0.990368127822876,
+                "source": {
+                  "start": 0,
+                  "end": 4
+                },
+                "attributes": []
+              },
+              {
+                "text": "Alice",
+                "confidence": 0.9893039464950562,
+                "source": {
+                  "start": 29,
+                  "end": 34
+                },
+                "attributes": []
+              }
+            ]
+          },
+          {
+            "name": "location",
+            "values": [
+              {
+                "text": "東京",
+                "confidence": 0.9923305511474609,
+                "source": {
+                  "start": 23,
+                  "end": 25
+                },
+                "attributes": []
+              }
+            ]
+          }
+        ],
+        "classifications": [],
+        "structures": [],
+        "relations": []
+      }
+    },
+    {
+      "id": "entity_attributes",
+      "text": "The iPhone camera is good. The battery is bad.",
+      "schema": {
+        "entities": [
+          "product"
+        ],
+        "entity_attributes": {
+          "sentiment": {
+            "labels": [
+              "positive",
+              "negative",
+              "neutral"
+            ],
+            "applies_to": [
+              "product"
+            ],
+            "qualify_labels": true
+          },
+          "condition": {
+            "labels": [
+              "working",
+              "broken"
+            ],
+            "multi_label": true,
+            "threshold": 0.5,
+            "qualify_labels": true
+          }
+        }
+      },
+      "expected": {
+        "entities": [
+          {
+            "name": "product",
+            "values": [
+              {
+                "text": "iPhone camera",
+                "confidence": 0.9502612352371216,
+                "source": {
+                  "start": 4,
+                  "end": 17
+                },
+                "attributes": [
+                  {
+                    "name": "sentiment",
+                    "labels": [
+                      {
+                        "label": "positive",
+                        "confidence": 0.5583068132400513
+                      }
+                    ]
+                  },
+                  {
+                    "name": "condition",
+                    "labels": []
+                  }
+                ]
+              },
+              {
+                "text": "battery",
+                "confidence": 0.7353109121322632,
+                "source": {
+                  "start": 31,
+                  "end": 38
+                },
+                "attributes": [
+                  {
+                    "name": "sentiment",
+                    "labels": [
+                      {
+                        "label": "negative",
+                        "confidence": 0.9942480325698853
+                      }
+                    ]
+                  },
+                  {
+                    "name": "condition",
+                    "labels": [
+                      {
+                        "label": "broken",
+                        "confidence": 0.7922473549842834
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "classifications": [],
+        "structures": [],
+        "relations": []
+      }
+    },
+    {
+      "id": "legacy_structure",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "structures": {
+          "employment": {
+            "fields": {
+              "person": {
+                "type": "str"
+              },
+              "organization": {
+                "type": "list"
+              }
+            }
+          }
+        }
+      },
+      "expected": {
+        "entities": [],
+        "classifications": [],
+        "structures": [
+          {
+            "name": "employment",
+            "instances": [
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "John",
+                        "confidence": 0.9956012964248657,
+                        "source": {
+                          "start": 0,
+                          "end": 4
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Apple",
+                        "confidence": 0.9980384707450867,
+                        "source": {
+                          "start": 14,
+                          "end": 19
+                        },
+                        "attributes": []
+                      },
+                      {
+                        "text": "Google",
+                        "confidence": 0.9973280429840088,
+                        "source": {
+                          "start": 36,
+                          "end": 42
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "record_natural",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "structures": {
+          "employment": {
+            "mode": "natural",
+            "anchor": "person",
+            "occurrence_policy": "latent_all",
+            "fields": {
+              "person": {
+                "type": "str",
+                "cardinality": "required_one"
+              },
+              "organization": {
+                "type": "str",
+                "exclusive": true
+              }
+            }
+          }
+        }
+      },
+      "expected": {
+        "entities": [],
+        "classifications": [],
+        "structures": [
+          {
+            "name": "employment",
+            "instances": [
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "John",
+                        "confidence": 0.9956012964248657,
+                        "source": {
+                          "start": 0,
+                          "end": 4
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Apple",
+                        "confidence": 0.8459343314170837,
+                        "source": {
+                          "start": 14,
+                          "end": 19
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "Alice",
+                        "confidence": 0.9839866161346436,
+                        "source": {
+                          "start": 21,
+                          "end": 26
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Google",
+                        "confidence": 0.853733241558075,
+                        "source": {
+                          "start": 36,
+                          "end": 42
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "record_latent",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "structures": {
+          "employment": {
+            "mode": "latent",
+            "fields": {
+              "person": {
+                "type": "str"
+              },
+              "organization": {
+                "type": "str"
+              }
+            }
+          }
+        }
+      },
+      "expected": {
+        "entities": [],
+        "classifications": [],
+        "structures": [
+          {
+            "name": "employment",
+            "instances": [
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": []
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Google",
+                        "confidence": 0.9382851719856262,
+                        "source": {
+                          "start": 36,
+                          "end": 42
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "John",
+                        "confidence": 0.802109956741333,
+                        "source": {
+                          "start": 0,
+                          "end": 4
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Apple",
+                        "confidence": 0.7269876003265381,
+                        "source": {
+                          "start": 14,
+                          "end": 19
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "John",
+                        "confidence": 0.961789608001709,
+                        "source": {
+                          "start": 0,
+                          "end": 4
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Apple",
+                        "confidence": 0.9614768624305725,
+                        "source": {
+                          "start": 14,
+                          "end": 19
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "John",
+                        "confidence": 0.5924288630485535,
+                        "source": {
+                          "start": 0,
+                          "end": 4
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Google",
+                        "confidence": 0.7744337916374207,
+                        "source": {
+                          "start": 36,
+                          "end": 42
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "Alice",
+                        "confidence": 0.845417857170105,
+                        "source": {
+                          "start": 21,
+                          "end": 26
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Google",
+                        "confidence": 0.853733241558075,
+                        "source": {
+                          "start": 36,
+                          "end": 42
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "John",
+                        "confidence": 0.6042893528938293,
+                        "source": {
+                          "start": 0,
+                          "end": 4
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Google",
+                        "confidence": 0.5626275539398193,
+                        "source": {
+                          "start": 36,
+                          "end": 42
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "John",
+                        "confidence": 0.9046096205711365,
+                        "source": {
+                          "start": 0,
+                          "end": 4
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Apple",
+                        "confidence": 0.9142481684684753,
+                        "source": {
+                          "start": 14,
+                          "end": 19
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "John",
+                        "confidence": 0.9642244577407837,
+                        "source": {
+                          "start": 0,
+                          "end": 4
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Apple",
+                        "confidence": 0.6320874094963074,
+                        "source": {
+                          "start": 14,
+                          "end": 19
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "John",
+                        "confidence": 0.9271669387817383,
+                        "source": {
+                          "start": 0,
+                          "end": 4
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Apple",
+                        "confidence": 0.6847800016403198,
+                        "source": {
+                          "start": 14,
+                          "end": 19
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "fields": [
+                  {
+                    "name": "person",
+                    "values": [
+                      {
+                        "text": "Alice",
+                        "confidence": 0.7323372960090637,
+                        "source": {
+                          "start": 21,
+                          "end": 26
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "organization",
+                    "values": [
+                      {
+                        "text": "Google",
+                        "confidence": 0.7759064435958862,
+                        "source": {
+                          "start": 36,
+                          "end": 42
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "record_anchorless",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "structures": {
+          "employment": {
+            "mode": "anchorless",
+            "fields": {
+              "person": {
+                "type": "str"
+              },
+              "organization": {
+                "type": "str"
+              }
+            }
+          }
+        }
+      },
+      "expected": {
+        "entities": [],
+        "classifications": [],
+        "structures": [],
+        "relations": []
+      }
+    },
+    {
+      "id": "enum_field",
+      "text": "The iPhone camera is good.",
+      "schema": {
+        "structures": {
+          "review": {
+            "fields": {
+              "product": {
+                "type": "str"
+              },
+              "sentiment": {
+                "type": "str",
+                "choices": [
+                  "positive",
+                  "negative"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "expected": {
+        "entities": [],
+        "classifications": [],
+        "structures": [
+          {
+            "name": "review",
+            "instances": [
+              {
+                "fields": [
+                  {
+                    "name": "product",
+                    "values": [
+                      {
+                        "text": "iPhone camera",
+                        "confidence": 0.9744067192077637,
+                        "source": {
+                          "start": 4,
+                          "end": 17
+                        },
+                        "attributes": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "sentiment",
+                    "values": [
+                      {
+                        "text": "positive",
+                        "confidence": 0.9993060827255249,
+                        "source": null,
+                        "attributes": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "constrained_classification",
+      "text": "Delete the temporary file.",
+      "schema": {
+        "classifications": [
+          {
+            "name": "intent",
+            "labels": [
+              "read",
+              "delete"
+            ],
+            "min_labels": 1,
+            "max_labels": 1
+          },
+          {
+            "name": "effects",
+            "labels": [
+              "read_only",
+              "delete"
+            ],
+            "min_labels": 1,
+            "max_labels": 1
+          }
+        ],
+        "classification_constraints": [
+          {
+            "type": "Implies",
+            "cond": {
+              "type": "LabelRef",
+              "task": "intent",
+              "label": "delete"
+            },
+            "then": {
+              "type": "LabelRef",
+              "task": "effects",
+              "label": "delete"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "entities": [],
+        "classifications": [
+          {
+            "name": "intent",
+            "labels": [
+              {
+                "label": "delete",
+                "confidence": 0.9999999853484565
+              }
+            ]
+          },
+          {
+            "name": "effects",
+            "labels": [
+              {
+                "label": "delete",
+                "confidence": 0.9999999938837478
+              }
+            ]
+          }
+        ],
+        "structures": [],
+        "relations": []
+      }
+    },
+    {
+      "id": "joint_ie",
+      "text": "John works at Apple. Alice works at Google.",
+      "schema": {
+        "joint_ie": {
+          "entities": {
+            "person": {},
+            "organization": {}
+          },
+          "relations": {
+            "works_for": {
+              "head": [
+                "person"
+              ],
+              "tail": [
+                "organization"
+              ],
+              "max_per_head": 1
+            }
+          }
+        }
+      },
+      "expected": {
+        "entities": [
+          {
+            "name": "person",
+            "values": [
+              {
+                "text": "John",
+                "confidence": 0.997024534627765,
+                "source": {
+                  "start": 0,
+                  "end": 4
+                },
+                "attributes": []
+              },
+              {
+                "text": "Alice",
+                "confidence": 0.9864922723879817,
+                "source": {
+                  "start": 21,
+                  "end": 26
+                },
+                "attributes": []
+              }
+            ]
+          },
+          {
+            "name": "organization",
+            "values": [
+              {
+                "text": "Apple",
+                "confidence": 0.9985848215496579,
+                "source": {
+                  "start": 14,
+                  "end": 19
+                },
+                "attributes": []
+              },
+              {
+                "text": "Google",
+                "confidence": 0.9981437884157629,
+                "source": {
+                  "start": 36,
+                  "end": 42
+                },
+                "attributes": []
+              }
+            ]
+          }
+        ],
+        "classifications": [],
+        "structures": [],
+        "relations": [
+          {
+            "name": "works_for",
+            "head": {
+              "text": "John",
+              "confidence": 0.997024534627765,
+              "source": {
+                "start": 0,
+                "end": 4
+              },
+              "attributes": []
+            },
+            "tail": {
+              "text": "Apple",
+              "confidence": 0.9985848215496579,
+              "source": {
+                "start": 14,
+                "end": 19
+              },
+              "attributes": []
+            },
+            "confidence": 0.8422008484894733,
+            "derived": false,
+            "head_entity_type": 0,
+            "tail_entity_type": 1
+          },
+          {
+            "name": "works_for",
+            "head": {
+              "text": "Alice",
+              "confidence": 0.9864922723879817,
+              "source": {
+                "start": 21,
+                "end": 26
+              },
+              "attributes": []
+            },
+            "tail": {
+              "text": "Google",
+              "confidence": 0.9981437884157629,
+              "source": {
+                "start": 36,
+                "end": 42
+              },
+              "attributes": []
+            },
+            "confidence": 0.8097893141350528,
+            "derived": false,
+            "head_entity_type": 0,
+            "tail_entity_type": 1
+          }
+        ]
+      }
+    }
+  ]
+}

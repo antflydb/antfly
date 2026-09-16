@@ -1,0 +1,21 @@
+# GLiNER2.5 fixture manifests and execution contracts pin these exact source
+# bytes (see testdata/gliner25/reference_manifest.json and scripts/gliner25/*
+# contracts). Keep capture and replay identities intact when formatting. Other
+# scripts and tests remain covered by the repository formatter.
+force-exclude = true
+
+[format]
+exclude = [
+    "zig/pkg/inference/scripts/gliner25/benchmark_cpu.py",
+    "zig/pkg/inference/scripts/gliner25/capture_inventory.py",
+    "zig/pkg/inference/scripts/gliner25/check_bundles.py",
+    "zig/pkg/inference/scripts/gliner25/check_trained_execution.py",
+    "zig/pkg/inference/scripts/gliner25/check_training_export.py",
+    "zig/pkg/inference/scripts/gliner25/check_training_merge.py",
+    "zig/pkg/inference/scripts/gliner25/extract_token_evidence.py",
+    "zig/pkg/inference/scripts/gliner25/generate_pipeline_cases.py",
+    "zig/pkg/inference/scripts/gliner25/oracle.py",
+    "zig/pkg/inference/scripts/gliner25/prepare_training_job_fixture.py",
+    "zig/pkg/inference/scripts/gliner25/process_supervision.py",
+    "zig/pkg/inference/scripts/gliner25/training_export_runtime.py",
+]
