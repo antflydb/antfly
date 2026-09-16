@@ -155,8 +155,9 @@ def test_vector_migration_preserves_native_ann_neighbors(stateful_api, mode):
             sync_level="full_index",
         )
     assert wait_until(
-        lambda: api.get_index(table, "model").get("status", {}).get("total_indexed")
-        == 4096,
+        lambda: (
+            api.get_index(table, "model").get("status", {}).get("total_indexed") == 4096
+        ),
         timeout_s=90,
     )
     queries = [vector() for _ in range(32)]
@@ -447,9 +448,12 @@ def test_cancelled_vector_migration_allows_backup_without_restart(
     assert finish(api, table, "cancel")["phase"] == "cancelled"
     assert api.get_table(table)["storage"]["dense_embeddings"] == "primary_lsm"
     location = tmp_path.resolve().as_uri()
-    assert api.backup_table(
-        table, backup_id="cancelled", location=location, backup_format=backup_format
-    )["backup"] == "successful"
+    assert (
+        api.backup_table(
+            table, backup_id="cancelled", location=location, backup_format=backup_format
+        )["backup"]
+        == "successful"
+    )
     api.delete_table(table)
     assert api.restore_table(table, backup_id="cancelled", location=location) == {
         "restore": "triggered"
@@ -495,15 +499,20 @@ def test_offline_vector_migration_cancels_before_copy_fence(stateful_api):
 
     def record():
         return next(
-            t for t in json.loads(catalog_path.read_text())["tables"]
+            t
+            for t in json.loads(catalog_path.read_text())["tables"]
             if t["name"] == table
         )
 
     try:
-        rejected = invoke(server.root / "wrong-replica-root", "cancel-before-fence", "--once")
+        rejected = invoke(
+            server.root / "wrong-replica-root", "cancel-before-fence", "--once"
+        )
         assert rejected.returncode != 0 and "FileNotFound" in rejected.stderr
         admitted_catalog = catalog_path.read_text()
-        assert record()["storage_migration"]["request"]["job_id"] == "cancel-before-fence"
+        assert (
+            record()["storage_migration"]["request"]["job_id"] == "cancel-before-fence"
+        )
         cancelled = invoke(server.replica_root, "cancel-before-fence", "--cancel")
         assert cancelled.returncode == 0, cancelled.stderr
         assert record().get("storage_migration") is None
