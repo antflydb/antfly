@@ -386,6 +386,8 @@ pub fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
 }
 
 pub const release_scale_test_filters = [_][]const u8{
+    "graph metric sparse vector chunks production scale",
+    "relational columnar bound scan benchmark",
     "hbc binary monotone insertion production scale",
     "db doc set bitmap promotion production scale",
     "compaction phase handoff production scale",

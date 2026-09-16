@@ -117,11 +117,16 @@ The local investigation, measured changes, and remaining bottlenecks are in
 
 ## Separating allocation stack capture from storage work
 
-The two Lite round-trip integration tests default to a local DebugAllocator
-with zero captured allocation stack frames, retaining safety and leak checks.
-Set `ANTFLY_TEST_ALLOCATOR_TRACES=1` to use `std.testing.allocator` and capture
-allocation/free traces when diagnosing a failure. This affects only these two
-fixtures; focused allocation/ownership tests retain their existing allocators.
+Selected expensive Lite, graph, relational, PDF, and extractor fixtures default
+to a local DebugAllocator with zero captured allocation stack frames, retaining
+safety and leak checks. Set `ANTFLY_TEST_ALLOCATOR_TRACES=1` to use
+`std.testing.allocator` and capture allocation/free traces when diagnosing a
+failure. The PDF and extractor fixtures still inject every allocation failure;
+only successful allocation/free backtraces are disabled. Other tests retain
+their existing allocator settings.
+
+See [CI_UNIT_PERFORMANCE.md](CI_UNIT_PERFORMANCE.md) for suite ownership,
+finetuning build reuse, graph/relational boundaries, and measured results.
 
 ```sh
 ANTFLY_TEST_TIMINGS=1 ANTFLY_TEST_ALLOCATOR_TRACES=1 \

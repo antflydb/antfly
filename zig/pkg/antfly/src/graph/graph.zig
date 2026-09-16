@@ -1852,11 +1852,15 @@ pub const GraphIndex = struct {
     }
 
     fn graphMetricControlKeyWithAllocator(alloc: Allocator, parts: []const []const u8) ![]u8 {
-        var list = std.ArrayListUnmanaged(u8).empty;
-        defer list.deinit(alloc);
-        try list.appendSlice(alloc, graphMetricControlPrefix(parts));
-        for (parts) |part| try internal_keys.appendEncodedComponent(&list, alloc, part);
-        return try list.toOwnedSlice(alloc);
+        const prefix = graphMetricControlPrefix(parts);
+        var length = prefix.len;
+        for (parts) |part| length = std.math.add(usize, length, internal_keys.encodedComponentLen(part)) catch return error.OutOfMemory;
+        const key = try alloc.alloc(u8, length);
+        @memcpy(key[0..prefix.len], prefix);
+        var offset = prefix.len;
+        for (parts) |part| offset += internal_keys.encodeComponent(key[offset..], part);
+        std.debug.assert(offset == key.len);
+        return key;
     }
 
     fn graphMetricControlPrefix(parts: []const []const u8) []const u8 {
@@ -15608,8 +15612,8 @@ pub const GraphIndex = struct {
     }
 
     fn graphMetricBuildJobNamespacePrefixAlloc(self: *GraphIndex, metric_name: []const u8, job_id: u64) ![]u8 {
-        const job_id_text = try std.fmt.allocPrint(self.alloc, "{d}", .{job_id});
-        defer self.alloc.free(job_id_text);
+        var job_id_buf: [20]u8 = undefined;
+        const job_id_text = try std.fmt.bufPrint(&job_id_buf, "{d}", .{job_id});
         return try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", job_id_text });
     }
 
@@ -21697,8 +21701,41 @@ test "graph metric vector chunks checkpoint across blocks preserve caller order 
     try std.testing.expectEqual(@as(f64, 0), fresh[0]);
 }
 
-test "graph metric vector chunks publish pagerank eigenvector and hits with sparse filtered ordinals" {
+test "graph metric control namespace keys allocate exactly once" {
     const alloc = std.testing.allocator;
+    for ([_][]const u8{ "rank", "rank/escaped\x00name", topology_task_name_prefix ++ "task" }) |metric| {
+        var expected = std.ArrayListUnmanaged(u8).empty;
+        defer expected.deinit(alloc);
+        const parts = [_][]const u8{ metric, "job", "18446744073709551615" };
+        try expected.appendSlice(alloc, GraphIndex.graphMetricControlPrefix(&parts));
+        for (parts) |part| try internal_keys.appendEncodedComponent(&expected, alloc, part);
+        var measured = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1, .resize_fail_index = 0 });
+        // The namespace constructor needs only the allocator, not an open index.
+        var graph: GraphIndex = undefined;
+        graph.alloc = measured.allocator();
+        const actual = try graph.graphMetricBuildJobNamespacePrefixAlloc(metric, std.math.maxInt(u64));
+        defer measured.allocator().free(actual);
+        try std.testing.expectEqualSlices(u8, expected.items, actual);
+        try std.testing.expectEqual(@as(usize, 1), measured.allocations);
+        try std.testing.expectEqual(@as(usize, 0), measured.resize_index);
+        try std.testing.expect(!measured.has_induced_failure);
+    }
+}
+
+test "graph metric vector chunks publish pagerank eigenvector and hits with sparse filtered ordinals" {
+    try testSparseGraphMetricVectorChunks(vector_chunk.entries + 1);
+}
+
+test "graph metric sparse vector chunks production scale" {
+    try testSparseGraphMetricVectorChunks(graph_metric_build_checkpoint_reduce_units + 1);
+}
+
+fn testSparseGraphMetricVectorChunks(dictionary_count: usize) !void {
+    // Keep allocation safety and leak detection; opt into expensive allocation
+    // backtraces when diagnosing a failure.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var store_buf: [256]u8 = undefined;
     const store_path = tmpPath(&store_buf, "store-metric-vector-chunks");
     defer cleanupTmp(store_path);
@@ -21716,13 +21753,16 @@ test "graph metric vector chunks publish pagerank eigenvector and hits with spar
     };
     var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs, .reverse_lsm_options = .{ .flush_threshold = 8192 } });
     defer graph.close();
-    const nodes = [_][]const u8{ "doc-0000", "doc-0001", "doc-4096" };
+    const distant_node = try std.fmt.allocPrint(alloc, "doc-{d:0>4}", .{dictionary_count - 1});
+    defer alloc.free(distant_node);
+    const nodes = [_][]const u8{ "doc-0000", "doc-0001", distant_node };
+    try std.testing.expect((dictionary_count - 1) / vector_chunk.entries > 0);
     try graph.addEdge(nodes[0], nodes[1], "cites", 1, 0, 0, "");
     try graph.addEdge(nodes[1], nodes[2], "cites", 1, 0, 0, "");
     try graph.addEdge(nodes[2], nodes[1], "cites", 1, 0, 0, "");
     // The projection is sparse in a large immutable node dictionary. This
     // exercises empty producer ranges and slots in distant vector chunks.
-    try installGraphMetricPlanningNodeRefsForTest(&graph, graph_metric_build_checkpoint_reduce_units + 1);
+    try installGraphMetricPlanningNodeRefsForTest(&graph, dictionary_count);
     const edges = [_]metric_kernels.Edge{ .{ .source = 0, .target = 1 }, .{ .source = 1, .target = 2 }, .{ .source = 2, .target = 1 } };
     var rank = try metric_kernels.pageRankAlloc(alloc, nodes.len, &edges, .{ .max_iterations = 3 });
     defer rank.deinit(alloc);
@@ -21744,7 +21784,9 @@ test "graph metric vector chunks publish pagerank eigenvector and hits with spar
             const job = (try graph.metricBuildJob(&txn, "rank")).?;
             if (job.iteration != 1) continue;
             const plan = try graph.graphMetricActivePlan(&txn, "rank", job.job_id);
-            try std.testing.expectEqual(@as(usize, 65), plan.count);
+            const expected_partitions = try std.math.divCeil(usize, dictionary_count, graph_metric_build_target_scan_page_units);
+            try std.testing.expectEqual(expected_partitions, plan.count);
+            try std.testing.expect(plan.count > 2);
             try std.testing.expectEqual(@as(u64, 3), plan.total());
             var active_count: usize = 0;
             for (plan.counts[0..plan.count], 0..) |count, i| {

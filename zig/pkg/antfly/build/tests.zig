@@ -4820,6 +4820,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "storage-work-contract-tests",
         .root_module = antfly_test_mod,
         .filters = &.{
+            "relational columnar bound selection and late projection match primary semantics",
+            "relational columnar bound scan has bounded plans and primary reads",
+            "db graph metric runtime planned scheduler sweeps pagerank across reopened handles",
+            "db graph metric runtime default gate runUntilIdle publishes configured graph pagerank metrics",
+            "graph metric control namespace keys allocate exactly once",
+            "graph metric vector chunks publish pagerank eigenvector and hits with sparse filtered ordinals",
             "flat traversal does not treat a full candidate heap",
             "hbc monotone insertion has bounded split and save work",
             "lite restore staging accepts aflite input for normal restore",
@@ -4965,14 +4971,37 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // its lazy PDF lane is part of that module graph even when the test itself
     // does not render a document.
     sparse_test_mod.addImport("antfly_pdf", pdf_mod);
+    // Sparse owns its index tests. The inventory audit found these dependency
+    // tests had no other unit owner; retain them explicitly while removing
+    // duplicated storage integration tests.
+    const sparse_dependency_filters = [_][]const u8{
+        "common.bounded_worker_lane.",
+        "common.maintenance_scheduler.",
+        "common.test_directory.",
+        "backend runtime API lane leases expose and release the interface",
+        "backend runtime control lane leases are isolated from API leases",
+        "backend runtime durable lane leaves inline failed jobs owned by caller",
+        "backend runtime durable lane runs inline jobs",
+        "backend runtime exposes native API filesystem IO separately",
+        "backend runtime inference lane has an isolated bounded executor",
+        "backend runtime native API lane preserves filesystem errors across executors",
+        "backend runtime rejects API lane leases after shutdown begins",
+        "backend runtime rejects control lane leases after shutdown begins",
+        "backend runtime separates native operation IO from outbound network IO",
+        "backend runtime threaded durable lane rejects jobs after owner close",
+        "storage.sim_runtime.",
+        "storage.lmdb.test.LMDB sim soak",
+        "storage.lmdb.test.zig backend soak:",
+    };
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,
+        .filters = &(.{"sparse."} ++ sparse_dependency_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    // This aggregate exercises long-running storage lifecycle tests. Use the
-    // simple runner so failures retain per-test/cleanup attribution instead of
-    // collapsing into an opaque test-server process exit.
-    const run_sparse_unit_tests = addFilteredTestRunArtifact(b, sparse_unit_tests);
-
+    const run_sparse_unit_tests = addCuratedTestRunArtifact(b, sparse_unit_tests, &.{"sparse."});
+    const run_sparse_dependency_tests = addCuratedTestRunArtifact(b, sparse_unit_tests, &sparse_dependency_filters);
+    b.step("storage-foundation-test", "Run common worker, storage runtime, and LMDB lifecycle fixtures").dependOn(&run_sparse_dependency_tests.step);
+    unit_test_step.dependOn(&run_sparse_dependency_tests.step);
     const sparse_test_step = b.step("sparse-test", "Run sparse index unit tests");
     sparse_test_step.dependOn(&run_sparse_unit_tests.step);
 

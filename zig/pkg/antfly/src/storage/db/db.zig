@@ -69744,6 +69744,11 @@ test "relational columnar decoded cache preserves snapshots and releases visitor
 }
 
 fn seedColumnScanPlanTest(db: *DB, alloc: Allocator) !void {
+    return seedColumnScanPlanRows(db, alloc, 768);
+}
+
+fn seedColumnScanPlanRows(db: *DB, alloc: Allocator, row_count: usize) !void {
+    std.debug.assert(row_count >= 8 and row_count <= 768);
     try db.setSchemaJson(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"user-name":{"type":"string"},"payload":{"type":"json"},"embedding":{"type":"embedding"},"wide":{"type":"string"}},"additionalProperties":false}}}}
     );
@@ -69752,8 +69757,8 @@ fn seedColumnScanPlanTest(db: *DB, alloc: Allocator) !void {
     const scratch = arena.allocator();
     const wide = try scratch.alloc(u8, 8192);
     @memset(wide, 'x');
-    const writes = try scratch.alloc(types.BatchWrite, 768);
-    for (writes, 0..) |*write, i| write.* = .{
+    const writes = try scratch.alloc(types.BatchWrite, row_count);
+    for (writes, 768 - row_count..) |*write, i| write.* = .{
         .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}),
         .value = try std.fmt.allocPrint(scratch, "{{\"n\":{d},\"user-name\":\"Ada\",\"payload\":{{\"items\":[{{\"id\":{d}}},{{\"id\":2}}],\"nil\":null}},\"embedding\":[1,2,3],\"wide\":\"{s}\"}}", .{ i, i, wide }),
     };
@@ -69799,7 +69804,11 @@ test "relational columnar JSON numeric predicates preserve document semantics" {
 }
 
 test "relational columnar bound selection and late projection match primary semantics" {
-    const alloc = std.testing.allocator;
+    // Keep the original fixture: its physical block layout makes the tail
+    // selection choose late materialization rather than sequential reads.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
@@ -69810,6 +69819,7 @@ test "relational columnar bound selection and late projection match primary sema
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
         try seedColumnScanPlanTest(&db, alloc);
+        try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) >= 2);
         const selections = [_][]const []const u8{
             &.{},                     &.{"user-name"}, &.{ "payload.items.id", "payload.nil", "missing.name" },
             &.{"payload.items.1.id"}, &.{"-wide"},     &.{"user-*"},
@@ -70014,8 +70024,19 @@ test "relational columnar sequential selection pins snapshots and releases failu
     }
 }
 
+test "relational columnar bound scan has bounded plans and primary reads" {
+    try testRelationalBoundScan(false);
+}
+
 test "relational columnar bound scan benchmark" {
-    const alloc = std.testing.allocator;
+    try testRelationalBoundScan(true);
+}
+
+fn testRelationalBoundScan(benchmark: bool) !void {
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const row_count: usize = if (benchmark) 768 else 2 * @import("column_read_cache.zig").max_rows;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
@@ -70025,17 +70046,17 @@ test "relational columnar bound scan benchmark" {
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
-        try seedColumnScanPlanTest(&db, alloc);
+        try seedColumnScanPlanRows(&db, alloc, row_count);
         const Scenario = struct { fields: []const []const u8, filter: []const u8 = "{\"numeric_range\":{\"field\":\"n\",\"min\":760}}", rows: usize = 8 };
         for ([_]Scenario{
-            .{ .fields = &.{} },                            .{ .fields = &.{"payload.items.0.id"} },                            .{ .fields = &.{"user-name"} },
-            .{ .fields = &.{}, .filter = "", .rows = 768 }, .{ .fields = &.{"payload.items.0.id"}, .filter = "", .rows = 768 },
+            .{ .fields = &.{} },                                  .{ .fields = &.{"payload.items.0.id"} },                                  .{ .fields = &.{"user-name"} },
+            .{ .fields = &.{}, .filter = "", .rows = row_count }, .{ .fields = &.{"payload.items.0.id"}, .filter = "", .rows = row_count },
         }) |scenario| {
             const fields = scenario.fields;
             var elapsed: [2][7]u64 = undefined;
             var allocated: [2]usize = @splat(0);
             var counters: types.ColumnarScanStats = .{};
-            for (0..8) |round| for (0..2) |step| {
+            for (0..@as(usize, if (benchmark) 8 else 1)) |round| for (0..2) |step| {
                 const mode = (round + step) % 2;
                 var measured = std.testing.FailingAllocator.init(alloc, .{});
                 var stats: types.ColumnarScanStats = .{};
@@ -70059,6 +70080,7 @@ test "relational columnar bound scan benchmark" {
                     try std.testing.expectEqual(@as(u64, if (fields.len == 0) scenario.rows else 0), stats.primary_rows_read);
                 }
             };
+            if (!benchmark) continue;
             for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
             std.debug.print("\nbound scan: backend={s}, projection={s}, rows={d}, primary/column median ns={d}/{d}, allocated bytes={d}/{d}, plans={d}, hits={d}, primary rows={d}, payload bytes={d}\n", .{
                 @tagName(backend), if (fields.len == 0) "full" else fields[0], scenario.rows, elapsed[0][3], elapsed[1][3], allocated[0], allocated[1], counters.scan_plans_built, counters.scan_plan_hits, counters.primary_rows_read, counters.payload_bytes_read,
