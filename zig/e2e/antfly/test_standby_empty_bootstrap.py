@@ -165,7 +165,7 @@ def _bootstrap_empty(cluster: HACluster) -> None:
             )
         },
     }
-    cluster.standby.extra_runtime_args = flags(
+    cluster.standby.extra_runtime_args += flags(
         {"hot_standby_startup_" + key: value for key, value in startup.items()}
     )
     cluster.primary.admin_post(
@@ -242,6 +242,15 @@ def test_empty_seed_then_first_table_replication_and_fenced_promotion(
     assert (
         cluster.standby.lookup_key("first_table", "first")["title"]
         == "created after empty bootstrap"
+    )
+    # Authority transfer alone must not acknowledge writes without a new
+    # synchronous replica, even with the future-primary policy preconfigured.
+    promoted_write = cluster.standby.batch_write_response(
+        "first_table", {"unprotected": {"title": "must not acknowledge"}}
+    )
+    assert promoted_write.status_code == 503
+    assert promoted_write.text == (
+        "write committed locally; standby durability acknowledgment pending"
     )
 
 
