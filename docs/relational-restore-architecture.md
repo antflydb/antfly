@@ -121,8 +121,16 @@ Snapshot certification, snapshot pages, and tail pages share one immutable
 compiled rewrite-program set per resident target owner. Its cache key binds the
 complete restore scope and a length-framed digest of the supplied schema bytes
 and policies, not just the caller's claimed program identity. Cold compilation
-is single-flight under a `std.Io.Mutex`, before acquiring source-generation or
-frame locks. Every compiler/retained allocation is admitted through the shared
+is single-flight outside the short `std.Io.Mutex` publication lock, before
+acquiring source-generation or frame locks. Readers hold reference-counted
+immutable generations, not the cache mutex; page preparation releases its lease
+before proposing the owned batch. Contending compilers use stack-owned `std.Io`
+event waiters that wake on completion and check semantic cancellation and request
+deadlines between 5 ms wait slices (in addition to native Io cancellation).
+Eviction detaches the cache reference without waiting for readers, and fences
+already-running compilation from repopulating the evicted cache. Detached
+generations remain charged until their last reader releases them. Every entry
+header and compiler/retained allocation is admitted through the shared
 relational preparation budget; pressure can reclaim idle programs but never a
 leased program. Restart and eviction recompile from the authenticated intent;
 final-tail completion, terminal cleanup, and owner close release retained state.
@@ -138,6 +146,9 @@ are diagnostic, not throughput guarantees. Snapshot transfer/reopen tests also
 assert one compilation per resident owner. Fault coverage includes every
 compiler allocation failure, slice/aggregate pressure, cancellation, input
 ownership, changed policies, and eight concurrent callers sharing one compile.
+Contention regressions cover callback cancellation, deadline expiry, native Io
+cancellation, surviving waiters, overlapping leases, and eviction during both
+active reading and compilation.
 
 The shared restore worker now drives source publication, bounded authenticated
 peer-artifact push, snapshot transformation, retained catchup, all-source

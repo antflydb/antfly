@@ -323,7 +323,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
             }
             // Compile once outside generation/frame locks; the lease protects
             // immutable programs across source certification and either page path.
-            var program_lease = if (input.rewrite) |intent| try target.rewrite_program_cache.acquire(env.io, target.alloc, target.core.index_manager.resource_manager, input.scope, intent, context.cancellation) else null;
+            var program_lease = if (input.rewrite) |intent| try target.rewrite_program_cache.acquire(env.io, target.alloc, target.core.index_manager.resource_manager, input.scope, intent, context) else null;
             defer if (program_lease) |*lease| lease.deinit();
             const program = if (program_lease) |lease| lease.program() else null;
             try context.ensureActive();
@@ -343,6 +343,10 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 if (assembled.frame) |frame| {
                     var page = try @import("db/relational_rewrite_staging.zig").prepareTailVerified(target, alloc, input.scope, frame, program.?, input.max_rows, context.cancellation);
                     defer page.deinit();
+                    // The owned batch no longer needs compiled schemas. Do not
+                    // pin program memory through a potentially slow proposal.
+                    if (program_lease) |*lease| lease.deinit();
+                    program_lease = null;
                     if (page.batch) |batch| {
                         try env.proposer.propose(env.proposer.ptr, batch, context);
                         var advanced = try staging.Progress.decode(alloc, batch.restore_staging.?.rewrite_page.next);
@@ -357,6 +361,8 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
             defer decoder.close();
             var page = if (program) |compiled| try target.prepareRewriteStagingPage(alloc, input.scope, &decoder, input.max_rows, context.cancellation, compiled) else try target.prepareRestoreStagingPage(alloc, input.scope, &decoder, input.max_rows, context.cancellation);
             defer page.deinit();
+            if (program_lease) |*lease| lease.deinit();
+            program_lease = null;
             if (page.batch) |batch| try env.proposer.propose(env.proposer.ptr, batch, context);
         },
         .validate => {
@@ -452,12 +458,19 @@ test "restore owner verified decoder rewrite history compiles once across produc
         scope: [32]u8,
         index: u64 = 0,
         lose_reply: bool = false,
+        evict_on_index: u64,
         fn propose(ptr: *anyopaque, request: db.types.BatchRequest, context: operation.RequestContext) !void {
             try context.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var batch = request;
             batch.restore_staging_scope = self.scope;
             self.index += 1;
+            if (self.index == self.evict_on_index) {
+                // The page must own all batch values and release its program
+                // lease before proposal. Evict before apply to prove both.
+                try std.testing.expectEqual(@as(usize, 1), self.target.rewrite_program_cache.entry.?.refs.load(.acquire));
+                self.target.rewrite_program_cache.evict(std.testing.io);
+            }
             try self.target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = self.index });
             if (self.lose_reply) {
                 self.lose_reply = false;
@@ -465,7 +478,7 @@ test "restore owner verified decoder rewrite history compiles once across produc
             }
         }
     };
-    var apply: Apply = .{ .target = &target, .scope = scope.digest() };
+    var apply: Apply = .{ .target = &target, .scope = scope.digest(), .evict_on_index = 1 + rows.len / 8 };
     const env: Environment = .{ .io = io, .runtime = &runtime, .location_options = .{}, .cache_path = try std.fmt.allocPrint(a, "{s}/decoder", .{root}), .proposer = .{ .ptr = &apply, .propose = Apply.propose } };
     _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .begin }, .{});
     // Seed the durable boundary after an empty snapshot; every measured tail
@@ -499,6 +512,7 @@ test "restore owner verified decoder rewrite history compiles once across produc
     const elapsed = started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
     try std.testing.expect(target.rewrite_program_cache.hits >= 31);
+    try std.testing.expect(target.rewrite_program_cache.entry == null);
     var status = (try target.restoreStagingStatus(alloc)).?;
     defer status.deinit();
     try std.testing.expectEqual(@as(u64, rows.len), status.value.rows);
