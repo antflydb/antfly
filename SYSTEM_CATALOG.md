@@ -179,6 +179,12 @@ validated/rebuilt with the other catalog indexes. Standalone owns equivalent chi
 Response formatting uses an index instead of repeated inventory scans.
 Standalone updates only affected rows and their in-memory indexes.
 
+Internal catalog reads fence metadata identity before and after the authoritative
+read through a dedicated group/incarnation projection. Identity verification
+never constructs a diagnostic status snapshot or enumerates tables, ranges,
+stores, or indexes. Missing identity capability requires an upgrade; an identity
+change fails the request with an availability error.
+
 A writable projection rebuilds name indexes from validated authoritative records
 before its first catalog point read after open or snapshot installation. Read-only
 open validates the persisted projection instead. A version marker, checked inside

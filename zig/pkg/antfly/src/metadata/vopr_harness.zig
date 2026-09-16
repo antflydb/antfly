@@ -6657,6 +6657,7 @@ pub const MetadataAdminVoprSource = struct {
             .ptr = self,
             .vtable = &.{
                 .system_catalog = systemCatalog,
+                .catalog_identity = catalogIdentity,
                 .head = head,
                 .linearizable_head = linearizableHead,
                 .linearizable_snapshot = linearizableSnapshot,
@@ -6689,6 +6690,14 @@ pub const MetadataAdminVoprSource = struct {
 
     /// Model the production read protocol against the actual replicated
     /// store. A missing capability is an upgrade failure, not a legacy read.
+    fn catalogIdentity(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return .{
+            .metadata_group_id = self.node.cluster.metadata_group_id,
+            .metadata_incarnation = (try self.node.metadataIncarnation()) orelse return error.MetadataIncarnationUnavailable,
+        };
+    }
+
     fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
         try context.ensureActive();
         const self: *@This() = @ptrCast(@alignCast(ptr));

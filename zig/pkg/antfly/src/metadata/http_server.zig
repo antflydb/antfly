@@ -104,11 +104,21 @@ fn systemCatalogServiceCall(comptime Service: type) *const fn (*anyopaque, std.m
     }.call;
 }
 
+fn systemCatalogIdentityCall(comptime Service: type) *const fn (*anyopaque) anyerror!metadata_api.CatalogIdentity {
+    return struct {
+        fn call(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+            const svc: *Service = @ptrCast(@alignCast(ptr));
+            return svc.catalogIdentity();
+        }
+    }.call;
+}
+
 pub const AdminSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        catalog_identity: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.CatalogIdentity = null,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: system_catalog.Call) anyerror![]u8 = null,
 
         head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
@@ -526,6 +536,7 @@ pub const AdminSource = struct {
             .ptr = svc,
             .vtable = &.{
                 .system_catalog = comptime systemCatalogServiceCall(service.MetadataService),
+                .catalog_identity = comptime systemCatalogIdentityCall(service.MetadataService),
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
                 .linearizable_snapshot = metadataServiceLinearizableSnapshot,
@@ -590,6 +601,7 @@ pub const AdminSource = struct {
             .ptr = svc,
             .vtable = &.{
                 .system_catalog = comptime systemCatalogServiceCall(service.MetadataHttpService),
+                .catalog_identity = comptime systemCatalogIdentityCall(service.MetadataHttpService),
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
@@ -1816,7 +1828,12 @@ pub const MetadataHttpServer = struct {
         ) catch return ctx.status(400).text("invalid forwarding context")) orelse return ctx.status(400).text("missing forwarding context");
         const context = systemCatalogRequestContext(ctx, forwarding.remaining_ms);
         const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
-        const read_identity = if (parsed.value != .mutate) try self.source.vtable.status(self.source.ptr) else null;
+        const identity_reader = if (parsed.value != .mutate)
+            self.source.vtable.catalog_identity orelse return ctx.status(426).text("catalog identity upgrade required")
+        else
+            null;
+        const read_identity = if (identity_reader) |read| read(self.source.ptr) catch |err|
+            return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err)) else null;
         self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         const response = callback(self.source.ptr, ctx.allocator, context, parsed.value) catch |err| {
             if (err == error.MetadataMutationOutcomeUnknown) try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
@@ -1824,10 +1841,11 @@ pub const MetadataHttpServer = struct {
         };
         defer ctx.allocator.free(response);
         if (read_identity) |before| {
-            const after = try self.source.vtable.status(self.source.ptr);
-            if (before.metadata_group_id != after.metadata_group_id or !std.meta.eql(before.metadata_incarnation, after.metadata_incarnation))
+            const after = identity_reader.?(self.source.ptr) catch |err|
+                return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err));
+            if (!std.meta.eql(before, after))
                 return ctx.status(503).text("metadata identity changed during catalog read");
-            const incarnation = after.metadata_incarnation orelse return ctx.status(503).text("metadata incarnation unavailable");
+            const incarnation = after.metadata_incarnation;
             // Header insertion owns its copy; avoid leaking temporary values
             // when the HTTP context uses a general-purpose allocator.
             var group_buf: [20]u8 = undefined;
@@ -4902,6 +4920,68 @@ test "metadata http server reports reallocation protocol upgrade gating" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 503), response.status.code);
     try std.testing.expectEqualStrings("metadata voter upgrade required", response.body.?);
+}
+
+test "system catalog read identity avoids diagnostic inventories and fences replacement" {
+    const Fixture = struct {
+        reads: usize = 0,
+        replace_identity: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn identity(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = if (self.replace_identity and self.reads % 2 == 0)
+                    "22222222222222222222222222222222".*
+                else
+                    "11111111111111111111111111111111".*,
+            };
+        }
+        fn catalog(_: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, _: system_catalog.Call) ![]u8 {
+            try context.ensureActive();
+            return alloc.dupe(u8, "{}");
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{};
+    var vtable = AdminSource.VTable{
+        .status = Fixture.status,
+        .admin_snapshot = Fixture.snapshot,
+        .free_admin_snapshot = Fixture.freeSnapshot,
+        .system_catalog = Fixture.catalog,
+        .catalog_identity = Fixture.identity,
+    };
+    var server = MetadataHttpServer.init(alloc, .{}, .{ .ptr = &fixture, .vtable = &vtable });
+    const body = try std.json.Stringify.valueAlloc(alloc, @as(system_catalog.Call, .snapshot), .{});
+    defer alloc.free(body);
+    for ([_]u16{ 200, 503, 426 }) |expected| {
+        fixture.reads = 0;
+        fixture.replace_identity = expected == 503;
+        if (expected == 426) vtable.catalog_identity = null;
+        var request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+        defer request.deinit();
+        try request.setBody(body);
+        try request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+        try request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+        try request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try server.metadataSystemCatalog(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(expected, response.status.code);
+        try std.testing.expectEqual(@as(usize, if (expected == 426) 0 else 2), fixture.reads);
+        if (expected == 200) {
+            try std.testing.expectEqualStrings("{}", response.body.?);
+            try std.testing.expectEqualStrings("11111111111111111111111111111111", response.headers.get("x-antfly-catalog-metadata-incarnation").?);
+        }
+    }
 }
 
 test "system catalog forwarding retains its executor clock and tighter ingress deadline" {

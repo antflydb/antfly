@@ -862,7 +862,7 @@ pub fn httpStatus(err: anyerror) u16 {
         error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge => 413,
         error.TableTopologyProtocolUpgradeRequired => 426,
         error.Forbidden => 403,
-        error.UnsupportedOperation, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout, error.ResourceTemporarilyUnavailable => 503,
+        error.UnsupportedOperation, error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout, error.ResourceTemporarilyUnavailable => 503,
         error.MetadataMutationOutcomeUnknown, error.NotLeader, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
         else => 500,
     };
