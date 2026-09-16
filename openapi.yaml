@@ -20117,12 +20117,6 @@ components:
           type: string
           description: Single model identifier. Either model or models must be provided.
           example: openai/gpt-4.1
-        models:
-          type: array
-          items:
-            type: string
-          description: >
-            Array of model identifiers for fallback routing. Either model or models must be provided.
         api_key:
           type: string
           writeOnly: true

@@ -12560,8 +12560,6 @@ pub const GeneratorConfig = struct {
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
     presence_penalty: ?f32 = null,
-    /// Array of model identifiers for fallback routing. Either model or models must be provided.
-    models: ?[]const []const u8 = null,
     rate_limit: ?RateLimitConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -12581,7 +12579,6 @@ pub const GeneratorConfig = struct {
         .{ "api_url", "api_url", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
-        .{ "models", "models", true },
         .{ "rate_limit", "rate_limit", true },
     };
 
@@ -12653,10 +12650,6 @@ pub const GeneratorConfig = struct {
         }
         if (self.presence_penalty) |value| {
             try jw.objectField("presence_penalty");
-            try jw.write(value);
-        }
-        if (self.models) |value| {
-            try jw.objectField("models");
             try jw.write(value);
         }
         if (self.rate_limit) |value| {
@@ -25006,8 +24999,6 @@ pub const OpenRouterEmbedderConfig = struct {
 pub const OpenRouterGeneratorConfig = struct {
     /// Single model identifier. Either model or models must be provided.
     model: ?[]const u8 = null,
-    /// Array of model identifiers for fallback routing. Either model or models must be provided.
-    models: ?[]const []const u8 = null,
     /// The OpenRouter API key.
     api_key: ?[]const u8 = null,
     /// Controls randomness in generation (0.0-2.0).
@@ -25024,7 +25015,6 @@ pub const OpenRouterGeneratorConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", true },
-        .{ "models", "models", true },
         .{ "api_key", "api_key", true },
         .{ "temperature", "temperature", true },
         .{ "max_tokens", "max_tokens", true },
@@ -25045,10 +25035,6 @@ pub const OpenRouterGeneratorConfig = struct {
         try jw.beginObject();
         if (self.model) |value| {
             try jw.objectField("model");
-            try jw.write(value);
-        }
-        if (self.models) |value| {
-            try jw.objectField("models");
             try jw.write(value);
         }
         if (self.api_key) |value| {
