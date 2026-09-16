@@ -1323,6 +1323,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "backup heartbeat ",
         "table storage creation intent survives",
         "model-directed",
         "tool query builder",
@@ -1438,6 +1439,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "runtime HTTP streaming carries policy headers before commitment across both adapters",
         "linked API route manifest preserves internal scan response streaming",
         "scan stream preserves chunk backpressure without buffered fallback",
+        "imported runtime I/O views override raw runtime including unavailable views",
+        "API imported runtime capability struct retains versioned C layout",
+        "API kernel create ",
+        "API kernel failed fallible create releases unpublished state",
+        "API kernel runtime I/O ",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const api_http_runtime_tests = b.addTest(.{

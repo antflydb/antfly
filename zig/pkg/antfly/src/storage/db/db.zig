@@ -109782,10 +109782,11 @@ test "db last dense catch-up lease finalizes every covered rebuilding generation
     // exact-vector file is shared by the table. Preserve the independently
     // certified sibling instead of projecting the owner's short fence onto
     // every dense index.
-    // This fixture disables index and optional runtime workers so checkpoint
-    // publication cannot race the manually installed certificates. Stage acceleration explicitly;
-    // the finalization assertions below exercise certification only.
-    _ = try db.publishVectorBlockBasesOnline(.{});
+    // Certification requires published native posting bases for both indexes.
+    // Online publication only schedules checkpoint builders and may return
+    // before either base is ready. Use the explicit stable-tip barrier so the
+    // lease-finalization assertions do not race background checkpoint work.
+    _ = try db.publishVectorBlockBasesAtStableTip();
     {
         const owner = db.core.index_manager.denseIndex(configs[0].name) orelse
             return error.TestUnexpectedResult;

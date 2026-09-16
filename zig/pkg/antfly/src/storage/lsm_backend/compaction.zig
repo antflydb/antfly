@@ -6739,6 +6739,8 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
         smallest_key: []u8 = &.{},
         largest_namespace_name: ?[]u8 = null,
         largest_key: []u8 = &.{},
+        largest_namespace_buffer: std.ArrayListUnmanaged(u8) = .empty,
+        largest_key_buffer: std.ArrayListUnmanaged(u8) = .empty,
         entry_count: usize = 0,
         tombstone_count: u32 = 0,
         logical_bytes: usize = 0,
@@ -6785,30 +6787,34 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
             }
             if (self.smallest_namespace_name) |name| self.backend.allocator.free(name);
             if (self.smallest_key.len > 0) self.backend.allocator.free(self.smallest_key);
-            if (self.largest_namespace_name) |name| self.backend.allocator.free(name);
-            if (self.largest_key.len > 0) self.backend.allocator.free(self.largest_key);
+            self.largest_namespace_buffer.deinit(self.backend.allocator);
+            self.largest_key_buffer.deinit(self.backend.allocator);
             if (self.output_ticket) |ticket| ticket.abandon();
             self.* = undefined;
+        }
+
+        fn reserveLargestBounds(self: *Self, namespace_len: usize, key_len: usize) !void {
+            defer {
+                if (self.largest_namespace_name != null) self.largest_namespace_name = self.largest_namespace_buffer.items;
+                self.largest_key = self.largest_key_buffer.items;
+            }
+            try self.largest_namespace_buffer.ensureTotalCapacity(self.backend.allocator, namespace_len);
+            try self.largest_key_buffer.ensureTotalCapacity(self.backend.allocator, key_len);
         }
 
         fn appendEntry(self: *Self, entry: lsm_table_file.Entry, entry_bytes: usize) !void {
             var new_smallest_namespace_name: ?[]u8 = null;
             var new_smallest_key: []u8 = &.{};
-            var new_largest_namespace_name: ?[]u8 = null;
-            var new_largest_key: []u8 = &.{};
             errdefer {
                 if (new_smallest_namespace_name) |name| self.backend.allocator.free(name);
                 if (new_smallest_key.len > 0) self.backend.allocator.free(new_smallest_key);
-                if (new_largest_namespace_name) |name| self.backend.allocator.free(name);
-                if (new_largest_key.len > 0) self.backend.allocator.free(new_largest_key);
             }
 
             if (self.entry_count == 0) {
                 new_smallest_namespace_name = if (entry.namespace_name) |name| try self.backend.allocator.dupe(u8, name) else null;
                 new_smallest_key = try self.backend.allocator.dupe(u8, entry.key);
             }
-            new_largest_namespace_name = if (entry.namespace_name) |name| try self.backend.allocator.dupe(u8, name) else null;
-            new_largest_key = try self.backend.allocator.dupe(u8, entry.key);
+            try self.reserveLargestBounds(if (entry.namespace_name) |name| name.len else 0, entry.key.len);
 
             try self.writer.appendEntry(entry);
 
@@ -6818,12 +6824,12 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 self.smallest_key = new_smallest_key;
                 new_smallest_key = &.{};
             }
-            if (self.largest_namespace_name) |name| self.backend.allocator.free(name);
-            if (self.largest_key.len > 0) self.backend.allocator.free(self.largest_key);
-            self.largest_namespace_name = new_largest_namespace_name;
-            new_largest_namespace_name = null;
-            self.largest_key = new_largest_key;
-            new_largest_key = &.{};
+            self.largest_namespace_buffer.clearRetainingCapacity();
+            if (entry.namespace_name) |name| self.largest_namespace_buffer.appendSliceAssumeCapacity(name);
+            self.largest_key_buffer.clearRetainingCapacity();
+            self.largest_key_buffer.appendSliceAssumeCapacity(entry.key);
+            self.largest_namespace_name = if (entry.namespace_name != null) self.largest_namespace_buffer.items else null;
+            self.largest_key = self.largest_key_buffer.items;
             self.entry_count += 1;
             self.tombstone_count += @intFromBool(entry.tombstone);
             self.logical_bytes += entry_bytes;
@@ -6835,6 +6841,10 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
 
         fn finish(self: *Self) !Run {
             if (self.entry_count == 0) return error.EmptyRun;
+            const largest_namespace_name = if (self.largest_namespace_name) |name| try self.backend.allocator.dupe(u8, name) else null;
+            errdefer if (largest_namespace_name) |name| self.backend.allocator.free(name);
+            const largest_key = try self.backend.allocator.dupe(u8, self.largest_key);
+            errdefer self.backend.allocator.free(largest_key);
             var persisted = try self.writer.finish();
             self.writer_active = false;
             errdefer {
@@ -6846,15 +6856,9 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
             self.smallest_namespace_name = null;
             const smallest_key = self.smallest_key;
             self.smallest_key = &.{};
-            const largest_namespace_name = self.largest_namespace_name;
-            self.largest_namespace_name = null;
-            const largest_key = self.largest_key;
-            self.largest_key = &.{};
             errdefer {
                 if (smallest_namespace_name) |name| self.backend.allocator.free(name);
                 self.backend.allocator.free(smallest_key);
-                if (largest_namespace_name) |name| self.backend.allocator.free(name);
-                self.backend.allocator.free(largest_key);
             }
 
             const ticket = self.output_ticket;
@@ -8299,4 +8303,229 @@ test "compaction publication OOM leaves the active run version intact" {
         }
     }
     try std.testing.expect(observed_preflight_failure);
+}
+
+const PersistedBoundsTestBackend = struct {
+    allocator: std.mem.Allocator,
+    storage: ?@import("storage_io.zig").Storage,
+    root_dir: ?[]const u8 = "/persisted-bounds",
+    next_run_id: u64 = 10,
+    options: @import("../lsm_backend.zig").Options = .{
+        .table_block_compression = .none,
+        .max_run_file_bytes = 4 * 1024 * 1024,
+    },
+};
+
+fn checkPersistedBoundsMerge(drop_tombstones: bool) !usize {
+    const allocator = std.testing.allocator;
+    const count = 4096;
+    var memory = @import("storage_io.zig").MemoryStorage.init(allocator);
+    defer memory.deinit();
+    const keys = try allocator.alloc([8]u8, count);
+    defer allocator.free(keys);
+    const entries = try allocator.alloc(lsm_table_file.Entry, count);
+    defer allocator.free(entries);
+    for (entries, keys, 0..) |*entry, *key, i| {
+        std.mem.writeInt(u64, key, @intCast(i), .big);
+        entry.* = .{ .key = key, .value = if (i % 2 == 0) "" else "old", .tombstone = i % 2 == 0 };
+    }
+    const older_encoded = try lsm_table_file.encodeAlloc(allocator, entries);
+    defer allocator.free(older_encoded);
+    try memory.storage().writeFileAbsolute("/persisted-bounds/older.tbl", older_encoded);
+    const newer_encoded = try lsm_table_file.encodeAlloc(allocator, &.{
+        .{ .key = &keys[count - 3], .value = "", .tombstone = true },
+        .{ .key = &keys[count - 1], .value = "new" },
+    });
+    defer allocator.free(newer_encoded);
+    try memory.storage().writeFileAbsolute("/persisted-bounds/newer.tbl", newer_encoded);
+
+    var older = Run{
+        .id = 1,
+        .level = 1,
+        .size_bytes = older_encoded.len,
+        .path = @constCast("/persisted-bounds/older.tbl"),
+        .smallest_namespace_name = null,
+        .smallest_key = &keys[0],
+        .largest_namespace_name = null,
+        .largest_key = &keys[count - 1],
+        .entry_count = count,
+        .bloom_filter = null,
+        .state = null,
+        .owns_metadata = false,
+    };
+    var newer = older;
+    newer.id = 2;
+    newer.level = 0;
+    newer.size_bytes = newer_encoded.len;
+    newer.path = @constCast("/persisted-bounds/newer.tbl");
+    newer.smallest_key = &keys[count - 3];
+    newer.entry_count = 2;
+
+    var counting = std.testing.FailingAllocator.init(allocator, .{});
+    var backend = PersistedBoundsTestBackend{ .allocator = counting.allocator(), .storage = memory.storage() };
+    var outputs = try makePersistedRunsFromSelectedRunsWithGc(PersistedBoundsTestBackend, &backend, &.{ &newer, &older }, 1, drop_tombstones);
+    defer discardOutputRuns(PersistedBoundsTestBackend, &backend, &outputs);
+    const compaction_allocations = counting.allocations;
+    try std.testing.expectEqual(@as(usize, 1), outputs.items.len);
+    const expected_count: usize = if (drop_tombstones) count / 2 - 1 else count;
+    try std.testing.expectEqual(@as(u32, @intCast(expected_count)), outputs.items[0].entry_count);
+    try std.testing.expectEqual(@as(?u32, if (drop_tombstones) 0 else count / 2 + 1), outputs.items[0].tombstone_count);
+    if (drop_tombstones) {
+        try std.testing.expectEqual(@as(u64, 0), outputs.items[0].oldest_tombstone_unix_ns);
+    } else {
+        try std.testing.expect(outputs.items[0].oldest_tombstone_unix_ns > 0);
+    }
+    try std.testing.expectEqualSlices(u8, &keys[if (drop_tombstones) 1 else 0], outputs.items[0].smallest_key);
+    try std.testing.expectEqualSlices(u8, &keys[count - 1], outputs.items[0].largest_key);
+    var state = try repository_mod.loadRunStateAllocWithStorage(memory.storage(), allocator, outputs.items[0].path.?);
+    defer state.deinit(allocator);
+    try std.testing.expectEqual(expected_count, state.entryCount());
+    var cursor: State.EntryCursor = .{};
+    var output_index: usize = 0;
+    for (0..count) |i| {
+        const tombstone = i % 2 == 0 or i == count - 3;
+        if (drop_tombstones and tombstone) continue;
+        const entry = cursor.at(&state, output_index);
+        output_index += 1;
+        try std.testing.expectEqualSlices(u8, &keys[i], entry.key);
+        try std.testing.expectEqual(tombstone, entry.tombstone);
+        try std.testing.expectEqualStrings(if (tombstone) "" else if (i == count - 1) "new" else "old", entry.value);
+    }
+    try std.testing.expectEqual(expected_count, output_index);
+    return compaction_allocations;
+}
+
+test "persisted compaction bounds allocations scale with blocks not entries" {
+    const compaction_allocations = try checkPersistedBoundsMerge(false);
+    const count = 4096;
+    std.debug.print("\nCOMPACTION_ALLOCATION_BOUND observed={d} exclusive_limit={d}\n", .{ compaction_allocations, count / 4 });
+    try std.testing.expect(compaction_allocations < count / 4);
+}
+
+test "persisted compaction bounds preserve current tombstone GC output metadata" {
+    _ = try checkPersistedBoundsMerge(true);
+}
+
+test "persisted compaction bounds own mutable input and preserve namespace presence" {
+    const allocator = std.testing.allocator;
+    for ([_]?[]const u8{ null, "", "docs" }) |namespace| {
+        var memory = @import("storage_io.zig").MemoryStorage.init(allocator);
+        defer memory.deinit();
+        var backend = PersistedBoundsTestBackend{ .allocator = allocator, .storage = memory.storage() };
+        var key = "a:000001".*;
+        var namespace_bytes = "docs".*;
+        var output: PersistedOutputRunBuilder(PersistedBoundsTestBackend) = undefined;
+        try output.initInPlace(&backend, 1, 2);
+        var output_active = true;
+        defer if (output_active) output.deinit();
+        const first = lsm_table_file.Entry{
+            .namespace_name = if (namespace) |name| namespace_bytes[0..name.len] else null,
+            .key = &key,
+            .value = "value",
+        };
+        try output.appendEntry(first, tableEntryLogicalBytes(first));
+        @memcpy(&key, "z:000002");
+        @memcpy(&namespace_bytes, "orgs");
+        const second = lsm_table_file.Entry{
+            .namespace_name = if (namespace) |name| namespace_bytes[0..name.len] else null,
+            .key = &key,
+            .value = "",
+            .tombstone = true,
+        };
+        try output.appendEntry(second, tableEntryLogicalBytes(second));
+        @memset(&key, 'x');
+        @memset(&namespace_bytes, 'x');
+        var run = try output.finish();
+        defer run.deinit(allocator);
+        output.deinit();
+        output_active = false;
+
+        try output.initInPlace(&backend, 1, 1);
+        output_active = true;
+        const later = lsm_table_file.Entry{ .namespace_name = "zzzz", .key = "zzzzzzzz", .value = "later" };
+        try output.appendEntry(later, tableEntryLogicalBytes(later));
+        var later_run = try output.finish();
+        defer later_run.deinit(allocator);
+        output.deinit();
+        output_active = false;
+
+        try std.testing.expectEqual(@as(?u32, 1), run.tombstone_count);
+        try std.testing.expect(run.oldest_tombstone_unix_ns > 0);
+        try std.testing.expectEqual(@as(?u32, 0), later_run.tombstone_count);
+        try std.testing.expectEqual(@as(u64, 0), later_run.oldest_tombstone_unix_ns);
+        try std.testing.expect(run.output_ticket == null and later_run.output_ticket == null);
+        try std.testing.expectEqual(namespace == null, run.smallest_namespace_name == null);
+        try std.testing.expectEqual(namespace == null, run.largest_namespace_name == null);
+        if (namespace) |name| {
+            try std.testing.expectEqualStrings(name, run.smallest_namespace_name.?);
+            try std.testing.expectEqualStrings(if (name.len == 0) "" else "orgs", run.largest_namespace_name.?);
+        }
+        try std.testing.expectEqualStrings("a:000001", run.smallest_key);
+        try std.testing.expectEqualStrings("z:000002", run.largest_key);
+        var state = try repository_mod.loadRunStateAllocWithStorage(memory.storage(), allocator, run.path.?);
+        defer state.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), state.entryCount());
+        var cursor: State.EntryCursor = .{};
+        const first_entry = cursor.at(&state, 0);
+        const second_entry = cursor.at(&state, 1);
+        try std.testing.expectEqualStrings("a:000001", first_entry.key);
+        try std.testing.expectEqualStrings("value", first_entry.value);
+        try std.testing.expect(!first_entry.tombstone);
+        try std.testing.expectEqualStrings("z:000002", second_entry.key);
+        try std.testing.expect(second_entry.tombstone);
+        if (namespace != null and namespace.?.len > 0) {
+            try std.testing.expectEqualStrings("docs", first_entry.namespace_name.?);
+            try std.testing.expectEqualStrings("orgs", second_entry.namespace_name.?);
+        } else {
+            try std.testing.expect(first_entry.namespace_name == null);
+            try std.testing.expect(second_entry.namespace_name == null);
+        }
+    }
+}
+
+test "persisted compaction bounds allocation failure preserves prior run bounds" {
+    for (0..2) |failure_offset| {
+        var memory = @import("storage_io.zig").MemoryStorage.init(std.testing.allocator);
+        defer memory.deinit();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var backend = PersistedBoundsTestBackend{ .allocator = failing.allocator(), .storage = memory.storage() };
+        var output: PersistedOutputRunBuilder(PersistedBoundsTestBackend) = undefined;
+        try output.initInPlace(&backend, 1, 2);
+        defer output.deinit();
+        const first = lsm_table_file.Entry{ .namespace_name = "a", .key = "a", .value = "value" };
+        try output.appendEntry(first, tableEntryLogicalBytes(first));
+        const allocations_before = failing.alloc_index;
+        const logical_bytes_before = output.logical_bytes;
+        const tombstones_before = output.tombstone_count;
+        const larger_bounds = [_]u8{'z'} ** (std.ArrayListUnmanaged(u8).growCapacity(1) + 1);
+        failing.fail_index = allocations_before + failure_offset;
+        failing.resize_fail_index = failing.resize_index;
+        const next = lsm_table_file.Entry{
+            .namespace_name = &larger_bounds,
+            .key = &larger_bounds,
+            .value = "",
+            .tombstone = true,
+        };
+        try std.testing.expectError(error.OutOfMemory, output.appendEntry(next, tableEntryLogicalBytes(next)));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failure_offset, failing.alloc_index - allocations_before);
+        try std.testing.expectEqual(@as(usize, 1), output.entry_count);
+        try std.testing.expectEqual(logical_bytes_before, output.logical_bytes);
+        try std.testing.expectEqual(tombstones_before, output.tombstone_count);
+        try std.testing.expectEqualStrings("a", output.smallest_namespace_name.?);
+        try std.testing.expectEqualStrings("a", output.smallest_key);
+        try std.testing.expectEqualStrings("a", output.largest_namespace_name.?);
+        try std.testing.expectEqualStrings("a", output.largest_key);
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+        try output.appendEntry(next, tableEntryLogicalBytes(next));
+        var run = try output.finish();
+        defer run.deinit(failing.allocator());
+        try std.testing.expectEqual(@as(u32, 2), run.entry_count);
+        try std.testing.expectEqual(@as(?u32, 1), run.tombstone_count);
+        try std.testing.expect(run.oldest_tombstone_unix_ns > 0);
+        try std.testing.expectEqualStrings("a", run.smallest_key);
+        try std.testing.expectEqualSlices(u8, &larger_bounds, run.largest_namespace_name.?);
+        try std.testing.expectEqualSlices(u8, &larger_bounds, run.largest_key);
+    }
 }

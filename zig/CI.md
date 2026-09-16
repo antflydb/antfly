@@ -20,7 +20,24 @@ use the same controller implementation and repository-specific suite maps.
    approve, including outside collaborators. Org membership alone does not grant
    approval rights. No per-user allowlist, GitHub App, or additional credential is
    required; permission checks use the automatically provided `GITHUB_TOKEN`.
-4. Follow **Approved PR CI** in Actions and the **PR CI** check on the PR head.
+4. Follow **Approved PR CI** in Actions and the **PR CI gate** status on the PR head.
+   Queued approvals link to the PR-filtered workflow listing, and admitted runs
+   link directly to their jobs. The **PR CI** check retains the approval record.
+
+### Required merge gate
+
+Require the commit status **PR CI gate**, published by GitHub Actions, and keep
+"Require branches to be up to date" enabled. Replace the old **PR CI** required
+check; do not require both. Actions-created checks can attach to an older
+controller check suite and appear missing in the merge box even after passing.
+The distinct commit status is independent of check-suite selection and also
+provides a working Details link.
+
+The gate is pending during approval/CI, success only after validated completion,
+and failure/error for failed or invalidated approvals. Publishing it is mandatory:
+API failure stops dispatch/admission/publication rather than silently retaining
+an older successful result. Deploy the controller before switching branch
+protection; existing heads need a fresh approval to publish the new gate.
 
 Posting a new approval cancels the previous PR run and starts another attempt.
 Use a fresh comment to retry failed tests; Actions' **Re-run jobs** is not an
