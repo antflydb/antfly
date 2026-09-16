@@ -131,6 +131,9 @@ pub const CommandSpec = struct {
     link_libc: bool = false,
     /// This command writes a release version to its output or training manifest.
     release_metadata: bool = false,
+    // Entrypoints that import another CLI through a relative source path must
+    // retain one module boundary (Zig rejects the file in two modules).
+    shared_check: bool = true,
 };
 
 pub const TestSpec = struct {
@@ -165,6 +168,20 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) Command {
             .optimize = ctx.optimize,
         }),
     });
+    configureCommand(ctx, spec, exe);
+
+    const run = b.addRunArtifact(exe);
+    run.setCwd(ctx.root orelse b.path("."));
+    if (ctx.args orelse b.args) |args| run.addArgs(args);
+    if (ctx.publish_targets) {
+        const step = b.step(spec.name, spec.description);
+        step.dependOn(&run.step);
+    }
+    return .{ .executable = exe, .run = run };
+}
+
+fn configureCommand(ctx: Context, spec: CommandSpec, exe: *std.Build.Step.Compile) void {
+    const b = ctx.b;
     addImports(ctx, exe.root_module, spec.imports, ctx.pjrt_mod);
     if (spec.assets) |owner| exe.root_module.addImport("inference_finetune_assets", @import("assets.zig").create(.{
         .b = b,
@@ -182,15 +199,72 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) Command {
         exe.root_module.addObject(ctx.build_info_object);
     }
     if (spec.link_libc) exe.root_module.link_libc = true;
+}
 
-    const run = b.addRunArtifact(exe);
-    run.setCwd(ctx.root orelse b.path("."));
-    if (ctx.args orelse b.args) |args| run.addArgs(args);
-    if (ctx.publish_targets) {
-        const step = b.step(spec.name, spec.description);
-        step.dependOn(&run.step);
+fn sameCommandConfiguration(a: CommandSpec, b: CommandSpec) bool {
+    return a.shared_check and b.shared_check and a.assets == b.assets and a.native_link == b.native_link and
+        a.link_libc == b.link_libc and a.release_metadata == b.release_metadata and
+        std.mem.eql(Import, a.imports, b.imports);
+}
+
+/// Check every registered entrypoint without recompiling its shared inference
+/// implementation for every CLI. Only identical import/link profiles share a
+/// compilation, so the check cannot supply another command's dependencies.
+/// Individual command artifacts and run targets remain independently buildable.
+pub fn addCommandChecks(ctx: Context, specs: []const CommandSpec) *std.Build.Step {
+    const b = ctx.b;
+    const step = b.step(if (ctx.publish_targets) "test-finetune-command-check" else "inference-finetune-command-check", "Compile and link all finetuning CLI entrypoints in shared configuration groups");
+    const assigned = b.allocator.alloc(bool, specs.len) catch @panic("OOM");
+    @memset(assigned, false);
+    var group_index: usize = 0;
+    for (specs, 0..) |spec, first| {
+        if (assigned[first]) continue;
+        var names: std.ArrayList([]const u8) = .empty;
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (specs, 0..) |candidate, index| {
+            if (assigned[index] or (index != first and !sameCommandConfiguration(spec, candidate))) continue;
+            std.debug.assert(std.mem.startsWith(u8, candidate.root_source_file, "src/"));
+            names.append(b.allocator, candidate.name) catch @panic("OOM");
+            paths.append(b.allocator, candidate.root_source_file) catch @panic("OOM");
+            assigned[index] = true;
+        }
+        const generated = b.addWriteFiles();
+        var source: std.Io.Writer.Allocating = .init(b.allocator);
+        source.writer.writeAll(@embedFile("command_check_preamble.zig.txt")) catch @panic("OOM");
+        for (names.items, 0..) |name, index| {
+            source.writer.print("    if (std.mem.eql(u8, name, \"{s}\")) return @import(\"command_{d}\").main(init);\n", .{ name, index }) catch @panic("OOM");
+        }
+        source.writer.writeAll("    return error.CompileCheckOnly;\n}\n") catch @panic("OOM");
+        const check = b.addExecutable(.{
+            .name = b.fmt("finetune-command-check-{d}", .{group_index}),
+            .max_rss = ctx.test_compile_max_rss,
+            .root_module = b.createModule(.{
+                .root_source_file = generated.add("check.zig", source.written()),
+                .target = ctx.target,
+                .optimize = ctx.optimize,
+            }),
+        });
+        configureCommand(ctx, spec, check);
+        // Share each named dependency within the group, while retaining the
+        // original source boundary for each command module.
+        for (paths.items, 0..) |path, index| {
+            const module = b.createModule(.{
+                .root_source_file = ctx.path(path),
+                .target = ctx.target,
+                .optimize = ctx.optimize,
+            });
+            var imports = check.root_module.import_table.iterator();
+            while (imports.next()) |entry| {
+                if (!std.mem.startsWith(u8, entry.key_ptr.*, "command_"))
+                    module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+            }
+            check.root_module.addImport(b.fmt("command_{d}", .{index}), module);
+        }
+        _ = check.getEmittedBin();
+        step.dependOn(&check.step);
+        group_index += 1;
     }
-    return .{ .executable = exe, .run = run };
+    return step;
 }
 
 pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {

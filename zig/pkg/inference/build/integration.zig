@@ -37,11 +37,10 @@ pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Buil
     var finetune_ctx = finetune.fromWorkflow(ctx);
     finetune_ctx.publish_targets = false;
     const finetune_step = @import("finetune/tests.zig").addTests(finetune_ctx, "inference-finetune-test");
-    const commands = @import("finetune/tools.zig").register(finetune_ctx);
+    _ = @import("finetune/tools.zig").register(finetune_ctx);
     const workflows = @import("finetune/workflows.zig").register(finetune_ctx);
-    for (commands) |command| finetune_step.dependOn(&command.executable.step);
+    finetune_step.dependOn(finetune.addCommandChecks(finetune_ctx, &(@import("finetune/tools.zig").specs ++ @import("finetune/workflows.zig").specs)));
     for (workflows) |command| {
-        finetune_step.dependOn(&command.executable.step);
         if (std.mem.eql(u8, command.executable.name, "gliner2-entity-training-readiness"))
             ctx.step("gliner2-entity-training-readiness", "Run GLiNER2 entity training readiness").dependOn(&command.run.step);
     }
