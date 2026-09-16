@@ -4,6 +4,44 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-16: Debug stack unwinding escaped a fresh VOPR fiber
+
+Local macOS ARM64 Debug profiling of `origin/main` (`70098c101d`) crashed in
+these borrowed-runtime tests:
+
+- `db apply fences wait through their borrowed runtime`
+- `graph ownership cleanup runs on borrowed VoprIo before replicated merge`
+- `background maintenance services lifecycle runs on borrowed VoprIo`
+- `ttl runtime executes production pass on borrowed VoprIo`
+- `transaction recovery executes production pass on borrowed VoprIo`
+
+The apply-fence case also failed with timing instrumentation disabled. The
+reported segmentation fault was at address `0x8`; stack-trace printing then
+stalled. DebugAllocator captures allocation/free traces on the VOPR task stack,
+so stack unwinding itself can cause this fault before any diagnostic is printed.
+
+`Kernel.createTask` initialized the fiber frame pointer to zero, but `Entry.entry`
+left ARM64's link register inherited from the scheduler. Metadata-based unwinding
+could follow that unrelated return address and interpret the null frame pointer
+as another frame. A standalone task-kernel regression reproduced the same
+`EXC_BAD_ACCESS` at `0x8` in `std.debug.Dwarf.SelfUnwinder.nextInner` under LLDB.
+The equivalent x86_64 synthetic return-address slot was uninitialized too.
+
+The entry trampoline now initializes the nonexistent caller's return address to
+zero on both architectures. This costs one instruction at task entry and leaves
+normal context switches unchanged. Allocator diagnostics and stack tracing stay
+enabled. The regression captures a complete trace and exercises DebugAllocator
+both before and after yielding the same task back to the scheduler.
+
+After the fix, macOS ARM64 Debug passed all **32 runtime adapter tests**, including
+the five failures, and all **167 VOPR library tests**. The standalone task-kernel
+suite also passed all **14 tests in ReleaseSafe**.
+The five reported cases additionally passed **20 fresh processes / 100 cases**
+with zero skips, failures, or leaks. The 14 task-kernel tests passed in Debug on
+Linux x86_64 under local container emulation. The pre-fix standalone regression
+also passed there, so the Linux run validates the fix but does not establish a
+Linux reproduction of the macOS fault.
+
 ## 2026-09-16: metadata ownership fixtures bypassed Raft serialization
 
 PR #704's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35052615288/job/104656431732)
