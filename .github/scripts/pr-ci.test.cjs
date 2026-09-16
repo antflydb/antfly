@@ -566,3 +566,17 @@ test('fork pushes invalidate approval at admission, verification, and completion
     }
   });
 });
+
+
+test('PR orchestrator limits all called suites to read-only GitHub caches', () => {
+  const root = path.resolve(__dirname, '../workflows');
+  const orchestrator = fs.readFileSync(path.join(root, 'pr-ci.yml'), 'utf8');
+  assert.match(orchestrator, /^cache-mode: read$/m);
+  // A calling job could override the top-level limit; forbid broader access.
+  for (const file of ['pr-ci.yml', 'pr-ci-admission.yml', ...config.suites.map(s => s.workflow)]) {
+    const workflow = fs.readFileSync(path.join(root, file), 'utf8');
+    for (const match of workflow.matchAll(/^\s*cache-mode:\s*(.*?)\s*$/gm)) {
+      assert.ok(['read', 'none'].includes(match[1]), `${file} broadens PR cache access`);
+    }
+  }
+});
