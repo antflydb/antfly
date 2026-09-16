@@ -24588,7 +24588,7 @@ test "transcription session append accepts framed raw pcm and the events stream 
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/x/audio");
         defer request.deinit();
         try request.setBody(envelope);
-    try request.setHeader("Content-Type", httpx.attachment_envelope.content_type);
+        try request.setHeader("Content-Type", httpx.attachment_envelope.content_type);
         var ctx = httpx.Context.init(allocator, std.testing.io, &request);
         defer ctx.deinit();
         var response = try node.appendTranscriptionAudio(&ctx, session_id);
@@ -27022,6 +27022,7 @@ test "download remote content accepts data uri" {
         .embed_cache = undefined,
         .metrics = undefined,
         .inference_admission = undefined,
+        .transcription_sessions = transcription_sessions.Registry.init(alloc),
     };
     var downloaded = try downloadRemoteContent(&node, alloc, "data:text/plain;base64,aGVsbG8=");
     defer downloaded.deinit(alloc);
@@ -27262,6 +27263,7 @@ test "download remote content blocks private ip urls when configured" {
         .embed_cache = undefined,
         .metrics = undefined,
         .inference_admission = undefined,
+        .transcription_sessions = transcription_sessions.Registry.init(alloc),
     };
     try std.testing.expectError(error.PrivateIpBlocked, downloadRemoteContent(&node, alloc, "http://127.0.0.1/test.png"));
 }
@@ -27280,6 +27282,7 @@ test "download remote content blocks hosts outside allowlist" {
         .embed_cache = undefined,
         .metrics = undefined,
         .inference_admission = undefined,
+        .transcription_sessions = transcription_sessions.Registry.init(alloc),
     };
     try std.testing.expectError(error.HostNotAllowed, downloadRemoteContent(&node, alloc, "https://example.com/a.png"));
 }
