@@ -77,7 +77,9 @@ queue; they have a separate execution policy below.
   comments, and completion of the orchestrator. It loads only default-branch
   controller code, never PR code. `pull_request_target` is metadata-only.
 - `.github/workflows/pr-ci.yml` consumes one recorded approval, calls selected
-  reusable workflows, and requires every selected suite to succeed.
+  reusable workflows, and requires every selected suite to succeed. A trusted
+  final job rechecks the live approval and publishes the PR check directly; it
+  does not depend on delivery of a separate completion event.
 - `.github/workflows/pr-ci-admission.yml` verifies the approval and checkout for
   each suite on a small GitHub-hosted runner before its test jobs are eligible.
 - `.github/scripts/pr-ci.cjs` implements the controller; `pr-ci-config.json`
