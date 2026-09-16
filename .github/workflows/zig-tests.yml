@@ -1,9 +1,27 @@
 name: Zig Tests
 
 on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        default: ''
+      head_sha:
+        type: string
+        default: ''
+      base_sha:
+        type: string
+        default: ''
+      check_id:
+        type: string
+        default: ''
+      comment_id:
+        type: string
+        default: ''
+      validation_scope:
+        type: string
+        default: all
   push:
-    branches: ["main"]
-  pull_request:
     branches: ["main"]
   merge_group:
     types: [checks_requested]
@@ -23,6 +41,8 @@ on:
 
 permissions:
   contents: read
+  checks: read
+  pull-requests: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -30,11 +50,28 @@ env:
   ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-global-cache
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: zig-${{ inputs.pr_number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  admission:
+    uses: ./.github/workflows/pr-ci-admission.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+      suite: zig
+
   changes:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) }}
+    needs: admission
     runs-on: arc-antfly-standard
     outputs:
       zig_tests: ${{ steps.detect.outputs.zig_tests }}
@@ -45,6 +82,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Detect relevant changes
@@ -53,7 +92,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          if [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "workflow_dispatch" ]]; then
             if [[ "${{ inputs.validation_scope }}" == "inference-e2e" ]]; then
               {
                 echo "zig_tests=false"
@@ -74,7 +113,7 @@ jobs:
             exit 0
           fi
 
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+          if [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "schedule" ]]; then
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
             if [[ "${{ github.event.schedule }}" == "0 3 * * 0" ]]; then
               {
@@ -94,9 +133,9 @@ jobs:
             exit 0
           fi
 
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            base="${{ github.event.pull_request.base.sha }}"
-          elif [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+          if [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "pull_request" ]]; then
+            base="${{ inputs.base_sha }}"
+          elif [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "push" && -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
             base="${{ github.event.before }}"
           else
             {
@@ -109,7 +148,7 @@ jobs:
             exit 0
           fi
 
-          if git diff --quiet "$base" "${{ github.sha }}" -- \
+          if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
@@ -144,7 +183,7 @@ jobs:
             echo "zig_tests=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if git diff --quiet "$base" "${{ github.sha }}" -- \
+          if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
@@ -165,7 +204,7 @@ jobs:
             echo "e2e=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if git diff --quiet "$base" "${{ github.sha }}" -- \
+          if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
             scripts/test-backup-s3-integration.sh \
             zig/build.zig \
             ':(glob)zig/pkg/antfly/build/**' \
@@ -184,7 +223,7 @@ jobs:
             echo "backup_s3=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if git diff --quiet "$base" "${{ github.sha }}" -- \
+          if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/specs/tla/**' \
             ':(glob)scripts/tla-*.sh' \
             ':(glob)scripts/tla-*.py' \
@@ -196,7 +235,7 @@ jobs:
             echo "model_check=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if git diff --quiet "$base" "${{ github.sha }}" -- \
+          if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/specs/tla/**' \
             ':(glob)scripts/tla-*.sh' \
             ':(glob)scripts/tla-*.py' \
@@ -219,16 +258,25 @@ jobs:
           fi
 
   backup-s3-integration:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (needs.changes.outputs.backup_s3 == 'true' &&
+      vars.ENABLE_BACKUP_S3_INTEGRATION == 'true') }}
     name: backup-s3-integration
-    needs: changes
+    needs: [admission, changes]
     # Opt in explicitly to avoid GitHub-hosted runner charges while this
     # service-backed integration is temporarily disabled.
-    if: needs.changes.outputs.backup_s3 == 'true' && vars.ENABLE_BACKUP_S3_INTEGRATION == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
 
       - name: Load pinned toolchain policy
@@ -248,21 +296,26 @@ jobs:
         run: scripts/test-backup-s3-integration.sh
 
   arm64-codec:
-    name: ${{ (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') && 'zig-base / arm64-codec' || 'zig-full / arm64-codec' }}
-    needs: changes
-    if: |
-      (
-        (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') &&
-        (
-          needs.changes.outputs.zig_tests == 'true' ||
-          needs.changes.outputs.model_check == 'true' ||
-          needs.changes.outputs.trace_validate == 'true'
-        )
-      ) ||
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (( (inputs.pr_number != '' ||
+      github.event.schedule == '0 3 * * 0') &&
+      ( needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true' ) ) ||
       github.event_name == 'merge_group' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
-      github.event.schedule == '0 8 * * *'
+      (github.event_name == 'push' &&
+      github.ref == 'refs/heads/main') ||
+      ((inputs.pr_number == '' &&
+      github.event_name == 'workflow_dispatch') &&
+      inputs.validation_scope == 'all') ||
+      github.event.schedule == '0 8 * * *') }}
+    name: ${{ (inputs.pr_number != '' || github.event.schedule == '0 3 * * 0') && 'zig-base / arm64-codec' || 'zig-full / arm64-codec' }}
+    needs: [admission, changes]
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 20
     env:
@@ -270,6 +323,9 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
 
       - name: Load pinned toolchain policy
         id: toolchain
@@ -322,9 +378,19 @@ jobs:
           zig test zig/lib/hash/src/mod.zig -O ReleaseSafe -mcpu=baseline -lc
 
   zig-base-tests:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      ((inputs.pr_number != '' ||
+      github.event.schedule == '0 3 * * 0') &&
+      (needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true')) }}
     name: zig-base / x86_64
-    needs: changes
-    if: (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') && (needs.changes.outputs.zig_tests == 'true' || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true')
+    needs: [admission, changes]
     runs-on: arc-antfly-heavy
     # Keep the outer job timeout above the in-step hard watchdog so true hangs
     # produce the watchdog stack dump instead of an opaque GitHub cancellation.
@@ -339,6 +405,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           fetch-depth: 0
           submodules: true
 
@@ -659,9 +727,21 @@ jobs:
         run: scripts/ci/zig-tla-verify.sh
 
   zig-full-tests:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' &&
+      github.ref == 'refs/heads/main') ||
+      ((inputs.pr_number == '' &&
+      github.event_name == 'workflow_dispatch') &&
+      inputs.validation_scope == 'all') ||
+      github.event.schedule == '0 8 * * *') }}
     name: zig-full / x86_64
-    needs: changes
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') || github.event.schedule == '0 8 * * *'
+    needs: [admission, changes]
     runs-on: arc-antfly-heavy
     timeout-minutes: 120
     env:
@@ -672,6 +752,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
 
       - name: Load pinned toolchain policy
@@ -823,9 +905,21 @@ jobs:
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
   zig-build-cache-tests:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' &&
+      github.ref == 'refs/heads/main') ||
+      ((inputs.pr_number == '' &&
+      github.event_name == 'workflow_dispatch') &&
+      inputs.validation_scope == 'all') ||
+      github.event.schedule == '0 8 * * *') }}
     name: zig-full / build-cache
-    needs: changes
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') || github.event.schedule == '0 8 * * *'
+    needs: [admission, changes]
     runs-on: arc-antfly-heavy
     timeout-minutes: 60
     env:
@@ -835,6 +929,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
 
       - name: Load pinned toolchain policy
@@ -876,17 +972,20 @@ jobs:
           if-no-files-found: ignore
 
   zig-base:
+    if: >-
+      ${{ !cancelled() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (always() &&
+      (inputs.pr_number != '' ||
+      github.event.schedule == '0 3 * * 0') &&
+      ( needs.changes.result != 'success' ||
+      needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true' )) }}
     name: zig-base
-    needs: [changes, zig-base-tests, arm64-codec]
-    if: |
-      always() &&
-      (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') &&
-      (
-        needs.changes.result != 'success' ||
-        needs.changes.outputs.zig_tests == 'true' ||
-        needs.changes.outputs.model_check == 'true' ||
-        needs.changes.outputs.trace_validate == 'true'
-      )
+    needs: [admission, changes, zig-base-tests, arm64-codec]
     runs-on: arc-antfly-standard
     steps:
       - name: Verify zig-base shards
@@ -901,16 +1000,21 @@ jobs:
           test "$ARM64_CODEC_RESULT" = "success"
 
   zig-full:
+    if: >-
+      ${{ !cancelled() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (always() &&
+      ( github.event_name == 'merge_group' ||
+      (github.event_name == 'push' &&
+      github.ref == 'refs/heads/main') ||
+      ((inputs.pr_number == '' &&
+      github.event_name == 'workflow_dispatch') &&
+      inputs.validation_scope == 'all') ||
+      github.event.schedule == '0 8 * * *' )) }}
     name: zig-full
-    needs: [changes, zig-full-tests, zig-build-cache-tests, arm64-codec]
-    if: |
-      always() &&
-      (
-        github.event_name == 'merge_group' ||
-        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
-        github.event.schedule == '0 8 * * *'
-      )
+    needs: [admission, changes, zig-full-tests, zig-build-cache-tests, arm64-codec]
     runs-on: arc-antfly-standard
     steps:
       - name: Verify zig-full shards
@@ -927,9 +1031,16 @@ jobs:
           test "$ARM64_CODEC_RESULT" = "success"
 
   e2e-base-build:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (inputs.pr_number != '' &&
+      needs.changes.outputs.e2e == 'true') }}
     name: e2e-base / build
-    needs: changes
-    if: github.event_name == 'pull_request' && needs.changes.outputs.e2e == 'true'
+    needs: [admission, changes]
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
@@ -948,6 +1059,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
 
       - name: Load pinned toolchain policy
@@ -987,13 +1100,17 @@ jobs:
           retention-days: 1
 
   e2e-base-tests:
-    name: e2e-base / ${{ matrix.suite }}
-    needs: [changes, e2e-base-build]
-    if: |
-      always() &&
-      github.event_name == 'pull_request' &&
+    if: >-
+      ${{ !cancelled() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (always() &&
+      inputs.pr_number != '' &&
       needs.changes.outputs.e2e == 'true' &&
-      needs.e2e-base-build.result == 'success'
+      needs.e2e-base-build.result == 'success') }}
+    name: e2e-base / ${{ matrix.suite }}
+    needs: [admission, changes, e2e-base-build]
     runs-on: arc-antfly-heavy
     timeout-minutes: 45
     strategy:
@@ -1010,6 +1127,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
 
       - name: Load pinned toolchain policy
@@ -1120,12 +1239,16 @@ jobs:
           e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
 
   e2e-base:
+    if: >-
+      ${{ !cancelled() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (always() &&
+      inputs.pr_number != '' &&
+      needs.changes.outputs.e2e == 'true') }}
     name: e2e-base
-    needs: [changes, e2e-base-build, e2e-base-tests]
-    if: |
-      always() &&
-      github.event_name == 'pull_request' &&
-      needs.changes.outputs.e2e == 'true'
+    needs: [admission, changes, e2e-base-build, e2e-base-tests]
     runs-on: arc-antfly-standard
     steps:
       - name: Verify base E2E shards
@@ -1138,13 +1261,20 @@ jobs:
           test "$TEST_RESULT" = "success"
 
   e2e-full-build:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' &&
+      github.ref == 'refs/heads/main') ||
+      (inputs.pr_number == '' &&
+      github.event_name == 'workflow_dispatch') ||
+      github.event.schedule == '0 8 * * *') }}
     name: e2e-full / build
-    needs: changes
-    if: |
-      github.event_name == 'merge_group' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.schedule == '0 8 * * *'
+    needs: [admission, changes]
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
@@ -1160,6 +1290,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
 
       - name: Load pinned toolchain policy
@@ -1199,21 +1331,27 @@ jobs:
           retention-days: 1
 
   e2e-full-tests:
-    name: e2e-full / ${{ matrix.suite }}
-    needs: [changes, e2e-full-build]
-    if: |
-      always() &&
+    if: >-
+      ${{ !cancelled() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (always() &&
       needs.e2e-full-build.result == 'success' &&
       (github.event_name == 'merge_group' ||
-       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.schedule == '0 8 * * *')
+      (github.event_name == 'push' &&
+      github.ref == 'refs/heads/main') ||
+      (inputs.pr_number == '' &&
+      github.event_name == 'workflow_dispatch') ||
+      github.event.schedule == '0 8 * * *')) }}
+    name: e2e-full / ${{ matrix.suite }}
+    needs: [admission, changes, e2e-full-build]
     runs-on: arc-antfly-heavy
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
-        suite: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'inference-e2e' && '["inference"]' || '["inference","antfly"]') }}
+        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference"]' || '["inference","antfly"]') }}
     env:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
@@ -1221,6 +1359,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
 
       - name: Load pinned toolchain policy
@@ -1361,14 +1501,20 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
 
   e2e-full:
-    name: e2e-full
-    needs: [changes, e2e-full-build, e2e-full-tests]
-    if: |
-      always() &&
+    if: >-
+      ${{ !cancelled() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (always() &&
       (github.event_name == 'merge_group' ||
-       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.schedule == '0 8 * * *')
+      (github.event_name == 'push' &&
+      github.ref == 'refs/heads/main') ||
+      (inputs.pr_number == '' &&
+      github.event_name == 'workflow_dispatch') ||
+      github.event.schedule == '0 8 * * *')) }}
+    name: e2e-full
+    needs: [admission, changes, e2e-full-build, e2e-full-tests]
     runs-on: arc-antfly-standard
     steps:
       - name: Verify full E2E suites

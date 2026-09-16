@@ -1,7 +1,4 @@
-# Proxy CI for the Antfly proxy library module.
-
-name: Proxy Tests
-
+name: PR CI Policy Tests
 on:
   workflow_call:
     inputs:
@@ -20,26 +17,11 @@ on:
       comment_id:
         type: string
         default: ''
-  push:
-    branches: ["main"]
-    paths:
-      - "go/pkg/proxy/**"
-      - "scripts/ci/toolchain-policy.json"
-      - ".github/actions/load-toolchain-policy/action.yml"
-      - ".github/workflows/antfly-proxy-go.yml"
-  workflow_dispatch:
 
 permissions:
   contents: read
   checks: read
   pull-requests: read
-
-concurrency:
-  group: proxy-${{ inputs.pr_number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   admission:
@@ -50,9 +32,9 @@ jobs:
       base_sha: ${{ inputs.base_sha }}
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
-      suite: proxy
+      suite: policy
 
-  proxies:
+  test:
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -60,23 +42,14 @@ jobs:
       (inputs.pr_number == '' ||
       github.run_attempt == 1) }}
     needs: admission
-    runs-on: arc-antfly-standard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-          submodules: true
-
-      - name: Load pinned toolchain policy
-        id: toolchain
-        uses: ./.github/actions/load-toolchain-policy
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          go-version: ${{ steps.toolchain.outputs.go_version }}
-          cache: false
-
-      - name: Test proxies
-        run: cd go/pkg/proxy && GOWORK=off go test ./...
+          node-version: 24
+      - run: node --test .github/scripts/pr-ci.test.cjs
