@@ -850,6 +850,9 @@ pub const AntflyApiHandler = struct {
         if (!policy.failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
         const mutation = classifyHaMutation(ctx.request.method, path) orelse return null;
+        if (policy.catalog_create_enabled and policy.remote_apply_mutations_enabled and
+            mutation.surface == .table_catalog and ctx.request.method == .POST)
+            return null;
         if (mutation.disposition != .reject and
             (mutation.disposition != .remote_apply or policy.remote_apply_mutations_enabled))
         {
@@ -5302,6 +5305,7 @@ pub const AntflyApiHandler = struct {
         while (true) {
             metadata_drop_attempts += 1;
             drop_result = self.api_server.source.dropTableExact(alloc, decoded_table_name) catch |err| switch (err) {
+                error.VectorMigrationActive => return textResponse(ctx, 409, "table storage migration is active"),
                 error.TableNotFound => {
                     _ = ctx.status(404);
                     return ctx.text("not found");
@@ -5991,6 +5995,44 @@ pub const AntflyApiHandler = struct {
 
     pub fn listArtifactRepairIssues(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         return try self.listTableRepairIssues(ctx, table_name);
+    }
+
+    pub fn createTableStorageMigration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.storageMigrationResponse(ctx, table_name, null, false);
+    }
+
+    pub fn getTableStorageMigration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
+        return self.storageMigrationResponse(ctx, table_name, job_id, true);
+    }
+
+    pub fn advanceTableStorageMigration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response {
+        return self.storageMigrationResponse(ctx, table_name, job_id, false);
+    }
+
+    fn storageMigrationResponse(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, job_path: ?[]const u8, observe: bool) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*owned| owned.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return textResponse(ctx, 400, "invalid table name");
+        defer ctx.allocator.free(name);
+        const job = if (job_path) |path| (try decodePathParamOrBadRequest(ctx, path)) orelse return textResponse(ctx, 400, "invalid job ID") else null;
+        defer if (job) |id| ctx.allocator.free(id);
+        const body = if (observe) "" else (try ctx.body()) orelse return textResponse(ctx, 400, "missing migration command");
+        const result = (if (job) |id|
+            if (observe) self.api_server.getStorageMigration(name, id) else self.api_server.advanceStorageMigration(name, id, body)
+        else
+            self.api_server.createStorageMigration(name, body)) catch |err| {
+            const code: u16 = switch (err) {
+                error.TableNotFound, error.NotFound, error.VectorMigrationNotFound => 404,
+                error.VectorMigrationIdempotencyConflict, error.VectorMigrationAlreadyExists, error.VectorMigrationAlreadyPublished, error.VectorMigrationNotReady, error.VectorMigrationActive, error.VectorMigrationConfigurationChanged, error.TableGenerationChanged => 409,
+                error.VectorMigrationRecoveryRequired, error.VectorMigrationDiskReserve, error.VectorMigrationTemporaryBudgetExceeded, error.ResourceBudgetExceeded, error.StorageBusy, error.GenerationTransitionActive => 503,
+                error.InvalidVectorMigrationId, error.InvalidVectorMigrationBudget, error.VectorMigrationRowExceedsBudget, error.VectorStoreLifecycleUnsupported, error.VectorStoreRequiresLocalSingleShardTable, error.VectorStoreRequiresOfflineCommand, error.UnsupportedOperation, error.SyntaxError, error.UnexpectedToken, error.UnknownField, error.MissingField, error.InvalidEnumTag => 400,
+                else => 500,
+            };
+            return textResponse(ctx, code, @errorName(err));
+        };
+        defer self.api_server.alloc.free(result);
+        return jsonResponse(ctx, 200, result);
     }
 
     pub fn runTableRepair(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {

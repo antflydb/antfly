@@ -800,6 +800,40 @@ pub const ExclusiveTransition = struct {
         _ = try reconcilePublishedGenerationExclusive(self.alloc, io_impl.io(), self.path, self.cleanup_scheduler);
     }
 
+    /// Stable, explicitly retained candidate for resumable offline conversion.
+    /// The caller validates its durable job before opening any existing stage.
+    pub fn resumeStaging(self: *ExclusiveTransition, job_id: []const u8) !StagedGeneration {
+        try self.validate(self.path);
+        try (@import("../../common/vector_migration.zig").Request{ .job_id = job_id, .mode = .offline }).validate();
+        const io = self.io orelse return error.MissingBackendRuntimeIo;
+        try self.reconcilePublished();
+        const live = try self.alloc.dupe(u8, self.path);
+        errdefer self.alloc.free(live);
+        const live_z = try self.alloc.dupeZ(u8, self.path);
+        errdefer self.alloc.free(live_z);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(job_id, &digest, .{});
+        const stage = try std.fmt.allocPrint(self.alloc, "{s}.restore-stage-{x}-{x}", .{
+            self.path, std.mem.readInt(u64, digest[0..8], .little), std.mem.readInt(u64, digest[8..16], .little),
+        });
+        errdefer self.alloc.free(stage);
+        const stage_z = try self.alloc.dupeZ(u8, stage);
+        errdefer self.alloc.free(stage_z);
+        try fs_paths.createDirPathPortable(io, stage);
+        return .{
+            .alloc = self.alloc,
+            .manager = self.manager,
+            .transition_id = self.id,
+            .live_path = live,
+            .live_path_z = live_z,
+            .staging_path = stage,
+            .staging_path_z = stage_z,
+            .cleanup_scheduler = self.cleanup_scheduler,
+            .io = io,
+            .preserve_unpublished = true,
+        };
+    }
+
     pub fn beginStaging(self: *ExclusiveTransition) !StagedGeneration {
         try self.validate(self.path);
         return try beginStagingGeneration(self.alloc, self.manager, self.path, self.id, self.cleanup_scheduler, self.io, true);
@@ -899,6 +933,7 @@ pub const StagedGeneration = struct {
     publication_outcome: ?PublicationOutcome = null,
     sealed: bool = false,
     preserve_retired: bool = false,
+    preserve_unpublished: bool = false,
     cleanup_scheduler: ?CleanupScheduler = null,
     /// Runtime-owned I/O carried by runtime-backed transitions. Legacy direct
     /// callers leave this null and retain the historical local-I/O fallback.
@@ -1131,7 +1166,7 @@ pub const StagedGeneration = struct {
         }
         if (self.published) {
             if (!self.preserve_retired) std.Io.Dir.cwd().deleteTree(io, self.staging_path) catch {};
-        } else {
+        } else if (!self.preserve_unpublished) {
             std.Io.Dir.cwd().deleteTree(io, self.staging_path) catch {};
         }
         self.alloc.free(self.staging_path);

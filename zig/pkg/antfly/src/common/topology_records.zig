@@ -12,6 +12,7 @@ const std = @import("std");
 
 pub const TableRecord = struct {
     storage: @import("table_storage.zig").Settings = .{},
+    storage_migration: ?@import("vector_migration.zig").Admission = null,
     table_id: u64,
     name: []const u8,
     description: []const u8 = "",

@@ -100,6 +100,9 @@ pub const ClientConfig = struct {
     default_headers: ?[]const [2][]const u8 = null,
     user_agent: []const u8 = meta.default_user_agent,
     max_response_size: usize = types.default_max_body_size,
+    /// Optional body ceiling for 4xx/5xx responses, independent of the request
+    /// ceiling but still bounded by max_response_size.
+    max_error_response_size: ?usize = null,
     max_response_headers: usize = 256,
     /// Default request lifetime for adapters whose provider interface does not
     /// expose per-call HTTP options. An explicit RequestOptions cancellation
@@ -164,8 +167,8 @@ pub const RequestOptions = struct {
     json: ?[]const u8 = null,
     timeout_ms: ?u64 = null,
     follow_redirects: ?bool = null,
-    /// Per-request response ceiling. This may lower, but never raise, the
-    /// client-wide maximum.
+    /// Per-request response ceiling, unless max_error_response_size applies.
+    /// This may lower, but never raise, the client-wide maximum.
     max_response_size: ?usize = null,
     /// Override ambient cookie persistence for this request. Credentialed API
     /// clients should set this false even when borrowing a general client.
@@ -639,6 +642,7 @@ const TlsSessionIoReader = struct {
     inner: *TlsSession,
     max_read: usize,
     reader_iface: Io.Reader,
+    read_error: ?TlsSession.ReadError = null,
     const max_empty_reads: usize = 5000;
 
     fn init(inner: *TlsSession, max_read: usize, buffer: []u8) TlsSessionIoReader {
@@ -658,6 +662,10 @@ const TlsSessionIoReader = struct {
         return @fieldParentPtr("reader_iface", r);
     }
 
+    fn checkReadError(self: *const TlsSessionIoReader) TlsSession.ReadError!void {
+        if (self.read_error) |err| return err;
+    }
+
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
         const p = parent(r);
         var iovecs_buffer: [8][]u8 = undefined;
@@ -669,7 +677,11 @@ const TlsSessionIoReader = struct {
         var empty_read_policy = EmptyReadPolicy.init(max_empty_reads);
 
         while (true) {
-            const n = p.inner.read(read_buf) catch return error.ReadFailed;
+            p.read_error = null;
+            const n = p.inner.read(read_buf) catch |err| {
+                p.read_error = err;
+                return error.ReadFailed;
+            };
 
             switch (empty_read_policy.observe(n)) {
                 .done => {
@@ -1765,6 +1777,14 @@ pub const Client = struct {
         return @min(req.max_response_size orelse self.config.max_response_size, self.config.max_response_size);
     }
 
+    fn responseSizeLimitForStatus(self: *const Self, success_limit: usize, status: u16) usize {
+        if (status >= 400 and status < 600) {
+            if (self.config.max_error_response_size) |limit|
+                return @min(limit, self.config.max_response_size);
+        }
+        return success_limit;
+    }
+
     fn checkedResponseSize(current: usize, incoming: usize, limit: usize) !usize {
         if (current > limit or incoming > limit - current)
             return error.ResponseTooLarge;
@@ -1777,6 +1797,10 @@ pub const Client = struct {
 
     fn configureH2ResponseStream(self: *const Self, stream: *Stream, req: *const Request) void {
         stream.max_data_size = self.responseSizeLimit(req);
+        stream.max_error_data_size = if (self.config.max_error_response_size) |limit|
+            @min(limit, self.config.max_response_size)
+        else
+            null;
     }
 
     /// Allocates and publishes a locally initiated stream while holding the
@@ -2154,7 +2178,12 @@ pub const Client = struct {
 
         // --- Phase 2: Create connection without lock (blocking I/O) ---
         const entry = try self.allocator.create(H2PoolEntry);
-        entry.recv_running = false;
+        entry.* = .{
+            .socket = undefined,
+            .session = undefined,
+            .h2 = undefined,
+            .is_tls = is_tls,
+        };
         errdefer self.allocator.destroy(entry);
 
         entry.socket = try self.connectHost(host, port, null);
@@ -2582,7 +2611,8 @@ pub const Client = struct {
             }
 
             if (s.data_buf.items.len > 0) {
-                if (s.data_buf.items.len > self.responseSizeLimit(req)) return error.ResponseTooLarge;
+                const limit = self.responseSizeLimitForStatus(self.responseSizeLimit(req), status_code orelse return error.InvalidResponse);
+                if (s.data_buf.items.len > limit) return error.ResponseTooLarge;
                 response_body = try self.allocator.dupe(u8, s.data_buf.items);
             }
         }
@@ -2940,12 +2970,7 @@ pub const Client = struct {
                 }
 
                 if (leftover >= buf.len) return error.InvalidResponse;
-                const n = recvFrom(source, buf[leftover..]) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) {
-                        if (err == error.ReadFailed) continue;
-                    }
-                    return err;
-                };
+                const n = try recvFrom(source, buf[leftover..]);
                 if (n == 0) break;
                 // This phase parses response headers into a fixed stack buffer.
                 // The caller-specific body ceiling is enforced by the streaming
@@ -3011,12 +3036,7 @@ pub const Client = struct {
                 }
 
                 if (leftover >= buf.len) return error.InvalidResponse;
-                const n = recvFrom(source, buf[leftover..]) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) {
-                        if (err == error.ReadFailed) continue;
-                    }
-                    return err;
-                };
+                const n = try recvFrom(source, buf[leftover..]);
                 if (n == 0) break;
                 const total = leftover + n;
                 const consumed = try parser.feed(buf[0..total]);
@@ -3065,7 +3085,7 @@ pub const Client = struct {
         } else if (Source == *TlsSession) {
             var empty_read_policy = EmptyReadPolicy.init(TlsSessionIoReader.max_empty_reads);
             while (true) {
-                const n = source.read(buf) catch return error.ReadFailed;
+                const n = try source.read(buf);
                 switch (empty_read_policy.observe(n)) {
                     .done => return n,
                     .retry => sleepAfterEmptyRead(source.io),
@@ -3178,9 +3198,13 @@ pub const Client = struct {
         source: anytype,
         leftover: []const u8,
         req_method: types.Method,
-        max_response_size: usize,
+        success_response_size: usize,
     ) !Response {
         const code = parser.status_code orelse return error.InvalidResponse;
+        const max_response_size = if (parser.status_code_is_three_digits)
+            self.responseSizeLimitForStatus(success_response_size, code)
+        else
+            success_response_size;
         var res = takeParsedResponse(parser, code);
         errdefer res.deinit();
 
@@ -3251,6 +3275,7 @@ pub const Client = struct {
 
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
+                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3278,6 +3303,7 @@ pub const Client = struct {
         } else {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
+                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3303,17 +3329,21 @@ pub const Client = struct {
     }
 
     fn writeStreamingResponse(
-        _: *Self,
+        self: *Self,
         parser: *Parser,
         source: anytype,
         leftover: []const u8,
         req_method: types.Method,
-        max_response_size: usize,
+        success_response_size: usize,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
     ) !Response {
         const code = parser.status_code orelse return error.InvalidResponse;
+        const max_response_size = if (parser.status_code_is_three_digits)
+            self.responseSizeLimitForStatus(success_response_size, code)
+        else
+            success_response_size;
         var res = takeParsedResponse(parser, code);
         errdefer res.deinit();
 
@@ -3364,6 +3394,7 @@ pub const Client = struct {
         if (is_redirect) {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
+                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3380,6 +3411,7 @@ pub const Client = struct {
             var encoded_prefix_len: usize = 0;
             while (encoded_prefix_len < encoded_prefix.len) {
                 const n = readSomeOnce(framed_reader, encoded_prefix[encoded_prefix_len..]) catch |err| {
+                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3400,6 +3432,7 @@ pub const Client = struct {
                 defer encoded.deinit(parser.allocator);
                 while (true) {
                     const n = readSomeOnce(&encoded_reader.reader_iface, &read_buf) catch |err| {
+                        if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                         if (err == error.EndOfStream) break;
                         if (err == error.ReadFailed and close_delimited_body) break;
                         return error.InvalidResponse;
@@ -3437,6 +3470,7 @@ pub const Client = struct {
 
                 while (true) {
                     const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                        if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                         if (err == error.EndOfStream) break;
                         if (err == error.ReadFailed and close_delimited_body) break;
                         return error.DecompressionFailed;
@@ -3458,6 +3492,7 @@ pub const Client = struct {
         } else {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
+                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -5603,4 +5638,280 @@ test "request watchdog reports parent task cancellation as stopped" {
     var future = io.async(Task.watch, .{ &stop, &started });
     while (!started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
     try std.testing.expectEqual(RequestWatchdogOutcome.stopped, try future.cancel(io));
+}
+
+test "error envelopes preserve success ceilings and the client hard ceiling" {
+    var client = Client.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .max_response_size = 1024,
+        .max_error_response_size = 4096,
+    });
+    defer client.deinit();
+    for ([_]u16{ 200, 206, 301 }) |status|
+        try std.testing.expectEqual(@as(usize, 256), client.responseSizeLimitForStatus(256, status));
+    for ([_]u16{ 400, 404, 503 }) |status|
+        try std.testing.expectEqual(@as(usize, 1024), client.responseSizeLimitForStatus(256, status));
+    var request = try Request.init(std.testing.allocator, .GET, "http://example.test/");
+    defer request.deinit();
+    request.max_response_size = 256;
+    var stream = Stream.init(1);
+    client.configureH2ResponseStream(&stream, &request);
+    try std.testing.expectEqual(@as(?usize, 256), stream.max_data_size);
+    try std.testing.expectEqual(@as(?usize, 1024), stream.max_error_data_size);
+    client.config.max_error_response_size = null;
+    try std.testing.expectEqual(@as(usize, 256), client.responseSizeLimitForStatus(256, 404));
+    client.configureH2ResponseStream(&stream, &request);
+    try std.testing.expectEqual(@as(?usize, 256), stream.max_data_size);
+    try std.testing.expectEqual(@as(?usize, null), stream.max_error_data_size);
+    for ([_]usize{ 0, 128 }) |error_limit| {
+        client.config.max_error_response_size = error_limit;
+        try std.testing.expectEqual(error_limit, client.responseSizeLimitForStatus(256, 404));
+        try std.testing.expectEqual(@as(usize, 256), client.responseSizeLimitForStatus(256, 200));
+        client.configureH2ResponseStream(&stream, &request);
+        try std.testing.expectEqual(@as(?usize, 256), stream.max_data_size);
+        try std.testing.expectEqual(@as(?usize, error_limit), stream.max_error_data_size);
+    }
+}
+
+test "H1 error envelopes use actual status for buffered and writer responses" {
+    const allocator = std.testing.allocator;
+    var client = Client.initWithConfig(allocator, std.testing.io, .{ .max_error_response_size = 4096 });
+    defer client.deinit();
+    var session = TlsSession.init(TlsConfig.insecure(allocator), std.testing.io);
+    defer session.deinit();
+    const Case = struct {
+        status: u16,
+        body_bytes: usize,
+        accepted: bool,
+        error_limit: ?usize = 4096,
+        raw_status: ?[]const u8 = null,
+    };
+    const cases = [_]Case{
+        .{ .status = 404, .body_bytes = 352, .accepted = true },
+        .{ .status = 404, .body_bytes = 4097, .accepted = false },
+        .{ .status = 200, .body_bytes = 257, .accepted = false },
+        .{ .status = 206, .body_bytes = 257, .accepted = false },
+        .{ .status = 206, .body_bytes = 256, .accepted = true },
+        .{ .status = 404, .body_bytes = 256, .accepted = true, .error_limit = null },
+        .{ .status = 404, .body_bytes = 257, .accepted = false, .error_limit = null },
+        .{ .status = 404, .body_bytes = 1, .accepted = false, .error_limit = 0 },
+        .{ .status = 404, .body_bytes = 128, .accepted = true, .error_limit = 128 },
+        .{ .status = 404, .body_bytes = 129, .accepted = false, .error_limit = 128 },
+        .{ .status = 404, .body_bytes = 257, .accepted = false, .raw_status = "0404" },
+        .{ .status = 404, .body_bytes = 257, .accepted = false, .raw_status = "+404" },
+        .{ .status = 404, .body_bytes = 257, .accepted = false, .raw_status = "4_04" },
+    };
+    const payload = [_]u8{'e'} ** 4097;
+    for (cases) |case| {
+        client.config.max_error_response_size = case.error_limit;
+        for ([_]bool{ false, true }) |to_writer| {
+            var parser = Parser.initResponse(allocator);
+            defer parser.deinit();
+            parser.headers_only = true;
+            const head = if (case.raw_status) |status|
+                try std.fmt.allocPrint(allocator, "HTTP/1.1 {s} Response\r\nContent-Length: {d}\r\n\r\n", .{ status, case.body_bytes })
+            else
+                try std.fmt.allocPrint(allocator, "HTTP/1.1 {d} Response\r\nContent-Length: {d}\r\n\r\n", .{ case.status, case.body_bytes });
+            defer allocator.free(head);
+            _ = try parser.feed(head);
+            try std.testing.expectEqual(case.raw_status == null, parser.status_code_is_three_digits);
+            var output = std.ArrayListUnmanaged(u8).empty;
+            defer output.deinit(allocator);
+            const result = if (to_writer)
+                client.writeStreamingResponse(&parser, &session, payload[0..case.body_bytes], .GET, 256, arrayListWriter(&output, allocator), null, null)
+            else
+                client.buildStreamingResponse(&parser, &session, payload[0..case.body_bytes], .GET, 256);
+            if (case.accepted) {
+                var response = try result;
+                defer response.deinit();
+                try std.testing.expectEqual(case.body_bytes, if (to_writer) output.items.len else response.body.?.len);
+            } else {
+                try std.testing.expectError(error.ResponseTooLarge, result);
+                try std.testing.expectEqual(@as(usize, 0), output.items.len);
+            }
+        }
+    }
+}
+
+test "error envelope writer preserves upstream response start ordering" {
+    const Writer = struct {
+        starts: usize = 0,
+        writes: usize = 0,
+        bytes: usize = 0,
+        status: u16 = 0,
+        content_length: ?u64 = null,
+        reject: bool = false,
+
+        pub fn startResponse(self: *@This(), response: Response) !void {
+            try std.testing.expectEqual(@as(usize, 0), self.starts);
+            try std.testing.expectEqual(@as(usize, 0), self.writes);
+            self.starts += 1;
+            self.status = response.status.code;
+            self.content_length = response.contentLength();
+            if (self.reject) return error.FixtureResponseRejected;
+        }
+
+        pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+            try std.testing.expectEqual(@as(usize, 1), self.starts);
+            self.writes += 1;
+            self.bytes += bytes.len;
+        }
+    };
+    const Case = struct {
+        code: u16,
+        method: types.Method = .GET,
+        bytes: usize,
+        expected_bytes: usize,
+        expected_error: ?anyerror = null,
+        reject: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .code = 404, .bytes = 352, .expected_bytes = 352 },
+        .{ .code = 200, .bytes = 256, .expected_bytes = 256 },
+        .{ .code = 200, .bytes = 257, .expected_bytes = 0, .expected_error = error.ResponseTooLarge },
+        .{ .code = 404, .bytes = 4097, .expected_bytes = 0, .expected_error = error.ResponseTooLarge },
+        .{ .code = 404, .method = .HEAD, .bytes = 352, .expected_bytes = 0 },
+        .{ .code = 204, .bytes = 0, .expected_bytes = 0 },
+        .{ .code = 302, .bytes = 1, .expected_bytes = 0 },
+        .{ .code = 404, .bytes = 352, .expected_bytes = 0, .expected_error = error.FixtureResponseRejected, .reject = true },
+    };
+    const allocator = std.testing.allocator;
+    var client = Client.initWithConfig(allocator, std.testing.io, .{ .max_error_response_size = 4096 });
+    defer client.deinit();
+    var session = TlsSession.init(TlsConfig.insecure(allocator), std.testing.io);
+    defer session.deinit();
+    const payload = [_]u8{'e'} ** 4097;
+    for (cases) |case| {
+        var writer: Writer = .{ .reject = case.reject };
+        var parser = Parser.initResponse(allocator);
+        defer parser.deinit();
+        parser.headers_only = true;
+        const head = try std.fmt.allocPrint(allocator, "HTTP/1.1 {d} Response\r\nContent-Length: {d}\r\n\r\n", .{ case.code, case.bytes });
+        defer allocator.free(head);
+        _ = try parser.feed(head);
+        try std.testing.expect(parser.isComplete());
+        const result = client.writeStreamingResponse(&parser, &session, payload[0..case.bytes], case.method, 256, &writer, null, null);
+        defer if (result) |response| {
+            var owned = response;
+            owned.deinit();
+        } else |_| {};
+        if (case.expected_error) |expected| {
+            try std.testing.expectError(expected, result);
+        } else {
+            _ = try result;
+        }
+        const redirect = case.code >= 300 and case.code < 400;
+        try std.testing.expectEqual(@as(usize, if (redirect) 0 else 1), writer.starts);
+        if (!redirect) {
+            try std.testing.expectEqual(case.code, writer.status);
+            try std.testing.expectEqual(@as(?u64, @intCast(case.bytes)), writer.content_length);
+        }
+        try std.testing.expectEqual(case.expected_bytes, writer.bytes);
+        if (case.expected_bytes == 0) try std.testing.expectEqual(@as(usize, 0), writer.writes);
+    }
+}
+
+test "residual TLS buffered header failure terminates" {
+    var client = Client.initWithConfig(std.testing.allocator, std.testing.io, .{});
+    defer client.deinit();
+    var session = TlsSession.init(TlsConfig.insecure(std.testing.allocator), std.testing.io);
+    defer session.deinit();
+    std.debug.print("RESIDUAL_RED TLS header buffered expects terminal error\n", .{});
+    try std.testing.expectError(error.TlsTransportReadFailed, client.readResponse(&session, .PUT, 1024));
+}
+
+test "residual TLS writer header failure terminates" {
+    var client = Client.initWithConfig(std.testing.allocator, std.testing.io, .{});
+    defer client.deinit();
+    var session = TlsSession.init(TlsConfig.insecure(std.testing.allocator), std.testing.io);
+    defer session.deinit();
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(std.testing.allocator);
+    std.debug.print("RESIDUAL_RED TLS header writer expects terminal error\n", .{});
+    try std.testing.expectError(error.TlsTransportReadFailed, client.readResponseToWriter(&session, .PUT, 1024, arrayListWriter(&output, std.testing.allocator), null, null));
+    try std.testing.expectEqual(@as(usize, 0), output.items.len);
+}
+
+const ResidualTlsBodyTest = struct {
+    fn run(comptime framing: []const u8, comptime to_writer: bool, head: []const u8) !void {
+        const allocator = std.testing.allocator;
+        var client = Client.initWithConfig(allocator, std.testing.io, .{});
+        defer client.deinit();
+        var session = TlsSession.init(TlsConfig.insecure(allocator), std.testing.io);
+        defer session.deinit();
+        var parser = Parser.initResponse(allocator);
+        defer parser.deinit();
+        parser.headers_only = true;
+        _ = try parser.feed(head);
+        try std.testing.expect(parser.isComplete());
+        std.debug.print("RESIDUAL_RED TLS body framing={s} writer={} expects terminal error\n", .{ framing, to_writer });
+        if (to_writer) {
+            var output = std.ArrayListUnmanaged(u8).empty;
+            defer output.deinit(allocator);
+            const result = client.writeStreamingResponse(&parser, &session, "", .PUT, 1024, arrayListWriter(&output, allocator), null, null);
+            if (result) |response| {
+                var owned = response;
+                owned.deinit();
+                return error.ExpectedTerminalTlsFailure;
+            } else |_| {}
+            try std.testing.expectError(error.TlsTransportReadFailed, result);
+        } else {
+            const result = client.buildStreamingResponse(&parser, &session, "", .PUT, 1024);
+            if (result) |response| {
+                var owned = response;
+                owned.deinit();
+                return error.ExpectedTerminalTlsFailure;
+            } else |_| {}
+            try std.testing.expectError(error.TlsTransportReadFailed, result);
+        }
+    }
+};
+
+test "residual TLS content-length buffered preserves error" {
+    try ResidualTlsBodyTest.run("content-length", false, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n");
+}
+
+test "residual TLS content-length writer preserves error" {
+    try ResidualTlsBodyTest.run("content-length", true, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n");
+}
+
+test "residual TLS chunked buffered preserves error" {
+    try ResidualTlsBodyTest.run("chunked", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+}
+
+test "residual TLS chunked writer preserves error" {
+    try ResidualTlsBodyTest.run("chunked", true, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+}
+
+test "residual TLS gzip buffered preserves error" {
+    try ResidualTlsBodyTest.run("gzip", false, "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nContent-Encoding: gzip\r\n\r\n");
+}
+
+test "residual TLS gzip writer preserves error" {
+    try ResidualTlsBodyTest.run("gzip", true, "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nContent-Encoding: gzip\r\n\r\n");
+}
+
+test "residual TLS deflate buffered preserves error" {
+    try ResidualTlsBodyTest.run("deflate", false, "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nContent-Encoding: deflate\r\n\r\n");
+}
+
+test "residual TLS deflate writer preserves error" {
+    try ResidualTlsBodyTest.run("deflate", true, "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nContent-Encoding: deflate\r\n\r\n");
+}
+
+test "residual TLS close-delimited buffered preserves error" {
+    try ResidualTlsBodyTest.run("close-delimited", false, "HTTP/1.1 200 OK\r\n\r\n");
+}
+
+test "residual TLS close-delimited writer preserves error" {
+    try ResidualTlsBodyTest.run("close-delimited", true, "HTTP/1.1 200 OK\r\n\r\n");
+}
+
+test "residual terminal TLS errors remain outside PUT retry aliases" {
+    try std.testing.expect(types.Method.PUT.isIdempotent());
+    try std.testing.expect((types.RetryPolicy{}).retry_on_connection_error);
+    try std.testing.expect((types.RetryPolicy{}).max_retries > 0);
+    inline for (.{ error.Timeout, error.Canceled, error.Cancelled, error.TlsTransportReadFailed, error.TlsAlert, error.TlsBadLength, error.TlsBadRecordMac, error.TlsConnectionTruncated, error.TlsDecodeError, error.TlsRecordOverflow, error.TlsUnexpectedMessage, error.TlsIllegalParameter, error.TlsSequenceOverflow }) |err| {
+        try std.testing.expect(!isRetryableTransportError(err));
+        try std.testing.expect(!isSafeUnsentRetryError(err));
+    }
 }

@@ -94,10 +94,13 @@ pub fn validate(
     expected_generation: []const u8,
     topology: Topology,
 ) !void {
+    // A new standalone instance has a durable catalog epoch but no tables,
+    // ranges, or replicas yet. Preserve that empty catalog in the seed;
+    // catalog mutation support is a separate replication capability.
     if (topology.format_version != topology_format_version or
         !std.mem.eql(u8, topology.generation, expected_generation) or
-        topology.catalog.epoch == 0 or topology.catalog.tables.len == 0 or
-        topology.catalog.ranges.len == 0 or
+        topology.catalog.epoch == 0 or
+        (topology.catalog.tables.len == 0) != (topology.catalog.ranges.len == 0) or
         topology.replicas.len != topology.catalog.ranges.len) return error.InvalidSeedTopology;
 
     for (topology.catalog.tables, 0..) |table, index| {
@@ -328,4 +331,34 @@ fn encodeHex(out: []u8, bytes: []const u8) void {
 
 fn readFileAlloc(io: std.Io, alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));
+}
+
+test "empty standalone seed retains epoch and rejects incomplete topology" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const empty = Topology{
+        .generation = "empty-1",
+        .catalog = .{ .epoch = 1, .tables = &.{}, .ranges = &.{} },
+        .replicas = &.{},
+    };
+    try validate(alloc, io, ".", "empty-1", empty);
+
+    var invalid = empty;
+    invalid.catalog.epoch = 0;
+    try std.testing.expectError(error.InvalidSeedTopology, validate(alloc, io, ".", "empty-1", invalid));
+    try std.testing.expectError(error.InvalidSeedTopology, validate(alloc, io, ".", "other-generation", empty));
+
+    invalid = empty;
+    invalid.catalog.tables = &.{undefined};
+    try std.testing.expectError(error.InvalidSeedTopology, validate(alloc, io, ".", "empty-1", invalid));
+    invalid = empty;
+    invalid.catalog.ranges = &.{undefined};
+    try std.testing.expectError(error.InvalidSeedTopology, validate(alloc, io, ".", "empty-1", invalid));
+    invalid = empty;
+    invalid.replicas = &.{undefined};
+    try std.testing.expectError(error.InvalidSeedTopology, validate(alloc, io, ".", "empty-1", invalid));
+
+    invalid = empty;
+    invalid.auth_enabled = true;
+    try std.testing.expectError(error.AuthSeedTopologyMismatch, validate(alloc, io, ".", "empty-1", invalid));
 }

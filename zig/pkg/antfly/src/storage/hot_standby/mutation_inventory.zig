@@ -51,6 +51,7 @@ pub const Surface = enum {
     table_restore,
     transaction_session,
     artifact_repair,
+    storage_migration,
     artifact_reprocess,
     backup,
     read_like_post,
@@ -96,7 +97,7 @@ pub const entries = [_]Entry{
     .{ .surface = .auth_row_filter, .disposition = .reject, .path_pattern = "/auth/v1/{users|subjects}/{subject}/row-filters/{table}", .methods = put_delete, .reason = "authorization filters are not continuously replicated" },
     .{ .surface = .auth_api_key, .disposition = .reject, .path_pattern = "/auth/v1/users/{user}/api-keys[/{key}]", .methods = post_delete, .reason = "API key creation and revocation are not continuously replicated" },
     .{ .surface = .secret, .disposition = .reject, .path_pattern = "/secrets/{key}", .methods = put_delete, .reason = "the node-local secret store is not part of the HA seed or continuous stream" },
-    .{ .surface = .table_catalog, .disposition = .reject, .path_pattern = "/tables/{table}", .methods = post_delete, .reason = "standalone catalog topology is not continuously replicated" },
+    .{ .surface = .table_catalog, .disposition = .reject, .path_pattern = "/tables/{table}", .methods = post_delete, .reason = "table-scoped streams reject catalog changes; whole-instance catalog replication admits table creation only" },
     .{ .surface = .table_schema, .disposition = .reject, .path_pattern = "/tables/{table}/schema", .methods = &.{.PUT}, .reason = "schema catalog generations are not continuously replicated" },
     .{ .surface = .table_index, .disposition = .reject, .path_pattern = "/tables/{table}/indexes/{index}", .methods = post_delete, .reason = "index definitions live in the non-replicated standalone catalog" },
     .{ .surface = .artifact_enrichment, .disposition = .reject, .path_pattern = "/tables/{table}/artifacts/{artifact}/enrichment", .methods = put_delete, .reason = "enrichment definitions live in the non-replicated standalone catalog" },
@@ -104,6 +105,8 @@ pub const entries = [_]Entry{
     .{ .surface = .cluster_restore, .disposition = .reject, .path_pattern = "/restore", .methods = post, .reason = "restore activation replaces local generation state outside the continuous stream" },
     .{ .surface = .table_restore, .disposition = .reject, .path_pattern = "/tables/{table}/restore", .methods = post, .reason = "table restore mutates both catalog and data outside one RemoteApply acknowledgement" },
     .{ .surface = .transaction_session, .disposition = .reject, .path_pattern = "/transactions[/... mutating operation]", .methods = post_put_delete, .reason = "durable transaction session state and savepoints are primary-local" },
+    .{ .surface = .storage_migration, .disposition = .reject, .path_pattern = "/tables/{table}/storage/migrations", .methods = post_delete, .reason = "source ownership migration is qualified only for unreplicated local tables" },
+    .{ .surface = .storage_migration, .disposition = .reject, .path_pattern = "/tables/{table}/storage/migrations/{job}", .methods = post_delete, .reason = "source ownership migration is qualified only for unreplicated local tables" },
     .{ .surface = .artifact_repair, .disposition = .reject, .path_pattern = "/tables/{table}/repair/{run|control-jobs|jobs/...}", .methods = post_delete, .reason = "repair job checkpoints and direct repair effects do not share one replicated acknowledgement" },
     .{ .surface = .artifact_reprocess, .disposition = .reject, .path_pattern = "/tables/{table}/.../reprocess[-jobs]", .methods = post_delete, .reason = "reprocess job checkpoints and derived effects do not share one replicated acknowledgement" },
     .{ .surface = .backup, .disposition = .reject, .path_pattern = "/backup | /tables/{table}/backup", .methods = post, .reason = "backup publication has an external side effect but no final HA authority recheck spanning snapshot and manifest publication" },
@@ -189,6 +192,7 @@ pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
         std.mem.startsWith(u8, path, routes.Routes.transactions_prefix))
         return rejected(.transaction_session);
 
+    if (routes.Routes.matchTableStorageMigration(path) != null or routes.Routes.matchTableStorageMigrationJob(path) != null) return rejected(.storage_migration);
     if (routes.Routes.matchTableArtifactRepairRun(path) != null or
         routes.Routes.matchTableRepairJobs(path) != null or
         routes.Routes.matchTableRepairControlJobs(path) != null or
@@ -265,6 +269,8 @@ test "hot-standby mutation classifier covers acknowledged security catalog and w
         .{ .method = .POST, .path = "/tables/docs/restore", .surface = .table_restore },
         .{ .method = .POST, .path = "/transactions/begin", .surface = .transaction_session },
         .{ .method = .POST, .path = "/tables/docs/repair/run", .surface = .artifact_repair },
+        .{ .method = .POST, .path = "/tables/docs/storage/migrations", .surface = .storage_migration },
+        .{ .method = .POST, .path = "/tables/docs/storage/migrations/job", .surface = .storage_migration },
         .{ .method = .POST, .path = "/tables/docs/artifacts/summary/reprocess", .surface = .artifact_reprocess },
     };
     for (cases) |case| {

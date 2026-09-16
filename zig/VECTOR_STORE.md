@@ -83,142 +83,199 @@ owner tests, 13 benchmark-tool tests, and 11 API checks with vector/HBC override
 cleared. A separate float16 override/reopen check also passed. No new throughput
 measurement is claimed.
 
-## Existing-table migration plan (not yet implemented)
+## Existing-table migration
 
-Treat the new ANN physical storage and source-vector ownership as separate
-transitions. The public logical index type remains `embeddings`; changing a
-model, dimension, distance metric or source definition is a separate index
-configuration/re-embedding operation. A format conversion must preserve the
-existing logical contract and exact source vectors.
+Source ownership and ANN format are separate transitions. The logical index
+remains `embeddings`: migration preserves the table/document incarnation, every
+artifact/producer identity, exact vector bytes, models, dimensions, metrics,
+chunks and index definitions. It does not re-embed documents. Dense artifacts
+with no ANN consumers migrate too, and dropping the last consumer preserves
+source ownership.
 
-| Transition | Authority that changes | Completion evidence |
-| --- | --- | --- |
-| ANN LSM projection to native generation | Per-index serving generation and its posting/vector manifests | Validated generation, mutation coverage fence, matching index incarnation/configuration and restart recovery |
-| `primary_lsm` to `vector_store` | Table-wide source payload ownership | Every live artifact resolves through a durable source reference, with concurrent mutations caught up and all protected generations retained |
+The first implementation supports local, single-shard, single-replica standalone
+tables moving from `primary_lsm` to `vector_store`. It is an explicit operation,
+not a setting PATCH or an automatic conversion on open. HA, replication, Lite,
+serverless, schema migration, restore and topology changes are not admitted.
+Index/producer/schema changes and table deletion are fenced while a job is
+active. Existing native generation repair handles legacy ANN conversion;
+discarded experimental formats do not gain compatibility decoders.
 
-The existing native-storage phases (`legacy`, `native_building`,
-`native_validating`, `native_authoritative`) describe ANN authority. Preserve
-that machinery and its supported pre-PR compatibility path. Those phases are
-not proof that source ownership has migrated: a native ANN index can still
-serve a `primary_lsm` table. Do not add decoders for discarded experimental
-formats from this PR. Unsupported source/native formats must fail closed.
+### Online operator
 
-### Durable job and admission
+Use the same binary for the server and its compiled runtime libraries:
 
-Introduce a separately versioned storage-migration job, rather than allowing a
-PATCH of the immutable ownership field. Persist the job ID/idempotency key,
-table incarnation, source and target ownership, ownership epoch, target format
-capabilities, artifact/schema configuration revision, snapshot fence, replay
-cursor, backfill cursor, candidate manifests, publication decision and error.
-Expose distinct source and per-index progress. Retries consult the same durable
-job; an ambiguous response must not start a second migration.
+```sh
+zig/zig-out/bin/antfly storage migrate \
+  --url http://127.0.0.1:8080 --table documents --to vector-store --job vectors-20260915
+```
 
-Start with the same qualified local single-shard deployment. Reject overlapping
-restore, split/move, ownership migration and incompatible schema/index changes;
-serialize index create/drop and producer-definition changes for the first online
-implementation. Ordinary document updates, deletes and enrichment completion
-must continue under version fencing. Admit only when the binary can read both
-representations, sufficient disk exists for the temporary overlap plus journals,
-and the operator's I/O, memory and journal-lag budgets can be enforced. No
-automatic conversion on open, and no new HA/replication admission by implication.
+The command creates a job with `POST /db/v1/tables/{table}/storage/migrations`,
+requiring table admin permission when authentication is enabled. `ANTFLY_API_KEY`
+supplies its Bearer token. Creation takes `{"job_id":"...","target":"vector_store",
+"budget":{...}}`. `GET /db/v1/tables/{table}/storage/migrations/{job}` observes the
+receipt; `POST` on that job takes `{"action":"step|publish|cancel"}` and uses its
+durable budgets. GET never admits work or reconciles catalog publication. An
+`admitted` receipt means the catalog marker exists but DB preparation has not
+begun; retry creation or send a job action to recover that boundary.
 
-### Preparation, backfill and publication
+The CLI defaults to `--action run`, which creates/resumes the job, advances
+bounded steps, and publishes when verification reaches `ready`. Actions `start`,
+`step`, `publish`, `status` and `cancel` provide explicit operator control. Ctrl-C
+stops the driver; durable capture continues, and running the identical command
+resumes it. The server does not schedule an unattended migration loop.
+Use a migration-capable server throughout the job; do not downgrade between
+admission and completion or cancellation. Older binaries do not maintain the
+candidate map required by an active job.
 
-1. **Prepare.** Establish a durable primary snapshot fence and a durable mutation
-   capture cursor atomically with respect to writes. Pin their recovery inputs.
-   The old ownership and serving generations remain authoritative while the
-   candidate is built. Reuse the source store and its prepare-before-primary-
-   commit protocol; do not create a third permanent vector corpus.
-2. **Backfill.** Stream all table-owned dense artifacts, including chunk artifacts,
-   externally supplied embeddings and artifacts with zero ANN consumers. Read in
-   bounded batches, bypass one-pass cache admission, and persist restartable
-   progress only after candidate payloads and reference mappings are durable.
-   Bind references to the complete artifact identity/version: document and shard
-   identity, artifact/producer identity, source hash, dimensions and model/config
-   identity. Never key migration by docid alone or assume one vector per document.
-3. **Catch up.** Replay committed mutations in order, including tombstones and
-   producer removals. Compare artifact versions when applying snapshot work so
-   an old row cannot overwrite a newer update or resurrect a deletion. Stale
-   enrichment completion must pass the normal producer/source-version checks.
-   Prepared but uncommitted payloads are orphans, not visible documents. Bound
-   replay retention and pause backfill or apply backpressure if it falls behind.
-4. **Prepare serving generations.** Reuse a compatible native index generation
-   where its immutable reference bindings remain valid; otherwise construct a
-   candidate version map/posting generation against the migrated source snapshot.
-   Keep the healthy old index queryable during replacement. Validate every
-   index's incarnation, config, artifact coverage and mutation fence, then check
-   representative query results and recall. Counts alone do not prove coverage.
-5. **Cut over.** Use a short write-admission fence to drain admitted mutations,
-   apply the final replay suffix and durably publish the selected ownership
-   epoch, source manifest/reference root and required serving manifests. This
-   needs a recoverable publication decision across catalog and DB state, not
-   independent flag/file renames. On reopen, resolve an uncertain decision before
-   admitting writes or GC. New writes then prepare durable source payloads before
-   committing primary references, as fresh vector-store tables already do.
-6. **Drain and reclaim.** Convert remaining inline primary values in bounded
-   version-checked batches. A transitional resolver must accept the proven old
-   inline representation and new references until conversion completes. Mark
-   the migration complete only after a full coverage check proves no live inline
-   payload remains and every committed reference resolves. Retain old files and
-   versions for old query/transaction snapshots, serving generations, recovery
-   journals and pinned backups. Reclaim only after those owners release them.
+Job ID, target and budgets form the creation idempotency contract. Keep them
+equal when retrying creation, including after a timeout. Job actions use the
+persisted configuration, so callers do not have to repeat budgets. DB publication
+is authoritative if its response or the catalog update is lost. Opening the DB
+can bridge that specific stale catalog setting using the matching durable job
+and table identity. A creation/action retry reconciles the catalog decision.
+The table retains its current receipt until a later job replaces it; this is
+not a permanent job-history service.
 
-For online conversion, the candidate reference root in step 5 must cover the
-entire cutover snapshot, including artifacts not yet rewritten in the primary
-LSM. Readers resolve against their captured ownership epoch; they must never
-combine an old primary snapshot with a new mutable reference map. Either retain
-the inline bytes for those readers or pin the corresponding immutable mapping.
-The migration state must explicitly distinguish published ownership from fully
-rewritten/reclaimed storage. This avoids an unbounded cutover transaction while
-preserving snapshot correctness.
+Defaults are 4 MiB and 1,024 primary rows per step, a 64 GiB temporary allowance,
+and a 1 GiB free-space reserve in addition to normal resource admission. The
+driver accepts `--batch-bytes`, `--batch-rows`, `--temporary-bytes` and
+`--disk-reserve-bytes`. Before publication, an individual dense artifact must
+fit the byte budget. Unrelated values contribute only their cursor keys to a
+page. Draining hashes borrowed inline vectors into compact references before
+retaining the page; an oversized vector captured after verification consumes
+one page by itself, without copying its payload into page memory.
+Preparation charges a conservative eight times payload/reference/metadata size,
+including concurrent embedding writes; the source also checks retained candidate
+bytes, covering failed preparations. This is an admission allowance, not a
+measurement of physical disk usage. It deliberately overestimates preparation
+cost and does not promise an exact filesystem quota. Free space is checked
+before preparation. Resource rejection preserves progress and reports the
+reason. Before publication, cancel and start a new ID if a larger allowance is
+needed; after publication, finish draining to retire the migration allowance.
+Reads/deletes continue when preparation is backpressured.
 
-The temporary mapping/journal is migration machinery. Retire it once primary
-references, serving bindings and the durable publication record suffice for
-recovery; include its bytes in accounting until then. Source GC must protect
-candidate preparations and migration snapshot/replay inputs. Cancellation before
-publication releases only candidate-owned data after proving no references were
-published. Once publication may have committed, cancellation requires resolving
-that outcome first.
+The durable phases are:
 
-### Rollback, restore and delivery order
+| Phase | Authority and work |
+| --- | --- |
+| `backfill` | Inline primary values remain authoritative; prepare candidate source payloads in bounded pages. |
+| `verifying` / `ready` | Verify exact identity/version bindings and byte equality for the cutover corpus. Concurrent writes keep the candidate current. |
+| `draining` | Ownership and the publication fence are durable. New writes use references; replace old inline values with already-prepared references. |
+| `final_verification` | Prove that every live dense artifact is a valid, resolvable reference. |
+| `serving` | Convert any legacy ANN generations and consolidate serving vectors into source references, retaining healthy query generations during replacement. |
+| `cleanup` | Delete temporary candidate mappings. |
+| `reclaiming` | Flush the final replacements once, durably request primary overlap rewrites, and advance bounded streaming compaction until those requests are discharged. |
+| `complete` | Reference, serving and primary rewrite closure are certified. Source GC and reader retirement can finish reclaiming retained versions. |
+| `cancelling` / `cancelled` | Before publication only: disable capture, remove candidate mappings, retain inline authority and a durable receipt. |
 
-Before cutover, rollback discards the unreferenced candidate and leaves the old
-table authoritative. After cutover, returning to `primary_lsm` requires a reverse
-backfill and mutation replay, or restoration of a consistent pre-migration
-backup with an explicit data-loss boundary. Changing the setting or booting an
-older binary is not rollback. Do not retain two payload copies indefinitely to
-make downgrade appear free.
+Progress includes the ownership epoch, snapshot/publication fences, an exclusive
+hex-encoded primary cursor, scanned/prepared/verified/rewritten counts, preparation
+bytes, charged temporary allowance and the last admission error. Existing table
+and index status endpoints provide source-store accounting, index readiness and
+repair status. `primary_reclamation_requested` records the durable primary
+rewrite request. `complete` includes discharge of those requests, but old readers,
+retention windows and source GC may still hold files; it does not mean all old
+files or cache pages have already been reclaimed. The request uses persistent
+run metadata and ordinary admitted streaming GC. Partial level jobs and splits
+carry the request even when their outputs contain no tombstones. Only a
+validated full overlap rewrite clears it. A crash between the manifest request
+and its job receipt safely repeats the request after reopening.
 
-Backups must capture catalog ownership/job state, primary references, all source
-files needed for reference closure and the selected ANN manifests at one proven
-fence. Restore either reproduces that state and resumes the job or rejects it
-before exposing the table. Until this is implemented, reject migration-overlap
-backups/restores; copying the primary LSM alone cannot back up a reference table.
+### Mutation, reader and recovery protocol
 
-Deliver in this order:
+A compacted candidate map replaces an additional payload replay journal. Each
+dense mutation prepares the payload and co-commits its full artifact-key/version
+reference with the authoritative inline primary value, reference epoch and
+allowance ledger. Deletes remove the candidate in the same transaction. There
+is no asynchronous capture lag. The backfill compares exact current bytes before
+installing a candidate, so it cannot overwrite an update or resurrect a deleted
+artifact. Normal enrichment producer/source-version fencing remains in force.
 
-1. A bounded, resumable offline migration command with exclusive table admission,
-   a streaming shadow-root copy that preserves internal document identities,
-   versions, all artifact namespaces and catalog definitions, and native ANN
-   rebuild with recoverable atomic publication. A public document-only export
-   is insufficient. Validate it on real legacy tables; this
-   provides an initial conversion route without immediately adding online replay.
-2. Durable online mutation capture, mixed-representation reads, candidate reference
-   roots and version-checked conversion. Reuse the offline builder and verifier;
-   add fault injection at every durability boundary before enabling publication.
-3. Online generation publication, cancellation and reverse conversion, followed
-   by backup/restore and broader topology support as separately qualified work.
+Publication commits the table setting and migration decision in one primary
+transaction under write admission. Its candidate map covers the entire cutover
+corpus. Mixed readers continue accepting inline bytes until draining finishes;
+stable old snapshots retain their original payloads and source leases protect
+reference snapshots. A live probe admitted before activation retries if it
+encounters a reference without a source lease. An ambiguous preparation/commit
+fences the shared DocStore, including transaction-recovery owners, until reopen.
 
-Require restart/crash tests between preparation, payload sync, reference commit,
-manifest publication and WAL retirement; repeated restarts and ambiguous retries;
-same-dimension different models and multiple indexes per artifact; updates,
-deletes and stale completions racing backfill; zero indexes and last-index drop
-followed by rebuild; old readers across cutover/GC; disk exhaustion, cancellation,
-backup/restore and rollback. Report progress, replay lag, lock-wait tails,
-temporary/retained/orphan bytes, primary/vector/journal write I/O, readiness,
-recall and query latency throughout. Run 50K then 1M with fixed-count churn, and
-compare migrated tables with freshly created vector-store tables to detect a
-permanent migration tax.
+Draining validates and reuses the durable candidate reference; it does not
+append the same payload again or create another permanent corpus. ANN format
+conversion uses native generation publication and coverage checks independently
+of the source rewrite. The healthy serving generation remains queryable while
+its replacement is staged. The source retains candidates throughout the active
+job, including cancellation, while checkpoints and memory admission continue.
+Once the job finishes, ordinary snapshot/ANN ownership and journal retirement
+control reclamation. Transaction and replay journals are included in total-disk
+qualification; old inline payloads are not retained indefinitely for rollback.
+After cancellation reaches `cancelled`, native and portable backups are eligible
+again without restarting. Retained source objects may still protect existing
+readers; snapshot eligibility checks durable cancellation and inline authority,
+and rechecks under capture admission before selecting a snapshot.
+
+### Offline operator
+
+The same `antfly storage migrate` subcommand supports stopped-server migration.
+The offline candidate uses a 64 MiB shared LSM block cache for repeated
+verification point reads when the caller has not supplied a cache. It shares the
+normal standalone memory budget and is released after the candidate closes.
+Stop standalone, then run:
+
+```sh
+zig/zig-out/bin/antfly storage migrate \
+  --catalog /data/metadata/local-metadata.json \
+  --replica-root /data/data/replicas \
+  --table documents --to vector-store --job vectors-offline-20260915
+```
+
+Use the actual configured catalog and replica-root paths. The command and the
+new standalone runtime lock the same stable catalog sibling inode. Older
+running binaries do not participate in this new operator lock: stop them first.
+The command preserves unknown catalog fields and extension records. It records
+offline admission before copying; standalone refuses to start while that marker
+is present. `--once` executes one bounded unit and leaves a resumable candidate;
+retry the same command and budgets to continue. `--cancel` discards only the
+unpublished candidate, persists a cancellation receipt and clears admission.
+It cannot cancel an already-published generation.
+
+Under exclusive generation admission, the command inventories and streams the
+whole physical database root into a durable sibling, recording a synced file and
+byte cursor. It preserves opaque internal namespaces, identity/version records,
+artifacts and ANN state; document-only export would lose required information.
+It rejects symlinks and storage configurations whose physical state is outside
+the lifecycle-owned root. The shadow replays committed derived work, runs the
+same source conversion/verifier and native ANN lifecycle, syncs, seals and
+publishes through the existing recoverable generation exchange. Repeated restart
+or a lost publication response resolves the same selected generation. Old roots
+are retired by the generation lifecycle after their readers release them.
+
+### Qualification and remaining scope
+
+Recovery checks cover preparation/commit/publication boundaries, interrupted
+physical copies, repeated restart, ambiguous retries, old readers, concurrent
+updates/deletes, distinct models, no ANN indexes, last-index drop/rebuild,
+resource rejection, cancellation and catalog fencing. The production HTTP and
+offline-command suites additionally check compiled-owner routing, admission,
+catalog recovery and queries across serving conversion.
+
+Performance qualification must compare migrated and fresh vector-store tables
+at 50K and then 1M, with fixed-count churn, restart, readiness, recall, QPS/tails,
+lock waits, memory and complete disk accounting. Report retained/orphan bytes and
+reclamation separately from logical completion. A passing migration correctness
+suite is not evidence of equivalent steady-state throughput.
+
+The [migration qualification findings](VECTOR_STORAGE_MIGRATION_FINDINGS.md)
+record the initial screen, the WAL-only page durability fix, and the shared
+restart cost found in both fresh and migrated tables. Page durability must not
+force one SSTable per progress update. Query comparisons include a matched
+restart in every arm so ingestion-time identity caches do not confound them.
+
+Reverse migration, migration-overlap backup/restore, HA/replication and broader
+topology remain separately qualified work. Migration-overlap backups/restores
+are rejected; a primary-only backup cannot capture reference closure. After
+publication, changing the setting or booting an older binary is not rollback.
+Returning to primary ownership requires a reverse conversion or a consistent
+pre-migration backup with an explicit data-loss boundary.
 
 ## September 13: compiled-owner maintenance and fresh ownership comparison
 
@@ -3690,10 +3747,10 @@ for the experimental mode until their lifecycle contracts are implemented and
 validated. Supported backup/restore paths must preserve reference closure; any
 unimplemented path must reject the operation explicitly.
 
-Switching an existing table requires the separate migration protocol planned
-above. Until it is implemented, select ownership explicitly on a fresh table
-and reload the complete source data. A runtime toggle is not a rollback
-mechanism for reference-only artifacts.
+Switching an existing table uses the explicit offline or online protocol in
+[Existing-table migration](#existing-table-migration). Direct configuration
+changes remain rejected. A runtime toggle is not a rollback mechanism for
+reference-only artifacts.
 
 ## Implementation sequence and acceptance
 

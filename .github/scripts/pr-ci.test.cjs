@@ -325,7 +325,11 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
     }
     const checkouts=text.match(/uses: actions\/checkout@[^\n]+\n[\s\S]*?(?=\n      -|$)/g)||[];
     for (const checkout of checkouts) {
-      assert.match(checkout,/ref: \$\{\{ inputs.head_sha \|\| github.sha \}\}/);
+      if (suite.id === 'policy' && /path: trusted-ci\n/.test(checkout)) {
+        assert.match(checkout,/ref: \$\{\{ github.workflow_sha \}\}/);
+      } else {
+        assert.match(checkout,/ref: \$\{\{ inputs.head_sha \|\| github.sha \}\}/);
+      }
       assert.match(checkout,/persist-credentials: false/);
     }
   }
@@ -337,6 +341,13 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
       assert.doesNotMatch(text,/secrets: inherit/,file);
     }
   }
+});
+
+test('policy validates the executing workflow even when a release predates the controller', () => {
+  const text=fs.readFileSync(path.resolve(__dirname,'../workflows/pr-ci-policy.yml'),'utf8');
+  assert.match(text,/ref: \$\{\{ github.workflow_sha \}\}\n\s+path: trusted-ci/);
+  assert.match(text,/name: Test executing CI policy\n\s+working-directory: trusted-ci\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
+  assert.match(text,/name: Test proposed CI policy when present\n\s+if: \$\{\{ hashFiles\('\.github\/scripts\/pr-ci.test.cjs'\) != '' \}\}\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
 });
 
 // The live rollout first creates an action_required check before an approval.
@@ -453,4 +464,60 @@ test('gate invalidation replaces success on the same head', async () => {
   assert.equal(f.statuses.at(-1).context, 'PR CI gate');
   assert.equal(f.statuses.at(-1).sha, SHA);
   assert.equal(f.statuses.at(-1).state, 'error');
+});
+
+
+test('dispatch returns an exact queued link without consuming admission', async () => {
+  const f = fixture();
+  f.github.rest.actions.createWorkflowDispatch = async body => {
+    f.dispatches.push(body);
+    return {data: {workflow_run_id: 91}};
+  };
+  await f.call();
+  assert.equal(f.dispatches[0].return_run_details, true);
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/91');
+  assert.equal(f.statuses.at(-1).description, 'CI queued; view workflow runs');
+  assert.equal(f.checks.at(-1).status, 'queued');
+  assert.equal(JSON.parse(f.checks.at(-1).output.text).run_id, undefined);
+  assert.equal(JSON.parse(f.checks.at(-1).output.text).dispatched_run_id, 91);
+  await f.call(); assert.equal(f.dispatches.length, 1);
+  f.context.runId = 92;
+  await assert.rejects(f.call('admit'), /another dispatched run/);
+  f.context.runId = 91;
+  await f.call('admit');
+  assert.equal(f.checks.at(-1).status, 'in_progress');
+  f.finish(); await f.call();
+  assert.equal(f.statuses.at(-1).state, 'success');
+});
+
+test('queued dispatch cannot pass without admission or finish from another run', async () => {
+  const f = fixture();
+  f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: 91}});
+  await f.call(); f.finish(); f.context.payload.workflow_run.id = 92;
+  await f.call();
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  f.context.payload.workflow_run.id = 91;
+  await f.call();
+  assert.equal(f.statuses.at(-1).state, 'failure');
+});
+
+test('invalid dispatch IDs fail closed', async () => {
+  for (const id of [null, 0, -1, '91', 1.5]) {
+    const f = fixture();
+    f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: id}});
+    await assert.rejects(f.call(), /Invalid dispatched run ID/);
+    assert.equal(f.statuses.at(-1).state, 'failure');
+  }
+});
+
+test('queued run link is replaced on a fresh approval', async () => {
+  const f = fixture();
+  let id = 91;
+  f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: id}});
+  await f.call();
+  f.comment.id = 18; id = 92;
+  await f.call();
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/92');
+  assert.equal(f.checks.at(-1).status, 'queued');
 });
