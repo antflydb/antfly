@@ -28321,6 +28321,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer k_mt.deinit();
         var v_mt = try v_metal.retainedCopy();
         defer v_mt.deinit();
+        if (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvInto(
+            self.provider_impl,
+            request.q_slot,
+            request.k_slot,
+            request.v_slot,
+            linear_input,
+            request.in_dim,
+            request.q_out_dim,
+            request.kv_out_dim,
+            k_mt,
+            v_mt,
+        )) |q| return try self.ctFromOwnedMetalTensor(q);
         const q = (try metal_runtime.tryApplyDenseRuntimeLinearQkvInto(
             self.provider_impl,
             request.q_slot,
@@ -28350,6 +28362,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const rows: usize = @intCast(linear_input.dim(0));
         var out_mt = try out_metal.retainedCopy();
         defer out_mt.deinit();
+        if (try metal_runtime.tryApplyQuantizedRuntimeLinearInto(
+            self.provider_impl,
+            request.slot,
+            linear_input,
+            rows,
+            request.in_dim,
+            request.out_dim,
+            out_mt,
+        )) return true;
         return metal_runtime.tryApplyDenseRuntimeLinearInto(
             self.provider_impl,
             request.slot,

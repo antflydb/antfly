@@ -2128,10 +2128,11 @@ fn buildWhisperPlannedExport(
             try reversedDimsFromShape(allocator, record.descriptor.shape);
         errdefer allocator.free(dimensions);
 
+        const requested_quantization = whisperTensorQuantization(quantization, output_name_result.name);
         const tensor_quantization = if (source_is_gguf)
             .none
         else
-            supportedQuantizationForDescriptor(source_is_gguf, quantization, record.descriptor, .none);
+            supportedQuantizationForDescriptor(source_is_gguf, requested_quantization, record.descriptor, .none);
         const filtered_quantization = if (!source_is_gguf and quantizationFilterMatches(filter, record.descriptor.name, output_name_result.name))
             tensor_quantization
         else
@@ -2936,6 +2937,41 @@ fn mapDenseTensorNameToT5Gguf(allocator: std.mem.Allocator, source_name: []const
         return .{ .name = try allocator.dupe(u8, name), .owned = true };
     }
     return error.UnsupportedTensorNameForGgufExport;
+}
+
+/// Whisper's own quantization policy, applied before the prefix filters:
+/// position tables stay dense; the token table (also the tied output head)
+/// and the whole encoder never go below q8_0; the decoder layers take the
+/// requested format. Below 8 bits the token table breaks language
+/// detection on the small checkpoints, and q4_0 across all 32 encoder
+/// layers of large-v3-turbo yields nonsense (any 16 of them are fine, and
+/// q4_1, q5_0 and q4_k survive, so it is accumulated q4_0 error, not a
+/// kernel). The encoder is compute-bound, so q8_0 is also its fastest
+/// quantized form on Metal. `--quantize-include` and `--quantize-exclude`
+/// still apply on top.
+fn whisperTensorQuantization(requested: QuantizationMode, output_name: []const u8) QuantizationMode {
+    if (requested == .none) return .none;
+    if (std.mem.endsWith(u8, output_name, "embed_positions.weight")) return .none;
+    const floor_at_q8 = std.mem.eql(u8, output_name, "model.decoder.embed_tokens.weight") or
+        std.mem.eql(u8, output_name, "proj_out.weight") or
+        std.mem.startsWith(u8, output_name, "model.encoder.");
+    if (!floor_at_q8) return requested;
+    return switch (requested) {
+        .q1_0, .q2_k, .q3_k, .q4_0, .q4_1, .q5_0, .q5_1, .q4_k, .q5_k => .q8_0,
+        else => requested,
+    };
+}
+
+test "whisper export keeps position tables dense and the encoder and token table at q8_0 or better" {
+    try std.testing.expectEqual(QuantizationMode.none, whisperTensorQuantization(.q4_0, "model.encoder.embed_positions.weight"));
+    try std.testing.expectEqual(QuantizationMode.none, whisperTensorQuantization(.q8_0, "model.decoder.embed_positions.weight"));
+    try std.testing.expectEqual(QuantizationMode.q8_0, whisperTensorQuantization(.q4_0, "model.decoder.embed_tokens.weight"));
+    try std.testing.expectEqual(QuantizationMode.q8_0, whisperTensorQuantization(.q4_k, "proj_out.weight"));
+    try std.testing.expectEqual(QuantizationMode.q8_0, whisperTensorQuantization(.q4_0, "model.encoder.layers.31.fc2.weight"));
+    try std.testing.expectEqual(QuantizationMode.q6_k, whisperTensorQuantization(.q6_k, "model.encoder.layers.0.fc1.weight"));
+    try std.testing.expectEqual(QuantizationMode.q6_k, whisperTensorQuantization(.q6_k, "model.decoder.embed_tokens.weight"));
+    try std.testing.expectEqual(QuantizationMode.q4_0, whisperTensorQuantization(.q4_0, "model.decoder.layers.0.self_attn.q_proj.weight"));
+    try std.testing.expectEqual(QuantizationMode.none, whisperTensorQuantization(.none, "model.decoder.layers.0.self_attn.q_proj.weight"));
 }
 
 fn mapDenseTensorNameToWhisperGguf(allocator: std.mem.Allocator, source_name: []const u8) !OutputName {

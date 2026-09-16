@@ -25957,6 +25957,140 @@ pub fn tryApplyDenseRuntimeLinearQkv(
     };
 }
 
+/// Single-row quantized projection written straight into `out` (rows of a
+/// resident cache slab), so a cache append needs no copy. False when the
+/// slot is not a quantized slot with a single-stage device kernel, or the
+/// shapes and residency do not fit; the caller then tries the dense path.
+pub fn tryApplyQuantizedRuntimeLinearInto(
+    self: anytype,
+    slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    out: MetalTensor,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or in_dim == 0 or out_dim == 0) return false;
+    if (self.raw_linear_slot_kinds[slot] != .quantized) return false;
+    if (!input.isDevice() or !out.isDevice()) return false;
+    if (input.ndim() != 2 or @as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return false;
+    if (out.ndim() != 2 or @as(usize, @intCast(out.dim(0))) != rows or @as(usize, @intCast(out.dim(1))) != out_dim) return false;
+    const kind = ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim);
+    if (kind == .none or referenceQuantizedRuntimeLinearDebug()) return false;
+    if (!quantizedRuntimeLinearKindHasSingleStageDeviceKernel(kind)) return false;
+    if (kind == .q4_0 and rows == 1 and !q4_0SingleRowDeviceLinearEnabled()) return false;
+    const format = metalQuantFormatForKind(kind);
+    if (format == .unsupported) return false;
+    if (kind != .tl1 and kind != .tl2) {
+        const storage = self.raw_linear_slot_quantized_storage[slot] orelse return false;
+        const descriptor = packedWeightDescriptorForMatrix(storage, in_dim, out_dim, format) orelse return false;
+        if (!descriptor.supported()) return false;
+    }
+    const rc = termite_metal_decode_runtime_apply_quantized_linear_slot_device(
+        runtime,
+        @intFromEnum(format),
+        slot,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        rows,
+        in_dim,
+        out_dim,
+        out.deviceHandle(),
+        out.deviceByteOffset(),
+    );
+    if (rc != 0) return false;
+    var out_mut = out;
+    return applyRuntimeLinearBiasDevice(self, slot, &out_mut, rows, out_dim);
+}
+
+/// Quantized counterpart of `tryApplyDenseRuntimeLinearQkvInto`: the fused
+/// Q/K/V kernel writes K and V into the caller's slab rows when all three
+/// slots share a fused format; otherwise each projection runs on its own,
+/// still in place. Returns the freshly allocated Q, or null when the slots
+/// are not quantized or the shapes do not fit.
+pub fn tryApplyQuantizedRuntimeLinearQkvInto(
+    self: anytype,
+    q_slot: usize,
+    k_slot: usize,
+    v_slot: usize,
+    input: MetalTensor,
+    in_dim: usize,
+    q_out_dim: usize,
+    kv_out_dim: usize,
+    k_out: MetalTensor,
+    v_out: MetalTensor,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (q_slot >= decoder_runtime_linear_slot_capacity or k_slot >= decoder_runtime_linear_slot_capacity or v_slot >= decoder_runtime_linear_slot_capacity) return null;
+    if (in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0) return null;
+    if (self.raw_linear_slot_kinds[q_slot] != .quantized or self.raw_linear_slot_kinds[k_slot] != .quantized or self.raw_linear_slot_kinds[v_slot] != .quantized) return null;
+    if (!input.isDevice() or !k_out.isDevice() or !v_out.isDevice()) return null;
+    if (input.ndim() != 2 or @as(usize, @intCast(input.dim(0))) != 1 or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
+    if (k_out.ndim() != 2 or @as(usize, @intCast(k_out.dim(0))) != 1 or @as(usize, @intCast(k_out.dim(1))) != kv_out_dim) return null;
+    if (v_out.ndim() != 2 or @as(usize, @intCast(v_out.dim(0))) != 1 or @as(usize, @intCast(v_out.dim(1))) != kv_out_dim) return null;
+    if (referenceQuantizedRuntimeLinearDebug()) return null;
+    const q_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, q_slot, in_dim, q_out_dim);
+    const k_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, k_slot, in_dim, kv_out_dim);
+    const v_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, v_slot, in_dim, kv_out_dim);
+    if (q_kind == .none or k_kind == .none or v_kind == .none) return null;
+    const fused: ?[3]MetalQuantFormat = if (q_kind == .q4_0 and k_kind == .q4_0 and v_kind == .q4_0)
+        .{ .q4_0, .q4_0, .q4_0 }
+    else if (q_kind == .q4_k and k_kind == .q4_k and v_kind == .q4_k)
+        .{ .q4_k, .q4_k, .q4_k }
+    else if (q_kind == .q5_k and k_kind == .q4_k and v_kind == .q4_k)
+        .{ .q5_k, .q4_k, .q4_k }
+    else if (q_kind == .q8_0 and k_kind == .q8_0 and v_kind == .q8_0)
+        .{ .q8_0, .q8_0, .q8_0 }
+    else
+        null;
+    if (fused) |formats| {
+        const q_shape = [_]i32{ 1, @intCast(q_out_dim) };
+        var q_device = try MetalTensor.deviceAllocate(runtime, q_out_dim * @sizeOf(f32), .private, &q_shape);
+        errdefer q_device.deinit();
+        const rc = termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
+            runtime,
+            @intFromEnum(formats[0]),
+            @intFromEnum(formats[1]),
+            @intFromEnum(formats[2]),
+            q_slot,
+            k_slot,
+            v_slot,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            1,
+            in_dim,
+            q_out_dim,
+            kv_out_dim,
+            q_device.deviceHandle(),
+            q_device.deviceByteOffset(),
+            k_out.deviceHandle(),
+            k_out.deviceByteOffset(),
+            v_out.deviceHandle(),
+            v_out.deviceByteOffset(),
+        );
+        if (rc == 0) {
+            var k_mut = k_out;
+            var v_mut = v_out;
+            if (applyRuntimeLinearBiasDevice(self, q_slot, &q_device, 1, q_out_dim) and
+                applyRuntimeLinearBiasDevice(self, k_slot, &k_mut, 1, kv_out_dim) and
+                applyRuntimeLinearBiasDevice(self, v_slot, &v_mut, 1, kv_out_dim))
+            {
+                return q_device;
+            }
+            q_device.deinit();
+            return null;
+        }
+        q_device.deinit();
+    }
+    // Mixed or unfused formats: separate kernels, still into the slab rows.
+    if (!try tryApplyQuantizedRuntimeLinearInto(self, k_slot, input, 1, in_dim, kv_out_dim, k_out)) return null;
+    if (!try tryApplyQuantizedRuntimeLinearInto(self, v_slot, input, 1, in_dim, kv_out_dim, v_out)) return null;
+    return try tryApplyQuantizedRuntimeLinear(self, q_slot, input, 1, in_dim, q_out_dim);
+}
+
 pub fn tryApplyQuantizedRuntimeLinearQkv(
     self: anytype,
     q_slot: usize,
