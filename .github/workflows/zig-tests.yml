@@ -94,16 +94,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Markdown is documentation, not test input: a change that only
-          # touches .md/.mdx files never selects test work. Fixture READMEs
-          # under testdata/ stay in scope because oracle scripts check them.
-          relevant_changes() {
-            local base="$1" head="$2"
-            shift 2
-            [ -n "$(git diff --name-only "$base" "$head" -- "$@" \
-              | awk '!(/\.mdx?$/ && !/(^|\/)testdata\//)')" ]
-          }
-
           if [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "workflow_dispatch" ]]; then
             if [[ "${{ inputs.validation_scope }}" == "inference-e2e" ]]; then
               {
@@ -160,7 +150,7 @@ jobs:
             exit 0
           fi
 
-          if ! relevant_changes "$base" "${{ inputs.head_sha || github.sha }}" \
+          if ! scripts/ci/zig-relevant-changes.sh "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
@@ -197,7 +187,7 @@ jobs:
             echo "zig_tests=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if ! relevant_changes "$base" "${{ inputs.head_sha || github.sha }}" \
+          if ! scripts/ci/zig-relevant-changes.sh "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
@@ -218,7 +208,7 @@ jobs:
             echo "e2e=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if ! relevant_changes "$base" "${{ inputs.head_sha || github.sha }}" \
+          if ! scripts/ci/zig-relevant-changes.sh "$base" "${{ inputs.head_sha || github.sha }}" -- \
             scripts/test-backup-s3-integration.sh \
             zig/build.zig \
             ':(glob)zig/pkg/antfly/build/**' \
@@ -237,7 +227,7 @@ jobs:
             echo "backup_s3=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if ! relevant_changes "$base" "${{ inputs.head_sha || github.sha }}" \
+          if ! scripts/ci/zig-relevant-changes.sh "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/specs/tla/**' \
             ':(glob)scripts/tla-*.sh' \
             ':(glob)scripts/tla-*.py' \
@@ -249,7 +239,7 @@ jobs:
             echo "model_check=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if ! relevant_changes "$base" "${{ inputs.head_sha || github.sha }}" \
+          if ! scripts/ci/zig-relevant-changes.sh "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/specs/tla/**' \
             ':(glob)scripts/tla-*.sh' \
             ':(glob)scripts/tla-*.py' \
@@ -278,13 +268,7 @@ jobs:
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
-          relevant_changes() {
-            local base="$1" head="$2"
-            shift 2
-            [ -n "$(git diff --name-only "$base" "$head" -- "$@" \
-              | awk '!(/\.mdx?$/ && !/(^|\/)testdata\//)')" ]
-          }
-          if ! relevant_changes "$BASE_SHA" "$HEAD_SHA" \
+          if ! scripts/ci/zig-relevant-changes.sh "$BASE_SHA" "$HEAD_SHA" -- \
             zig/build.zig \
             zig/build.zig.zon \
             ':(glob)zig/lib/vopr/**' \

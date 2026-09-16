@@ -105,10 +105,15 @@ queue; they have a separate execution policy below.
 - `.github/scripts/pr-ci.cjs` implements the controller; `pr-ci-config.json`
   contains the repository's suite labels and path patterns. Keep controller and
   test code identical in both repositories when changing policy.
-- Markdown is documentation, not test input. The suite path patterns and the
-  `changes` job in `zig-tests.yml` ignore `.md`/`.mdx` files, so a docs-only
-  change runs admission and policy but no test suites. Fixture READMEs under a
-  `testdata/` directory stay in scope because oracle scripts check them.
+- Markdown is documentation, not test input. The suite path patterns ignore
+  `.md`/`.mdx` files, and the `changes` job in `zig-tests.yml` decides through
+  `scripts/ci/zig-relevant-changes.sh`, which drops Markdown from the diff
+  before selecting work, so a docs-only change runs admission and policy but
+  no test suites. Two exceptions stay in scope: fixture READMEs under a
+  `testdata/` directory, and the files in the script's `DOC_TEST_INPUTS` list,
+  which Zig tests read directly. Renames are diffed as delete plus add, and a
+  git failure selects tests rather than skipping them.
+  `scripts/ci/test_zig_validation_scope.py` covers the script.
 - `.github/workflows/pr-ci-policy.yml` exercises the policy tests using the
   approved checkout. Test jobs have no Actions/check-write permission. Only the
   trusted control plane writes `PR CI` on the actual PR commit, because a normal

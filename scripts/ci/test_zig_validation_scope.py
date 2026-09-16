@@ -48,7 +48,7 @@ class ZigValidationScopeTests(unittest.TestCase):
         }
         unrelated = {"scripts/unrelated.py", "docs/guide.md"}
         for source in (workflow, focused):
-            command = source.split("if git diff --quiet", 1)[1].split(
+            command = source.split("if ! scripts/ci/zig-relevant-changes.sh", 1)[1].split(
                 "\n          then", 1
             )[0]
             pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
@@ -69,7 +69,7 @@ class ZigValidationScopeTests(unittest.TestCase):
 
     def test_codegen_inputs_select_zig_validation(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
-        command = workflow.split("if git diff --quiet", 1)[1].split(
+        command = workflow.split("if ! scripts/ci/zig-relevant-changes.sh", 1)[1].split(
             "\n          then", 1
         )[0]
         pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
@@ -111,6 +111,92 @@ class ZigValidationScopeTests(unittest.TestCase):
         self.assertEqual(
             {path.decode() for path in selected.split(b"\0") if path}, inputs
         )
+
+
+SCRIPT = ROOT / "scripts/ci/zig-relevant-changes.sh"
+
+
+def _relevant(root: Path, base: str, head: str, *pathspecs: str) -> int:
+    return subprocess.run(
+        [str(SCRIPT), base, head, "--", *pathspecs],
+        cwd=root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode
+
+
+def _commit(root: Path, message: str) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", message],
+        cwd=root,
+        check=True,
+    )
+
+
+class ZigRelevantChangesScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        subprocess.run(["git", "init", "-q", self.temporary.name], check=True)
+        for name in (
+            "zig/source.zig",
+            "zig/DESIGN.md",
+            "zig/pkg/inference/testdata/gliner25/README.md",
+            "zig/pkg/inference/QUANT_KERNEL_COMPILER.md",
+        ):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("v1\n")
+        _commit(self.root, "base")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _change(self, name: str, text: str = "v2\n") -> None:
+        (self.root / name).write_text(text)
+
+    def test_markdown_only_change_is_not_relevant(self):
+        self._change("zig/DESIGN.md")
+        _commit(self.root, "docs")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)zig/**"), 1)
+
+    def test_code_change_is_relevant(self):
+        self._change("zig/source.zig")
+        _commit(self.root, "code")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)zig/**"), 0)
+
+    def test_testdata_readme_is_relevant(self):
+        self._change("zig/pkg/inference/testdata/gliner25/README.md")
+        _commit(self.root, "fixture policy")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)zig/**"), 0)
+
+    def test_markdown_read_by_a_test_is_relevant(self):
+        self._change("zig/pkg/inference/QUANT_KERNEL_COMPILER.md")
+        _commit(self.root, "doc contract")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)zig/**"), 0)
+
+    def test_renaming_code_to_markdown_is_relevant(self):
+        (self.root / "zig/source.zig").rename(self.root / "zig/source.md")
+        _commit(self.root, "rename")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)zig/**"), 0)
+
+    def test_pathspec_outside_the_change_is_not_relevant(self):
+        self._change("zig/source.zig")
+        _commit(self.root, "code")
+        self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)go/**"), 1)
+
+    def test_git_failure_selects_tests(self):
+        self.assertEqual(_relevant(self.root, "no-such-revision", "HEAD", ":(glob)zig/**"), 0)
+
+    def test_missing_separator_is_a_usage_error(self):
+        code = subprocess.run(
+            [str(SCRIPT), "HEAD", "HEAD", ":(glob)zig/**"],
+            cwd=self.root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":
