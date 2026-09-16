@@ -6828,7 +6828,13 @@ pub fn whisperNativeDecoder(
     var cb = try getComputeBackendWithControl(session, allocator, control);
     errdefer cb.deinit();
     const shape = [_]i32{ 1, @intCast(enc_seq), @intCast(cfg.d_model) };
-    const encoder_ct = try cb.backend.fromFloat32Shape(encoder_hidden, &shape);
+    const encoder_host = try cb.backend.fromFloat32Shape(encoder_hidden, &shape);
+    // Upload once so the cross-attention projections run on the device and
+    // their outputs are born resident.
+    const encoder_ct = if (try cb.backend.ensureDeviceResident(encoder_host)) |device| blk: {
+        cb.backend.free(encoder_host);
+        break :blk device;
+    } else encoder_host;
     errdefer cb.backend.free(encoder_ct);
     const cache = try whisper_arch.DecodeCache.init(&cb.backend, allocator, cfg, encoder_ct, enc_seq);
     return .{

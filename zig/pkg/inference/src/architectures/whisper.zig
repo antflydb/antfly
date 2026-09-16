@@ -33,43 +33,61 @@ pub const Config = whisper_config.Config;
 /// Run the Whisper encoder forward pass on mel spectrogram features.
 /// mel_features: [batch * num_mel_bins * time_steps] as CT (channels-first).
 /// Returns encoder hidden states as f32: [batch * enc_seq * d_model].
-pub fn encoderForward(
+/// Per-call profile of the encoder, printed with
+/// TERMITE_WHISPER_METAL_PROFILE=1. Each mark flushes the open frame so
+/// the elapsed time attributes to the ops since the previous mark.
+const EncoderProfile = struct {
+    enabled: bool,
+    frame_active: *bool,
+    last_ns: u64 = 0,
+
+    fn start(self: *EncoderProfile) void {
+        if (!self.enabled) return;
+        self.last_ns = platform.time.monotonicNs();
+        std.debug.print("whisper_metal_encoder", .{});
+    }
+
+    fn mark(self: *EncoderProfile, cb: *const ComputeBackend, label: []const u8) void {
+        if (!self.enabled) return;
+        if (self.frame_active.*) cb.decoderRuntimeFlushActiveFrame() catch {};
+        const now = platform.time.monotonicNs();
+        std.debug.print(" {s}={d}us", .{ label, (now -| self.last_ns) / std.time.ns_per_us });
+        self.last_ns = now;
+    }
+
+    fn finish(self: *const EncoderProfile) void {
+        if (self.enabled) std.debug.print("\n", .{});
+    }
+};
+
+/// `[batch, d_model, enc_time]` (conv layout) to `[batch * enc_time, d_model]`
+/// (token rows). On backends with a device transpose the data never leaves
+/// the accelerator; otherwise it goes through the host.
+fn timeMajorHidden(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
-    config: Config,
-    mel_features: CT,
+    conv_out: CT,
     batch: usize,
-    time_steps: usize,
-) ![]f32 {
-    const d_model = config.d_model;
-
-    // 1. Conv1d frontend: mel [batch, num_mel_bins, time] → [batch, d_model, time]
-    const conv1_w = try cb.getWeight("model.encoder.conv1.weight");
-    defer cb.free(conv1_w);
-    const conv1_b = try cb.getWeight("model.encoder.conv1.bias");
-    defer cb.free(conv1_b);
-    const conv1_out = try cb.conv1d(mel_features, conv1_w, conv1_b, batch, config.num_mel_bins, d_model, time_steps, 3, 1, 1);
-    defer cb.free(conv1_out);
-    const conv1_act = try cb.gelu(conv1_out);
-    defer cb.free(conv1_act);
-
-    // Second conv: stride=2 downsamples time by 2 → [batch, d_model, enc_time]
-    const conv2_w = try cb.getWeight("model.encoder.conv2.weight");
-    defer cb.free(conv2_w);
-    const conv2_b = try cb.getWeight("model.encoder.conv2.bias");
-    defer cb.free(conv2_b);
-    const enc_time = (time_steps + 2 * 1 - 3) / 2 + 1;
-    const conv2_out = try cb.conv1d(conv1_act, conv2_w, conv2_b, batch, d_model, d_model, time_steps, 3, 2, 1);
-    defer cb.free(conv2_out);
-    const conv2_act = try cb.gelu(conv2_out);
-    defer cb.free(conv2_act);
-
-    // 2. Transpose [batch, d_model, enc_time] → [batch*enc_time, d_model]
-    // Read to f32, transpose, re-wrap as CT
-    const conv_data = try cb.toFloat32(conv2_act, allocator);
-    defer allocator.free(conv_data);
-
+    d_model: usize,
+    enc_time: usize,
+) !CT {
     const total = batch * enc_time;
+    const conv_shape = [_]i64{ @intCast(batch), @intCast(d_model), @intCast(enc_time) };
+    const perm = [_]u8{ 0, 2, 1 };
+    if (cb.primTranspose(conv_out, &perm, &conv_shape)) |transposed| {
+        const rows_shape = [_]i64{ @intCast(total), @intCast(d_model) };
+        if (cb.primReshape(transposed, &rows_shape)) |rows| {
+            cb.free(transposed);
+            return rows;
+        } else |_| {}
+        cb.free(transposed);
+    } else |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {},
+    }
+
+    const conv_data = try cb.toFloat32(conv_out, allocator);
+    defer allocator.free(conv_data);
     const transposed = try allocator.alloc(f32, total * d_model);
     defer allocator.free(transposed);
     for (0..batch) |b| {
@@ -79,52 +97,254 @@ pub fn encoderForward(
             }
         }
     }
+    const hidden_shape = [_]i32{ @intCast(total), @intCast(d_model) };
+    const host = try cb.fromFloat32Shape(transposed, &hidden_shape);
+    return residentProjection(cb, host);
+}
 
-    const hidden_shape = [_]i32{
-        @intCast(total),
-        @intCast(d_model),
-    };
-    var hidden = try cb.fromFloat32Shape(transposed, &hidden_shape);
+/// Run the Whisper encoder over log-mel features `[batch, num_mel_bins,
+/// time_steps]` and return the hidden states `[batch * enc_time, d_model]`
+/// on the host. On Metal the whole pass is one frame on one compute
+/// encoder: the conv stem, a device transpose, and pre-norm blocks whose
+/// residual adds are folded into the following layer norm.
+pub fn encoderForward(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    mel_features: CT,
+    batch: usize,
+    time_steps: usize,
+) ![]f32 {
+    const d_model = config.d_model;
+    const num_heads = config.encoder_attention_heads;
+    const head_dim = config.encoderHeadDim();
+    const ffn_dim = config.encoder_ffn_dim;
 
-    // 3. Add sinusoidal position embeddings
+    var frame_active = try beginWhisperMetalFrame(cb, .prefill);
+    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    const scope_active = frame_active and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
+    defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();
+    var profile = EncoderProfile{ .enabled = frame_active and whisperMetalProfileEnabled(), .frame_active = &frame_active };
+    profile.start();
+    defer profile.finish();
+
+    var fetcher = WeightFetcher{ .cb = cb, .allocator = allocator, .prefix = "model.encoder.layers" };
+    defer fetcher.release(cb);
+    var buf: [256]u8 = undefined;
+
+    // The caller hands mel features as a host tensor; move them once.
+    const mel_device = try cb.ensureDeviceResident(mel_features);
+    defer if (mel_device) |t| cb.free(t);
+    const mel = mel_device orelse mel_features;
+
+    // 1. Conv1d frontend: [batch, num_mel_bins, time] -> [batch, d_model, enc_time].
+    // Preferred route: unfold on the device and run each conv as one dense
+    // matmul, which also leaves the result in token-row order so no
+    // transpose is needed. Falls back to the direct conv kernels.
+    const conv1_w = try fetcher.fetch("model.encoder.conv1.weight");
+    const conv1_b = try fetcher.fetch("model.encoder.conv1.bias");
+    const conv2_w = try fetcher.fetch("model.encoder.conv2.weight");
+    const conv2_b = try fetcher.fetch("model.encoder.conv2.bias");
+    const enc_time = (time_steps + 2 * 1 - 3) / 2 + 1;
+    const total = batch * enc_time;
+    var hidden: CT = undefined;
+    var hidden_live = false;
+    if (try convViaIm2col(cb, conv1_w, conv1_b, mel, batch, config.num_mel_bins, d_model, time_steps, 3, 1, 1, false)) |conv1_out| {
+        defer cb.free(conv1_out);
+        const conv1_act = try cb.gelu(conv1_out);
+        defer cb.free(conv1_act);
+        profile.mark(cb, "conv1");
+        if (try convViaIm2col(cb, conv2_w, conv2_b, conv1_act, batch, d_model, d_model, time_steps, 3, 2, 1, true)) |conv2_out| {
+            defer cb.free(conv2_out);
+            hidden = try cb.gelu(conv2_out);
+            hidden_live = true;
+        } else {
+            // Back to the channel-major kernels for the second conv.
+            const rows_shape = [_]i64{ @intCast(batch), @intCast(time_steps), @intCast(d_model) };
+            const perm = [_]u8{ 0, 2, 1 };
+            const channel_major = try cb.primTranspose(conv1_act, &perm, &rows_shape);
+            defer cb.free(channel_major);
+            const conv2_out = try cb.conv1d(channel_major, conv2_w, conv2_b, batch, d_model, d_model, time_steps, 3, 2, 1);
+            defer cb.free(conv2_out);
+            const conv2_act = try cb.gelu(conv2_out);
+            defer cb.free(conv2_act);
+            hidden = try timeMajorHidden(cb, allocator, conv2_act, batch, d_model, enc_time);
+            hidden_live = true;
+        }
+        profile.mark(cb, "conv2");
+    } else {
+        const conv1_out = try cb.conv1d(mel, conv1_w, conv1_b, batch, config.num_mel_bins, d_model, time_steps, 3, 1, 1);
+        defer cb.free(conv1_out);
+        const conv1_act = try cb.gelu(conv1_out);
+        defer cb.free(conv1_act);
+        profile.mark(cb, "conv1");
+        const conv2_out = try cb.conv1d(conv1_act, conv2_w, conv2_b, batch, d_model, d_model, time_steps, 3, 2, 1);
+        defer cb.free(conv2_out);
+        const conv2_act = try cb.gelu(conv2_out);
+        defer cb.free(conv2_act);
+        profile.mark(cb, "conv2");
+        hidden = try timeMajorHidden(cb, allocator, conv2_act, batch, d_model, enc_time);
+        hidden_live = true;
+        profile.mark(cb, "transpose");
+    }
+    defer if (hidden_live) cb.free(hidden);
+
     var pos_ids_buf: [4096]i64 = undefined;
-    if (total > 4096) return error.SequenceTooLong;
+    if (total > pos_ids_buf.len) return error.SequenceTooLong;
     const pos_ids = pos_ids_buf[0..total];
     for (0..total) |i| pos_ids[i] = @intCast(i % enc_time);
-
-    const pos_w = try cb.getWeight("model.encoder.embed_positions.weight");
-    defer cb.free(pos_w);
+    const pos_w = try fetcher.fetch("model.encoder.embed_positions.weight");
     const pos_emb = try cb.embeddingLookup(pos_w, pos_ids, total, d_model);
     defer cb.free(pos_emb);
-
-    const with_pos = try cb.add(hidden, pos_emb);
+    var stream = ResidualStream{ .sum = try cb.add(hidden, pos_emb) };
+    defer stream.deinit(cb);
     cb.free(hidden);
-    hidden = with_pos;
+    hidden_live = false;
+    profile.mark(cb, "positions");
 
-    // 4. Encoder blocks
-    var mask_buf: [4096]i64 = undefined;
-    const mask = mask_buf[0..total];
-    @memset(mask, 1); // audio: attend to everything
-
-    var name_buf: [256]u8 = undefined;
-
+    // 3. Encoder blocks.
     for (0..config.encoder_layers) |layer| {
-        const new_hidden = try encoderBlock(cb, config, hidden, mask, batch, enc_time, layer, &name_buf);
-        cb.free(hidden);
-        hidden = new_hidden;
+        const w = EncoderLayerWeights{
+            .self_ln = try fetcher.norm(layer, "self_attn_layer_norm", &buf),
+            .q = try fetcher.linear(layer, "self_attn.q_proj", &buf),
+            .k = try fetcher.linear(layer, "self_attn.k_proj", &buf),
+            .v = try fetcher.linear(layer, "self_attn.v_proj", &buf),
+            .o = try fetcher.linear(layer, "self_attn.out_proj", &buf),
+            .ffn_ln = try fetcher.norm(layer, "final_layer_norm", &buf),
+            .fc1 = try fetcher.linear(layer, "fc1", &buf),
+            .fc2 = try fetcher.linear(layer, "fc2", &buf),
+        };
+        const normed = try stream.normalize(cb, w.self_ln, d_model, null);
+        defer cb.free(normed);
+        const residual = stream.sum;
+        profile.mark(cb, "ln1");
+
+        const proj = try projectEncoderQkv(cb, &w, normed, total, d_model);
+        defer {
+            cb.free(proj.q);
+            cb.free(proj.k);
+            cb.free(proj.v);
+        }
+        profile.mark(cb, "qkv");
+        // Non-causal attention over all encoder rows; the vision variant
+        // selects the flash kernel for head_dim 64 on Metal.
+        const attn_out = try cb.scaledDotProductAttentionQwen3VlVision(proj.q, proj.k, proj.v, batch, enc_time, num_heads, head_dim);
+        defer cb.free(attn_out);
+        profile.mark(cb, "attention");
+        const projected = try w.o.apply(cb, attn_out, total, d_model, d_model);
+        defer cb.free(projected);
+        const after_attn = try addNorm(cb, projected, residual, w.ffn_ln, d_model, null);
+        var after_attn_sum_live = true;
+        defer if (after_attn_sum_live) cb.free(after_attn.sum);
+        defer cb.free(after_attn.normed);
+        profile.mark(cb, "out_proj");
+
+        const fc1_out = try w.fc1.apply(cb, after_attn.normed, total, d_model, ffn_dim);
+        defer cb.free(fc1_out);
+        const activated = try cb.gelu(fc1_out);
+        defer cb.free(activated);
+        profile.mark(cb, "fc1");
+        const fc2_out = try w.fc2.apply(cb, activated, total, ffn_dim, d_model);
+        profile.mark(cb, "fc2");
+
+        cb.free(stream.sum);
+        stream.sum = after_attn.sum;
+        after_attn_sum_live = false;
+        stream.pending = fc2_out;
     }
 
-    // 5. Final layer norm
-    const ln_w = try cb.getWeight("model.encoder.layer_norm.weight");
-    defer cb.free(ln_w);
-    const ln_b = try cb.getWeight("model.encoder.layer_norm.bias");
-    defer cb.free(ln_b);
-    const normed = try cb.layerNorm(hidden, ln_w, ln_b, d_model, 1e-5);
-    cb.free(hidden);
-
+    // 4. Final layer norm, then read the hidden states back.
+    const final_ln = Norm{
+        .w = try fetcher.fetch("model.encoder.layer_norm.weight"),
+        .b = try fetcher.fetch("model.encoder.layer_norm.bias"),
+    };
+    const normed = try stream.normalize(cb, final_ln, d_model, null);
+    defer cb.free(normed);
+    profile.mark(cb, "final_norm");
+    if (frame_active) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        frame_active = false;
+    }
     const result = try cb.toFloat32(normed, allocator);
-    cb.free(normed);
+    profile.mark(cb, "readback");
     return result;
+}
+
+/// A 1-D convolution as im2col plus one dense linear over the backend's
+/// matmul path. Output rows are `[batch * out_time, out_channels]`
+/// (time-major). Null when the backend lacks the pieces.
+fn convViaIm2col(
+    cb: *const ComputeBackend,
+    weight: CT,
+    bias: CT,
+    input: CT,
+    batch: usize,
+    in_channels: usize,
+    out_channels: usize,
+    time_steps: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    time_major: bool,
+) !?CT {
+    const trace = whisperMetalProfileEnabled();
+    const cols = try cb.conv1dIm2col(input, batch, in_channels, time_steps, kernel_size, stride, padding, time_major) orelse {
+        if (trace) std.debug.print("whisper_metal_conv: im2col unavailable in={d} k={d}\n", .{ in_channels, kernel_size });
+        return null;
+    };
+    defer cb.free(cols);
+    const in_dim = in_channels * kernel_size;
+    // The conv weight `[out, in, kernel]` is already the row-major
+    // `[out, in * kernel]` matrix the linear slot wants; the slot
+    // preparation relabels it.
+    const slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = weight, .bias = bias, .in_dim = in_dim, .out_dim = out_channels })) orelse {
+        if (trace) std.debug.print("whisper_metal_conv: no linear slot in={d} out={d}\n", .{ in_dim, out_channels });
+        return null;
+    };
+    const out = try cb.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = cols, .in_dim = in_dim, .out_dim = out_channels });
+    if (out == null and trace) std.debug.print("whisper_metal_conv: linear declined slot={d} in={d} out={d}\n", .{ slot, in_dim, out_channels });
+    return out;
+}
+
+const EncoderLayerWeights = struct {
+    self_ln: Norm,
+    q: Linear,
+    k: Linear,
+    v: Linear,
+    o: Linear,
+    ffn_ln: Norm,
+    fc1: Linear,
+    fc2: Linear,
+};
+
+/// Q/K/V over all encoder rows from one fused dispatch when the backend has
+/// slots for the three projections, otherwise three linears.
+fn projectEncoderQkv(cb: *const ComputeBackend, w: *const EncoderLayerWeights, normed: CT, rows: usize, d_model: usize) !Projections {
+    if (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = w.q.w, .bias = w.q.b, .in_dim = d_model, .out_dim = d_model })) |q_slot| {
+        if (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = w.k.w, .bias = w.k.b, .in_dim = d_model, .out_dim = d_model })) |k_slot| {
+            if (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = w.v.w, .bias = w.v.b, .in_dim = d_model, .out_dim = d_model })) |v_slot| {
+                if (q_slot != k_slot and q_slot != v_slot and k_slot != v_slot) {
+                    if (try cb.decoderRuntimeApplyLinearQkv(&.{
+                        .q_slot = q_slot,
+                        .k_slot = k_slot,
+                        .v_slot = v_slot,
+                        .input = normed,
+                        .in_dim = d_model,
+                        .q_out_dim = d_model,
+                        .kv_out_dim = d_model,
+                    })) |triple| {
+                        return .{ .q = triple.first, .k = triple.second, .v = triple.third };
+                    }
+                }
+            }
+        }
+    }
+    const q = try w.q.apply(cb, normed, rows, d_model, d_model);
+    errdefer cb.free(q);
+    const k = try w.k.apply(cb, normed, rows, d_model, d_model);
+    errdefer cb.free(k);
+    const v = try w.v.apply(cb, normed, rows, d_model, d_model);
+    return .{ .q = q, .k = k, .v = v };
 }
 
 /// Run the Whisper decoder forward pass.
@@ -190,68 +410,6 @@ pub fn decoderForward(
 
     const result = try cb.toFloat32(logits, allocator);
     cb.free(logits);
-    return result;
-}
-
-// --- Encoder block ---
-
-fn encoderBlock(
-    cb: *const ComputeBackend,
-    config: Config,
-    hidden: CT,
-    attention_mask: []const i64,
-    batch: usize,
-    seq_len: usize,
-    layer: usize,
-    buf: *[256]u8,
-) !CT {
-    const d_model = config.d_model;
-    const num_heads = config.encoder_attention_heads;
-    const head_dim = config.encoderHeadDim();
-    const ffn_dim = config.encoder_ffn_dim;
-    const total = batch * seq_len;
-
-    // --- Self-attention sublayer (pre-norm) ---
-    const ln_w = try getEncoderWeight(cb, layer, "self_attn_layer_norm.weight", buf);
-    defer cb.free(ln_w);
-    const ln_b = try getEncoderWeight(cb, layer, "self_attn_layer_norm.bias", buf);
-    defer cb.free(ln_b);
-    const normed = try cb.layerNorm(hidden, ln_w, ln_b, d_model, 1e-5);
-    defer cb.free(normed);
-
-    const Q = try linearWithBias(cb, normed, layer, "encoder", "self_attn.q_proj", total, d_model, d_model, buf);
-    defer cb.free(Q);
-    const K = try linearWithBias(cb, normed, layer, "encoder", "self_attn.k_proj", total, d_model, d_model, buf);
-    defer cb.free(K);
-    const V = try linearWithBias(cb, normed, layer, "encoder", "self_attn.v_proj", total, d_model, d_model, buf);
-    defer cb.free(V);
-
-    const attn_out = try cb.scaledDotProductAttention(Q, K, V, attention_mask, null, batch, seq_len, num_heads, head_dim);
-    defer cb.free(attn_out);
-
-    const projected = try linearWithBias(cb, attn_out, layer, "encoder", "self_attn.out_proj", total, d_model, d_model, buf);
-    defer cb.free(projected);
-
-    const attn_res = try cb.add(projected, hidden);
-
-    // --- FFN sublayer (pre-norm) ---
-    const ffn_ln_w = try getEncoderWeight(cb, layer, "final_layer_norm.weight", buf);
-    defer cb.free(ffn_ln_w);
-    const ffn_ln_b = try getEncoderWeight(cb, layer, "final_layer_norm.bias", buf);
-    defer cb.free(ffn_ln_b);
-    const ffn_normed = try cb.layerNorm(attn_res, ffn_ln_w, ffn_ln_b, d_model, 1e-5);
-    defer cb.free(ffn_normed);
-
-    const fc1_out = try linearWithBias(cb, ffn_normed, layer, "encoder", "fc1", total, d_model, ffn_dim, buf);
-    defer cb.free(fc1_out);
-    const activated = try cb.gelu(fc1_out);
-    defer cb.free(activated);
-    const fc2_out = try linearWithBias(cb, activated, layer, "encoder", "fc2", total, ffn_dim, d_model, buf);
-    defer cb.free(fc2_out);
-
-    const result = try cb.add(fc2_out, attn_res);
-    cb.free(attn_res);
-
     return result;
 }
 
@@ -533,6 +691,8 @@ const WeightFetcher = struct {
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     handles: std.ArrayListUnmanaged(CT) = .empty,
+    /// Layer weight name prefix (`model.decoder.layers` or `model.encoder.layers`).
+    prefix: []const u8 = "model.decoder.layers",
 
     fn fetch(self: *WeightFetcher, name: []const u8) !CT {
         const tensor = try self.cb.getWeight(name);
@@ -552,17 +712,17 @@ const WeightFetcher = struct {
     }
 
     fn linear(self: *WeightFetcher, layer: usize, proj: []const u8, buf: *[256]u8) !Linear {
-        const w_name = std.fmt.bufPrint(buf, "model.decoder.layers.{d}.{s}.weight", .{ layer, proj }) catch return error.NameTooLong;
+        const w_name = std.fmt.bufPrint(buf, "{s}.{d}.{s}.weight", .{ self.prefix, layer, proj }) catch return error.NameTooLong;
         const w = try self.fetch(w_name);
-        const b_name = std.fmt.bufPrint(buf, "model.decoder.layers.{d}.{s}.bias", .{ layer, proj }) catch return error.NameTooLong;
+        const b_name = std.fmt.bufPrint(buf, "{s}.{d}.{s}.bias", .{ self.prefix, layer, proj }) catch return error.NameTooLong;
         const b = try self.fetchOptional(b_name);
         return .{ .w = w, .b = b };
     }
 
     fn norm(self: *WeightFetcher, layer: usize, name: []const u8, buf: *[256]u8) !Norm {
-        const w_name = std.fmt.bufPrint(buf, "model.decoder.layers.{d}.{s}.weight", .{ layer, name }) catch return error.NameTooLong;
+        const w_name = std.fmt.bufPrint(buf, "{s}.{d}.{s}.weight", .{ self.prefix, layer, name }) catch return error.NameTooLong;
         const w = try self.fetch(w_name);
-        const b_name = std.fmt.bufPrint(buf, "model.decoder.layers.{d}.{s}.bias", .{ layer, name }) catch return error.NameTooLong;
+        const b_name = std.fmt.bufPrint(buf, "{s}.{d}.{s}.bias", .{ self.prefix, layer, name }) catch return error.NameTooLong;
         const b = try self.fetch(b_name);
         return .{ .w = w, .b = b };
     }
@@ -1063,27 +1223,36 @@ fn decoderBlockCached(
     const hidden = stream.sum;
     profile.mark(cb, .self_norm);
 
-    // Decode steps with a resident slab and prepared slots project K and V
-    // straight into their cache rows, so the append is free and the step
-    // needs no blit (which would split the command sequence).
+    // With a resident slab and prepared slots, K and V are projected
+    // straight into their cache rows (one fused dispatch for a single token,
+    // two multi-row linears for the prompt block), so the append is free and
+    // no blit splits the command sequence.
     var proj: Projections = undefined;
     var in_place = false;
-    if (start > 0 and dec_seq == 1 and cache.preallocated() and w.qkv_slots != null and start < cache.capacity) {
+    if (cache.preallocated() and w.qkv_slots != null and start + dec_seq <= cache.capacity) {
         const slots = w.qkv_slots.?;
-        const k_dst = try cb.sliceRows2D(allocator, layer_cache.k_self.?, start, 1, d_model);
+        const k_dst = try cb.sliceRows2D(allocator, layer_cache.k_self.?, start, dec_seq, d_model);
         var dst_live = true;
         errdefer if (dst_live) cb.free(k_dst);
-        const v_dst = try cb.sliceRows2D(allocator, layer_cache.v_self.?, start, 1, d_model);
+        const v_dst = try cb.sliceRows2D(allocator, layer_cache.v_self.?, start, dec_seq, d_model);
         errdefer if (dst_live) cb.free(v_dst);
-        if (try cb.decoderRuntimeApplyLinearQkvInto(&.{
-            .q_slot = slots[0],
-            .k_slot = slots[1],
-            .v_slot = slots[2],
-            .input = normed,
-            .in_dim = d_model,
-            .q_out_dim = d_model,
-            .kv_out_dim = d_model,
-        }, k_dst, v_dst)) |q| {
+        var q_in_place: ?CT = null;
+        if (dec_seq == 1) {
+            q_in_place = try cb.decoderRuntimeApplyLinearQkvInto(&.{
+                .q_slot = slots[0],
+                .k_slot = slots[1],
+                .v_slot = slots[2],
+                .input = normed,
+                .in_dim = d_model,
+                .q_out_dim = d_model,
+                .kv_out_dim = d_model,
+            }, k_dst, v_dst);
+        } else {
+            const k_ok = try cb.decoderRuntimeApplyLinearInto(&.{ .slot = slots[1], .input = normed, .in_dim = d_model, .out_dim = d_model }, k_dst);
+            const v_ok = k_ok and try cb.decoderRuntimeApplyLinearInto(&.{ .slot = slots[2], .input = normed, .in_dim = d_model, .out_dim = d_model }, v_dst);
+            if (v_ok) q_in_place = try w.q.apply(cb, normed, dec_seq, d_model, d_model);
+        }
+        if (q_in_place) |q| {
             proj = .{ .q = q, .k = k_dst, .v = v_dst };
             in_place = true;
             profile.fused_qkv += 1;

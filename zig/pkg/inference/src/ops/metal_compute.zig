@@ -5269,7 +5269,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .dense_fallback_max_bytes = if (dense_mirror) 32 * 1024 * 1024 else null,
             .allow_direct_quant_fallback = dense_mirror,
             .prefer_f16_mps_fallback = dense_mirror,
-        }))) return null;
+        }))) {
+            if (getenvBool("TERMITE_METAL_TRACE_DENSE_LINEAR_PREPARE")) std.debug.print("metal_dense_prepare_failed: slot={d} in={d} out={d}\n", .{ slot, in_dim, out_dim });
+            return null;
+        }
         try self.dynamic_linear_slots.put(self.allocator, key, slot);
         return slot;
     }
@@ -13214,6 +13217,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return err;
         };
         return .{ .sum = sum_ct, .normed = normed_ct };
+    }
+
+    fn conv1dIm2colOp(ctx: *anyopaque, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (bufHasAnyQuantizedStorage(toBuf(input))) return null;
+        if (self.provider_impl.raw_decode_runtime == null) return null;
+        var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
+        defer input_mt.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeConv1dIm2colF32Device(self.provider_impl, .{
+            .input = input_mt,
+            .batch = batch,
+            .in_channels = in_channels,
+            .time_steps = time_steps,
+            .kernel_size = kernel_size,
+            .stride = stride,
+            .padding = padding,
+            .time_major = time_major,
+        })) orelse return null;
+        return try self.ctFromOwnedMetalTensor(tensor);
     }
 
     fn ensureDeviceResidentOp(ctx: *anyopaque, tensor: CT) anyerror!?CT {
@@ -27384,6 +27406,28 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         else
             null;
         defer if (dense_weight) |*weight| weight.deinit();
+        // A weight stored with extra trailing axes (a conv kernel
+        // `[out, in, k]`) is the row-major `[out, in * k]` matrix the slot
+        // wants; relabel it rather than refuse it.
+        if (dense_weight) |*weight| {
+            if (weight.ndim() != 2 and weight.elemCount() == request.in_dim * request.out_dim and
+                request.in_dim <= std.math.maxInt(i32) and request.out_dim <= std.math.maxInt(i32))
+            {
+                const matrix_shape = [_]i32{ @intCast(request.out_dim), @intCast(request.in_dim) };
+                if (weight.isDevice()) {
+                    var relabeled = try weight.retainedView(0, weight.deviceByteLen(), &matrix_shape);
+                    weight.deinit();
+                    dense_weight = relabeled;
+                    _ = &relabeled;
+                } else {
+                    const host = try weight.toHostSlice();
+                    var relabeled = try MetalTensor.ownedCloneFrom(host, &matrix_shape);
+                    weight.deinit();
+                    dense_weight = relabeled;
+                    _ = &relabeled;
+                }
+            }
+        }
         var dummy_weight_value: f32 = 0;
         const dummy_weight_shape = [_]i32{0};
         const weight = dense_weight orelse MetalTensor.borrowed((&dummy_weight_value)[0..1].ptr, 0, &dummy_weight_shape);
@@ -28246,6 +28290,31 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return try self.ctFromOwnedMetalTensor(q);
     }
 
+    fn decoderRuntimeApplyLinearIntoOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearRequest, out: CT) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const out_buf = toBuf(out);
+        if (bufHasAnyQuantizedStorage(out_buf)) return false;
+        const out_metal = if (out_buf.metal_tensor) |*tensor| tensor else return false;
+        if (!out_metal.isDevice()) return false;
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        var linear_input = try retainedLinearInputView(&input, request.in_dim);
+        defer linear_input.deinit();
+        if (!linear_input.isDevice()) return false;
+        const rows: usize = @intCast(linear_input.dim(0));
+        var out_mt = try out_metal.retainedCopy();
+        defer out_mt.deinit();
+        return metal_runtime.tryApplyDenseRuntimeLinearInto(
+            self.provider_impl,
+            request.slot,
+            linear_input,
+            rows,
+            request.in_dim,
+            request.out_dim,
+            out_mt,
+        );
+    }
+
     fn decoderRuntimeBeginPlannedComputeScopeOp(ctx: *anyopaque) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
@@ -28739,6 +28808,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.addLayerNorm = addLayerNormOp;
         vt.addLayerNormSum = addLayerNormSumOp;
         vt.ensureDeviceResident = ensureDeviceResidentOp;
+        vt.conv1dIm2col = conv1dIm2colOp;
         vt.whisperLogitsStatsEncode = whisperLogitsStatsEncodeOp;
         vt.whisperLogitsStatsRead = whisperLogitsStatsReadOp;
         vt.linear = linearOp;
@@ -28844,6 +28914,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimeApplyLinearPair = decoderRuntimeApplyLinearPairOp;
         vt.decoderRuntimeApplyLinearQkv = decoderRuntimeApplyLinearQkvOp;
         vt.decoderRuntimeApplyLinearQkvInto = decoderRuntimeApplyLinearQkvIntoOp;
+        vt.decoderRuntimeApplyLinearInto = decoderRuntimeApplyLinearIntoOp;
         vt.decoderRuntimeBeginPlannedComputeScope = decoderRuntimeBeginPlannedComputeScopeOp;
         vt.decoderRuntimeEndPlannedComputeScope = decoderRuntimeEndPlannedComputeScopeOp;
         vt.decoderRuntimeApplyActivation = decoderRuntimeApplyActivationOp;

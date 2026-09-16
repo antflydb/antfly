@@ -4149,6 +4149,43 @@ pub fn decoderRuntimeApplyAddLayerNorm(self: anytype, request: anytype, stats: a
     return null;
 }
 
+/// Unfold a conv1d input into `[batch * out_time, in_channels * kernel]`
+/// rows on the device, so the convolution runs as one dense linear.
+pub fn decoderRuntimeConv1dIm2colF32Device(self: anytype, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!request.input.isDevice()) return null;
+    if (request.batch == 0 or request.in_channels == 0 or request.time_steps == 0 or request.kernel_size == 0 or request.stride == 0) return null;
+    if (request.time_steps + 2 * request.padding < request.kernel_size) return null;
+    const out_time = (request.time_steps + 2 * request.padding - request.kernel_size) / request.stride + 1;
+    if (out_time == 0) return null;
+    if (request.input.elemCount() != request.batch * request.in_channels * request.time_steps) return null;
+    const rows = request.batch * out_time;
+    const cols = request.in_channels * request.kernel_size;
+    if (rows > std.math.maxInt(i32) or cols > std.math.maxInt(i32)) return null;
+    const out_shape = [_]i32{ @intCast(rows), @intCast(cols) };
+    var output = try MetalTensor.deviceAllocate(runtime, rows * cols * @sizeOf(f32), .private, &out_shape);
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_conv1d_im2col_f32_device(
+        runtime,
+        request.input.deviceHandle(),
+        request.input.deviceByteOffset(),
+        request.batch,
+        request.in_channels,
+        request.time_steps,
+        request.kernel_size,
+        request.stride,
+        request.padding,
+        out_time,
+        @intFromBool(request.time_major),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc == 0) return output;
+    output.deinit();
+    return null;
+}
+
 pub const AddLayerNormSumResult = struct {
     sum: MetalTensor,
     normed: MetalTensor,
@@ -18522,6 +18559,21 @@ pub extern fn termite_metal_decode_runtime_apply_add_layer_norm_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_conv1d_im2col_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    batch: usize,
+    in_channels: usize,
+    time_steps: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    out_time: usize,
+    time_major: u32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_apply_add_layer_norm_sum_device(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -25552,6 +25604,53 @@ pub fn tryApplyDenseRuntimeLinearPair(
         .first = MetalTensor.owned(first_out, &shape),
         .second = MetalTensor.owned(second_out, &shape),
     };
+}
+
+/// Dense linear whose output lands in a caller-provided device tensor
+/// (`rows x out_dim`), e.g. rows of a resident cache slab. False when the
+/// slot, shapes, or residency do not fit; nothing is written then.
+pub fn tryApplyDenseRuntimeLinearInto(
+    self: anytype,
+    slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    out: MetalTensor,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or in_dim == 0 or out_dim == 0) return false;
+    if (rows > std.math.maxInt(i32) or in_dim > std.math.maxInt(i32) or out_dim > std.math.maxInt(i32)) return false;
+    if (!self.raw_linear_slots_prepared[slot] or self.raw_linear_slot_kinds[slot] != .dense) return false;
+    if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return false;
+    if (!input.isDevice() or !out.isDevice()) return false;
+    if (input.ndim() != 2 or @as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return false;
+    if (out.ndim() != 2 or @as(usize, @intCast(out.dim(0))) != rows or @as(usize, @intCast(out.dim(1))) != out_dim) return false;
+    const rc = if (rows == 1)
+        termite_metal_decode_runtime_apply_linear_device(
+            runtime,
+            slot,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            in_dim,
+            out_dim,
+            out.deviceHandle(),
+            out.deviceByteOffset(),
+        )
+    else
+        termite_metal_decode_runtime_apply_linear_multi_row_device(
+            runtime,
+            slot,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            rows,
+            in_dim,
+            out_dim,
+            out.deviceHandle(),
+            out.deviceByteOffset(),
+        );
+    return rc == 0;
 }
 
 /// Single-row fused Q/K/V projection whose K and V land in caller-provided

@@ -13,6 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
+const build_options = @import("build_options");
 const generic = @import("inference_audio");
 
 pub const wav = generic.wav;
@@ -112,9 +114,177 @@ pub fn whisperMelFromPcmSeconds(
     const prepared = try copyOrResample(allocator, window, sample_rate, WHISPER_SAMPLE_RATE);
     defer allocator.free(prepared);
     const bounded = prepared[0..@min(prepared.len, @as(usize, seconds) * WHISPER_SAMPLE_RATE)];
+    if (blas_available and !platform.env.getenvBool("TERMITE_WHISPER_DISABLE_BLAS_MEL")) {
+        return whisperLogMelBlas(allocator, bounded, seconds);
+    }
     var config = WHISPER_CONFIG;
     config.chunk_length_s = seconds;
     return logMelSpectrogramWithConfig(allocator, bounded, config);
+}
+
+const blas_available = build_options.enable_system_blas;
+
+const blas = if (blas_available) struct {
+    pub const row_major: c_int = 101;
+    pub const no_trans: c_int = 111;
+    pub const trans: c_int = 112;
+    pub extern "c" fn cblas_sgemm(
+        layout: c_int,
+        transa: c_int,
+        transb: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        alpha: f32,
+        a: [*]const f32,
+        lda: c_int,
+        b: [*]const f32,
+        ldb: c_int,
+        beta: f32,
+        c_out: [*]f32,
+        ldc: c_int,
+    ) void;
+} else struct {};
+
+/// Whisper log-mel as two dense matrix products on the system BLAS: the
+/// windowed frames against the 400-point DFT basis, then the power
+/// spectrum against the mel filterbank. Same math as the FFT path within
+/// float rounding, and several times faster than the per-frame Bluestein
+/// transform on a 30 s window. Output layout and normalization match
+/// `logMelSpectrogramWithConfig` with the Whisper configuration.
+pub fn whisperLogMelBlas(allocator: std.mem.Allocator, samples: []const f32, seconds: u32) ![]f32 {
+    const n_fft: usize = WHISPER_CONFIG.n_fft;
+    const hop: usize = WHISPER_CONFIG.hop_length;
+    const n_mels: usize = WHISPER_CONFIG.n_mels;
+    const n_freq = n_fft / 2 + 1;
+    const max_frames = @as(usize, seconds) * WHISPER_SAMPLE_RATE / hop;
+    const min_samples = @as(usize, seconds) * WHISPER_SAMPLE_RATE;
+    const padded_len = @max(samples.len, min_samples);
+    const frames = @min((padded_len - n_fft) / hop + 1, max_frames);
+    if (frames == 0 or frames > std.math.maxInt(c_int) / 2) return error.UnsupportedAudioFormat;
+
+    // Windowed frames [frames, n_fft].
+    const frame_matrix = try allocator.alloc(f32, frames * n_fft);
+    defer allocator.free(frame_matrix);
+    for (0..frames) |f| {
+        const start = f * hop;
+        const row = frame_matrix[f * n_fft ..][0..n_fft];
+        for (0..n_fft) |i| {
+            const idx = start + i;
+            const sample: f32 = if (idx < samples.len) samples[idx] else 0;
+            const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_fft));
+            row[i] = sample * 0.5 * (1.0 - @cos(2.0 * std.math.pi * t));
+        }
+    }
+
+    // DFT basis [n_fft, 2 * n_freq]: cos and -sin per bin.
+    const basis_cols = 2 * n_freq;
+    const basis = try allocator.alloc(f32, n_fft * basis_cols);
+    defer allocator.free(basis);
+    for (0..n_fft) |i| {
+        for (0..n_freq) |k| {
+            const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(i * k)) / @as(f64, @floatFromInt(n_fft));
+            basis[i * basis_cols + 2 * k] = @floatCast(@cos(angle));
+            basis[i * basis_cols + 2 * k + 1] = @floatCast(-@sin(angle));
+        }
+    }
+
+    const spectrum = try allocator.alloc(f32, frames * basis_cols);
+    defer allocator.free(spectrum);
+    blas.cblas_sgemm(
+        blas.row_major,
+        blas.no_trans,
+        blas.no_trans,
+        @intCast(frames),
+        @intCast(basis_cols),
+        @intCast(n_fft),
+        1.0,
+        frame_matrix.ptr,
+        @intCast(n_fft),
+        basis.ptr,
+        @intCast(basis_cols),
+        0.0,
+        spectrum.ptr,
+        @intCast(basis_cols),
+    );
+
+    // Power spectrum [frames, n_freq].
+    const power = try allocator.alloc(f32, frames * n_freq);
+    defer allocator.free(power);
+    for (0..frames) |f| {
+        const src = spectrum[f * basis_cols ..][0..basis_cols];
+        const dst = power[f * n_freq ..][0..n_freq];
+        for (0..n_freq) |k| {
+            const re = src[2 * k];
+            const im = src[2 * k + 1];
+            dst[k] = re * re + im * im;
+        }
+    }
+
+    // Mel energies [frames, n_mels] = power x filters^T.
+    const filters = try generic.melFilterbankWithRange(allocator, @intCast(n_mels), @intCast(n_fft), WHISPER_SAMPLE_RATE, 0, 0);
+    defer allocator.free(filters);
+    const mel = try allocator.alloc(f32, frames * n_mels);
+    defer allocator.free(mel);
+    blas.cblas_sgemm(
+        blas.row_major,
+        blas.no_trans,
+        blas.trans,
+        @intCast(frames),
+        @intCast(n_mels),
+        @intCast(n_freq),
+        1.0,
+        power.ptr,
+        @intCast(n_freq),
+        filters.ptr,
+        @intCast(n_freq),
+        0.0,
+        mel.ptr,
+        @intCast(n_mels),
+    );
+
+    // [n_mels, max_frames] with Whisper's log10, clamp, and scale.
+    const output = try allocator.alloc(f32, n_mels * max_frames);
+    errdefer allocator.free(output);
+    @memset(output, 0);
+    for (0..frames) |f| {
+        for (0..n_mels) |m| {
+            output[m * max_frames + f] = @max(mel[f * n_mels + m], 1e-10);
+        }
+    }
+    var max_val: f32 = -std.math.inf(f32);
+    for (output) |*v| {
+        v.* = @log(v.*) / @log(10.0);
+        if (v.* > max_val) max_val = v.*;
+    }
+    const floor_val = max_val - 8.0;
+    const offset_val = max_val - 4.0;
+    for (output) |*v| v.* = (@max(v.*, floor_val) - offset_val) * 0.25;
+    return output;
+}
+
+test "blas log-mel matches the fft path" {
+    if (!blas_available) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const seconds: u32 = 2;
+    const samples = try allocator.alloc(f32, seconds * WHISPER_SAMPLE_RATE - 3000);
+    defer allocator.free(samples);
+    var prng = std.Random.DefaultPrng.init(0x3e1);
+    const random = prng.random();
+    for (samples, 0..) |*s, i| {
+        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(WHISPER_SAMPLE_RATE));
+        s.* = 0.4 * @sin(2.0 * std.math.pi * 440.0 * t) + 0.2 * @sin(2.0 * std.math.pi * 3100.0 * t) + 0.05 * (random.float(f32) - 0.5);
+    }
+    var config = WHISPER_CONFIG;
+    config.chunk_length_s = seconds;
+    const reference = try logMelSpectrogramWithConfig(allocator, samples, config);
+    defer allocator.free(reference);
+    const fast = try whisperLogMelBlas(allocator, samples, seconds);
+    defer allocator.free(fast);
+    try std.testing.expectEqual(reference.len, fast.len);
+    var max_diff: f32 = 0;
+    for (reference, fast) |a, b| max_diff = @max(max_diff, @abs(a - b));
+    try std.testing.expect(max_diff < 2e-3);
 }
 
 /// Mel frames produced for a `seconds` context (100 per second at 16 kHz).

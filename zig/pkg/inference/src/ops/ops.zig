@@ -1693,6 +1693,7 @@ pub const ComputeBackend = struct {
         addLayerNorm: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
         addLayerNormSum: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?AddLayerNormSumResult = null,
         ensureDeviceResident: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
+        conv1dIm2col: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT = null,
         whisperLogitsStatsEncode: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
         whisperLogitsStatsRead: ?*const fn (ctx: *anyopaque, out: *WhisperLogitsStatsRaw) bool = null,
 
@@ -2545,6 +2546,7 @@ pub const ComputeBackend = struct {
         /// input and return all projected outputs.
         decoderRuntimeApplyLinearQkv: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest) anyerror!?LinearNoBiasTripleResult = null,
         decoderRuntimeApplyLinearQkvInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) anyerror!?CT = null,
+        decoderRuntimeApplyLinearInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearRequest, out: CT) anyerror!bool = null,
         decoderRuntimeBeginPlannedComputeScope: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
         decoderRuntimeEndPlannedComputeScope: ?*const fn (ctx: *anyopaque) void = null,
 
@@ -3438,6 +3440,15 @@ pub const ComputeBackend = struct {
 
     pub fn layerNormBackward(self: *const ComputeBackend, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) !?CT {
         if (self.vtable.layerNormBackward) |f| return try f(self.ptr, input, gamma, beta, dy, dim, eps);
+        return null;
+    }
+
+    /// Unfold a conv1d input into `[batch * out_time, in_channels * kernel]`
+    /// rows so the convolution runs as a dense linear over the backend's
+    /// matmul path. `time_major` reads `[batch * time, channels]` input
+    /// instead of `[batch, channels, time]`. Null when unsupported.
+    pub fn conv1dIm2col(self: *const ComputeBackend, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) !?CT {
+        if (self.vtable.conv1dIm2col) |f| return f(self.ptr, input, batch, in_channels, time_steps, kernel_size, stride, padding, time_major);
         return null;
     }
 
@@ -4610,6 +4621,14 @@ pub const ComputeBackend = struct {
             return op(self.ptr, request);
         }
         return null;
+    }
+
+    /// Dense linear written into `out`, a `rows x out_dim` device tensor
+    /// such as rows of a resident cache. False (nothing written) when the
+    /// backend cannot place the output.
+    pub fn decoderRuntimeApplyLinearInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearRequest, out: CT) !bool {
+        if (self.vtable.decoderRuntimeApplyLinearInto) |op| return op(self.ptr, request, out);
+        return false;
     }
 
     /// Single-row fused Q/K/V where K and V are written into `k_out` and
