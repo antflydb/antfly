@@ -24434,6 +24434,73 @@ fn implementationTests() type {
             try std.testing.expect(written[1] * 4 < written[0]);
         }
 
+        test "lsm backend metadata updates bound snapshot memory across WAL reopen" {
+            var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer storage.deinit();
+
+            const root_dir = "/lsm-metadata-churn-reopen";
+            const options = Options{
+                .flush_threshold = 64,
+                .storage = storage.storage(),
+            };
+            const keys = [_][]const u8{ "node:1", "node:2" };
+            var expected: [2][4097]u8 = undefined;
+            var lengths: [2]usize = undefined;
+            var peak_live_bytes: u64 = 0;
+            var peak_immutable_bytes: u64 = 0;
+            {
+                var backend = try Backend.open(std.testing.allocator, root_dir, options);
+                defer backend.close();
+                for (0..512) |round| {
+                    {
+                        var write = try backend.beginWrite();
+                        defer write.abort();
+                        for (keys, 0..) |key, slot| {
+                            lengths[slot] = 4096 + (round + slot) % 2;
+                            const value = expected[slot][0..lengths[slot]];
+                            @memset(value, @truncate(round + slot));
+                            std.mem.writeInt(u64, expected[slot][0..8], @intCast(round), .little);
+                            try write.put(.{ .name = "metadata-apply" }, key, value);
+                        }
+                        try write.commit();
+                    }
+                    {
+                        var read = try backend.beginRead();
+                        defer read.abort();
+                        for (keys, 0..) |key, slot|
+                            try std.testing.expectEqualSlices(u8, expected[slot][0..lengths[slot]], try read.get(.{ .name = "metadata-apply" }, key));
+                    }
+                    const stats = backend.snapshotMaintenanceStats();
+                    peak_live_bytes = @max(peak_live_bytes, stats.mutable_bytes + stats.immutable_bytes + stats.retired_immutable_bytes);
+                    peak_immutable_bytes = @max(peak_immutable_bytes, stats.immutable_bytes);
+                }
+                backend.options.backend.read_only = true;
+            }
+
+            var reopened = try Backend.open(std.testing.allocator, root_dir, options);
+            defer reopened.close();
+            const open_stats = reopened.snapshotOpenStats();
+            try std.testing.expect(open_stats.wal_replay_records >= 512);
+            try std.testing.expect(open_stats.wal_replay_entries >= 1024);
+            const before_read = reopened.snapshotMaintenanceStats();
+            {
+                var read = try reopened.beginRead();
+                defer read.abort();
+                for (keys, 0..) |key, slot|
+                    try std.testing.expectEqualSlices(u8, expected[slot][0..lengths[slot]], try read.get(.{ .name = "metadata-apply" }, key));
+            }
+            const after_read = reopened.snapshotMaintenanceStats();
+            const replay_bytes = before_read.mutable_bytes + before_read.immutable_bytes + before_read.retired_immutable_bytes;
+            const reopened_bytes = after_read.mutable_bytes + after_read.immutable_bytes + after_read.retired_immutable_bytes;
+            std.debug.print("METADATA_CHURN live_peak={d} immutable_peak={d} replay_bytes={d} reopened_bytes={d}\n", .{
+                peak_live_bytes, peak_immutable_bytes, replay_bytes, reopened_bytes,
+            });
+            try std.testing.expect(peak_live_bytes < 512 * 1024);
+            try std.testing.expect(peak_immutable_bytes < 512 * 1024);
+            try std.testing.expect(replay_bytes < 512 * 1024);
+            try std.testing.expect(reopened_bytes < 512 * 1024);
+        }
+
         test "lsm backend recovery replay stores snapshot-shareable mutable entries" {
             var memory_storage = storage_io.MemoryStorage.init(std.testing.allocator);
             defer memory_storage.deinit();

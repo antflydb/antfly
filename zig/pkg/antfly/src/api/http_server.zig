@@ -1092,6 +1092,50 @@ pub const InferenceRequestAdmissionSource = struct {
     }
 };
 
+pub const RuntimeIoViews = struct {
+    api: ?std.Io = null,
+    api_network: ?std.Io = null,
+    api_filesystem: ?std.Io = null,
+    durable: ?std.Io = null,
+};
+
+test "imported runtime I/O views override raw runtime including unavailable views" {
+    var tokens: [5]u8 = @splat(0);
+    const owner_io: std.Io = .{ .userdata = &tokens[0], .vtable = std.Io.failing.vtable };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = owner_io },
+    });
+    defer runtime.deinit();
+    var cfg: ApiHttpServerConfig = .{
+        .backend_runtime = runtime.ptr(),
+        .imported_runtime_io = .{
+            .api = .{ .userdata = &tokens[1], .vtable = std.Io.failing.vtable },
+            .api_network = .{ .userdata = &tokens[2], .vtable = std.Io.failing.vtable },
+            .api_filesystem = .{ .userdata = &tokens[3], .vtable = std.Io.failing.vtable },
+            .durable = .{ .userdata = &tokens[4], .vtable = std.Io.failing.vtable },
+        },
+    };
+    try std.testing.expect(ApiHttpServer.configuredApiIo(cfg).?.userdata == @as(?*anyopaque, &tokens[1]));
+    try std.testing.expect(ApiHttpServer.configuredApiNetworkIo(cfg).?.userdata == @as(?*anyopaque, &tokens[2]));
+    try std.testing.expect(ApiHttpServer.configuredApiFilesystemIo(cfg).?.userdata == @as(?*anyopaque, &tokens[3]));
+    try std.testing.expect(ApiHttpServer.configuredDurableIo(cfg).?.userdata == @as(?*anyopaque, &tokens[4]));
+    try std.testing.expect(ApiHttpServer.queryEmbeddingCacheIo(cfg).userdata == @as(?*anyopaque, &tokens[1]));
+    cfg.imported_runtime_io = .{};
+    try std.testing.expect(ApiHttpServer.configuredApiIo(cfg) == null);
+    try std.testing.expect(ApiHttpServer.configuredApiNetworkIo(cfg) == null);
+    try std.testing.expect(ApiHttpServer.configuredApiFilesystemIo(cfg) == null);
+    try std.testing.expect(ApiHttpServer.configuredDurableIo(cfg) == null);
+    cfg.imported_runtime_io = null;
+    try std.testing.expect(ApiHttpServer.configuredApiIo(cfg).?.userdata == owner_io.userdata);
+    try std.testing.expect(ApiHttpServer.configuredApiNetworkIo(cfg).?.userdata == owner_io.userdata);
+    try std.testing.expect(ApiHttpServer.configuredApiFilesystemIo(cfg).?.userdata == owner_io.userdata);
+    try std.testing.expect(ApiHttpServer.configuredDurableIo(cfg).?.userdata == owner_io.userdata);
+    cfg.backend_runtime = null;
+    try std.testing.expect(ApiHttpServer.configuredApiIo(cfg) == null);
+    try std.testing.expect(ApiHttpServer.configuredDurableIo(cfg) == null);
+}
+
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     experimental: bool = false,
@@ -1146,6 +1190,7 @@ pub const ApiHttpServerConfig = struct {
     internal_service_accept_legacy_unauthenticated: bool = false,
     deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    imported_runtime_io: ?RuntimeIoViews = null,
     storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
     /// Node-local Raft quarantine diagnostics and fenced recovery. The source
     /// owns runtime serialization; handlers never access a Raft host directly.
@@ -3174,8 +3219,8 @@ pub const ApiHttpServer = struct {
                 .repair_job_store_path = cfg.repair_job_store_path,
                 .repair_job_retention_ms = cfg.repair_job_retention_ms,
             }),
-            .restore_job_store = if (cfg.backend_runtime) |runtime|
-                if (runtime.io()) |io| restore_jobs.Store.initWithIo(owner_alloc, io) else restore_jobs.Store.init(owner_alloc)
+            .restore_job_store = if (configuredDurableIo(cfg)) |io|
+                restore_jobs.Store.initWithIo(owner_alloc, io)
             else
                 restore_jobs.Store.init(owner_alloc),
             .repair_job_owner_id = owner_ids.repair,
@@ -3210,8 +3255,31 @@ pub const ApiHttpServer = struct {
 
     fn queryEmbeddingCacheIo(cfg: ApiHttpServerConfig) std.Io {
         const fallback = std.Io.Threaded.global_single_threaded.io();
-        const runtime = cfg.backend_runtime orelse return fallback;
-        return runtime.apiIo() orelse fallback;
+        return configuredApiIo(cfg) orelse fallback;
+    }
+
+    fn configuredApiIo(cfg: ApiHttpServerConfig) ?std.Io {
+        if (cfg.imported_runtime_io) |views| return views.api;
+        const runtime = cfg.backend_runtime orelse return null;
+        return runtime.apiIo();
+    }
+
+    fn configuredApiNetworkIo(cfg: ApiHttpServerConfig) ?std.Io {
+        if (cfg.imported_runtime_io) |views| return views.api_network;
+        const runtime = cfg.backend_runtime orelse return null;
+        return runtime.apiNetworkIo();
+    }
+
+    fn configuredApiFilesystemIo(cfg: ApiHttpServerConfig) ?std.Io {
+        if (cfg.imported_runtime_io) |views| return views.api_filesystem;
+        const runtime = cfg.backend_runtime orelse return null;
+        return runtime.apiFilesystemIo();
+    }
+
+    fn configuredDurableIo(cfg: ApiHttpServerConfig) ?std.Io {
+        if (cfg.imported_runtime_io) |views| return views.durable;
+        const runtime = cfg.backend_runtime orelse return null;
+        return runtime.io();
     }
 
     fn protocolStoreNowNs() u64 {
@@ -3220,8 +3288,7 @@ pub const ApiHttpServer = struct {
 
     pub fn inferenceIo(self: *const ApiHttpServer) std.Io {
         const fallback = std.Io.Threaded.global_single_threaded.io();
-        const runtime = self.cfg.backend_runtime orelse return fallback;
-        return runtime.apiNetworkIo() orelse fallback;
+        return configuredApiNetworkIo(self.cfg) orelse fallback;
     }
 
     pub fn requestStats(self: *ApiHttpServer) RequestStats {
@@ -3769,8 +3836,8 @@ pub const ApiHttpServer = struct {
             .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
-            .network_io = if (self.cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null,
-            .filesystem_io = if (self.cfg.backend_runtime) |runtime| runtime.apiFilesystemIo() else null,
+            .network_io = self.sharedApiNetworkIo(),
+            .filesystem_io = self.sharedApiFilesystemIo(),
         }, &self.connections_cache, .{
             .include_models = connections_api.includeHasModels(include_param),
             .probe = connections_api.includeHasStatus(include_param),
@@ -3838,13 +3905,11 @@ pub const ApiHttpServer = struct {
     /// Shared asynchronous I/O runtime for short-lived API helpers. Borrowers
     /// must not retain it beyond the server lifetime.
     pub fn sharedApiIo(self: *ApiHttpServer) ?std.Io {
-        const runtime = self.cfg.backend_runtime orelse return null;
-        return runtime.apiIo();
+        return configuredApiIo(self.cfg);
     }
 
     pub fn sharedApiNetworkIo(self: *ApiHttpServer) ?std.Io {
-        const runtime = self.cfg.backend_runtime orelse return null;
-        return runtime.apiNetworkIo();
+        return configuredApiNetworkIo(self.cfg);
     }
 
     /// Local backup repositories need the API lane's native filesystem
@@ -3854,16 +3919,14 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         location: *const backups_api.BackupLocation,
     ) ?std.Io {
-        const runtime = self.cfg.backend_runtime orelse return null;
         return switch (location.*) {
-            .file => runtime.apiFilesystemIo(),
-            .remote => runtime.apiNetworkIo(),
+            .file => self.sharedApiFilesystemIo(),
+            .remote => self.sharedApiNetworkIo(),
         };
     }
 
     pub fn sharedApiFilesystemIo(self: *ApiHttpServer) ?std.Io {
-        const runtime = self.cfg.backend_runtime orelse return null;
-        return runtime.apiFilesystemIo();
+        return configuredApiFilesystemIo(self.cfg);
     }
 
     /// Native shard backup and restore always operate on local files, even
@@ -6018,10 +6081,8 @@ pub const ApiHttpServer = struct {
     }
 
     fn internalAuthRealtimeNs(self: *ApiHttpServer) i128 {
-        if (self.cfg.backend_runtime) |runtime| {
-            if (runtime.io()) |io|
-                return @intCast(std.Io.Clock.real.now(io).nanoseconds);
-        }
+        if (configuredDurableIo(self.cfg)) |io|
+            return @intCast(std.Io.Clock.real.now(io).nanoseconds);
         return nowNs();
     }
 
@@ -15908,8 +15969,7 @@ pub const ApiHttpServer = struct {
 
         fn run(ptr: *anyopaque) !void {
             const self: *TableRepairJobHeartbeatWork = @ptrCast(@alignCast(ptr));
-            const runtime = self.server.cfg.backend_runtime orelse return;
-            const api_io = runtime.apiIo() orelse return;
+            const api_io = self.server.sharedApiIo() orelse return;
             var elapsed_ns: u64 = 0;
             while (!self.stop.load(.acquire)) {
                 api_io.sleep(std.Io.Duration.fromNanoseconds(@intCast(poll_ns)), .awake) catch {};
@@ -15970,7 +16030,7 @@ pub const ApiHttpServer = struct {
     fn submitTableRepairJobHeartbeat(self: *ApiHttpServer, job_id: u64, attempt_id: u64) !?*TableRepairJobHeartbeatWork {
         const runtime = self.cfg.backend_runtime orelse return null;
         if (runtime.threaded_jobs == null) return null;
-        if (runtime.apiIo() == null) return null;
+        if (self.sharedApiIo() == null) return null;
         if (self.repair_job_owner_id == 0) return null;
 
         const heartbeat = try self.alloc.create(TableRepairJobHeartbeatWork);
