@@ -2760,6 +2760,8 @@ test "metadata ownership excludes colliding data placements across control round
         var server = try Server.init(alloc, paths.config());
         defer server.deinit();
         try server.start();
+        // start() runs the restore supervisor. Drive Raft through the service
+        // owner so Ready processing shares its lock with supervisor ReadIndex.
         const svc = server.metadataHttpService();
         try server.bootstrapLocal(svc.metadata_group_id, 3);
         if (boot == 0) {
@@ -2898,6 +2900,8 @@ fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !v
         var server = try Server.init(alloc, cfg);
         defer server.deinit();
         try server.start();
+        // start() runs the restore supervisor. Drive Raft through the service
+        // owner so Ready processing shares its lock with supervisor ReadIndex.
         const svc = server.metadataHttpService();
         try server.bootstrapLocal(svc.metadata_group_id, 3);
         if (boot == 0) {
@@ -2946,8 +2950,6 @@ fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !v
                 });
             }
         }
-        // start() also runs the restore supervisor, which requests ReadIndex.
-        // Drive Raft through the service so both share its runtime mutex.
         for (0..8) |_| try svc.runRaftRoundOnly();
         switch (case) {
             .progress => {

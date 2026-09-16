@@ -963,6 +963,47 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             self.rollback_count += 1;
         }
     };
+    // Exercise the production maintenance/status paths while restore stages,
+    // publishes, rejects metadata publication, reconciles, and reopens owners.
+    // Unlike the deterministic held-lease regression, this uses native workers
+    // and the real compiled storage archive and backup bytes.
+    const RestoreMaintenance = struct {
+        source: *kernel_owner_source.ProvisionedKernelOwnerSource,
+        stop: std.atomic.Value(bool) = .init(false),
+        rounds: std.atomic.Value(usize) = .init(0),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                self.round() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                _ = self.rounds.fetchAdd(1, .release);
+                std.testing.io.sleep(.fromMilliseconds(1), .awake) catch return;
+            }
+        }
+
+        fn round(self: *@This()) !void {
+            const maintenance = self.source.maintenanceSource();
+            _ = try maintenance.maintenanceSnapshot(false);
+            _ = try maintenance.runLsmRound(false);
+            maintenance.publishRuntimeStatuses();
+        }
+    };
+    var concurrent_maintenance = RestoreMaintenance{ .source = &owner_source };
+    const maintenance_thread = try std.Thread.spawn(.{}, RestoreMaintenance.run, .{&concurrent_maintenance});
+    var maintenance_joined = false;
+    defer if (!maintenance_joined) {
+        concurrent_maintenance.stop.store(true, .release);
+        maintenance_thread.join();
+    };
+    const maintenance_deadline = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 5 * std.time.ns_per_s;
+    while (concurrent_maintenance.rounds.load(.acquire) == 0) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= maintenance_deadline) return error.TestMaintenanceNotStarted;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const rounds_before = concurrent_maintenance.rounds.load(.acquire);
     for (backup_formats, 0..) |backup, backup_index| {
         const mutation_key = if (backup.format == .portable) "doc:after-portable" else "doc:after-native";
         _ = try write_source.source().batch(alloc, "articles", .{
@@ -1076,6 +1117,12 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         )) != null);
         try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
     }
+
+    concurrent_maintenance.stop.store(true, .release);
+    maintenance_thread.join();
+    maintenance_joined = true;
+    if (concurrent_maintenance.failure) |err| return err;
+    try std.testing.expect(concurrent_maintenance.rounds.load(.acquire) > rounds_before);
 
     const accepted_snapshot = try shard_state_store.encodeGroupStateSnapshot(
         alloc,

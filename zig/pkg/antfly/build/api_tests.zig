@@ -223,7 +223,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed join applies auth row filter to right table filter query",
         "distributed join preserves native public filters when adding join predicates",
         "scan request errors map to stable client responses",
-        "httpx antfly reads map missing table errors to not found",
+        "httpx antfly reads preserve availability and terminal failures",
         "httpx antfly scan honors optional body and documented bad requests",
         "httpx multi batch route uses the batch commit hook and public response contract",
         "httpx stable transaction commit durably hands off recovery before acknowledgement",
@@ -1233,7 +1233,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     const lib_api_graph_wire_test_step = b.step("lib-api-graph-wire-test", "Run canonical internal graph wire-contract regressions");
     lib_api_graph_wire_test_step.dependOn(&run_lib_api_graph_wire_tests.step);
-    const lib_api_distributed_query_availability_runtime_filters = &.{"distributed query transport failures become one retryable availability condition"};
+    const lib_api_distributed_query_availability_runtime_filters = &.{
+        "distributed query transport failures become one retryable availability condition",
+        "remote lookup transport failures preserve read availability without retrying",
+    };
     const lib_api_distributed_query_availability_tests = @import("linked_tests.zig").add(b, .{
         .name = "api-distributed-query-availability-tests",
         .root_module = api_table_reads_docid_test_mod,
@@ -1578,6 +1581,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "structural reconcile retains ordered constant-time repair wake membership across plan resets",
             "resident DB retry preparation waits outside admission for writer publication",
             "resident DB retry preparation does not block a borrowed std.Io scheduler",
+            "write cache pending closes yield to the borrowed scheduler",
             "admitted resident DB lease never waits for an in-flight writer publication",
             "write cache local mutation preempts stale startup writer",
             "structural reconcile pending set never revisits completed groups",

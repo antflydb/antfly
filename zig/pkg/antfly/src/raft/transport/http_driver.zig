@@ -529,10 +529,6 @@ pub const HttpFrameDriver = struct {
     }
 };
 
-fn nowMs() u64 {
-    return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-}
-
 test "http driver module compiles" {
     _ = HttpDriverConfig;
     _ = SendBatch;
@@ -695,8 +691,8 @@ test "http frame driver isolates blocked peers without reordering a peer lane" {
         },
     });
 
-    const deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-    while (executor.callCount() < 2 and platform_time.monotonicNs() < deadline_ns) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    const deadline_ns = std.Io.Clock.now(.awake, io).nanoseconds + 5 * std.time.ns_per_s;
+    while (executor.callCount() < 2 and std.Io.Clock.now(.awake, io).nanoseconds < deadline_ns) try io.sleep(.fromMilliseconds(1), .awake);
     // One worker may block per peer. The second peer-2 frame stays queued while
     // peer 3 progresses independently.
     try std.testing.expectEqual(@as(usize, 2), executor.callCount());

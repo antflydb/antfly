@@ -329,13 +329,23 @@ const ManualRuntime = struct {
                 _ = finish_catch_up(self.ctx, worker.kind, token, worker.applied_sequence, false) catch {};
             };
         }
+        const ApplySession = struct {
+            runtime: *ManualRuntime,
+            token: CatchUpSessionToken,
+
+            fn apply(ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) anyerror!bool {
+                const session: *@This() = @ptrCast(@alignCast(ptr));
+                return session.runtime.apply_fn(session.runtime.ctx, batch, index_ref, session.token);
+            }
+        };
+        var session = ApplySession{ .runtime = self, .token = token };
         const stats = try derived_worker.catchUpIndexWithOptions(
             self.alloc,
             self.replay_source,
             worker.kind,
             worker.applied_sequence,
-            self.ctx,
-            self.apply_fn,
+            &session,
+            ApplySession.apply,
             .{
                 .resource_manager = self.backlog.resource_manager,
             },

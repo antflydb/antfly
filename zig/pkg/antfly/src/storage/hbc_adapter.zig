@@ -6893,6 +6893,8 @@ pub const HBCIndex = struct {
         // IndexManager binds this during construction/startup, before requests
         // are admitted. Direct library users retain the threaded fallback.
         self.runtime_io = io;
+        self.published_snapshot_mu.io = io;
+        self.cache_mu.io = io;
     }
 
     fn runtimeIo(self: *const HBCIndex) std.Io {

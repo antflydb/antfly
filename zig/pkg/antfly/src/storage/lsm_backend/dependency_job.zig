@@ -15,6 +15,7 @@
 //! Revalidate stable input identities and dependency coverage without an
 //! unbounded locked walk or a resizing membership hash table.
 const std = @import("std");
+const work_budget = @import("work_budget.zig");
 const Directory = @import("run_directory.zig").Directory;
 const state = @import("state.zig");
 const Member = struct {
@@ -39,14 +40,14 @@ test "dependency validation budgets identities overlaps and cleanup" {
         fn check(allocator: std.mem.Allocator, directory: *Directory, handles: []const Directory.Handle) !void {
             var job = Job.init(directory, .{ .input_handles = @as(?[]const Directory.Handle, handles), .source_level = @as(u32, 0), .output_level = @as(u32, 1), .tombstone_gc = false, .split_gc = false });
             defer job.deinit(allocator);
-            try std.testing.expect(!try job.step(allocator, 1, 0));
+            try std.testing.expect(!try job.step(allocator, 1, work_budget.Deadline{ .io = null, .ns = 0 }));
             try std.testing.expect(job.indices == null);
             var slices: usize = 0;
-            while (!try job.step(allocator, 1, std.math.maxInt(u64))) slices += 1;
+            while (!try job.step(allocator, 1, work_budget.Deadline{ .io = null, .ns = std.math.maxInt(u64) })) slices += 1;
             try std.testing.expect(slices > 2);
             try std.testing.expect(job.valid);
             try std.testing.expect(!job.covered);
-            try std.testing.expect(try job.step(allocator, 0, 0));
+            try std.testing.expect(try job.step(allocator, 0, work_budget.Deadline{ .io = null, .ns = 0 }));
             while (true) {
                 var credits: usize = 1;
                 if (job.deinitStep(allocator, &credits)) break;
@@ -69,7 +70,7 @@ test "dependency validation budgets identities overlaps and cleanup" {
     try changed.put(&fixture, replacement);
     var stale = Job.init(changed, .{ .input_handles = @as(?[]const Directory.Handle, &handles), .source_level = @as(u32, 0), .output_level = @as(u32, 1), .tombstone_gc = false, .split_gc = false });
     defer stale.deinit(allocator);
-    while (!try stale.step(allocator, 1, std.math.maxInt(u64))) {}
+    while (!try stale.step(allocator, 1, work_budget.Deadline{ .io = null, .ns = std.math.maxInt(u64) })) {}
     try std.testing.expect(!stale.valid);
 }
 const Members = @import("ordered_index.zig").SummarizedIndex(Member, Member.compare, void);
@@ -88,7 +89,7 @@ test "dependency certificate rebases newer writes and rejects changed inputs or 
     for (0..5) |variant| {
         var job = Job.init(base, .{ .input_handles = @as(?[]const Directory.Handle, &handles), .source_level = @as(u32, 0), .output_level = @as(u32, 1), .tombstone_gc = variant == 4, .split_gc = false });
         defer job.deinit(allocator);
-        while (!try job.step(allocator, 1, std.math.maxInt(u64))) {}
+        while (!try job.step(allocator, 1, work_budget.Deadline{ .io = null, .ns = std.math.maxInt(u64) })) {}
         try std.testing.expect(job.valid and job.covered);
         // Delta certification must still work after bounded scratch cleanup.
         job.deinit(allocator);
@@ -136,7 +137,7 @@ test "dependency certificate delta scaling benchmark" {
         var slices: usize = 0;
         while (true) {
             const before = clock.monotonicNs();
-            const done = try job.step(allocator, 2048, before +| 2 * std.time.ns_per_ms);
+            const done = try job.step(allocator, 2048, work_budget.Deadline{ .io = null, .ns = before +| 2 * std.time.ns_per_ms });
             max_slice = @max(max_slice, clock.monotonicNs() - before);
             slices += 1;
             if (done) break;
@@ -224,10 +225,10 @@ pub const Job = struct {
         const order = state.compareNamespace(.{ .name = a_ns }, .{ .name = b_ns });
         return if (order == .eq) std.mem.order(u8, a, b) else order;
     }
-    pub fn step(self: *Job, allocator: std.mem.Allocator, credits_arg: usize, deadline: u64) !bool {
+    pub fn step(self: *Job, allocator: std.mem.Allocator, credits_arg: usize, deadline: anytype) !bool {
         if (self.done) return true;
         var credits = credits_arg;
-        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+        while (credits != 0 and work_budget.before(deadline)) {
             if (self.indices == null) self.indices = try allocator.alloc(usize, self.handles.len);
             if (self.index < self.handles.len) {
                 credits -= 1;

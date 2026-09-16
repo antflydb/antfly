@@ -29,7 +29,19 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const repair_activation_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "db repair activation",
+            "db dense shadow activation rejects surplus candidate coverage",
+            "db paused dense repair resumes its durable candidate after restart",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = &.{
+        "db resolver workers recover pending journal targets after reopen without new writes",
         "db resolver worker resumes durable backfill after deferred activation and reopen",
         "db managed resolver changes fence in-flight replay and reset durable cursors",
         "storage.db.db.test.db batch marks generated enrichment replay",
@@ -503,16 +515,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &.{
             "storage.db.db.test.db reopens persisted",
+            "storage.db.db.test.db split prepare and finalize work with durable lsm primary backend",
             "storage.db.db.test.db delete index persists",
             "storage.db.db.test.db indexed delete removes",
             "storage.db.db.test.db indexed overwrite replaces",
-            "storage.db.db.test.db compacts tiny text segments",
             "storage.db.db.test.db phrase query survives",
             "storage.db.db.test.db prefix wildcard and regexp",
             "storage.db.db.test.db typed and dictionary queries survive",
             "storage.db.db.test.db mixed-type stored fields survive",
             "storage.db.db.test.db persists byte range across reopen",
-            "storage.db.db.test.db snapshot copies current store and derived log",
             "storage.db.db.test.db updateRange constrains index backfill",
         },
     });

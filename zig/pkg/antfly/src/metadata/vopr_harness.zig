@@ -7821,6 +7821,11 @@ pub const VoprPublicClusterFixture = struct {
             .{ .resource_managers = &self.resource_managers },
             &self.api_base_uris,
         );
+        // Publish listener and cache ownership before range bootstrap can
+        // suspend while opening writers. A cutoff must be able to stop the
+        // public stack even when those writes have not finished initializing.
+        self.uri_count = node_count;
+        self.stack_live = true;
         // The hosted public stack owns the resident group writers. Retain
         // those exact writers for the real merge coordinator instead of
         // reopening live LSM roots through a parallel test-only path.
@@ -7842,8 +7847,6 @@ pub const VoprPublicClusterFixture = struct {
             .reach_fn = reachDistributedGraphLifecycle,
         };
         for (&self.read_sources) |*source| _ = source.withDistributedGraphLifecycleHook(graph_hook);
-        self.uri_count = node_count;
-        self.stack_live = true;
         self.client = api_http_client.ApiHttpClient.init(alloc, self.client_http_executor.executor());
         for (0..node_count) |index| try self.cluster.node(index).runRound();
         self.bootstrap_phase = .public_stack_ready;

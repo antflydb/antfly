@@ -1702,7 +1702,13 @@ class MultiNodeScalingCluster:
         except Exception as exc:
             print(f"failed to preserve scaling diagnostics: {exc!r}")
 
-    def stop(self, *, timeout_s: float = 10.0, test_failed: bool = False) -> None:
+    def stop(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        test_failed: bool = False,
+        reject_data_crashes: bool = False,
+    ) -> None:
         self.port_reservations.close()
         if test_failed:
             self.preserve_failure_diagnostics()
@@ -1724,11 +1730,29 @@ class MultiNodeScalingCluster:
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
+        shutdown_error = None
+        if reject_data_crashes:
+            # Earlier bind-collision attempts may have exited intentionally;
+            # inspect the current incarnation of each serving data node.
+            crashed = {
+                node_id: proc.returncode
+                for node_id, proc in self.data_proc_by_node_id.items()
+                if proc.returncode not in (0, -signal.SIGKILL)
+            }
+            if crashed:
+                shutdown_error = (
+                    f"data processes crashed during teardown: {crashed}\n"
+                    f"{self.debug_logs()}"
+                )
+                test_failed = True
+                self.preserve_failure_diagnostics()
         for handle in self.log_files:
             if not handle.closed:
                 handle.close()
         if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
+        if shutdown_error is not None:
+            raise AssertionError(shutdown_error)
 
 
 def test_scaling_cluster_retries_data_node_after_bind_collision(tmp_path: Path):

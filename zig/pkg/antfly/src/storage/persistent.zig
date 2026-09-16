@@ -133,6 +133,7 @@ fn nsToMs(ns: u64) u64 {
 
 pub const PersistentIndexOptions = struct {
     path: [*:0]const u8,
+    io: ?std.Io = null,
     main_backend: MainBackend = .lsm,
     wal_backend: ?wal_mod.StorageBackend = null,
     main_lsm_storage: ?lsm_backend.Storage = null,
@@ -904,14 +905,43 @@ pub const text_projection_provenance_meta_key = "text_projection_provenance";
 const segments_db_name = "segments";
 const meta_db_name = "meta";
 const deletions_db_name = "deletions";
-var global_storage_mu: std.atomic.Mutex = .unlocked;
 
-fn lockPersistentStorage() void {
-    platform_sync.lockYielding(&global_storage_mu);
+fn persistentStorageIo(runtime_io: ?std.Io) std.Io {
+    return runtime_io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
-fn unlockPersistentStorage() void {
-    global_storage_mu.unlock();
+test "persistent storage contention yields through borrowed IO during cancellation cleanup" {
+    const Probe = struct {
+        index: *PersistentIndex,
+        waits: usize = 0,
+        wakes: usize = 0,
+        io: std.Io = undefined,
+
+        fn wait(ptr: ?*anyopaque, _: *const u32, _: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.waits += 1;
+            self.index.unlockStorage();
+        }
+
+        fn wake(ptr: ?*anyopaque, _: *const u32, _: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.wakes += 1;
+        }
+    };
+    var index: PersistentIndex = undefined;
+    var mutex: std.Io.Mutex = .init;
+    index.storage_mu = &mutex;
+    var probe = Probe{ .index = &index };
+    var vtable: std.Io.VTable = undefined;
+    vtable.futexWaitUncancelable = Probe.wait;
+    vtable.futexWake = Probe.wake;
+    probe.io = .{ .userdata = &probe, .vtable = &vtable };
+    index.io = probe.io;
+    try std.testing.expect(index.storage_mu.tryLock());
+    index.lockStorage();
+    index.unlockStorage();
+    try std.testing.expectEqual(@as(usize, 1), probe.waits);
+    try std.testing.expectEqual(@as(usize, 2), probe.wakes);
 }
 
 const MainKeyspace = enum {
@@ -1057,6 +1087,11 @@ const OpenedMainStore = struct {
 
 pub const PersistentIndex = struct {
     alloc: Allocator,
+    // Each live generation owns its writer, WAL, and stores. Serialize its
+    // mutations without fencing unrelated indexes or their IO runtimes.
+    // Keep the wait address stable when the catalog moves a quiescent owner.
+    storage_mu: *std.Io.Mutex,
+    io: ?std.Io = null,
     writer: index_mod.IndexWriter,
     main_store: backend_erased.NamespaceStore,
     main_store_owner: MainStoreOwner,
@@ -1394,9 +1429,10 @@ pub const PersistentIndex = struct {
 
     /// Open or create a persistent index. Recovers existing state + replays WAL.
     pub fn open(alloc: Allocator, opts: PersistentIndexOptions) !PersistentIndex {
-        lockPersistentStorage();
-        defer unlockPersistentStorage();
-
+        // The new owner is unpublished until recovery completes.
+        const storage_mu = try alloc.create(std.Io.Mutex);
+        errdefer alloc.destroy(storage_mu);
+        storage_mu.* = .init;
         const path_span = std.mem.span(opts.path);
         const wal_storage = opts.wal_storage orelse opts.main_lsm_storage;
         const needs_host_dirs =
@@ -1575,6 +1611,8 @@ pub const PersistentIndex = struct {
         }
 
         var pi = PersistentIndex{
+            .storage_mu = storage_mu,
+            .io = opts.io,
             .alloc = alloc,
             .writer = writer,
             .main_store = opened_main.store,
@@ -1617,13 +1655,11 @@ pub const PersistentIndex = struct {
     }
 
     fn lockStorage(self: *PersistentIndex) void {
-        _ = self;
-        lockPersistentStorage();
+        self.storage_mu.lockUncancelable(persistentStorageIo(self.io));
     }
 
     fn unlockStorage(self: *PersistentIndex) void {
-        _ = self;
-        unlockPersistentStorage();
+        self.storage_mu.unlock(persistentStorageIo(self.io));
     }
 
     pub fn close(self: *PersistentIndex) void {
@@ -1636,6 +1672,7 @@ pub const PersistentIndex = struct {
         if (self.retired_segment_file_deleter) |deleter| deleter.release();
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();
+        self.alloc.destroy(self.storage_mu);
         self.* = undefined;
     }
 
@@ -1657,6 +1694,7 @@ pub const PersistentIndex = struct {
         if (self.retired_segment_file_deleter) |deleter| deleter.release();
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();
+        self.alloc.destroy(self.storage_mu);
         self.* = undefined;
     }
 
@@ -3834,6 +3872,55 @@ fn cleanupPersistDir(path: [*:0]const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "persistent independent indexes publish while another owner is locked" {
+    const alloc = std.testing.allocator;
+    var first_path_buf: [256]u8 = undefined;
+    const first_path = persistTmpPath(&first_path_buf);
+    defer cleanupPersistDir(first_path);
+    var second_path_buf: [256]u8 = undefined;
+    const second_path = persistTmpPath(&second_path_buf);
+    defer cleanupPersistDir(second_path);
+    var first = try PersistentIndex.open(alloc, .{ .path = first_path });
+    defer first.close();
+
+    // A contended second owner releases the first so a regression fails an
+    // assertion instead of hanging. Neither open nor publication may wait.
+    const Probe = struct {
+        first: *PersistentIndex,
+        first_locked: bool = true,
+        waits: usize = 0,
+
+        fn wait(ptr: ?*anyopaque, _: *const u32, _: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.waits += 1;
+            if (self.first_locked) {
+                self.first_locked = false;
+                self.first.unlockStorage();
+            }
+        }
+
+        fn wake(_: ?*anyopaque, _: *const u32, _: u32) void {}
+    };
+    var probe = Probe{ .first = &first };
+    var vtable = std.testing.io.vtable.*;
+    vtable.futexWaitUncancelable = Probe.wait;
+    vtable.futexWake = Probe.wake;
+    const io: std.Io = .{ .userdata = &probe, .vtable = &vtable };
+    first.lockStorage();
+    defer if (probe.first_locked) first.unlockStorage();
+    var second = try PersistentIndex.open(alloc, .{ .path = second_path, .io = io });
+    defer second.close();
+    const segment = try buildSimpleSegment(alloc, "doc1", "hello");
+    defer alloc.free(segment);
+    try second.indexSegment(segment);
+    try second.writeGenerationMetadata("independent", "published");
+    const value = (try second.readGenerationMetadataAlloc(alloc, "independent")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("published", value);
+    try std.testing.expectEqual(@as(usize, 0), probe.waits);
+    try std.testing.expect(probe.first_locked);
 }
 
 test "persistent index write and read" {

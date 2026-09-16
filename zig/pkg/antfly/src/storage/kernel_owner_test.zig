@@ -1796,7 +1796,26 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
 }
 
 test "storage kernel status registry is unique and lossless" {
-    try @import("kernel_error_identity").validateForTest();
+    try error_identity.validateForTest();
+    const runtime_error = @import("../runtime_error_abi.zig");
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |expected| {
+        const failure = error_identity.failureFromError(
+            expected,
+            .local_query,
+            abi.abi_version,
+            @intFromEnum(abi.LocalQueryOperation.execute_internal_query),
+        );
+        var forwarded: abi.FailureIdentity = .{};
+        try local_query_client.acceptProviderFailure(failure.status, failure, .validate_provider_response, &forwarded);
+        const received = blk: {
+            client.statusToError(forwarded.status) catch |err| break :blk err;
+            return error.ExpectedReadinessFailure;
+        };
+        try std.testing.expectEqual(expected, received);
+        const public_status = runtime_error.statusFromError(received);
+        try std.testing.expectEqual(@intFromEnum(runtime_error.Code.retryable), public_status.code);
+        try std.testing.expectEqual(expected, runtime_error.errorFromStatus(public_status));
+    }
 }
 
 test "failed owner configuration releases its writer and context lease" {

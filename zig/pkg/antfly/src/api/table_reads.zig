@@ -214,14 +214,14 @@ const platform_time = @import("antfly_platform").time;
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const fusion_mod = @import("../search/fusion.zig");
 
-/// Collapse failures of an internal distributed-query transport into one
-/// public availability condition. The coordinator owns every intermediate
-/// result, so callers must never receive a successful response assembled from
-/// only the workers that happened to answer.
-pub fn normalizeDistributedQueryOperationalError(err: anyerror) anyerror {
+/// Normalize known read-transport failures before they cross a compiled
+/// boundary. Reads have no ambiguous mutation outcome; unavailable peers must
+/// not become an unknown runtime defect or a successful empty/partial result.
+fn normalizeDistributedReadTransportError(err: anyerror) anyerror {
     return switch (err) {
         error.RemoteUnavailable,
         error.ConnectionFailed,
+        error.AddressUnavailable,
         error.ConnectionReset,
         error.ConnectionRefused,
         error.ConnectionResetByPeer,
@@ -239,6 +239,14 @@ pub fn normalizeDistributedQueryOperationalError(err: anyerror) anyerror {
         error.NameServerFailure,
         error.RecvFailed,
         error.SendFailed,
+        => error.StorageReadTemporarilyUnavailable,
+        else => err,
+    };
+}
+
+pub fn normalizeDistributedQueryOperationalError(err: anyerror) anyerror {
+    return switch (normalizeDistributedReadTransportError(err)) {
+        error.StorageReadTemporarilyUnavailable,
         // A topology retry that loses its race twice is an availability
         // outcome, not an internal server failure. The coordinator still
         // owns all intermediate results and the caller can safely retry the
@@ -5535,7 +5543,8 @@ pub const HostedProvisionedTableReadSource = struct {
             }
         };
         var fence_writer = FenceWriter{ .downstream = writer, .require_ack = encoded_fence != null };
-        return (try client.executeRequestStream(routed_request, fence_writer.streamWriter())) orelse false;
+        return (client.executeRequestStream(routed_request, fence_writer.streamWriter()) catch |err|
+            return normalizeDistributedReadTransportError(err)) orelse false;
     }
 
     fn executeInternalRequest(
@@ -5583,7 +5592,8 @@ pub const HostedProvisionedTableReadSource = struct {
                 routed_request.headers = headers;
             }
         }
-        var response = try client.executeRequest(routed_request);
+        var response = client.executeRequest(routed_request) catch |err|
+            return normalizeDistributedReadTransportError(err);
         errdefer response.deinit(alloc);
         if (encoded_fence != null) {
             const ack = response.header(metadata_api.catalog_route_fence_ack_header) orelse {
@@ -14320,7 +14330,7 @@ fn lookupRemote(
         .leader_lease => "leader_lease",
         .read_index => "read_index",
     };
-    var result = try client.fetchGroupLookupWithControl(
+    var result = client.fetchGroupLookupWithControl(
         base_uri,
         group_id,
         table_name,
@@ -14329,7 +14339,7 @@ fn lookupRemote(
         read_consistency,
         timeout_ms,
         cancellation,
-    );
+    ) catch |err| return normalizeDistributedReadTransportError(err);
     defer result.deinit(alloc);
     try checkLookupOptionsActive(opts);
     return try controlledLookupResponseAlloc(
@@ -16316,6 +16326,7 @@ fn consumerTests() type {
         }
 
         test "distributed query transport failures become one retryable availability condition" {
+            try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.AddressUnavailable));
             try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.SendFailed));
             try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.ConnectionResetByPeer));
             try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.ConnectionTimedOut));
@@ -16325,6 +16336,30 @@ fn consumerTests() type {
             try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.ReadIndexTimeout));
             try std.testing.expectEqual(error.Timeout, normalizeDistributedQueryOperationalError(error.Timeout));
             try std.testing.expectEqual(error.InternalFailure, normalizeDistributedQueryOperationalError(error.InternalFailure));
+        }
+
+        test "remote lookup transport failures preserve read availability without retrying" {
+            const Executor = struct {
+                failure: anyerror,
+                calls: usize = 0,
+
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, request: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(http_common.Method.GET, request.method);
+                    return self.failure;
+                }
+            };
+            for ([_]anyerror{ error.AddressUnavailable, error.ConnectionRefused, error.ConnectionResetByPeer, error.NetworkUnreachable, error.Canceled, error.Timeout, error.InternalFailure }) |failure| {
+                var executor = Executor{ .failure = failure };
+                const source: http_common.RequestExecutor = .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } };
+                const expected = switch (failure) {
+                    error.Canceled, error.Timeout, error.InternalFailure => failure,
+                    else => error.StorageReadTemporarilyUnavailable,
+                };
+                try std.testing.expectError(expected, lookupRemote(source, std.testing.allocator, "http://127.0.0.1:1", 7, "entities", "person/ada_lovelace", .{}, .read_index));
+                try std.testing.expectEqual(@as(usize, 1), executor.calls);
+            }
         }
 
         test "table reads translate request deadlines into the routing clock" {

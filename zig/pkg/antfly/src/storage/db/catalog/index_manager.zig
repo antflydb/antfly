@@ -4391,7 +4391,7 @@ pub const IndexManager = struct {
             self.vector_block_build_mu.unlock();
             locked = false;
             prepared.reclaimObsolete();
-            std.log.info("shared vector-block native generations compacted sequence={} vectors={}", .{ covered_source_sequence, entry.index.stats().active_count });
+            std.log.debug("shared vector-block native generations compacted sequence={} vectors={}", .{ covered_source_sequence, entry.index.stats().active_count });
             return true;
         }
         return error.VectorBlockSnapshotAdvancedWithoutWal;
@@ -4666,7 +4666,7 @@ pub const IndexManager = struct {
             try hook.call(hook.ctx);
         const started = platform_time.monotonicNs();
         if (builtin.is_test) test_vector_block_primary_snapshot_builds += 1;
-        std.log.info(
+        std.log.debug(
             "shared vector-block primary snapshot build started index={s} generation={} sequence={} vectors={}",
             .{ entry.config.name, generation, applied_sequence, entry.index.stats().active_count },
         );
@@ -4806,7 +4806,7 @@ pub const IndexManager = struct {
         build_mu_locked = false;
         prepared.reclaimObsolete();
 
-        std.log.info(
+        std.log.debug(
             "shared vector-block base published generation={} sequence={} vectors={} vector_bytes={} artifact_bytes={} block_bytes={} elapsed_ms={}",
             .{
                 generation,
@@ -11160,7 +11160,10 @@ pub const IndexManager = struct {
 
     pub fn setIo(self: *IndexManager, io: ?std.Io) void {
         self.io = io;
-        for (self.text_indexes.items) |*entry| entry.io = self.checkpointIo();
+        for (self.text_indexes.items) |*entry| {
+            entry.io = self.checkpointIo();
+            entry.persistent.io = io;
+        }
         for (self.dense_indexes.items) |*entry| entry.index.setIo(io);
     }
 
@@ -11541,6 +11544,13 @@ pub const IndexManager = struct {
         updated_no_backfill,
     };
 
+    pub fn resolverConfigMatches(self: *IndexManager, cfg: resolver_catalog.ResolverConfig) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const existing = self.getResolver(cfg.name) orelse return false;
+        return existing.eql(cfg);
+    }
+
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return !std.mem.eql(u8, existing.table, next.table) or
             !std.mem.eql(u8, existing.key_template, next.key_template) or
@@ -11579,6 +11589,7 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         for (self.resolvers.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
+            if (entry.eql(cfg)) return .updated_no_backfill;
             if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) return error.ResolverSourceArtifactImmutable;
             if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
@@ -20009,6 +20020,7 @@ pub const IndexManager = struct {
 
                 const persistent_opts = persistent_mod.PersistentIndexOptions{
                     .path = zpath,
+                    .io = self.io,
                     .main_backend = self.text_main_backend,
                     .main_lsm_storage = self.text_lsm_storage,
                     .wal_storage = self.text_lsm_storage,
@@ -20364,7 +20376,7 @@ pub const IndexManager = struct {
                         };
                     }
                     if (index.experimentalPostingReadsEnabled()) {
-                        std.log.info("dense posting sidecar activated index={s} sequence={}", .{ cfg.name, posting_sequence });
+                        std.log.debug("dense posting sidecar activated index={s} sequence={}", .{ cfg.name, posting_sequence });
                     }
                 }
                 // A legacy v1 index may maintain a posting sidecar, but its

@@ -743,6 +743,23 @@ pub fn managedIndexBackends(
     return .{ .dense_native_migration_policy_source = source };
 }
 
+pub fn prepareManagedSchemaBeforeIndexLoad(
+    alloc: std.mem.Allocator,
+    mode: ManagedDbOpenMode,
+    schema_json: ?[]const u8,
+) !?db_mod.SchemaBeforeIndexLoad {
+    if (mode == .query_readonly or mode == .status_only) return null;
+    // Null means no authoritative contract was supplied; an explicit empty
+    // contract means the default schema, even when there are no indexes.
+    const effective = tables_api.effectiveSchemaJson(schema_json orelse return null);
+    var parsed = try tables_api.parseValidatedTableSchema(alloc, effective);
+    defer parsed.deinit(alloc);
+    return .{
+        .runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed),
+        .public_schema_json = effective,
+    };
+}
+
 pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -789,15 +806,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
-            const schema_before_index_load: ?db_mod.SchemaBeforeIndexLoad = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |schema_json| blk: {
-                if (schema_json.len == 0) break :blk null;
-                var parsed_schema = try tables_api.parseValidatedTableSchema(allocator, schema_json);
-                defer parsed_schema.deinit(allocator);
-                break :blk .{
-                    .runtime_schema = try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema),
-                    .public_schema_json = schema_json,
-                };
-            } else null;
+            const schema_before_index_load = try prepareManagedSchemaBeforeIndexLoad(allocator, open_mode, open_options.schema_json_before_index_load);
             defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema.runtime_schema);
 
             if (open_options.native_restore_open_plan) |native_plan| {

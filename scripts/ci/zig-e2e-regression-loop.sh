@@ -105,6 +105,7 @@ if ((workers > 1)); then
     wait 2>/dev/null || true
     exit 130
   }
+  # shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap below.
   cleanup_worker_logs() {
     if ((preserve_log_root == 0)); then
       rm -rf -- "$log_root"
@@ -160,6 +161,11 @@ export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 failures=0
 preserved_failures=0
 worker_id="${ANTFLY_E2E_REGRESSION_WORKER_ID:-1}"
+report_dir="${ANTFLY_E2E_REGRESSION_REPORT_DIR:-}"
+if [[ -n "$report_dir" ]]; then
+  mkdir -p "$report_dir"
+fi
+case_number=0
 for ((iteration = 1; iteration <= repeats; iteration++)); do
   for test_name in "${tests[@]}"; do
     printf '\nE2E regression worker=%s iteration=%d/%d test=%s\n' \
@@ -168,11 +174,35 @@ for ((iteration = 1; iteration <= repeats; iteration++)); do
     if ((preserved_failures < preserve_failure_limit)); then
       preserve_root=1
     fi
+    case_number=$((case_number + 1))
+    report_args=()
+    if [[ -n "$report_dir" ]]; then
+      report_path="$report_dir/worker-$worker_id-case-$case_number.xml"
+      # Never accept stale evidence from another invocation.
+      if [[ -e "$report_path" ]]; then
+        echo "regression report already exists: $report_path" >&2
+        exit 2
+      fi
+      report_args=("--junitxml=$report_path")
+    fi
     if ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE="$preserve_root" \
-      uv run --project e2e/antfly pytest -q -s --durations=10 "$test_name"; then
+      uv run --project e2e/antfly pytest -q -s --durations=10 "${report_args[@]}" "$test_name"; then
       status=0
     else
       status=$?
+    fi
+    if ((status == 0)) && [[ -n "$report_dir" ]]; then
+      if ! python3 - "$report_path" <<'PYREPORT'
+import sys
+import xml.etree.ElementTree as ET
+
+cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase")
+assert cases, "regression report contains no executed tests"
+assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), "regression requires passes, not skipped or failed cases"
+PYREPORT
+      then
+        status=1
+      fi
     fi
     if ((status == 130 || status == 143)); then
       printf '\nE2E regression loop interrupted with exit code %d\n' "$status" >&2

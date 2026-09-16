@@ -3789,6 +3789,7 @@ fn remotePublicBatchError(status: u16, body: []const u8) anyerror {
 }
 
 fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "ReadIndexTimeout")) return error.ReadIndexTimeout;
     if (std.mem.eql(u8, body, "GenerationTransitionActive")) return error.GenerationTransitionActive;
     if (std.mem.eql(u8, body, "storage read temporarily unavailable")) {
         return error.StorageReadTemporarilyUnavailable;
