@@ -22150,6 +22150,24 @@ pub const DB = struct {
     };
     var test_snapshot_fence_hook: ?SnapshotFenceTestHook = null;
 
+    fn ensurePrimaryOnlySnapshotLocked(self: *DB) !void {
+        if (self.source_vectors.load(.acquire) == null) return;
+        // Cancellation retains the source object for already-admitted readers
+        // and background retirement. Its presence is not published authority:
+        // a terminal cancelled job has removed all candidate roots and kept
+        // every live artifact inline in the primary store.
+        var job = (try vector_migration.load(self.alloc, self.core.store)) orelse return error.VectorStoreLifecycleUnsupported;
+        defer job.deinit();
+        if (self.table_storage.dense_embeddings != .primary_lsm or job.value.phase != .cancelled)
+            return error.VectorStoreLifecycleUnsupported;
+    }
+
+    fn ensurePrimaryOnlySnapshot(self: *DB) !void {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        try self.ensurePrimaryOnlySnapshotLocked();
+    }
+
     fn snapshotInternal(
         self: *DB,
         id: []const u8,
@@ -22157,7 +22175,7 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
         maintenance_deadline_ns: ?u64,
     ) !u64 {
-        if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
+        try self.ensurePrimaryOnlySnapshot();
         // Serialize only snapshot construction/publication. Normal writes can
         // resume before native manifest hashing, while same-ID captures cannot
         // race the fresh-directory check or atomic rename.
@@ -22211,6 +22229,8 @@ pub const DB = struct {
             try self.lockApplyForPortableRuntime();
             var apply_held = true;
             defer if (apply_held) self.core.unlockApply();
+            // Migration may have started while portable maintenance drained.
+            try self.ensurePrimaryOnlySnapshotLocked();
             try self.core.syncStore(true);
             try self.core.index_manager.syncAll(true);
             var primary_snapshot = try self.core.pinPortableSnapshot();
@@ -22244,7 +22264,7 @@ pub const DB = struct {
         defer capture.release();
         // Migration may have won admission after the optimistic entry check.
         // Its structural mutation uses this same snapshot fence.
-        if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
+        try self.ensurePrimaryOnlySnapshot();
         if (builtin.is_test) {
             if (test_snapshot_fence_hook) |hook| hook.after_capture_admission(hook.ptr);
         }
@@ -128858,6 +128878,50 @@ test "source vector migration progress pages sync the WAL without flushing tiny 
     try std.testing.expectEqual(before.flush_output_runs, after.flush_output_runs);
 }
 
+test "source vector migration drains late oversized embeddings and skips unrelated payloads" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("migration-large-rows");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    const options: OpenOptions = .{ .table_storage = .{ .dense_embeddings = .primary_lsm }, .start_index_workers = false, .start_optional_runtimes = false };
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "late", "model");
+    defer alloc.free(key);
+    const values: [2048]f32 = @splat(0.5);
+    const artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 2, &values);
+    defer alloc.free(artifact);
+    const large: [6000]u8 = @splat('x');
+    const request: vector_migration.contract.Request = .{ .job_id = "large", .mode = .online, .budget = .{ .batch_rows = 2, .batch_bytes = 4096, .disk_reserve_bytes = 0 } };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.core.store.put("unrelated-before", &large);
+        try db.startVectorMigration(request);
+        for (0..128) |_| {
+            var job = (try vector_migration.load(alloc, db.core.store)).?;
+            defer job.deinit();
+            if (job.value.phase == .ready) break;
+            try db.advanceVectorMigration(request.job_id);
+        } else return error.VectorMigrationDidNotFinish;
+        // Capture is still active after verification: this valid vector is
+        // larger than a page but already has a durable candidate reference.
+        try db.core.store.put(key, artifact);
+        try db.core.store.put("unrelated-after", &large);
+        try db.publishVectorMigration(request.job_id);
+        try db.advanceVectorMigration(request.job_id);
+    }
+    var db = try DB.open(alloc, path, options);
+    defer db.close();
+    try completeVectorMigrationForTest(&db, request.job_id);
+    const actual = try db.core.store.get(alloc, key);
+    defer alloc.free(actual);
+    try std.testing.expectEqualSlices(u8, artifact, actual);
+    inline for (.{ "unrelated-before", "unrelated-after" }) |name| {
+        const document = try db.core.store.get(alloc, name);
+        defer alloc.free(document);
+        try std.testing.expectEqualSlices(u8, &large, document);
+    }
+}
+
 test "source vector migration recovers each preparation commit and publication boundary" {
     const alloc = std.testing.allocator;
     const Hook = struct {
@@ -129611,6 +129675,33 @@ test "source vector migration budget rejection is retryable and cancellation sur
     var status = (try vector_migration.load(alloc, db.core.store)).?;
     defer status.deinit();
     try std.testing.expectEqual(@as(u64, 2), status.value.ownership_epoch);
+}
+
+test "source vector migration cancelled snapshot preserves old readers and rejects a replacement" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("migration-cancel-snapshot");
+    defer tmp.cleanup();
+    const path = std.mem.span(tmp.path().ptr);
+    const snapshots = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{path});
+    defer alloc.free(snapshots);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
+    var db = try DB.open(alloc, path, .{ .table_storage = .{ .dense_embeddings = .primary_lsm }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.core.store.put("ordinary", "preserved");
+    const request: vector_migration.contract.Request = .{ .job_id = "cancel", .mode = .online, .budget = .{ .disk_reserve_bytes = 0 } };
+    try db.startVectorMigration(request);
+    var old = try db.core.store.beginReadTxn();
+    defer old.abort();
+    try std.testing.expect(old.payload_session != null);
+    try std.testing.expectError(error.VectorStoreLifecycleUnsupported, db.snapshotNative("active"));
+    try db.cancelVectorMigration(request.job_id);
+    try std.testing.expectError(error.VectorStoreLifecycleUnsupported, db.snapshotNative("cancelling"));
+    try db.advanceVectorMigration(request.job_id);
+    try std.testing.expect(db.source_vectors.load(.acquire) != null);
+    try std.testing.expect(try db.snapshotNative("cancelled") > 0);
+    try std.testing.expectEqualStrings("preserved", try old.get("ordinary"));
+    try db.startVectorMigration(.{ .job_id = "replacement", .mode = .online, .budget = request.budget });
+    try std.testing.expectError(error.VectorStoreLifecycleUnsupported, db.snapshotNative("replacement"));
 }
 
 test "source vector migration cancels rejected admission durably without a source store" {

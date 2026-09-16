@@ -385,6 +385,52 @@ def test_online_vector_migration_cancellation_reopens_inline_authority(stateful_
     assert command(api, table, "second", "status")["phase"] == "complete"
 
 
+def test_online_vector_migration_skips_large_documents_after_publication(stateful_api):
+    api = stateful_api
+    table = f"migration_large_document_{time.time_ns()}"
+    seed(api, table)
+    status = command(api, table, "large")
+    for _ in range(128):
+        if status["phase"] == "ready":
+            break
+        status = command(api, table, "large", "step")
+    assert status["phase"] == "ready"
+    document = {"text": "x" * 6000}
+    api.batch_write(table, inserts={"large": document}, sync_level="full_index")
+    status = command(api, table, "large", "publish")
+    assert status["phase"] == "draining"
+    api.restart_server()
+    assert finish(api, table, "large")["phase"] == "complete"
+    assert api.lookup_key(table, "large") == document
+    assert nearest(api, table, "model_a", [1, 0, 0]) == ["a", "b"]
+
+
+@pytest.mark.parametrize("backup_format", ["native", "portable"])
+def test_cancelled_vector_migration_allows_backup_without_restart(
+    stateful_api, tmp_path, backup_format
+):
+    api = stateful_api
+    table = f"migration_cancel_backup_{time.time_ns()}"
+    seed(api, table)
+    command(api, table, "cancel")
+    command(api, table, "cancel", "step")
+    command(api, table, "cancel", "cancel")
+    assert finish(api, table, "cancel")["phase"] == "cancelled"
+    assert api.get_table(table)["storage"]["dense_embeddings"] == "primary_lsm"
+    location = tmp_path.resolve().as_uri()
+    assert api.backup_table(
+        table, backup_id="cancelled", location=location, backup_format=backup_format
+    )["backup"] == "successful"
+    api.delete_table(table)
+    assert api.restore_table(table, backup_id="cancelled", location=location) == {
+        "restore": "triggered"
+    }
+    assert api.lookup_key(table, "a")["text"] == "alpha"
+    api.restart_server()
+    assert api.lookup_key(table, "a")["text"] == "alpha"
+    assert nearest(api, table, "model_a", [1, 0, 0]) == ["a", "b"]
+
+
 def test_offline_vector_migration_cancels_before_copy_fence(stateful_api):
     api = stateful_api
     table = f"offline_cancel_admission_{time.time_ns()}"

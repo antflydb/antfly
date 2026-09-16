@@ -415,3 +415,31 @@ both cancellation cases passed. This remains an unresolved ANN qualification
 issue, not a clean end-to-end result. Logs, the tested Debug executable, and both
 failed database roots are retained under
 `.benchmark-results/vector-migration-review-20260915/review-followup/fixes/`.
+
+## Large rows and backups after cancellation
+
+Migration pages now retain only cursor keys for unrelated primary values.
+Draining hashes borrowed inline embeddings into compact references while
+scanning, then validates those references against the committed candidate map.
+The DB retains apply-exclusive admission across capture and commit. A vector
+larger than the page budget, captured after verification, consumes one page
+without retaining a full payload copy. Prepublication dense-artifact admission
+remains bounded by the configured byte budget. The regression inserts a large
+document and an oversized embedding after `ready`, publishes, restarts during
+draining, and verifies exact preservation after completion.
+
+Snapshot eligibility now distinguishes retained source objects from published
+ownership. A terminal cancelled job on primary ownership can back up immediately;
+its source object remains alive for old readers and retirement. Active,
+cancelling, replacement and published jobs remain ineligible. Both native and
+portable capture recheck eligibility after their admission/maintenance boundary.
+The focused regression holds an old source reader through cancellation and
+native backup, then verifies that starting a replacement closes admission again.
+
+The focused migration/recovery suite passes 31/31 with no leaks. The packaged
+Debug executable builds. Its migration/vector-store E2E run passes 17/18,
+including the large-document case and immediate native/portable backup, restore
+and restart after cancellation. The remaining online ANN case reproduces the
+same query-15 neighbor difference documented above; its assertions are unchanged.
+The tested binary, logs and failed database root are retained under
+`.benchmark-results/vector-migration-review-20260916/fixes/`.

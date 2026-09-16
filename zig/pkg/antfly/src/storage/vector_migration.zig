@@ -52,8 +52,14 @@ pub fn save(alloc: Allocator, txn: anytype, job: contract.Job) !void {
 }
 
 const Rows = struct {
+    const Row = struct {
+        key: []const u8,
+        value: []const u8,
+        dense: bool,
+        inline_payload: bool,
+    };
     arena: std.heap.ArenaAllocator,
-    items: []const docstore.KVPair,
+    items: []const Row,
     exhausted: bool,
     fn deinit(self: *Rows) void {
         self.arena.deinit();
@@ -64,7 +70,7 @@ fn readRows(alloc: Allocator, primary: *docstore.DocStore, job: contract.Job) !R
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const scratch = arena.allocator();
-    var rows = std.ArrayListUnmanaged(docstore.KVPair).empty;
+    var rows = std.ArrayListUnmanaged(Rows.Row).empty;
     var read = try primary.runtime_store.beginReadWithBlockCacheAdmission(.transient);
     defer read.abort();
     var cursor = try read.openCursor();
@@ -84,11 +90,27 @@ fn readRows(alloc: Allocator, primary: *docstore.DocStore, job: contract.Job) !R
             entry = null;
             break;
         }
-        const size = try std.math.add(u64, row.key.len, row.value.len);
+        // Unrelated primary values only contribute a cursor key. In draining,
+        // hash the borrowed inline value into its compact reference before
+        // advancing the cursor; a concurrent capture after verification may
+        // have introduced an embedding larger than the original page budget.
+        const dense = !cleanup and try denseArtifact(.{ .key = row.key, .value = row.value });
+        const inline_payload = dense and !payload.isReference(row.value);
+        const work_bytes = try std.math.add(u64, row.key.len, if (dense) row.value.len else 0);
+        if (rows.items.len == job.budget.batch_rows or
+            (rows.items.len != 0 and bytes + work_bytes > job.budget.batch_bytes)) break;
+        var reference: [payload.reference_len]u8 = undefined;
+        const value = if (!dense) "" else if (job.phase == .draining and inline_payload) blk: {
+            reference = (try payload.Reference.forArtifact(row.key, row.value)).encode();
+            break :blk &reference;
+        } else row.value;
+        if (job.phase == .final_verification and inline_payload) return error.VectorMigrationInlinePayloadRemains;
+        const size = try std.math.add(u64, row.key.len, value.len);
         if (size > job.budget.batch_bytes) return error.VectorMigrationRowExceedsBudget;
-        if (rows.items.len == job.budget.batch_rows or bytes + size > job.budget.batch_bytes) break;
-        try rows.append(scratch, .{ .key = try scratch.dupe(u8, row.key), .value = try scratch.dupe(u8, row.value) });
-        bytes += size;
+        try rows.append(scratch, .{ .key = try scratch.dupe(u8, row.key), .value = try scratch.dupe(u8, value), .dense = dense, .inline_payload = inline_payload });
+        // An oversized published inline vector consumes a page by itself. Its
+        // bytes are borrowed from the cursor; only the reference is retained.
+        bytes += work_bytes;
         entry = try cursor.next();
     }
     return .{ .arena = arena, .items = rows.items, .exhausted = entry == null };
@@ -136,8 +158,11 @@ pub fn advance(alloc: Allocator, primary: *docstore.DocStore, source: payload.St
             continue;
         }
         next.scanned_rows +|= 1;
-        if (!try denseArtifact(row)) continue;
-        if (!try sameCurrent(&txn, row)) continue;
+        if (!row.dense) continue;
+        // The DB holds apply-exclusive across page capture and commit. The
+        // published phases therefore use the reference certified above without
+        // retaining or hashing another copy of the inline payload.
+        if (!job.published() and !try sameCurrent(&txn, .{ .key = row.key, .value = row.value })) continue;
         const candidate_key = try contract.candidateKeyAlloc(alloc, row.key);
         defer alloc.free(candidate_key);
         switch (job.phase) {
@@ -163,19 +188,18 @@ pub fn advance(alloc: Allocator, primary: *docstore.DocStore, source: payload.St
                 next.verified_artifacts +|= 1;
             },
             .draining => {
-                if (payload.isReference(row.value)) continue;
-                const expected = try payload.Reference.forArtifact(row.key, row.value);
-                const reference = expected.encode();
+                if (!row.inline_payload) continue;
+                const reference = row.value;
                 const candidate = txn.get(candidate_key) catch |err| switch (err) {
                     error.NotFound => return error.VectorMigrationCoverageMismatch,
                     else => return err,
                 };
-                if (!std.mem.eql(u8, candidate, &reference)) return error.VectorMigrationCoverageMismatch;
+                if (!std.mem.eql(u8, candidate, reference)) return error.VectorMigrationCoverageMismatch;
                 // Preparation already committed with the candidate mapping.
                 // Reuse that proof instead of appending/charging the payload a
                 // second time while draining the old primary representation.
-                try txn.put(row.key, &reference);
-                try session.recordOwnership(&txn, row.key, &reference);
+                try txn.put(row.key, reference);
+                try session.recordOwnership(&txn, row.key, reference);
                 try txn.delete(candidate_key);
                 next.rewritten_artifacts +|= 1;
             },

@@ -139,7 +139,11 @@ not a permanent job-history service.
 Defaults are 4 MiB and 1,024 primary rows per step, a 64 GiB temporary allowance,
 and a 1 GiB free-space reserve in addition to normal resource admission. The
 driver accepts `--batch-bytes`, `--batch-rows`, `--temporary-bytes` and
-`--disk-reserve-bytes`. An individual primary row must fit the byte budget.
+`--disk-reserve-bytes`. Before publication, an individual dense artifact must
+fit the byte budget. Unrelated values contribute only their cursor keys to a
+page. Draining hashes borrowed inline vectors into compact references before
+retaining the page; an oversized vector captured after verification consumes
+one page by itself, without copying its payload into page memory.
 Preparation charges a conservative eight times payload/reference/metadata size,
 including concurrent embedding writes; the source also checks retained candidate
 bytes, covering failed preparations. This is an admission allowance, not a
@@ -204,6 +208,10 @@ job, including cancellation, while checkpoints and memory admission continue.
 Once the job finishes, ordinary snapshot/ANN ownership and journal retirement
 control reclamation. Transaction and replay journals are included in total-disk
 qualification; old inline payloads are not retained indefinitely for rollback.
+After cancellation reaches `cancelled`, native and portable backups are eligible
+again without restarting. Retained source objects may still protect existing
+readers; snapshot eligibility checks durable cancellation and inline authority,
+and rechecks under capture admission before selecting a snapshot.
 
 ### Offline operator
 
