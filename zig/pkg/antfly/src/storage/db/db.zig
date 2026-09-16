@@ -32397,7 +32397,7 @@ pub const DB = struct {
             return .{
                 .kind = .full_text,
                 .doc_count = text_snapshot.liveDocCount(),
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = @intCast(@max(0, std.Io.Clock.awake.now(index_manager.checkpointIo()).nanoseconds)),
             };
         }
         if (index_manager.denseIndex(index_name)) |entry| {
@@ -32407,7 +32407,7 @@ pub const DB = struct {
                 .doc_count = dense_stats.active_count,
                 .node_count = dense_stats.node_count,
                 .root_node = dense_stats.root_node,
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = @intCast(@max(0, std.Io.Clock.awake.now(index_manager.checkpointIo()).nanoseconds)),
             };
         }
         if (index_manager.sparseIndex(index_name)) |entry| {
@@ -32416,7 +32416,7 @@ pub const DB = struct {
                 .kind = .sparse_vector,
                 .doc_count = sparse_stats.doc_count,
                 .term_count = sparse_stats.term_count,
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = @intCast(@max(0, std.Io.Clock.awake.now(index_manager.checkpointIo()).nanoseconds)),
             };
         }
         if (index_manager.graphIndex(index_name)) |entry| {
@@ -32427,7 +32427,7 @@ pub const DB = struct {
                 .edge_count = graph_stats.edge_count,
                 .graph_counts_pending = graph_stats.counts_pending,
                 .node_count = graph_stats.node_count,
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = @intCast(@max(0, std.Io.Clock.awake.now(index_manager.checkpointIo()).nanoseconds)),
             };
         }
         return null;
@@ -66999,6 +66999,17 @@ test "db implicit batch timestamps use the borrowed runtime clock" {
     try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), try db.getTimestamp(alloc, "doc:b"));
     try db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{}" }}, .timestamp_ns = 99, .sync_level = .write });
     try std.testing.expectEqual(@as(u64, 99), try db.getTimestamp(alloc, "doc:c"));
+    // Persisted advisory status affects compression and disk-usage reports too;
+    // its timestamp must remain in the same runtime as the owning DB.
+    vopr_io.monotonic_ns = 123 * std.time.ns_per_ms;
+    try db.addIndex(.{ .name = "clock_graph", .kind = .graph, .config_json = "{}" });
+    try db.saveAllLiveIndexStatusSnapshots(alloc);
+    const status = (try db.loadIndexStatusSnapshot(alloc, "clock_graph")).?;
+    try std.testing.expectEqual(@as(u64, 123 * std.time.ns_per_ms), status.updated_at_ns);
+    vopr_io.monotonic_ns = 456 * std.time.ns_per_ms;
+    try db.saveAllLiveIndexStatusSnapshots(alloc);
+    const later = (try db.loadIndexStatusSnapshot(alloc, "clock_graph")).?;
+    try std.testing.expectEqual(@as(u64, 456 * std.time.ns_per_ms), later.updated_at_ns);
 }
 
 test "background maintenance services lifecycle runs on borrowed VoprIo" {
