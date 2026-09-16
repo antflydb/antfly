@@ -1023,6 +1023,7 @@ pub const RequestAdmission = @import("../common/request_admission.zig").RequestA
 pub const HAMutationPolicySnapshot = struct {
     failover_safe_mutations_only: bool = false,
     remote_apply_mutations_enabled: bool = false,
+    catalog_create_enabled: bool = false,
 };
 
 /// Live HA ingress policy owned by the process runtime. Promotion changes the
@@ -1242,6 +1243,7 @@ pub const ApiHttpServerConfig = struct {
     /// synchronous RemoteApply. The route classifier alone cannot establish
     /// the active durability policy.
     ha_remote_apply_mutations_enabled: bool = false,
+    ha_catalog_create_enabled: bool = false,
     /// Optional live source supplied by HA-aware runtimes. Static fields above
     /// remain the policy for kernels and tests without a mutable role.
     ha_mutation_policy_source: ?HAMutationPolicySource = null,
@@ -3193,6 +3195,7 @@ pub const ApiHttpServer = struct {
         return .{
             .failover_safe_mutations_only = self.cfg.ha_failover_safe_mutations_only,
             .remote_apply_mutations_enabled = self.cfg.ha_remote_apply_mutations_enabled,
+            .catalog_create_enabled = self.cfg.ha_catalog_create_enabled,
         };
     }
 

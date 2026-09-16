@@ -114,6 +114,7 @@ class HAStandaloneNode:
         self.admin_token_env = admin_token_env
         self.admin_token = admin_token
         self.proc: subprocess.Popen[str] | None = None
+        self.extra_runtime_args: list[str] = []
 
     @property
     def node_root(self) -> Path:
@@ -253,6 +254,7 @@ class HAStandaloneNode:
                 str(self.epoch),
             ]
         )
+        command.extend(self.extra_runtime_args)
         env = os.environ.copy()
         if self.admin_token_env is not None:
             command.extend(["--admin-token-env", self.admin_token_env])
