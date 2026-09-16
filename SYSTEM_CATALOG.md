@@ -444,6 +444,15 @@ The logical catalog JSON reader also serves current HA seed import, including
 the new catalog resources. That active restore contract remains supported; it
 is not a migration between development layouts.
 
+Whole-instance hot standby table creation logs the physical table, owning ranges,
+and logical catalog delta in one WAL record. Local publication and standby apply
+use the same row journal, so a public name cannot be acknowledged without its
+binding surviving failover. Duplicate-create responses require the standby's
+catalog frontier acknowledgement. Startup accepts the table-create records
+already shipped on main; new records include the catalog revision fence and
+binding. Other catalog mutations remain subject to the hot standby mutation
+policy.
+
 Cached store heartbeats may reference committed runtime observations by exact
 reporter incarnation and status generation. A separate internal heartbeat endpoint
 and a full-report response capability header negotiate support; all metadata voters
