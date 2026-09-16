@@ -15,6 +15,9 @@ on:
         description: Human approval comment ID (set by the approval controller)
         type: string
         required: true
+# Approved PR code must not publish caches in the default-branch dispatch scope.
+# This limit propagates to every reusable suite workflow.
+cache-mode: read
 permissions:
   contents: read
   actions: read
