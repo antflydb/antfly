@@ -4929,7 +4929,7 @@ pub const Fixture = struct {
         pending: bool,
         ready: bool,
         replay_converged: bool,
-        total_indexed: i64,
+        total_indexed: ?u64,
     };
 
     fn managedIndexObservationAt(self: *Fixture, node_index: usize) !ManagedIndexObservation {
@@ -4962,7 +4962,7 @@ pub const Fixture = struct {
             stats.coverage.?.summary_ready and
             stats.coverage.?.complete and
             stats.coverage.?.healthy;
-        const total_indexed = stats.total_indexed orelse -1;
+        const total_indexed = stats.total_indexed;
         const ready = readiness.state == .ready and readiness.queryable and
             readiness.complete and coverage_complete and replay_converged and
             !(stats.rebuilding orelse true) and

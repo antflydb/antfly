@@ -22,9 +22,14 @@ const metadata_incarnation = @import("../incarnation.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const topology_protocol = @import("../topology_protocol.zig");
 
-pub const AppliedMetadataBatch = struct {
+pub const AppliedMetadataCheckpoint = struct {
     commit_index: u64,
-    entries_bytes: []const u8,
+    input_kind: enum(u8) { committed_entries = 0, snapshot = 1 },
+    input_bytes: u64,
+
+    pub fn fromInput(commit_index: u64, kind: @FieldType(@This(), "input_kind"), bytes: []const u8) @This() {
+        return .{ .commit_index = commit_index, .input_kind = kind, .input_bytes = bytes.len };
+    }
 };
 
 pub const TableTransitionFence = struct {
@@ -96,6 +101,12 @@ pub const ProjectionSignal = struct {
     group_id: u64 = 0,
     store_id: u64 = 0,
     node_id: u64 = 0,
+    /// False only when existing report payloads and observation clocks are unchanged.
+    store_reports_changed: bool = true,
+    /// Runtime references change group facts/clocks but retain runtime pages.
+    store_runtime_changed: bool = true,
+    /// Borrowed until the synchronous listener returns; null invalidates all groups.
+    store_group_ids: ?[]const u64 = null,
 };
 
 pub const ProjectionListener = struct {
@@ -156,3 +167,60 @@ pub const CommittedKeyListener = struct {
 
 /// Process-local token used to detach and drain one registered callback pair.
 pub const LifecycleListenerRegistration = struct { id: u64 };
+
+const system_catalog = @import("../../system_catalog/domain.zig");
+
+pub const TableTopologyMutation = union(enum) {
+    create: struct {
+        expected_transition_generation: u64,
+        table: metadata.TableRecord,
+        ranges: []const metadata.RangeRecord,
+    },
+    drop: struct {
+        table_id: u64,
+        expected_name: []const u8,
+        expected_transition_generation: u64,
+        range_contract: union(enum) {
+            /// Fixed-size membership proof used by topology protocol v2.
+            membership: topology_protocol.RangeMembership,
+            /// Decode-only compatibility for v1 entries already present in a
+            /// Raft log during a rolling binary upgrade.
+            legacy_group_ids: []const u64,
+        },
+    },
+};
+
+pub const SystemCatalogCommand = struct {
+    version: u16 = 1,
+    expected_revision: u64,
+    mutation: system_catalog.Mutation,
+    topology: ?TableTopologyMutation = null,
+    placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
+};
+
+pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{} };
+
+const store_report_update = @import("../store_report_update.zig");
+pub const CatalogProjectionRequest = union(enum) {
+    read_store: struct { store_id: u64, reports: bool },
+    read_store_group_facts: u64,
+    read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
+    catalog_read: system_catalog.Read,
+    catalog_export: void,
+    catalog_list_tables: system_catalog.TableList,
+    catalog_meta: void,
+    catalog_admission: system_catalog.Mutation,
+    catalog_prepare: SystemCatalogCommand,
+    catalog_resolve_table: system_catalog.Target,
+    catalog_resolve_identity: system_catalog.Target,
+    catalog_resolve_many: system_catalog.ResolveMany,
+    catalog_query_definition: []const u8,
+    catalog_write_validation: []const u8,
+    catalog_write_validation_revision: void,
+    topology_activation: void,
+    report_cursor: u64,
+    read_control_stores: []const u64,
+    report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
+    report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
+    catalog_snapshot: void,
+};

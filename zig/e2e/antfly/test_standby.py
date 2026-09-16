@@ -55,6 +55,8 @@ HA_BACKUP_FILE_KIND_METADATA = 3
 HA_TRANSITION_BUSY_BODY = b"HAStateTransitionBusy"
 HA_TRANSITION_RETRY_TIMEOUT_S = 20.0
 HA_TRANSITION_RETRY_INTERVAL_S = 0.1
+# Exercise identities outside the signed range on every capture and replication run.
+HA_TEST_CLUSTER_ID = (1 << 63) + 100
 
 pytestmark = pytest.mark.ha_standby
 
@@ -127,12 +129,59 @@ class HAStandaloneNode:
     def catalog_path(self) -> Path:
         return self.node_root / "metadata" / "local-metadata.json"
 
+    def capture_catalog(self) -> dict[str, Any]:
+        generation = f"catalog-{time.time_ns()}"
+        deadline = time.monotonic() + HA_TRANSITION_RETRY_TIMEOUT_S
+        while True:
+            try:
+                captured = self.admin_post(
+                    "/base-backups/capture",
+                    {
+                        "slot_name": "catalog-inspection",
+                        "generation": generation,
+                        "topology_id": "e2e",
+                        "topology_generation": 1,
+                        "node_id": "standby-a",
+                        "target_pvc_name": "e2e-data",
+                        "target_pvc_uid": "e2e-data-uid",
+                    },
+                )
+                break
+            except requests.HTTPError as error:
+                response = error.response
+                if (
+                    response is None
+                    or response.status_code != 503
+                    or response.text != "HASeedSnapshotRuntimeBusy"
+                    or time.monotonic() >= deadline
+                ):
+                    raise
+                time.sleep(HA_TRANSITION_RETRY_INTERVAL_S)
+        topology = json.loads(
+            (Path(captured["content_root"]) / "TOPOLOGY.json").read_text()
+        )
+        # Inspection does not create a standby. Release its retention slot so
+        # later lag/reseed assertions observe only the test's actual replicas.
+        self._check(
+            self._request(
+                "DELETE",
+                f"{self.url}{HA_ADMIN_ROOT}/replication-slots/catalog-inspection",
+                headers=self.admin_headers(),
+                timeout=10,
+            )
+        )
+        return topology["catalog"]
+
     def start(self, *, enable_replication: bool = True) -> None:
         self.node_root.mkdir(parents=True, exist_ok=True)
+        extension_root = self.node_root / "extensions"
+        extension_root.mkdir(exist_ok=True)
         command = _standalone_stateful_command(
             self.binary, host=self.host, port=self.port, root=self.node_root
         )
         command.extend(["--health", "true", "--health-port", str(self.health_port)])
+        command.extend(["--extension-package-store", str(extension_root)])
+        command.extend(["--ha-seed-capture-root", str(self.ha_root / "captures")])
         if self.role == "primary":
             command.extend(
                 [
@@ -437,7 +486,7 @@ class HACluster:
                 root=self.root,
                 role="primary",
                 node_id="primary-a",
-                cluster_id=100,
+                cluster_id=HA_TEST_CLUSTER_ID,
                 timeline_id=1,
                 epoch=1,
                 sync_standby_name="standby-a",
@@ -450,7 +499,7 @@ class HACluster:
                 root=self.root,
                 role="standby",
                 node_id="standby-a",
-                cluster_id=100,
+                cluster_id=HA_TEST_CLUSTER_ID,
                 timeline_id=1,
                 epoch=1,
                 upstream_url=self.primary.url,
@@ -473,12 +522,12 @@ class HACluster:
         catalog_rel = Path("metadata") / "local-metadata.json"
         catalog_backup_path = backup_root / catalog_rel
         catalog_backup_path.parent.mkdir(parents=True, exist_ok=True)
-        catalog_bytes = self.primary.catalog_path.read_bytes()
+        catalog_bytes = json.dumps(self.primary.capture_catalog()).encode()
         catalog_backup_path.write_bytes(catalog_bytes)
 
         self.standby.node_root.mkdir(parents=True, exist_ok=True)
         self.standby.catalog_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(self.primary.catalog_path, self.standby.catalog_path)
+        self.standby.catalog_path.write_bytes(catalog_bytes)
 
         manifest_id = "base-standby-a"
         begun = self.primary.admin_post(
@@ -799,7 +848,13 @@ def _wait_for_primary_slot_applied(
 def _table_identity_from_catalog(
     node: HAStandaloneNode, table_name: str
 ) -> tuple[int, int]:
-    catalog = json.loads(node.catalog_path.read_text())
+    catalog = node.capture_catalog()
+    resource = next(
+        resource
+        for resource in catalog["system_catalog"]["resources"]
+        if resource["kind"] == "table" and resource["name"] == table_name
+    )
+    table_name = resource["storage_name"]
     table = next(table for table in catalog["tables"] if table["name"] == table_name)
     table_id = int(table["table_id"])
     table_range = next(

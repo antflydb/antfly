@@ -15,7 +15,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 49;
+pub const abi_version: u32 = 50;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -420,6 +420,42 @@ pub const Status = enum(u32) {
     storage_unavailable = 462,
     transaction_too_large = 463,
     unsupported_operation = 464,
+    catalog_already_exists = 465,
+    catalog_command_too_large = 466,
+    catalog_generation_changed = 467,
+    catalog_id_exhausted = 468,
+    catalog_not_found = 469,
+    catalog_projection_refresh_required = 470,
+    catalog_routing_snapshot_timeout = 471,
+    catalog_table_topology_required = 472,
+    create_table_request_too_large = 473,
+    database_not_empty = 474,
+    database_not_found = 475,
+    forbidden = 476,
+    invalid_catalog_mutation = 477,
+    invalid_catalog_name = 478,
+    invalid_catalog_record = 479,
+    invalid_catalog_route_fence = 480,
+    invalid_metadata_node_id = 481,
+    invalid_store_reporter_fence = 482,
+    invalid_tablespace_location = 483,
+    invalid_tablespace_placement_policy = 484,
+    metadata_incarnation_mismatch = 485,
+    metadata_incarnation_unavailable = 486,
+    metadata_mutation_outcome_unknown = 487,
+    metadata_snapshot_head_mismatch = 488,
+    namespace_not_empty = 489,
+    namespace_not_found = 490,
+    not_leader = 491,
+    protected_catalog_resource = 492,
+    resource_request_too_large = 493,
+    store_report_base_mismatch = 494,
+    table_already_exists = 495,
+    table_topology_protocol_upgrade_required = 496,
+    tablespace_in_use = 497,
+    tablespace_not_found = 498,
+    ha_seed_snapshot_runtime_busy = 499,
+    ha_seed_capture_already_in_progress = 500,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

@@ -364,7 +364,12 @@ def generate(argv: list[str]) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--depfile", type=Path)
+    parser.add_argument(
+        "--output", type=Path, help="Output path relative to the working directory"
+    )
     options, args = parser.parse_known_args(argv)
+    if options.output is not None:
+        args.append(str(options.output.resolve()))
     if options.depfile is not None:
         target_index = 1 if args[:1] == ["--compare"] else 0
         if len(args) > target_index and not args[target_index].startswith("--"):

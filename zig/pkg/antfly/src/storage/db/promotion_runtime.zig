@@ -162,6 +162,7 @@ fn processResolutionArtifactWithCatalog(
         if (e.canonical_name.len == 0) continue;
         try entries.append(a, .{
             .table = e.doc_ref.table,
+            .storage_table = e.doc_ref.storage_table,
             .key = e.doc_ref.key,
             .doc_json = try buildEntityDocAlloc(a, e),
         });

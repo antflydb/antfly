@@ -175,7 +175,7 @@ pub const CdcConnectionConfig = struct {
     /// Antfly table receiving changes from this CDC source.
     table_name: ?[]const u8 = null,
     /// Zero-based ordinal of the source within the table's CDC runtime.
-    source_ordinal: ?i64 = null,
+    source_ordinal: ?u32 = null,
     /// Source-side table or stream name.
     external_table: ?[]const u8 = null,
     /// Provider replication cursor or slot name when applicable.

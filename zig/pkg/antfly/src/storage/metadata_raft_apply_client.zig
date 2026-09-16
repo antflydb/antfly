@@ -37,7 +37,7 @@ pub const RaftApplyStoreConfig = struct {
     context: ?*anyopaque = null,
 };
 
-pub const AppliedMetadataBatch = contract.AppliedMetadataBatch;
+pub const AppliedMetadataCheckpoint = contract.AppliedMetadataCheckpoint;
 pub const TableTransitionFence = contract.TableTransitionFence;
 pub const TableRestoreAdmission = contract.TableRestoreAdmission;
 pub const TableDropProjection = contract.TableDropProjection;
@@ -76,8 +76,6 @@ pub const RaftApplyStore = struct {
     handle: ?*anyopaque,
     listeners: std.ArrayListUnmanaged(*ListenerRegistration) = .empty,
     listeners_mutex: std.Io.Mutex = .init,
-    latest_batches: std.AutoHashMapUnmanaged(u64, AppliedMetadataBatch) = .empty,
-    latest_batches_mutex: std.Io.Mutex = .init,
 
     pub const RestoreJobRow = struct {
         key: []u8,
@@ -104,9 +102,6 @@ pub const RaftApplyStore = struct {
         abi.antfly_metadata_apply_store_close(self.handle);
         for (self.listeners.items) |listener| self.alloc.destroy(listener);
         self.listeners.deinit(self.alloc);
-        var batches = self.latest_batches.valueIterator();
-        while (batches.next()) |batch| self.alloc.free(@constCast(batch.entries_bytes));
-        self.latest_batches.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -223,29 +218,97 @@ pub const RaftApplyStore = struct {
         };
     }
 
-    pub fn latestBatch(self: *RaftApplyStore, group_id: u64) !?AppliedMetadataBatch {
-        const decoded = (try self.projectionWithAllocator(
-            ?AppliedMetadataBatch,
-            self.alloc,
-            .{ .kind = .latest_batch, .group_id = group_id },
-        )) orelse return null;
-        var decoded_owned = true;
-        defer if (decoded_owned) self.alloc.free(@constCast(decoded.entries_bytes));
-
-        self.latest_batches_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.latest_batches_mutex.unlock(std.Options.debug_io);
-        const entry = try self.latest_batches.getOrPut(self.alloc, group_id);
-        if (entry.found_existing) {
-            if (entry.value_ptr.commit_index == decoded.commit_index and
-                std.mem.eql(u8, entry.value_ptr.entries_bytes, decoded.entries_bytes))
-            {
-                return entry.value_ptr.*;
-            }
-            self.alloc.free(@constCast(entry.value_ptr.entries_bytes));
+    pub fn readControlStores(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, groups: []const u64) ![]metadata.StoreRecord {
+        return self.catalogProjection([]metadata.StoreRecord, alloc, group_id, .{ .read_control_stores = groups });
+    }
+    pub fn readStore(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, store_id: u64, reports: bool) !?metadata.StoreRecord {
+        return self.catalogProjection(?metadata.StoreRecord, alloc, group_id, .{ .read_store = .{ .store_id = store_id, .reports = reports } });
+    }
+    pub fn readStoreGroupFacts(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, store_id: u64) !?metadata.StoreRecord {
+        return self.catalogProjection(?metadata.StoreRecord, alloc, group_id, .{ .read_store_group_facts = store_id });
+    }
+    pub fn readStoreReportTargetsWithRuntime(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, update: store_report_update.Update, include_runtime: bool) !?metadata.StoreRecord {
+        var ids: std.ArrayListUnmanaged(u64) = .empty;
+        defer ids.deinit(alloc);
+        if (update.base != null) {
+            for (update.report.group_statuses) |item| try ids.append(alloc, item.group_id);
+            for (update.report.runtime_statuses) |item| try ids.append(alloc, item.group_id);
+            try ids.appendSlice(alloc, update.removed_groups);
         }
-        entry.value_ptr.* = decoded;
-        decoded_owned = false;
-        return entry.value_ptr.*;
+        return self.catalogProjection(?metadata.StoreRecord, alloc, group_id, .{ .read_store_report_targets = .{ .store_id = update.report.store_id, .group_ids = ids.items, .full = update.base == null, .include_runtime = include_runtime } });
+    }
+    pub fn systemCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Read) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_read = request });
+    }
+    pub fn exportSystemCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_export = {} });
+    }
+    pub fn listSystemCatalogTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.TableList) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_list_tables = request });
+    }
+    pub fn systemCatalogMeta(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !system_catalog.Meta {
+        return self.catalogProjection(system_catalog.Meta, alloc, group_id, .{ .catalog_meta = {} });
+    }
+    pub fn systemCatalogAdmission(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Mutation) !contract.CatalogAdmission {
+        return self.catalogProjection(contract.CatalogAdmission, alloc, group_id, .{ .catalog_admission = request });
+    }
+    pub fn prepareSystemCatalogResult(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: contract.SystemCatalogCommand) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_prepare = command });
+    }
+    pub fn resolveSystemCatalogTable(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, target: system_catalog.Target) !?metadata.TableRecord {
+        return self.catalogProjection(?metadata.TableRecord, alloc, group_id, .{ .catalog_resolve_table = target });
+    }
+    pub fn resolveSystemCatalogIdentity(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, target: system_catalog.Target) !?system_catalog.ResolvedTable {
+        return self.catalogProjection(?system_catalog.ResolvedTable, alloc, group_id, .{ .catalog_resolve_identity = target });
+    }
+    pub fn resolveSystemCatalogIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany) !system_catalog.ResolvedMany {
+        return self.catalogProjection(system_catalog.ResolvedMany, alloc, group_id, .{ .catalog_resolve_many = request });
+    }
+    pub fn tableWriteValidation(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_write_validation = name });
+    }
+    pub fn writeValidationRevision(self: *RaftApplyStore, group_id: u64) !u64 {
+        return self.catalogProjection(u64, self.alloc, group_id, .catalog_write_validation_revision);
+    }
+    pub fn queryTableDefinition(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) !?system_catalog.QueryDefinition {
+        return self.catalogProjection(?system_catalog.QueryDefinition, alloc, group_id, .{ .catalog_query_definition = name });
+    }
+    pub fn topologyActivation(self: *RaftApplyStore, group_id: u64) !?topology_protocol.Activation {
+        return self.catalogProjection(?topology_protocol.Activation, self.alloc, group_id, .{ .topology_activation = {} });
+    }
+    pub fn reportBaselineProgress(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/store_report_baseline.zig").Request) !@import("../metadata/store_report_baseline.zig").Progress {
+        return self.reportBaselineProgressForKey(group_id, try request.progressQuery());
+    }
+    pub fn reportBaselineProgressForKey(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/store_report_baseline.zig").ProgressQuery) !@import("../metadata/store_report_baseline.zig").Progress {
+        return self.catalogProjection(@import("../metadata/store_report_baseline.zig").Progress, self.alloc, group_id, .{ .report_baseline_progress = request });
+    }
+    pub fn admitBaselineFragment(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/store_report_baseline.zig").Request) !u16 {
+        return self.catalogProjection(u16, self.alloc, group_id, .{ .report_baseline_fragment_admission = request });
+    }
+    pub fn reportCursor(self: *RaftApplyStore, group_id: u64, store_id: u64) !?store_report_update.Cursor {
+        return self.catalogProjection(?store_report_update.Cursor, self.alloc, group_id, .{ .report_cursor = store_id });
+    }
+    pub fn readStoreReportTargets(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, update: store_report_update.Update) !?metadata.StoreRecord {
+        return self.readStoreReportTargetsWithRuntime(alloc, group_id, update, true);
+    }
+    pub fn validateSystemCatalog(self: *RaftApplyStore, group_id: u64, command: contract.SystemCatalogCommand) !void {
+        const result = try self.prepareSystemCatalogResult(self.alloc, group_id, command);
+        self.alloc.free(result);
+    }
+    pub fn systemCatalogSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !system_catalog.OwnedState {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const value = try self.catalogProjection(struct { meta: system_catalog.Meta, value: system_catalog.State }, arena.allocator(), group_id, .{ .catalog_snapshot = {} });
+        return .{ .arena = arena, .meta = value.meta, .value = value.value };
+    }
+    fn catalogProjection(self: *RaftApplyStore, comptime T: type, alloc: std.mem.Allocator, group_id: u64, request: contract.CatalogProjectionRequest) !T {
+        const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(bytes);
+        return self.projectionWithAllocator(T, alloc, .{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(bytes) });
+    }
+
+    pub fn latestCheckpoint(self: *RaftApplyStore, group_id: u64) !?AppliedMetadataCheckpoint {
+        return self.projection(?AppliedMetadataCheckpoint, .{ .kind = .latest_checkpoint, .group_id = group_id });
     }
 
     pub fn getMetadataIncarnation(self: *RaftApplyStore, group_id: u64) !?metadata_incarnation.MetadataClusterIncarnation {
@@ -616,6 +679,9 @@ pub const RaftApplyStore = struct {
             .group_id = signal.group_id,
             .store_id = signal.store_id,
             .node_id = signal.node_id,
+            .store_reports_changed = signal.store_reports_changed != 0,
+            .store_runtime_changed = signal.store_runtime_changed != 0,
+            .store_group_ids = if (signal.has_store_group_ids != 0) (if (signal.store_group_ids) |ids| ids[0..signal.store_group_ids_len] else &.{}) else null,
         });
     }
 
@@ -701,3 +767,7 @@ pub const RaftApplyStore = struct {
 fn statusToError(status: abi.Status) !void {
     return error_identity.statusToError(status);
 }
+
+const system_catalog = @import("../system_catalog/domain.zig");
+const store_report_update = @import("../metadata/store_report_update.zig");
+const topology_protocol = @import("../metadata/topology_protocol.zig");

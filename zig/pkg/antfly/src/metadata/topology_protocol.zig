@@ -24,9 +24,16 @@ const std = @import("std");
 /// Version 5 adds conditional restore admission; ordinary job updates retain
 /// their existing wire format.
 /// Version 6 adds digest-conditional restore expiry.
-pub const current_version: u16 = 6;
+/// Version 7 adds system catalog records and atomic catalog/table publication.
+/// Version 8 adds acknowledged sparse store reports.
+/// Version 9 adds durable membership-bound protocol activation.
+/// Version 10 adds resumable store inventories and atomic schema-progress batches.
+pub const current_version: u16 = 10;
+pub const durable_activation_version: u16 = 9;
+pub const store_report_update_version: u16 = 8;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
+pub const system_catalog_version: u16 = 7;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
 /// when a membership change temporarily includes a lower-capability peer.
@@ -165,3 +172,24 @@ test "range membership is order independent and table scoped" {
     try rhs.add(303);
     try std.testing.expect(!lhs.finish(7).eql(rhs.finish(7)));
 }
+
+/// Replicated proof that this exact incarnation and membership can decode a
+/// protocol. Terms are deliberately excluded: elections do not undo activation.
+pub const Activation = struct {
+    version: u16,
+    incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    member_count: u32,
+    membership_fingerprint: @import("reallocation_request.zig").MembershipFingerprint,
+
+    pub fn satisfies(self: @This(), required: @This()) bool {
+        return self.version >= required.version and self.member_count == required.member_count and
+            std.meta.eql(self.incarnation, required.incarnation) and
+            std.meta.eql(self.membership_fingerprint, required.membership_fingerprint);
+    }
+};
+
+/// Resumable report generations and bounded retired-page collection.
+pub const store_report_baseline_version: u16 = 10;
+
+/// Atomic, bounded acknowledgements for local schema migration readiness.
+pub const schema_progress_batch_version: u16 = 10;

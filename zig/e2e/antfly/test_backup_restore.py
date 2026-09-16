@@ -33,6 +33,7 @@ from conftest import (
     DEFAULT_ANTFLY_BIN,
     REPO_ROOT,
     _read_log_tail,
+    annotate_metadata_table_names,
     antfly_public_api_url,
     maybe_preserve_tempdir,
     resolve_binary_path,
@@ -770,7 +771,9 @@ class ThreeByThreeBackupCluster:
             f"{self.metadata_admin_urls[index]}/metadata/v1/admin/snapshot",
             timeout=request_timeout_s,
         )
-        return _check_response(response)
+        return annotate_metadata_table_names(
+            _check_response(response), self.data_api_urls, timeout_s=request_timeout_s
+        )
 
     def metadata_snapshots(
         self, *, request_timeout_s: float = 1.0
@@ -836,7 +839,8 @@ class ThreeByThreeBackupCluster:
                 (
                     int(table.get("table_id", 0))
                     for table in snapshot.get("tables", [])
-                    if isinstance(table, dict) and table.get("name") == table_name
+                    if isinstance(table, dict)
+                    and table.get("logical_name", table.get("name")) == table_name
                 ),
                 None,
             )
@@ -896,7 +900,8 @@ class ThreeByThreeBackupCluster:
             (
                 int(table.get("table_id", 0))
                 for table in snapshot.get("tables", [])
-                if isinstance(table, dict) and table.get("name") == table_name
+                if isinstance(table, dict)
+                and table.get("logical_name", table.get("name")) == table_name
             ),
             None,
         )
@@ -920,7 +925,8 @@ class ThreeByThreeBackupCluster:
                 (
                     int(table.get("table_id", 0))
                     for table in snapshot.get("tables", [])
-                    if isinstance(table, dict) and table.get("name") == table_name
+                    if isinstance(table, dict)
+                    and table.get("logical_name", table.get("name")) == table_name
                 ),
                 None,
             )
@@ -942,7 +948,7 @@ class ThreeByThreeBackupCluster:
             return False
         return all(
             not any(
-                isinstance(table, dict) and table.get("name") == table_name
+                isinstance(table, dict) and int(table.get("table_id", 0)) == table_id
                 for table in snapshot.get("tables", [])
             )
             and not any(
@@ -1747,7 +1753,9 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     restored_topology = cluster.table_topology(table_name)
     assert restored_topology is not None
     restored_table_id, restored_group_ids = restored_topology
-    assert restored_table_id == original_table_id
+    # Drop removes the catalog binding. Restore allocates a new immutable
+    # destination so stale cleanup for the source cannot affect restored rows.
+    assert restored_table_id != original_table_id
     assert len(restored_group_ids) == 3
     assert restored_group_ids.isdisjoint(original_group_ids), (
         "restore reused source physical Raft groups instead of allocating "

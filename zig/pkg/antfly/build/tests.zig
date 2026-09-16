@@ -185,6 +185,63 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
 
+    const store_observer_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[2],
+        .filters = &.{"store observer "},
+    });
+    b.step("antfly-store-observer-test", "Run store report admission, fencing, and ownership regressions").dependOn(&b.addRunArtifact(store_observer_tests).step);
+
+    const system_catalog_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
+    });
+    const system_catalog_store_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog" },
+    });
+    const system_catalog_store_step = b.step("antfly-system-catalog-store-test", "Run catalog report persistence, snapshot, drain, and migration regressions");
+    system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
+    const schema_finalization_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[0],
+        .filters = &.{ "system catalog migration finalization", "schema migration" },
+    });
+    const run_schema_finalization = b.addRunArtifact(schema_finalization_tests);
+    // Opt-in measurements must observe this invocation's environment and
+    // execute fresh samples, even after the same tests ran without timing.
+    run_schema_finalization.has_side_effects = true;
+    b.step("antfly-system-catalog-finalization-test", "Run migration finalization and opt-in readiness workload").dependOn(&run_schema_finalization.step);
+    const schema_progress_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[6],
+        .filters = &.{ "system catalog schema progress", "runtime schema progress", "schema progress runtime coverage" },
+    });
+    b.step("antfly-system-catalog-progress-test", "Run schema migration readiness, acknowledged deltas, and opt-in collector workload").dependOn(&b.addRunArtifact(schema_progress_tests).step);
+    const report_bench_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"store report workload benchmark"},
+    });
+    const admission_bench_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "store report workload benchmark selected admission", "store report workload benchmark reconciliation view" },
+    });
+    const run_report_bench = b.addRunArtifact(report_bench_tests);
+    const run_admission_bench = b.addRunArtifact(admission_bench_tests);
+    run_report_bench.has_side_effects = true;
+    run_admission_bench.has_side_effects = true;
+    // Compile both before either timed workload, and serialize measurements.
+    run_report_bench.step.dependOn(&admission_bench_tests.step);
+    run_admission_bench.step.dependOn(&run_report_bench.step);
+    b.step("antfly-system-catalog-report-bench", "Run opt-in report apply, repair and selected admission workloads").dependOn(&run_admission_bench.step);
+    const system_catalog_api_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "system catalog", "prepared query routing", "routing session pins every table", "metadata.table status encoder", "metadata.table detail encoder" },
+    });
+    const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
+    system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
+    const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
+    system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_tests).step);
+    const system_catalog_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog"} });
+    system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_transport_tests).step);
+
     const metadata_unit_test_root_paths = [_][]const u8{
         "pkg/antfly/src/metadata_unit_lane_a_test_root.zig",
         "pkg/antfly/src/metadata_unit_lane_b_test_root.zig",
@@ -1323,6 +1380,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "system catalog",
         "backup heartbeat ",
         "table storage creation intent survives",
         "model-directed",
@@ -1579,6 +1637,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = selectTestFilters(b, &raft_unit_default_filters),
     });
     const run_raft_unit_tests = addFilteredTestRunArtifact(b, raft_unit_tests);
+    const checkpoint_host_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"managed host default"},
+    });
+    b.step("antfly-system-catalog-host-test", "Run metadata checkpoint host persistence regressions").dependOn(&b.addRunArtifact(checkpoint_host_tests).step);
 
     const raft_read_gate_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_read_gate_test_root.zig"),
@@ -1994,6 +2057,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_metadata_vopr_public_integration_tests = metadata_tests_addTests_result.run_lib_metadata_vopr_public_integration_tests;
 
     const api_tests_addTests_result = api_tests.addTests(b, .{
+        .api_http_runtime_test_mod = api_http_runtime_test_mod,
         .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,
         .optimize = optimize,
@@ -2041,6 +2105,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_metadata_service_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
+            "store observer ",
             "metadata service ",
             "cdc work permit ",
             "metadata proposal receipt ",
@@ -3829,10 +3894,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     usermgr_storage_standalone_runtime_test_mod.addImport("antfly_root", standalone_runtime_test_mod);
     usermgr_storage_standalone_runtime_test_mod.addImport("antfly_platform", platform_mod);
     standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_standalone_runtime_test_mod);
+    const system_catalog_standalone_tests = b.addTest(.{
+        .root_module = standalone_runtime_test_mod,
+        .filters = &.{"system catalog"},
+    });
+    const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
+    system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
     const lib_standalone_runtime_tests = b.addTest(.{
         .root_module = standalone_runtime_test_mod,
         .filters = &.{
             "standalone runtime module compiles",
+            "standalone.runtime.test.system catalog",
+            "catalog.domain.",
             "standalone runtime local generator accepts media url data uris",
             "local generate message conversion preserves tool history and admission",
             "inference worker",
@@ -3953,6 +4026,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_restore_test_step = b.step("antfly-raft-restore-test", "Run focused Raft restore authority and restart tests");
     raft_restore_test_step.dependOn(&run_raft_restore_tests.step);
 
+    const scheduler_bench = b.addTest(.{
+        .root_module = antfly_test_mod,
+        // Retain the module reachability anchors as well as the workload;
+        // otherwise Zig can report passing tests without importing the driver.
+        .filters = &.{ "raft integration module compiles", "raft transport module compiles", "http driver module compiles", "http frame driver scheduler workload benchmark" },
+    });
+    b.step("antfly-http-scheduler-bench", "Measure peer scheduling after node backlogs drain").dependOn(&b.addRunArtifact(scheduler_bench).step);
     const raft_transport_test_step = b.step("antfly-raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
 
@@ -4204,6 +4284,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
+    persistent_test_mod.addImport("antfly_pdf", pdf_mod);
     persistent_test_mod.addImport("antfly_vellum", vellum_mod);
     persistent_test_mod.addImport("antfly_regex", regex_mod);
     persistent_test_mod.addImport("antfly_vector", vector_mod);
@@ -4211,6 +4292,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     persistent_test_mod.addImport("antfly_reranking", reranking_mod);
     persistent_test_mod.addImport("structlog", structlog_mod);
     persistent_test_mod.addImport("vopr", vopr_mod);
+    const persistent_rebuild_tests = b.addTest(.{
+        .root_module = persistent_test_mod,
+        .filters = &.{"persistent rebuild page"},
+    });
+    const persistent_rebuild_run = addFilteredTestRunArtifact(b, persistent_rebuild_tests);
+    b.step("persistent-rebuild-page-test", "Run atomic rebuild page regressions and optional scaling benchmark").dependOn(&persistent_rebuild_run.step);
+
     const persistent_unit_tests = b.addTest(.{
         .root_module = persistent_test_mod,
         .test_runner = .{

@@ -16,25 +16,6 @@
 
 const derived_types = @import("derived_types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
-const types = @import("../types.zig");
-const platform = @import("antfly_platform");
-
-/// Deadline and clock are one contract across manual and borrowed-Io workers.
-/// Never forward the absolute timestamp while discarding its clock domain.
-pub const VisibilityWait = struct {
-    cancellation: types.CancellationToken = .none,
-    deadline_ns: ?u64 = null,
-    clock: ?platform.clock.Clock = null,
-
-    pub fn check(self: @This()) !void {
-        if (self.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
-        if (self.deadline_ns) |deadline_ns| {
-            const now_ns = if (self.clock) |clock| clock.nowRealtimeNs() else platform.time.monotonicNs();
-            if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
-        }
-    }
-};
-
 pub const RuntimeError = error{AsyncWorkerFailed};
 
 pub const ApplyFn = *const fn (ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) anyerror!bool;
@@ -54,3 +35,43 @@ pub const BeginCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager_
 pub const FinishCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, applied_sequence: u64, success: bool) anyerror!CatchUpFinishResult;
 pub const CanAdvanceToTargetFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
 pub const AppliedSequenceAdvancedFn = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
+
+const std = @import("std");
+const types = @import("../types.zig");
+const platform_clock = @import("antfly_platform").clock;
+const platform_time = @import("antfly_platform").time;
+
+/// Deadline and its clock travel together across executor implementations.
+pub const VisibilityWait = struct {
+    cancellation: types.CancellationToken = .none,
+    deadline_ns: ?u64 = null,
+    clock: ?platform_clock.Clock = null,
+
+    pub fn check(self: @This()) !void {
+        if (self.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+        if (self.deadline_ns) |deadline_ns| {
+            const now_ns = if (self.clock) |clock|
+                clock.nowRealtimeNs()
+            else
+                platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
+        }
+    }
+};
+
+test "derived visibility wait retains its deadline clock and cancellation" {
+    var clock = platform_clock.ManualClock{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    const wait = VisibilityWait{
+        .clock = clock.clock(),
+        .deadline_ns = 100,
+        .cancellation = types.CancellationToken.fromAtomic(&cancelled),
+    };
+    try wait.check();
+    clock.advanceNs(99);
+    try wait.check();
+    clock.advanceNs(1);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, wait.check());
+    cancelled.store(true, .release);
+    try std.testing.expectError(error.EnrichmentWaitCanceled, wait.check());
+}

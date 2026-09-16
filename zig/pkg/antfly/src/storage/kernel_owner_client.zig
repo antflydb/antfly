@@ -344,6 +344,21 @@ pub const Owner = struct {
         }));
     }
 
+    /// Reconstruction uses a shared generation lease. Configuration is a
+    /// separate exclusive operation and cannot change under this invocation.
+    pub fn repairIndex(self: *Owner, table_name: []const u8, target_index_name: ?[]const u8, controls: abi.RepairControls) !abi.ReconcileResult {
+        var result: abi.ReconcileResult = .{};
+        try statusToError(abi.antfly_storage_owner_reconcile(self.handle, &.{
+            .advance_index_repair = 1,
+            .repair_only = 1,
+            .table_name = .fromSlice(table_name),
+            .target_index_name = .fromSlice(target_index_name orelse ""),
+            .repair_controls = controls,
+        }, &result));
+        if (result.version != abi.abi_version) return error.InvalidAbi;
+        return result;
+    }
+
     pub fn findMedianKey(self: *Owner, table_name: []const u8) !?Response {
         var response: Response = .{};
         const status = abi.antfly_storage_owner_find_median_key(self.handle, &.{
@@ -921,6 +936,17 @@ pub const Owner = struct {
         ));
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
         return result;
+    }
+
+    pub fn captureHASeedSnapshot(self: *Owner, table_name: []const u8, token: []const u8, destination: []const u8) !void {
+        var result: abi.MaintenanceResult = .{};
+        try statusToError(abi.antfly_storage_owner_maintenance(self.handle, &.{
+            .action = @intFromEnum(abi.MaintenanceAction.capture_ha_seed_snapshot),
+            .table_name = .fromSlice(table_name),
+            .snapshot_token = .fromSlice(token),
+            .destination_root = .fromSlice(destination),
+        }, &result));
+        if (result.version != abi.abi_version) return error.InvalidAbiVersion;
     }
 
     pub fn prepareHASeedSnapshot(

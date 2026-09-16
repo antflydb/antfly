@@ -1,7 +1,10 @@
 // Copyright 2026 Antfly, Inc.
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0.
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
 //
 // Unless required by applicable law or agreed to in writing, software distributed
 // under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
@@ -117,14 +120,14 @@ pub const CatalogProjectionReader = struct {
         }
     };
 
-    const SnapshotLease = struct {
+    pub const SnapshotLease = struct {
         shared: *SharedSnapshot,
 
-        fn snapshot(self: @This()) *const Snapshot {
+        pub fn snapshot(self: @This()) *const Snapshot {
             return &self.shared.value;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.shared.release();
             self.* = undefined;
         }
@@ -194,6 +197,15 @@ pub const CatalogProjectionReader = struct {
             if (self.mutex.tryLock()) return true;
             platform_clock.Clock.real().sleepMs(1);
         }
+    }
+
+    /// Caller holds the reader mutex. Retain the exact coherent generation
+    /// returned by validation, including a non-reusable capture during churn.
+    pub fn validationLeaseLocked(self: *CatalogProjectionReader, alloc: std.mem.Allocator, metadata_group_id: u64, source: Source) !SnapshotLease {
+        _ = try self.validationSnapshotLocked(alloc, metadata_group_id, source, null);
+        const shared = self.cache.snapshot.?;
+        shared.retain();
+        return .{ .shared = shared };
     }
 
     pub fn validationSnapshotLocked(

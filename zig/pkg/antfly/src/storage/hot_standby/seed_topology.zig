@@ -17,7 +17,7 @@ const topology_records = @import("../../common/topology_records.zig");
 const extensions = @import("../../extensions/mod.zig");
 const validation = @import("validation.zig");
 
-pub const topology_format_version: u16 = 3;
+pub const topology_format_version: u16 = 4;
 pub const topology_name = "TOPOLOGY.json";
 pub const logical_snapshot_manifest_name = "SNAPSHOT.json";
 pub const max_topology_bytes: usize = 64 * 1024 * 1024;
@@ -41,6 +41,8 @@ pub const PortableAuthSeed = struct {
 
 pub const LogicalCatalog = struct {
     epoch: u64,
+    // Optional only for reading v3 seeds. V4 always carries the catalog.
+    system_catalog: ?@import("../../system_catalog/domain.zig").State = null,
     tables: []const topology_records.TableRecord,
     ranges: []const topology_records.RangeRecord,
     extension_packages: []const extensions.PackageManifest = &.{},
@@ -94,14 +96,16 @@ pub fn validate(
     expected_generation: []const u8,
     topology: Topology,
 ) !void {
-    if (topology.format_version != topology_format_version or
+    if ((topology.format_version != topology_format_version and topology.format_version != 3) or
         !std.mem.eql(u8, topology.generation, expected_generation) or
         topology.catalog.epoch == 0 or topology.catalog.tables.len == 0 or
         topology.catalog.ranges.len == 0 or
         topology.replicas.len != topology.catalog.ranges.len) return error.InvalidSeedTopology;
 
+    try validateLogicalCatalog(alloc, topology.format_version, topology.catalog);
     for (topology.catalog.tables, 0..) |table, index| {
-        if (table.table_id == 0 or !validation.isIdentifier(table.name)) return error.InvalidSeedTopology;
+        if (table.table_id == 0) return error.InvalidSeedTopology;
+        try validateTableIdentityName(table.name);
         if (index > 0 and topology.catalog.tables[index - 1].table_id >= table.table_id) return error.NonCanonicalSeedTopology;
         try validateJson(table.schema_json, true);
         try validateJson(table.read_schema_json, true);
@@ -328,4 +332,34 @@ fn encodeHex(out: []u8, bytes: []const u8) void {
 
 fn readFileAlloc(io: std.Io, alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));
+}
+
+pub fn validateLogicalCatalog(alloc: Allocator, version: u16, catalog: LogicalCatalog) !void {
+    if (version >= 4 and catalog.system_catalog == null) return error.InvalidSeedTopology;
+    if (catalog.system_catalog) |state| {
+        if (state.next_id < 3) return error.InvalidSeedTopology;
+        const domain = @import("../../system_catalog/domain.zig");
+        var index = try domain.StateIndex.init(alloc, state);
+        defer index.deinit(alloc);
+        for (state.resources) |resource| {
+            try domain.validateResourceName(resource.kind, resource.name);
+            if (resource.id == 0 or (resource.kind != .table and resource.id >= state.next_id)) return error.InvalidSeedTopology;
+            switch (resource.kind) {
+                .table => {
+                    const table = findTable(catalog.tables, resource.id) orelse return error.InvalidSeedTopology;
+                    if (!std.mem.eql(u8, table.name, resource.storage_name) or index.byId(.namespace, resource.parent_id) == null) return error.InvalidSeedTopology;
+                },
+                .namespace => if (index.byId(.database, resource.parent_id) == null) return error.InvalidSeedTopology,
+                else => {},
+            }
+            if (resource.tablespace_id != 0 and index.byId(.tablespace, resource.tablespace_id) == null) return error.InvalidSeedTopology;
+        }
+    }
+}
+
+pub fn validateTableIdentityName(name: []const u8) !void {
+    const domain = @import("../../system_catalog/domain.zig");
+    if (name.len <= 255) {
+        domain.validateTableName(name) catch return error.InvalidSeedTopology;
+    } else domain.validateStorageName(name) catch return error.InvalidSeedTopology;
 }

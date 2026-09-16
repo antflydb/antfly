@@ -1,0 +1,710 @@
+{
+  "scenario": "skewed_schema_migrations_with_foreground_traffic",
+  "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "configuration": {
+    "large_documents": 10000,
+    "small_tenants": 5,
+    "traffic_clients": 1,
+    "warmups_per_binary": 1,
+    "samples_per_binary": 3
+  },
+  "binaries": {
+    "baseline": {
+      "path": "/private/tmp/antfly-catalog-round4-baseline",
+      "sha256": "09f761e926b1ebc60baca15bb1057ab0a9320d0f85b4ab8163b050087c4f232d"
+    },
+    "candidate": {
+      "path": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+      "sha256": "67a0ccc697546f32e10a7c775ccc7137e7be8ac6b2f43a418a0b8df2d219a07d"
+    }
+  },
+  "source_head": "5dcf4b3233daf043eb78c6634f6c04e98a6ca2cc",
+  "source_diff_sha256": "acf5a5148f770c848274a3a7df90fdfe37908734556310f3d6a5c93fdf35dab6",
+  "runs": [
+    {
+      "binary": "baseline",
+      "iteration": 0,
+      "warmup": true,
+      "exit_code": 1,
+      "timed_out": false,
+      "interrupted": false,
+      "environment_failure": null,
+      "elapsed_seconds": 51.37182412529364,
+      "free_disk_bytes_before": 129397489664,
+      "log": "/private/tmp/catalog-round4-final-comparison.baseline.0.log",
+      "observations": [
+        {
+          "completed_ms": {
+            "migration_large": 8630.624707788229,
+            "migration_small_0": 2462.5057498924434,
+            "migration_small_1": 4549.872040748596,
+            "migration_small_2": 8556.599999777973,
+            "migration_small_3": 3701.69287500903,
+            "migration_small_4": 4074.2599577642977
+          },
+          "failures": [
+            "lookup migration_small_4: 500 Server Error: Internal Server Error for url: http://127.0.0.1:49206/db/v1/tables/migration_small_4/documents/doc-000000 {\"error\":\"INTERNAL_ERROR\",\"message\":\"internal server error\"}"
+          ],
+          "large_documents": 10000,
+          "replicas": 3,
+          "request_latencies": {
+            "lookup_ms": [
+              416.9059582054615,
+              5034.434374887496,
+              71.20383298024535,
+              142.89670810103416,
+              69.16179182007909,
+              1993.8654592260718,
+              103.50104188546538
+            ],
+            "search_ms": [
+              82.59704196825624,
+              64.33120928704739,
+              130.53774973377585,
+              56.04975018650293,
+              77.7793750166893,
+              74.56429209560156
+            ],
+            "write_ms": [
+              78.38791608810425,
+              24.068125057965517,
+              22.36166689544916,
+              25.029624812304974,
+              28.165791649371386,
+              31.001375056803226
+            ]
+          },
+          "scenario": "skewed_schema_migrations_with_foreground_traffic",
+          "small_documents_per_tenant": 20,
+          "small_tenants": 5,
+          "traffic_clients": 1
+        }
+      ]
+    },
+    {
+      "binary": "candidate",
+      "iteration": 0,
+      "warmup": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "interrupted": false,
+      "environment_failure": null,
+      "elapsed_seconds": 54.884383582975715,
+      "free_disk_bytes_before": 128770920448,
+      "log": "/private/tmp/catalog-round4-final-comparison.candidate.0.log",
+      "observations": [
+        {
+          "completed_ms": {
+            "migration_large": 9047.830541152507,
+            "migration_small_0": 6791.138750035316,
+            "migration_small_1": 6823.697333224118,
+            "migration_small_2": 6846.807083114982,
+            "migration_small_3": 6875.436916016042,
+            "migration_small_4": 6900.054290890694
+          },
+          "failures": [],
+          "large_documents": 10000,
+          "replicas": 3,
+          "request_latencies": {
+            "lookup_ms": [
+              377.5384579785168,
+              409.3536250293255,
+              79.28395783528686,
+              549.0467078052461,
+              76.39750000089407,
+              111.93129094317555,
+              73.6662084236741,
+              105.27916718274355,
+              61.97141669690609,
+              573.5008753836155,
+              60.2630409412086,
+              83.08687526732683,
+              82.74191617965698,
+              111.39904195442796,
+              64.37449995428324,
+              106.30929237231612,
+              51.99400009587407,
+              135.48475038260221,
+              300.3814588300884,
+              108.15587500110269,
+              44.10583432763815,
+              341.3284169510007,
+              105.99941713735461,
+              71.46837469190359,
+              94.65900016948581,
+              101.47429211065173
+            ],
+            "search_ms": [
+              78.51845910772681,
+              92.4702500924468,
+              71.10170787200332,
+              327.6040838100016,
+              69.75479237735271,
+              130.73387509211898,
+              85.58095758780837,
+              83.65454198792577,
+              84.31566692888737,
+              59.15470840409398,
+              105.1152921281755,
+              81.35787537321448,
+              115.21595809608698,
+              76.3028752990067,
+              107.50616574659944,
+              115.1600000448525,
+              79.08379100263119,
+              71.48170797154307,
+              109.14045758545399,
+              80.69120813161135,
+              55.90941710397601,
+              317.33129220083356,
+              110.58970773592591,
+              68.71337536722422,
+              76.09220873564482,
+              54.36304211616516
+            ],
+            "write_ms": [
+              24.472041986882687,
+              26.903041172772646,
+              81.34054206311703,
+              29.391624964773655,
+              46.88908299431205,
+              27.03566662967205,
+              46.873792074620724,
+              37.771834060549736,
+              118.19483386352658,
+              46.74420831725001,
+              43.371041771024466,
+              34.03316717594862,
+              69.00983396917582,
+              96.14216675981879,
+              29.902207665145397,
+              34.983749967068434,
+              59.37312496826053,
+              21.208666265010834,
+              27.031625155359507,
+              70.84870804101229,
+              31.004459131509066,
+              42.56270779296756,
+              22.75758283212781,
+              39.0262077562511,
+              102.95895813032985,
+              32.95987518504262
+            ]
+          },
+          "scenario": "skewed_schema_migrations_with_foreground_traffic",
+          "small_documents_per_tenant": 20,
+          "small_tenants": 5,
+          "traffic_clients": 1
+        }
+      ]
+    },
+    {
+      "binary": "baseline",
+      "iteration": 1,
+      "warmup": false,
+      "exit_code": 0,
+      "timed_out": false,
+      "interrupted": false,
+      "environment_failure": null,
+      "elapsed_seconds": 49.23232779186219,
+      "free_disk_bytes_before": 128262402048,
+      "log": "/private/tmp/catalog-round4-final-comparison.baseline.1.log",
+      "observations": [
+        {
+          "completed_ms": {
+            "migration_large": 5015.105625148863,
+            "migration_small_0": 7942.251707892865,
+            "migration_small_1": 1384.5700831152499,
+            "migration_small_2": 5701.944916043431,
+            "migration_small_3": 5117.368165869266,
+            "migration_small_4": 6933.143333066255
+          },
+          "failures": [],
+          "large_documents": 10000,
+          "replicas": 3,
+          "request_latencies": {
+            "lookup_ms": [
+              431.7979170009494,
+              149.07408272847533,
+              67.76349991559982,
+              3090.016749687493,
+              98.68012508377433,
+              73.93549988046288,
+              113.3945407345891,
+              1070.8027500659227,
+              71.8020424246788,
+              126.20275001972914,
+              74.9669587239623,
+              113.70270885527134,
+              80.00354235991836,
+              64.91545913740993
+            ],
+            "search_ms": [
+              103.69716677814722,
+              107.16624977067113,
+              73.23691714555025,
+              554.895750246942,
+              49.60837494581938,
+              88.26766675338149,
+              76.69337512925267,
+              53.769166115671396,
+              58.983124792575836,
+              47.053083311766386,
+              57.790250051766634,
+              104.98212510719895,
+              57.12445918470621,
+              61.233666725456715
+            ],
+            "write_ms": [
+              50.84454221650958,
+              34.779833164066076,
+              24.383625015616417,
+              23.796167224645615,
+              24.46699980646372,
+              18.28241627663374,
+              38.84887509047985,
+              69.8161250911653,
+              34.36941606923938,
+              26.634375099092722,
+              38.77929085865617,
+              76.63495792075992,
+              29.711250215768814
+            ]
+          },
+          "scenario": "skewed_schema_migrations_with_foreground_traffic",
+          "small_documents_per_tenant": 20,
+          "small_tenants": 5,
+          "traffic_clients": 1
+        }
+      ]
+    },
+    {
+      "binary": "candidate",
+      "iteration": 1,
+      "warmup": false,
+      "exit_code": 1,
+      "timed_out": false,
+      "interrupted": false,
+      "environment_failure": null,
+      "elapsed_seconds": 54.675192249938846,
+      "free_disk_bytes_before": 127495409664,
+      "log": "/private/tmp/catalog-round4-final-comparison.candidate.1.log",
+      "observations": [
+        {
+          "completed_ms": {
+            "migration_large": 7025.940999854356,
+            "migration_small_0": 6565.854541957378,
+            "migration_small_1": 6617.331083863974,
+            "migration_small_2": 6648.020000196993,
+            "migration_small_3": 6722.756042145193,
+            "migration_small_4": 6762.447792105377
+          },
+          "failures": [
+            "write migration_large: 500 Server Error: Internal Server Error for url: http://127.0.0.1:61940/db/v1/tables/migration_large/batch {\"error\":\"RuntimeBoundaryFailure\",\"message\":\"batch failed\"}"
+          ],
+          "large_documents": 10000,
+          "replicas": 3,
+          "request_latencies": {
+            "lookup_ms": [
+              380.22445794194937,
+              93.50429195910692,
+              54.54774992540479,
+              122.98187520354986,
+              150.86233289912343
+            ],
+            "search_ms": [
+              89.9231662042439,
+              101.12087475135922,
+              83.59324978664517,
+              50.67945783957839
+            ],
+            "write_ms": [
+              5045.632333029062,
+              36.93941701203585,
+              820.2156247571111,
+              30.63995810225606
+            ]
+          },
+          "scenario": "skewed_schema_migrations_with_foreground_traffic",
+          "small_documents_per_tenant": 20,
+          "small_tenants": 5,
+          "traffic_clients": 1
+        }
+      ]
+    },
+    {
+      "binary": "baseline",
+      "iteration": 2,
+      "warmup": false,
+      "exit_code": 0,
+      "timed_out": false,
+      "interrupted": false,
+      "environment_failure": null,
+      "elapsed_seconds": 49.05253016622737,
+      "free_disk_bytes_before": 126166679552,
+      "log": "/private/tmp/catalog-round4-final-comparison.baseline.2.log",
+      "observations": [
+        {
+          "completed_ms": {
+            "migration_large": 5325.649874750525,
+            "migration_small_0": 5718.0789997801185,
+            "migration_small_1": 6603.15145784989,
+            "migration_small_2": 1179.560124874115,
+            "migration_small_3": 7814.8781247437,
+            "migration_small_4": 5398.412374779582
+          },
+          "failures": [],
+          "large_documents": 10000,
+          "replicas": 3,
+          "request_latencies": {
+            "lookup_ms": [
+              372.6081671193242,
+              847.0988338813186,
+              109.96454209089279,
+              526.8756658770144,
+              72.79658317565918,
+              106.10524984076619,
+              52.51649999991059,
+              85.95037506893277,
+              53.84537484496832,
+              998.943124897778
+            ],
+            "search_ms": [
+              2992.6579166203737,
+              53.99954225867987,
+              59.07133314758539,
+              351.0773330926895,
+              70.06866624578834,
+              53.402415942400694,
+              75.5437077023089,
+              50.74879201129079,
+              61.165958642959595,
+              77.66791712492704
+            ],
+            "write_ms": [
+              19.017291720956564,
+              35.77591711655259,
+              23.111958988010883,
+              22.56083395332098,
+              43.82549971342087,
+              33.042124938219786,
+              19.742750097066164,
+              15.301334206014872,
+              15.129874926060438,
+              22.656624671071768
+            ]
+          },
+          "scenario": "skewed_schema_migrations_with_foreground_traffic",
+          "small_documents_per_tenant": 20,
+          "small_tenants": 5,
+          "traffic_clients": 1
+        }
+      ]
+    },
+    {
+      "binary": "candidate",
+      "iteration": 2,
+      "warmup": false,
+      "exit_code": 0,
+      "timed_out": false,
+      "interrupted": false,
+      "environment_failure": null,
+      "elapsed_seconds": 48.38919783337042,
+      "free_disk_bytes_before": 125981700096,
+      "log": "/private/tmp/catalog-round4-final-comparison.candidate.2.log",
+      "observations": [
+        {
+          "completed_ms": {
+            "migration_large": 8166.459959000349,
+            "migration_small_0": 6772.743375040591,
+            "migration_small_1": 6805.571958888322,
+            "migration_small_2": 6827.890334185213,
+            "migration_small_3": 6851.0144171305,
+            "migration_small_4": 6876.90570903942
+          },
+          "failures": [],
+          "large_documents": 10000,
+          "replicas": 3,
+          "request_latencies": {
+            "lookup_ms": [
+              395.6462498754263,
+              399.32812517508864,
+              68.1385830976069,
+              535.8279580250382,
+              64.67816699296236,
+              88.90429232269526,
+              79.92904214188457,
+              96.3319162838161,
+              94.50958296656609,
+              1020.7608751952648,
+              70.01154171302915,
+              98.19391602650285,
+              73.00329208374023,
+              116.31654063239694,
+              72.7618751116097,
+              87.42220792919397,
+              78.89812532812357,
+              70.0509580783546,
+              56.81004095822573,
+              100.85025010630488,
+              64.38787514343858,
+              657.383874990046
+            ],
+            "search_ms": [
+              64.38895780593157,
+              43.51820796728134,
+              79.75370809435844,
+              319.92316618561745,
+              54.22412510961294,
+              80.3424590267241,
+              65.718499943614,
+              78.37649993598461,
+              74.93983395397663,
+              79.21120896935463,
+              81.02324977517128,
+              80.38849988952279,
+              75.21808287128806,
+              80.88304102420807,
+              77.84083299338818,
+              76.67612470686436,
+              50.89062498882413,
+              89.16154224425554,
+              85.01191576942801,
+              75.49808407202363,
+              67.43129109963775
+            ],
+            "write_ms": [
+              35.77516693621874,
+              29.409291688352823,
+              27.342415880411863,
+              18.776957876980305,
+              71.70233363285661,
+              37.77558309957385,
+              33.08391710743308,
+              51.584791857749224,
+              43.78179181367159,
+              31.056042294949293,
+              63.673458993434906,
+              101.32537502795458,
+              39.47708290070295,
+              43.090291786938906,
+              46.43341712653637,
+              47.061416786164045,
+              54.8659167252481,
+              24.07333441078663,
+              30.243834014981985,
+              30.548749957233667,
+              61.290625017136335
+            ]
+          },
+          "scenario": "skewed_schema_migrations_with_foreground_traffic",
+          "small_documents_per_tenant": 20,
+          "small_tenants": 5,
+          "traffic_clients": 1
+        }
+      ]
+    },
+    {
+      "binary": "baseline",
+      "iteration": 3,
+      "warmup": false,
+      "exit_code": 1,
+      "timed_out": false,
+      "interrupted": false,
+      "environment_failure": null,
+      "elapsed_seconds": 51.49643629183993,
+      "free_disk_bytes_before": 125699031040,
+      "log": "/private/tmp/catalog-round4-final-comparison.baseline.3.log",
+      "observations": [
+        {
+          "completed_ms": {
+            "migration_large": 11166.595875285566,
+            "migration_small_0": 6046.356082893908,
+            "migration_small_1": 11184.28266607225,
+            "migration_small_2": 7149.678625166416,
+            "migration_small_3": 3901.6541661694646,
+            "migration_small_4": 5916.456582956016
+          },
+          "failures": [
+            "search migration_small_4: 500 Server Error: Internal Server Error for url: http://127.0.0.1:51802/db/v1/tables/migration_small_4/query query failed"
+          ],
+          "large_documents": 10000,
+          "replicas": 3,
+          "request_latencies": {
+            "lookup_ms": [
+              408.7471659295261,
+              182.50300036743283,
+              58.222291991114616,
+              520.5914578400552,
+              62.96279188245535,
+              109.22979097813368,
+              71.78991660475731,
+              86.1460417509079,
+              59.15149999782443,
+              1026.8235001713037,
+              69.96945803985,
+              99.41579215228558,
+              64.85162489116192,
+              89.2677498050034,
+              62.80479207634926,
+              98.30133337527514
+            ],
+            "search_ms": [
+              2954.031208064407,
+              78.5370827652514,
+              80.87312523275614,
+              343.66070898249745,
+              54.51720813289285,
+              51.6869998537004,
+              52.918416913598776,
+              77.91304169222713,
+              137.23204098641872,
+              65.34658279269934,
+              55.135125294327736,
+              79.25095781683922,
+              77.15141726657748,
+              52.71358275786042,
+              105.07183289155364,
+              5032.529625110328
+            ],
+            "write_ms": [
+              16.511833295226097,
+              28.98720884695649,
+              27.514916844666004,
+              55.29691698029637,
+              20.681167021393776,
+              15.857125166803598,
+              23.469417355954647,
+              40.88399978354573,
+              38.71295787394047,
+              70.84912480786443,
+              27.078083250671625,
+              12.714083772152662,
+              14.638791792094707,
+              20.225165877491236,
+              27.017624583095312
+            ]
+          },
+          "scenario": "skewed_schema_migrations_with_foreground_traffic",
+          "small_documents_per_tenant": 20,
+          "small_tenants": 5,
+          "traffic_clients": 1
+        }
+      ]
+    },
+    {
+      "binary": "candidate",
+      "iteration": 3,
+      "warmup": false,
+      "exit_code": 0,
+      "timed_out": false,
+      "interrupted": false,
+      "environment_failure": null,
+      "elapsed_seconds": 52.67550087533891,
+      "free_disk_bytes_before": 124619186176,
+      "log": "/private/tmp/catalog-round4-final-comparison.candidate.3.log",
+      "observations": [
+        {
+          "completed_ms": {
+            "migration_large": 10888.37124966085,
+            "migration_small_0": 6752.385499887168,
+            "migration_small_1": 6786.704582627863,
+            "migration_small_2": 6808.827999979258,
+            "migration_small_3": 6845.26824997738,
+            "migration_small_4": 6873.45162499696
+          },
+          "failures": [],
+          "large_documents": 10000,
+          "replicas": 3,
+          "request_latencies": {
+            "lookup_ms": [
+              441.85395911335945,
+              391.38099970296025,
+              208.10095919296145,
+              546.4355000294745,
+              55.17808301374316,
+              84.28862504661083,
+              59.71791595220566,
+              77.15783314779401,
+              49.94316725060344,
+              1043.40475006029,
+              71.88774971291423,
+              90.123041998595,
+              79.41237511113286,
+              104.23762490972877,
+              77.64529203996062,
+              89.4935829564929,
+              60.14883331954479,
+              88.28070806339383,
+              59.56533318385482,
+              97.49554190784693,
+              116.05037515982985,
+              332.050375174731
+            ],
+            "search_ms": [
+              54.02158293873072,
+              107.60874999687076,
+              62.07245774567127,
+              343.00908306613564,
+              59.31208282709122,
+              60.94474997371435,
+              46.93704191595316,
+              83.61187530681491,
+              102.73720836266875,
+              56.367124896496534,
+              132.8237080015242,
+              105.02970824018121,
+              78.69154121726751,
+              81.25824993476272,
+              80.45208314433694,
+              53.442958276718855,
+              92.73925004526973,
+              79.64050024747849,
+              60.52787462249398,
+              85.49454156309366,
+              3192.6491246558726
+            ],
+            "write_ms": [
+              31.53683291748166,
+              42.10537485778332,
+              37.57354198023677,
+              42.39849979057908,
+              42.10333386436105,
+              62.00512498617172,
+              30.320916790515184,
+              58.09979187324643,
+              31.284292228519917,
+              79.28966684266925,
+              40.614624973386526,
+              41.76962515339255,
+              30.734708067029715,
+              46.70616704970598,
+              35.25570873171091,
+              80.06591582670808,
+              57.958416640758514,
+              29.475457966327667,
+              55.02387462183833,
+              36.062125116586685,
+              21.944459062069654
+            ]
+          },
+          "scenario": "skewed_schema_migrations_with_foreground_traffic",
+          "small_documents_per_tenant": 20,
+          "small_tenants": 5,
+          "traffic_clients": 1
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "Fresh three-metadata/three-data process cluster per run; provisioning excluded from workload timings.",
+    "Closed-loop traffic; compare completion times and raw request distributions together, not as fixed offered-load SLOs.",
+    "Warmups are retained and labeled; failed runs are retained, never included as successful latency samples."
+  ],
+  "interpretation": {
+    "stage": "after idempotent repair pages, before catalog routing error ABI fix",
+    "host_contention": "Unrelated worktree compiler jobs were active during this run. No task-owned compiler jobs ran concurrently. Not an isolated latency comparison.",
+    "failed_candidate": "One measured run returned RuntimeBoundaryFailure for an unclassified CatalogRoutingSnapshotTimeout. This prompted the stable error detail regression/fix.",
+    "failures_retained": true
+  }
+}

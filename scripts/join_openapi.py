@@ -296,7 +296,12 @@ def generate(argv: list[str]) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--depfile", type=Path)
+    parser.add_argument(
+        "--output", type=Path, help="Output path relative to the working directory"
+    )
     options, args = parser.parse_known_args(argv)
+    if options.output is not None:
+        args.append(str(options.output.resolve()))
     # Other legacy modes can consult Git for ordering or validate external
     # references. Only the modular join is a cached build producer.
     if options.depfile is not None and args[:1] != ["--joined-only"]:

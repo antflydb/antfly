@@ -14613,6 +14613,7 @@ pub const ProvisionedTableWriteSource = struct {
                 table_name,
                 metadata.target_index_name,
                 metadata.advance_index_repairs,
+                metadata.index_repair_options,
                 false,
             )) orelse return error.StorageKernelOwnerUnavailable;
             defer observation.deinit(alloc);
@@ -14657,6 +14658,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .restore_repair_progressed = result.restore_repair_progressed != 0,
                 .index_repair_pending = result.state == .repair_pending or result.repair_remaining != 0,
                 .index_repair_attempted = result.repair_attempted != 0,
+                .index_repair_paused = result.repair_paused != 0,
                 .index_repair_repaired = result.repair_repaired != 0,
                 .index_repair_degraded = result.state == .degraded or result.repair_terminal != 0,
                 .index_repair_disk_wait = result.repair_disk_waits != 0,
@@ -16123,7 +16125,11 @@ pub const ProvisionedTableWriteSource = struct {
         snapshot_token: []const u8,
         destination_root: []const u8,
     ) !void {
-        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            _ = (try owner.captureHASeedSnapshotGroupLocal(group_id, table_name, snapshot_token, destination_root)) orelse return error.StorageKernelOwnerUnavailable;
+            return;
+        }
         var probe = self.probeManagedWriterGroupBestEffort(table_name, group_id);
         defer probe.deinit();
         switch (probe) {
@@ -16269,33 +16275,8 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn captureHASeedDbSnapshot(
-        alloc: std.mem.Allocator,
-        db: *db_mod.DB,
-        db_path: []const u8,
-        snapshot_token: []const u8,
-        destination_root: []const u8,
-    ) !void {
-        switch (db.primary_backend) {
-            .lmdb, .lsm => {},
-            .mem, .lsm_memory => return error.HASeedSnapshotUnsupportedBackend,
-        }
-        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
-        defer alloc.free(snapshot_root);
-        var io_impl = Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
-        defer Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
-        const maintenance_clock = db.backend_runtime.monotonicClock();
-        const maintenance_deadline_ns = maintenance_clock.nowRealtimeNs() +| std.time.ns_per_s;
-        _ = db.snapshotHASeed(snapshot_token, maintenance_deadline_ns) catch |err| switch (err) {
-            error.EnrichmentWaitCanceled,
-            error.EnrichmentWaitTimeout,
-            error.EnrichmentRetryInProgress,
-            => return error.HASeedSnapshotRuntimeBusy,
-            else => return err,
-        };
-        try backups_api.copyDirectoryRecursive(alloc, snapshot_root, destination_root);
+    fn captureHASeedDbSnapshot(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, snapshot_token: []const u8, destination_root: []const u8) !void {
+        return @import("../storage/hot_standby/seed_snapshot.zig").capture(alloc, db, db_path, snapshot_token, destination_root);
     }
 
     fn hasActiveBulkIngestSessionForTableBestEffort(
@@ -19608,6 +19589,7 @@ pub const ProvisionedTableWriteSource = struct {
                 table_name,
                 metadata.target_index_name,
                 false,
+                .{},
                 true,
             )) orelse return error.StorageKernelOwnerUnavailable;
             defer observation.deinit(alloc);
@@ -22216,10 +22198,9 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(local_location);
 
         const source_shard = plan.manifest.shards[0];
-        const group_id = if (plan.replace_existing)
-            (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null
-        else
-            source_shard.group_id;
+        // The source shard identifies the backup artifact. Publication always
+        // targets the current catalog incarnation, including restore-as-new.
+        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const restore_source: backup_restore.RestoreSource = .{
@@ -22395,11 +22376,9 @@ pub const ProvisionedTableWriteSource = struct {
         const source_identity = try backups_api.canonicalRestoreSourceIdentityAlloc(alloc, plan.source_location);
         defer alloc.free(source_identity);
         const source_shard = &plan.manifest.shards[0];
-        const group_id = if (plan.replace_existing)
-            (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse
-                return null
-        else
-            source_shard.group_id;
+        // The backup shard identifies the source artifact. Restore-as-new must
+        // publish into the destination catalog's newly allocated group.
+        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const identity_namespace = try loadTableIdentityNamespaceForGroup(
@@ -33076,7 +33055,7 @@ fn consumerTests() type {
                 fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
                     return error.UnexpectedBatch;
                 }
-                fn observe(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: ?[]const u8, advance: bool, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: ?[]const u8, advance: bool, _: db_mod.types.ArtifactRepairRunOptions, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(!advance and !retain);
                     self.calls += 1;
@@ -33121,7 +33100,7 @@ fn consumerTests() type {
                 fn reconcile(_: *anyopaque, _: u64, _: []const u8, _: ?[]const u8, _: bool) anyerror!?table_write_source.LocalStructuralReconcileResult {
                     return .{ .state = .complete };
                 }
-                fn observe(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, target: ?[]const u8, advance: bool, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, target: ?[]const u8, advance: bool, _: db_mod.types.ArtifactRepairRunOptions, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table);
                     try std.testing.expectEqualStrings("vec", target.?);
