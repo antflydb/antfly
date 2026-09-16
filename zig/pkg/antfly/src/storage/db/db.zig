@@ -67323,7 +67323,8 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
                 closed.* = true;
             }
             try database.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-            const initial_status = (try database.loadIndexStatusSnapshot(std.testing.allocator, "g")) orelse return error.TestUnexpectedResult;
+            try database.saveAllLiveIndexStatusSnapshots(database.alloc);
+            const initial_status = (try database.loadIndexStatusSnapshot(database.alloc, "g")) orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(u64, 200 * std.time.ns_per_day), initial_status.updated_at_ns);
             try database.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
             try database.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
@@ -67350,8 +67351,8 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
             try database.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 });
             try std.testing.expectEqual(@as(u64, 2), (try database.raftAppliedEntry()).?.index);
             try std.testing.expectEqualStrings("", database.getRange().end);
-            const retired = try database.getEdges(std.testing.allocator, "g", "a", "link", .in);
-            defer graph_mod.GraphIndex.freeEdges(std.testing.allocator, retired);
+            const retired = try database.getEdges(database.alloc, "g", "a", "link", .in);
+            defer graph_mod.GraphIndex.freeEdges(database.alloc, retired);
             try std.testing.expectEqual(@as(usize, 0), retired.len);
         }
     };

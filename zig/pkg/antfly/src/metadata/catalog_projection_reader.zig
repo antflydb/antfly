@@ -1227,7 +1227,7 @@ test "catalog retained WAL replay preserves durable metadata while applied water
     var wal = try raft_storage.WalReplicaState.init(alloc, layout, .{ .applied_watermark_persist_interval = 1 });
     defer wal.deinit();
     try std.testing.expectEqual(@as(u64, 1), wal.appliedIndex());
-    try std.testing.expectEqual(@as(u64, 5), (try store.latestBatch(group_id)).?.commit_index);
+    try std.testing.expectEqual(@as(u64, 5), (try store.latestCheckpoint(group_id)).?.commit_index);
     var source = Source{ .store = &store };
     var reader: CatalogProjectionReader = .{};
     defer reader.deinit(alloc);
@@ -1271,13 +1271,13 @@ test "catalog retained WAL replay preserves durable metadata while applied water
         try std.testing.expectEqual(@as(u64, @intCast(expected_index)), node.status().applied_index);
         try std.testing.expectEqual(@as(u64, @intCast(expected_index)), wal.appliedIndex());
         std.debug.print("retained-wal-probe replayed={d} durable_before=5 durable_now={d} revision_before={d} revision_now={d}\n", .{
-            expected_index, (try store.latestBatch(group_id)).?.commit_index, before.catalog_revision, (try store.captureCatalogCursor(group_id)).revision,
+            expected_index, (try store.latestCheckpoint(group_id)).?.commit_index, before.catalog_revision, (try store.captureCatalogCursor(group_id)).revision,
         });
         var current = try reader.routingSnapshot(alloc, group_id, source.source(), null);
         defer reader.freeRoutingSnapshot(alloc, &current);
         try std.testing.expectEqualDeep(before.tables, current.tables);
         try std.testing.expectEqual(before.catalog_revision, current.catalog_revision);
-        try std.testing.expectEqual(@as(u64, 5), (try store.latestBatch(group_id)).?.commit_index);
+        try std.testing.expectEqual(@as(u64, 5), (try store.latestCheckpoint(group_id)).?.commit_index);
         try std.testing.expectEqual(epoch, source.epoch.load(.acquire));
     }
     try std.testing.expectEqual(@as(u64, 5), wal.appliedIndex());

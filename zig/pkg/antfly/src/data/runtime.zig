@@ -39415,6 +39415,34 @@ fn implementationTests() type {
 
         test "DataServer store status retries leadership changes on borrowed VoprIo" {
             const alloc = std.testing.allocator;
+            const RuntimeRound = struct {
+                // Publication now runs on its own worker. Await it from a
+                // scheduler-owned fiber, just like the production caller.
+                fn run(server: *DataServer, runtime: *@import("vopr").vopr_io.VoprIo) !void {
+                    const vopr = @import("vopr");
+                    const allocator = server.alloc;
+                    const io = runtime.io();
+                    var future = io.async(DataServer.runStoreStatusRoundOnly, .{server});
+                    defer {
+                        _ = runtime.cancelAndDrainTasksForTeardown(allocator, 10_000) catch @panic("store report test cleanup failed");
+                        _ = future.cancel(io) catch {};
+                    }
+                    var enabled: vopr.transition.List = .{};
+                    defer enabled.deinit(allocator);
+                    var events: vopr.event.Sink = .{};
+                    defer events.deinit(allocator);
+                    for (0..1_000) |_| {
+                        if (runtime.scheduler().quiescent()) break;
+                        enabled.items.clearRetainingCapacity();
+                        try runtime.scheduler().enumerateReady(&enabled, allocator);
+                        try enabled.canonicalize();
+                        if (enabled.items.items.len == 0) return error.VoprStoreReportDeadlock;
+                        try runtime.scheduler().executeReady(enabled.items.items[0].id, &events, allocator);
+                    }
+                    try std.testing.expect(runtime.scheduler().quiescent());
+                    try future.await(io);
+                }
+            };
 
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
@@ -39439,6 +39467,7 @@ fn implementationTests() type {
                 requests: usize = 0,
                 reports: usize = 0,
                 delayed_error: ?anyerror = null,
+                dirty_on_report: ?*DataServer = null,
 
                 fn executor(self: *@This()) antfly.common.http.RequestExecutor {
                     return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -39463,9 +39492,21 @@ fn implementationTests() type {
                         };
                     }
                     try std.testing.expectEqual(antfly.common.http.Method.POST, request.method);
-                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/status"));
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/status/update"));
+                    var update = try std.json.parseFromSlice(store_report_update.Update, response_alloc, request.body, .{});
+                    defer update.deinit();
                     self.reports += 1;
-                    return .{ .status = 200 };
+                    if (self.dirty_on_report) |server| {
+                        server.markStoreStatusDirtyImmediate();
+                        self.dirty_on_report = null;
+                    }
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(request.body, &digest, .{});
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(response_alloc, store_report_update.Cursor{
+                        .reporter_incarnation = update.value.report.reporter_incarnation,
+                        .sequence = update.value.sequence,
+                        .digest = digest,
+                    }, .{}) };
                 }
             };
             var metadata_transport = Metadata{ .vopr_io = &vopr_io };
@@ -39511,7 +39552,7 @@ fn implementationTests() type {
 
             // A transient election failure must preserve the publication and yield,
             // even when the borrowed clock is far beyond host uptime.
-            try server.runStoreStatusRoundOnly();
+            try RuntimeRound.run(&server, &vopr_io);
             try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
             try std.testing.expect(server.store_status_dirty.load(.acquire));
             try std.testing.expect(server.embedding_activity_status_dirty.load(.acquire));
@@ -39521,14 +39562,14 @@ fn implementationTests() type {
             // Make an accidental early attempt observable as a permanent error.
             server.setRemoteMetadataFetchErrorForTest(error.MetadataIncarnationMismatch);
             vopr_io.monotonic_ns = @as(i96, retry_at_ms - 1) * std.time.ns_per_ms;
-            try server.runStoreStatusRoundOnly();
+            try RuntimeRound.run(&server, &vopr_io);
             try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
             vopr_io.monotonic_ns += std.time.ns_per_ms;
-            try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
+            try std.testing.expectError(error.MetadataIncarnationMismatch, RuntimeRound.run(&server, &vopr_io));
             try std.testing.expect(server.store_status_dirty.load(.acquire));
 
             server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
-            try server.runStoreStatusRoundOnly();
+            try RuntimeRound.run(&server, &vopr_io);
             try std.testing.expectEqual(@as(u32, 2), server.metadataBootstrapRetryAttemptsForTest());
             try std.testing.expectEqual(@as(usize, 0), metadata_transport.reports);
 
@@ -39550,28 +39591,29 @@ fn implementationTests() type {
                 .merge_transitions = &.{},
             });
             remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
-            try server.runStoreStatusRoundOnly();
+            metadata_transport.dirty_on_report = &server;
+            try RuntimeRound.run(&server, &vopr_io);
             try std.testing.expectEqual(@as(usize, 1), metadata_transport.reports);
             try std.testing.expectEqual(@as(u32, 0), server.metadataBootstrapRetryAttemptsForTest());
             try std.testing.expectEqual(@as(u64, 0), server.nextMetadataBootstrapRetryAtMsForTest());
-            // The manual runtime completes the cold local-status refresh during
-            // collection. Its new wake must survive this successful report.
+            // A newer observation arrives while the report is in flight.
+            // Its wake must survive acknowledgement of the captured report.
             try std.testing.expect(server.store_status_dirty.load(.acquire));
             try std.testing.expect(!server.embedding_activity_status_dirty.load(.acquire));
-            try server.runStoreStatusRoundOnly();
+            try RuntimeRound.run(&server, &vopr_io);
             try std.testing.expectEqual(@as(usize, 2), metadata_transport.reports);
             try std.testing.expect(!server.store_status_dirty.load(.acquire));
-            try std.testing.expectEqual(server.backgroundMonotonicMs(), server.last_store_status_report_at_ms);
+            try std.testing.expectEqual(server.backgroundMonotonicMs(), server.last_store_status_report_at_ms.load(.acquire));
 
             // Registration uses the same backoff before the status collector runs.
             server.store_registration_confirmed = false;
             server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
-            try server.runStoreStatusRoundOnly();
+            try RuntimeRound.run(&server, &vopr_io);
             try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
             server.setRemoteMetadataFetchErrorForTest(error.MetadataIncarnationMismatch);
-            try server.runStoreStatusRoundOnly();
+            try RuntimeRound.run(&server, &vopr_io);
             vopr_io.monotonic_ns = @as(i96, server.nextMetadataBootstrapRetryAtMsForTest()) * std.time.ns_per_ms;
-            try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
+            try std.testing.expectError(error.MetadataIncarnationMismatch, RuntimeRound.run(&server, &vopr_io));
             try std.testing.expectEqual(@as(usize, 2), metadata_transport.reports);
             // Cover actual transport failures that complete after the old deadline
             // would already have elapsed, for both publication and registration.
@@ -39584,7 +39626,7 @@ fn implementationTests() type {
                 metadata_transport.delayed_error = error.NotLeader;
                 const started_at_ms = server.backgroundMonotonicMs();
                 const requests_before = metadata_transport.requests;
-                try server.runStoreStatusRoundOnly();
+                try RuntimeRound.run(&server, &vopr_io);
                 const failed_at_ms = server.backgroundMonotonicMs();
                 try std.testing.expectEqual(started_at_ms + 2000, failed_at_ms);
                 try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
@@ -39597,12 +39639,12 @@ fn implementationTests() type {
                 // No new transport call may start until the delay after completion
                 // expires. A permanent failure at that boundary must still escape.
                 metadata_transport.delayed_error = error.MetadataIncarnationMismatch;
-                try server.runStoreStatusRoundOnly();
+                try RuntimeRound.run(&server, &vopr_io);
                 vopr_io.monotonic_ns = @as(i96, delayed_retry_at_ms - 1) * std.time.ns_per_ms;
-                try server.runStoreStatusRoundOnly();
+                try RuntimeRound.run(&server, &vopr_io);
                 try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
                 vopr_io.monotonic_ns += std.time.ns_per_ms;
-                try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
+                try std.testing.expectError(error.MetadataIncarnationMismatch, RuntimeRound.run(&server, &vopr_io));
                 try std.testing.expectEqual(requests_before + 2, metadata_transport.requests);
                 try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
                 try std.testing.expectEqual(delayed_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());

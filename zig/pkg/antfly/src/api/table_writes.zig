@@ -36457,7 +36457,7 @@ fn consumerTests() type {
             const ownership = source.structural_reconcile_keys.getPtr(yielded.scheduler_key).?;
             ownership.* = .active;
             source.structural_reconcile_mutex.unlock(io);
-            const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+            const now_ms = monotonicMsWithIo(io);
             yielded.not_before_ms = ProvisionedTableWriteSource.structuralReconcileRequeueAtMs(.yielded, now_ms);
             source.requeueActiveStructuralReconcile(&yielded, std.heap.page_allocator);
 

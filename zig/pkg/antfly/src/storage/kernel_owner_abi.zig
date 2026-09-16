@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 59;
+pub const abi_version: u32 = 60;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1459,6 +1459,8 @@ pub extern fn antfly_storage_system_current_scan_abort(txn: ?*anyopaque) callcon
 pub extern fn antfly_storage_system_write_get(txn: ?*anyopaque, key: BorrowedBytes, out_value: *BorrowedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_system_write_put(txn: ?*anyopaque, key: BorrowedBytes, value: BorrowedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_system_write_delete(txn: ?*anyopaque, key: BorrowedBytes) callconv(.c) Status;
+/// Cursor borrows the write transaction and must close before commit or abort.
+pub extern fn antfly_storage_system_write_open_cursor(txn: ?*anyopaque, out_cursor: *?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_storage_system_write_commit(txn: ?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_storage_system_write_abort(txn: ?*anyopaque) callconv(.c) void;
 pub extern fn antfly_storage_system_cursor_move(

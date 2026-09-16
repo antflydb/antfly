@@ -45718,12 +45718,10 @@ test "api http server join planner uses complete fresh local stats before metada
             return self.snapshot.status;
         }
 
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        fn acquireJoinPlanning(ptr: *anyopaque, budget: table_router.RouteBudget) !?*join_planning.Generation {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.snapshot;
+            return try join_planning.Generation.create(std.testing.allocator, self.snapshot, budget);
         }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
     const FakeReads = struct {
@@ -45801,8 +45799,7 @@ test "api http server join planner uses complete fresh local stats before metada
         .ptr = &fake,
         .vtable = &.{
             .status = FakeSource.status,
-            .admin_snapshot = FakeSource.adminSnapshot,
-            .free_admin_snapshot = FakeSource.freeAdminSnapshot,
+            .acquire_join_planning = FakeSource.acquireJoinPlanning,
         },
     }, reads.source(), null);
     defer server.deinit();

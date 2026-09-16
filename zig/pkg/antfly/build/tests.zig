@@ -203,7 +203,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
     const system_catalog_projection_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[1],
-        .filters = &.{ "catalog projection", "system catalog forwarding retains" },
+        .filters = &.{ "catalog projection", "catalog retained WAL replay", "system catalog forwarding retains" },
     });
     b.step("antfly-system-catalog-projection-test", "Run immutable catalog generation publication and retention regressions").dependOn(&b.addRunArtifact(system_catalog_projection_tests).step);
     const schema_finalization_tests = b.addTest(.{
@@ -3709,6 +3709,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "replicated merge retains its resident writer while graph ownership cleanup is pending",
         "table provisioner materializes metadata indexes into hosted group dbs",
     };
+    const vopr_runtime_adapter_selected_filters = selectTestFilters(b, vopr_runtime_adapter_filters);
     const vopr_runtime_adapter_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         // The physical-owner adapter root peaks at 11.49 GB on native macOS
@@ -3716,9 +3717,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 10) * 1024 * 1024 * 1024,
         // These named module tests make the schema admission regressions
         // reachable; runtime filtering executes only the selected tests.
-        .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, vopr_runtime_adapter_filters),
+        .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, vopr_runtime_adapter_selected_filters),
     });
-    const run_vopr_runtime_adapter_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, vopr_runtime_adapter_tests, vopr_runtime_adapter_filters);
+    const run_vopr_runtime_adapter_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, vopr_runtime_adapter_tests, vopr_runtime_adapter_selected_filters);
     const vopr_runtime_adapter_test_step = b.step("vopr-runtime-test", "Run Antfly background-service adapters on the deterministic VOPR runtime");
     vopr_runtime_adapter_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
     vopr_runtime_adapter_test_step.dependOn(&run_data_runtime_vopr_tests.step);

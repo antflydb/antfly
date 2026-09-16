@@ -2637,6 +2637,65 @@ pub fn storageSystemWriteDelete(
     return .ok;
 }
 
+pub fn storageSystemWriteOpenCursor(
+    txn_ptr: ?*anyopaque,
+    out_cursor: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_cursor.* = null;
+    const handle = asSystemWriteTxn(txn_ptr) orelse return .invalid_argument;
+    const cursor = handle.txn.openCursor() catch |err| return storageOwnerStatusFromError(err);
+    const wrapper = handle.alloc.create(SystemCursorHandle) catch {
+        var owned = cursor;
+        owned.close();
+        return .out_of_memory;
+    };
+    wrapper.* = .{ .alloc = handle.alloc, .cursor = cursor };
+    out_cursor.* = wrapper;
+    return .ok;
+}
+
+test "capi system write cursor sees pending catalog rows and preserves abort" {
+    const alloc = std.testing.allocator;
+    var test_tmp = try TestDirectory.init("system-write-cursor");
+    defer test_tmp.cleanup();
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "catalog");
+    defer alloc.free(path);
+    var backend = try lite_backend.Handle.create(alloc, path, false);
+    defer backend.deinit();
+    const store = try backend.runtimeStoreForNamespace("system/metadata");
+    {
+        var seed = try store.beginWrite();
+        errdefer seed.abort();
+        try seed.put("catalog:a", "old");
+        try seed.commit();
+    }
+    {
+        var txn = SystemWriteTxnHandle{ .alloc = alloc, .txn = try store.beginWrite() };
+        defer txn.txn.abort();
+        try txn.txn.delete("catalog:a");
+        try txn.txn.put("catalog:b", "pending");
+        try txn.txn.put("catalog:c", "last");
+        var cursor: ?*anyopaque = null;
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, storageSystemWriteOpenCursor(null, &cursor));
+        try std.testing.expect(cursor == null);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageSystemWriteOpenCursor(&txn, &cursor));
+        defer storageSystemCursorClose(cursor);
+        var entry: kernel_owner_abi.SystemEntryResult = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageSystemCursorMove(cursor, .at_or_after, .fromSlice("catalog:"), &entry));
+        try std.testing.expectEqual(@as(u8, 1), entry.present);
+        try std.testing.expectEqualStrings("catalog:b", entry.key.slice());
+        try std.testing.expectEqualStrings("pending", entry.value.slice());
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageSystemCursorMove(cursor, .next, .{}, &entry));
+        try std.testing.expectEqualStrings("catalog:c", entry.key.slice());
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageSystemCursorMove(cursor, .previous, .{}, &entry));
+        try std.testing.expectEqualStrings("catalog:b", entry.key.slice());
+    }
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("old", try read.get("catalog:a"));
+    try std.testing.expectError(error.NotFound, read.get("catalog:b"));
+}
+
 pub fn storageSystemWriteCommit(txn_ptr: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     const handle = asSystemWriteTxn(txn_ptr) orelse return .invalid_argument;
     const alloc = handle.alloc;
