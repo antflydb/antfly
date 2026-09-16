@@ -17119,6 +17119,24 @@ test "placement topology uses authoritative split peer set during partial projec
     try std.testing.expectEqual(@as(usize, 0), topology.learners(708).?.len);
 }
 
+test "data ownership fallback requires a single store across all roles" {
+    const stores = [_]antfly.metadata.table_manager.StoreRecord{
+        .{ .store_id = 1, .node_id = 1, .role = "hot" },
+        .{ .store_id = 2, .node_id = 2, .role = "cold" },
+    };
+    std.debug.print("DATA_OWNERSHIP_FALLBACK excludes cross-role stores\n", .{});
+    try std.testing.expect(!hasSingleRoleStore(&stores, "hot", 1));
+    try std.testing.expect(!hasSingleRoleStore(&stores, "cold", 2));
+    try std.testing.expect(hasSingleRoleStore(stores[0..1], "hot", 1));
+    try std.testing.expect(!hasSingleRoleStore(stores[0..1], "cold", 1));
+    try std.testing.expect(!hasSingleRoleStore(stores[0..1], "hot", 2));
+    try std.testing.expect(!hasSingleRoleStore(&.{}, "hot", 1));
+
+    var same_role = stores;
+    same_role[1].role = "hot";
+    try std.testing.expect(!hasSingleRoleStore(&same_role, "hot", 1));
+}
+
 test "placement peer collection preserves complete intent peers during partial projection" {
     const intents = [_]antfly.raft.PlacementIntent{.{
         .record = .{ .group_id = 703, .replica_id = 2, .local_node_id = 2 },
@@ -17633,10 +17651,30 @@ const RemoteMetadataSource = struct {
         snapshot: antfly.metadata_api.AdminSnapshot,
         ticket: LinearizableSnapshotTicket,
     ) !LinearizableSnapshotAcceptance {
+        return self.acceptLinearizableSnapshotWithBudget(snapshot, ticket, .{}, null);
+    }
+
+    fn acceptLinearizableSnapshotWithBudget(
+        self: *RemoteMetadataSource,
+        snapshot: antfly.metadata_api.AdminSnapshot,
+        ticket: LinearizableSnapshotTicket,
+        request: antfly.public_api.operation.RequestContext,
+        budget: ?antfly.metadata_http_client.RequestBudget,
+    ) !LinearizableSnapshotAcceptance {
         const incarnation = try requireValidMetadataIncarnation(snapshot.status.metadata_incarnation);
-        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        const now_ms = @as(u64, @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)));
         var retired_snapshot: ?antfly.metadata_api.AdminSnapshot = null;
         lockAtomic(&self.cache_mutex);
+        request.ensureActive() catch |err| {
+            self.cache_mutex.unlock();
+            return err;
+        };
+        if (budget) |value| {
+            if (platform_time.monotonicNs() >= value.deadline_ns) {
+                self.cache_mutex.unlock();
+                return error.MetadataLinearizableReadTimeout;
+            }
+        }
         if (self.snapshot_invalidation_generation != ticket.invalidation_generation) {
             self.cache_mutex.unlock();
             return error.MetadataSnapshotHeadMismatch;
@@ -18110,17 +18148,23 @@ const RemoteMetadataSource = struct {
                     last_err = err;
                     continue :endpoint_attempts;
                 };
-                var cache_ownership_transferred = false;
-                defer if (!cache_ownership_transferred) freeAdminSnapshotOwned(self.alloc, &cached);
-                const acceptance = self.acceptLinearizableSnapshot(cached, ticket) catch |err| {
+                var cached_owned = true;
+                defer if (cached_owned) freeAdminSnapshotOwned(self.alloc, &cached);
+                try request.ensureActive();
+                if (platform_time.monotonicNs() >= deadline_ns) return error.MetadataLinearizableReadTimeout;
+                const acceptance = self.acceptLinearizableSnapshotWithBudget(cached, ticket, request, budget) catch |err| {
+                    if (err == error.Canceled or err == error.DeadlineExceeded or err == error.MetadataLinearizableReadTimeout) return err;
                     if (err == error.MetadataSnapshotHeadMismatch and snapshot_attempt == 0) {
                         continue :snapshot_attempts;
                     }
                     last_err = err;
                     continue :endpoint_attempts;
                 };
-                cache_ownership_transferred = acceptance == .published;
+                if (acceptance == .superseded) freeAdminSnapshotOwned(self.alloc, &cached);
+                cached_owned = false;
                 self.noteMetadataReadSuccess(index);
+                try request.ensureActive();
+                if (platform_time.monotonicNs() >= deadline_ns) return error.MetadataLinearizableReadTimeout;
                 result_owned = false;
                 return result;
             }
@@ -20249,7 +20293,7 @@ fn hasSingleRoleStore(
 ) bool {
     var matching_store_id: ?u64 = null;
     for (stores) |store| {
-        if (!std.mem.eql(u8, store.role, role)) continue;
+        if (!std.mem.eql(u8, store.role, role)) return false;
         if (matching_store_id == null) {
             matching_store_id = store.store_id;
             continue;
@@ -35507,4 +35551,71 @@ test "remote catalog watches reserve the outer deadline for replica failover" {
             25 * std.time.ns_per_ms,
         ),
     );
+}
+
+// The release branch has one platform monotonic clock, so no borrowed-clock
+// ABI is required to fence publication after a caller's budget expires.
+test "remote metadata deadline rejects inactive publication and leaves the cache intact" {
+    const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+    var source = try RemoteMetadataSource.init(alloc, &.{"http://metadata.invalid"}, runtime.ptr().apiIoImpl().?);
+    defer source.deinit();
+    const snapshot: antfly.metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 9, .metadata_incarnation = .{'1'} ** 32, .metadata_epoch = 7, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    source.cached_snapshot = try cloneAdminSnapshotOwned(alloc, snapshot);
+    source.cached_snapshot_at_ms = 1;
+    var cancellation = std.atomic.Value(bool).init(true);
+    const Case = struct {
+        request: antfly.public_api.operation.RequestContext = .{},
+        budget: ?antfly.metadata_http_client.RequestBudget = null,
+        expected: anyerror,
+    };
+    const cases = [_]Case{
+        .{ .request = .{ .cancellation = .fromAtomic(&cancellation) }, .expected = error.Canceled },
+        .{ .request = .{ .deadline_ns = 0 }, .expected = error.DeadlineExceeded },
+        .{ .budget = .{ .deadline_ns = 0 }, .expected = error.MetadataLinearizableReadTimeout },
+    };
+    for (cases) |case| {
+        var incoming = try cloneAdminSnapshotOwned(alloc, snapshot);
+        defer freeAdminSnapshotOwned(alloc, &incoming);
+        incoming.status.metadata_epoch = 8;
+        const ticket = source.beginLinearizableSnapshot();
+        try std.testing.expectError(case.expected, source.acceptLinearizableSnapshotWithBudget(incoming, ticket, case.request, case.budget));
+        try std.testing.expectEqual(@as(u64, 7), source.cached_snapshot.?.status.metadata_epoch);
+        try std.testing.expectEqual(@as(u64, 1), source.cached_snapshot_at_ms);
+        try std.testing.expectEqual(@as(u64, 0), source.snapshot_fence_generation);
+        try std.testing.expectEqual(@as(u64, 0), source.published_linearizable_snapshot_sequence);
+        try std.testing.expect(source.cache_mutex.tryLock());
+        source.cache_mutex.unlock();
+    }
+    var incoming = try cloneAdminSnapshotOwned(alloc, snapshot);
+    incoming.status.metadata_epoch = 9;
+    var owned = true;
+    defer if (owned) freeAdminSnapshotOwned(alloc, &incoming);
+    const accepted = try source.acceptLinearizableSnapshotWithBudget(incoming, source.beginLinearizableSnapshot(), .{}, .{ .deadline_ns = std.math.maxInt(u64) });
+    owned = accepted != .published;
+    try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, accepted);
+    try std.testing.expectEqual(@as(u64, 9), source.cached_snapshot.?.status.metadata_epoch);
+    try std.testing.expectEqual(@as(u64, 1), source.snapshot_fence_generation);
+}
+
+test "remote metadata deadline rejects inactive reads before contacting metadata" {
+    const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+    var source = try RemoteMetadataSource.init(alloc, &.{"http://metadata.invalid"}, runtime.ptr().apiIoImpl().?);
+    defer source.deinit();
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, RemoteMetadataSource.remoteLinearizableSnapshot(&source, .{ .cancellation = .fromAtomic(&canceled) }));
+    try std.testing.expectError(error.DeadlineExceeded, RemoteMetadataSource.remoteLinearizableSnapshot(&source, .{ .deadline_ns = 0 }));
+    try std.testing.expect(source.cached_snapshot == null);
+    try std.testing.expectEqual(@as(u64, 0), source.next_linearizable_snapshot_sequence);
 }

@@ -4254,6 +4254,7 @@ pub fn build(b: *std.Build) void {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "backup heartbeat ",
         "model-directed",
         "tool query builder",
         "agent conversation",
@@ -4339,6 +4340,7 @@ pub fn build(b: *std.Build) void {
         "gzip request completes with combined encoded and decoded budget",
         "shared application admission covers MCP query and write operations",
         "API kernel ABI rejects mismatched context and function-table prefixes",
+        "API kernel failed fallible create releases unpublished state",
         "runtime HTTP values retain C layout",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
@@ -4795,6 +4797,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lake_scaffold_tests.step);
 
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data ownership fallback requires a single store across all roles",
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",
         "enrichment index status encodes worker lifecycle diagnostics",
@@ -4942,6 +4945,7 @@ pub fn build(b: *std.Build) void {
         "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
+        "remote metadata deadline ",
     };
     const lib_data_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
