@@ -382,11 +382,11 @@ test('finalizer rejects other approval inputs and cannot restore a revoked check
 });
 
 
-test('CI run status links queued approval to listing and admitted run to jobs', async () => {
+test('PR CI gate status links queued approval to listing and admitted run to jobs', async () => {
   const f = fixture();
   await f.call();
   assert.deepEqual(f.statuses.at(-1), {
-    owner: 'acme', repo: 'project', sha: SHA, context: 'CI run', state: 'pending',
+    owner: 'acme', repo: 'project', sha: SHA, context: 'PR CI gate', state: 'pending',
     target_url: 'https://github.com/acme/project/actions/workflows/pr-ci.yml?query=PR%20CI%20%237%20%2F',
     description: 'CI queued; view workflow runs',
   });
@@ -398,7 +398,7 @@ test('CI run status links queued approval to listing and admitted run to jobs', 
   assert.equal(f.statuses.at(-1).sha, SHA);
 });
 
-test('CI run status reflects failure, dispatch failure, and invalidated approval', async t => {
+test('PR CI gate status reflects failure, dispatch failure, and invalidated approval', async t => {
   for (const outcome of ['failure', 'dispatch failure', 'revoked']) await t.test(outcome, async () => {
     const f = fixture();
     if (outcome === 'dispatch failure') {
@@ -418,13 +418,39 @@ test('CI run status reflects failure, dispatch failure, and invalidated approval
   });
 });
 
-test('CI run status supports enterprise URLs and cannot block the required check', async () => {
+test('PR CI gate supports enterprise URLs', async () => {
   const f = fixture(); f.context.serverUrl = 'https://github.example.com';
   await f.call();
   assert.ok(f.statuses.at(-1).target_url.startsWith('https://github.example.com/'));
-  f.github.rest.repos.createCommitStatus = async () => {throw new Error('permission denied');};
   await f.call('admit');
-  f.finish(); await f.call();
-  assert.equal(f.checks.at(-1).conclusion, 'success');
-  assert.ok(f.notices.some(n => n.includes('Could not publish CI run link')));
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.example.com/acme/project/actions/runs/91');
+});
+
+test('gate publication failure prevents dispatch and approval consumption', async () => {
+  const f = fixture();
+  f.github.rest.repos.createCommitStatus = async () => {throw new Error('permission denied');};
+  await assert.rejects(f.call(), /permission denied/);
+  assert.equal(f.dispatches.length, 0);
+  assert.equal(f.checks.at(-1).status, 'queued');
+  await assert.rejects(f.call('admit'), /permission denied/);
+  assert.equal(JSON.parse(f.checks.at(-1).output.text).run_id, undefined);
+});
+
+test('gate publication failure cannot publish a successful check', async () => {
+  const f = fixture(); await f.call(); await f.call('admit'); f.finish();
+  f.github.rest.repos.createCommitStatus = async () => {throw new Error('status unavailable');};
+  await assert.rejects(f.call(), /status unavailable/);
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.notEqual(f.checks.at(-1).conclusion, 'success');
+});
+
+test('gate invalidation replaces success on the same head', async () => {
+  const f = fixture(); await f.call(); await f.call('admit'); f.finish(); await f.call();
+  assert.equal(f.statuses.at(-1).state, 'success');
+  f.context.eventName = 'pull_request_target';
+  f.context.payload.action = 'converted_to_draft'; f.pr.draft = true;
+  await f.call();
+  assert.equal(f.statuses.at(-1).context, 'PR CI gate');
+  assert.equal(f.statuses.at(-1).sha, SHA);
+  assert.equal(f.statuses.at(-1).state, 'error');
 });
