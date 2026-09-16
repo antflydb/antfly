@@ -5026,25 +5026,28 @@ pub const AntflyApiHandler = struct {
 
     fn resolvePublicTableName(self: *AntflyApiHandler, ctx: *httpx.Context, encoded: []const u8, identity: *?AuthenticatedIdentity) !?[]u8 {
         const alloc = ctx.allocator;
-        const name = (try decodePathParamOrBadRequest(ctx, encoded)) orelse return null;
+        const name = (try decodePathParamOrBadRequest(ctx, encoded)) orelse {
+            _ = try ctx.response.text("invalid path parameter");
+            return null;
+        };
         errdefer alloc.free(name);
         const route = system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path)) catch |err| {
             if (err == error.OutOfMemory) return err;
             alloc.free(name);
-            _ = ctx.status(400);
+            _ = try ctx.response.status(400).text("invalid path parameter");
             return null;
         };
         defer if (route) |value| value.deinit(alloc);
         if (route == null and self.api_server.source.vtable.system_catalog == null) return name;
         const target: system_catalog.Target = (if (route) |value| value.target() else system_catalog.Target.literal(name)) catch {
             alloc.free(name);
-            _ = ctx.status(400);
+            _ = try ctx.response.status(400).text("invalid path parameter");
             return null;
         };
         const bytes = self.api_server.source.systemCatalog(alloc, operationContext(ctx, identity.*), .{ .resolve = target }) catch |err| {
             if (route == null and err == error.UnsupportedOperation) return name;
             alloc.free(name);
-            _ = ctx.status(system_catalog.httpStatus(err));
+            _ = try ctx.response.status(system_catalog.httpStatus(err)).text(@errorName(err));
             return null;
         };
         defer alloc.free(bytes);
@@ -5052,7 +5055,7 @@ pub const AntflyApiHandler = struct {
         defer parsed.deinit();
         const table = parsed.value orelse {
             alloc.free(name);
-            _ = ctx.status(404);
+            _ = try ctx.response.status(404).text("not found");
             return null;
         };
         const logical = try target.resourceNameAlloc(alloc);
@@ -5342,7 +5345,7 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         if (http_server_mod.runtimeSchemaDebugRequested(ctx.request.uri.query orelse "")) {
-            const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+            const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
             defer alloc.free(decoded_table_name);
             if (!self.api_server.runtimeSchemaDebugAllowed(authenticated_identity)) return jsonErrorResponse(ctx, 403, "forbidden");
             const debug_body = (try self.api_server.encodeTableRuntimeSchemaDebugAlloc(alloc, decoded_table_name)) orelse
@@ -5650,7 +5653,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         const metadata_drop_start_ns = platform_time.monotonicNs();
         var metadata_drop_attempts: usize = 0;
@@ -5780,7 +5783,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
@@ -5802,7 +5805,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         const reads = self.api_server.table_reads orelse {
             _ = ctx.status(404);
@@ -5871,7 +5874,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
         const expected_fence = backups_api.parseTableBackupFenceHeaderValuesWithDeadline(
@@ -5910,8 +5913,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse
-            return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         var resp = try self.api_server.handlePublicReauthorizeTableDestinations(
             decoded_table_name,
@@ -5938,7 +5940,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
@@ -6052,7 +6054,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         // The OpenAPI request body is optional; an absent body is the default
         // unbounded-range scan, just like an explicitly empty legacy request.
@@ -6177,7 +6179,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         const decoded_key = (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_key);
@@ -6277,7 +6279,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         const decoded_key = (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_key);
@@ -6307,7 +6309,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         const decoded_key = (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_key);
@@ -6333,7 +6335,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         var resp = try public_table_http.handleListArtifactEnrichments(ctx.allocator, decoded_table_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
@@ -6346,7 +6348,7 @@ pub const AntflyApiHandler = struct {
         if (ctx.request.uri.query) |query| {
             if (query.len != 0) return textResponse(ctx, 400, "repair requests use json body");
         }
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
         var response = try self.api_server.handlePublicListArtifactRepairIssues(decoded_table_name, body_data);
@@ -6373,7 +6375,7 @@ pub const AntflyApiHandler = struct {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*owned| owned.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
-        const name = (try self.resolvePublicTableName(ctx, table_name, &identity)) orelse return ctx.text("invalid or missing table target");
+        const name = (try self.resolvePublicTableName(ctx, table_name, &identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(name);
         const job = if (job_path) |path| (try decodePathParamOrBadRequest(ctx, path)) orelse return textResponse(ctx, 400, "invalid job ID") else null;
         defer if (job) |id| ctx.allocator.free(id);
@@ -6402,7 +6404,7 @@ pub const AntflyApiHandler = struct {
         if (ctx.request.uri.query) |query| {
             if (query.len != 0) return textResponse(ctx, 400, "repair requests use json body");
         }
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
         var response = try self.api_server.handlePublicRunTableRepair(decoded_table_name, body_data);
@@ -6416,7 +6418,7 @@ pub const AntflyApiHandler = struct {
         if (ctx.request.uri.query) |query| {
             if (query.len != 0) return textResponse(ctx, 400, "repair job requests use json body");
         }
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
         var response = try self.api_server.handlePublicStartTableRepairJob(decoded_table_name, body_data);
@@ -6441,7 +6443,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicTableRepairJob(decoded_table_name, job_id);
         return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
@@ -6451,7 +6453,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicAdvanceTableRepairJob(decoded_table_name, job_id);
         return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
@@ -6461,7 +6463,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicCancelTableRepairJob(decoded_table_name, job_id);
         return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
@@ -6472,7 +6474,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         const decoded_key = (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_key);
@@ -6491,7 +6493,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         const decoded_artifact_name = (try decodePathParamOrBadRequest(ctx, artifact_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_artifact_name);
@@ -6504,7 +6506,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
         var response = try self.api_server.handlePublicStartDocumentArtifactReprocessJob(decoded_table_name, artifact_name, body_data);
@@ -6515,7 +6517,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicDocumentArtifactReprocessJob(decoded_table_name, artifact_name, job_id);
         return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
@@ -6525,7 +6527,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicAdvanceDocumentArtifactReprocessJob(decoded_table_name, artifact_name, job_id);
         return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
@@ -6535,7 +6537,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         var response = try self.api_server.handlePublicCancelDocumentArtifactReprocessJob(decoded_table_name, artifact_name, job_id);
         return respondOwnedApiResponseWithAllocator(ctx, &response, self.api_server.alloc);
@@ -6545,7 +6547,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         var resp = try public_table_http.handleTableListIndexes(ctx.allocator, decoded_table_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
@@ -6555,7 +6557,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
@@ -6574,7 +6576,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
@@ -6599,7 +6601,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
@@ -6618,7 +6620,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
@@ -6633,7 +6635,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         const decoded_artifact_name = (try decodePathParamOrBadRequest(ctx, artifact_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_artifact_name);
@@ -6647,7 +6649,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         const decoded_artifact_name = (try decodePathParamOrBadRequest(ctx, artifact_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_artifact_name);

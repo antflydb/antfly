@@ -49983,16 +49983,31 @@ test "backup heartbeat shard admission failure preserves coordinator writer" {
 test "system catalog identity failures remain unavailable across status adapters" {
     const Fixture = struct {
         err: anyerror,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
         fn call(ptr: *anyopaque, _: std.mem.Allocator, _: api_operation.RequestContext, _: system_catalog.Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.err;
         }
     };
     var fixture = Fixture{ .err = error.MetadataIncarnationUnavailable };
-    const source = StatusSource{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.call } };
+    const source = StatusSource{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.call } };
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source, null, null);
+    defer server.deinit();
     for ([_]anyerror{ error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch }) |err| {
         fixture.err = @import("../runtime_error_abi.zig").errorFromStatus(@import("../runtime_error_abi.zig").statusFromError(err));
         try std.testing.expectEqual(err, fixture.err);
         try std.testing.expectError(error.CatalogRoutingUnavailable, source.systemCatalog(std.testing.allocator, .{}, .snapshot));
+        try std.testing.expectEqual(@as(u16, 503), system_catalog.httpStatus(error.CatalogRoutingUnavailable));
+        var response = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = "/databases/default/namespaces/public/tables/docs/batch",
+            .content_type = "application/json",
+            .body = "{\"inserts\":{\"doc\":{}}}",
+        });
+        defer response.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+        try std.testing.expectEqualStrings("CatalogRoutingUnavailable", response.body);
     }
 }
