@@ -49,7 +49,7 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../zig/ROADMAP.md).
 | Inference | [inference/cuda/turboquant-l4.md](completed/inference/cuda/turboquant-l4.md) | [CUDA.md](../zig/pkg/inference/CUDA.md) | L4 TurboQuant qualification checklist |
 | Inference | [inference/ggml-graph-execution-history.md](completed/inference/ggml-graph-execution-history.md) | [GGML.md](../zig/pkg/inference/GGML.md) | Partition executor and quant-matmul routing history |
 | Inference | [inference/turboquant-history.md](completed/inference/turboquant-history.md) | [TURBOQUANT.md](../zig/pkg/inference/TURBOQUANT.md) | Compressed-KV history including the removed MLX provider |
-| Inference | [inference/llms-stale-sections.md](completed/inference/llms-stale-sections.md) | [LLMS.md](../zig/pkg/inference/LLMS.md) | MLX-era Phase 5 and Phase 10 narrative |
+| Inference | [inference/llms-plan.md](completed/inference/llms-plan.md) | [LLMS.md](../zig/pkg/inference/LLMS.md) | The original LLM plan: MLX-era status, KV cache design, delivery phases, and testing strategy |
 | Inference | [inference/qwen/performance-evidence.md](completed/inference/qwen/performance-evidence.md) | [PERFORMANCE.md](../zig/pkg/inference/models/qwen/PERFORMANCE.md) | Dated campaigns, pass counts, and evidence-artifact ledger |
 | Inference | [inference/qwen/qwen3vl-qualification-2026-08.md](completed/inference/qwen/qwen3vl-qualification-2026-08.md) | [QWEN3VL.md](../zig/pkg/inference/models/qwen/QWEN3VL.md) | August 2026 qualification runs |
 | Inference | [inference/onnx-quantized-status-history.md](completed/inference/onnx-quantized-status-history.md) | [ONNX.md](../zig/pkg/inference/ONNX.md) | Quantized export proof runs and debugger bisection |
