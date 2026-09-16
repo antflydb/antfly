@@ -14,6 +14,7 @@ each family are under `work-log/completed/inference/<family>/`.
 | Qwen | [qwen/PERFORMANCE.md](qwen/PERFORMANCE.md) | Retained Qwen3 embedding and Qwen3-VL Metal optimizations, rollback env vars, and the promotion gate |
 | GLiNER2 | [gliner2/CUDA.md](gliner2/CUDA.md) | CUDA encoder dispatch policy, qualified benchmark contract, and remaining work |
 | GLiNER2 | [gliner2/FINETUNING.md](gliner2/FINETUNING.md) | Operator and release contract for GLiNER2 fine-tuning on Zig, Metal, and CUDA |
+| GLiNER2.5 | [../scripts/gliner25/README.md](../scripts/gliner25/README.md) | Development tools, fixture policy, and the CPU ([BENCHMARK.md](../scripts/gliner25/BENCHMARK.md)) and Metal ([METAL_BENCHMARK.md](../scripts/gliner25/METAL_BENCHMARK.md)) comparison harnesses; no design doc yet, see the GLiNER2 docs above for the shared runtime |
 | BitNet | [bitnet/BITNET.md](bitnet/BITNET.md) | BitNet-style GGUF support: tensor types, current state, and work items |
 | LayoutDoc | [layoutdoc/LAYOUTDOC.md](layoutdoc/LAYOUTDOC.md) | Native LayoutDoc document-classification runtime, HTTP API, probe CLIs, and parity fixtures |
 
