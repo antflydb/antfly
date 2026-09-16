@@ -310,8 +310,15 @@ def test_catalog_scoped_join_keeps_literal_lookalikes_separate(
     literal = f"{database}.public.customers"
     literal_path = "/tables/" + literal
     docs = root + "/namespaces/public/tables/docs"
+    # One replica forces broadcast joins to contact other owners in a cluster.
+    # A replica on every node would hide a coordinator doing local admission.
+    tablespace = database + "_single_replica"
+    api.post(
+        "/tablespaces/" + tablespace,
+        {"placement_policy_json": json.dumps({"desired_replica_count": 1})},
+    )
     for path in (scoped, literal_path, docs):
-        api.post(path, {"num_shards": num_shards})
+        api.post(path, {"num_shards": num_shards, "tablespace_name": tablespace})
     try:
         for path, name in ((scoped, "scoped"), (literal_path, "literal")):
             api.post(
@@ -329,21 +336,23 @@ def test_catalog_scoped_join_keeps_literal_lookalikes_separate(
             ({"right_table": literal}, "literal"),
             ({"right_target": {"database": database, "table": "customers"}}, "scoped"),
         ):
-            body = {
-                "full_text_search": {"match_all": {}},
-                "limit": 10,
-                "join": {
-                    **target,
-                    "on": {"left_field": "customer_id", "right_field": "_id"},
-                    "right_fields": ["name"],
-                },
-            }
-            response = api.post(docs + "/query", body)["responses"][0]
-            assert response["table"] == f"{database}.public.docs"
-            hits = response["hits"]["hits"]
-            assert len(hits) == 1, response
-            assert hits[0]["_source"][literal + ".name"] == expected
-            assert "table:" not in json.dumps(response)
+            for strategy in ("index_lookup", "broadcast"):
+                body = {
+                    "full_text_search": {"match_all": {}},
+                    "limit": 10,
+                    "join": {
+                        "strategy_hint": strategy,
+                        **target,
+                        "on": {"left_field": "customer_id", "right_field": "_id"},
+                        "right_fields": ["name"],
+                    },
+                }
+                response = api.post(docs + "/query", body)["responses"][0]
+                assert response["table"] == f"{database}.public.docs"
+                hits = response["hits"]["hits"]
+                assert len(hits) == 1, response
+                assert hits[0]["_source"][literal + ".name"] == expected
+                assert "table:" not in json.dumps(response)
         both = {
             "full_text_search": {"match_all": {}},
             "join": {
@@ -360,6 +369,7 @@ def test_catalog_scoped_join_keeps_literal_lookalikes_separate(
         for path in (scoped, literal_path, docs):
             api.delete(path)
         api.delete(root)
+        api.delete("/tablespaces/" + tablespace)
 
 
 def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):

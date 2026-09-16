@@ -4672,11 +4672,29 @@ pub const ProvisionedTableReadSource = struct {
     // Route unfenced coordinator calls before local admission; hosted local
     // routes bind a fence and dispatch through the existing routed callbacks,
     // which retain this source's resident DB and read-admission owner.
+    fn coordinatorGroupFence(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest) !metadata_api.CatalogRouteFence {
+        const budget = table_router.RouteBudget.fromRequest(req);
+        try budget.check();
+        const native_deadline = (table_catalog.RoutingBudget{}).deadlineFrom(budget.clock);
+        if (self.catalog.vtable.route_fence != null)
+            return catalogRouteFenceForGroup(alloc, self.catalog, table_name, group_id, native_deadline, req.cancellation);
+        const snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, self.catalog.deadlineFrom(budget.clock));
+        var fence = snapshot.fence() orelse return error.TopologyChanged;
+        fence.admission_deadline_ns = native_deadline;
+        fence.admission_cancellation = req.cancellation orelse .none;
+        try budget.check();
+        return fence;
+    }
+
     fn queryGroupCoordinator(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         if (self.distributed_router != null) {
+            const fence = try self.coordinatorGroupFence(alloc, group_id, table_name, req);
+            var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+            var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
             var hosted = self.routedHostedSource();
+            hosted.catalog = pinned.source();
             return HostedProvisionedTableReadSource.queryGroupLocal(&hosted, alloc, group_id, table_name, req, consistency);
         }
         return queryGroupLocal(ptr, alloc, group_id, table_name, req, consistency);
@@ -4686,7 +4704,11 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         if (self.distributed_router != null) {
+            const fence = try self.coordinatorGroupFence(alloc, group_id, table_name, req);
+            var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+            var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
             var hosted = self.routedHostedSource();
+            hosted.catalog = pinned.source();
             return HostedProvisionedTableReadSource.searchResultGroupLocal(&hosted, alloc, group_id, table_name, req, consistency);
         }
         return searchResultGroupLocal(ptr, alloc, group_id, table_name, req, consistency);
@@ -23535,6 +23557,23 @@ fn consumerTests() type {
                     };
                 }
 
+                fn resolveRoute(_: *anyopaque, allocator: std.mem.Allocator, name: []const u8, query: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                    try std.testing.expectEqualStrings("docs", name);
+                    const fence = (try routeFence(undefined, query.group)).?;
+                    return .{ .found = .{
+                        .metadata_group_id = fence.metadata_group_id,
+                        .metadata_incarnation = fence.metadata_incarnation,
+                        .catalog_revision = fence.catalog_revision,
+                        .table_id = fence.table_id,
+                        .topology_epoch = fence.topology_epoch,
+                        .groups = try allocator.dupe(table_catalog.CatalogGroupRoute, &.{fence.route}),
+                    } };
+                }
+
+                fn unboundSource() table_catalog.CatalogSource {
+                    return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot, .resolve_route = resolveRoute } };
+                }
+
                 fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
                     return error.UnexpectedAdminSnapshot;
                 }
@@ -23620,7 +23659,7 @@ fn consumerTests() type {
                     return result;
                 }
             };
-            var provisioned = ProvisionedTableReadSource.init("must-not-open", FakeCatalog.source(), raft_mod.read_gate.alreadyReadSafeBarrier());
+            var provisioned = ProvisionedTableReadSource.init("must-not-open", FakeCatalog.unboundSource(), raft_mod.read_gate.alreadyReadSafeBarrier());
             _ = provisioned.withDistributedRouting(.{ .ptr = undefined, .vtable = &.{
                 .local_node_id = Router.localNodeId,
                 .local_status = Router.localStatus,
