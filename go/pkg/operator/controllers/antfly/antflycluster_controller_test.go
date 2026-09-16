@@ -16006,7 +16006,7 @@ func TestStandaloneHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {
 			Selection:    antflyv1.HAStandbySelectionAll,
 			StandbyNames: []string{"standby-a", "standby-b"},
 		},
-	}, "")
+	}, "", false)
 
 	g.Expect(args).To(ContainSubstring(`--ha-sync-mode 'remote-apply'`))
 	g.Expect(args).To(ContainSubstring(`--ha-sync-selection 'all'`))
@@ -16028,13 +16028,13 @@ func TestStandaloneHAArgsScopesDefaultStandbyProgressToActivatedGeneration(t *te
 		},
 	}
 
-	args := standaloneHAArgs(ha, "reseed-standby-a-topology-2")
+	args := standaloneHAArgs(ha, "reseed-standby-a-topology-2", false)
 	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/ha/standby-generations/reseed-standby-a-topology-2/receive.wal'`))
 	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/ha/standby-generations/reseed-standby-a-topology-2/progress.wal'`))
 
 	ha.Runtime.Standby.LogPath = "/antflydb/custom/receive.wal"
 	ha.Runtime.Standby.ProgressPath = "/antflydb/custom/progress.wal"
-	args = standaloneHAArgs(ha, "reseed-standby-a-topology-2")
+	args = standaloneHAArgs(ha, "reseed-standby-a-topology-2", false)
 	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/custom/receive.wal'`))
 	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/custom/progress.wal'`))
 }
@@ -16059,7 +16059,7 @@ func TestStandaloneHAArgsShellQuotesRuntimeValues(t *testing.T) {
 			Mode:         antflyv1.HADurabilityModeRemoteWrite,
 			StandbyNames: []string{"standby-$(touch /tmp/pwned)"},
 		},
-	}, "")
+	}, "", false)
 
 	g.Expect(args).To(ContainSubstring(`--ha-primary-node-id 'primary-$(touch /tmp/pwned)` + "`" + `x` + "`" + `'`))
 	g.Expect(args).To(ContainSubstring(`--ha-former-primary-log '/antflydb/ha/'\''former.wal'`))
@@ -16702,5 +16702,21 @@ func baseStandaloneControllerCluster() *antflyv1.AntflyCluster {
 			},
 			Config: "{}",
 		},
+	}
+}
+
+func TestStandaloneHAArgsPreserveWholeInstanceScope(t *testing.T) {
+	for _, role := range []antflyv1.HARuntimeRole{antflyv1.HARuntimeRolePrimary, antflyv1.HARuntimeRoleStandby} {
+		t.Run(string(role), func(t *testing.T) {
+			g := NewWithT(t)
+			ha := &antflyv1.HighAvailabilitySpec{
+				Mode:     antflyv1.HAModeHotStandby,
+				Identity: &antflyv1.HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1},
+				Runtime:  &antflyv1.HARuntimeSpec{Role: role, NodeID: "node-a"},
+			}
+			args := standaloneHAArgs(ha, "", true)
+			g.Expect(args).To(ContainSubstring("--ha-shard-id 0"))
+			g.Expect(args).To(ContainSubstring("--ha-table-id 0"))
+		})
 	}
 }

@@ -150,6 +150,7 @@ comptime {
     _ = @import("ha/seed_activation.zig");
     _ = @import("ha/seed_artifact.zig");
     _ = @import("ha/seed_capture.zig");
+    _ = @import("ha/seed_materialization.zig");
     _ = @import("ha/seed_namespace_control.zig");
     _ = @import("ha/seed_prefix_cleanup_test.zig");
     _ = @import("ha/session.zig");

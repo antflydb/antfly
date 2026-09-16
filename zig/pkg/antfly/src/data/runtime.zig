@@ -4018,6 +4018,10 @@ const HAStandbyReplicationErrorCode = enum(u8) {
     ConnectionRefused,
     BrokenPipe,
     EndOfStream,
+    InvalidResponse,
+    InvalidSocketOption,
+    RecvFailed,
+    SendFailed,
     NoAddressReturned,
     Timeout,
     ConnectionTimedOut,
@@ -4072,6 +4076,10 @@ fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
         error.ConnectionRefused => .ConnectionRefused,
         error.BrokenPipe => .BrokenPipe,
         error.EndOfStream => .EndOfStream,
+        error.InvalidResponse => .InvalidResponse,
+        error.InvalidSocketOption => .InvalidSocketOption,
+        error.RecvFailed => .RecvFailed,
+        error.SendFailed => .SendFailed,
         error.NoAddressReturned => .NoAddressReturned,
         error.Timeout => .Timeout,
         error.ConnectionTimedOut => .ConnectionTimedOut,
@@ -4128,6 +4136,10 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
         .ConnectionRefused => "ConnectionRefused",
         .BrokenPipe => "BrokenPipe",
         .EndOfStream => "EndOfStream",
+        .InvalidResponse => "InvalidResponse",
+        .InvalidSocketOption => "InvalidSocketOption",
+        .RecvFailed => "RecvFailed",
+        .SendFailed => "SendFailed",
         .NoAddressReturned => "NoAddressReturned",
         .Timeout => "Timeout",
         .ConnectionTimedOut => "ConnectionTimedOut",
@@ -4183,6 +4195,13 @@ fn isHAStandbyUpstreamTransportError(err: anyerror) bool {
         .ConnectionRefused,
         .BrokenPipe,
         .EndOfStream,
+        // httpx reports a peer closing mid-response this way. No incomplete
+        // replication frame is applied or acknowledged; retry from durable progress.
+        .InvalidResponse,
+        // A retired pooled socket can fail timeout setup before dispatch.
+        .InvalidSocketOption,
+        .RecvFailed,
+        .SendFailed,
         .NoAddressReturned,
         .Timeout,
         .ConnectionTimedOut,
@@ -4290,6 +4309,10 @@ test "data server keeps upstream replication availability failures nonfatal" {
         error.ConnectionRefused,
         error.BrokenPipe,
         error.EndOfStream,
+        error.InvalidResponse,
+        error.InvalidSocketOption,
+        error.RecvFailed,
+        error.SendFailed,
         error.NoAddressReturned,
         error.Timeout,
         error.ConnectionTimedOut,
@@ -5517,6 +5540,9 @@ pub const DataServer = struct {
     owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     ha_cfg: DataServerHAConfig = .{},
+    /// Standalone owns its durable catalog; apply before routing later WAL records.
+    ha_catalog_apply_ctx: ?*anyopaque = null,
+    ha_catalog_apply_fn: ?*const fn (*anyopaque, antfly.ha.replication_record.RecordView) anyerror!void = null,
     ha_state_mutex: std.atomic.Mutex = .unlocked,
     /// Global primary mutation/capture ordering point. All DB/catalog writers
     /// share this instance through their HA mirror configuration.
@@ -6097,6 +6123,11 @@ pub const DataServer = struct {
     }
 
     pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.ha.replication_record.RecordView) !void {
+        if (record.kind == .metadata_mutation and record.table_id == 0 and record.shard_id == 0) {
+            const apply = self.ha_catalog_apply_fn orelse return error.HACatalogReplicationUnavailable;
+            try apply(self.ha_catalog_apply_ctx orelse return error.HACatalogReplicationUnavailable, record);
+            return;
+        }
         if (isWholeInstanceHAControlRecord(record)) return;
 
         var snapshot = try self.write_source.catalog.adminSnapshot();
@@ -6108,6 +6139,68 @@ pub const DataServer = struct {
             route.table_name,
             record,
         );
+    }
+
+    pub const HACatalogCommit = struct {
+        mirror: antfly.db.HAAsyncEffectMirror,
+        generation: u64,
+        lsn: u64,
+    };
+
+    /// Caller holds the shared mutation barrier and catalog lock. An append
+    /// failure can have an uncertain durable outcome, so fence until replay.
+    pub fn appendHACatalogCreate(self: *DataServer, payload: []const u8) !HACatalogCommit {
+        platform_sync.lockYielding(&self.ha_state_mutex);
+        defer self.ha_state_mutex.unlock();
+        const generation = self.ha_public_gate_state.currentGeneration();
+        try self.ha_public_gate_state.checkWrite(generation);
+        const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
+        if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+            return error.HACatalogRequiresWholeInstance;
+        errdefer self.ha_public_gate_state.publishPrimaryFence(true);
+        const lsn = try mirror.primary.append(.{
+            .kind = .metadata_mutation,
+            .payload_codec = .json,
+            .table_id = 0,
+            .shard_id = 0,
+            .payload = payload,
+        });
+        try mirror.primary.log.wal.sync(true);
+        self.ha_primary_mirror_last_lsn.store(lsn, .release);
+        return .{ .mirror = mirror, .generation = generation, .lsn = lsn };
+    }
+
+    /// Caller holds the catalog lock and shared mutation barrier, so every
+    /// visible catalog record is already in this log frontier. Reuse the normal
+    /// RemoteApply wait rather than treating a primary-local lookup as proof.
+    pub fn acknowledgeHAExistingCatalog(self: *DataServer) !void {
+        const commit: HACatalogCommit = blk: {
+            platform_sync.lockYielding(&self.ha_state_mutex);
+            defer self.ha_state_mutex.unlock();
+            const generation = self.ha_public_gate_state.currentGeneration();
+            try self.ha_public_gate_state.checkWrite(generation);
+            const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
+            if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+                return error.HACatalogRequiresWholeInstance;
+            break :blk .{ .mirror = mirror, .generation = generation, .lsn = mirror.primary.lastLsn() };
+        };
+        try self.acknowledgeHACatalogCreate(commit);
+    }
+
+    /// Local catalog publication has completed. A remote timeout leaves an
+    /// uncertain client outcome, but must not undo committed catalog state or
+    /// require a process restart when the standby becomes available again.
+    pub fn acknowledgeHACatalogCreate(self: *DataServer, commit: HACatalogCommit) !void {
+        const mirror = commit.mirror;
+        // Do not hold the transition mutex while waiting for receiver acks.
+        if (mirror.sync_wait_fn) |wait| {
+            try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.primary, commit.lsn, mirror.sync_policy);
+        }
+        platform_sync.lockYielding(&self.ha_state_mutex);
+        defer self.ha_state_mutex.unlock();
+        try self.ha_public_gate_state.checkWrite(commit.generation);
+        const gate = try antfly.ha.commit_gate.evaluate(mirror.primary, commit.lsn, mirror.sync_policy);
+        if (!gate.shouldAcknowledge()) return error.SyncPolicyUnsatisfied;
     }
 
     pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: antfly.ha.replication_record.RecordView) anyerror!void {
@@ -6634,8 +6727,7 @@ pub const DataServer = struct {
         std.mem.sort(u64, group_ids, {}, std.sort.asc(u64));
 
         if (metadata_snapshot.status.metadata_epoch == 0 or
-            metadata_snapshot.tables.len == 0 or
-            metadata_snapshot.ranges.len == 0 or
+            (metadata_snapshot.tables.len == 0) != (metadata_snapshot.ranges.len == 0) or
             group_ids.len != metadata_snapshot.ranges.len)
             return error.HASeedSnapshotIncompleteTopology;
         std.mem.sort(antfly.metadata.TableRecord, metadata_snapshot.tables, {}, struct {
@@ -6806,7 +6898,7 @@ pub const DataServer = struct {
     fn prepareDefaultHASeedSnapshotMaintenance(self: *DataServer) !void {
         var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
-        if (metadata_snapshot.tables.len == 0 or metadata_snapshot.ranges.len == 0)
+        if ((metadata_snapshot.tables.len == 0) != (metadata_snapshot.ranges.len == 0))
             return error.HASeedSnapshotIncompleteTopology;
 
         const deadline_ns = platform_time.monotonicNs() +| ha_seed_snapshot_preflight_timeout_ns;
@@ -6874,7 +6966,10 @@ pub const DataServer = struct {
         }
 
         var store_dir = std.Io.Dir.cwd().openDir(io, store_root, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return error.HASeedExtensionCatalogMismatch,
+            // A fresh instance has no package directory until its first
+            // extension is installed. The catalog/store match above already
+            // rejects missing packages; an absent empty store needs no copy.
+            error.FileNotFound => if (packages.len == 0) return else return error.HASeedExtensionCatalogMismatch,
             else => return err,
         };
         defer store_dir.close(io);
@@ -7005,9 +7100,6 @@ pub const DataServer = struct {
         ) catch return error.InvalidHASeedSnapshotTopology;
         defer parsed.deinit();
         const topology = parsed.value;
-        if (topology.format_version != ha_seed_snapshot_format_version or
-            !std.mem.eql(u8, topology.generation, generation) or topology.replicas.len == 0)
-            return error.InvalidHASeedSnapshotTopology;
         antfly.ha.seed_materialization.validateTopology(
             alloc,
             io,

@@ -417,8 +417,8 @@ pub fn validateTopology(
 ) !void {
     if (topology.format_version != topology_format_version or
         !std.mem.eql(u8, topology.generation, expected_generation) or
-        topology.catalog.epoch == 0 or topology.catalog.tables.len == 0 or
-        topology.catalog.ranges.len == 0 or
+        topology.catalog.epoch == 0 or
+        (topology.catalog.tables.len == 0) != (topology.catalog.ranges.len == 0) or
         topology.replicas.len != topology.catalog.ranges.len) return error.InvalidSeedTopology;
 
     for (topology.catalog.tables, 0..) |table, index| {
@@ -808,4 +808,34 @@ fn pathExists(io: std.Io, path: []const u8) !bool {
         else => return err,
     };
     return true;
+}
+
+test "empty standalone seed retains epoch and rejects incomplete topology" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const empty = Topology{
+        .generation = "empty-1",
+        .catalog = .{ .epoch = 1, .tables = &.{}, .ranges = &.{} },
+        .replicas = &.{},
+    };
+    try validateTopology(alloc, io, ".", "empty-1", empty);
+
+    var invalid = empty;
+    invalid.catalog.epoch = 0;
+    try std.testing.expectError(error.InvalidSeedTopology, validateTopology(alloc, io, ".", "empty-1", invalid));
+    try std.testing.expectError(error.InvalidSeedTopology, validateTopology(alloc, io, ".", "other-generation", empty));
+
+    invalid = empty;
+    invalid.catalog.tables = &.{undefined};
+    try std.testing.expectError(error.InvalidSeedTopology, validateTopology(alloc, io, ".", "empty-1", invalid));
+    invalid = empty;
+    invalid.catalog.ranges = &.{undefined};
+    try std.testing.expectError(error.InvalidSeedTopology, validateTopology(alloc, io, ".", "empty-1", invalid));
+    invalid = empty;
+    invalid.replicas = &.{undefined};
+    try std.testing.expectError(error.InvalidSeedTopology, validateTopology(alloc, io, ".", "empty-1", invalid));
+
+    invalid = empty;
+    invalid.auth_enabled = true;
+    try std.testing.expectError(error.AuthSeedTopologyMismatch, validateTopology(alloc, io, ".", "empty-1", invalid));
 }

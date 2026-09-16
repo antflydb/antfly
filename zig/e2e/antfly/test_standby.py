@@ -104,6 +104,7 @@ class HAStandaloneNode:
         self.admin_token_env = admin_token_env
         self.admin_token = admin_token
         self.proc: subprocess.Popen[str] | None = None
+        self.extra_runtime_args: list[str] = []
 
     @property
     def node_root(self) -> Path:
@@ -191,6 +192,7 @@ class HAStandaloneNode:
                 str(self.epoch),
             ]
         )
+        command.extend(self.extra_runtime_args)
         env = os.environ.copy()
         if self.admin_token_env is not None:
             command.extend(["--admin-token-env", self.admin_token_env])
@@ -581,7 +583,11 @@ def ha_cluster(request: pytest.FixtureRequest) -> HACluster:
 
 
 def _wait_for_standby_applied(
-    cluster: HACluster, lsn: int, *, timeout_s: float = 20.0
+    cluster: HACluster,
+    lsn: int,
+    *,
+    timeout_s: float = 20.0,
+    require_live_replication: bool = False,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     last_snapshot: dict[str, Any] | None = None
@@ -595,7 +601,17 @@ def _wait_for_standby_applied(
             continue
         snapshot = status["snapshot"]
         last_snapshot = snapshot
-        if snapshot["received_lsn"] >= lsn and snapshot["applied_lsn"] >= lsn:
+        # Bootstrap restores progress before the pull loop contacts the primary.
+        # Require an acknowledged round before issuing synchronous writes.
+        replication_ready = not require_live_replication or (
+            (snapshot.get("last_success_ns") or 0) > 0
+            and snapshot.get("last_error") is None
+        )
+        if (
+            snapshot["received_lsn"] >= lsn
+            and snapshot["applied_lsn"] >= lsn
+            and replication_ready
+        ):
             return snapshot
         time.sleep(0.25)
     raise AssertionError(

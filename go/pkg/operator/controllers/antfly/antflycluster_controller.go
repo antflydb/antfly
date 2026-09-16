@@ -155,6 +155,7 @@ const (
 	haStartupGateReceiptHashAnnotation      = "antfly.io/ha-startup-receipt-hash"
 	haSeedRoleAnnotation                    = "antfly.io/ha-seed-role"
 	haTopologyIDAnnotation                  = "antfly.io/ha-topology-id"
+	haCatalogReplicationAnnotation          = "antfly.io/ha-catalog-replication"
 	haTopologyGenerationAnnotation          = "antfly.io/ha-topology-generation"
 	haNodeIDAnnotation                      = "antfly.io/ha-node-id"
 	haSlotNameAnnotation                    = "antfly.io/ha-slot-name"
@@ -703,7 +704,7 @@ func hasExplicitStandaloneStoragePVC(statefulSet *appsv1.StatefulSet, storageVol
 	return false
 }
 
-func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration string) string {
+func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration string, catalogReplication bool) string {
 	if ha == nil || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil || ha.Identity == nil {
 		return ""
 	}
@@ -814,10 +815,12 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration strin
 	}
 	appendHAArg("--ha-seed-capture-root", seedCaptureRoot)
 	appendHAUint("--ha-cluster-id", identity.ClusterID)
-	if identity.ShardID != 0 {
+	// Persisted zero-valued identities predate catalog replication. Preserve
+	// their omitted CLI flags unless the cluster explicitly opts into 0/0.
+	if catalogReplication || identity.ShardID != 0 {
 		appendHAUint("--ha-shard-id", identity.ShardID)
 	}
-	if identity.TableID != 0 {
+	if catalogReplication || identity.TableID != 0 {
 		appendHAUint("--ha-table-id", identity.TableID)
 	}
 	appendHAUint("--ha-timeline-id", identity.TimelineID)
@@ -4724,7 +4727,7 @@ exec /antfly standalone --id %d --config /config/config.json \
 								standalone.MetadataAPI.Port,
 								standalone.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
-								standaloneHAArgs(cluster.Spec.HighAvailability, standaloneHAStartupGeneration(cluster)),
+								standaloneHAArgs(cluster.Spec.HighAvailability, standaloneHAStartupGeneration(cluster), cluster.Annotations[haCatalogReplicationAnnotation] == "true"),
 								standaloneHAStartupArgs(cluster),
 							),
 						},
