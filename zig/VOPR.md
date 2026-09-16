@@ -1683,19 +1683,14 @@ equality.
 
 > **Relocated:** The dated checkpoint-recap narrative that previously lived here is preserved verbatim in [work-log/completed/vopr/status-history.md](../work-log/completed/vopr/status-history.md).
 
-Completion labels have these
-strict scopes:
-
-- **Integrated foundation** means the reusable engine/runtime capability exists,
-  is exercised by a focused gate, and exact replay is part of its contract.
-- **Integrated seam** means the named production path and listed fault modes are
-  implemented and replay-proven; it does not include residual work named in the
-  same row.
-- **Partially integrated** means focused production seams exist but are not yet
-  composed through the whole public/deployment path.
-- **Ongoing** and **conditional** are not implemented completion claims.
-
-These four tiers map onto the three-level Conformance Status scale above: **Integrated foundation** and **Integrated seam** both correspond to **Integrated**, **Partially integrated** corresponds to **Executable foundation**, and **Ongoing** and **conditional** correspond to **Operational follow-up** or explicitly future work.
+Completion labels in the tables below use the three-level scale defined
+under Conformance Status. A row may narrow an **Integrated** claim with a
+scope qualifier such as "foundation" (the reusable engine/runtime capability
+and its focused gate) or "at the named seam" (the listed production path and
+fault modes only, excluding residual work named in the same row). **Partially
+integrated** is the Executable-foundation level: focused production seams
+exist but are not yet composed through the whole public/deployment path.
+**Ongoing** and **conditional** are not completion claims.
 
 Therefore the features labeled integrated below are implemented to their stated
 boundaries, but the complete roadmap is not finished. In particular, local
