@@ -64,9 +64,7 @@ def _assert_usage(usage: dict) -> None:
 def test_dictate_without_cleanup_returns_raw_transcript(api):
     """Without cleanup_model the text is the transcript itself."""
     audio = base64.b64encode(_WHISPER_QUALITY_WAV.read_bytes()).decode()
-    resp = api.post(
-        "/dictate", json={"model": "openai/whisper-tiny", "audio": audio}
-    )
+    resp = api.post("/dictate", json={"model": "openai/whisper-tiny", "audio": audio})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["object"] == "dictation"
@@ -91,7 +89,11 @@ def test_dictate_dynamic_audio_context_matches_full_window(api):
     audio = base64.b64encode(_WHISPER_QUALITY_WAV.read_bytes()).decode()
     resp = api.post(
         "/dictate",
-        json={"model": "openai/whisper-tiny", "audio": audio, "audio_context": "dynamic"},
+        json={
+            "model": "openai/whisper-tiny",
+            "audio": audio,
+            "audio_context": "dynamic",
+        },
     )
     assert resp.status_code == 200, resp.text
     lowered = " ".join(resp.json()["text"].lower().split())
@@ -151,8 +153,14 @@ def test_dictate_rejects_invalid_options_before_transcribing(api):
     """Validation failures never reach the model."""
     audio = base64.b64encode(_WHISPER_QUALITY_WAV.read_bytes()).decode()
     cases = [
-        ({"model": "openai/whisper-tiny", "audio": audio, "dictionary": ["a\nb"]}, "dictionary"),
-        ({"model": "openai/whisper-tiny", "audio": audio, "max_tokens": 0}, "max_tokens"),
+        (
+            {"model": "openai/whisper-tiny", "audio": audio, "dictionary": ["a\nb"]},
+            "dictionary",
+        ),
+        (
+            {"model": "openai/whisper-tiny", "audio": audio, "max_tokens": 0},
+            "max_tokens",
+        ),
         ({"model": "", "audio": audio}, "model is required"),
         ({"model": "openai/whisper-tiny", "audio": "%%%"}, "base64"),
     ]
@@ -224,7 +232,7 @@ def test_dictate_streams_transcript_then_deltas_then_completion(api):
             continue
         text = line.decode()
         assert text.startswith("data: "), text
-        payload = text[len("data: "):]
+        payload = text[len("data: ") :]
         if payload == "[DONE]":
             done = True
             break
@@ -236,10 +244,14 @@ def test_dictate_streams_transcript_then_deltas_then_completion(api):
     assert types[-1] == "dictation.completed"
     assert "dictation.delta" in types
     assert "error" not in types
-    deltas = "".join(event["delta"] for event in events if event["type"] == "dictation.delta")
+    deltas = "".join(
+        event["delta"] for event in events if event["type"] == "dictation.delta"
+    )
     completed = events[-1]
     assert completed["text"]
-    assert completed["text"] in deltas or deltas.strip().startswith(completed["text"][:8])
+    assert completed["text"] in deltas or deltas.strip().startswith(
+        completed["text"][:8]
+    )
     _assert_usage(completed["usage"])
     assert len({event["id"] for event in events}) == 1
 
@@ -258,7 +270,10 @@ def _attachment_envelope(metadata: dict, mime: str, data: bytes) -> bytes:
 def test_dictate_returns_timestamped_phrases_with_words(api):
     """Segments come from Whisper timestamp tokens and carry word spans."""
     audio = base64.b64encode(_WHISPER_QUALITY_WAV.read_bytes()).decode()
-    resp = api.post("/dictate", json={"model": "openai/whisper-tiny", "audio": audio, "language": "en"})
+    resp = api.post(
+        "/dictate",
+        json={"model": "openai/whisper-tiny", "audio": audio, "language": "en"},
+    )
     assert resp.status_code == 200, resp.text
     transcript = resp.json()["transcript"]
     assert transcript["segments"], transcript
@@ -268,7 +283,9 @@ def test_dictate_returns_timestamped_phrases_with_words(api):
         assert segment["end_ms"] >= segment["start_ms"]
         assert segment["end_ms"] <= transcript["duration_ms"]
         assert segment["words"], segment
-        assert " ".join(w["word"] for w in segment["words"]) == " ".join(segment["text"].split())
+        assert " ".join(w["word"] for w in segment["words"]) == " ".join(
+            segment["text"].split()
+        )
         assert segment["words"][0]["start_ms"] == segment["start_ms"]
         assert segment["words"][-1]["end_ms"] == segment["end_ms"]
         previous_end = segment["end_ms"]
@@ -283,8 +300,16 @@ def test_dictate_accepts_transcript_prompt_and_dictionary(api):
     # The prompt is treated as text that preceded the clip, so it must not
     # repeat the clip's own words or Whisper will skip them as already said.
     for body in (
-        {"model": "openai/whisper-tiny", "audio": audio, "dictionary": ["Antfly", "Colony"]},
-        {"model": "openai/whisper-tiny", "audio": audio, "transcript_prompt": "Glossary: Antfly, Colony, Roetker."},
+        {
+            "model": "openai/whisper-tiny",
+            "audio": audio,
+            "dictionary": ["Antfly", "Colony"],
+        },
+        {
+            "model": "openai/whisper-tiny",
+            "audio": audio,
+            "transcript_prompt": "Glossary: Antfly, Colony, Roetker.",
+        },
     ):
         resp = api.post("/dictate", json=body)
         assert resp.status_code == 200, resp.text
@@ -293,7 +318,11 @@ def test_dictate_accepts_transcript_prompt_and_dictionary(api):
             assert word in lowered, lowered
     too_long = api.post(
         "/dictate",
-        json={"model": "openai/whisper-tiny", "audio": audio, "transcript_prompt": "x" * 1025},
+        json={
+            "model": "openai/whisper-tiny",
+            "audio": audio,
+            "transcript_prompt": "x" * 1025,
+        },
     )
     assert too_long.status_code == 400, too_long.text
 
@@ -317,7 +346,9 @@ def test_dictate_framed_attachment_transport(api):
     assert "fox" in lowered, lowered
 
     # An inline JSON request may not reference attachments.
-    bad = api.post("/dictate", json={"model": "openai/whisper-tiny", "audio": "attachment:0"})
+    bad = api.post(
+        "/dictate", json={"model": "openai/whisper-tiny", "audio": "attachment:0"}
+    )
     assert bad.status_code == 400
     assert "attachment" in bad.json()["message"]
 
@@ -327,7 +358,11 @@ def test_dictate_with_silero_vad_skips_tone_windows(api):
     """Neural VAD windowing drops a long tone-only stretch instead of transcribing it."""
     probe = api.post(
         "/dictate",
-        json={"model": "openai/whisper-tiny", "audio": make_wav_b64(0.2), "vad": {"model": "onnx-community/silero-vad"}},
+        json={
+            "model": "openai/whisper-tiny",
+            "audio": make_wav_b64(0.2),
+            "vad": {"model": "onnx-community/silero-vad"},
+        },
     )
     if probe.status_code == 400 and "Silero" in probe.text or probe.status_code == 404:
         pytest.skip("onnx-community/silero-vad is not pulled")
@@ -343,7 +378,11 @@ def test_dictate_with_silero_vad_skips_tone_windows(api):
     clip = tone + pcm  # 32 s of tone, then the phrase: the first window is tone only
     resp = api.post(
         "/dictate",
-        json={"model": "openai/whisper-tiny", "audio": _wav_b64(clip, rate), "vad": {"model": "onnx-community/silero-vad"}},
+        json={
+            "model": "openai/whisper-tiny",
+            "audio": _wav_b64(clip, rate),
+            "vad": {"model": "onnx-community/silero-vad"},
+        },
         timeout=300,
     )
     assert resp.status_code == 200, resp.text

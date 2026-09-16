@@ -191,7 +191,7 @@ def _sse_messages(raw: bytes) -> list:
     for line in raw.decode().split("\n"):
         if not line.startswith("data: "):
             continue
-        payload = line[len("data: "):]
+        payload = line[len("data: ") :]
         messages.append("[DONE]" if payload == "[DONE]" else json.loads(payload))
     return messages
 
@@ -209,7 +209,9 @@ def test_session_finals_carry_words_and_accept_dictionary(api):
     assert final["words"], final
     assert final["words"][0]["start_ms"] == final["start_ms"]
     assert final["words"][-1]["end_ms"] <= final["end_ms"]
-    assert " ".join(w["word"] for w in final["words"]) == " ".join(final["text"].split())
+    assert " ".join(w["word"] for w in final["words"]) == " ".join(
+        final["text"].split()
+    )
     api.s.delete(f"{api.url}/ai/v1/transcription/sessions/{session_id}")
 
 
@@ -219,7 +221,12 @@ def test_session_framed_append(api):
     session = _create(api, emit_partials=False)
     session_id = session["id"]
     body = _attachment_envelope(
-        {"audio": "attachment:0", "format": "pcm16", "sample_rate": rate, "commit": True},
+        {
+            "audio": "attachment:0",
+            "format": "pcm16",
+            "sample_rate": rate,
+            "commit": True,
+        },
         "audio/pcm",
         pcm,
     )
@@ -259,7 +266,7 @@ def test_session_events_stream_receives_appended_events(api):
                 text = line.decode()
                 if not text.startswith("data: "):
                     continue
-                payload = text[len("data: "):]
+                payload = text[len("data: ") :]
                 if payload == "[DONE]":
                     break
                 received.append(__import__("json").loads(payload))
@@ -279,7 +286,11 @@ def test_session_events_stream_receives_appended_events(api):
     assert types[0] == "session.open", types
     assert "transcription.event" in types, types
     assert types[-1] == "session.closed", types
-    finals = [m["event"] for m in received if m["type"] == "transcription.event" and m["event"]["type"] == "final"]
+    finals = [
+        m["event"]
+        for m in received
+        if m["type"] == "transcription.event" and m["event"]["type"] == "final"
+    ]
     assert finals and "fox" in finals[0]["text"].lower(), received
 
 
@@ -302,7 +313,13 @@ def test_session_stream_upload_returns_events(api):
     messages = _sse_messages(resp.content)
     assert messages[0]["type"] == "session.open"
     assert messages[-1] == "[DONE]"
-    finals = [m["event"] for m in messages if isinstance(m, dict) and m["type"] == "transcription.event" and m["event"]["type"] == "final"]
+    finals = [
+        m["event"]
+        for m in messages
+        if isinstance(m, dict)
+        and m["type"] == "transcription.event"
+        and m["event"]["type"] == "final"
+    ]
     assert len(finals) == 2, messages
     for final in finals:
         assert "fox" in final["text"].lower(), final
@@ -381,7 +398,13 @@ def test_session_stream_upload_is_duplex_over_chunked_http1(api):
     messages = _sse_messages(bytes(payload))
     assert messages[0]["type"] == "session.open"
     assert messages[-1] == "[DONE]"
-    finals = [m["event"] for m in messages if isinstance(m, dict) and m["type"] == "transcription.event" and m["event"]["type"] == "final"]
+    finals = [
+        m["event"]
+        for m in messages
+        if isinstance(m, dict)
+        and m["type"] == "transcription.event"
+        and m["event"]["type"] == "final"
+    ]
     assert len(finals) == 2, messages
     for final in finals:
         assert "fox" in final["text"].lower(), final
@@ -391,7 +414,10 @@ def test_session_stream_upload_is_duplex_over_chunked_http1(api):
 def _silero_available(api) -> bool:
     resp = api.post(
         "/transcription/sessions",
-        json={"model": "openai/whisper-tiny", "vad": {"model": "onnx-community/silero-vad"}},
+        json={
+            "model": "openai/whisper-tiny",
+            "vad": {"model": "onnx-community/silero-vad"},
+        },
     )
     if resp.status_code == 200:
         api.s.delete(f"{api.url}/ai/v1/transcription/sessions/{resp.json()['id']}")
@@ -414,7 +440,9 @@ def test_session_silero_vad_ignores_tones_and_endpoints_speech(api):
     )
     silence = b"\x00\x00" * rate
 
-    session = _create(api, emit_partials=False, vad={"model": "onnx-community/silero-vad"})
+    session = _create(
+        api, emit_partials=False, vad={"model": "onnx-community/silero-vad"}
+    )
     session_id = session["id"]
     events = []
     for chunk in _chunks(tone + silence + pcm + silence, rate, 500):
@@ -433,7 +461,9 @@ def test_session_silero_vad_ignores_tones_and_endpoints_speech(api):
     for chunk in _chunks(tone + silence, rate, 500):
         energy_events.extend(_append(api, energy["id"], chunk, rate)["data"])
     energy_events.extend(_append(api, energy["id"], None, rate, commit=True)["data"])
-    assert any(e["type"] == "final" for e in energy_events) or energy_events == [], energy_events
+    assert any(e["type"] == "final" for e in energy_events) or energy_events == [], (
+        energy_events
+    )
     api.s.delete(f"{api.url}/ai/v1/transcription/sessions/{energy['id']}")
 
     bad = api.post(
