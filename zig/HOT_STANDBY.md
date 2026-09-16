@@ -1607,3 +1607,12 @@ current primary log position before returning `table already exists`. A table
 visible only on the primary still returns the versioned unknown-outcome response,
 including after primary restart. Catch-up lets the same retry complete without
 appending another catalog record or restarting the primary.
+
+### Operator catalog-mode opt-in
+
+For operator-managed whole-instance catalog replication, set the AntflyCluster
+annotation `antfly.io/ha-catalog-replication: "true"` on both nodes and use zero
+table/shard identities with the matching runtime and operator release. The
+operator then emits explicit zero CLI identities. Without this opt-in, omitted
+or zero-valued identity fields retain the legacy omitted CLI arguments; existing
+nonzero table-scoped identities remain unchanged across operator upgrades.
