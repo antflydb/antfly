@@ -307,12 +307,16 @@ pub const Registry = struct {
     }
 
     /// Queue events for the entry's event stream and wake it. Events are
-    /// moved; the caller must not deinit them afterwards. Beyond the pending
+    /// moved; the caller must not deinit them afterwards. On error nothing
+    /// was moved and the caller still owns every event. Beyond the pending
     /// cap the oldest partials are dropped first, finals are kept.
     pub fn publish(self: *Registry, entry: *Entry, events: []streaming.Event, io: std.Io) !void {
         self.lock();
         defer self.mutex.unlock();
-        for (events) |event| try entry.pending.append(self.allocator, event);
+        // All or nothing: room for the whole batch is made before any event
+        // changes hands, so a failure cannot leave part of it queued.
+        try entry.pending.ensureUnusedCapacity(self.allocator, events.len);
+        entry.pending.appendSliceAssumeCapacity(events);
         var index: usize = 0;
         while (entry.pending.items.len > max_pending_events and index < entry.pending.items.len) {
             if (entry.pending.items[index].kind == .partial) {
@@ -502,6 +506,62 @@ test "registry does not keep an entry whose creation failed" {
     var a = try registry.create(allocator, .{ .id = testId(1), .model = "m", .now_wall_s = 0, .now_mono_ns = 0, .io = std.testing.io });
     defer a.deinit(allocator);
     try std.testing.expect(registry.contains(&a.id));
+}
+
+test "registry publishes a batch of events all or nothing" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+    var a = try registry.create(allocator, .{ .id = testId(1), .model = "m", .now_wall_s = 0, .now_mono_ns = 0, .io = std.testing.io });
+    defer a.deinit(allocator);
+    const entry = try registry.watch(&a.id);
+    defer registry.unwatch(entry);
+
+    var events: [2]streaming.Event = undefined;
+    for (&events, 0..) |*event, i| {
+        event.* = .{
+            .kind = .final,
+            .sequence = i,
+            .text = try allocator.dupe(u8, "x"),
+            .stable_text = try allocator.dupe(u8, "x"),
+            .start_ms = 0,
+            .end_ms = 1,
+            .language = null,
+        };
+    }
+    defer for (&events) |*event| event.deinit(allocator);
+
+    // The queue cannot grow: nothing may have moved, so the caller's
+    // cleanup above frees each event exactly once.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    registry.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, registry.publish(entry, &events, std.testing.io));
+    registry.allocator = allocator;
+    try std.testing.expectEqual(@as(usize, 0), entry.pending.items.len);
+
+    // A successful publish moves the batch; hand the caller fresh copies
+    // so its deferred cleanup stays balanced.
+    var moved: [2]streaming.Event = undefined;
+    for (&moved, 0..) |*event, i| {
+        event.* = .{
+            .kind = .final,
+            .sequence = 10 + i,
+            .text = try allocator.dupe(u8, "y"),
+            .stable_text = try allocator.dupe(u8, "y"),
+            .start_ms = 0,
+            .end_ms = 1,
+            .language = null,
+        };
+    }
+    try registry.publish(entry, &moved, std.testing.io);
+    var out = std.ArrayListUnmanaged(streaming.Event).empty;
+    defer {
+        for (out.items) |*event| event.deinit(allocator);
+        out.deinit(allocator);
+    }
+    try std.testing.expect(try registry.drain(entry, &out));
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqual(@as(u64, 10), out.items[0].sequence);
 }
 
 test "registry expires idle sessions and enforces the cap" {
