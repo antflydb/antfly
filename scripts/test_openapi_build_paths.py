@@ -22,6 +22,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+from jsonschema import Draft4Validator
+
 # The generators are standalone scripts with sibling imports. Support both
 # unittest's repository-root module invocation and discovery in scripts/.
 with patch.object(sys, "path", [str(Path(__file__).resolve().parent), *sys.path]):
@@ -30,6 +33,48 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parent), *sys.path]
 
 
 class OpenApiBuildPathsTest(unittest.TestCase):
+    def test_openrouter_generator_schema_matches_single_model_runtime(self):
+        root = Path(__file__).resolve().parent.parent
+        source = yaml.safe_load(
+            (root / "specs/openapi/shared/generating.yaml").read_text()
+        )["components"]["schemas"]
+        public = yaml.safe_load((root / "openapi.yaml").read_text())["components"]["schemas"]
+        for schemas in (source, public):
+            with self.subTest(source=schemas is source):
+                schema = schemas["OpenRouterGeneratorConfig"]
+                validator = Draft4Validator(
+                    {
+                        "$ref": "#/components/schemas/GeneratorConfig",
+                        "components": {"schemas": schemas},
+                    }
+                )
+                self.assertTrue(
+                    validator.is_valid(
+                        {
+                            "provider": "openrouter",
+                            "model": "openai/gpt-4.1",
+                            "url": "https://gateway.example/v1",
+                            "api_key": "${secret:custom.openrouter}",
+                        }
+                    )
+                )
+                self.assertFalse(
+                    validator.is_valid(
+                        {"provider": "openrouter", "models": ["openai/gpt-4.1"]}
+                    )
+                )
+                self.assertFalse(
+                    Draft4Validator(schema).is_valid(
+                        {"provider": "openai", "model": "gpt-4.1"}
+                    )
+                )
+                self.assertNotIn("models", schema["properties"])
+                self.assertIn("openrouter", schemas["GeneratorProvider"]["enum"])
+                self.assertIn(
+                    {"$ref": "#/components/schemas/OpenRouterGeneratorConfig"},
+                    schemas["GeneratorConfig"]["allOf"][0]["oneOf"],
+                )
+
     def test_relative_build_outputs_and_comparison(self):
         scripts = Path(__file__).resolve().parent
         for script, mode in (

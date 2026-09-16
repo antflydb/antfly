@@ -10373,13 +10373,19 @@ export interface components {
         };
         /** @description Configuration for the OpenRouter generative AI provider. */
         OpenRouterGeneratorConfig: {
+            /** @enum {string} */
+            provider: "openrouter";
             /**
-             * @description Single model identifier. Either model or models must be provided.
+             * @description The OpenRouter model identifier to use.
              * @example openai/gpt-4.1
              */
-            model?: string;
-            /** @description Array of model identifiers for fallback routing. Either model or models must be provided. */
-            models?: string[];
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the OpenRouter API endpoint.
+             * @default https://openrouter.ai/api/v1
+             */
+            url?: string;
             /** @description The OpenRouter API key. */
             api_key?: string;
             /**
