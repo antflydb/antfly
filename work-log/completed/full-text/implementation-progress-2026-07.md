@@ -1,6 +1,6 @@
 # Full-Text Performance: Implementation Progress Log (2026-07)
 
-> Relocated verbatim from `zig/FULL_TEXT_PERFORMANCE.md` (lines 616–2925 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`FULL_TEXT_PERFORMANCE.md`](../../../zig/FULL_TEXT_PERFORMANCE.md). Durable decisions from this log were folded into that document before the move.
+> Relocated verbatim from `zig/FULL_TEXT_PERFORMANCE.md` (lines 616–2925 at commit 271838a195) on 2026-09-16 during the documentation cleanup (since merged into FULL_TEXT.md and bench/full_text/BENCHMARK.md). This is a historical implementation log kept for context; the living design is [`FULL_TEXT.md`](../../../zig/FULL_TEXT.md). Durable decisions from this log were folded into that document before the move.
 
 ## Implementation Progress
 
@@ -2312,3 +2312,25 @@ record indexing CPU or peak RSS; its accepted same-index rebuild peak-RSS result
 remains in `full-corpus-v27-production-query-resources.json`, so no redundant
 full comparator rebuild was run.
 
+## Status paragraph at consolidation (relocated from FULL_TEXT_PERFORMANCE.md)
+
+> Moved here verbatim on 2026-09-16 when FULL_TEXT_PERFORMANCE.md was split into FULL_TEXT.md and bench/full_text/BENCHMARK.md; the design doc keeps a shorter present-tense summary.
+
+
+The eight-milestone implementation plan above is complete: the benchmark
+specification (grammar, corpus normalization, score/cutoff-tie rules, segment
+modes, manifest schema) is frozen and checked in; the embedded adapter
+(`bench/full_text/search_benchmark_*.zig`, `search-benchmark-game/engines/antfly-zig/`)
+is correct and correctness-gated; the production-backed kernel API
+(`pkg/antfly/src/index.zig`, `pkg/antfly/src/search/search.zig`) returns
+native ordinals/scores without MVCC or body-loading overhead; the runner
+(`tools/run_search_kernel_benchmark.py`, `tools/run_search_server_benchmark.py`)
+is reproducible with an archived baseline; the boolean iterator tree, scored
+two-phase phrase executor, and segment/codec/allocation optimizations
+described in the Engine Optimization Roadmap above are implemented in
+`pkg/antfly/src/search/scorer.zig` and `pkg/antfly/src/section/inverted.zig`;
+and the product/server benchmark (persistent-client concurrency sweeps, mixed
+read/write, freshness, durability-profile, and restart/recovery measurements)
+is implemented and compared against Quickwit. The dated log below records the
+ongoing measurement history against that completed harness; it is not a list
+of outstanding milestone work.

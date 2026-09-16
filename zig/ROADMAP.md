@@ -256,10 +256,11 @@ file's own title and a one-line description taken from its first paragraph.
 ### Indexing
 
 - [FULL_TEXT.md](FULL_TEXT.md) — Full-Text Indexing: visibility semantics kept
-  aligned with the LSM path.
-- [FULL_TEXT_PERFORMANCE.md](FULL_TEXT_PERFORMANCE.md) — Full-Text Performance
-  and Benchmark Plan: how to make full-text performance work measurable,
-  comparable, and implementable.
+  aligned with the LSM path, plus the search execution architecture and
+  design (boolean iterator tree, phrase execution, segment/codec layout).
+- [bench/full_text/BENCHMARK.md](bench/full_text/BENCHMARK.md) — Full-Text
+  Benchmark Protocol: the correctness-gated search-kernel and database
+  benchmark contracts and result artifact.
 - [SORT.md](SORT.md) — Sort And Search Design: converging `order_by`/
   `search_after` on a native, segment-aware execution model.
 - [DOCID.md](DOCID.md) — Document IDs and Posting IDs: the document-ID/
