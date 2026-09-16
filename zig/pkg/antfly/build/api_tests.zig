@@ -63,6 +63,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
     const public_api_parity_default_filters = [_][]const u8{
+        "join planning",
         "public openapi contract module is generated and wired",
         "admin openapi contract module is generated and wired",
         "internal openapi contract module is generated and wired",

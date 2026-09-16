@@ -476,6 +476,47 @@ def catalog_scenario(args, binary: Path) -> dict:
                         break
                 else:
                     raise RuntimeError("no nonmember coordinator for target table")
+            if args.deployment == "cluster" and args.catalog_shards > 1:
+                right_groups = {
+                    int(group)
+                    for group in api.request("GET", scope + "/tables/events_0")[
+                        "shards"
+                    ]
+                }
+                with requests.Session() as session:
+                    response = session.get(
+                        instance.metadata_urls[0] + "/metadata/v1/admin/snapshot",
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    placements = response.json()["placement_intents"]
+                coordinator = instance.data_nodes[
+                    instance.data_api_urls.index(api.base)
+                ]["id"]
+                owners = {
+                    group: sorted(
+                        {
+                            int(intent["record"]["local_node_id"])
+                            for intent in placements
+                            if int(intent["record"]["group_id"]) == group
+                            and intent["serving_state"] == "serving"
+                        }
+                    )
+                    for group in right_groups
+                }
+                if any(not nodes for nodes in owners.values()):
+                    raise RuntimeError("join fanout has an unplaced right-hand shard")
+                remote_groups = sorted(
+                    group for group, nodes in owners.items() if coordinator not in nodes
+                )
+                if not remote_groups:
+                    raise RuntimeError("join fanout requires a remote right-hand shard")
+                ingress = {
+                    **(ingress or {}),
+                    "coordinator_node_id": coordinator,
+                    "join_group_owners": owners,
+                    "remote_join_group_ids": remote_groups,
+                }
             target = {"database": "benchmark", "namespace": "serving", "table": table}
             query = {
                 "table_target": target,

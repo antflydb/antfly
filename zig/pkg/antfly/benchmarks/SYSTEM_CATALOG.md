@@ -615,3 +615,37 @@ snapshot results with retained peer results at publication, using 1,000 tables
 with 8 KiB schema payloads. Incoming snapshot construction is excluded from both
 measurements. This isolates publication/result-copy cost; it is not an end-to-end
 network or throughput benchmark.
+
+### Join planning acquisition and shard fanout
+
+The retained-planning workload compares warm diagnostic-snapshot acquisition and
+release with warm planning-generation acquisition, indexed table/key lookup, and
+release. It uses the same Debug binary and checking allocator for both paths.
+The opt-in size is 1,000 tables with one range each and 8 KiB schema definitions;
+normal test runs use 16 tables. Initial control-generation publication is reported
+separately, outside the warm samples.
+
+```sh
+ANTFLY_CATALOG_JOIN_PLANNING_BENCH=1 python3 tools/run_bounded_zig_build.py \
+  build antfly-data-runtime-test -- \
+  --test-filter 'system catalog join planning retained acquisition workload'
+```
+
+For the complete read path, run the catalog workload on fresh three-data-node
+clusters, with eight single-replica shards per table and a coordinator that must
+forward to remote right-hand shards. The harness verifies and records those
+placements. It validates writes, lookups, search, joins, NDJSON, discovery, and
+rename. Sequential join and NDJSON samples cross cache freshness intervals; this
+is separate from the deliberately warm component measurement.
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --binary /path/to/antfly --scenario catalog --deployment cluster \
+  --table-counts 10 --catalog-shards 8 \
+  --schema-fields 32 --samples 20 --warmup 2 --ndjson-lines 20 \
+  --output /tmp/catalog-join-fanout.json
+```
+
+Run baseline and candidate sequentially without task-owned compilation or other
+workloads. Compare result correctness, p50/p95/max, and errors as well as warm
+acquisition cost. A component speedup does not establish an HTTP tail-latency SLO.

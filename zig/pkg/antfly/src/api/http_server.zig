@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const join_planning = @import("join_planning.zig");
 const system_catalog = @import("../system_catalog/domain.zig");
 const system_catalog_routes = @import("../system_catalog/routes.zig");
 const system_catalog_operations = @import("../system_catalog/operations.zig");
@@ -1387,6 +1388,7 @@ pub const StatusSource = struct {
 
     pub const VTable = struct {
         supports_query_definitions: bool = false,
+        acquire_join_planning: ?*const fn (*anyopaque, table_router.RouteBudget) anyerror!?*join_planning.Generation = null,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: system_catalog.Call) anyerror![]u8 = null,
 
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
@@ -1435,6 +1437,12 @@ pub const StatusSource = struct {
         restore_extensions: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, installed: []const extension_domain.InstalledExtension, members: []const extension_domain.ExtensionMember, dependencies: []const extension_domain.ExtensionDependency) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn acquireJoinPlanning(self: StatusSource, budget: table_router.RouteBudget) !?*join_planning.Generation {
+        try budget.check();
+        const capture = self.vtable.acquire_join_planning orelse return null;
+        return try BoundaryAbi.call("acquire_join_planning", self.boundary_dispatch, capture, .{ self.ptr, budget });
+    }
 
     pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
         const callback = self.vtable.system_catalog orelse return error.UnsupportedOperation;
@@ -1726,6 +1734,19 @@ pub const StatusSource = struct {
                 return try cast(ptr).adminSnapshot();
             }
 
+            fn acquireJoinPlanning(ptr: *anyopaque, budget: table_router.RouteBudget) anyerror!?*join_planning.Generation {
+                try budget.check();
+                const svc = cast(ptr);
+                const native_deadline = (table_catalog.RoutingBudget{}).deadlineFrom(budget.clock);
+                var routing = try svc.catalogRoutingSnapshot(native_deadline);
+                defer svc.freeCatalogRoutingSnapshot(&routing);
+                return try join_planning.Generation.create(svc.alloc, .{
+                    .tables = routing.tables,
+                    .ranges = routing.ranges,
+                    .merged_group_statuses = @as([]const metadata_reconciler.MergedGroupStatus, &.{}),
+                }, budget);
+            }
+
             fn cachedAdminSnapshot(ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot {
                 return try cast(ptr).adminSnapshot();
             }
@@ -1895,6 +1916,7 @@ pub const StatusSource = struct {
             .supports_query_definitions = true,
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
+            .acquire_join_planning = Gen.acquireJoinPlanning,
             .cached_admin_snapshot = Gen.cachedAdminSnapshot,
             .linearizable_snapshot = Gen.linearizableSnapshot,
             .free_admin_snapshot = Gen.freeAdminSnapshot,
@@ -3946,8 +3968,7 @@ pub const ApiHttpServer = struct {
     }
 
     const join_context_vtable = distributed_join.JoinContext.VTable{
-        .admin_snapshot = joinCtxAdminSnapshot,
-        .free_admin_snapshot = joinCtxFreeAdminSnapshot,
+        .acquire_planning = joinCtxAcquirePlanning,
         .local_table_stats = joinCtxLocalTableStats,
         .get_join_shuffle_lease = joinCtxGetJoinShuffleLease,
         .upsert_join_shuffle_lease = joinCtxUpsertJoinShuffleLease,
@@ -3960,14 +3981,9 @@ pub const ApiHttpServer = struct {
         .ensure_foreign_registry = joinCtxEnsureForeignRegistry,
     };
 
-    fn joinCtxAdminSnapshot(ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot {
+    fn joinCtxAcquirePlanning(ptr: *anyopaque, _: std.mem.Allocator, budget: table_router.RouteBudget) anyerror!?*join_planning.Generation {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.source.adminSnapshot();
-    }
-
-    fn joinCtxFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
-        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        self.source.freeAdminSnapshot(snapshot);
+        return try self.source.acquireJoinPlanning(budget);
     }
 
     fn joinCtxRealtimeNowMillis(ptr: *anyopaque) u64 {

@@ -86,6 +86,17 @@ pub const RoutingBudget = struct {
     }
 };
 
+/// Narrow a fence in its own clock domain. A timestamp and its clock are one
+/// budget; callers must never compare raw timestamps from different clocks.
+pub fn narrowRouteFenceBudget(fence: *metadata_api.CatalogRouteFence, source: RoutingBudget) void {
+    const target = RoutingBudget{ .io = fence.admission_deadline_io };
+    const incoming = target.deadlineFrom(source) orelse return;
+    fence.admission_deadline_ns = if (fence.admission_deadline_ns) |current|
+        @min(current, incoming)
+    else
+        incoming;
+}
+
 fn cloneGroupIdsUntil(
     alloc: std.mem.Allocator,
     source: []const u64,

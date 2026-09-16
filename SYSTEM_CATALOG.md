@@ -927,8 +927,9 @@ explicit outcomes.
 
 Remote document reads select endpoints from an immutable index derived from the
 accepted control snapshot. It contains healthy node API URLs, readable placement
-membership, and merged leader hints, keyed by node and group. It retains no table
-schemas, document statistics, or diagnostic inventory. Serving/draining relocation
+membership, and merged leader hints, keyed by node and group. The shared control-read
+generation also owns the compact join-planning view described below. Neither view
+retains table schemas or diagnostic inventory. Serving/draining relocation
 rules remain identical to the peer-aware placement rules.
 
 Control snapshot publication replaces the index under the same incarnation and
@@ -956,3 +957,33 @@ A local serving leader requires no endpoint discovery. A local Raft member's
 leader observation takes precedence over metadata hints; a non-member's retained
 Raft hint does not. Routing hints never replace the destination's topology fence,
 placement checks, or requested read-consistency barrier.
+
+
+### Join planning and deadline ownership
+
+Public joins acquire one immutable planning generation lazily, after the left-hand
+query produces rows. Planning, index lookup, broadcast routing, and shuffle worker
+selection reuse that observation. Background jobs do not retain request-scoped
+pointers; resumed work acquires its own observation. The planning generation owns
+only names, table identities, range boundaries/identities, group IDs, aggregated
+row/byte estimates, and document-identity readiness. Name lookup is indexed and
+point-key routing searches sorted table-local ranges. Missing shard reports leave
+statistics explicitly unknown rather than treating missing data as zero.
+
+Data nodes publish this generation with the peer-routing index when accepting a
+control observation. Warm acquisition retains it under the cache mutex without
+copying catalog/schema data. Cold acquisition shares the existing control refresh,
+including its deadline, cancellation, singleflight, incarnation, and invalidation
+fences; it never requests the paginated diagnostic snapshot. The cold control
+transfer still includes the existing control-plane inventory. Projection build
+cost is paid at publication, not by every planning phase or table lookup.
+
+Embedded metadata sources use the compact catalog projection and the existing
+local runtime-statistics adapter for estimates. Query planning has no production
+fallback to administrative snapshots. Statistics guide costs only; destination
+workers remain responsible for current topology and document-identity validation.
+
+An admission deadline always travels with its clock authority. Narrowing a fence
+first converts the incoming remaining budget into the fence's clock, then takes
+the earlier deadline. Lookup, coordinator, and worker paths preserve this pair;
+clock translation never refreshes an expired deadline or extends a tighter fence.
