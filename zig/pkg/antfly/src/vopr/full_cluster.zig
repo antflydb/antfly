@@ -3546,7 +3546,7 @@ fn runExactMode(
             else if (production_durable_join_takeover_mode)
                 "full-cluster-vopr-v20-durable-join-takeover"
             else if (production_join_split_mode)
-                "full-cluster-vopr-v54-join-split-borrowed-routing-clock"
+                "full-cluster-vopr-v55-join-split-authoritative-topology-clock"
             else if (production_graph_split_resource_pressure_mode)
                 "full-cluster-vopr-v18-graph-split-resource-pressure"
             else if (production_graph_split_partial_write_mode)

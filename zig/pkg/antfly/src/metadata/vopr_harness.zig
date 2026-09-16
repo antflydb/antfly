@@ -8054,10 +8054,14 @@ pub const VoprPublicClusterFixture = struct {
         workflow: *metadata_table_workflow.TableWorkflow,
         ranges: []const metadata_table_manager.RangeRecord,
     ) !void {
+        // This fixture bypasses the public create API. Supply its canonical
+        // default schema before any owner creates postings, so later split
+        // admission does not install a different projection provenance.
         const docs_summary = try workflow.createTableWithRanges(&self.cluster.node(self.metadata_leader_index), .{
             .table_id = table_id,
             .name = "docs",
             .description = "full cluster VOPR documents",
+            .schema_json = api_tables.default_schema_json,
             .indexes_json = graph_indexes_json,
             .desired_replica_count = 2,
             .min_ranges = 1,
@@ -8085,6 +8089,7 @@ pub const VoprPublicClusterFixture = struct {
             .table_id = tenant_table_id,
             .name = "tenant_b_docs",
             .description = "full cluster VOPR tenant-isolation documents",
+            .schema_json = api_tables.default_schema_json,
             .indexes_json = api_tables.default_indexes_json,
             .desired_replica_count = 2,
             .min_ranges = 1,

@@ -201,6 +201,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_store_step = b.step("antfly-system-catalog-store-test", "Run catalog report persistence, snapshot, drain, and migration regressions");
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
+    const system_catalog_projection_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "catalog projection", "system catalog forwarding retains" },
+    });
+    b.step("antfly-system-catalog-projection-test", "Run immutable catalog generation publication and retention regressions").dependOn(&b.addRunArtifact(system_catalog_projection_tests).step);
     const schema_finalization_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[0],
         .filters = &.{ "system catalog migration finalization", "schema migration" },

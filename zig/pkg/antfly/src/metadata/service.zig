@@ -6012,6 +6012,14 @@ pub const MetadataService = struct {
 
     /// Capture only the atomically paired table/range projection used for
     /// routing, without computing the full administrative status projection.
+    pub fn acquireCatalogRoutingGeneration(self: *MetadataService, deadline_ns: ?u64) !*@import("../api/table_catalog.zig").RoutingGeneration {
+        return try self.catalog_projection_reader.acquireRoutingGeneration(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), deadline_ns);
+    }
+
+    pub fn acquireCatalogJoinPlanning(self: *MetadataService, budget: @import("../api/table_router.zig").RouteBudget) !*@import("../api/join_planning.zig").Generation {
+        return try self.catalog_projection_reader.acquireJoinPlanning(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), budget);
+    }
+
     pub fn catalogRoutingSnapshot(self: *MetadataService, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         return try self.catalog_projection_reader.routingSnapshot(
             self.alloc,
@@ -9795,6 +9803,14 @@ pub const MetadataHttpService = struct {
     /// Capture only the atomically paired table/range projection used for
     /// routing. In particular, this avoids computing detailed operator status
     /// and reconciliation planning on the public request path.
+    pub fn acquireCatalogRoutingGeneration(self: *MetadataHttpService, deadline_ns: ?u64) !*@import("../api/table_catalog.zig").RoutingGeneration {
+        return try self.catalog_projection_reader.acquireRoutingGeneration(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), deadline_ns);
+    }
+
+    pub fn acquireCatalogJoinPlanning(self: *MetadataHttpService, budget: @import("../api/table_router.zig").RouteBudget) !*@import("../api/join_planning.zig").Generation {
+        return try self.catalog_projection_reader.acquireJoinPlanning(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), budget);
+    }
+
     pub fn catalogRoutingSnapshot(self: *MetadataHttpService, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         return try self.catalog_projection_reader.routingSnapshot(
             self.alloc,

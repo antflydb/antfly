@@ -260,6 +260,7 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
                 .catalog_identity = metadataServiceCatalogIdentity,
+                .acquire_routing_generation = metadataServiceAcquireRoutingGeneration,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
@@ -281,6 +282,7 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .catalog_identity = metadataHttpServiceCatalogIdentity,
+                .acquire_routing_generation = metadataHttpServiceAcquireRoutingGeneration,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
@@ -302,6 +304,7 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataServerAdminSnapshot,
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
                 .catalog_identity = metadataServerCatalogIdentity,
+                .acquire_routing_generation = metadataServerAcquireRoutingGeneration,
                 .routing_snapshot = metadataServerRoutingSnapshot,
                 .table_routing_snapshot = metadataServerTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
@@ -2789,6 +2792,17 @@ fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Adm
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataServiceAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*RoutingGeneration {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    if (authoritative) {
+        svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+            error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+    }
+    return try svc.acquireCatalogRoutingGeneration(deadline_ns);
+}
+
 fn metadataServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     return try svc.catalogRoutingSnapshot(deadline_ns);
@@ -2864,6 +2878,17 @@ fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataHttpServiceAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*RoutingGeneration {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    if (authoritative) {
+        svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+            error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+    }
+    return try svc.acquireCatalogRoutingGeneration(deadline_ns);
+}
+
 fn metadataHttpServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try svc.catalogRoutingSnapshot(deadline_ns);
@@ -2937,6 +2962,17 @@ fn metadataServerCatalogIdentity(ptr: *anyopaque) !metadata_api.CatalogIdentity 
 fn metadataServerFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     srv.freeAdminSnapshot(snapshot);
+}
+
+fn metadataServerAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*RoutingGeneration {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    if (authoritative) {
+        srv.svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+            error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+    }
+    return try srv.svc.acquireCatalogRoutingGeneration(deadline_ns);
 }
 
 fn metadataServerRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {

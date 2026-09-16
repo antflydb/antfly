@@ -94,7 +94,12 @@ fn systemCatalogServiceCall(comptime Service: type) *const fn (*anyopaque, std.m
     return struct {
         fn call(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: system_catalog.Call) ![]u8 {
             const svc: *Service = @ptrCast(@alignCast(ptr));
-            return system_catalog_operations.call(svc, alloc, context, input);
+            // Metadata service internals use native CPU deadlines. Keep the
+            // borrowed ingress clock until this concrete service boundary.
+            var native = context;
+            native.deadline_ns = (api_table_catalog.RoutingBudget{}).deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+            native.deadline_io = null;
+            return system_catalog_operations.call(svc, alloc, native, input);
         }
     }.call;
 }
@@ -1809,8 +1814,7 @@ pub const MetadataHttpServer = struct {
             ctx.header(routes.Routes.raft_mutation_campaign_allowed_header),
             .{ .max_remaining_ms = raft_mutation_forwarding.max_remaining_ms, .max_forwards = raft_mutation_forwarding.max_forwards },
         ) catch return ctx.status(400).text("invalid forwarding context")) orelse return ctx.status(400).text("missing forwarding context");
-        var context = requestContext(ctx);
-        context.deadline_ns = platform_time.monotonicNs() +| @as(u64, forwarding.remaining_ms) * std.time.ns_per_ms;
+        const context = systemCatalogRequestContext(ctx, forwarding.remaining_ms);
         const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
         const read_identity = if (parsed.value != .mutate) try self.source.vtable.status(self.source.ptr) else null;
         self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
@@ -1850,6 +1854,17 @@ pub const MetadataHttpServer = struct {
             .request_id = ctx.header("x-request-id") orelse "",
             .deadline_ns = ctx.application_deadline_ns,
         };
+    }
+
+    fn systemCatalogRequestContext(ctx: *httpx.Context, remaining_ms: u32) operation.RequestContext {
+        var context = requestContext(ctx);
+        context.deadline_io = if (ctx.application_deadline_io) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null;
+        const clock = api_table_catalog.RoutingBudget.initIo(null, ctx.io);
+        const forwarded_deadline = clock.nowNs() +| @as(u64, remaining_ms) * std.time.ns_per_ms;
+        const admitted = clock.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        context.deadline_ns = @min(forwarded_deadline, admitted orelse forwarded_deadline);
+        context.deadline_io = clock.io;
+        return context;
     }
 
     fn readOperations(self: *MetadataHttpServer) admin_read_operations.Operations {
@@ -4887,6 +4902,30 @@ test "metadata http server reports reallocation protocol upgrade gating" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 503), response.status.code);
     try std.testing.expectEqualStrings("metadata voter upgrade required", response.body.?);
+}
+
+test "system catalog forwarding retains its executor clock and tighter ingress deadline" {
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer clock.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/internal/v1/system-catalog");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, clock.io(), &request);
+    defer ctx.deinit();
+    const forwarded = MetadataHttpServer.systemCatalogRequestContext(&ctx, 2000);
+    try std.testing.expectEqual(@as(?u64, 9 * std.time.ns_per_s), forwarded.deadline_ns);
+    try std.testing.expect(forwarded.deadline_io != null);
+    try forwarded.ensureActive();
+    ctx.application_deadline_io = clock.io();
+    ctx.application_deadline_ns = 8 * std.time.ns_per_s;
+    const narrowed = MetadataHttpServer.systemCatalogRequestContext(&ctx, 2000);
+    try std.testing.expectEqual(ctx.application_deadline_ns, narrowed.deadline_ns);
+    try clock.advance(std.time.ns_per_s);
+    try std.testing.expectError(error.DeadlineExceeded, narrowed.ensureActive());
+    try std.testing.expectError(error.DeadlineExceeded, MetadataHttpServer.systemCatalogRequestContext(&ctx, 2000).ensureActive());
+    // Native ingress contracts are translated once, without refreshing them.
+    ctx.application_deadline_io = null;
+    ctx.application_deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, MetadataHttpServer.systemCatalogRequestContext(&ctx, 2000).ensureActive());
 }
 
 test "metadata routing server converts relative budget to local deadline" {

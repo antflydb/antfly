@@ -1781,15 +1781,7 @@ pub const StatusSource = struct {
 
             fn acquireJoinPlanning(ptr: *anyopaque, budget: table_router.RouteBudget) anyerror!?*join_planning.Generation {
                 try budget.check();
-                const svc = cast(ptr);
-                const native_deadline = (table_catalog.RoutingBudget{}).deadlineFrom(budget.clock);
-                var routing = try svc.catalogRoutingSnapshot(native_deadline);
-                defer svc.freeCatalogRoutingSnapshot(&routing);
-                return try join_planning.Generation.create(svc.alloc, .{
-                    .tables = routing.tables,
-                    .ranges = routing.ranges,
-                    .merged_group_statuses = @as([]const metadata_reconciler.MergedGroupStatus, &.{}),
-                }, budget);
+                return try cast(ptr).acquireCatalogJoinPlanning(budget);
             }
 
             fn cachedAdminSnapshot(ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot {
@@ -4025,6 +4017,8 @@ pub const ApiHttpServer = struct {
     pub fn joinContext(self: *ApiHttpServer) distributed_join.JoinContext {
         return .{
             .ptr = self,
+            .require_authoritative_routing = true,
+            .fanout_io = if (self.sharedApiIo()) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null,
             .vtable = &join_context_vtable,
             .lifecycle_hook = self.cfg.distributed_join_lifecycle_hook,
         };

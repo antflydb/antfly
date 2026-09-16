@@ -121,6 +121,38 @@ fn catalogRouteFenceForGroup(
         .admission_cancellation = cancellation orelse .none,
     };
 }
+/// Each adapter borrows its runtime/resident owners but owns its routing lease.
+fn JoinReadBinding(comptime Source: type) type {
+    return struct {
+        view: @import("table_read_source.zig").JoinReadView,
+        alloc: std.mem.Allocator,
+        routed: Source,
+        fn acquire(ptr: *anyopaque, alloc: std.mem.Allocator, budget: table_router.RouteBudget) !*@import("table_read_source.zig").JoinReadView {
+            try budget.check();
+            const source: *Source = @ptrCast(@alignCast(ptr));
+            const self = try alloc.create(@This());
+            errdefer alloc.destroy(self);
+            self.alloc = alloc;
+            self.routed = source.*;
+            self.view = .{
+                .session = try table_catalog.RoutingSession.init(alloc, source.catalog, source.catalog.deadlineFrom(budget.clock)),
+                .source = undefined,
+                .destroy = destroy,
+            };
+            errdefer self.view.session.deinit();
+            try budget.check();
+            self.routed.catalog = self.view.session.catalog();
+            self.view.source = self.routed.source();
+            return &self.view;
+        }
+        fn destroy(view: *@import("table_read_source.zig").JoinReadView) void {
+            const self: *@This() = @fieldParentPtr("view", view);
+            self.view.session.deinit();
+            self.alloc.destroy(self);
+        }
+    };
+}
+
 const http_route_helpers = @import("http_route_helpers.zig");
 const GraphMetricFanInShardRequest = table_read_graph.GraphMetricFanInShardRequest;
 const graphSearchQueryNeedsInternalMetricStatus = table_read_graph.graphSearchQueryNeedsInternalMetricStatus;
@@ -3264,6 +3296,7 @@ pub const ProvisionedTableReadSource = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .acquire_join_view = JoinReadBinding(ProvisionedTableReadSource).acquire,
                 .lookup = lookup,
                 .scan = scan,
                 .scan_stream = scanStream,
@@ -4773,14 +4806,14 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const start_ns = platform_time.monotonicNs();
+        const start_ns = self.monotonicNs();
         var execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency, self.callerReadActivityHeld());
         defer execution.releaseDb();
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
         var meta: query_api.QueryResponseMeta = .{
-            .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
+            .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
             .shard_count = 1,
             .dense_search = execution.dense_profile,
         };
@@ -4937,6 +4970,13 @@ pub const ProvisionedTableReadSource = struct {
         const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const router = self.distributed_router orelse return null;
+        if (self.catalog.vtable.route_fence != null) {
+            var hosted = self.routedHostedSource();
+            var destination = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return error.TopologyChanged;
+            defer destination.deinit(alloc);
+            if (destination == .local) return error.JoinWorkerOwnedLocally;
+            return try joinPartitionRemote(hosted.internalExecutor(), alloc, destination.remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs());
+        }
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
@@ -4956,6 +4996,13 @@ pub const ProvisionedTableReadSource = struct {
         const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const router = self.distributed_router orelse return null;
+        if (self.catalog.vtable.route_fence != null) {
+            var hosted = self.routedHostedSource();
+            var destination = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return error.TopologyChanged;
+            defer destination.deinit(alloc);
+            if (destination == .local) return error.JoinWorkerOwnedLocally;
+            return try joinRowsRemote(hosted.internalExecutor(), alloc, destination.remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs());
+        }
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
@@ -4975,6 +5022,13 @@ pub const ProvisionedTableReadSource = struct {
         const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const router = self.distributed_router orelse return null;
+        if (self.catalog.vtable.route_fence != null) {
+            var hosted = self.routedHostedSource();
+            var destination = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return error.TopologyChanged;
+            defer destination.deinit(alloc);
+            if (destination == .local) return error.JoinWorkerOwnedLocally;
+            return try joinUnmatchedRemote(hosted.internalExecutor(), alloc, destination.remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs());
+        }
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
@@ -4994,6 +5048,13 @@ pub const ProvisionedTableReadSource = struct {
         const budget = table_router.RouteBudget.fromTimeoutMs(timeout_ms);
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const router = self.distributed_router orelse return null;
+        if (self.catalog.vtable.route_fence != null) {
+            var hosted = self.routedHostedSource();
+            var destination = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return error.TopologyChanged;
+            defer destination.deinit(alloc);
+            if (destination == .local) return error.JoinWorkerOwnedLocally;
+            return try joinFinalizeRemote(hosted.internalExecutor(), alloc, destination.remote.base_uri, group_id, table_name, body, try budget.remainingTimeoutMs());
+        }
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(budget), group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
@@ -5861,6 +5922,7 @@ pub const HostedProvisionedTableReadSource = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .acquire_join_view = JoinReadBinding(HostedProvisionedTableReadSource).acquire,
                 .lookup = lookup,
                 .scan = scan,
                 .scan_stream = scanStream,
@@ -23686,7 +23748,9 @@ fn consumerTests() type {
                 fn nodeUri(_: *anyopaque, allocator: std.mem.Allocator, _: u64) !?[]u8 {
                     return try allocator.dupe(u8, "http://peer.test");
                 }
-                fn routes(_: *anyopaque, allocator: std.mem.Allocator, ids: []const u64, _: table_router.RoutePolicy, _: table_router.RouteBudget) !?[]table_router.GroupRoute {
+                fn routes(ptr: *anyopaque, allocator: std.mem.Allocator, ids: []const u64, _: table_router.RoutePolicy, _: table_router.RouteBudget) !?[]table_router.GroupRoute {
+                    const calls: *usize = @ptrCast(@alignCast(ptr));
+                    calls.* += 1;
                     try std.testing.expectEqualSlices(u64, &.{7001}, ids);
                     const result = try allocator.alloc(table_router.GroupRoute, 1);
                     errdefer allocator.free(result);
@@ -23694,8 +23758,9 @@ fn consumerTests() type {
                     return result;
                 }
             };
+            var route_calls: usize = 0;
             var provisioned = ProvisionedTableReadSource.init("must-not-open", FakeCatalog.unboundSource(), raft_mod.read_gate.alreadyReadSafeBarrier());
-            _ = provisioned.withDistributedRouting(.{ .ptr = undefined, .vtable = &.{
+            _ = provisioned.withDistributedRouting(.{ .ptr = &route_calls, .vtable = &.{
                 .local_node_id = Router.localNodeId,
                 .local_status = Router.localStatus,
                 .node_base_uri = Router.nodeUri,
@@ -23711,6 +23776,27 @@ fn consumerTests() type {
             var routed_response = (try source.queryGroupLocal(std.testing.allocator, 7001, "docs", .{}, .read_index)).?;
             defer routed_response.deinit(std.testing.allocator);
             try std.testing.expectEqualStrings("{}", routed_response.json);
+
+            // A join's retained topology also fences every shuffle worker
+            // operation. Each dispatch resolves once and fails closed when a
+            // peer does not acknowledge the selected topology capability.
+            provisioned.catalog = FakeCatalog.source();
+            inline for (.{
+                TableReadSource.joinPartitionGroupLocalWithTimeout,
+                TableReadSource.joinRowsGroupLocalWithTimeout,
+                TableReadSource.joinUnmatchedGroupLocalWithTimeout,
+                TableReadSource.joinFinalizeGroupLocalWithTimeout,
+            }) |dispatch| {
+                const before_calls = route_calls;
+                executor.acknowledge = false;
+                try std.testing.expectError(error.StorageReadTemporarilyUnavailable, dispatch(source, std.testing.allocator, 7001, "docs", "{}", 1000));
+                try std.testing.expectEqual(before_calls + 1, route_calls);
+                executor.acknowledge = true;
+                var worker_response = (try dispatch(source, std.testing.allocator, 7001, "docs", "{}", 1000)).?;
+                defer worker_response.deinit(std.testing.allocator);
+                try std.testing.expectEqualStrings("{}", worker_response.json);
+                try std.testing.expectEqual(before_calls + 2, route_calls);
+            }
         }
 
         test "join job-state polling bypasses storage route fencing without weakening storage reads" {
@@ -25107,6 +25193,7 @@ fn implementationTests() type {
                 db: *db_mod.DB,
                 leases: usize = 0,
                 releases: usize = 0,
+                clock: ?*@import("vopr").vopr_io.VoprIo = null,
 
                 fn iface(self: *@This()) ResidentDbSource {
                     return .{
@@ -25128,6 +25215,7 @@ fn implementationTests() type {
                     try std.testing.expectEqual(@as(u64, 7001), group_id);
                     try std.testing.expectEqual(@as(u64, 9), lsm_root_generation);
                     self.leases += 1;
+                    if (self.clock) |clock| try clock.advance(7 * std.time.ns_per_ms);
                     return .{
                         .ptr = self,
                         .db = self.db,
@@ -25166,6 +25254,27 @@ fn implementationTests() type {
             try std.testing.expectEqualStrings("doc:a", execution.result.hits[0].id);
             execution.releaseDb();
             try std.testing.expectEqual(@as(usize, 1), resident.releases);
+
+            // Wire-visible query timing belongs to the executor clock, just
+            // like hosted/coordinator timing. Native elapsed time makes exact
+            // replay depend on host load even when results are identical.
+            var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 3 * std.time.ns_per_s });
+            defer clock.deinit();
+            resident.clock = &clock;
+            var source = ProvisionedTableReadSource.init("must-not-open", SingleGroupReadTestCatalog.iface(), raft_mod.read_gate.alreadyReadSafeBarrier());
+            source.resident_db = resident.iface();
+            _ = source.withIoInterface(clock.io(), .unlimited);
+            source.group_visible_root_generation = .{ .ptr = undefined, .visible_root_generation_for_group = struct {
+                fn generation(_: *anyopaque, _: u64) u64 {
+                    return 9;
+                }
+            }.generation };
+            var response = (try ProvisionedTableReadSource.queryGroupLocalPhysical(&source, alloc, 7001, "docs", .{ .limit = 1 }, .stale)).?;
+            defer response.deinit(alloc);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("responses").?.array.items[0].object.get("took").?.integer);
+            try std.testing.expectEqual(resident.leases, resident.releases);
         }
 
         test "provisioned auxiliary reads publish resident databases outside read admission" {

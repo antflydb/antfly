@@ -92,16 +92,34 @@ pub const CatalogProjectionReader = struct {
     };
 
     /// Immutable projection ownership shared by the cache and active readers.
-    /// Retaining under the reader mutex closes the load/retire race; cloning
-    /// then proceeds without holding the publication critical section.
+    /// Retaining under the reader mutex closes the load/retire race. Routing
+    /// indexes and advisory planning data are built once per publication;
+    /// acquisitions retain them without cloning under the publication mutex.
     const SharedSnapshot = struct {
         alloc: std.mem.Allocator,
         refs: std.atomic.Value(usize) = .init(1),
         value: Snapshot,
+        routing: *@import("../api/table_catalog.zig").RoutingGeneration,
+        planning: *@import("../api/join_planning.zig").Generation,
 
-        fn create(alloc: std.mem.Allocator, value: Snapshot) !*SharedSnapshot {
+        fn create(alloc: std.mem.Allocator, value: Snapshot, metadata_group_id: u64, deadline_ns: ?u64) !*SharedSnapshot {
             const shared = try alloc.create(SharedSnapshot);
-            shared.* = .{ .alloc = alloc, .value = value };
+            errdefer alloc.destroy(shared);
+            const routing = try @import("../api/table_catalog.zig").RoutingGeneration.create(alloc, .{
+                .metadata_group_id = metadata_group_id,
+                .metadata_incarnation = value.metadata_incarnation,
+                .catalog_revision = value.catalog_revision,
+                .change_token = .{ .metadata_group_id = metadata_group_id, .metadata_incarnation = value.metadata_incarnation, .revision = value.catalog_revision },
+                .tables = value.tables,
+                .ranges = value.ranges,
+            }, .{ .deadline_ns = deadline_ns });
+            errdefer routing.release();
+            const planning = try @import("../api/join_planning.zig").Generation.create(alloc, .{
+                .tables = value.tables,
+                .ranges = value.ranges,
+                .merged_group_statuses = @as([]const @import("reconciler.zig").MergedGroupStatus, &.{}),
+            }, .{ .clock = .{ .deadline_ns = deadline_ns } });
+            shared.* = .{ .alloc = alloc, .value = value, .routing = routing, .planning = planning };
             return shared;
         }
 
@@ -114,6 +132,8 @@ pub const CatalogProjectionReader = struct {
             const previous = self.refs.fetchSub(1, .acq_rel);
             std.debug.assert(previous != 0);
             if (previous != 1) return;
+            self.routing.release();
+            self.planning.release();
             var value = self.value;
             value.deinit(self.alloc);
             self.alloc.destroy(self);
@@ -243,7 +263,7 @@ pub const CatalogProjectionReader = struct {
                 return error.CatalogProjectionRevisionRegressed;
             }
         }
-        const shared = try SharedSnapshot.create(alloc, fresh);
+        const shared = try SharedSnapshot.create(alloc, fresh, metadata_group_id, deadline_ns);
         fresh = .{};
         if (self.cache.snapshot) |snapshot| snapshot.release();
         self.cache = .{
@@ -336,7 +356,7 @@ pub const CatalogProjectionReader = struct {
             self.finishBuildFlight(flight, err);
             return err;
         };
-        const shared = SharedSnapshot.create(alloc, fresh) catch |err| {
+        const shared = SharedSnapshot.create(alloc, fresh, metadata_group_id, deadline_ns) catch |err| {
             self.finishBuildFlight(flight, err);
             return err;
         };
@@ -389,6 +409,23 @@ pub const CatalogProjectionReader = struct {
         flight.ready.set(std.Options.debug_io);
         self.unlock();
         flight.release();
+    }
+
+    pub fn acquireRoutingGeneration(self: *CatalogProjectionReader, alloc: std.mem.Allocator, metadata_group_id: u64, source: Source, deadline_ns: ?u64) !*@import("../api/table_catalog.zig").RoutingGeneration {
+        var lease = try self.snapshotLease(alloc, metadata_group_id, source, deadline_ns);
+        defer lease.deinit();
+        try ensureBeforeDeadline(deadline_ns);
+        lease.shared.routing.retain();
+        return lease.shared.routing;
+    }
+
+    pub fn acquireJoinPlanning(self: *CatalogProjectionReader, alloc: std.mem.Allocator, metadata_group_id: u64, source: Source, budget: @import("../api/table_router.zig").RouteBudget) !*@import("../api/join_planning.zig").Generation {
+        try budget.check();
+        const deadline_ns = (@import("../api/table_catalog.zig").RoutingBudget{}).deadlineFrom(budget.clock);
+        var lease = try self.snapshotLease(alloc, metadata_group_id, source, deadline_ns);
+        defer lease.deinit();
+        try budget.check();
+        return lease.shared.planning.retain();
     }
 
     pub fn routingSnapshot(
@@ -771,6 +808,24 @@ test "catalog projection churn returns coherent snapshots and only caches stable
     var cached = try reader.routingSnapshot(std.testing.allocator, 91, fake.source(), null);
     reader.freeRoutingSnapshot(std.testing.allocator, &cached);
     try std.testing.expectEqual(@as(usize, 3), fake.captures);
+
+    const routing = try reader.acquireRoutingGeneration(std.testing.allocator, 91, fake.source(), null);
+    defer routing.release();
+    const again = try reader.acquireRoutingGeneration(std.testing.allocator, 91, fake.source(), null);
+    defer again.release();
+    try std.testing.expect(routing == again);
+    const planning = try reader.acquireJoinPlanning(std.testing.allocator, 91, fake.source(), .{});
+    defer planning.release();
+    const planning_again = try reader.acquireJoinPlanning(std.testing.allocator, 91, fake.source(), .{});
+    defer planning_again.release();
+    try std.testing.expect(planning == planning_again);
+    try std.testing.expectEqual(@as(usize, 3), fake.captures);
+    fake.epoch += 1;
+    const replaced = try reader.acquireRoutingGeneration(std.testing.allocator, 91, fake.source(), null);
+    defer replaced.release();
+    try std.testing.expect(routing != replaced);
+    try std.testing.expectEqual(@as(u64, 3), routing.indexed.snapshot.value.catalog_revision);
+    try std.testing.expectEqual(@as(u64, 4), replaced.indexed.snapshot.value.catalog_revision);
 }
 
 test "catalog projection cache rejects revision regression within one authority" {

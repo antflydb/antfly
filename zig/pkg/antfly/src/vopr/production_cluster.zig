@@ -3185,6 +3185,12 @@ pub const Fixture = struct {
             self.join_restart_future = null;
         }
         if (self.failure == null) self.failure = self.join_owner_restart_failure;
+        // Recovery is an end-of-workload observation. Initial data elections
+        // can overlap a metadata election; latching that transient absence
+        // forever rejects a history that subsequently commits the split and
+        // completes every post-recovery public read.
+        self.topology_sound = self.metadata.?.cluster.currentMetadataLeaderIndex() != null and
+            (!self.active_split_enabled or self.split_sound);
         self.driver_stop = true;
         if (self.driver_future) |*future| {
             // The driver polls this stop bit at a 1 ms logical cadence. Join
@@ -3260,7 +3266,6 @@ pub const Fixture = struct {
             try self.waitForDataLeader(group_id);
             std.log.debug("production data-plane VOPR elected group leader group={}", .{group_id});
         }
-        self.topology_sound = self.metadata.?.cluster.currentMetadataLeaderIndex() != null;
 
         var left_write = self.sim.io().async(runWrite, .{
             self,
@@ -3545,7 +3550,6 @@ pub const Fixture = struct {
             "production-split",
         );
         self.split_sound = try operationSucceeded(post_split_read_result);
-        self.topology_sound = self.topology_sound and self.split_sound;
         self.phase = .post_split_read_complete;
         if (!self.split_sound) return error.ProductionDataSplitRoundTripFailed;
 
@@ -4729,7 +4733,6 @@ pub const Fixture = struct {
         self.graph_stale_snapshot_recovered = self.split_sound and self.graph_hydration_sound;
         self.post_split_graph_sound = self.graph_stale_snapshot_recovered;
         self.graph_sound = self.graph_sound and self.post_split_graph_sound;
-        self.topology_sound = self.topology_sound and self.split_sound;
         self.phase = .post_split_graph_query_complete;
         return self.graph_stale_snapshot_recovered;
     }

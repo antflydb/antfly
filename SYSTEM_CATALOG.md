@@ -961,13 +961,20 @@ placement checks, or requested read-consistency barrier.
 
 ### Join planning and deadline ownership
 
-Public joins acquire one immutable planning generation lazily, after the left-hand
-query produces rows. Planning, index lookup, broadcast routing, and shuffle worker
-selection reuse that observation. Background jobs do not retain request-scoped
-pointers; resumed work acquires its own observation. The planning generation owns
+Public joins pin an authoritative routing session before reading either side.
+Index lookup, broadcast, and shuffle select groups from that session, and the
+read adapter carries its fences to local admission and remote workers. A split
+after selection must fail the old fence; a split before selection is included
+even when advisory observations still describe the donor's former range. A
+finalizer that fans out further compares its new session against the topology
+admitted by its coordinator and rejects a mismatch.
+
+Joins also acquire one immutable planning generation lazily for cost estimates.
+Background jobs do not retain request-scoped pointers; resumed work acquires its
+own routing session and planning observation. The planning generation owns
 only names, table identities, range boundaries/identities, group IDs, aggregated
 row/byte estimates, and document-identity readiness. Name lookup is indexed and
-point-key routing searches sorted table-local ranges. Missing shard reports leave
+authoritative point-key routing searches sorted table-local ranges. Missing shard reports leave
 statistics explicitly unknown rather than treating missing data as zero.
 
 Data nodes publish this generation with the peer-routing index when accepting a
@@ -978,12 +985,31 @@ fences; it never requests the paginated diagnostic snapshot. The cold control
 transfer still includes the existing control-plane inventory. Projection build
 cost is paid at publication, not by every planning phase or table lookup.
 
-Embedded metadata sources use the compact catalog projection and the existing
-local runtime-statistics adapter for estimates. Query planning has no production
-fallback to administrative snapshots. Statistics guide costs only; destination
-workers remain responsible for current topology and document-identity validation.
+Embedded metadata sources publish retained routing and planning generations with
+their immutable catalog projection. Warm acquisition does not copy or reindex
+the catalog. Old request leases survive replacement; authoritative acquisitions
+still cross the metadata read barrier. The local runtime-statistics adapter
+supplies estimates. Query planning has no production fallback to administrative
+snapshots. Statistics guide costs only; destination workers validate topology
+and document identity.
+
+Lookup joins partition left rows by owner once before preparing requests. Shard
+reads run in batches of at most eight on the server's I/O executor, with isolated
+result arenas and deterministic merging in catalog order. All launched work is
+drained before returning an error or releasing the routing lease. Request
+construction stays serial because it shares the request's resolver. Graph phases
+remain serial to honor their request-wide retained-state budgets.
 
 An admission deadline always travels with its clock authority. Narrowing a fence
 first converts the incoming remaining budget into the fence's clock, then takes
 the earlier deadline. Lookup, coordinator, and worker paths preserve this pair;
 clock translation never refreshes an expired deadline or extends a tighter fence.
+Finalizers retain both the caller's cancellation and the admitted worker's
+cancellation for their entire fanout. Durable job stores retain runtime services
+and clocks, but clear borrowed request deadlines, cancellation, labels, resolvers,
+and catalog leases. Wire-visible shard query durations use the executor clock so
+local and hosted responses have the same timing contract.
+Forwarded system-catalog requests likewise keep the listener's executor clock
+through admission and preserve any earlier ingress deadline. The concrete
+metadata-service adapter translates the remaining budget to its native CPU clock;
+transport-neutral adapters retain the original clock capability.
