@@ -48,9 +48,9 @@ class ZigValidationScopeTests(unittest.TestCase):
         }
         unrelated = {"scripts/unrelated.py", "docs/guide.md"}
         for source in (workflow, focused):
-            command = source.split('if ! "$helper"', 1)[1].split(
-                "\n          then", 1
-            )[0]
+            command = source.split('if ! "$helper"', 1)[1].split("\n          then", 1)[
+                0
+            ]
             pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -69,9 +69,7 @@ class ZigValidationScopeTests(unittest.TestCase):
 
     def test_codegen_inputs_select_zig_validation(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
-        command = workflow.split('if ! "$helper"', 1)[1].split(
-            "\n          then", 1
-        )[0]
+        command = workflow.split('if ! "$helper"', 1)[1].split("\n          then", 1)[0]
         pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
         inputs = {
             "scripts/openapi_inputs.py",
@@ -128,7 +126,10 @@ def embedded_helper() -> str:
         r'cat > "\$helper" <<\'HELPER\'\n(.*?)\n {10}HELPER\n', workflow, re.S
     )
     assert match, "embedded zig-relevant-changes helper not found in zig-tests.yml"
-    lines = [line[10:] if line.startswith(" " * 10) else line for line in match.group(1).splitlines()]
+    lines = [
+        line[10:] if line.startswith(" " * 10) else line
+        for line in match.group(1).splitlines()
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -144,7 +145,17 @@ def _relevant(root: Path, base: str, head: str, *pathspecs: str) -> int:
 def _commit(root: Path, message: str) -> None:
     subprocess.run(["git", "add", "-A"], cwd=root, check=True)
     subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", message],
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
         cwd=root,
         check=True,
     )
@@ -218,7 +229,9 @@ class ZigRelevantChangesScriptTests(unittest.TestCase):
         self.assertEqual(_relevant(self.root, "HEAD~1", "HEAD", ":(glob)go/**"), 1)
 
     def test_git_failure_selects_tests(self):
-        self.assertEqual(_relevant(self.root, "no-such-revision", "HEAD", ":(glob)zig/**"), 0)
+        self.assertEqual(
+            _relevant(self.root, "no-such-revision", "HEAD", ":(glob)zig/**"), 0
+        )
 
     def test_missing_separator_is_a_usage_error(self):
         code = subprocess.run(
