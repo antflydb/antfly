@@ -37,7 +37,9 @@ pub const VisibilityWait = struct {
 
 pub const RuntimeError = error{AsyncWorkerFailed};
 
-pub const ApplyFn = *const fn (ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) anyerror!bool;
+/// A batch carries the session opened by BeginCatchUpFn. Its token is explicit
+/// even when callbacks resume on another worker or share one cooperative thread.
+pub const ApplyFn = *const fn (ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken) anyerror!bool;
 pub const PersistFn = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) anyerror!bool;
 pub const TruncateFn = *const fn (ctx: *anyopaque, sequence: u64) anyerror!void;
 pub const CatchUpSessionToken = struct {

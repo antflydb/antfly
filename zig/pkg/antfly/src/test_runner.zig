@@ -306,6 +306,9 @@ pub fn log(
     if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
         _ = log_err_count.fetchAdd(1, .monotonic);
     }
+    // Match Zig's default runner: tests may opt into info/debug output via
+    // testing.log_level, while warnings and all error accounting stay visible.
+    if (@intFromEnum(message_level) > @intFromEnum(testing.log_level)) return;
     std.debug.print("[{s}] ({s}): ", .{
         @tagName(message_level),
         @tagName(scope),

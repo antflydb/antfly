@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import time
 from pathlib import Path
 from typing import Any
@@ -132,10 +133,46 @@ def resolution_cluster(request: pytest.FixtureRequest):
         yield cluster
     finally:
         report = getattr(request.node, "rep_call", None)
+        if report and report.failed:
+            # Capture while the six node processes are still alive, including
+            # failures that now stop immediately on an unexpected HTTP 500.
+            _capture_failure_stacks(cluster)
         cluster.stop(
             timeout_s=AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S,
             test_failed=bool(report and report.failed),
+            reject_data_crashes=not bool(report and report.failed),
         )
+
+
+def _capture_failure_stacks(cluster: MultiNodeScalingCluster) -> str:
+    # Capture once at the first failure, then reuse during fixture teardown.
+    # Six default 25-second debugger waits followed by another capture could
+    # otherwise consume the soak's evidence-upload budget on every failed case.
+    captured = getattr(cluster, "_autograph_failure_stacks", None)
+    if captured is None:
+        captured = cluster.native_stack_dumps(per_process_timeout_s=5.0)
+        cluster._autograph_failure_stacks = captured
+        try:
+            (cluster.root / "native-stacks.txt").write_text(captured, encoding="utf-8")
+        except OSError as exc:
+            print(f"failed to preserve Autograph native stacks: {exc!r}")
+    return captured
+
+
+def test_autograph_failure_stacks_are_bounded_and_retained_once(tmp_path):
+    class Cluster:
+        root = tmp_path
+        calls = []
+
+        def native_stack_dumps(self, *, per_process_timeout_s):
+            self.calls.append(per_process_timeout_s)
+            return "resolver waiting for read barrier"
+
+    cluster = Cluster()
+    first = _capture_failure_stacks(cluster)
+    assert _capture_failure_stacks(cluster) == first
+    assert cluster.calls == [5.0]
+    assert (tmp_path / "native-stacks.txt").read_text() == first
 
 
 class _Api:
@@ -175,7 +212,7 @@ class _Api:
                     else max_timeout
                 )
             except AssertionError as exc:
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 index_names = sorted(indexes.keys()) if indexes is not None else []
                 raise AssertionError(
                     f"create table exhausted its {deadline.timeout_s:.1f}s deadline "
@@ -192,7 +229,7 @@ class _Api:
             except requests.RequestException as exc:
                 # A transport failure does not prove whether the DDL reached
                 # Raft, so never replay it automatically.
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 index_names = sorted(indexes.keys()) if indexes is not None else []
                 raise AssertionError(
                     f"create table timed out/failed table={name!r} shards={num_shards} "
@@ -238,7 +275,7 @@ class _Api:
                     else max_timeout
                 )
             except AssertionError as exc:
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 raise AssertionError(
                     f"batch insert exhausted its {deadline.timeout_s:.1f}s deadline "
                     f"table={table!r} key={doc_id!r} sync_level={sync_level!r} "
@@ -255,7 +292,7 @@ class _Api:
                 # A timed-out write usually means a node wedged in memory without
                 # logging anything; capture native stacks before teardown so the
                 # CI failure is diagnosable.
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 raise AssertionError(
                     f"batch insert timed out/failed table={table!r} key={doc_id!r} "
                     f"sync_level={sync_level!r}: {exc!r}\n[native stacks]\n{stacks}"
@@ -609,7 +646,13 @@ def _wait_for_entities(
     while not deadline.expired():
         for key in list(pending):
             try:
-                doc = api.lookup("entities", key, timeout=deadline.request_timeout())
+                timeout = deadline.request_timeout()
+            except AssertionError:
+                # Preserve the pending keys and diagnostics when there is no
+                # longer enough budget to issue another bounded request.
+                break
+            try:
+                doc = api.lookup("entities", key, timeout=timeout)
             except requests.RequestException as exc:
                 if not _transient_poll_error(exc):
                     raise
@@ -627,7 +670,7 @@ def _wait_for_entities(
         f"entities were not promoted within {deadline.timeout_s}s "
         f"(elapsed={deadline.elapsed():.1f}s, pending={sorted(pending)!r}, "
         f"last={last!r}, last_error={last_error!r})"
-        f"\n[native stacks]\n{api._server.native_stack_dumps()}"
+        f"\n[native stacks]\n{_capture_failure_stacks(api._server)}"
         f"\n{api.diagnostic()}"
     )
 
@@ -641,7 +684,11 @@ def _doc_text(doc: dict) -> str:
 def _transient_poll_error(exc: requests.RequestException) -> bool:
     response = getattr(exc, "response", None)
     if response is not None:
-        return response.status_code >= 500
+        # Availability has an explicit contract. Retrying an INTERNAL_ERROR
+        # hid an untransportable ReadIndexTimeout until the promotion deadline.
+        return response.status_code == 503 and bool(
+            response.headers.get("Retry-After", "").strip()
+        )
     return isinstance(
         exc,
         (
@@ -650,6 +697,69 @@ def _transient_poll_error(exc: requests.RequestException) -> bool:
             requests.Timeout,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "retry_after", "expected"),
+    [
+        (503, "1", True),
+        (503, None, False),
+        (500, "1", False),
+        (502, None, False),
+        (504, None, False),
+        (409, None, False),
+    ],
+)
+def test_autograph_poll_retries_only_explicit_availability(
+    status, retry_after, expected
+):
+    response = requests.Response()
+    response.status_code = status
+    if retry_after is not None:
+        response.headers["Retry-After"] = retry_after
+    assert _transient_poll_error(requests.HTTPError(response=response)) is expected
+
+
+def test_autograph_entity_poll_propagates_internal_failure():
+    class BrokenApi:
+        def lookup(self, *_args, **_kwargs):
+            response = requests.Response()
+            response.status_code = 500
+            raise requests.HTTPError("RuntimeBoundaryFailure", response=response)
+
+    with pytest.raises(requests.HTTPError, match="RuntimeBoundaryFailure"):
+        _wait_for_entities(
+            BrokenApi(),
+            {"person/ada_lovelace": "Ada Lovelace"},
+            deadline=_Deadline(1.0),
+        )
+
+
+@pytest.mark.parametrize("hydrate", [False, True])
+def test_autograph_poll_preserves_context_at_request_deadline(monkeypatch, hydrate):
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    monkeypatch.setitem(globals(), "_capture_failure_stacks", lambda _: "stacks")
+
+    class Api:
+        _server = None
+
+        def diagnostic(self, **_kwargs):
+            return "retained graph status"
+
+    deadline = _Deadline(0.05)
+    expected = {"person/ada_lovelace": "Ada Lovelace"}
+    with pytest.raises(AssertionError, match="retained graph status") as failure:
+        if hydrate:
+            _wait_for_mention_hydration(
+                Api(), start_node="doc:a", expected_names=expected, deadline=deadline
+            )
+        else:
+            _wait_for_entities(Api(), expected, deadline=deadline)
+    assert "person/ada_lovelace" in str(failure.value)
+    assert "request floor" not in str(failure.value)
+    assert now[0] <= deadline.timeout_s
 
 
 def _graph_result(result: dict, name: str) -> dict | None:
@@ -688,9 +798,11 @@ def _wait_for_mention_hydration(
     last_error: str | None = None
     while not deadline.expired():
         try:
-            last = api.query_table(
-                "documents", payload, timeout=deadline.request_timeout()
-            )
+            timeout = deadline.request_timeout()
+        except AssertionError:
+            break
+        try:
+            last = api.query_table("documents", payload, timeout=timeout)
         except requests.RequestException as exc:
             if not _transient_poll_error(exc):
                 raise
@@ -726,7 +838,124 @@ def _wait_for_mention_hydration(
 def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
     resolution_cluster,
 ):
-    cluster = resolution_cluster
+    _exercise_multinode_autograph(resolution_cluster, restart_data=False)
+
+
+def test_multinode_autograph_recovers_after_data_restart(resolution_cluster):
+    _exercise_multinode_autograph(resolution_cluster, restart_data=True)
+
+
+def _restart_data_owners(cluster):
+    for node in cluster.data_nodes:
+        node_id = int(node["id"])
+        cluster.stop_data_node(node_id)
+        returncode = cluster.data_proc_by_node_id[node_id].returncode
+        # The fixture may force a crash after its bounded graceful-stop wait.
+        # A spontaneous assertion/segfault must not disappear behind restart.
+        assert returncode in (0, -signal.SIGKILL), (
+            f"data node {node_id} crashed during restart rc={returncode}\n"
+            f"{cluster.debug_logs()}"
+        )
+    for node in cluster.data_nodes:
+        cluster._start_data_node(node)
+
+
+@pytest.mark.parametrize(
+    "returncode", [0, -signal.SIGKILL, -signal.SIGABRT, -signal.SIGSEGV]
+)
+def test_autograph_restart_rejects_spontaneous_crashes(returncode):
+    class Process:
+        pass
+
+    process = Process()
+    process.returncode = returncode
+
+    class Cluster:
+        data_nodes = [{"id": 101}, {"id": 102}]
+        data_proc_by_node_id = {101: process, 102: process}
+        actions = []
+
+        def stop_data_node(self, node_id):
+            self.actions.append(("stop", node_id))
+
+        def _start_data_node(self, node):
+            self.actions.append(("start", node["id"]))
+
+        def debug_logs(self):
+            return "retained crash evidence"
+
+    cluster = Cluster()
+    if returncode in (0, -signal.SIGKILL):
+        _restart_data_owners(cluster)
+        assert cluster.actions == [
+            ("stop", 101),
+            ("stop", 102),
+            ("start", 101),
+            ("start", 102),
+        ]
+    else:
+        with pytest.raises(AssertionError, match="retained crash evidence"):
+            _restart_data_owners(cluster)
+        assert cluster.actions == [("stop", 101)]
+
+
+@pytest.mark.parametrize(
+    "returncode", [0, -signal.SIGKILL, -signal.SIGABRT, -signal.SIGSEGV]
+)
+def test_autograph_teardown_crash_preserves_failure_evidence(monkeypatch, returncode):
+    import test_scaling
+
+    class Process:
+        def poll(self):
+            return self.returncode
+
+    process = Process()
+    process.returncode = returncode
+
+    class Resources:
+        cleaned = False
+
+        def close(self):
+            pass
+
+        def cleanup(self):
+            self.cleaned = True
+
+    class Cluster:
+        port_reservations = Resources()
+        tempdir = Resources()
+        data_procs = [process]
+        metadata_procs = []
+        data_proc_by_node_id = {101: process}
+        log_files = []
+        diagnostics_saved = False
+
+        def debug_logs(self):
+            return "promotion callback crash"
+
+        def preserve_failure_diagnostics(self):
+            self.diagnostics_saved = True
+
+    preserved = []
+
+    def preserve(tempdir, *, failed):
+        preserved.append(failed)
+        return failed
+
+    monkeypatch.setattr(test_scaling, "maybe_preserve_tempdir", preserve)
+    cluster = Cluster()
+    crashed = returncode not in (0, -signal.SIGKILL)
+    if crashed:
+        with pytest.raises(AssertionError, match="promotion callback crash"):
+            MultiNodeScalingCluster.stop(cluster, reject_data_crashes=True)
+    else:
+        MultiNodeScalingCluster.stop(cluster, reject_data_crashes=True)
+    assert preserved == [crashed]
+    assert cluster.diagnostics_saved == crashed
+    assert cluster.tempdir.cleaned != crashed
+
+
+def _exercise_multinode_autograph(cluster, *, restart_data: bool):
     api = _Api(cluster.data_api_urls[0], cluster)
 
     # Entities live in their own table (own shard group); documents are spread
@@ -754,6 +983,11 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
         },
         deadline=_new_e2e_deadline(),
     )
+
+    if restart_data:
+        # Reopen every data owner with the committed document on disk. Do not
+        # issue another write before observing resolution/promotion recovery.
+        _restart_data_owners(cluster)
 
     # The promoter upserts a canonical entity document per resolved mention into
     # the entity table on its own shard.
