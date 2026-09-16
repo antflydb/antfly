@@ -1494,7 +1494,10 @@ pub const StatusSource = struct {
 
     pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
         const callback = self.vtable.system_catalog orelse return error.UnsupportedOperation;
-        return BoundaryAbi.call("system_catalog", self.boundary_dispatch, callback, .{ self.ptr, alloc, context, input });
+        return BoundaryAbi.call("system_catalog", self.boundary_dispatch, callback, .{ self.ptr, alloc, context, input }) catch |err| switch (err) {
+            error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch => error.CatalogRoutingUnavailable,
+            else => err,
+        };
     }
 
     pub fn status(self: StatusSource) !metadata_api.MetadataStatus {
@@ -49975,4 +49978,21 @@ test "backup heartbeat table admission failure retires owned writer and reservat
 
 test "backup heartbeat shard admission failure preserves coordinator writer" {
     try testBackupHeartbeatCapacity(.shard, true);
+}
+
+test "system catalog identity failures remain unavailable across status adapters" {
+    const Fixture = struct {
+        err: anyerror,
+        fn call(ptr: *anyopaque, _: std.mem.Allocator, _: api_operation.RequestContext, _: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+    var fixture = Fixture{ .err = error.MetadataIncarnationUnavailable };
+    const source = StatusSource{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.call } };
+    for ([_]anyerror{ error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch }) |err| {
+        fixture.err = @import("../runtime_error_abi.zig").errorFromStatus(@import("../runtime_error_abi.zig").statusFromError(err));
+        try std.testing.expectEqual(err, fixture.err);
+        try std.testing.expectError(error.CatalogRoutingUnavailable, source.systemCatalog(std.testing.allocator, .{}, .snapshot));
+    }
 }

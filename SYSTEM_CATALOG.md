@@ -1013,3 +1013,14 @@ Forwarded system-catalog requests likewise keep the listener's executor clock
 through admission and preserve any earlier ingress deadline. The concrete
 metadata-service adapter translates the remaining budget to its native CPU clock;
 transport-neutral adapters retain the original clock capability.
+
+
+Offline vector-storage migration shares standalone's durable catalog row keys and
+exclusive operator lock. It resolves public names through catalog bindings,
+updates the selected table and catalog epoch in one WAL-backed transaction, and
+preserves namespace resources, extensions, and listing indexes. Server startup
+rejects offline admission markers for both row-store and imported checkpoints.
+`storage migrate --action status --catalog ...` inspects the stopped catalog;
+online migration uses the same authenticated table-identity resolution as other
+public operations. Migration publication participates in the standalone mutation
+journal, including rollback and restart recovery.

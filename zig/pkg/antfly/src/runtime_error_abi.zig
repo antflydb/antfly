@@ -418,6 +418,9 @@ pub const Detail = enum(c_int) {
     catalog_routing_snapshot_timeout,
     catalog_routing_unavailable,
     catalog_projection_refresh_required,
+    metadata_incarnation_unavailable,
+    invalid_metadata_incarnation,
+    metadata_incarnation_mismatch,
 };
 
 pub const Status = extern struct {
@@ -443,6 +446,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.NamespaceNotFound => status(.not_found, .namespace_not_found),
         error.TablespaceNotFound => status(.not_found, .tablespace_not_found),
         error.CatalogRoutingSnapshotTimeout => status(.timeout, .catalog_routing_snapshot_timeout),
+        error.MetadataIncarnationUnavailable => status(.unavailable, .metadata_incarnation_unavailable),
+        error.InvalidMetadataIncarnation => status(.unavailable, .invalid_metadata_incarnation),
+        error.MetadataIncarnationMismatch => status(.unavailable, .metadata_incarnation_mismatch),
         error.CatalogRoutingUnavailable => status(.unavailable, .catalog_routing_unavailable),
         error.CatalogProjectionRefreshRequired => status(.unavailable, .catalog_projection_refresh_required),
         error.CatalogNotFound => status(.not_found, .catalog_not_found),
@@ -858,6 +864,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .namespace_not_found => "NamespaceNotFound",
         .tablespace_not_found => "TablespaceNotFound",
         .catalog_routing_snapshot_timeout => "CatalogRoutingSnapshotTimeout",
+        .metadata_incarnation_unavailable => "MetadataIncarnationUnavailable",
+        .invalid_metadata_incarnation => "InvalidMetadataIncarnation",
+        .metadata_incarnation_mismatch => "MetadataIncarnationMismatch",
         .catalog_routing_unavailable => "CatalogRoutingUnavailable",
         .catalog_projection_refresh_required => "CatalogProjectionRefreshRequired",
         .catalog_not_found => "CatalogNotFound",

@@ -6373,7 +6373,7 @@ pub const AntflyApiHandler = struct {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*owned| owned.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
-        const name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return textResponse(ctx, 400, "invalid table name");
+        const name = (try self.resolvePublicTableName(ctx, table_name, &identity)) orelse return ctx.text("invalid or missing table target");
         defer ctx.allocator.free(name);
         const job = if (job_path) |path| (try decodePathParamOrBadRequest(ctx, path)) orelse return textResponse(ctx, 400, "invalid job ID") else null;
         defer if (job) |id| ctx.allocator.free(id);

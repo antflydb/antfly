@@ -911,6 +911,10 @@ const LocalStandaloneMetadata = struct {
             self.owned_catalog_store = try self.owned_catalog_backend.?.backend.runtimeStore(alloc, .{ .name = "system/metadata" });
         }
         try self.loadPersistedCatalog();
+        var admitted_tables = self.manager.tables.valueIterator();
+        while (admitted_tables.next()) |table| if (table.storage_migration) |admission| {
+            if (admission.request.mode == .offline) return error.VectorMigrationOfflineAdmission;
+        };
         if (self.system_catalog_state == null) self.system_catalog_state = try system_catalog.MutableState.clone(self.alloc, .{});
         return self;
     }
@@ -2311,20 +2315,15 @@ const LocalStandaloneMetadata = struct {
         return self.manager.findTableByName(table_name);
     }
 
-    const CatalogHead = struct {
-        version: u16 = 1,
-        epoch: u64,
-        revision: u64,
-        next_id: u64,
-    };
+    const CatalogHead = @import("catalog_format.zig").Head;
     const CatalogRow = union(enum) {
         table: antfly.metadata.TableRecord,
         range: antfly.metadata.RangeRecord,
         resource: system_catalog.Resource,
         extensions: PersistedCatalog,
     };
-    const catalog_head_key = "catalog-v2/head";
-    const catalog_row_prefix = "catalog-v2/row/";
+    const catalog_head_key = @import("catalog_format.zig").head_key;
+    const catalog_row_prefix = @import("catalog_format.zig").row_prefix;
 
     fn durableCatalogStore(self: *LocalStandaloneMetadata) !*antfly.storage_backend_erased.Store {
         return self.catalog_store orelse if (self.owned_catalog_store) |*store| store else error.CatalogStorageUnavailable;
@@ -2406,9 +2405,6 @@ const LocalStandaloneMetadata = struct {
         });
         defer parsed.deinit();
 
-        for (parsed.value.tables) |table| if (table.storage_migration) |admission| {
-            if (admission.request.mode == .offline) return error.VectorMigrationOfflineAdmission;
-        };
         _ = try self.manager.replaceProjectedTopology(parsed.value.tables, parsed.value.ranges);
         try self.extension_catalog.loadProjectedRows(
             parsed.value.extension_packages,
@@ -10435,4 +10431,45 @@ test "standalone fills ha flags from the config ha section without overriding fl
     try std.testing.expectEqual(@as(u64, 4096), cli.ha_retention_max_lag_lsn.?);
     try std.testing.expectEqualStrings("/data/ha/fence.wal", cli.ha_fence_wal.?);
     try std.testing.expect(cli.ha_standby_log == null);
+}
+
+test "system catalog offline migration publishes rows and fences server startup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    {
+        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        try LocalStandaloneMetadata.createTable(&metadata, alloc, "docs", .{ .storage = .{ .dense_embeddings = .primary_lsm } });
+        const tenant = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "preserved" } } });
+        alloc.free(tenant);
+    }
+    const Offline = @import("offline_catalog.zig").Catalog;
+    {
+        var catalog = try Offline.open(alloc, std.testing.io, path);
+        defer catalog.deinit();
+        const table = &catalog.document.value.object.getPtr("tables").?.array.items[0];
+        const a = catalog.document.arena.allocator();
+        const admission = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"request\":{\"job_id\":\"offline\",\"mode\":\"offline\"}}", .{});
+        try table.object.put(a, "storage_migration", admission);
+        try catalog.publish(table.*);
+    }
+    try std.testing.expectError(error.VectorMigrationOfflineAdmission, LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local));
+    {
+        var catalog = try Offline.open(alloc, std.testing.io, path);
+        defer catalog.deinit();
+        const table = &catalog.document.value.object.getPtr("tables").?.array.items[0];
+        _ = table.object.swapRemove("storage_migration");
+        const a = catalog.document.arena.allocator();
+        try table.object.put(a, "storage", try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"dense_embeddings\":\"vector_store\"}", .{}));
+        try catalog.publish(table.*);
+    }
+    var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer reopened.deinit();
+    try std.testing.expectEqual(.vector_store, reopened.findTableByNameLocked("docs").?.storage.dense_embeddings);
+    try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "preserved") != null);
 }
