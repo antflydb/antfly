@@ -124,6 +124,7 @@ pub const Server = struct {
         }
     };
 
+    // Called before taking state_mutex; catalog writers may acquire that mutex.
     pub const CatalogEmptySource = struct {
         ptr: *anyopaque,
         read_fn: *const fn (ptr: *anyopaque) anyerror!bool,
@@ -309,6 +310,15 @@ pub const Server = struct {
             if (req.method != .get) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handleAdminWatchdogProof();
         }
+        // Catalog writers acquire the catalog lock before the HA state lock.
+        // Observe readiness before taking state_mutex to avoid reversing that
+        // order. This is an advisory observation; the primary role and HA
+        // snapshot are still checked under state_mutex below.
+        const waiting_for_tables: ?bool = if (req.method == .get and
+            std.mem.eql(u8, path, admin_api.routes.ha_primary_status))
+        blk: {
+            break :blk if (self.auth.catalog_empty) |source| try source.read_fn(source.ptr) else null;
+        } else null;
         var primary_fence_lease: ?mutation_barrier.MutationBarrier.ExclusiveLease = null;
         if (req.method == .post and std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
             if (self.auth.primary_fence_barrier) |barrier| {
@@ -333,7 +343,7 @@ pub const Server = struct {
                     return try textResponse(self.alloc, 503, "not ready");
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_primary_status)) {
-                    return try self.handleAdminPrimaryStatus(req);
+                    return try self.handleAdminPrimaryStatus(req, waiting_for_tables);
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_standby_status)) {
                     return try self.handleAdminStandbyStatus(req);
@@ -451,7 +461,7 @@ pub const Server = struct {
         return try admin_api.routes.replicationSlotNameFromPathAlloc(self.alloc, path, suffix);
     }
 
-    fn handleAdminPrimaryStatus(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
+    fn handleAdminPrimaryStatus(self: *Server, req: http_operation.Request, waiting_for_tables: ?bool) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         const query = requestQuery(req.target);
         const max_lag_lsn = if (queryValue(query, "max_lag_lsn")) |raw|
@@ -482,7 +492,6 @@ pub const Server = struct {
         const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
         const watchdog_proof = if (self.auth.lease_watchdog_proof) |source| try source.snapshot(self.alloc) else null;
         defer if (watchdog_proof) |proof| self.alloc.free(proof.observed_holder_node_id);
-        const waiting_for_tables = if (self.auth.catalog_empty) |source| try source.read_fn(source.ptr) else null;
         const response = admin_api.HAPrimaryStatusResponse{
             .schema_version = 1,
             .snapshot = blk: {
@@ -5055,7 +5064,7 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
 }
 
-test "storage.hot_standby primary status reports catalog readiness without creating slots" {
+test "storage.hot_standby primary status observes catalog outside the HA lock without creating slots" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "catalog-readiness");
     defer paths.deinit(alloc);
@@ -5063,14 +5072,20 @@ test "storage.hot_standby primary status reports catalog readiness without creat
     defer primary.close();
     const Catalog = struct {
         empty: bool = true,
+        state_mutex: std.atomic.Mutex = .unlocked,
         fn read(ptr: *anyopaque) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Model a catalog writer acquiring HA state while the catalog is
+            // observed. Fail deterministically instead of hanging on inversion.
+            if (!self.state_mutex.tryLock()) return error.CatalogReadUnderHAStateLock;
+            defer self.state_mutex.unlock();
             return self.empty;
         }
     };
     var catalog = Catalog{};
     var server = Server.initWithOptions(alloc, .{ .primary = &primary, .primary_node_id = "primary-a" }, .{
         .catalog_empty = .{ .ptr = &catalog, .read_fn = Catalog.read },
+        .state_mutex = &catalog.state_mutex,
     });
     defer server.deinit();
     for ([_]bool{ true, false, true }) |empty| {
