@@ -4,6 +4,48 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-16: constrained Autograph restart lost retryable owner admission
+
+The second retained-corpus qualification of PR #704 at `81ab94c8b1` failed its
+[production E2E job](https://github.com/antflydb/antfly/actions/runs/35126679231/job/104951437450).
+All eight VOPR campaign shards and all four corpus replay jobs passed. Under
+the 256-descriptor Autograph profile, worker 2, iteration 16,
+`test_multinode_autograph_recovers_after_data_restart` completed its assertions
+but failed teardown because data node 102 exited with code 1. Its log identifies
+`StorageBusy` applying the `documents` Raft entry at index 6. The artifact
+`production-e2e-soak` retains the failed root `antfly-zig-scaling-e2e-l3fykcbz`.
+
+The descriptor-pinned committed-entry path used foreground owner acquisition,
+which waits up to five seconds for registry/owner admission before returning
+`StorageBusy`. The apply driver recognized only writer-unavailable and resource
+budget errors as retryable, so the busy result escaped and stopped the process.
+The logs do not identify which lease held admission. The regression forces
+registry contention, an exclusive owner lease, and publication independently.
+
+Committed-entry admission now makes one attempt and yields conflicts to the
+existing Raft pending-apply queue, before encoding the batch. `StorageBusy` and
+publication's `StorageReadTemporarilyUnavailable` retain the original term/index
+and retry checkpoint. Neither advances the applied watermark, completes a write
+waiter, nor marks the command rejected. Recovery replays the same entry identity;
+the owner persists that identity atomically with the mutation. Unexpected errors
+retain their fatal behavior. This avoids parking the shared progress driver behind an owner
+whose maintenance callback may itself need Raft progress.
+
+The same failed root logged `DistributedQueryUnavailable` becoming
+`RuntimeBoundaryFailure` and then `InternalFailure`. Register that exact
+retryable identity in both callback and owner failure formats so the HTTP layer
+can retain its existing 503 behavior. The new cross-unit callback assertion
+failed before the fix with exactly that identity loss.
+
+The Autograph step was misleadingly green because GitHub's implicit Bash shell
+did not enable `pipefail`; `tee` hid the script's nonzero exit. The final JUnit
+evidence check correctly failed the job. Explicit Bash now propagates pipeline
+failures while retaining logs. Injected failures in all three production
+pipelines fail against the original workflow and preserve their exit status
+with the fix. The existing 200-case Autograph soak, including restart and
+teardown checks in both profiles, remains enabled. The Raft checkpoint regression
+also runs in scheduled VOPR qualification.
+
 ## 2026-09-16: Debug stack unwinding escaped a fresh VOPR fiber
 
 Local macOS ARM64 Debug profiling of `origin/main` (`70098c101d`) crashed in

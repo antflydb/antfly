@@ -44,6 +44,11 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    # Explicit bash enables pipefail, including production soaks piped to tee.
+    shell: bash
+
 concurrency:
   group: vopr-soak-${{ github.ref }}-${{ inputs.diagnostic_trace || 'campaign' }}
   cancel-in-progress: false

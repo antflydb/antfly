@@ -1198,6 +1198,7 @@ const RaftTableApplyStateMachine = struct {
     const TestFaults = if (@import("builtin").is_test) struct {
         writer_unavailable_once_at_index: ?u64 = null,
         resource_budget_exceeded_once_at_index: ?u64 = null,
+        storage_admission_once: ?struct { index: u64, err: anyerror } = null,
         applied_index_publication_failure_once: bool = false,
         document_apply_attempts: usize = 0,
         document_apply_successes: usize = 0,
@@ -1610,6 +1611,12 @@ const RaftTableApplyStateMachine = struct {
                 self.test_faults.resource_budget_exceeded_once_at_index = null;
                 return error.ResourceBudgetExceeded;
             }
+            if (self.test_faults.storage_admission_once) |failure| {
+                if (failure.index == entry_index) {
+                    self.test_faults.storage_admission_once = null;
+                    return failure.err;
+                }
+            }
         }
         const entry: antfly.db.types.RaftAppliedEntryIdentity = .{ .term = entry_term, .index = entry_index };
         if (comptime linked_storage) {
@@ -1834,9 +1841,12 @@ const RaftTableApplyStateMachine = struct {
                                 @errorName(err),
                             });
                         } else if (err == error.RaftApplyWriterUnavailable or
+                            err == error.StorageBusy or
+                            err == error.StorageReadTemporarilyUnavailable or
                             err == error.ResourceBudgetExceeded)
                         {
-                            // Resource admission can fail before or during an
+                            // Owner publication/lease and resource admission
+                            // can fail before or during an
                             // atomic local DB batch. The Raft entry remains
                             // committed and its entry identity makes replay
                             // idempotent, so preserve the apply checkpoint and
@@ -37569,13 +37579,24 @@ fn implementationTests() type {
             );
             try std.testing.expectEqual(@as(u64, 3), apply_sm.writer_unavailable_retries_total.load(.monotonic));
             try std.testing.expectEqual(@as(u64, 2), apply_sm.writer_unavailable_logs_suppressed_total.load(.monotonic));
+            for ([_]anyerror{ error.StorageBusy, error.StorageReadTemporarilyUnavailable }) |admission_error| {
+                apply_sm.test_faults.storage_admission_once = .{ .index = 2, .err = admission_error };
+                try std.testing.expectError(
+                    error.RaftApplyWriterUnavailable,
+                    RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &.{}),
+                );
+                try std.testing.expectEqual(@as(u64, 0), apply_sm.appliedIndex(group_id));
+                try std.testing.expectEqual(@as(u64, 1), apply_sm.retry_apply_checkpoints.get(group_id).?.completed_index);
+                try std.testing.expectEqual(.pending, apply_sm.apply_outcomes.get(.{ .group_id = group_id, .index = 2 }).?.outcome);
+                try std.testing.expect(apply_sm.stateMachine().isApplyRetryable(group_id, error.RaftApplyWriterUnavailable));
+            }
             try DataServer.handleRaftProgressError(error.RaftApplyWriterUnavailable);
             try std.testing.expectError(error.OutOfMemory, DataServer.handleRaftProgressError(error.OutOfMemory));
 
             try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &extended_entries, &.{});
             try std.testing.expectEqual(@as(u64, 3), apply_sm.appliedIndex(group_id));
             try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
-            try std.testing.expectEqual(@as(usize, 6), apply_sm.test_faults.document_apply_attempts);
+            try std.testing.expectEqual(@as(usize, 8), apply_sm.test_faults.document_apply_attempts);
             try std.testing.expectEqual(@as(usize, 3), apply_sm.test_faults.document_apply_successes);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 1).?);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 2).?);
@@ -37611,7 +37632,7 @@ fn implementationTests() type {
             try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &shifted_entries, &.{});
             try std.testing.expectEqual(@as(u64, 5), apply_sm.appliedIndex(group_id));
             try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
-            try std.testing.expectEqual(@as(usize, 8), apply_sm.test_faults.document_apply_attempts);
+            try std.testing.expectEqual(@as(usize, 10), apply_sm.test_faults.document_apply_attempts);
             try std.testing.expectEqual(@as(usize, 5), apply_sm.test_faults.document_apply_successes);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 4).?);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 5).?);

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,60 @@ import zig_vopr_soak as soak
 
 
 class SoakTests(unittest.TestCase):
+    def test_production_pipelines_preserve_the_producer_failure(self):
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/zig-vopr-soak.yml"
+        ).read_text()
+        # Match GitHub's invocation for an explicit bash shell; its implicit
+        # bash fallback omits pipefail, which previously hid the failed soak.
+        explicit_bash = re.search(
+            r"(?m)^defaults:\n  run:\n(?:    #[^\n]*\n)*    shell: bash$",
+            workflow,
+        )
+        shell = ["bash", "--noprofile", "--norc", "-e"]
+        if explicit_bash:
+            shell += ["-o", "pipefail"]
+        for step_name in (
+            "Build production executable and qualify owner publication",
+            "Soak public overwrite restore with concurrent readers and status",
+            "Soak cross-shard Autograph resolution, promotion, and hydration",
+        ):
+            with self.subTest(
+                step=step_name
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "production-e2e-soak").mkdir()
+                (root / "scripts/ci").mkdir(parents=True)
+                for filename in (
+                    "zig",
+                    "scripts/ci/zig-e2e-regression-loop.sh",
+                    "scripts/ci/zig-e2e-autograph-soak.sh",
+                ):
+                    stub = root / filename
+                    stub.write_text(
+                        "#!/usr/bin/env bash\necho injected-soak-failure\nexit 37\n"
+                    )
+                    stub.chmod(0o755)
+                step = workflow.split(f"      - name: {step_name}\n", 1)[1]
+                step = step.split("      - name:", 1)[0]
+                command = textwrap.dedent(step.split("        run: |\n", 1)[1])
+                result = subprocess.run(
+                    shell + ["-c", command],
+                    cwd=root,
+                    env={
+                        **os.environ,
+                        "RUNNER_TEMP": directory,
+                        "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
+                logs = list((root / "production-e2e-soak").glob("*.log"))
+                self.assertEqual(len(logs), 1)
+                self.assertIn("injected-soak-failure", logs[0].read_text())
+
     def test_timeout_kills_and_reaps_a_child_that_ignores_termination(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
