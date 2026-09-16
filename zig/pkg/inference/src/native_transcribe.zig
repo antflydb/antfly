@@ -135,6 +135,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             .max_length = @intCast(whisper_cfg.max_target_positions),
             .decoder_start_token_id = whisper_cfg.decoder_start_token_id,
             .eos_token_id = whisper_cfg.eos_token_id,
+            .n_mels = whisper_cfg.num_mel_bins,
             .language = opts.language,
             .forced_decoder_ids = forced_ids,
             .language_tokens = prompt_cache.language_tokens,
