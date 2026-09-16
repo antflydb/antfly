@@ -10378,6 +10378,8 @@ export interface components {
              * @example openai/gpt-4.1
              */
             model?: string;
+            /** @description Array of model identifiers for fallback routing. Either model or models must be provided. */
+            models?: string[];
             /** @description The OpenRouter API key. */
             api_key?: string;
             /**
