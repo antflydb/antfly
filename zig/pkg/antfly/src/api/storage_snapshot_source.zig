@@ -16,6 +16,9 @@
 //! and namespace exchange stay behind an opaque compiled-kernel handle while
 //! catalog validation and generation admission remain in distributed control.
 
+const std = @import("std");
+const cancellation = @import("../common/cancellation.zig");
+
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const backup_contract = @import("backup_contract.zig");
 
@@ -44,16 +47,35 @@ pub const RestoreRequest = struct {
     shard: *const backup_contract.ShardSnapshot,
 };
 
+/// Admission stays closed until the caller has committed or rolled back the
+/// namespace and catalog changes, including destruction of staged snapshots.
+pub const PublicationRequest = struct {
+    io: std.Io,
+    group_id: u64,
+    table_name: []const u8,
+    cancellation: cancellation.CancellationToken = .none,
+    drain_timeout_ns: u64 = 5 * std.time.ns_per_s,
+};
+
+pub const Publication = struct {
+    source: Source,
+    handle: *anyopaque,
+    active: bool = true,
+
+    pub fn deinit(self: *Publication) void {
+        if (!self.active) return;
+        self.source.vtable.end_publication(self.source.ptr, self.handle);
+        self.active = false;
+    }
+};
+
 pub const Source = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        retire_group_for_publication: *const fn (
-            ptr: *anyopaque,
-            group_id: u64,
-            table_name: []const u8,
-        ) anyerror!void,
+        begin_publication: *const fn (ptr: *anyopaque, request: PublicationRequest) anyerror!*anyopaque,
+        end_publication: *const fn (ptr: *anyopaque, publication: *anyopaque) void,
         prepare: *const fn (
             ptr: *anyopaque,
             request: PrepareRequest,
@@ -80,8 +102,8 @@ pub const Source = struct {
         destroy: *const fn (ptr: *anyopaque, snapshot: *anyopaque) void,
     };
 
-    pub fn retireGroupForPublication(self: Source, group_id: u64, table_name: []const u8) !void {
-        return try self.vtable.retire_group_for_publication(self.ptr, group_id, table_name);
+    pub fn beginPublication(self: Source, request: PublicationRequest) !Publication {
+        return .{ .source = self, .handle = try self.vtable.begin_publication(self.ptr, request) };
     }
 
     pub fn prepare(self: Source, request: PrepareRequest) !Prepared {

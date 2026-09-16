@@ -48,8 +48,11 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_query, .err = error.InvalidQueryRequest },
     .{ .status = .unsupported_query, .err = error.UnsupportedQueryRequest },
     .{ .status = .index_not_found, .err = error.IndexNotFound },
+    .{ .status = .index_rebuilding, .err = error.IndexRebuilding },
+    .{ .status = .incomplete_published_snapshot, .err = error.IncompletePublishedSnapshot },
     .{ .status = .identity_read_generation_changed, .err = error.IdentityReadGenerationChanged },
     .{ .status = .timeout, .err = error.Timeout },
+    .{ .status = .read_index_timeout, .err = error.ReadIndexTimeout },
     .{ .status = .table_visibility_timeout, .err = error.TableVisibilityTimeout },
     .{ .status = .cancelled, .err = error.Cancelled },
     .{ .status = .canceled, .err = error.Canceled },
@@ -556,7 +559,10 @@ fn hasRegisteredIdentity(status: abi.Status) bool {
 
 pub fn validateForTest() !void {
     @setEvalBranchQuota(100_000);
-    inline for (mappings) |mapping| {
+    // Execute the audit as loops. Expanding every mapping and pair into
+    // separate checks produces quadratic-size IR and makes LLVM optimization
+    // dominate compilation of the linked owner tests as the registry grows.
+    for (mappings) |mapping| {
         try std.testing.expectEqual(mapping.status, statusFromError(mapping.err));
         try std.testing.expectError(mapping.err, statusToError(mapping.status));
     }
@@ -567,14 +573,13 @@ pub fn validateForTest() !void {
     // The three exceptions are protocol sentinels rather than domain-error
     // identities: success, the ABI-27 compatibility status, and the explicit
     // unexpected-provider-failure sentinel.
-    inline for (std.meta.fields(abi.Status)) |field| {
-        const status: abi.Status = @enumFromInt(field.value);
+    for (std.meta.tags(abi.Status)) |status| {
         if (status == .ok or status == .backup_integrity or status == .internal) continue;
         try std.testing.expect(hasRegisteredIdentity(status));
     }
 
-    inline for (mappings, 0..) |lhs, i| {
-        inline for (mappings[i + 1 ..]) |rhs| {
+    for (mappings, 0..) |lhs, i| {
+        for (mappings[i + 1 ..]) |rhs| {
             try std.testing.expect(lhs.status != rhs.status);
             try std.testing.expect(lhs.err != rhs.err);
         }
@@ -665,4 +670,18 @@ pub fn validateForTest() !void {
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
     try validateForTest();
+}
+
+test "index readiness survives the local query and storage owner boundary" {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |expected| {
+        // The local query provider reports readiness through the storage
+        // owner before the serving callback can return a retryable response.
+        const failure = failureFromError(expected, .local_query, abi.abi_version, 4);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        const transported = blk: {
+            statusToError(failure.status) catch |err| break :blk err;
+            return error.ExpectedReadinessFailure;
+        };
+        try std.testing.expectEqual(expected, transported);
+    }
 }

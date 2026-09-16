@@ -4331,6 +4331,9 @@ pub fn storageOwnerOpen(
         .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
         .entity_sink = if (runtime_hooks) |value| value.entitySink() else null,
         .promotion_owner = if (runtime_hooks) |value| value.promotionOwner() else null,
+        // Reconcile the authoritative resolver catalog before autonomous
+        // replay can hold its catalog fence or invoke distributed callbacks.
+        .start_resolver_workers = false,
         .index_backends = .{ .dense_native_migration_policy_source = if (runtime_hooks) |value| value.nativeMigrationPolicy() else null },
         .remote_content = if (owner_context) |context| context.remoteContent() else null,
     };
@@ -4383,6 +4386,7 @@ pub fn storageOwnerOpen(
     // The opaque handle now owns the DB at its final address. Match resident
     // cache installation: source verification and other DB-owned maintenance
     // must progress even when this owner receives no foreground requests.
+    handle.db.activateResolverReplayRuntimes() catch |err| return storageOwnerStatusFromError(err);
     handle.db.startResidentBackgroundWorkersIfNeeded();
     success = true;
     out_owner.* = handle;
@@ -6427,7 +6431,14 @@ pub fn storageOwnerBufferDestroy(buffer: *kernel_owner_abi.OwnedBytes) callconv(
 }
 
 fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
-    return kernel_error_identity.statusFromError(err);
+    const status = kernel_error_identity.statusFromError(err);
+    if (status == .internal) {
+        // This status-only boundary cannot carry undeclared error names.
+        // Preserve the originating diagnostic before consumers see the
+        // intentionally generic StorageKernelFailure control-flow status.
+        std.log.warn("storage owner returned undeclared error err={s}", .{@errorName(err)});
+    }
+    return status;
 }
 
 fn openDefaultDirectoryHandle(path: []const u8) !*Handle {

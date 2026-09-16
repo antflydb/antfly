@@ -37,8 +37,12 @@ pub const Status = enum {
 
 pub const TaskSnapshot = struct {
     id: ids.StableId,
+    identity_scope: ids.StableId,
+    resource_owner_id: ids.StableId,
     status: Status,
     sleep_deadline_ns: ?i96,
+    sleep_clock: ?std.Io.Clock,
+    awaited_task_id: ?ids.StableId,
     waiting_on_futex: bool,
     external_resource_id: ?ids.StableId,
 };
@@ -275,17 +279,29 @@ pub const Kernel = struct {
 
     pub fn futureSnapshot(self: *const Kernel, any_future: *std.Io.AnyFuture) ?TaskSnapshot {
         const target: *Task = @ptrCast(@alignCast(any_future));
-        for (self.tasks.items) |task| {
+        for (self.tasks.items, 0..) |task, index| {
             if (task != target) continue;
-            return .{
-                .id = task.id,
-                .status = task.status,
-                .sleep_deadline_ns = if (task.sleep) |sleep| sleep.deadline_ns else null,
-                .waiting_on_futex = task.futex_ptr != null,
-                .external_resource_id = task.external_id,
-            };
+            return self.snapshotAt(index);
         }
         return null;
+    }
+
+    /// Allocation-free inspection of retained owners, including wait edges
+    /// and their actual clock deadlines. This never advances scheduler state.
+    pub fn snapshotAt(self: *const Kernel, index: usize) ?TaskSnapshot {
+        if (index >= self.tasks.items.len) return null;
+        const task = self.tasks.items[index];
+        return .{
+            .id = task.id,
+            .identity_scope = task.identity_parent,
+            .resource_owner_id = task.resource_owner_id,
+            .status = task.status,
+            .sleep_deadline_ns = if (task.sleep) |sleep| sleep.deadline_ns else null,
+            .sleep_clock = if (task.sleep) |sleep| sleep.clock else null,
+            .awaited_task_id = if (task.waiting_on_future) |awaited| awaited.id else null,
+            .waiting_on_futex = task.futex_ptr != null,
+            .external_resource_id = task.external_id,
+        };
     }
 
     pub fn isQuiescent(self: *const Kernel) bool {
@@ -803,8 +819,13 @@ pub const Kernel = struct {
         const storage_len = result_offset + @max(result_len, 1);
         const task = try self.allocator.create(Task);
         errdefer self.allocator.destroy(task);
-        const stack = try self.allocator.alignedAlloc(u8, .fromByteUnits(stack_alignment), self.config.stack_size);
-        errdefer self.allocator.free(stack);
+        // A fiber stack contains no initialized objects until the fiber runs.
+        // Keep allocator ownership/accounting, but avoid poisoning every byte
+        // of large stacks for each short-lived task in Debug/ReleaseSafe runs.
+        const stack_ptr = self.allocator.rawAlloc(self.config.stack_size, .fromByteUnits(stack_alignment), @returnAddress()) orelse
+            return error.OutOfMemory;
+        const stack: []align(stack_alignment) u8 = @alignCast(stack_ptr[0..self.config.stack_size]);
+        errdefer self.allocator.rawFree(stack, .fromByteUnits(stack_alignment), @returnAddress());
         const storage = try self.allocator.alignedAlloc(u8, .fromByteUnits(storage_alignment), storage_len);
         errdefer self.allocator.free(storage);
         @memcpy(storage[0..context_bytes.len], context_bytes);
@@ -959,7 +980,7 @@ pub const Kernel = struct {
 
     fn destroyTaskMemory(self: *Kernel, task: *Task) void {
         self.allocator.free(task.storage);
-        self.allocator.free(task.stack);
+        self.allocator.rawFree(task.stack, .fromByteUnits(stack_alignment), @returnAddress());
         self.allocator.destroy(task);
     }
 

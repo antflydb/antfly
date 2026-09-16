@@ -1836,10 +1836,10 @@ pub const Backend = struct {
     /// allocating, including when the originating request was cancelled.
     fn drainOutputCleanupSliceLocked(self: *Backend) !bool {
         const queue = self.options.unpublished_outputs orelse return false;
-        const deadline = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
         var progressed = false;
         for (0..64) |_| {
-            if (platform.time.monotonicNs() >= deadline) break;
+            if (runtime_mod.workNowNs(self) >= deadline) break;
             const ticket = queue.pop() orelse break;
             errdefer {
                 queue.append(ticket);
@@ -3767,8 +3767,8 @@ pub const Backend = struct {
         self.directory_reclaim_in_flight = true;
         defer self.directory_reclaim_in_flight = false;
         var credits: usize = 2048;
-        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             if (self.directory_reclaimer == null) {
                 const directory = self.retired_run_directories orelse break;
                 self.retired_run_directories = directory.retired_next;
@@ -3801,8 +3801,8 @@ pub const Backend = struct {
         self.store_reclaim_in_flight = true;
         defer self.store_reclaim_in_flight = false;
         var credits: usize = 2048;
-        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             if (self.store_reclaimer == null) {
                 const store = self.retired_run_stores orelse break;
                 self.retired_run_stores = store.retired_next;
@@ -3842,8 +3842,8 @@ pub const Backend = struct {
         self.mu.unlock();
         var credits: usize = 2048;
         var done = false;
-        const deadline = platform_time.monotonicNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and platform_time.monotonicNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             var quantum: usize = @min(credits, 64);
             const before = quantum;
             done = pending.cleanupStep(self.allocator, &quantum);
@@ -3886,8 +3886,8 @@ pub const Backend = struct {
         self.mu.unlock();
         var credits: usize = 2048;
         var done = false;
-        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             var quantum: usize = @min(credits, 64);
             const before = quantum;
             done = pending.cleanupStep(self.allocator, &quantum);
@@ -3913,8 +3913,8 @@ pub const Backend = struct {
         self.mu.unlock();
         var credits: usize = 2048;
         var done = false;
-        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             var quantum: usize = @min(credits, 64);
             const before = quantum;
             done = pending.cleanupStep(self.allocator, &quantum);
@@ -3946,8 +3946,8 @@ pub const Backend = struct {
         self.mu.unlock();
         var credits: usize = 2048;
         var done = false;
-        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
             var quantum: usize = @min(credits, 64);
             const before = quantum;
             done = pending.cleanupStep(self.allocator, &quantum);
@@ -5426,6 +5426,16 @@ pub const Backend = struct {
         try self.maybeCheckpointWalAfterManifestPublish();
         self.manifest_dirty = !self.manifestCoversCurrentRuns();
         self.obsolete_manifest_dirty = self.obsolete_paths.tree.root != self.manifest_journal.obsolete.tree.root;
+    }
+
+    /// Publication and reclamation budgets share the clock of their yield
+    /// lane. Reading host time here would change slice boundaries on replay.
+    pub fn coordinationNowNs(self: *Backend) u64 {
+        if (self.manifestCoordinationIo()) |io| {
+            const now = std.Io.Clock.awake.now(io).nanoseconds;
+            return @intCast(std.math.clamp(now, 0, std.math.maxInt(u64)));
+        }
+        return platform_time.monotonicNs();
     }
 
     pub fn manifestCoordinationIo(self: *Backend) ?std.Io {
@@ -8130,13 +8140,13 @@ pub const Backend = struct {
         if (self.obsolete_reclaim_in_flight) return;
         self.obsolete_reclaim_in_flight = true;
         defer self.obsolete_reclaim_in_flight = false;
-        const deadline = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
         const now_ns = self.nowNs();
         // Bound each maintenance turn, including already-due pinned files.
         // Resume by path against the current root so churn cannot invalidate
         // a borrowed cursor or force a restart from the first pinned file.
         for (0..128) |_| {
-            if (platform.time.monotonicNs() >= deadline) return;
+            if (runtime_mod.workNowNs(self) >= deadline) return;
             const obsolete = self.obsolete_paths.nextDueAfter(now_ns, self.obsolete_reclaim_after) orelse {
                 if (self.obsolete_reclaim_after) |path| self.allocator.free(path);
                 self.obsolete_reclaim_after = null;

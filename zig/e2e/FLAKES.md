@@ -1,5 +1,36 @@
 # Zig E2E flakes
 
+## 2026-09-15: Autograph promotion and read-timeout boundary
+
+The first corrected local executable still failed 3/10 data-restart cases and
+exposed a promotion callback using a freed Raft service during shutdown. The
+compiled-owner shutdown barrier and resolver activation ordering are corrected.
+Revision `256bb99782` passed ten restart probes and the full local 200-case
+Autograph soak: 100 normal and 100 descriptor-limited cases, with 50 ordinary
+and 50 restart cases per profile, zero failures/errors/skips, and an unchanged
+executable hash. This result precedes the subsequent apply-lock handoff fix;
+Linux CI and full VOPR qualification must validate the final revision. The restart test now rejects
+spontaneous assertion/segmentation crashes instead of silently replacing the
+process. See `../FLAKES.md` for exact executable hashes and evidence.
+
+`test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities`
+failed in [run 34928784180](https://github.com/antflydb/antfly/actions/runs/34928784180/job/104259435053)
+with missing promoted entities and an HTTP 500 caused by an untransportable
+`ReadIndexTimeout`. See [the runtime investigation](../FLAKES.md#2026-09-15-multi-node-autograph-promotion-stalls-with-an-untransportable-read-timeout)
+for the exact revision, retained journal evidence, and deterministic reopen fix.
+The merged-main production binary reproduced two failures in 100 local cases:
+pending promotion at journal sequence 3 was absent from the reopened runtime's
+target of 2. A later 50/50 pass does not invalidate those failures.
+The poller now rejects unexpected 500s immediately. The scheduled production
+soak runs 50 normal and 50 constrained-descriptor repetitions of each of the
+original case and `test_multinode_autograph_recovers_after_data_restart`, using
+`scripts/ci/zig-e2e-autograph-soak.sh`, with exact JUnit counts and retained native
+failure diagnostics (GDB on Linux, `sample` on macOS). The restart case exposed
+an additional untransportable `AddressUnavailable`; known read-transport failures
+now preserve the existing retryable read-availability contract. A passing helper
+or deterministic test does not qualify the post-fix production soak.
+
+
 ## 2026-09-13: artifact coverage restart failure reproduced locally (#722)
 
 [CI run 34789270919, job 103815319126](https://github.com/antflydb/antfly/actions/runs/34789270919/job/103815319126?pr=722)

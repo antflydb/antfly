@@ -251,6 +251,7 @@ comptime {
     _ = @import("lsm_backend/run_store.zig");
     _ = @import("lsm_backend/gc_job.zig");
     _ = @import("lsm_backend/dependency_job.zig");
+    _ = @import("lsm_backend/dependency_validation.zig");
     _ = @import("lsm_backend/runtime.zig");
     _ = @import("lsm_backend/current_point_test.zig");
     _ = @import("lsm_backend/state.zig");

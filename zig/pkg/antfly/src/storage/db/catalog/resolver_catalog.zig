@@ -110,6 +110,15 @@ pub const ResolverConfig = struct {
     /// Bumped to force a versioned re-resolution pass.
     config_generation: u64 = 0,
 
+    pub fn eql(self: ResolverConfig, other: ResolverConfig) bool {
+        inline for (std.meta.fields(ResolverConfig)) |field| {
+            if (field.type == []const u8) {
+                if (!std.mem.eql(u8, @field(self, field.name), @field(other, field.name))) return false;
+            } else if (!std.meta.eql(@field(self, field.name), @field(other, field.name))) return false;
+        }
+        return true;
+    }
+
     pub fn clone(alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
         return .{
             .name = try alloc.dupe(u8, cfg.name),

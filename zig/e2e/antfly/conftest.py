@@ -3369,7 +3369,7 @@ def stateful_api(request: pytest.FixtureRequest):
                 "POST", f"/transactions/{transaction_id}/commit", payload or None
             )
             if response.status_code not in (200, 409):
-                response.raise_for_status()
+                self._check(response)
             return response.status_code, self._decode(response)
 
         def abort_transaction_session(self, transaction_id: str) -> dict:
