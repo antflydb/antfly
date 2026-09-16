@@ -49618,8 +49618,8 @@ fn implementationTests() type {
 
             const FakeEmbeddingProvider = struct {
                 request_count: std.atomic.Value(u32) = .init(0),
-                rate_limited_count: std.atomic.Value(u32) = .init(0),
-                allow_all: std.atomic.Value(bool) = .init(false),
+                entered: std.Io.Event = .unset,
+                release: std.Io.Event = .unset,
 
                 fn vectorForInput(input: std.json.Value) []const u8 {
                     if (jsonValueContainsText(input, "alpha")) return "[1,0,0]";
@@ -49672,17 +49672,8 @@ fn implementationTests() type {
                     defer parsed_req.deinit();
 
                     _ = self.request_count.fetchAdd(1, .monotonic);
-                    if (!self.allow_all.load(.acquire)) {
-                        _ = self.rate_limited_count.fetchAdd(1, .monotonic);
-                        const body = try arena.dupe(u8,
-                            \\{"error":{"message":"rate limited","type":"rate_limit_exceeded"}}
-                        );
-                        return .{
-                            .status = 429,
-                            .content_type = try arena.dupe(u8, "application/json"),
-                            .body = body,
-                        };
-                    }
+                    self.entered.set(std.testing.io);
+                    self.release.waitUncancelable(std.testing.io);
 
                     const body = try successBody(arena, parsed_req.value.input);
                     return .{
@@ -49693,7 +49684,7 @@ fn implementationTests() type {
                 }
 
                 fn allowAll(self: *@This()) void {
-                    self.allow_all.store(true, .release);
+                    self.release.set(std.testing.io);
                 }
             };
 
@@ -49770,6 +49761,9 @@ fn implementationTests() type {
             source.read_cache = &read_cache;
             source.write_cache = &write_cache;
             source.backend_runtime = backend_runtime.ptr();
+            // Release blocked HTTP work before source/cache shutdown, including
+            // assertion failures while the initial cached reader is inspected.
+            defer embedding_provider.allowAll();
 
             _ = try source.source().batch(alloc, "docs", .{
                 .writes = &.{
@@ -49780,11 +49774,9 @@ fn implementationTests() type {
                 .sync_level = .write,
             });
 
-            var attempts: usize = 0;
-            while (attempts < 100 and embedding_provider.rate_limited_count.load(.monotonic) == 0) : (attempts += 1) {
-                sleepNs(50 * std.time.ns_per_ms);
-            }
-            try std.testing.expect(embedding_provider.rate_limited_count.load(.monotonic) > 0);
+            // Hold the response until the stale reader exists. Returning 429
+            // here couples cache invalidation to unrelated provider backoff.
+            try embedding_provider.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } });
 
             const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
             defer alloc.free(db_path);
@@ -49801,14 +49793,15 @@ fn implementationTests() type {
                     .limit = 3,
                 });
                 defer initial.deinit();
-                try std.testing.expect(initial.total_hits < 3);
+                try std.testing.expectEqual(@as(u32, 0), initial.total_hits);
             }
 
             embedding_provider.allowAll();
 
             var ready = false;
-            attempts = 0;
-            while (attempts < 200) : (attempts += 1) {
+            var last_total_hits: u32 = 0;
+            const deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
+            while (platform_time.monotonicNs() < deadline_ns) {
                 {
                     var read_lease = try read_cache.getOrOpen(db_path, FakeCatalog.iface(), 7001, 0, "docs");
                     defer read_lease.release();
@@ -49822,6 +49815,7 @@ fn implementationTests() type {
                         .limit = 3,
                     });
                     defer result.deinit();
+                    last_total_hits = result.total_hits;
                     if (result.total_hits == 3 and result.hits.len == 3) {
                         try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
                         ready = true;
@@ -49832,6 +49826,7 @@ fn implementationTests() type {
                 sleepNs(25 * std.time.ns_per_ms);
             }
 
+            if (!ready) std.debug.print("managed dense visibility timed out: provider_requests={d} cached_total_hits={d}\n", .{ embedding_provider.request_count.load(.monotonic), last_total_hits });
             try std.testing.expect(ready);
         }
 

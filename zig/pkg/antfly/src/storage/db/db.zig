@@ -68817,45 +68817,69 @@ test "relational columnar shared pages bound alternating merges and survive recl
 
 test "relational columnar row cursor skips artifact fanout and preserves binary owners" {
     const alloc = std.testing.allocator;
-    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_tmp = try TestDirectory.init("db");
-        defer path_tmp.cleanup();
-        const path = path_tmp.path().ptr;
-        defer cleanupTempDir(path);
-        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
-        defer db.close();
-        const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
-        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
-        const owners = [_][]const u8{ "", "a", "a\x00", "a\xff", "orphan" };
-        for (owners[0..4]) |owner| try db.batch(.{ .writes = &.{.{ .key = owner, .value = "{\"n\":1}" }} });
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const scratch = arena.allocator();
-        var batch = try db.core.store.beginWriteBatch();
-        var live = true;
-        defer if (live) batch.abort();
-        for (owners) |owner| {
-            const prefix_key = try internal_keys.artifactRootPrefixAlloc(scratch, owner);
-            for (0..2048) |i| try batch.asTxn().put(try std.fmt.allocPrint(scratch, "{s}{d:0>4}", .{ prefix_key, i }), "artifact payload is never a row");
+    // Exercise both an uninterrupted bootstrap and deterministic partial
+    // publication. Small published ranges may then be merged by maintenance.
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
+    defer relational_columns.test_owner_limit = null;
+    for ([_]?usize{ null, 2 }) |owner_limit| {
+        for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+            relational_columns.test_owner_limit = owner_limit;
+            var path_tmp = try TestDirectory.init("db");
+            defer path_tmp.cleanup();
+            const path = path_tmp.path().ptr;
+            defer cleanupTempDir(path);
+            var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+            defer db.close();
+            const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+            try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+            const owners = [_][]const u8{ "", "a", "a\x00", "a\xff", "orphan" };
+            for (owners[0..4]) |owner| try db.batch(.{ .writes = &.{.{ .key = owner, .value = "{\"n\":1}" }} });
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var batch = try db.core.store.beginWriteBatch();
+            var live = true;
+            defer if (live) batch.abort();
+            for (owners) |owner| {
+                const prefix_key = try internal_keys.artifactRootPrefixAlloc(scratch, owner);
+                for (0..2048) |i| try batch.asTxn().put(try std.fmt.allocPrint(scratch, "{s}{d:0>4}", .{ prefix_key, i }), "artifact payload is never a row");
+            }
+            try batch.commit();
+            live = false;
+            var stats: types.ColumnarScanStats = .{};
+            var primary = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = true, .columnar_stats = &stats });
+            defer primary.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 4), primary.documents.len);
+            try std.testing.expectEqual(@as(u64, 5), stats.primary_owners_examined);
+            for (primary.documents, owners[0..4]) |document, owner| try std.testing.expectEqualStrings(owner, document.id);
+            stats = .{};
+            var bounded = try db.scan(alloc, "a", "a\xff", .{ .include_documents = true, .include_all_fields = true, .inclusive_from = false, .exclusive_to = true, .columnar_stats = &stats });
+            defer bounded.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), bounded.documents.len);
+            try std.testing.expectEqualStrings("a\x00", bounded.documents[0].id);
+            if (owner_limit) |limit| {
+                try std.testing.expect(try db.rebuildRelationalColumns());
+                try std.testing.expectEqual(@as(u64, limit), db.relational_column_maintenance.owners_examined.load(.monotonic));
+                // Force a bootstrap split, then restore the normal merge budget.
+                relational_columns.test_owner_limit = null;
+            }
+            try drainTestRelationalMaintenance(&db);
+            const maintenance = db.relational_column_maintenance.snapshot();
+            try std.testing.expectEqual(@as(u64, 4), maintenance.primary_rows_read);
+            // Owner visits include typed rows revisited by post-bootstrap merges;
+            // only the five primary owners may be scanned, regardless of fanout.
+            try std.testing.expectEqual(@as(u64, 5) + maintenance.covered_rows_read, maintenance.owners_examined);
+            if (owner_limit == null) {
+                try std.testing.expectEqual(@as(u64, 1), maintenance.bootstrap_quanta);
+            } else {
+                try std.testing.expect(maintenance.bootstrap_quanta > 1);
+                try std.testing.expect(maintenance.covered_rows_read > 0);
+            }
+            var covered = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"} });
+            defer covered.deinit(alloc);
+            try std.testing.expectEqualDeep(primary.documents, covered.documents);
         }
-        try batch.commit();
-        live = false;
-        var stats: types.ColumnarScanStats = .{};
-        var primary = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = true, .columnar_stats = &stats });
-        defer primary.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 4), primary.documents.len);
-        try std.testing.expectEqual(@as(u64, 5), stats.primary_owners_examined);
-        for (primary.documents, owners[0..4]) |document, owner| try std.testing.expectEqualStrings(owner, document.id);
-        stats = .{};
-        var bounded = try db.scan(alloc, "a", "a\xff", .{ .include_documents = true, .include_all_fields = true, .inclusive_from = false, .exclusive_to = true, .columnar_stats = &stats });
-        defer bounded.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 1), bounded.documents.len);
-        try std.testing.expectEqualStrings("a\x00", bounded.documents[0].id);
-        try drainTestRelationalMaintenance(&db);
-        try std.testing.expectEqual(@as(u64, 5), db.relational_column_maintenance.owners_examined.load(.monotonic));
-        var covered = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"} });
-        defer covered.deinit(alloc);
-        try std.testing.expectEqualDeep(primary.documents, covered.documents);
     }
 }
 
