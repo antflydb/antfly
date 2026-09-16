@@ -938,6 +938,7 @@ fn metadataDataBearingStoreGroupRouter(svc: *service.MetadataHttpService) api_ta
 
 fn metadataStoreRouterLocalNodeId(ptr: *anyopaque) u64 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    if (!svc.local_data_owner) return 0;
     return svc.raft.host.http_host.host.cfg.local_node_id;
 }
 
@@ -1062,7 +1063,7 @@ fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.All
     defer candidates.deinit(alloc);
     try candidates.ensureTotalCapacity(alloc, @intCast(snapshot.placements.len));
     for (snapshot.stores) |store| {
-        if (store.node_id == local_node_id or store.api_url.len == 0 or
+        if ((svc.local_data_owner and store.node_id == local_node_id) or store.api_url.len == 0 or
             !store.live or !std.mem.eql(u8, store.health_class, "healthy")) continue;
 
         for (store.group_statuses) |status| {

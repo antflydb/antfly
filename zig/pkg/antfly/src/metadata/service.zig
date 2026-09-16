@@ -1767,6 +1767,8 @@ pub const MetadataServiceConfig = struct {
     },
     reconcile_lease: metadata_reconcile_lease.Config = .{},
     observe_local_replica_root: bool = true,
+    // Embedded services may cohost data; dedicated metadata runtimes opt out.
+    local_data_owner: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
@@ -4339,6 +4341,7 @@ pub const MetadataService = struct {
     metadata_group_id: u64,
     replica_root_dir: ?[]const u8,
     observe_local_replica_root: bool,
+    local_data_owner: bool,
     store_status_ticks: usize,
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
@@ -4433,6 +4436,7 @@ pub const MetadataService = struct {
             .metadata_group_id = metadata_group_id,
             .replica_root_dir = host_cfg.host.replica_root_dir,
             .observe_local_replica_root = cfg.observe_local_replica_root,
+            .local_data_owner = cfg.local_data_owner,
             .store_status_ticks = 0,
             .local_placement_epoch = null,
             .last_local_placement_refresh_at_ms = 0,
@@ -6351,6 +6355,7 @@ pub const MetadataService = struct {
         const local_node_id = self.raft.host.host.cfg.local_node_id;
         for (projected) |intent| {
             if (intent.record.local_node_id != local_node_id) continue;
+            if (!self.local_data_owner and intent.record.group_id != self.metadata_group_id) continue;
             try local.append(self.alloc, try raft_reconciler.cloneIntentOwned(self.alloc, intent));
         }
 
@@ -6526,6 +6531,7 @@ pub const MetadataService = struct {
     }
 
     fn refreshLocalTableProvisioning(self: *MetadataService) !metadata_table_provisioner.ProvisionSummary {
+        if (!self.local_data_owner) return .{};
         const replica_root_dir = self.replica_root_dir orelse return .{};
         const current_epoch = self.projection_epoch.load(.monotonic);
         const group_ids = try self.listLocalGroupIds(self.alloc);
@@ -6604,6 +6610,7 @@ pub const MetadataService = struct {
         tables: []const metadata_table_manager.TableRecord,
         ranges: []const metadata_table_manager.RangeRecord,
     ) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         // A control compilation unit obtains durable restore markers from the
         // resident data/storage owner. Until that adapter is installed, retain
@@ -6635,6 +6642,7 @@ pub const MetadataService = struct {
     }
 
     fn refreshLocalSchemaProgress(self: *MetadataService) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.host.cfg.local_node_id;
         const current_epoch = self.projection_epoch.load(.monotonic);
@@ -6714,12 +6722,14 @@ pub const MetadataService = struct {
         backfill_markers: ?[]const StoreStatusBackfillMarker,
         use_provider: bool,
     ) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.host.cfg.local_node_id;
         try syncLocalStoreStatus(self, local_node_id, replica_root_dir, backfill_markers, use_provider);
     }
 
     fn refreshStoreStatusBackfillMarkersForRound(self: *MetadataService) ![]const StoreStatusBackfillMarker {
+        if (!self.local_data_owner) return &.{};
         self.store_status_ticks += 1;
         self.store_status_backfill_probe_ticks += 1;
         const replica_root_dir = self.replica_root_dir orelse return &.{};
@@ -6735,6 +6745,7 @@ pub const MetadataService = struct {
     }
 
     fn refreshStoreStatusBackfillMarkersForLifecycleRound(self: *MetadataService) ![]const StoreStatusBackfillMarker {
+        if (!self.local_data_owner) return &.{};
         const replica_root_dir = self.replica_root_dir orelse return &.{};
         if (self.store_status_backfill_marker_cache.markers.len == 0 and self.store_status_backfill_marker_cache.scanned_at_ms == 0) {
             try refreshStoreStatusBackfillMarkerCacheNowWithIo(
@@ -6901,6 +6912,7 @@ pub const MetadataHttpService = struct {
     metadata_group_id: u64,
     replica_root_dir: ?[]const u8,
     observe_local_replica_root: bool,
+    local_data_owner: bool,
     reallocation_protocol_peers: []const ReallocationProtocolPeer,
     store_status_ticks: usize,
     projection_epoch: std.atomic.Value(u64) = .init(1),
@@ -7037,6 +7049,7 @@ pub const MetadataHttpService = struct {
             .metadata_group_id = metadata_group_id,
             .replica_root_dir = host_cfg.http.host.replica_root_dir,
             .observe_local_replica_root = cfg.observe_local_replica_root,
+            .local_data_owner = cfg.local_data_owner,
             .reallocation_protocol_peers = cfg.reallocation_protocol_peers,
             .store_status_ticks = 0,
             .local_placement_epoch = null,
@@ -10767,6 +10780,7 @@ pub const MetadataHttpService = struct {
 
         for (inputs.placement_intents) |intent| {
             if (intent.record.local_node_id != self.raft.host.http_host.host.cfg.local_node_id) continue;
+            if (!self.local_data_owner and intent.record.group_id != self.metadata_group_id) continue;
             try local.append(self.alloc, try raft_reconciler.cloneIntentOwned(self.alloc, intent));
         }
 
@@ -10962,6 +10976,7 @@ pub const MetadataHttpService = struct {
     }
 
     fn refreshLocalTableProvisioning(self: *MetadataHttpService, round_inputs: ?*const LocalProjectionInputs) !metadata_table_provisioner.ProvisionSummary {
+        if (!self.local_data_owner) return .{};
         const replica_root_dir = self.replica_root_dir orelse return .{};
         const current_epoch = self.projection_epoch.load(.monotonic);
         var owned_inputs: ?LocalProjectionInputs = null;
@@ -11040,6 +11055,7 @@ pub const MetadataHttpService = struct {
         ranges: []const metadata_table_manager.RangeRecord,
         projected_progress: []const metadata_table_manager.RestoreProgressRecord,
     ) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         // See the threaded service path above. Never reopen storage from the
         // control unit merely because the owner adapter has not arrived yet.
@@ -11068,6 +11084,7 @@ pub const MetadataHttpService = struct {
     }
 
     fn refreshLocalSchemaProgress(self: *MetadataHttpService, round_inputs: ?*const LocalProjectionInputs) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         const current_epoch = self.projection_epoch.load(.monotonic);
@@ -11147,12 +11164,14 @@ pub const MetadataHttpService = struct {
         backfill_markers: ?[]const StoreStatusBackfillMarker,
         use_provider: bool,
     ) !void {
+        if (!self.local_data_owner) return;
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         try syncLocalStoreStatus(self, local_node_id, replica_root_dir, backfill_markers, use_provider);
     }
 
     fn refreshStoreStatusBackfillMarkersForRound(self: *MetadataHttpService) ![]const StoreStatusBackfillMarker {
+        if (!self.local_data_owner) return &.{};
         self.store_status_ticks += 1;
         self.store_status_backfill_probe_ticks += 1;
         const replica_root_dir = self.replica_root_dir orelse return &.{};
@@ -11168,6 +11187,7 @@ pub const MetadataHttpService = struct {
     }
 
     fn refreshStoreStatusBackfillMarkersForLifecycleRound(self: *MetadataHttpService) ![]const StoreStatusBackfillMarker {
+        if (!self.local_data_owner) return &.{};
         const replica_root_dir = self.replica_root_dir orelse return &.{};
         if (self.store_status_backfill_marker_cache.markers.len == 0 and self.store_status_backfill_marker_cache.scanned_at_ms == 0) {
             try refreshStoreStatusBackfillMarkerCacheNowWithIo(
