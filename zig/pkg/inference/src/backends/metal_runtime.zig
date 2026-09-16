@@ -4254,9 +4254,66 @@ pub fn whisperLogitsStatsEncode(self: anytype, logits: MetalTensor, params: *con
     return rc == 0;
 }
 
-pub fn whisperLogitsStatsRead(self: anytype, out: *[16]f32) bool {
+pub fn whisperLogitsStatsRead(self: anytype, slot: usize, out: *[16]f32) bool {
     const runtime = self.raw_decode_runtime orelse return false;
-    return termite_metal_decode_runtime_read_whisper_logits_stats(runtime, out) == 0;
+    return termite_metal_decode_runtime_read_whisper_logits_stats(runtime, slot, out) == 0;
+}
+
+pub fn whisperGrammarWrite(self: anytype, state: *const [8]u32) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    return termite_metal_decode_runtime_write_whisper_grammar(runtime, state, state.len) == 0;
+}
+
+pub fn setWhisperPipelinedFrames(self: anytype, enabled: bool) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    return termite_metal_decode_runtime_set_whisper_pipelined_frames(runtime, @intFromBool(enabled)) == 0;
+}
+
+/// Embed the token a previous frame's Whisper reduce kernel left in the
+/// runtime token buffer, from a `[rows, dim]` f32 table (host or device;
+/// the prepared-table cache keeps it resident). Null when the runtime
+/// cannot serve it from the frame.
+pub fn decoderRuntimeEmbeddingLookupDeviceToken(self: anytype, weight: MetalTensor, token_slot: usize, dim: usize) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !hasActiveFrame(runtime)) return null;
+    if (dim == 0 or weight.ndim() != 2) return null;
+    const rows = @as(usize, @intCast(weight.dim(0)));
+    if (rows == 0 or @as(usize, @intCast(weight.dim(1))) != dim) return null;
+    if (weight.isDevice()) {
+        if (termite_metal_decode_runtime_prepare_embedding_table_device(
+            runtime,
+            weight.deviceHandle(),
+            weight.deviceByteOffset(),
+            rows,
+            dim,
+        ) != 0) return null;
+    } else {
+        var host_weight = weight;
+        if (termite_metal_decode_runtime_prepare_embedding_table(
+            runtime,
+            try tensorHostConstPtr(&host_weight),
+            rows,
+            dim,
+        ) != 0) return null;
+    }
+    const shape = [_]i32{ 1, @intCast(dim) };
+    var output = try MetalTensor.deviceAllocate(runtime, dim * @sizeOf(f32), .private, &shape);
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_embedding_lookup_prepared_device_token(
+        runtime,
+        token_slot,
+        dim,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) {
+        if (getenvBool("TERMITE_WHISPER_TRACE_PIPELINE")) std.debug.print("whisper_pipeline: device token embedding rc={d}\n", .{rc});
+        output.deinit();
+        return null;
+    }
+    return output;
 }
 
 pub fn decoderRuntimeApplyAddLayerNormInto(
@@ -18599,6 +18656,10 @@ pub const WhisperLogitsParams = extern struct {
     ts_max: u32,
     eot: u32,
     probe_id: u32,
+    mode: u32 = 0,
+    token_slot: u32 = 0,
+    stats_slot: u32 = 0,
+    reserved: u32 = 0,
 };
 pub extern fn termite_metal_decode_runtime_whisper_logits_stats_device(
     runtime: ?*RawMetalDecodeRuntime,
@@ -18610,7 +18671,24 @@ pub extern fn termite_metal_decode_runtime_whisper_logits_stats_device(
 ) c_int;
 pub extern fn termite_metal_decode_runtime_read_whisper_logits_stats(
     runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
     output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_write_whisper_grammar(
+    runtime: ?*RawMetalDecodeRuntime,
+    state: [*c]const u32,
+    count: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_set_whisper_pipelined_frames(
+    runtime: ?*RawMetalDecodeRuntime,
+    enabled: c_int,
+) c_int;
+pub extern fn termite_metal_decode_runtime_embedding_lookup_prepared_device_token(
+    runtime: ?*RawMetalDecodeRuntime,
+    token_slot: usize,
+    dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_rms_norm(
     runtime: ?*RawMetalDecodeRuntime,

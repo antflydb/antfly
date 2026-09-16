@@ -6790,6 +6790,39 @@ pub const WhisperNativeDecoder = struct {
         return whisper_arch.decoderStepCached(&self.cb.backend, self.allocator, self.config, tokens, &self.cache, output);
     }
 
+    /// Enter or leave pipelined decoding (`.pipelined` steps); false when
+    /// the backend cannot keep a step in flight.
+    pub fn setPipelined(self: *WhisperNativeDecoder, enabled: bool) bool {
+        return whisper_arch.setPipelinedDecode(&self.cb.backend, &self.cache, enabled);
+    }
+
+    /// Seed the device timestamp-grammar state before pipelined steps.
+    pub fn seedGrammar(self: *WhisperNativeDecoder, state: *const ops.WhisperGrammarState) bool {
+        return self.cb.backend.whisperGrammarWrite(state);
+    }
+
+    /// Submit the step the last `.pipelined` call encoded.
+    pub fn submit(self: *WhisperNativeDecoder) !void {
+        return whisper_arch.decoderStepSubmit(&self.cb.backend);
+    }
+
+    /// Drop the step the last `.pipelined` call encoded without running it.
+    pub fn discard(self: *WhisperNativeDecoder) void {
+        whisper_arch.decoderStepDiscard(&self.cb.backend);
+    }
+
+    /// Collect the statistics of the step in flight from `slot`.
+    pub fn awaitStats(self: *WhisperNativeDecoder, slot: usize) !?ops.WhisperLogitsStatsRaw {
+        return whisper_arch.decoderStepAwait(&self.cb.backend, slot);
+    }
+
+    /// Wait for any step still in flight and drop any step still encoded;
+    /// safe to call when there is neither.
+    pub fn drain(self: *WhisperNativeDecoder) void {
+        self.cb.backend.decoderRuntimeWaitSubmittedFrame() catch {};
+        whisper_arch.decoderStepDiscard(&self.cb.backend);
+    }
+
     pub fn positions(self: *const WhisperNativeDecoder) usize {
         return self.cache.positions;
     }

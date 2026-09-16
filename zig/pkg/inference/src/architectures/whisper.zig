@@ -933,6 +933,10 @@ pub const StepOutput = union(enum) {
     /// Whisper's constrained token choice and log-sum-exp terms computed on
     /// the device from the logits row, so only sixteen floats come back.
     stats: StatsRequest,
+    /// Like `stats`, but the step is only encoded: the frame stays open
+    /// for `decoderStepSubmit`, the device chooses the token itself, and
+    /// `decoderStepAwait` collects the statistics.
+    pipelined: PipelinedRequest,
 };
 
 pub const StatsRequest = struct {
@@ -940,11 +944,65 @@ pub const StatsRequest = struct {
     suppress: []const i32,
 };
 
+pub const PipelinedRequest = struct {
+    params: ops.WhisperLogitsParams,
+    suppress: []const i32,
+    /// Embed the token a previous step left in this backend token slot
+    /// instead of the host token (which is then a placeholder).
+    device_token_slot: ?usize = null,
+};
+
 pub const StepResult = union(enum) {
     logits: []f32,
     none,
     stats: ops.WhisperLogitsStatsRaw,
+    /// The step is encoded in the open frame, waiting for `decoderStepSubmit`.
+    encoded,
 };
+
+/// Encode-ahead decoding is opt-in: with one frame in flight the backend
+/// hides only the host encode, which is not on the critical path (whisper
+/// tiny: 2.2 ms/token either way, 1.8 ms of it GPU time), so the proven
+/// synchronous path stays the default.
+fn whisperPipelinedDecodeEnabled() bool {
+    return platform.env.getenvBool("TERMITE_WHISPER_ENABLE_PIPELINED_DECODE");
+}
+
+fn pipelineTrace(comptime fmt: []const u8, args: anytype) void {
+    if (platform.env.getenvBool("TERMITE_WHISPER_TRACE_PIPELINE")) std.debug.print("whisper_pipeline: " ++ fmt ++ "\n", args);
+}
+
+/// Switch the backend into (or out of) pipelined decoding, where one step
+/// runs on the device while the next is encoded. False when the backend
+/// cannot pipeline; the cache must own preallocated slabs so no step
+/// reallocates while another is in flight.
+pub fn setPipelinedDecode(cb: *const ComputeBackend, cache: *const DecodeCache, enabled: bool) bool {
+    if (!enabled) return cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+    if (cb.kind() != .metal or !whisperMetalFramesEnabled() or !whisperPipelinedDecodeEnabled()) return false;
+    if (!cache.preallocated() or whisperMetalProfileEnabled()) return false;
+    return cb.decoderRuntimeSetWhisperPipelinedFrames(true);
+}
+
+/// Submit the frame a `.pipelined` step left open. The backend keeps one
+/// submitted frame, so the previous step must have been awaited.
+pub fn decoderStepSubmit(cb: *const ComputeBackend) !void {
+    try cb.decoderRuntimeSubmitFrame();
+}
+
+/// Drop an encoded step that will never be submitted (the step before it
+/// ended the text).
+pub fn decoderStepDiscard(cb: *const ComputeBackend) void {
+    if (cb.decoderRuntimeHasActiveFrame()) cb.decoderRuntimeCancelFrame() catch {};
+}
+
+/// Wait for the step submitted by `decoderStepSubmit` and read the
+/// statistics it left in `slot`. Null when nothing could be read.
+pub fn decoderStepAwait(cb: *const ComputeBackend, slot: usize) !?ops.WhisperLogitsStatsRaw {
+    try cb.decoderRuntimeWaitSubmittedFrame();
+    var stats: ops.WhisperLogitsStatsRaw = undefined;
+    if (!cb.whisperLogitsStatsRead(slot, &stats)) return null;
+    return stats;
+}
 
 /// Decode `tokens` at positions `[cache.positions, cache.positions + len)`.
 /// With an empty cache the whole block runs in one causal pass (the decoder
@@ -1045,16 +1103,30 @@ fn decodeBlockCached(
     // failure cancels the frame after the intermediates are released.
     var frame_active = try beginWhisperMetalFrame(cb, if (start == 0) .prefill else .decode);
     errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    // A pipelined step must run inside a frame: the caller submits it later
+    // instead of waiting for it here.
+    const pipelined = output == .pipelined;
+    if (pipelined and (!frame_active or n != 1)) {
+        pipelineTrace("step declined: frame_active={} tokens={d}", .{ frame_active, n });
+        return error.UnsupportedOperation;
+    }
     // One compute encoder for the whole step: every runtime op joins it, so
     // the GPU sees a single command sequence rather than an encoder per op.
     // Submitting the frame closes it; the end call only releases the scope.
     const scope_active = frame_active and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
     defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();
-    var profile = StepProfile{ .enabled = frame_active and whisperMetalProfileEnabled(), .frame_active = &frame_active };
+    var profile = StepProfile{ .enabled = frame_active and !pipelined and whisperMetalProfileEnabled(), .frame_active = &frame_active };
     profile.planned_scope = scope_active;
     profile.start();
 
-    const embedded = try cb.embeddingLookup(weights.embed, tokens, n, d_model);
+    const device_token_slot: ?usize = if (pipelined) output.pipelined.device_token_slot else null;
+    const embedded = if (device_token_slot) |slot|
+        (try cb.embeddingLookupDeviceToken(weights.embed, slot, d_model)) orelse {
+            pipelineTrace("step declined: device token embedding (slot {d})", .{slot});
+            return error.UnsupportedOperation;
+        }
+    else
+        try cb.embeddingLookup(weights.embed, tokens, n, d_model);
     var embedded_live = true;
     defer if (embedded_live) cb.free(embedded);
 
@@ -1102,6 +1174,18 @@ fn decodeBlockCached(
     defer cb.free(logits);
     profile.mark(cb, .lm_head);
 
+    if (pipelined) {
+        const request = output.pipelined;
+        if (!try cb.whisperLogitsStatsEncode(logits, &request.params, request.suppress)) {
+            pipelineTrace("step declined: stats encode", .{});
+            return error.UnsupportedOperation;
+        }
+        // The frame stays open; the caller submits it once the previous
+        // step has been awaited (the backend keeps one frame in flight).
+        frame_active = false;
+        cache.positions += n;
+        return .encoded;
+    }
     if (output == .stats) {
         const request = output.stats;
         if (try cb.whisperLogitsStatsEncode(logits, &request.params, request.suppress)) {
@@ -1110,7 +1194,7 @@ fn decodeBlockCached(
                 frame_active = false;
             }
             var stats: ops.WhisperLogitsStatsRaw = undefined;
-            if (cb.whisperLogitsStatsRead(&stats)) {
+            if (cb.whisperLogitsStatsRead(request.params.stats_slot, &stats)) {
                 profile.device_choice = true;
                 profile.mark(cb, .readback);
                 profile.report(start, n);

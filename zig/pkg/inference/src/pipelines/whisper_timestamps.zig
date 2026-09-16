@@ -177,6 +177,10 @@ pub const stats_ts_sum = 11;
 pub const stats_raw_max = 12;
 pub const stats_raw_sum = 13;
 pub const stats_probe = 14;
+/// In device-choice mode (`whisper_logits_mode_choose`) position 14 holds
+/// the chosen token's id bits and 15 its log-probability instead.
+pub const stats_choice_token = 14;
+pub const stats_choice_logprob = 15;
 /// Raw logit of `eot`, which the mass rule never removes.
 pub const stats_eot = 15;
 pub const no_candidate: u32 = 0xffff_ffff;
@@ -228,6 +232,64 @@ pub fn chooseFromStats(stats: *const ops.WhisperLogitsStatsRaw, timestamps_on: b
     const best_id = statsId(stats, stats_best_id) orelse return null;
     const lse_all = statsLogSumExp(stats, stats_all_max, stats_all_sum);
     return .{ .token = best_id, .logprob = @as(f64, stats[stats_best_value]) - @as(f64, lse_all) };
+}
+
+/// The grammar state the device choice kernel keeps: the window for the
+/// next step followed by the token history it was derived from, in the
+/// shape `ruleWindow` sees it. `advanceGrammar` is the host mirror of the
+/// kernel's update.
+pub fn grammarState(rules: Rules, generated: []const i32, vocab: usize, rules_active: bool) ops.WhisperGrammarState {
+    var state: ops.WhisperGrammarState = [_]u32{0} ** 8;
+    if (!rules_active) {
+        state[0] = 1;
+        state[1] = @intCast(vocab);
+        state[2] = @intCast(vocab);
+        return state;
+    }
+    const window = ruleWindow(rules, generated, vocab);
+    state[0] = @intFromBool(window.text_allowed);
+    state[1] = @intCast(window.ts_min);
+    state[2] = @intCast(window.ts_max);
+    // With fewer than two tokens the penultimate counts as a timestamp, so
+    // an empty history reads as "last was a timestamp" for the next update.
+    state[3] = @intFromBool(generated.len == 0 or rules.isTimestamp(generated[generated.len - 1]));
+    state[4] = @intFromBool(generated.len < 2 or rules.isTimestamp(generated[generated.len - 2]));
+    var i = generated.len;
+    while (i > 0) {
+        i -= 1;
+        if (rules.isTimestamp(generated[i])) {
+            state[5] = 1;
+            state[6] = @intCast(generated[i]);
+            break;
+        }
+    }
+    if (generated.len > 0) state[7] = @intCast(generated[generated.len - 1]);
+    return state;
+}
+
+/// Fold `token` into the grammar state the way the device kernel does.
+pub fn advanceGrammar(state: *ops.WhisperGrammarState, token: u32, ts_begin: u32, vocab: u32) void {
+    const is_ts = token >= ts_begin;
+    const penult_is_ts = state[3];
+    const last_is_ts: u32 = @intFromBool(is_ts);
+    var has_last_ts = state[5];
+    var last_ts = state[6];
+    if (is_ts) {
+        has_last_ts = 1;
+        last_ts = token;
+    }
+    var text_allowed: u32 = 1;
+    var ts_min: u32 = ts_begin;
+    var ts_max: u32 = vocab;
+    if (last_is_ts != 0) {
+        if (penult_is_ts != 0) ts_max = ts_min else text_allowed = 0;
+    }
+    if (has_last_ts != 0) {
+        const first_allowed = if (last_is_ts != 0 and penult_is_ts == 0) last_ts else last_ts + 1;
+        ts_min = @max(ts_min, @min(first_allowed, vocab));
+    }
+    if (ts_max < ts_min) ts_max = ts_min;
+    state.* = .{ text_allowed, ts_min, ts_max, last_is_ts, penult_is_ts, has_last_ts, last_ts, token };
 }
 
 /// Probability of the probed token under the raw (unconstrained) logits.
@@ -588,4 +650,38 @@ test "rule window with timestamps disabled allows everything" {
     try std.testing.expect(window.text_allowed);
     try std.testing.expectEqual(@as(usize, 64), window.ts_min);
     try std.testing.expectEqual(@as(usize, 64), window.ts_max);
+}
+
+test "device grammar state follows ruleWindow token by token" {
+    const rules = Rules{ .timestamp_begin = 48, .eot = 47, .no_timestamps = 46, .max_initial_timestamp_index = 6 };
+    const vocab: usize = 64;
+    const sequences = [_][]const i32{
+        &.{ 48, 5, 6, 50, 50, 7, 52 },
+        &.{ 49, 1, 2, 3, 51, 51, 51, 55, 4, 55 },
+        &.{ 5, 6, 7 },
+        &.{ 48, 48, 49, 49 },
+    };
+    for (sequences) |seq| {
+        // Seed from every prefix length, then let the mirror advance.
+        for (0..seq.len) |seed_len| {
+            var state = grammarState(rules, seq[0..seed_len], vocab, true);
+            var len = seed_len;
+            while (len < seq.len) : (len += 1) {
+                const expected = ruleWindow(rules, seq[0..len], vocab);
+                try std.testing.expectEqual(@intFromBool(expected.text_allowed), state[0]);
+                try std.testing.expectEqual(@as(u32, @intCast(expected.ts_min)), state[1]);
+                try std.testing.expectEqual(@as(u32, @intCast(expected.ts_max)), state[2]);
+                advanceGrammar(&state, @intCast(seq[len]), 48, @intCast(vocab));
+            }
+            const final = ruleWindow(rules, seq, vocab);
+            try std.testing.expectEqual(@intFromBool(final.text_allowed), state[0]);
+            try std.testing.expectEqual(@as(u32, @intCast(final.ts_min)), state[1]);
+            try std.testing.expectEqual(@as(u32, @intCast(final.ts_max)), state[2]);
+        }
+    }
+    // Rules off: everything but timestamps, which do not exist.
+    const off = grammarState(rules, &.{ 1, 2 }, vocab, false);
+    try std.testing.expectEqual(@as(u32, 1), off[0]);
+    try std.testing.expectEqual(@as(u32, 64), off[1]);
+    try std.testing.expectEqual(@as(u32, 64), off[2]);
 }

@@ -1576,6 +1576,11 @@ typedef struct termite_metal_decode_runtime {
     id<MTLBuffer> sample_topk_ids_buffer;
     id<MTLBuffer> whisper_stats_buffer;
     id<MTLBuffer> whisper_stats_partials_buffer;
+    id<MTLBuffer> whisper_grammar_buffer;
+    // Set by the Whisper decoder while it keeps one frame in flight behind
+    // the one being encoded; lets begin_frame accept a submitted frame
+    // without the executor's pipelined-decode gate.
+    BOOL whisper_pipelined_frames;
     id<MTLBuffer> moe_route_ids_buffer;
     id<MTLBuffer> moe_route_weights_buffer;
     // One Shared expert-id -> resident-slot directory per qualified A4B
@@ -6003,7 +6008,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_florence_window_params { uint batch; uint height; uint width; uint dim; uint window_size; uint padded_h; uint padded_w; uint window_area; uint window_count; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_florence_channel_params { uint batch; uint seq_len; uint dim; uint groups; uint channels_per_group; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_argmax_suppress_params { uint out_dim; uint suppress_count; uint reserved0; uint reserved1; };\n"
-           "struct termite_metal_whisper_logits_params { uint out_dim; uint suppress_count; uint ts_begin; uint text_allowed; uint ts_min; uint ts_max; uint eot; uint probe_id; };\n"
+           "struct termite_metal_whisper_logits_params { uint out_dim; uint suppress_count; uint ts_begin; uint text_allowed; uint ts_min; uint ts_max; uint eot; uint probe_id; uint mode; uint token_slot; uint stats_slot; uint reserved; };\n"
            "struct termite_metal_compressed_attention_store_local_params { uint query_rows; uint query_abs_start; uint head_dim; uint reserved; };\n"
            "struct termite_metal_compressed_attention_component_params { uint query_rows; uint query_abs_start; uint total_tokens; uint compress_rate; uint row_dim; uint gate_width; uint row_count; uint rope_dim; float theta; float freq_scale; float eps; uint consecutive_pairs; uint bias_rows; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_compressed_attention_params { uint query_abs_start; uint query_rows; uint token_count; uint compressed_rows; uint num_heads; uint head_dim; uint sliding_window; uint top_k; uint has_indexer; uint index_rows; uint index_heads; uint index_head_dim; uint has_sinks; uint reserved0; float scale; float reserved1; };\n"
@@ -8547,8 +8552,10 @@ static NSString *termite_metal_shader_source(void) {
            "inline void termite_whisper_best_push(thread float &bv, thread uint &bi, float v, uint i) {\n"
            "    if (bi == 0xffffffffu || v > bv || (v == bv && i < bi)) { bv = v; bi = i; }\n"
            "}\n"
-           "kernel void termite_whisper_logits_partials(device const float *logits [[buffer(0)]], device const int *suppress_ids [[buffer(1)]], device float *partials [[buffer(2)]], constant termite_metal_whisper_logits_params &p [[buffer(3)]], threadgroup float *sh [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {\n"
+           "kernel void termite_whisper_logits_partials(device const float *logits [[buffer(0)]], device const int *suppress_ids [[buffer(1)]], device float *partials [[buffer(2)]], constant termite_metal_whisper_logits_params &p [[buffer(3)]], device const uint *grammar [[buffer(4)]], threadgroup float *sh [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {\n"
            "    const uint block_size = 1024u;\n"
+           "    uint text_allowed = p.text_allowed; uint ts_min = p.ts_min; uint ts_max = p.ts_max;\n"
+           "    if ((p.mode & 1u) != 0u) { text_allowed = grammar[0]; ts_min = grammar[1]; ts_max = grammar[2]; }\n"
            "    const uint start = block * block_size;\n"
            "    const uint end = min(start + block_size, p.out_dim);\n"
            "    float best_v = -INFINITY; uint best_i = 0xffffffffu;\n"
@@ -8561,7 +8568,7 @@ static NSString *termite_metal_shader_source(void) {
            "        termite_whisper_best_push(raw_v, raw_i, v, i);\n"
            "        termite_whisper_lse_push(raw_m, raw_s, v);\n"
            "        bool is_ts = i >= p.ts_begin;\n"
-           "        bool allowed = (i == p.eot) || (is_ts ? (i >= p.ts_min && i < p.ts_max) : (p.text_allowed != 0u));\n"
+           "        bool allowed = (i == p.eot) || (is_ts ? (i >= ts_min && i < ts_max) : (text_allowed != 0u));\n"
            "        if (allowed && p.suppress_count != 0u && termite_argmax_suppressed_token(i, suppress_ids, p.suppress_count)) allowed = false;\n"
            "        if (!allowed) continue;\n"
            "        termite_whisper_best_push(best_v, best_i, v, i);\n"
@@ -8599,8 +8606,9 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    if (tid == 0u) { for (uint c = 0u; c < 14u; ++c) partials[block * 16u + c] = sh[c * n]; partials[block * 16u + 14u] = 0.0f; partials[block * 16u + 15u] = 0.0f; }\n"
            "}\n"
-           "kernel void termite_whisper_logits_reduce(device const float *logits [[buffer(0)]], device const float *partials [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_whisper_logits_params &p [[buffer(3)]], constant uint &partial_count [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
+           "kernel void termite_whisper_logits_reduce(device const float *logits [[buffer(0)]], device const float *partials [[buffer(1)]], device float *output_base [[buffer(2)]], constant termite_metal_whisper_logits_params &p [[buffer(3)]], constant uint &partial_count [[buffer(4)]], device uint *grammar [[buffer(5)]], device uint *token_out [[buffer(6)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid != 0u) return;\n"
+           "    device float *output = output_base + p.stats_slot * 16u;\n"
            "    float best_v = -INFINITY; uint best_i = 0xffffffffu; float text_v = -INFINITY; uint text_i = 0xffffffffu; float ts_v = -INFINITY; uint ts_i = 0xffffffffu; float raw_v = -INFINITY; uint raw_i = 0xffffffffu;\n"
            "    float all_m = -INFINITY; float all_s = 0.0f; float tsl_m = -INFINITY; float tsl_s = 0.0f; float raw_m = -INFINITY; float raw_s = 0.0f;\n"
            "    for (uint b = 0u; b < partial_count; ++b) {\n"
@@ -8617,7 +8625,37 @@ static NSString *termite_metal_shader_source(void) {
            "    output[0] = best_v; output[1] = as_type<float>(best_i); output[2] = text_v; output[3] = as_type<float>(text_i);\n"
            "    output[4] = ts_v; output[5] = as_type<float>(ts_i); output[6] = raw_v; output[7] = as_type<float>(raw_i);\n"
            "    output[8] = all_m; output[9] = all_s; output[10] = tsl_m; output[11] = tsl_s; output[12] = raw_m; output[13] = raw_s;\n"
-           "    output[14] = (p.probe_id < p.out_dim) ? logits[p.probe_id] : 0.0f; output[15] = (p.eot < p.out_dim) ? logits[p.eot] : -INFINITY;\n"
+           "    const float eot_logit = (p.eot < p.out_dim) ? logits[p.eot] : -INFINITY;\n"
+           "    output[14] = (p.probe_id < p.out_dim) ? logits[p.probe_id] : 0.0f; output[15] = eot_logit;\n"
+           "    if ((p.mode & 2u) == 0u) return;\n"
+           "    // Device token choice (mirrors the host chooseFromStats): the\n"
+           "    // timestamp-mass rule, then eot competing with the timestamps.\n"
+           "    const bool ts_on = (p.mode & 4u) != 0u; const bool eot_ok = (p.mode & 8u) != 0u;\n"
+           "    uint tok = 0u; float lp = -100.0f; bool chosen = false;\n"
+           "    if (ts_on && ts_i != 0xffffffffu) {\n"
+           "        const float lse_ts = (tsl_s <= 0.0f) ? -INFINITY : (tsl_m + log(tsl_s));\n"
+           "        if (text_i == 0xffffffffu || lse_ts > text_v) {\n"
+           "            if (eot_ok && eot_logit != -INFINITY) {\n"
+           "                const float hi = max(lse_ts, eot_logit); const float lse = hi + log(exp(lse_ts - hi) + exp(eot_logit - hi));\n"
+           "                if (eot_logit >= ts_v) { tok = p.eot; lp = eot_logit - lse; } else { tok = ts_i; lp = ts_v - lse; }\n"
+           "            } else { tok = ts_i; lp = ts_v - lse_ts; }\n"
+           "            chosen = true;\n"
+           "        }\n"
+           "    }\n"
+           "    if (!chosen && best_i != 0xffffffffu) { tok = best_i; lp = best_v - ((all_s <= 0.0f) ? -INFINITY : (all_m + log(all_s))); }\n"
+           "    output[14] = as_type<float>(tok); output[15] = lp;\n"
+           "    token_out[p.token_slot] = tok;\n"
+           "    // Advance the timestamp grammar so the next step's window is ready\n"
+           "    // before the host has seen this token (ruleWindow on the device).\n"
+           "    const bool is_ts = tok >= p.ts_begin;\n"
+           "    const uint penult_is_ts = grammar[3]; const uint last_is_ts = is_ts ? 1u : 0u;\n"
+           "    uint has_last_ts = grammar[5]; uint last_ts = grammar[6];\n"
+           "    if (is_ts) { has_last_ts = 1u; last_ts = tok; }\n"
+           "    uint text_allowed = 1u; uint ts_min = p.ts_begin; uint ts_max = p.out_dim;\n"
+           "    if (last_is_ts != 0u) { if (penult_is_ts != 0u) ts_max = ts_min; else text_allowed = 0u; }\n"
+           "    if (has_last_ts != 0u) { const uint first_allowed = (last_is_ts != 0u && penult_is_ts == 0u) ? last_ts : (last_ts + 1u); ts_min = max(ts_min, min(first_allowed, p.out_dim)); }\n"
+           "    if (ts_max < ts_min) ts_max = ts_min;\n"
+           "    grammar[0] = text_allowed; grammar[1] = ts_min; grammar[2] = ts_max; grammar[3] = last_is_ts; grammar[4] = penult_is_ts; grammar[5] = has_last_ts; grammar[6] = last_ts; grammar[7] = tok;\n"
            "}\n"
            "inline bool termite_lm_head_candidate_better(float value, uint token_id, float other_value, uint other_token_id) {\n"
            "    return value > other_value || (value == other_value && token_id < other_token_id);\n"
@@ -26256,6 +26294,8 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->sample_topk_ids_buffer = nil;
     runtime->whisper_stats_buffer = nil;
     runtime->whisper_stats_partials_buffer = nil;
+    runtime->whisper_grammar_buffer = nil;
+    runtime->whisper_pipelined_frames = NO;
     runtime->moe_route_ids_buffer = nil;
     runtime->moe_route_weights_buffer = nil;
     runtime->moe_route_slots_buffer = nil;
@@ -40154,7 +40194,41 @@ typedef struct termite_metal_whisper_logits_params_host {
     uint32_t ts_max;
     uint32_t eot;
     uint32_t probe_id;
+    // Bit 0: take the window from the device grammar state instead of the
+    // fields above. Bit 1: choose the token on the device, write it to the
+    // token buffer slot and advance the grammar state. Bit 2: timestamps
+    // on (the timestamp-mass rule applies). Bit 3: eot may be chosen.
+    uint32_t mode;
+    uint32_t token_slot;
+    uint32_t stats_slot;
+    uint32_t reserved;
 } termite_metal_whisper_logits_params_host;
+
+#define TERMITE_METAL_WHISPER_STATS_SLOTS 2u
+#define TERMITE_METAL_WHISPER_GRAMMAR_WORDS 8u
+
+static int termite_metal_decode_runtime_ensure_whisper_grammar_buffer(termite_metal_decode_runtime *runtime) {
+    if (runtime->whisper_grammar_buffer != nil) return 0;
+    id<MTLBuffer> grammar = [runtime->device newBufferWithLength:TERMITE_METAL_WHISPER_GRAMMAR_WORDS * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    if (grammar == nil) return -1;
+    memset(grammar.contents, 0, TERMITE_METAL_WHISPER_GRAMMAR_WORDS * sizeof(uint32_t));
+    runtime->whisper_grammar_buffer = grammar;
+    return 0;
+}
+
+// The Whisper decoder's chosen tokens live in the shared token buffer, one
+// uint per slot, so a lookahead frame can embed a token the host has not
+// read yet.
+static int termite_metal_decode_runtime_ensure_whisper_token_buffer(termite_metal_decode_runtime *runtime, size_t slots) {
+    const size_t bytes = slots * sizeof(uint32_t);
+    if (runtime->token_buffer != nil && runtime->token_capacity >= bytes && runtime->token_buffer.storageMode == MTLStorageModeShared) return 0;
+    id<MTLBuffer> token = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    if (token == nil) return -1;
+    memset(token.contents, 0, bytes);
+    runtime->token_buffer = token;
+    runtime->token_capacity = bytes;
+    return 0;
+}
 
 // Whisper's greedy token choice with the timestamp grammar applied on the
 // device: one pass over the logits row yields the constrained argmax, the
@@ -40191,10 +40265,13 @@ int termite_metal_decode_runtime_whisper_logits_stats_device(
             runtime->whisper_stats_partials_capacity = partial_bytes;
         }
         if (runtime->whisper_stats_buffer == nil) {
-            id<MTLBuffer> stats = [runtime->device newBufferWithLength:16u * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> stats = [runtime->device newBufferWithLength:TERMITE_METAL_WHISPER_STATS_SLOTS * 16u * sizeof(float) options:MTLResourceStorageModeShared];
             if (stats == nil) return -5;
             runtime->whisper_stats_buffer = stats;
         }
+        if (params->stats_slot >= TERMITE_METAL_WHISPER_STATS_SLOTS) return -3;
+        if (termite_metal_decode_runtime_ensure_whisper_grammar_buffer(runtime) != 0) return -5;
+        if (termite_metal_decode_runtime_ensure_whisper_token_buffer(runtime, (size_t)params->token_slot + 1u) != 0) return -5;
         id<MTLBuffer> suppress_buffer = runtime->whisper_stats_buffer;
         if (suppress_count > 0) {
             size_t suppress_bytes = 0;
@@ -40211,7 +40288,9 @@ int termite_metal_decode_runtime_whisper_logits_stats_device(
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, logits_buffer) != 0 ||
                 termite_metal_decode_runtime_retain_frame_resource(runtime, suppress_buffer) != 0 ||
                 termite_metal_decode_runtime_retain_frame_resource(runtime, runtime->whisper_stats_partials_buffer) != 0 ||
-                termite_metal_decode_runtime_retain_frame_resource(runtime, runtime->whisper_stats_buffer) != 0) {
+                termite_metal_decode_runtime_retain_frame_resource(runtime, runtime->whisper_stats_buffer) != 0 ||
+                termite_metal_decode_runtime_retain_frame_resource(runtime, runtime->whisper_grammar_buffer) != 0 ||
+                termite_metal_decode_runtime_retain_frame_resource(runtime, runtime->token_buffer) != 0) {
                 return -7;
             }
         }
@@ -40225,6 +40304,7 @@ int termite_metal_decode_runtime_whisper_logits_stats_device(
         [encoder setBuffer:suppress_buffer offset:0 atIndex:1];
         [encoder setBuffer:runtime->whisper_stats_partials_buffer offset:0 atIndex:2];
         [encoder setBytes:params length:sizeof(*params) atIndex:3];
+        [encoder setBuffer:runtime->whisper_grammar_buffer offset:0 atIndex:4];
         [encoder setThreadgroupMemoryLength:14u * 256u * sizeof(float) atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -40234,6 +40314,8 @@ int termite_metal_decode_runtime_whisper_logits_stats_device(
         [encoder setBuffer:runtime->whisper_stats_buffer offset:0 atIndex:2];
         [encoder setBytes:params length:sizeof(*params) atIndex:3];
         [encoder setBytes:&partial_count length:sizeof(partial_count) atIndex:4];
+        [encoder setBuffer:runtime->whisper_grammar_buffer offset:0 atIndex:5];
+        [encoder setBuffer:runtime->token_buffer offset:0 atIndex:6];
         [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
@@ -40242,14 +40324,98 @@ int termite_metal_decode_runtime_whisper_logits_stats_device(
 
 int termite_metal_decode_runtime_read_whisper_logits_stats(
     termite_metal_decode_runtime *runtime,
+    size_t slot,
     float *output
 ) {
     if (runtime == NULL || output == NULL) return -1;
+    if (slot >= TERMITE_METAL_WHISPER_STATS_SLOTS) return -1;
     if (runtime->whisper_stats_buffer == nil || runtime->whisper_stats_buffer.storageMode != MTLStorageModeShared) return -2;
     const float *stats = (const float *)runtime->whisper_stats_buffer.contents;
     if (stats == NULL) return -3;
+    stats += slot * 16u;
     for (size_t i = 0; i < 16u; ++i) output[i] = stats[i];
     return 0;
+}
+
+// Seed the device grammar state (window for the next step plus the token
+// history it derives from) from the host. Only valid while no frame that
+// reads or writes the state is in flight.
+int termite_metal_decode_runtime_write_whisper_grammar(
+    termite_metal_decode_runtime *runtime,
+    const uint32_t *state,
+    size_t count
+) {
+    if (runtime == NULL || state == NULL || count != TERMITE_METAL_WHISPER_GRAMMAR_WORDS) return -1;
+    if (runtime->device == nil) return -2;
+    if (runtime->submitted_frame_cb != nil) return -3;
+    if (termite_metal_decode_runtime_ensure_whisper_grammar_buffer(runtime) != 0) return -4;
+    memcpy(runtime->whisper_grammar_buffer.contents, state, count * sizeof(uint32_t));
+    return 0;
+}
+
+int termite_metal_decode_runtime_set_whisper_pipelined_frames(
+    termite_metal_decode_runtime *runtime,
+    int enabled
+) {
+    if (runtime == NULL) return -1;
+    if (runtime->queue == nil) return -2;
+    runtime->whisper_pipelined_frames = enabled != 0 ? YES : NO;
+    return 0;
+}
+
+// Embed the token a previous frame's Whisper reduce kernel left in
+// `token_buffer[token_slot]`, from the prepared generic embedding table.
+// Frame-only: the whole point is that the host never reads the token.
+int termite_metal_decode_runtime_embedding_lookup_prepared_device_token(
+    termite_metal_decode_runtime *runtime,
+    size_t token_slot,
+    size_t dim,
+    void *output_handle,
+    size_t output_offset
+) {
+    if (runtime == NULL || output_handle == NULL) return -1;
+    if (runtime->embedding_lookup_pipeline == nil) return -2;
+    if (runtime->generic_embedding_table_buffer == nil) return -3;
+    if (dim == 0 || dim != runtime->generic_embedding_dim) return -4;
+    if (runtime->active_frame_cb == nil) return -5;
+    if (termite_metal_decode_runtime_ensure_whisper_token_buffer(runtime, token_slot + 1u) != 0) return -6;
+    @autoreleasepool {
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        const size_t output_bytes = dim * sizeof(float);
+        if (output_offset + output_bytes > output_buffer.length) return -7;
+        const size_t token_offset = token_slot * sizeof(uint32_t);
+        if (termite_metal_decode_runtime_retain_frame_resource(runtime, runtime->token_buffer) != 0) return -8;
+        termite_metal_embedding_lookup_params params = {
+            .total = 1u,
+            .dim = (uint32_t)dim,
+        };
+        id<MTLCommandBuffer> command_buffer = runtime->active_frame_cb;
+        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+        const BOOL planned_encoder = (encoder != nil);
+        if (!planned_encoder) {
+            encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_EMBEDDING);
+            if (encoder == nil) return -9;
+        }
+        termite_metal_planned_encoder_range accesses[3];
+        if (termite_metal_planned_range_make(runtime->generic_embedding_table_buffer, runtime->generic_embedding_buffer_offset, runtime->generic_embedding_table_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -9) != 0 ||
+            termite_metal_planned_range_make(runtime->token_buffer, token_offset, sizeof(uint32_t), TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -9) != 0 ||
+            termite_metal_planned_range_make(output_buffer, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[2], -9) != 0 ||
+            termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 3, -9) != 0)
+        {
+            return -9;
+        }
+        [encoder setComputePipelineState:runtime->embedding_lookup_pipeline];
+        [encoder setBuffer:runtime->generic_embedding_table_buffer offset:runtime->generic_embedding_buffer_offset atIndex:0];
+        [encoder setBuffer:runtime->token_buffer offset:token_offset atIndex:1];
+        [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
+        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        NSUInteger thread_width = runtime->embedding_lookup_pipeline.maxTotalThreadsPerThreadgroup;
+        if (thread_width == 0) thread_width = 64;
+        if (thread_width > dim) thread_width = dim;
+        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        if (!planned_encoder) [encoder endEncoding];
+        return 0;
+    }
 }
 
 int termite_metal_decode_runtime_read_token_id(
@@ -58648,8 +58814,8 @@ static int termite_metal_decode_runtime_begin_frame_internal(
     if (runtime->active_frame_cb != nil) return -3;
     termite_metal_decode_runtime_reset_a4b_concurrent_ffn_scope(runtime);
     runtime->a4b_route_slots_fold_valid = 0u;
-    if (runtime->submitted_frame_cb != nil && !termite_metal_pipelined_decode_frame_enabled()) return -4;
-    if (runtime->submitted_frame_cb != nil && runtime->pipelined_decode_frame_reported == 0) {
+    if (runtime->submitted_frame_cb != nil && !runtime->whisper_pipelined_frames && !termite_metal_pipelined_decode_frame_enabled()) return -4;
+    if (runtime->submitted_frame_cb != nil && !runtime->whisper_pipelined_frames && runtime->pipelined_decode_frame_reported == 0) {
         fprintf(
             stderr,
             "metal_pipelined_decode_frame: enabled=1 owner=executor rollback=TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME\n");

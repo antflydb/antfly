@@ -13266,9 +13266,55 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         );
     }
 
-    fn whisperLogitsStatsReadOp(ctx: *anyopaque, out: *ops.WhisperLogitsStatsRaw) bool {
+    fn whisperLogitsStatsReadOp(ctx: *anyopaque, slot: usize, out: *ops.WhisperLogitsStatsRaw) bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        return metal_runtime.whisperLogitsStatsRead(self.provider_impl, out);
+        return metal_runtime.whisperLogitsStatsRead(self.provider_impl, slot, out);
+    }
+
+    fn whisperGrammarWriteOp(ctx: *anyopaque, state: *const ops.WhisperGrammarState) bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.whisperGrammarWrite(self.provider_impl, state);
+    }
+
+    fn embeddingLookupDeviceTokenOp(ctx: *anyopaque, weight: CT, token_slot: usize, dim: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const weight_buf = toBuf(weight);
+        if (bufHasAnyQuantizedStorage(weight_buf) or weight_buf.native_dense_bytes != null or disableRuntimeEmbeddingLookup()) return null;
+        var weight_mt = try self.ownedMetalTensorFromCt(weight);
+        defer weight_mt.deinit();
+        const tensor = try metal_runtime.decoderRuntimeEmbeddingLookupDeviceToken(self.provider_impl, weight_mt, token_slot, dim) orelse return null;
+        return try self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeSetWhisperPipelinedFramesOp(ctx: *anyopaque, enabled: bool) bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.setWhisperPipelinedFrames(self.provider_impl, enabled);
+    }
+
+    fn decoderRuntimeSubmitFrameOp(ctx: *anyopaque) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedOperation;
+        if (!metal_runtime.hasActiveFrame(runtime)) return error.UnsupportedOperation;
+        errdefer {
+            var active = true;
+            self.cancelDecoderRuntimeFrame(runtime, &active);
+        }
+        if (metal_runtime.hasSubmittedFrame(runtime)) return error.UnsupportedOperation;
+        try metal_runtime.submitFrame(runtime);
+        self.timing_stats.decoder_runtime_frame_submits += 1;
+    }
+
+    fn decoderRuntimeWaitSubmittedFrameOp(ctx: *anyopaque) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        if (!metal_runtime.hasSubmittedFrame(runtime)) return;
+        const started_at = monotonicNowNs();
+        try metal_runtime.waitFrame(runtime);
+        const finished_at = monotonicNowNs();
+        if (finished_at > started_at) {
+            self.timing_stats.decoder_runtime_frame_wait_nanos += @intCast(finished_at - started_at);
+        }
+        self.timing_stats.decoder_runtime_frame_gpu_nanos += metal_runtime.lastFrameGpuNanos(runtime);
     }
 
     fn linearNoBiasOp(
@@ -28811,6 +28857,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.conv1dIm2col = conv1dIm2colOp;
         vt.whisperLogitsStatsEncode = whisperLogitsStatsEncodeOp;
         vt.whisperLogitsStatsRead = whisperLogitsStatsReadOp;
+        vt.whisperGrammarWrite = whisperGrammarWriteOp;
+        vt.embeddingLookupDeviceToken = embeddingLookupDeviceTokenOp;
+        vt.decoderRuntimeSetWhisperPipelinedFrames = decoderRuntimeSetWhisperPipelinedFramesOp;
+        vt.decoderRuntimeSubmitFrame = decoderRuntimeSubmitFrameOp;
+        vt.decoderRuntimeWaitSubmittedFrame = decoderRuntimeWaitSubmittedFrameOp;
         vt.linear = linearOp;
         vt.denseMlp2 = denseMlp2Op;
         vt.denseFfnLayerNorm = denseFfnLayerNormOp;

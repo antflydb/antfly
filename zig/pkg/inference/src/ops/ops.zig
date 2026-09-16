@@ -101,7 +101,30 @@ pub const WhisperLogitsParams = extern struct {
     ts_max: u32,
     eot: u32,
     probe_id: u32,
+    /// Bit set of `whisper_logits_mode_*`.
+    mode: u32 = 0,
+    /// Token buffer slot the device writes the chosen token to.
+    token_slot: u32 = 0,
+    /// Which of the two statistics slots receives this step's output.
+    stats_slot: u32 = 0,
+    reserved: u32 = 0,
 };
+
+/// Take the timestamp window from the device grammar state.
+pub const whisper_logits_mode_device_window: u32 = 1;
+/// Choose the token on the device, publish it to the token buffer slot and
+/// advance the grammar state; the stats then carry the choice in
+/// positions 14 (token bits) and 15 (log-probability).
+pub const whisper_logits_mode_choose: u32 = 2;
+/// Timestamps are on: the timestamp-mass rule applies to the choice.
+pub const whisper_logits_mode_timestamps: u32 = 4;
+/// End-of-text may be chosen.
+pub const whisper_logits_mode_eot_allowed: u32 = 8;
+
+/// Device grammar state: window for the next step (text_allowed, ts_min,
+/// ts_max), then last_is_ts, penult_is_ts, has_last_ts, last_ts, and the
+/// last chosen token.
+pub const WhisperGrammarState = [8]u32;
 
 /// Sixteen floats written by the Whisper logits kernel. Ids are u32 bit
 /// patterns; 0xffffffff means "no candidate".
@@ -1695,7 +1718,12 @@ pub const ComputeBackend = struct {
         ensureDeviceResident: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
         conv1dIm2col: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT = null,
         whisperLogitsStatsEncode: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
-        whisperLogitsStatsRead: ?*const fn (ctx: *anyopaque, out: *WhisperLogitsStatsRaw) bool = null,
+        whisperLogitsStatsRead: ?*const fn (ctx: *anyopaque, slot: usize, out: *WhisperLogitsStatsRaw) bool = null,
+        whisperGrammarWrite: ?*const fn (ctx: *anyopaque, state: *const WhisperGrammarState) bool = null,
+        embeddingLookupDeviceToken: ?*const fn (ctx: *anyopaque, weight: CT, token_slot: usize, dim: usize) anyerror!?CT = null,
+        decoderRuntimeSetWhisperPipelinedFrames: ?*const fn (ctx: *anyopaque, enabled: bool) bool = null,
+        decoderRuntimeSubmitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        decoderRuntimeWaitSubmittedFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
         /// Planned variant for graph executors that already selected a
         /// backend-specific operator. Backends that leave this null use
@@ -3480,9 +3508,45 @@ pub const ComputeBackend = struct {
         return false;
     }
 
-    pub fn whisperLogitsStatsRead(self: *const ComputeBackend, out: *WhisperLogitsStatsRaw) bool {
-        if (self.vtable.whisperLogitsStatsRead) |f| return f(self.ptr, out);
+    pub fn whisperLogitsStatsRead(self: *const ComputeBackend, slot: usize, out: *WhisperLogitsStatsRaw) bool {
+        if (self.vtable.whisperLogitsStatsRead) |f| return f(self.ptr, slot, out);
         return false;
+    }
+
+    /// Seed the device timestamp-grammar state read by `whisperLogitsStatsEncode`
+    /// in device-window mode. Only valid while no frame is in flight.
+    pub fn whisperGrammarWrite(self: *const ComputeBackend, state: *const WhisperGrammarState) bool {
+        if (self.vtable.whisperGrammarWrite) |f| return f(self.ptr, state);
+        return false;
+    }
+
+    /// Embed the token a previous frame's choice kernel left in the
+    /// backend's token buffer slot, inside the active frame. Null when the
+    /// backend cannot.
+    pub fn embeddingLookupDeviceToken(self: *const ComputeBackend, weight: CT, token_slot: usize, dim: usize) !?CT {
+        if (self.vtable.embeddingLookupDeviceToken) |f| return f(self.ptr, weight, token_slot, dim);
+        return null;
+    }
+
+    /// Allow `decoderRuntimeBeginFrame` while a submitted frame is still
+    /// running, so the caller can keep one frame in flight behind the one
+    /// it encodes. Returns false when the backend cannot pipeline.
+    pub fn decoderRuntimeSetWhisperPipelinedFrames(self: *const ComputeBackend, enabled: bool) bool {
+        if (self.vtable.decoderRuntimeSetWhisperPipelinedFrames) |f| return f(self.ptr, enabled);
+        return false;
+    }
+
+    /// Submit the active frame without waiting; pair with
+    /// `decoderRuntimeWaitSubmittedFrame`.
+    pub fn decoderRuntimeSubmitFrame(self: *const ComputeBackend) !void {
+        if (self.vtable.decoderRuntimeSubmitFrame) |op| return op(self.ptr);
+        return error.UnsupportedOperation;
+    }
+
+    /// Wait for the frame submitted by `decoderRuntimeSubmitFrame`; a no-op
+    /// when none is in flight.
+    pub fn decoderRuntimeWaitSubmittedFrame(self: *const ComputeBackend) !void {
+        if (self.vtable.decoderRuntimeWaitSubmittedFrame) |op| return op(self.ptr);
     }
 
     pub fn addLayerNorm(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
