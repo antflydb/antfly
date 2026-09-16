@@ -527,6 +527,7 @@ pub const OllamaGeneratorConfig = types.OllamaGeneratorConfig;
 pub const OpenAIEmbedderConfig = types.OpenAIEmbedderConfig;
 pub const OpenAIGeneratorConfig = types.OpenAIGeneratorConfig;
 pub const OpenRouterEmbedderConfig = types.OpenRouterEmbedderConfig;
+pub const OpenRouterGeneratorConfig = types.OpenRouterGeneratorConfig;
 pub const PackageArtifact = types.PackageArtifact;
 pub const PackageDependency = types.PackageDependency;
 pub const PackageKind = types.PackageKind;

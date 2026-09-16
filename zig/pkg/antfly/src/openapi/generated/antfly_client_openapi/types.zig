@@ -12886,6 +12886,7 @@ pub const GeneratorProvider = enum {
     vertex,
     ollama,
     openai,
+    openrouter,
     antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -12894,6 +12895,7 @@ pub const GeneratorProvider = enum {
             .vertex => "vertex",
             .ollama => "ollama",
             .openai => "openai",
+            .openrouter => "openrouter",
             .antfly => "antfly",
         };
         try jw.write(s);
@@ -12909,6 +12911,7 @@ pub const GeneratorProvider = enum {
             .{ "vertex", .vertex },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
+            .{ "openrouter", .openrouter },
             .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -18496,6 +18499,7 @@ pub const IndexConfig = struct {
 pub const IndexEmbedderConfig = union(enum) {
     ollama_embedder_config: OllamaEmbedderConfig,
     open_ai_embedder_config: OpenAIEmbedderConfig,
+    open_router_embedder_config: OpenRouterEmbedderConfig,
     bedrock_embedder_config: BedrockEmbedderConfig,
     cohere_embedder_config: CohereEmbedderConfig,
     google_embedder_config: GoogleEmbedderConfig,
@@ -18525,6 +18529,9 @@ pub const IndexEmbedderConfig = union(enum) {
         }
         if (std.mem.eql(u8, disc_str, "openai")) {
             return .{ .open_ai_embedder_config = try std.json.parseFromSliceLeaky(OpenAIEmbedderConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "openrouter")) {
+            return .{ .open_router_embedder_config = try std.json.parseFromSliceLeaky(OpenRouterEmbedderConfig, allocator, input, options) };
         }
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromSliceLeaky(BedrockEmbedderConfig, allocator, input, options) };
@@ -18564,6 +18571,9 @@ pub const IndexEmbedderConfig = union(enum) {
         if (std.mem.eql(u8, disc_str, "openai")) {
             return .{ .open_ai_embedder_config = try std.json.parseFromValueLeaky(OpenAIEmbedderConfig, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "openrouter")) {
+            return .{ .open_router_embedder_config = try std.json.parseFromValueLeaky(OpenRouterEmbedderConfig, allocator, source, options) };
+        }
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromValueLeaky(BedrockEmbedderConfig, allocator, source, options) };
         }
@@ -18586,6 +18596,7 @@ pub const IndexEmbedderConfig = union(enum) {
         switch (self) {
             .ollama_embedder_config => |v| try jw.write(v),
             .open_ai_embedder_config => |v| try jw.write(v),
+            .open_router_embedder_config => |v| try jw.write(v),
             .bedrock_embedder_config => |v| try jw.write(v),
             .cohere_embedder_config => |v| try jw.write(v),
             .google_embedder_config => |v| try jw.write(v),
@@ -25220,11 +25231,13 @@ pub const OpenAIGeneratorConfig = struct {
     }
 };
 
-/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
+/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. Antfly currently supports dense text embeddings through this provider. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
 pub const OpenRouterEmbedderConfig = struct {
     provider: []const u8,
     /// The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
     model: []const u8,
+    /// The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
+    url: ?[]const u8 = null,
     /// The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
     api_key: ?[]const u8 = null,
     /// Output dimension for the embedding (if supported by the model).
@@ -25234,6 +25247,7 @@ pub const OpenRouterEmbedderConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
         .{ "model", "model", false },
+        .{ "url", "url", true },
         .{ "api_key", "api_key", true },
         .{ "dimensions", "dimensions", true },
     };
@@ -25252,12 +25266,95 @@ pub const OpenRouterEmbedderConfig = struct {
         try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
             try jw.write(value);
         }
         if (self.dimensions) |value| {
             try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Configuration for the OpenRouter generative AI provider.
+pub const OpenRouterGeneratorConfig = struct {
+    provider: []const u8,
+    /// The OpenRouter model identifier to use.
+    model: []const u8,
+    /// The URL of the OpenRouter API endpoint.
+    url: ?[]const u8 = null,
+    /// The OpenRouter API key.
+    api_key: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", false },
+        .{ "url", "url", true },
+        .{ "api_key", "api_key", true },
+        .{ "temperature", "temperature", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "top_p", "top_p", true },
+        .{ "frequency_penalty", "frequency_penalty", true },
+        .{ "presence_penalty", "presence_penalty", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.frequency_penalty) |value| {
+            try jw.objectField("frequency_penalty");
+            try jw.write(value);
+        }
+        if (self.presence_penalty) |value| {
+            try jw.objectField("presence_penalty");
             try jw.write(value);
         }
         try jw.endObject();
