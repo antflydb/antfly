@@ -10421,7 +10421,7 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |*entry| {
             if (!entry.apply_mutex.tryLock()) continue;
             defer entry.apply_mutex.unlock();
-            if (entry.index.posting_refresh_clean_epoch == entry.index.published_mutation_epoch.load(.acquire)) continue;
+            if (!entry.index.postingRefreshPending()) continue;
             if (entry.index.resource_manager) |resources| if (resources.shouldDeferPostingRefreshForForegroundWrites()) continue;
             if (entry.index.treeLinkRepairPending() or
                 (if (entry.index.resource_manager) |resources| resources.dense_posting_row_deltas else @import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS")))

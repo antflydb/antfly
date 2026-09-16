@@ -443,3 +443,52 @@ and restart after cancellation. The remaining online ANN case reproduces the
 same query-15 neighbor difference documented above; its assertions are unchanged.
 The tested binary, logs and failed database root are retained under
 `.benchmark-results/vector-migration-review-20260916/fixes/`.
+
+
+## ANN comparison baseline and posting-refresh convergence
+
+The query-15 mismatch is reproducible without migration. On the preserved
+pre-fix executable, three immediate primary-LSM restarts retained `doc:000221`;
+five seconds idle then replaced it with `doc:002725`, exactly as in the migration
+failure. A phase-by-phase online run first changed during backfill, before
+ownership publication. Logs show one deferred posting repair. The same-index
+comparison after that maintenance settled preserved all 32 ordered top-ten
+lists through conversion and restart. The control scripts, logs and databases
+are under `.benchmark-results/vector-migration-review-20260916/`.
+
+The fixture confused replay completion with convergence of optional ANN work.
+Dirty posting payloads fall back to exact member scoring; clean postings can use
+quantized candidate selection. Consequently, the same corpus can have different
+approximate neighbors across an idle repair. Restart alone does not drain it.
+The earlier failures did not demonstrate missing source vectors or migration
+corruption, and repeated immediate queries were not a sufficient baseline gate.
+
+Index status now includes `hbc_posting.refresh_pending`. The bounded refresh
+scanner publishes an atomic certificate only after a clean sweep at the current
+mutation epoch. A partial/changed sweep stays pending, a write or abort
+invalidates the certificate, and reopen starts uncertified. Lightweight status,
+cached-status overlays and detailed diagnostics expose the same constant-cost
+observation; they do not scan the corpus to count dirty postings. Shard
+aggregation remains pending if any reported shard is pending or lacks the new
+observation. Read-only verification progress also invalidates runtime status so
+the final clean transition can be published without another repair. Query
+readiness and optional-maintenance scheduling remain separate.
+
+The E2E fixture first activates the lazily opened owner with a query, then waits
+for fresh, complete status and a clean refresh certificate. Status-only cold
+inspection can retire its temporary owner, so polling it alone does not request
+resident background maintenance. The fixture retains exact ordered-neighbor
+assertions, adds a no-migration restart control, and checks two post-operation
+restarts. Unit regressions cover partial sweeps, writes behind the cursor,
+aborted writes, reopen, cached observations and conservative shard aggregation.
+
+Validation after merging origin/main `1faa190bd2`: the packaged Debug build
+succeeded; all 13 focused refresh/status/stable-tip and merge-fixture tests
+passed, along with their 43 storage-owner boundary tests. The migration/recovery
+suite passed 31/31 with no leaks. The full production migration/vector-store
+suite passed 19/19, followed by three additional restart/online/offline rounds
+(9/9). All ordered-neighbor assertions remain exact. Earlier overlapping Zig
+targets collided on existing fixed `/tmp` fixture paths; the final combined
+unit invocation runs those dependencies once and passes. The tested binary,
+source patch, command driver and final logs are recorded in
+`.benchmark-results/vector-migration-review-20260916/REFRESH_QUALIFICATION.md`.

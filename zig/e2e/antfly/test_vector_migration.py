@@ -104,7 +104,27 @@ def finish(api, table, job, status=None, check=None):
     pytest.fail(f"migration did not finish: {status}")
 
 
-@pytest.mark.parametrize("mode", ["online", "offline"])
+def wait_for_ann_refresh(api, table, index, count, query):
+    """Activate the lazy owner, then wait for a verified clean posting sweep."""
+    api.query_table(
+        table, {"embeddings": {index: query}, "indexes": [index], "limit": 1}
+    )
+
+    def settled():
+        status = api.get_index(table, index).get("status", {})
+        return (
+            status.get("runtime_fresh") is True
+            and status.get("total_indexed") == count
+            and status.get("readiness", {}).get("complete") is True
+            and status.get("hbc_posting", {}).get("refresh_pending") is False
+        )
+
+    assert wait_until(settled, timeout_s=90, interval_s=0.1), json.dumps(
+        api.get_index(table, index), indent=2
+    )
+
+
+@pytest.mark.parametrize("mode", ["restart", "online", "offline"])
 def test_vector_migration_preserves_native_ann_neighbors(stateful_api, mode):
     """Compare the same built ANN before/after ownership conversion and restart."""
     api = stateful_api
@@ -152,9 +172,12 @@ def test_vector_migration_preserves_native_ann_neighbors(stateful_api, mode):
             for q in queries
         ]
 
-    # Stabilize persistence before taking the baseline: a different ANN build
-    # can have different recall even with identical input and query vectors.
+    # Replay completion and restart do not drain optional posting refresh.
+    # Dirty leaves use exact member scoring; repaired leaves use RaBitQ, so
+    # their approximate candidates can differ even with no storage migration.
+    # Certify a clean sweep after reopen before comparing the same ANN state.
     api.restart_server()
+    wait_for_ann_refresh(api, table, "model", 4096, queries[0])
     before = neighbors()
     assert all(len(hits) == 10 for hits in before)
     assert neighbors() == before
@@ -172,7 +195,7 @@ def test_vector_migration_preserves_native_ann_neighbors(stateful_api, mode):
             },
         )
         assert finish(api, table, "neighbors", status=status)["phase"] == "complete"
-    else:
+    elif mode == "offline":
         server = api._server
         api.pause_server()
         try:
@@ -203,6 +226,12 @@ def test_vector_migration_preserves_native_ann_neighbors(stateful_api, mode):
             api.resume_server()
     assert neighbors() == before
     api.restart_server()
+    wait_for_ann_refresh(api, table, "model", 4096, queries[0])
+    assert neighbors() == before
+    # A second reopen also checks the no-migration control and catches a
+    # baseline captured before deferred maintenance was actually certified.
+    api.restart_server()
+    wait_for_ann_refresh(api, table, "model", 4096, queries[0])
     assert neighbors() == before
 
 

@@ -4127,6 +4127,9 @@ pub fn freeAlgebraicAdaptiveProgress(alloc: Allocator, progress: []AlgebraicAdap
 }
 
 pub const HbcPostingStats = struct {
+    /// False only after a clean bounded sweep at the current mutation epoch.
+    /// Defaults conservatively when a runtime observation is unavailable.
+    refresh_pending: bool = true,
     scanned_nodes: u64 = 0,
     scanned_postings: u64 = 0,
     dirty_postings: u64 = 0,

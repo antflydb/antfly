@@ -32999,6 +32999,7 @@ pub const DB = struct {
                         item.node_count = hbc_stats.node_count;
                         item.root_node = hbc_stats.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
+                        item.hbc_posting.refresh_pending = entry.index.postingRefreshPending();
                     }
                     try self.populateConfiguredDerivedCoverageCounts(item.name, item);
                     visible_doc_count = @max(visible_doc_count, item.doc_count);
@@ -33856,6 +33857,7 @@ pub const DB = struct {
                         item.serving_snapshot_owner_id = self.backend_owner_id;
                         serving_observed = true;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
+                        item.hbc_posting.refresh_pending = entry.index.postingRefreshPending();
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
                     }
@@ -34105,6 +34107,7 @@ pub const DB = struct {
                         item.root_node = hbc_stats.root_node;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         item.hbc_posting = dbHbcPostingStats(try entry.index.postingBacklogStats(), entry.index.getWriteProfile());
+                        item.hbc_posting.refresh_pending = entry.index.postingRefreshPending();
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
                         if (async_indexing.dense_catch_up.active) {
                             item.catch_up_active = true;
@@ -90576,6 +90579,48 @@ test "db runUntilIdle drains lazy dense posting maintenance" {
         try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].hbc_posting.dirty_postings);
         try std.testing.expect(stats.indexes[0].hbc_posting.maintenance_repaired_postings > 0);
     }
+}
+
+test "db posting refresh status follows verification and invalidates cached observations" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"use_quantization\":false}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "a", .value = "{\"embedding\":[1.0,0.0]}" }},
+        .sync_level = .full_index,
+    });
+    const entry = db.core.denseIndex("dv_v1").?;
+    const manager = entry.index.resource_manager;
+    entry.index.resource_manager = null;
+    defer entry.index.resource_manager = manager;
+    try entry.index.markNodePostingDirtyForTest(entry.index.metadata.root_node);
+    {
+        const status = try db.runtimeStatusStatsConsistent(alloc);
+        defer types.freeDBStats(alloc, status);
+        try std.testing.expect(status.indexes[0].hbc_posting.refresh_pending);
+    }
+    for (0..16) |_| {
+        if (!(try entry.index.refreshPostingPayloadPage(1, 1)).pending) break;
+    }
+    try std.testing.expect(!entry.index.postingRefreshPending());
+    var cached = try db.runtimeStatusStatsConsistent(alloc);
+    defer types.freeDBStats(alloc, cached);
+    try std.testing.expect(!cached.indexes[0].hbc_posting.refresh_pending);
+    {
+        const diagnostic = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, diagnostic);
+        try std.testing.expect(!diagnostic.indexes[0].hbc_posting.refresh_pending);
+    }
+    try entry.index.markNodePostingDirtyForTest(entry.index.metadata.root_node);
+    try db.overlayRuntimeStatusConsistent(alloc, &cached);
+    try std.testing.expect(cached.indexes[0].hbc_posting.refresh_pending);
 }
 
 test "db posting refresh checks clean indexes without exclusive admission" {
