@@ -1155,6 +1155,8 @@ pub const StreamingEncoder = struct {
     block_smallest_key: []u8 = &.{},
     block_largest_namespace_name: ?[]u8 = null,
     block_largest_key: []u8 = &.{},
+    block_largest_namespace_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    block_largest_key_buffer: std.ArrayListUnmanaged(u8) = .empty,
     finished: bool = false,
 
     pub fn init(
@@ -1202,6 +1204,8 @@ pub const StreamingEncoder = struct {
         self.block_prefix_hashes.deinit(self.allocator);
         self.clearBlockSmallest();
         self.clearBlockLargest();
+        self.block_largest_namespace_buffer.deinit(self.allocator);
+        self.block_largest_key_buffer.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1219,8 +1223,8 @@ pub const StreamingEncoder = struct {
         bytes +|= self.blocks_owned_heap_bytes;
         if (self.block_smallest_namespace_name) |name| bytes +|= name.len;
         bytes +|= self.block_smallest_key.len;
-        if (self.block_largest_namespace_name) |name| bytes +|= name.len;
-        bytes +|= self.block_largest_key.len;
+        bytes +|= capacityBytes(u8, self.block_largest_namespace_buffer.capacity);
+        bytes +|= capacityBytes(u8, self.block_largest_key_buffer.capacity);
         return bytes;
     }
 
@@ -1312,6 +1316,7 @@ pub const StreamingEncoder = struct {
         if (entry_start_usize > max_entry_data_len or entry_len > max_entry_data_len - entry_start_usize) {
             return error.TableFileTooLarge;
         }
+        try self.reserveBlockLargest(if (entry.namespace_name) |name| name.len else 0, entry.key.len);
 
         if (self.block_start == null) {
             self.block_start = entry_start;
@@ -1449,17 +1454,28 @@ pub const StreamingEncoder = struct {
         self.block_smallest_key = &.{};
     }
 
+    fn reserveBlockLargest(self: *StreamingEncoder, namespace_len: usize, key_len: usize) !void {
+        defer {
+            if (self.block_largest_namespace_name != null) self.block_largest_namespace_name = self.block_largest_namespace_buffer.items;
+            self.block_largest_key = self.block_largest_key_buffer.items;
+        }
+        try self.block_largest_namespace_buffer.ensureTotalCapacity(self.allocator, namespace_len);
+        try self.block_largest_key_buffer.ensureTotalCapacity(self.allocator, key_len);
+    }
+
     fn setBlockLargest(self: *StreamingEncoder, entry: Entry) !void {
+        try self.reserveBlockLargest(if (entry.namespace_name) |name| name.len else 0, entry.key.len);
         self.clearBlockLargest();
-        self.block_largest_namespace_name = if (entry.namespace_name) |name| try self.allocator.dupe(u8, name) else null;
-        errdefer if (self.block_largest_namespace_name) |name| self.allocator.free(name);
-        self.block_largest_key = try self.allocator.dupe(u8, entry.key);
+        if (entry.namespace_name) |name| self.block_largest_namespace_buffer.appendSliceAssumeCapacity(name);
+        self.block_largest_key_buffer.appendSliceAssumeCapacity(entry.key);
+        self.block_largest_namespace_name = if (entry.namespace_name != null) self.block_largest_namespace_buffer.items else null;
+        self.block_largest_key = self.block_largest_key_buffer.items;
     }
 
     fn clearBlockLargest(self: *StreamingEncoder) void {
-        if (self.block_largest_namespace_name) |name| self.allocator.free(name);
+        self.block_largest_namespace_buffer.clearRetainingCapacity();
+        self.block_largest_key_buffer.clearRetainingCapacity();
         self.block_largest_namespace_name = null;
-        if (self.block_largest_key.len > 0) self.allocator.free(self.block_largest_key);
         self.block_largest_key = &.{};
     }
 
@@ -1505,19 +1521,17 @@ pub const StreamingEncoder = struct {
         const hash_slots = try self.allocator.alloc(u32, 0);
         errdefer self.allocator.free(hash_slots);
 
+        const largest_namespace_name = if (self.block_largest_namespace_name) |name| try self.allocator.dupe(u8, name) else null;
+        errdefer if (largest_namespace_name) |name| self.allocator.free(name);
+        const largest_key = try self.allocator.dupe(u8, self.block_largest_key);
+        errdefer self.allocator.free(largest_key);
         const smallest_namespace_name = self.block_smallest_namespace_name;
         self.block_smallest_namespace_name = null;
         const smallest_key = self.block_smallest_key;
         self.block_smallest_key = &.{};
-        const largest_namespace_name = self.block_largest_namespace_name;
-        self.block_largest_namespace_name = null;
-        const largest_key = self.block_largest_key;
-        self.block_largest_key = &.{};
         errdefer {
             if (smallest_namespace_name) |name| self.allocator.free(name);
             self.allocator.free(smallest_key);
-            if (largest_namespace_name) |name| self.allocator.free(name);
-            self.allocator.free(largest_key);
         }
 
         const next_completed_blocks_metadata_bytes = try checkedAddUsize(
@@ -1555,6 +1569,7 @@ pub const StreamingEncoder = struct {
         self.block_bytes.clearRetainingCapacity();
         self.block_hashes.clearRetainingCapacity();
         self.block_prefix_hashes.clearRetainingCapacity();
+        self.clearBlockLargest();
         self.block_start = null;
         self.block_entry_count = 0;
     }
@@ -3675,4 +3690,154 @@ test "table file legacy v3 index decoder is rejected" {
 
 test "table file codec rejects invalid header" {
     try std.testing.expectError(error.InvalidTableFile, decodeAlloc(std.testing.allocator, "bad"));
+}
+
+test "streaming table bounds avoid per-entry allocations" {
+    const allocator = std.testing.allocator;
+    var counting = std.testing.FailingAllocator.init(allocator, .{});
+    var sink_impl = MemoryTableSink.init(allocator);
+    defer sink_impl.deinit();
+    var sink = sink_impl.sink();
+    const entry_count = 4096;
+    var encoder = try StreamingEncoder.init(counting.allocator(), &sink, entry_count, .{
+        .block_compression = .none,
+        .prefix_extractor = .none,
+    });
+    defer encoder.deinit();
+
+    const allocations_before = counting.alloc_index;
+    for (0..entry_count) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, @intCast(i), .big);
+        try encoder.appendEntry(.{ .key = &key, .value = "", .tombstone = true });
+    }
+    var result = try encoder.finish();
+    defer result.filter.deinit(counting.allocator());
+
+    try std.testing.expectEqual(@as(usize, entry_count), result.entry_count);
+    try std.testing.expect(encoder.blocks.items.len > 1);
+    std.debug.print("\nSTREAMING_ALLOCATION_BOUND observed={d} exclusive_limit={d}\n", .{ counting.alloc_index - allocations_before, entry_count / 8 });
+    try std.testing.expect(counting.alloc_index - allocations_before < entry_count / 8);
+}
+
+test "streaming table bounds own mutable inputs across blocks" {
+    const allocator = std.testing.allocator;
+    const namespaces = [_]?[]const u8{ null, "", "docs", "namespace-long" };
+    const keys = [_][]const u8{ "", "aaaaaaaaaaaaaaaaaaaa", "b", "cc" };
+    const value = [_]u8{'v'} ** (default_block_size / 4);
+    var entries: [namespaces.len * keys.len]Entry = undefined;
+    for (&entries, 0..) |*entry, i| {
+        const tombstone = i % 3 == 1;
+        entry.* = .{
+            .namespace_name = namespaces[i / keys.len],
+            .key = keys[i % keys.len],
+            .value = if (tombstone) "" else &value,
+            .tombstone = tombstone,
+        };
+    }
+
+    for ([_]CompressionPolicy{ .none, .snappy_adaptive }) |policy| {
+        var sink_impl = MemoryTableSink.init(allocator);
+        defer sink_impl.deinit();
+        var sink = sink_impl.sink();
+        var encoder = try StreamingEncoder.init(allocator, &sink, entries.len, .{ .block_compression = policy });
+        defer encoder.deinit();
+
+        var namespace_buf: [32]u8 = undefined;
+        var key_buf: [32]u8 = undefined;
+        var value_buf: [value.len]u8 = undefined;
+        for (entries) |entry| {
+            const namespace_name = if (entry.namespace_name) |name| blk: {
+                @memcpy(namespace_buf[0..name.len], name);
+                break :blk namespace_buf[0..name.len];
+            } else null;
+            @memcpy(key_buf[0..entry.key.len], entry.key);
+            @memcpy(value_buf[0..entry.value.len], entry.value);
+            try encoder.appendEntry(.{
+                .namespace_name = namespace_name,
+                .key = key_buf[0..entry.key.len],
+                .value = value_buf[0..entry.value.len],
+                .tombstone = entry.tombstone,
+            });
+            @memset(&namespace_buf, 0xcc);
+            @memset(&key_buf, 0xcc);
+            @memset(&value_buf, 0xcc);
+        }
+        var result = try encoder.finish();
+        defer result.filter.deinit(allocator);
+        const encoded = try sink_impl.finishOwned();
+        defer allocator.free(encoded);
+
+        var filter = try buildFilterAlloc(allocator, &entries, default_filter_config);
+        defer filter.deinit(allocator);
+        const reference = try encodeWithFilterAllocOptions(allocator, &entries, filter, .{ .block_compression = policy });
+        defer allocator.free(reference);
+        try std.testing.expectEqualSlices(u8, reference, encoded);
+
+        var decoded = try decodeAlloc(allocator, encoded);
+        defer decoded.deinit(allocator);
+        try std.testing.expectEqual(entries.len, decoded.entries.len);
+        for (decoded.entries, entries) |actual, expected| {
+            const expected_namespace: ?[]const u8 = if (expected.namespace_name) |name| (if (name.len == 0) null else name) else null;
+            try std.testing.expectEqual(expected_namespace == null, actual.namespace_name == null);
+            if (expected_namespace) |name| try std.testing.expectEqualStrings(name, actual.namespace_name.?);
+            try std.testing.expectEqualStrings(expected.key, actual.key);
+            try std.testing.expectEqualSlices(u8, expected.value, actual.value);
+            try std.testing.expectEqual(expected.tombstone, actual.tombstone);
+        }
+
+        var index = try decodeIndexAlloc(allocator, encoded);
+        defer index.deinit(allocator);
+        try std.testing.expect(index.blockCount() > 1);
+        for (index.blocks) |block| {
+            const first = entries[block.first_entry_index];
+            const last = entries[block.lastEntryIndex()];
+            try std.testing.expectEqual(first.namespace_name == null, block.smallest_namespace_name == null);
+            if (first.namespace_name) |name| try std.testing.expectEqualStrings(name, block.smallest_namespace_name.?);
+            try std.testing.expectEqualStrings(first.key, block.smallest_key.?);
+            try std.testing.expectEqual(last.namespace_name == null, block.largest_namespace_name == null);
+            if (last.namespace_name) |name| try std.testing.expectEqualStrings(name, block.largest_namespace_name.?);
+            try std.testing.expectEqualStrings(last.key, block.largest_key);
+        }
+    }
+}
+
+test "streaming table largest bounds clean up allocation failures" {
+    const Fixture = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var sink_impl = MemoryTableSink.init(std.testing.allocator);
+            defer sink_impl.deinit();
+            var sink = sink_impl.sink();
+            var encoder = try StreamingEncoder.init(allocator, &sink, 4, .{});
+            defer encoder.deinit();
+
+            try encoder.setBlockLargest(.{ .key = "", .value = "" });
+            try encoder.setBlockLargest(.{ .namespace_name = "", .key = "a", .value = "" });
+            try encoder.setBlockLargest(.{ .namespace_name = "docs", .key = "long-key-before-growth", .value = "" });
+            try encoder.setBlockLargest(.{ .namespace_name = "namespace-after-growth", .key = "b", .value = "" });
+            try encoder.setBlockLargest(.{ .key = "c", .value = "" });
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "streaming table unnamed block publication cleans up allocation failures" {
+    const Fixture = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var sink_impl = MemoryTableSink.init(std.testing.allocator);
+            defer sink_impl.deinit();
+            var sink = sink_impl.sink();
+            var encoder = try StreamingEncoder.init(allocator, &sink, 4, .{ .block_compression = .none });
+            defer encoder.deinit();
+            const value = [_]u8{'v'} ** (default_block_size / 2);
+            for ([_][]const u8{ "", "aaaaaaaaaaaaaaaaaaaa", "b", "cc" }) |key| {
+                try encoder.appendEntry(.{ .key = key, .value = &value });
+            }
+            var result = try encoder.finish();
+            defer result.filter.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 4), result.entry_count);
+            try std.testing.expectEqual(@as(usize, 4), encoder.blocks.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
