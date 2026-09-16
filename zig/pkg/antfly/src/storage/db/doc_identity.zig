@@ -728,6 +728,16 @@ pub fn resolvedDocSetForIdsAtGenerationTxn(
     doc_ids: []const []const u8,
     generation: ?u64,
 ) !doc_set.ResolvedDocSet {
+    return resolvedDocSetForIdsAtGenerationWithPolicyTxn(alloc, txn, doc_ids, generation, .{});
+}
+
+pub fn resolvedDocSetForIdsAtGenerationWithPolicyTxn(
+    alloc: Allocator,
+    txn: anytype,
+    doc_ids: []const []const u8,
+    generation: ?u64,
+    policy: doc_set.BitmapPolicy,
+) !doc_set.ResolvedDocSet {
     const mutable_txn = txn;
     var ordinals = std.ArrayListUnmanaged(DocOrdinal).empty;
     defer ordinals.deinit(alloc);
@@ -757,7 +767,7 @@ pub fn resolvedDocSetForIdsAtGenerationTxn(
         return try doc_set.cloneDocKeysAlloc(alloc, fallback_doc_ids.items);
     }
     if (ordinals.items.len == 0) return .none;
-    return try doc_set.fromOrdinalsAlloc(alloc, ordinals.items);
+    return try doc_set.fromOrdinalsWithPolicyAlloc(alloc, ordinals.items, policy);
 }
 
 pub fn fastStatsFromStore(store: *docstore_mod.DocStore) !Stats {

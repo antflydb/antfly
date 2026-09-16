@@ -27276,9 +27276,19 @@ pub const DB = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) !doc_set.ResolvedDocSet {
+        return self.resolveDocSetForIdsNoLockAtGenerationWithPolicyAlloc(alloc, doc_ids, generation, .{});
+    }
+
+    fn resolveDocSetForIdsNoLockAtGenerationWithPolicyAlloc(
+        self: *DB,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+        policy: doc_set.BitmapPolicy,
+    ) !doc_set.ResolvedDocSet {
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
-        const resolved = try doc_identity.resolvedDocSetForIdsAtGenerationTxn(alloc, &txn, doc_ids, generation);
+        const resolved = try doc_identity.resolvedDocSetForIdsAtGenerationWithPolicyTxn(alloc, &txn, doc_ids, generation, policy);
         self.recordResolvedDocSet(&resolved, doc_ids.len > 0 and switch (resolved) {
             .doc_keys => true,
             else => false,
@@ -74492,6 +74502,14 @@ test "db explicit doc-id filter resolution honors identity generation" {
 }
 
 test "db doc set planning stats record ordinal bitmap promotion" {
+    try testDocSetBitmapPromotion(.{ .min_cardinality = 16 });
+}
+
+test "db doc set bitmap promotion production scale" {
+    try testDocSetBitmapPromotion(.{});
+}
+
+fn testDocSetBitmapPromotion(policy: doc_set.BitmapPolicy) !void {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -74514,7 +74532,7 @@ test "db doc set planning stats record ordinal bitmap promotion" {
         owned_doc_ids.deinit(alloc);
     }
 
-    for (0..doc_set.bitmap_min_cardinality) |i| {
+    for (0..policy.min_cardinality) |i| {
         const doc_id = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         errdefer alloc.free(doc_id);
         try owned_doc_ids.append(alloc, doc_id);
@@ -74524,18 +74542,31 @@ test "db doc set planning stats record ordinal bitmap promotion" {
 
     try db.batch(.{ .writes = writes.items });
 
-    var resolved = try db.resolveDocSetForIdsAlloc(alloc, doc_ids.items);
+    // Below the threshold must retain ordinal representation; crossing it
+    // must promote and increment the same production planning counters.
+    var below = blk: {
+        lockApplyShared(&db);
+        defer db.core.unlockApplyShared();
+        break :blk try db.resolveDocSetForIdsNoLockAtGenerationWithPolicyAlloc(alloc, doc_ids.items[0 .. doc_ids.items.len - 1], null, policy);
+    };
+    defer below.deinit(alloc);
+    try std.testing.expect(below == .ordinals);
+    var resolved = blk: {
+        lockApplyShared(&db);
+        defer db.core.unlockApplyShared();
+        break :blk try db.resolveDocSetForIdsNoLockAtGenerationWithPolicyAlloc(alloc, doc_ids.items, null, policy);
+    };
     defer resolved.deinit(alloc);
     switch (resolved) {
-        .ordinal_bitmap => |*bitmap| try std.testing.expectEqual(@as(usize, doc_set.bitmap_min_cardinality), bitmap.cardinality()),
+        .ordinal_bitmap => |*bitmap| try std.testing.expectEqual(@as(usize, policy.min_cardinality), bitmap.cardinality()),
         else => return error.ExpectedOrdinalBitmapDocSet,
     }
 
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.resolved_set_count);
+    try std.testing.expectEqual(@as(u64, 2), stats.doc_set_planning.resolved_set_count);
     try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.ordinal_bitmap_count);
-    try std.testing.expectEqual(@as(u64, doc_set.bitmap_min_cardinality), stats.doc_set_planning.ordinal_bitmap_docs);
+    try std.testing.expectEqual(@as(u64, policy.min_cardinality), stats.doc_set_planning.ordinal_bitmap_docs);
     try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.bitmap_promotion_count);
 }
 

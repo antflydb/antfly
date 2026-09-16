@@ -27827,10 +27827,15 @@ test "flat traversal does not treat a full candidate heap as a pruning proof" {
     });
     defer idx.close();
 
-    for (0..128) |i| {
-        const value: f32 = @floatFromInt(i + 1);
-        try idx.insert(@intCast(i + 1), &.{ value, 1 });
+    // Traversal needs a published directory with more than two leaves. A
+    // balanced build isolates that contract from adversarial binary insertion.
+    var vectors: [128][2]f32 = undefined;
+    var items: [128]BatchInsertItem = undefined;
+    for (&vectors, &items, 0..) |*vector, *item, i| {
+        vector.* = .{ @floatFromInt(i + 1), 1 };
+        item.* = .{ .vector_id = @intCast(i + 1), .vector = vector };
     }
+    try idx.bulkBuildWithMetadata(&items);
 
     var profiled = try idx.searchProfiledRequest(.{
         .query = &.{ 1, 0 },
@@ -27843,6 +27848,55 @@ test "flat traversal does not treat a full candidate heap as a pruning proof" {
     try std.testing.expectEqual(@as(u64, 2), profiled.profile.traversal_initial_wave_leaves);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
     try std.testing.expect(profiled.profile.leaves_explored > 2);
+}
+
+test "hbc monotone insertion has bounded split and save work" {
+    try testMonotoneInsertionWork(128, 16);
+}
+
+test "hbc binary monotone insertion production scale" {
+    try testMonotoneInsertionWork(128, 2);
+}
+
+fn testMonotoneInsertionWork(count: usize, fanout: u32) !void {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .metric = .inner_product,
+        .leaf_size = 8,
+        .branching_factor = fanout,
+        .search_width = 8,
+        .use_quantization = true,
+        .rerank_policy = .boundary,
+        .centroid_directory_mode = .flat_exact,
+        .flat_centroid_block_size = 4,
+        .flat_centroid_probe_count = 2,
+    });
+    defer idx.close();
+    for (0..count) |i| try idx.insert(@intCast(i + 1), &.{ @floatFromInt(i + 1), 1 });
+    const profile = idx.write_profile;
+    // Binary fanout permits unary internal nodes and quadratic split cascades.
+    // Keep its original adversarial fixture in the scale suite; ordinary
+    // fanout must stay within a linear work budget on the same ordered input.
+    const split_budget = if (fanout == 2) count * count / 16 else count;
+    const save_budget = if (fanout == 2) count * count / 4 else 8 * count;
+    try std.testing.expect(profile.split_leaf_calls <= count / 2);
+    try std.testing.expect(profile.split_internal_calls <= split_budget);
+    try std.testing.expect(profile.save_node_calls <= save_budget);
+    if (fanout != 2) try std.testing.expect(profile.range_nodes_examined <= 64 * count);
+    var result = try idx.searchProfiledRequest(.{
+        .query = &.{ 1, 0 },
+        .k = 1,
+        .search_width = 8,
+        .load_metadata = false,
+    });
+    defer result.results.deinit();
+    try std.testing.expectEqual(@as(u64, @intCast(count)), result.results.getHits()[0].vector_id);
+    if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+        std.debug.print("\nWORK insertion fanout={d} count={d} leaf_splits={d} internal_splits={d} saves={d} range_nodes={d}\n", .{ fanout, count, profile.split_leaf_calls, profile.split_internal_calls, profile.save_node_calls, profile.range_nodes_examined });
 }
 
 test "flat rabitq full effort exhausts an underfilled published directory" {

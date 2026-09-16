@@ -4814,6 +4814,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     release_blocker_regression_step.dependOn(&run_release_blocker_regression_tests.step);
     unit_test_step.dependOn(&run_release_blocker_regression_tests.step);
 
+    // A small independently compilable entry point for work-count regressions
+    // and repeated measurements. The ordinary storage gate also owns them.
+    const storage_work_contract_tests = b.addTest(.{
+        .name = "storage-work-contract-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "flat traversal does not treat a full candidate heap",
+            "hbc monotone insertion has bounded split and save work",
+            "lite restore staging accepts aflite input for normal restore",
+            "lite portable backup roundtrips through normal table backup APIs",
+            "storage.lite.native.test.",
+            "storage.lite.index_storage.test.",
+            "storage.db.doc_set.",
+            "db doc set planning stats record ordinal bitmap promotion",
+            "compaction phase handoff bounds memory and preserves epoch validation",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_storage_work_contract_tests = addCuratedTestRunArtifact(b, storage_work_contract_tests, storage_work_contract_tests.filters);
+    b.step("storage-work-contract-test", "Run storage boundary and bounded-work regressions").dependOn(&run_storage_work_contract_tests.step);
+
     const release_scale_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &release_scale_test_filters,
@@ -4822,10 +4843,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const run_release_scale_tests = addFilteredTestRunArtifact(b, release_scale_tests);
+    const run_release_scale_tests = addCuratedTestRunArtifact(b, release_scale_tests, &release_scale_test_filters);
     const release_scale_test_step = b.step(
         "release-scale-test",
-        "Run corpus-scale ANN and full-text release regressions",
+        "Run corpus-scale ANN, full-text, bitmap, and compaction regressions",
     );
     release_scale_test_step.dependOn(&run_release_scale_tests.step);
 
@@ -5188,13 +5209,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = 12 * 1024 * 1024 * 1024,
     });
     unit_storage_support_tests.step.dependOn(&unit_storage_shard_audit.step);
+    // Exclude the unit lane's fixed ownership set, not user-selected filters:
+    // using lib_unit_filters here makes focused storage runs skip themselves.
     const run_unit_storage_support_tests = b.addRunArtifact(unit_storage_support_tests);
     configureUnitStorageTestRun(
         b,
         run_unit_storage_support_tests,
         lib_storage_runtime_filters,
         !storage_runtime_filter_is_default,
-        lib_unit_filters,
+        &lib_unit_default_filters,
         &root_test_skip_filters,
         &.{},
         false,
@@ -5223,7 +5246,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         run_unit_storage_engine_tests,
         lib_storage_runtime_filters,
         !storage_runtime_filter_is_default,
-        lib_unit_filters,
+        &lib_unit_default_filters,
         &root_test_skip_filters,
         &.{},
         // This artifact owns HA, so do not apply the broad-root HA skip.
@@ -5365,7 +5388,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             run_unit_storage_db_core_tests,
             lib_storage_runtime_filters,
             true,
-            lib_unit_filters,
+            &lib_unit_default_filters,
             &root_test_skip_filters,
             &.{},
             false,

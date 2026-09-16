@@ -1897,6 +1897,11 @@ fn primeDeferredLeafNonQuantCacheWithAddedVectors(
 }
 
 pub fn computeNodeSplitRange(self: anytype, txn: anytype, node: *const types.Node, is_not_found: fn (anyerror) bool) !?types.NodeSplitRange {
+    const Index = switch (@typeInfo(@TypeOf(self))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(self),
+    };
+    if (comptime @hasField(Index, "write_profile")) self.write_profile.range_nodes_examined += 1;
     if (node.is_leaf) {
         var min_key: ?[]u8 = null;
         errdefer if (min_key) |key| self.alloc.free(key);
