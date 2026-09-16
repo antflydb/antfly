@@ -6088,6 +6088,7 @@ pub const BoundTableWriteSource = struct {
                 .repair_artifact_issues = repairArtifactIssues,
                 .repair_artifact_issues_controlled = repairArtifactIssuesControlled,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .vector_migration_group_local = vectorMigrationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
@@ -6182,6 +6183,15 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
         return try (try self.activeDb()).repairArtifactIssuesWithRequestOptions(alloc, req, options);
+    }
+
+    fn vectorMigrationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        _ = group_id;
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        var command = try std.json.parseFromSlice(@import("../common/vector_migration.zig").Command, alloc, request_json, .{});
+        defer command.deinit();
+        return try (try self.activeDb()).vectorMigrationCommand(alloc, command.value);
     }
 
     fn listArtifactRepairIssuesGroupLocal(
@@ -20628,6 +20638,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .vector_migration_group_local = vectorMigrationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
@@ -24887,6 +24898,19 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
+    fn vectorMigrationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime !control_only_storage_sources) {
+            if (self.localWriteOwnerSource()) |owner_source| return try owner_source.vectorMigrationGroupLocal(alloc, group_id, table_name, request_json);
+        }
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+        const owner_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+        return try owner_source.vectorMigrationGroupLocal(alloc, group_id, table_name, request_json);
+    }
+
     fn listArtifactRepairIssuesGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -25744,6 +25768,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .vector_migration_group_local = vectorMigrationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
@@ -27463,6 +27488,12 @@ pub const HostedProvisionedTableWriteSource = struct {
             self.invalidateManagedCache(table_name);
         }
         return result;
+    }
+
+    fn vectorMigrationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+        return try owner_source.vectorMigrationGroupLocal(alloc, group_id, table_name, request_json);
     }
 
     fn listArtifactRepairIssuesGroupLocal(
@@ -49587,8 +49618,8 @@ fn implementationTests() type {
 
             const FakeEmbeddingProvider = struct {
                 request_count: std.atomic.Value(u32) = .init(0),
-                rate_limited_count: std.atomic.Value(u32) = .init(0),
-                allow_all: std.atomic.Value(bool) = .init(false),
+                entered: std.Io.Event = .unset,
+                release: std.Io.Event = .unset,
 
                 fn vectorForInput(input: std.json.Value) []const u8 {
                     if (jsonValueContainsText(input, "alpha")) return "[1,0,0]";
@@ -49641,17 +49672,8 @@ fn implementationTests() type {
                     defer parsed_req.deinit();
 
                     _ = self.request_count.fetchAdd(1, .monotonic);
-                    if (!self.allow_all.load(.acquire)) {
-                        _ = self.rate_limited_count.fetchAdd(1, .monotonic);
-                        const body = try arena.dupe(u8,
-                            \\{"error":{"message":"rate limited","type":"rate_limit_exceeded"}}
-                        );
-                        return .{
-                            .status = 429,
-                            .content_type = try arena.dupe(u8, "application/json"),
-                            .body = body,
-                        };
-                    }
+                    self.entered.set(std.testing.io);
+                    self.release.waitUncancelable(std.testing.io);
 
                     const body = try successBody(arena, parsed_req.value.input);
                     return .{
@@ -49662,7 +49684,7 @@ fn implementationTests() type {
                 }
 
                 fn allowAll(self: *@This()) void {
-                    self.allow_all.store(true, .release);
+                    self.release.set(std.testing.io);
                 }
             };
 
@@ -49739,6 +49761,9 @@ fn implementationTests() type {
             source.read_cache = &read_cache;
             source.write_cache = &write_cache;
             source.backend_runtime = backend_runtime.ptr();
+            // Release blocked HTTP work before source/cache shutdown, including
+            // assertion failures while the initial cached reader is inspected.
+            defer embedding_provider.allowAll();
 
             _ = try source.source().batch(alloc, "docs", .{
                 .writes = &.{
@@ -49749,11 +49774,9 @@ fn implementationTests() type {
                 .sync_level = .write,
             });
 
-            var attempts: usize = 0;
-            while (attempts < 100 and embedding_provider.rate_limited_count.load(.monotonic) == 0) : (attempts += 1) {
-                sleepNs(50 * std.time.ns_per_ms);
-            }
-            try std.testing.expect(embedding_provider.rate_limited_count.load(.monotonic) > 0);
+            // Hold the response until the stale reader exists. Returning 429
+            // here couples cache invalidation to unrelated provider backoff.
+            try embedding_provider.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } });
 
             const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
             defer alloc.free(db_path);
@@ -49770,14 +49793,15 @@ fn implementationTests() type {
                     .limit = 3,
                 });
                 defer initial.deinit();
-                try std.testing.expect(initial.total_hits < 3);
+                try std.testing.expectEqual(@as(u32, 0), initial.total_hits);
             }
 
             embedding_provider.allowAll();
 
             var ready = false;
-            attempts = 0;
-            while (attempts < 200) : (attempts += 1) {
+            var last_total_hits: u32 = 0;
+            const deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
+            while (platform_time.monotonicNs() < deadline_ns) {
                 {
                     var read_lease = try read_cache.getOrOpen(db_path, FakeCatalog.iface(), 7001, 0, "docs");
                     defer read_lease.release();
@@ -49791,6 +49815,7 @@ fn implementationTests() type {
                         .limit = 3,
                     });
                     defer result.deinit();
+                    last_total_hits = result.total_hits;
                     if (result.total_hits == 3 and result.hits.len == 3) {
                         try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
                         ready = true;
@@ -49801,6 +49826,7 @@ fn implementationTests() type {
                 sleepNs(25 * std.time.ns_per_ms);
             }
 
+            if (!ready) std.debug.print("managed dense visibility timed out: provider_requests={d} cached_total_hits={d}\n", .{ embedding_provider.request_count.load(.monotonic), last_total_hits });
             try std.testing.expect(ready);
         }
 
@@ -52323,7 +52349,7 @@ fn implementationTests() type {
                     source: *ProvisionedTableWriteSource,
                     cache: *runtime_status.TableRuntimeSnapshotCache,
                     fenced: bool = false,
-                    clear_publications: usize = 0,
+                    enabled: bool = true,
 
                     fn run(ptr: *anyopaque) void {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -52334,14 +52360,12 @@ fn implementationTests() type {
                         else
                             false;
                         self.source.table_activity_mutex.unlock(io);
-                        if (!clear_observed) return;
-                        self.clear_publications += 1;
-                        // Fence both the clear callback's publication and the
-                        // caller's final consistent publication. The next scheduler
-                        // pass must own recovery of the still-pending handoff.
-                        if (self.clear_publications > 2) return;
+                        if (!self.enabled or !clear_observed) return;
+                        // Fence every actual publication in this repair quantum.
+                        // The best-effort clear callback can skip publication on
+                        // WriterLocked, so a fixed callback count is not a barrier.
                         self.cache.invalidateTable("docs");
-                        self.fenced = self.clear_publications == 2;
+                        self.fenced = true;
                     }
                 };
                 var publication_fence = PublicationFence{ .source = &source, .cache = &snapshot_cache };
@@ -52349,6 +52373,7 @@ fn implementationTests() type {
                     source: *ProvisionedTableWriteSource,
                     indexes_json: []const u8,
                     namespace: doc_identity.Namespace,
+                    publication_fence: *PublicationFence,
                     attempted_repair: bool = false,
                     repaired: bool = false,
                     repair_passes: usize = 0,
@@ -52371,6 +52396,18 @@ fn implementationTests() type {
                                 self.err = err;
                                 return;
                             };
+                            if (self.publication_fence.enabled and self.publication_fence.fenced) {
+                                // A fenced completion must retain the handoff for
+                                // another admitted owner, even if durable repair
+                                // itself completed in this quantum.
+                                if (!repair.index_repair_pending or
+                                    !self.source.structuralStatusSnapshotOnlyBestEffort("docs"))
+                                {
+                                    self.err = error.TestUnexpectedResult;
+                                    return;
+                                }
+                                self.publication_fence.enabled = false;
+                            }
                             if (repair.index_repair_repaired or repair.cleared_debt) {
                                 var resident = self.source.residentDbSource().leaseGroup(
                                     std.testing.allocator,
@@ -52404,6 +52441,7 @@ fn implementationTests() type {
                     .source = &source,
                     .indexes_json = indexes_json,
                     .namespace = namespace,
+                    .publication_fence = &publication_fence,
                 };
                 // Snapshot-only status is observational and cannot delay the cold
                 // repair owner. The repair's clear plus final cached publication must

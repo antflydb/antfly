@@ -18,6 +18,7 @@ function fixture() {
   const context = {repo: {owner: 'acme', repo: 'project'}, eventName: 'issue_comment',
     ref: 'refs/heads/main', runId: 91, apiUrl: 'https://api.github.com',
     payload: {action: 'created', repository, issue: {number: 7, pull_request: {}, labels: []}, comment}};
+  const statuses = [];
   const checks = [], dispatches = [], cancelled = [], runs = [], outputs = {}, notices = [];
   let permission = 'write';
   let files = [{filename: 'docs/guide.md'}];
@@ -41,7 +42,7 @@ function fixture() {
       },
     },
     issues: {getComment: async () => ({data: structuredClone(comment)})},
-    repos: {getCollaboratorPermissionLevel: async () => {
+    repos: {createCommitStatus: async body => {statuses.push(structuredClone(body));}, getCollaboratorPermissionLevel: async () => {
       if (typeof permission === 'number') throw Object.assign(new Error('Permission lookup failed'), {status: permission});
       return {data: {permission}};
     }},
@@ -55,7 +56,7 @@ function fixture() {
   }, paginate: async (method, args) => method(args)};
   const core = {setOutput: (k,v) => {outputs[k]=v;}, notice: msg => notices.push(msg)};
   const env = {PR_NUMBER: '7', CHECK_ID: '1', COMMENT_ID: '17', HEAD_SHA: SHA, BASE_SHA: BASE};
-  return {pr, comment, context, checks, dispatches, cancelled, runs, outputs, env, github,
+  return {pr, comment, context, checks, statuses, notices, dispatches, cancelled, runs, outputs, env, github,
     permission: value => {permission = value;}, files: value => {files = value;},
     jobs: value => {jobs = value;},
     call: (mode='event') => main({github, context, core, mode, config, env}),
@@ -98,6 +99,42 @@ test('approval is consumed once, uses the default branch, and publishes on the P
   f.finish(); await f.call();
   assert.equal(f.checks[0].conclusion,'success');
   await assert.rejects(f.call('verify'),/expired/);
+});
+
+test('PR checks link to the admitted run through completion and revocation', async t => {
+  for (const outcome of ['success', 'failure', 'cancelled', 'revoked']) {
+    await t.test(outcome, async () => {
+      const f = fixture();
+      await f.call();
+      assert.equal(f.checks[0].details_url, undefined);
+      assert.ok(!f.checks[0].output.summary.includes('View CI run'));
+      await f.call('admit');
+      const url = 'https://github.com/acme/project/actions/runs/91';
+      const assertLink = () => {
+        assert.equal(f.checks[0].details_url, url);
+        assert.ok(f.checks[0].output.summary.endsWith(`[View CI run](${url})`));
+        assert.equal(JSON.parse(f.checks[0].output.text).run_id, 91);
+      };
+      assertLink();
+      if (outcome === 'revoked') {
+        f.context.payload.action = 'edited';
+      } else {
+        f.finish();
+        f.context.payload.workflow_run.conclusion = outcome;
+      }
+      await f.call();
+      assert.equal(f.checks[0].status, 'completed');
+      assertLink();
+    });
+  }
+});
+
+test('run links use the configured GitHub server', async () => {
+  const f = fixture();
+  f.context.serverUrl = 'https://github.example.com';
+  await f.call();
+  await f.call('admit');
+  assert.equal(f.checks[0].details_url, 'https://github.example.com/acme/project/actions/runs/91');
 });
 
 test('writers, maintainers, and admins approve using the default token, including outside collaborators', async t => {
@@ -175,6 +212,10 @@ test('a fresh approval revokes the old run; a late completion cannot pass it', a
   assert.deepEqual(f.cancelled,[91]);
   assert.equal(f.checks[0].conclusion,'action_required');
   assert.equal(f.checks[1].status,'queued');
+  assert.equal(f.checks[1].details_url, undefined);
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.ok(f.statuses.at(-1).target_url.includes('/actions/workflows/'));
+  assert.ok(!f.checks[1].output.summary.includes('View CI run'));
   f.finish(); await f.call();
   assert.equal(f.checks[1].status,'queued');
   assert.equal(JSON.parse(f.checks[1].output.text).comment_id,18);
@@ -284,7 +325,11 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
     }
     const checkouts=text.match(/uses: actions\/checkout@[^\n]+\n[\s\S]*?(?=\n      -|$)/g)||[];
     for (const checkout of checkouts) {
-      assert.match(checkout,/ref: \$\{\{ inputs.head_sha \|\| github.sha \}\}/);
+      if (suite.id === 'policy' && /path: trusted-ci\n/.test(checkout)) {
+        assert.match(checkout,/ref: \$\{\{ github.workflow_sha \}\}/);
+      } else {
+        assert.match(checkout,/ref: \$\{\{ inputs.head_sha \|\| github.sha \}\}/);
+      }
       assert.match(checkout,/persist-credentials: false/);
     }
   }
@@ -296,6 +341,13 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
       assert.doesNotMatch(text,/secrets: inherit/,file);
     }
   }
+});
+
+test('policy validates the executing workflow even when a release predates the controller', () => {
+  const text=fs.readFileSync(path.resolve(__dirname,'../workflows/pr-ci-policy.yml'),'utf8');
+  assert.match(text,/ref: \$\{\{ github.workflow_sha \}\}\n\s+path: trusted-ci/);
+  assert.match(text,/name: Test executing CI policy\n\s+working-directory: trusted-ci\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
+  assert.match(text,/name: Test proposed CI policy when present\n\s+if: \$\{\{ hashFiles\('\.github\/scripts\/pr-ci.test.cjs'\) != '' \}\}\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
 });
 
 // The live rollout first creates an action_required check before an approval.
@@ -338,4 +390,134 @@ test('finalizer rejects other approval inputs and cannot restore a revoked check
   f.env.CHECK_ID='1';
   f.checks[0].output.text=JSON.stringify({...JSON.parse(f.checks[0].output.text),revoked:true});
   await f.call('complete'); assert.notEqual(f.checks[0].conclusion,'success');
+});
+
+
+test('PR CI gate status links queued approval to listing and admitted run to jobs', async () => {
+  const f = fixture();
+  await f.call();
+  assert.deepEqual(f.statuses.at(-1), {
+    owner: 'acme', repo: 'project', sha: SHA, context: 'PR CI gate', state: 'pending',
+    target_url: 'https://github.com/acme/project/actions/workflows/pr-ci.yml?query=PR%20CI%20%237%20%2F',
+    description: 'CI queued; view workflow runs',
+  });
+  await f.call('admit');
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/91');
+  f.finish(); await f.call();
+  assert.equal(f.statuses.at(-1).state, 'success');
+  assert.equal(f.statuses.at(-1).sha, SHA);
+});
+
+test('PR CI gate status reflects failure, dispatch failure, and invalidated approval', async t => {
+  for (const outcome of ['failure', 'dispatch failure', 'revoked']) await t.test(outcome, async () => {
+    const f = fixture();
+    if (outcome === 'dispatch failure') {
+      f.github.rest.actions.createWorkflowDispatch = async () => {throw new Error('dispatch failed');};
+      await assert.rejects(f.call(), /dispatch failed/);
+    } else {
+      await f.call(); await f.call('admit');
+      if (outcome === 'revoked') {
+        f.context.payload.action = 'edited';
+      } else {
+        f.finish(); f.context.payload.workflow_run.conclusion = 'failure';
+      }
+      await f.call();
+    }
+    assert.equal(f.statuses.at(-1).state, outcome === 'revoked' ? 'error' : 'failure');
+    assert.notEqual(f.checks.at(-1).conclusion, 'success');
+  });
+});
+
+test('PR CI gate supports enterprise URLs', async () => {
+  const f = fixture(); f.context.serverUrl = 'https://github.example.com';
+  await f.call();
+  assert.ok(f.statuses.at(-1).target_url.startsWith('https://github.example.com/'));
+  await f.call('admit');
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.example.com/acme/project/actions/runs/91');
+});
+
+test('gate publication failure prevents dispatch and approval consumption', async () => {
+  const f = fixture();
+  f.github.rest.repos.createCommitStatus = async () => {throw new Error('permission denied');};
+  await assert.rejects(f.call(), /permission denied/);
+  assert.equal(f.dispatches.length, 0);
+  assert.equal(f.checks.at(-1).status, 'queued');
+  await assert.rejects(f.call('admit'), /permission denied/);
+  assert.equal(JSON.parse(f.checks.at(-1).output.text).run_id, undefined);
+});
+
+test('gate publication failure cannot publish a successful check', async () => {
+  const f = fixture(); await f.call(); await f.call('admit'); f.finish();
+  f.github.rest.repos.createCommitStatus = async () => {throw new Error('status unavailable');};
+  await assert.rejects(f.call(), /status unavailable/);
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.notEqual(f.checks.at(-1).conclusion, 'success');
+});
+
+test('gate invalidation replaces success on the same head', async () => {
+  const f = fixture(); await f.call(); await f.call('admit'); f.finish(); await f.call();
+  assert.equal(f.statuses.at(-1).state, 'success');
+  f.context.eventName = 'pull_request_target';
+  f.context.payload.action = 'converted_to_draft'; f.pr.draft = true;
+  await f.call();
+  assert.equal(f.statuses.at(-1).context, 'PR CI gate');
+  assert.equal(f.statuses.at(-1).sha, SHA);
+  assert.equal(f.statuses.at(-1).state, 'error');
+});
+
+
+test('dispatch returns an exact queued link without consuming admission', async () => {
+  const f = fixture();
+  f.github.rest.actions.createWorkflowDispatch = async body => {
+    f.dispatches.push(body);
+    return {data: {workflow_run_id: 91}};
+  };
+  await f.call();
+  assert.equal(f.dispatches[0].return_run_details, true);
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/91');
+  assert.equal(f.statuses.at(-1).description, 'CI queued; view workflow runs');
+  assert.equal(f.checks.at(-1).status, 'queued');
+  assert.equal(JSON.parse(f.checks.at(-1).output.text).run_id, undefined);
+  assert.equal(JSON.parse(f.checks.at(-1).output.text).dispatched_run_id, 91);
+  await f.call(); assert.equal(f.dispatches.length, 1);
+  f.context.runId = 92;
+  await assert.rejects(f.call('admit'), /another dispatched run/);
+  f.context.runId = 91;
+  await f.call('admit');
+  assert.equal(f.checks.at(-1).status, 'in_progress');
+  f.finish(); await f.call();
+  assert.equal(f.statuses.at(-1).state, 'success');
+});
+
+test('queued dispatch cannot pass without admission or finish from another run', async () => {
+  const f = fixture();
+  f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: 91}});
+  await f.call(); f.finish(); f.context.payload.workflow_run.id = 92;
+  await f.call();
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  f.context.payload.workflow_run.id = 91;
+  await f.call();
+  assert.equal(f.statuses.at(-1).state, 'failure');
+});
+
+test('invalid dispatch IDs fail closed', async () => {
+  for (const id of [null, 0, -1, '91', 1.5]) {
+    const f = fixture();
+    f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: id}});
+    await assert.rejects(f.call(), /Invalid dispatched run ID/);
+    assert.equal(f.statuses.at(-1).state, 'failure');
+  }
+});
+
+test('queued run link is replaced on a fresh approval', async () => {
+  const f = fixture();
+  let id = 91;
+  f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: id}});
+  await f.call();
+  f.comment.id = 18; id = 92;
+  await f.call();
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/92');
+  assert.equal(f.checks.at(-1).status, 'queued');
 });

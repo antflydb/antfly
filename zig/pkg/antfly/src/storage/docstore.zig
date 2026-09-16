@@ -377,6 +377,10 @@ fn columnarMutationToken(txn: anytype, cached: *?internal_keys.ColumnarMutationT
 
 pub const DocStore = struct {
     payload_store: ?artifact_payload.Store = null,
+    payload_capture_inline: bool = false,
+    payload_migration_allowance: ?u64 = null,
+    payload_policy_mutex: std.atomic.Mutex = .unlocked,
+    payload_recovery_required: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     /// Process-local wake hint, published only after successful row/schema
     /// commits. Durable mutation IDs and timers remain the restart authority.
@@ -511,7 +515,13 @@ pub const DocStore = struct {
 
         pub fn get(self: *Txn, key: []const u8) ![]const u8 {
             const value = try self.getPhysical(key);
-            return if (self.payload_session) |session| try session.get(key, value) else value;
+            if (self.payload_session) |session| return try session.get(key, value);
+            // A live probe admitted before migration may observe a later
+            // reference. Retry with a new source lease; never leak its encoding
+            // or acquire a lease after reading a potentially retired reference.
+            if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(value))
+                return error.VectorMigrationReadEpochChanged;
+            return value;
         }
 
         pub fn getArtifactMetadata(self: *Txn, key: []const u8) !artifact_payload.Metadata {
@@ -541,7 +551,13 @@ pub const DocStore = struct {
         /// Short-lived value lease, released when this transaction aborts.
         /// Immutable LSM bytes may be pinned rather than copied.
         pub fn getLeased(self: *Txn, key: []const u8) ![]const u8 {
-            if (self.probe) |*probe| return try probe.getLeased(key);
+            if (self.probe) |*probe| {
+                const value = try probe.getLeased(key);
+                if (self.payload_session) |session| return try session.get(key, value);
+                if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(value))
+                    return error.VectorMigrationReadEpochChanged;
+                return value;
+            }
             return try self.get(key);
         }
 
@@ -569,7 +585,10 @@ pub const DocStore = struct {
                 for (keys, values) |key, *value| if (value.*) |raw| {
                     value.* = try session.get(key, raw);
                 };
-            }
+            } else for (keys, values) |key, value| if (value) |raw| {
+                if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(raw))
+                    return error.VectorMigrationReadEpochChanged;
+            };
         }
 
         pub fn getManySortedPhysical(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
@@ -612,7 +631,10 @@ pub const DocStore = struct {
                     for (keys, values) |key, *value| if (value.*) |raw| {
                         value.* = try session.get(key, raw);
                     };
-                }
+                } else for (keys, values) |key, value| if (value) |raw| {
+                    if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(raw))
+                        return error.VectorMigrationReadEpochChanged;
+                };
                 return;
             }
             return try self.getManySorted(keys, values);
@@ -645,7 +667,7 @@ pub const DocStore = struct {
                 }
             }
             const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-            try self.write.?.put(key, stored);
+            try self.write.?.put(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
             if (self.payload_session) |session| try session.recordOwnership(&self.write.?, key, stored);
         }
 
@@ -701,7 +723,7 @@ pub const DocStore = struct {
         fn openCursorAdapter(self: *Txn) !CursorAdapter {
             var cursor_adapter = try self.openPhysicalCursorAdapter();
             errdefer cursor_adapter.close();
-            return try wrapPayloadCursor(self.alloc, cursor_adapter, self.payload_session);
+            return try wrapPayloadCursor(self.alloc, cursor_adapter, self.payload_session, self.current_scan != null or self.probe != null);
         }
 
         pub fn openPhysicalCursorAdapter(self: *Txn) !CursorAdapter {
@@ -761,7 +783,13 @@ pub const DocStore = struct {
                     if (self.raw) |raw| return try raw.get(self.dbi, key);
                 }
                 const value = try self.runtime.?.get(key);
-                return if (self.payload_session) |session| try session.get(key, value) else value;
+                if (self.payload_session) |session| return try session.get(key, value);
+                // A live probe admitted before migration may observe a later
+                // reference. Retry with a new source lease; never leak its encoding
+                // or acquire a lease after reading a potentially retired reference.
+                if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(value))
+                    return error.VectorMigrationReadEpochChanged;
+                return value;
             }
 
             pub fn getManySorted(self: @This(), keys: []const []const u8, values: []?[]const u8) !void {
@@ -796,7 +824,7 @@ pub const DocStore = struct {
                     }
                 }
                 const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-                try self.runtime.?.put(key, stored);
+                try self.runtime.?.put(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
@@ -817,7 +845,7 @@ pub const DocStore = struct {
                     if (self.raw != null) return error.Unsupported;
                 }
                 const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-                try self.runtime.?.appendPut(key, stored);
+                try self.runtime.?.appendPut(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
@@ -862,7 +890,7 @@ pub const DocStore = struct {
                 }
                 var physical = try self.runtime.?.openCursor();
                 errdefer physical.close();
-                return try wrapPayloadCursor(self.alloc, physical, self.payload_session);
+                return try wrapPayloadCursor(self.alloc, physical, self.payload_session, false);
             }
 
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
@@ -1155,18 +1183,21 @@ pub const DocStore = struct {
 
     const PayloadCursor = struct {
         physical: backend_erased.Cursor,
-        session: *artifact_payload.Session,
+        session: ?*artifact_payload.Session,
         arena: std.heap.ArenaAllocator,
 
         pub fn close(self: *@This()) void {
             self.physical.close();
             self.arena.deinit();
-            self.session.release();
+            if (self.session) |session| session.release();
         }
         fn resolve(self: *@This(), entry: ?backend_erased.Entry) !?backend_erased.Entry {
             _ = self.arena.reset(.retain_capacity);
             const value = entry orelse return null;
-            return .{ .key = value.key, .value = try self.session.getAlloc(self.arena.allocator(), value.key, value.value) };
+            if (self.session) |session| return .{ .key = value.key, .value = try session.getAlloc(self.arena.allocator(), value.key, value.value) };
+            if (artifact_payload.isEmbeddingKey(value.key) and artifact_payload.isReference(value.value))
+                return error.VectorMigrationReadEpochChanged;
+            return value;
         }
         pub fn first(self: *@This()) !?backend_erased.Entry {
             return self.resolve(try self.physical.first());
@@ -1191,15 +1222,39 @@ pub const DocStore = struct {
         }
     };
 
-    fn wrapPayloadCursor(alloc: Allocator, physical: backend_erased.Cursor, session: ?*artifact_payload.Session) !backend_erased.Cursor {
-        const owner = session orelse return physical;
-        owner.retain();
-        errdefer owner.release();
+    fn wrapPayloadCursor(alloc: Allocator, physical: backend_erased.Cursor, session: ?*artifact_payload.Session, live: bool) !backend_erased.Cursor {
+        if (session == null and !live) return physical;
+        if (session) |owner| owner.retain();
+        errdefer if (session) |owner| owner.release();
         return try backend_erased.cursorFrom(alloc, PayloadCursor{
             .physical = physical,
-            .session = owner,
+            .session = session,
             .arena = std.heap.ArenaAllocator.init(alloc),
         });
+    }
+
+    fn lockPayloadPolicy(self: *DocStore) void {
+        while (!self.payload_policy_mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// DB apply admission excludes writers. Reader admission holds this mutex
+    /// until its primary view and source lease have both been captured.
+    pub fn configurePayloadPolicy(self: *DocStore, store: ?artifact_payload.Store, capture_inline: bool, migration_allowance: ?u64) void {
+        self.lockPayloadPolicy();
+        defer self.payload_policy_mutex.unlock();
+        self.payload_store = store;
+        self.payload_capture_inline = capture_inline;
+        self.payload_migration_allowance = migration_allowance;
+    }
+
+    fn createPayloadSession(self: *DocStore) !?*artifact_payload.Session {
+        if (self.payload_recovery_required.load(.acquire)) return error.VectorMigrationRecoveryRequired;
+        if (self.kind != .runtime) return null;
+        const store = self.payload_store orelse return null;
+        const session = try artifact_payload.Session.create(self.alloc, store);
+        session.capture_inline = self.payload_capture_inline;
+        session.migration_allowance = self.payload_migration_allowance;
+        return session;
     }
 
     pub fn beginReadTxn(self: *DocStore) !Txn {
@@ -1233,7 +1288,9 @@ pub const DocStore = struct {
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
-        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        if (self.kind == .runtime) self.lockPayloadPolicy();
+        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
@@ -1288,7 +1345,9 @@ pub const DocStore = struct {
     ) !Txn {
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
-        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        if (self.kind == .runtime) self.lockPayloadPolicy();
+        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         var txn: Txn = switch (self.kind) {
             // The outer probe transaction already owns the portable-import
@@ -1313,7 +1372,9 @@ pub const DocStore = struct {
     pub fn beginCurrentScanTxn(self: *DocStore) !Txn {
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
-        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        if (self.kind == .runtime) self.lockPayloadPolicy();
+        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         var txn: Txn = switch (self.kind) {
             .lmdb => try self.beginReadTxnUnchecked(),
@@ -1334,7 +1395,9 @@ pub const DocStore = struct {
         if (!(try self.hasReplayEntries())) return error.ReplayIndexUnavailable;
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
-        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        if (self.kind == .runtime) self.lockPayloadPolicy();
+        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         var txn: Txn = switch (self.kind) {
             .lmdb => try self.beginReadTxnUnchecked(),
@@ -1350,7 +1413,9 @@ pub const DocStore = struct {
 
     pub fn beginWriteTxn(self: *DocStore) !Txn {
         try self.ensurePortableImportOperational();
-        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        if (self.kind == .runtime) self.lockPayloadPolicy();
+        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
@@ -1379,7 +1444,9 @@ pub const DocStore = struct {
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
         try self.ensurePortableImportOperational();
-        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        if (self.kind == .runtime) self.lockPayloadPolicy();
+        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {

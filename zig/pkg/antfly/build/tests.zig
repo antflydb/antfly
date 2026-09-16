@@ -1323,6 +1323,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "backup heartbeat ",
         "table storage creation intent survives",
         "model-directed",
         "tool query builder",
@@ -1438,6 +1439,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "runtime HTTP streaming carries policy headers before commitment across both adapters",
         "linked API route manifest preserves internal scan response streaming",
         "scan stream preserves chunk backpressure without buffered fallback",
+        "imported runtime I/O views override raw runtime including unavailable views",
+        "API imported runtime capability struct retains versioned C layout",
+        "API kernel create ",
+        "API kernel failed fallible create releases unpublished state",
+        "API kernel runtime I/O ",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const api_http_runtime_tests = b.addTest(.{
@@ -2217,6 +2223,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
     lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
+
+    const vector_migration_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"source vector migration"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("vector-migration-test", "Run source ownership migration and recovery tests").dependOn(&b.addRunArtifact(vector_migration_tests).step);
 
     const resource_budget_runtime_filters = [_][]const u8{
         "default tokenizer cache budget is aligned with its resource slice",
@@ -4965,6 +4978,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.transform.",
             "storage.db.typed_doc_values_coverage.",
             "storage.db.types.",
+            "storage.vector_migration_offline.",
         },
         &.{"storage.hot_standby."},
         &.{
@@ -5186,7 +5200,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_storage_db_core_tests.step.dependOn(&unit_storage_shard_audit.step);
     @import("test_support.zig").addOwnerTestRuns(b, db_test_step, &.{
         .{ .artifact = unit_storage_support_tests, .filters = &.{"storage.db."} },
-        .{ .artifact = unit_storage_db_core_tests, .filters = &.{"storage.db."}, .skip_filters = unit_storage_support_compile_filters },
+        .{ .artifact = unit_storage_db_core_tests, .filters = &.{ "storage.db.", "storage.vector_migration_offline." }, .skip_filters = unit_storage_support_compile_filters },
     }, &release_scale_test_filters);
     const unit_storage_compile_step = b.step(
         "unit-storage-compile",
