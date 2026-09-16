@@ -2219,3 +2219,128 @@ measurement. Tail qualification under sustained load remains separate work.
 [candidate workload](system_catalog_join_planning_candidate_2026_09_15.json)
 retain exact binary hashes, settings, placements, and per-request concurrent
 lookup samples.
+
+## Authoritative join topology and bounded fanout (2026-09-15)
+
+This follow-up pins one authoritative routing generation for the complete join,
+including left-side reads, right-side group selection, and worker fences. Cached
+planning statistics cannot omit a newly split range. Lookup keys are partitioned
+once, and independent shard reads run in batches of at most eight. Embedded
+metadata retains routing and planning indexes across queries. Deadline and
+cancellation scopes survive finalizer dispatch without escaping into durable
+job-store state.
+
+The split model exposed two fixture defects: direct table creation omitted the
+public API's default schema, changing posting provenance when split admission
+later installed it; and the recovery oracle permanently latched a transient
+initial metadata election. The fixture now initializes the canonical schema and
+observes recovered topology after workload completion. Production fixes also
+align wire-visible local query timing and forwarded catalog admission budgets
+with their executor clocks. Metadata service adapters translate deadlines at the
+native service boundary. No provenance checks or replay assertions are disabled.
+
+The control binary is built from `3928b1d2b`, including `origin/main` through
+`4da9b1cc6`; the candidate adds only this follow-up to that same base. Both are
+Debug builds. The many-to-one enrichment workload checks every event identity
+and customer value, forces and verifies both index-lookup and broadcast joins,
+and confirms distributed execution and remote right-hand shard placement.
+
+The same-binary lookup partition component uses 20,000 rows and 64 ranges, one
+warmup pair and seven measured pairs. Repeated per-group scanning took a median
+847.856 ms; partitioning once took 15.796 ms, a 53.68× reduction. Both paths
+validate identical bucket counts. This isolates key classification and allocation;
+it excludes topology acquisition, storage, HTTP, and result encoding, and is not
+an end-to-end speedup claim. [Raw paired samples](system_catalog_join_partition_2026_09_15.json).
+
+
+The initial ten-table/eight-shard baseline completed: 1,001 events and 251
+customers, 20 measured requests per strategy after two warmups. Index lookup
+p50/p95/max was 369.07/772.52/880.81 ms; broadcast was
+652.71/716.63/6,846.47 ms. Single-document dataset construction took 334.57 s and
+is excluded from these timings. An earlier bulk seed failed in cross-shard
+transaction preparation; the read harness now uses individual document mutations.
+The matched candidate failed during ingestion with a missing metadata identity
+proof. Its unclassified callback error was incorrectly surfaced as an invalid
+path parameter; stable identity-error transport and catalog-unavailability
+mapping now preserve that failure correctly. This is a failed observation, not
+a valid end-to-end speedup comparison.
+
+[Successful baseline](system_catalog_join_topology_baseline_2026_09_15.json) and
+[failed candidate](system_catalog_join_topology_candidate_failed_2026_09_15.json)
+retain the binary hashes, settings, and outcome. No task-owned compiler, model
+runner, profiler, or second workload ran concurrently with their measured phases.
+These are shared-host observations; unrelated worktree activity is not controlled.
+
+Integration with `origin/main` at `46fb5ca95` adds the vector-storage migration
+work. The merge preserves main's published ABI error ordinals and appends catalog
+identities, regenerates clients from the combined API, and connects online and
+offline migration to catalog identity and row persistence. Three migration E2Es
+passed, covering online restart, offline lock/resume, and cancellation after
+restoring stale catalog state.
+
+The subsequent main merge is `271838a19` (empty hot standby instances and
+replicated table creation). Table-create WAL records now include the logical
+catalog delta and revision fence as well as physical tables/ranges; standby
+apply journals both atomically. Existing-create acknowledgements retain the
+RemoteApply frontier requirement. All four new bootstrap/restart/outage/promotion
+E2Es passed in 74.53 s. The stale-catalog case restores the row store while the
+fixture is stopped, and artifact identity comes from the fixture's actual u64
+cluster ID.
+
+Exact-replay diagnosis traced a one-byte disk-usage difference to persisted
+index-status timestamps read from the host clock. Full-text, dense, sparse, and
+graph status snapshots now read the owning index manager's I/O clock. This keeps
+persisted bytes, compression, and resulting disk telemetry in the same clock
+domain. A focused regression verifies persisted timestamps at two injected clock
+values; it passed without leaks. The replay oracle still compares full payloads.
+
+The first successful final eight-shard enrichment run used two tables, 32 schema
+fields, 257 events, and 65 customers. Ten samples per strategy after two warmups
+returned exact event/customer matches: index lookup p50/p95/max
+155.90/186.15/186.15 ms; broadcast 159.14/178.65/178.65 ms. Setup took 74.19 s and
+is excluded. Five of the eight right-table ranges were remote to ingress.
+This smaller workload and newer main revision are not comparable to the earlier
+ten-table baseline. [Raw observation before compact identity projection](system_catalog_join_topology_before_identity_projection_2026_09_16.json).
+
+Final review found that HTTP catalog identity fencing called full diagnostic
+status twice per read, allocating projected table/range/store inventories.
+The endpoint now requires a dedicated group/incarnation capability before and
+after its authoritative read. A regression makes diagnostic status fail if used
+and checks stable identity, replacement, and missing capability. This removes
+catalog-size work from identity fencing without weakening the read barrier.
+
+The model fixture now advances metadata consensus independently of public
+workload progress, as the production metadata servers do. Previously a request
+waiting for catalog authority could prevent the next control round that would
+elect a metadata leader. The complete join/split target passed all 16 tests,
+including bounded cancellation and exact replay, with the original 11,000- and
+420,000-tick budgets. This run includes the persisted-clock fix and independent
+metadata driver; qualification of the subsequent compact identity callback is
+reported separately below. Assertions and fault coverage are unchanged.
+
+The final main merge through `c4b4728fa` updates CI admission and documentation;
+it does not change production code or the measured binary.
+
+The compact-identity binary completed the same two-table/eight-shard workload
+with all correctness checks passing. Ten samples followed two warmups for each
+operation. The comparison below reports p50/p95 milliseconds:
+
+| Operation | Before compact identity | Compact identity |
+| --- | ---: | ---: |
+| Event/customer index lookup | 155.90 / 186.15 | 127.94 / 184.99 |
+| Event/customer broadcast | 159.14 / 178.65 | 143.33 / 181.48 |
+| Qualified document lookup | 28.56 / 60.68 | 25.13 / 29.01 |
+| Qualified query | 79.77 / 104.47 | 80.06 / 108.68 |
+| Single-event qualified join | 128.21 / 156.71 | 143.57 / 163.37 |
+| Ten-query NDJSON request | 674.63 / 713.01 | 608.50 / 675.21 |
+
+Setup took 75.37 s outside the measurements. Six of eight right-table ranges
+were remote, versus five in the preceding run. Placement and unrelated host work
+are uncontrolled, and some operations regressed; this small comparison does not
+establish a uniform or causal latency improvement. The deterministic gain is
+removing two full diagnostic inventory reads from each catalog read. Concurrent
+lookup completed 80 requests with eight readers in 0.427 s (p50/p95
+33.58/56.59 ms); that short burst does not measure sustained throughput.
+No task-owned build, model, profiler, or second workload overlapped measurement.
+[Final raw observation](system_catalog_join_topology_final_2026_09_16.json)
+records the settings, binary hash, placements, and concurrent request samples.

@@ -5,6 +5,36 @@ they are not CI latency thresholds or production capacity claims.
 See [recorded measurements](SYSTEM_CATALOG_RESULTS.md) for a reproducible local
 before/after comparison and representative request latencies.
 
+## Event enrichment across shards
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --binary /path/to/immutable/antfly --scenario catalog --deployment cluster \
+  --table-counts 10 --catalog-shards 8 --schema-fields 32 --join-rows 1000 \
+  --samples 20 --warmup 2 --ndjson-lines 20 --output enrichment.json
+```
+
+`--join-rows` adds hash-distributed events with repeated customer keys, then
+measures lookup and broadcast enrichment separately. Every result is checked
+for complete event identities, duplicates, and the correct customer payload.
+Setup and cleanup use individual document mutations outside request timings,
+so constructing the dataset does not require cross-shard transaction preparation.
+The artifact records shard
+owners and verifies remote right-hand shards. Compare immutable baseline and
+candidate binaries serially; sweep shard and row counts to separate per-row
+partitioning from transport fanout. Debug builds are useful for relative costs,
+but these measurements do not establish production capacity.
+
+The lookup partition component compares the prior per-group scan with the
+production partitioner on 20,000 rows and 64 ranges, including bucket allocation
+and destruction. It validates every bucket count, warms once, and records seven
+paired samples without a timing assertion:
+
+```sh
+ANTFLY_CATALOG_JOIN_PARTITION_BENCH=1 python3 tools/run_bounded_zig_build.py \
+  build public-api-parity-test -- --test-filter 'distributed join lookup partition benchmark'
+```
+
 ## Reporting cadence and concurrent migrations
 
 ```sh

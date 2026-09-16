@@ -592,6 +592,108 @@ def catalog_scenario(args, binary: Path) -> dict:
             for name, fn in operations.items():
                 print(f"catalog: {count} tables, {name}", file=sys.stderr)
                 measured[name] = api.measure(fn, args.samples, args.warmup)
+            if args.join_rows and count > 1:
+                # Model a page of events enriched from a customer dimension.
+                # Hash-distributed identities exercise many owning ranges, and
+                # repeated customer keys model ordinary many-to-one joins.
+                print(
+                    f"catalog: loading {args.join_rows} enrichment events",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                setup_start = time.perf_counter_ns()
+                customers = {
+                    hashlib.sha256(f"customer:{i}".encode()).hexdigest(): {
+                        "body": f"customer {i}"
+                    }
+                    for i in range(max(1, args.join_rows // 4))
+                }
+                customer_keys = list(customers)
+                events = {
+                    hashlib.sha256(f"event:{i}".encode()).hexdigest(): {
+                        "body": "enrichment event",
+                        "customer_id": customer_keys[i % len(customer_keys)],
+                    }
+                    for i in range(args.join_rows)
+                }
+                right_path = scope + "/tables/events_0"
+                for target_path, rows in ((right_path, customers), (path, events)):
+                    # Seed one identity per mutation, outside the timed region.
+                    # This read benchmark must not depend on cross-shard
+                    # transaction preparation to construct its dataset.
+                    for key, document in rows.items():
+                        api.request(
+                            "POST",
+                            target_path + "/batch",
+                            {"inserts": {key: document}, "sync_level": "full_index"},
+                        )
+                setup_ms = (time.perf_counter_ns() - setup_start) / 1e6
+
+                def enrich(strategy, joined=joined, events=events, customers=customers):
+                    body = {
+                        **joined,
+                        "limit": args.join_rows + 1,
+                        "profile": True,
+                        "join": {**joined["join"], "strategy_hint": strategy},
+                    }
+                    value = api.request(
+                        "POST", "/query", json.dumps(body) + "\n", ndjson=True
+                    )[0]
+                    profile = value["responses"][0]["profile"]["join"]
+                    if profile["strategy_used"] != strategy:
+                        raise RuntimeError(
+                            f"enrichment used an unexpected strategy: {profile}"
+                        )
+                    if args.catalog_shards > 1 and not profile["distributed_execution"]:
+                        raise RuntimeError(
+                            "enrichment did not exercise distributed execution"
+                        )
+                    hits = value["responses"][0]["hits"]["hits"]
+                    if {hit["_id"] for hit in hits} != set(events) | {"doc"}:
+                        raise RuntimeError(
+                            "enrichment lost or duplicated event identities"
+                        )
+                    if len(hits) != len(events) + 1:
+                        raise RuntimeError("enrichment returned duplicate events")
+                    for hit in hits:
+                        expected = (
+                            "customer benchmark"
+                            if hit["_id"] == "doc"
+                            else customers[events[hit["_id"]]["customer_id"]]["body"]
+                        )
+                        if (
+                            hit["_source"].get("benchmark.serving.events_0.body")
+                            != expected
+                        ):
+                            raise RuntimeError("enrichment returned the wrong customer")
+
+                print(
+                    "catalog: measuring event/customer enrichment",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    measured["event_customer_enrichment"] = {
+                        "left_rows": len(events) + 1,
+                        "distinct_customers": len(customers) + 1,
+                        "setup_ms": setup_ms,
+                        **{
+                            strategy: api.measure(
+                                lambda strategy=strategy: enrich(strategy),
+                                args.samples,
+                                args.warmup,
+                            )
+                            for strategy in ("index_lookup", "broadcast")
+                        },
+                    }
+                finally:
+                    for target_path, rows in ((path, events), (right_path, customers)):
+                        for key in rows:
+                            api.request(
+                                "POST",
+                                target_path + "/batch",
+                                {"deletes": [key], "sync_level": "full_index"},
+                            )
             print(
                 f"catalog: {count} tables, concurrent lookup at {time.time()}",
                 file=sys.stderr,
@@ -1147,6 +1249,12 @@ def main():
     )
     parser.add_argument("--table-counts", nargs="+", type=positive, default=[10, 100])
     parser.add_argument(
+        "--join-rows",
+        type=int,
+        default=0,
+        help="Extra events in a many-to-one customer enrichment benchmark (0 disables)",
+    )
+    parser.add_argument(
         "--catalog-shards",
         type=positive,
         default=1,
@@ -1232,6 +1340,8 @@ def main():
         parser.error("--listing-reader-rate must be nonnegative")
     if args.schema_fields < 0:
         parser.error("--schema-fields must be nonnegative")
+    if args.join_rows < 0:
+        parser.error("--join-rows must be nonnegative")
     binary = args.binary.resolve(strict=True)
     with binary.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
