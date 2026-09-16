@@ -816,6 +816,8 @@ from .open_ai_generator_config import OpenAIGeneratorConfig
 from .open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
 from .open_router_embedder_config import OpenRouterEmbedderConfig
 from .open_router_embedder_config_provider import OpenRouterEmbedderConfigProvider
+from .open_router_generator_config import OpenRouterGeneratorConfig
+from .open_router_generator_config_provider import OpenRouterGeneratorConfigProvider
 from .package_artifact import PackageArtifact
 from .package_artifact_kind import PackageArtifactKind
 from .package_dependency import PackageDependency
@@ -1904,6 +1906,8 @@ __all__ = (
     "OpenAIGeneratorConfigProvider",
     "OpenRouterEmbedderConfig",
     "OpenRouterEmbedderConfigProvider",
+    "OpenRouterGeneratorConfig",
+    "OpenRouterGeneratorConfigProvider",
     "PackageArtifact",
     "PackageArtifactKind",
     "PackageDependency",

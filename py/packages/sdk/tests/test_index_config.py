@@ -179,3 +179,27 @@ def test_validates_openapi_index_request_relationships() -> None:
             "sources": [{"artifact": "dense_v1"}],
         }
     )
+
+
+def test_openrouter_index_configuration_round_trips() -> None:
+    from antfly.client_generated.models.create_embeddings_index_request import (
+        CreateEmbeddingsIndexRequest,
+    )
+    from antfly.client_generated.models.open_router_embedder_config import (
+        OpenRouterEmbedderConfig,
+    )
+
+    body = {
+        "type": "embeddings",
+        "field": "body",
+        "embedder": {
+            "provider": "openrouter",
+            "model": "openai/text-embedding-3-small",
+            "url": "https://gateway.example/api/v1",
+            "api_key": "${secret:team.router}",
+            "dimensions": 3,
+        },
+    }
+    parsed = CreateEmbeddingsIndexRequest.from_dict(body)
+    assert isinstance(parsed.embedder, OpenRouterEmbedderConfig)
+    assert parsed.to_dict() == body

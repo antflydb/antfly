@@ -10174,6 +10174,7 @@ components:
       oneOf:
         - $ref: '#/components/schemas/OllamaEmbedderConfig'
         - $ref: '#/components/schemas/OpenAIEmbedderConfig'
+        - $ref: '#/components/schemas/OpenRouterEmbedderConfig'
         - $ref: '#/components/schemas/BedrockEmbedderConfig'
         - $ref: '#/components/schemas/CohereEmbedderConfig'
         - $ref: '#/components/schemas/GoogleEmbedderConfig'
@@ -10184,6 +10185,7 @@ components:
         mapping:
           ollama: '#/components/schemas/OllamaEmbedderConfig'
           openai: '#/components/schemas/OpenAIEmbedderConfig'
+          openrouter: '#/components/schemas/OpenRouterEmbedderConfig'
           bedrock: '#/components/schemas/BedrockEmbedderConfig'
           cohere: '#/components/schemas/CohereEmbedderConfig'
           gemini: '#/components/schemas/GoogleEmbedderConfig'
@@ -19630,6 +19632,9 @@ components:
         API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
 
 
+        Antfly currently supports dense text embeddings through this provider.
+
+
         **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
 
         google/gemini-embedding-001, qwen/qwen3-embedding-8b
@@ -19646,6 +19651,10 @@ components:
           description: The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
           default: openai/text-embedding-3-small
           example: openai/text-embedding-3-small
+        url:
+          type: string
+          format: uri
+          description: The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
         api_key:
           type: string
           writeOnly: true
@@ -20796,6 +20805,58 @@ components:
       required:
         - provider
         - model
+    OpenRouterGeneratorConfig:
+      type: object
+      description: >
+        Configuration for the OpenRouter generative AI provider.
+      properties:
+        provider:
+          type: string
+          enum:
+            - openrouter
+        model:
+          type: string
+          description: The OpenRouter model identifier to use.
+          example: openai/gpt-4.1
+        url:
+          type: string
+          format: uri
+          description: The URL of the OpenRouter API endpoint.
+          default: https://openrouter.ai/api/v1
+        api_key:
+          type: string
+          writeOnly: true
+          description: The OpenRouter API key.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-2.0).
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate in the response.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter (0.0-1.0).
+          minimum: 0.0
+          maximum: 1.0
+        frequency_penalty:
+          type: number
+          format: float
+          description: Penalty for token frequency (-2.0 to 2.0).
+          minimum: -2.0
+          maximum: 2.0
+        presence_penalty:
+          type: number
+          format: float
+          description: Penalty for token presence (-2.0 to 2.0).
+          minimum: -2.0
+          maximum: 2.0
+      required:
+        - provider
+        - model
     GeneratorProvider:
       type: string
       enum:
@@ -20803,6 +20864,7 @@ components:
         - vertex
         - ollama
         - openai
+        - openrouter
         - antfly
       description: Generator providers implemented by Antfly's generation runtime.
     GeneratorConfig:
@@ -20815,6 +20877,7 @@ components:
             - $ref: '#/components/schemas/OllamaGeneratorConfig'
             - $ref: '#/components/schemas/AntflyGeneratorConfig'
             - $ref: '#/components/schemas/OpenAIGeneratorConfig'
+            - $ref: '#/components/schemas/OpenRouterGeneratorConfig'
         - properties:
             rate_limit:
               x-go-type-skip-optional-pointer: false
