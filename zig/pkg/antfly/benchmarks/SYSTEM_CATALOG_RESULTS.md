@@ -2354,3 +2354,20 @@ ordinals, the catalog's host-owned retry queue, and one retry policy for schedul
 and explicitly awaited store reports. A newly included virtual-HTTP fiber test
 uses leak-checked allocation without native stack capture, matching the other
 fiber fixtures and avoiding macOS unwinding across switched stacks.
+
+Qualification after the `6f7df8233` merge passed: all 16 join/split model tests
+with exact replay (11 minutes), 132 standalone tests, 84 transport tests, five
+virtual-HTTP tests, 69 table-read contracts plus 12 write implementation tests,
+and 17 failure/error ABI tests. Four standby and three distributed resolution
+E2Es passed together; three migration E2Es then passed in 14.90 s after clearing
+completed task build artifacts to restore the fixture's required disk headroom.
+Thirty resolution helper tests also passed. Sandbox-blocked TLS listener tests
+were rerun with loopback access; disk admission and test assertions remain enabled.
+
+The later `04df69feb` main merge adds OpenRouter provider support. Go, Python,
+TypeScript, and Zig clients and the bundled UI were regenerated from the combined
+catalog/provider sources. This provider merge follows the timings above; it is
+not part of their binary hashes.
+The final production build and all 67 catalog HTTP tests passed, along with the
+Go generated client tests, nine Python index-configuration tests, five OpenAPI
+path checks, and the bundled UI build/typecheck.
