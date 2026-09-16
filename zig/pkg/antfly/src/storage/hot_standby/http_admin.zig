@@ -124,6 +124,11 @@ pub const Server = struct {
         }
     };
 
+    pub const CatalogEmptySource = struct {
+        ptr: *anyopaque,
+        read_fn: *const fn (ptr: *anyopaque) anyerror!bool,
+    };
+
     pub const SeedCaptureHook = struct {
         ptr: *anyopaque,
         run_fn: *const fn (
@@ -225,6 +230,7 @@ pub const Server = struct {
         standby_status_extras: ?StandbyStatusExtras = null,
         state_mutex: ?*std.atomic.Mutex = null,
         seed_capture: ?SeedCaptureHook = null,
+        catalog_empty: ?CatalogEmptySource = null,
         standby_upstream: ?StandbyUpstreamHook = null,
         lifecycle_receipts: ?LifecycleReceipts = null,
         lease_watchdog_proof: ?LeaseWatchdogProofSource = null,
@@ -476,11 +482,13 @@ pub const Server = struct {
         const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
         const watchdog_proof = if (self.auth.lease_watchdog_proof) |source| try source.snapshot(self.alloc) else null;
         defer if (watchdog_proof) |proof| self.alloc.free(proof.observed_holder_node_id);
+        const waiting_for_tables = if (self.auth.catalog_empty) |source| try source.read_fn(source.ptr) else null;
         const response = admin_api.HAPrimaryStatusResponse{
             .schema_version = 1,
             .snapshot = blk: {
                 var result = try adminPrimarySnapshot(self.alloc, snapshot, node_id);
                 result.lease_watchdog = watchdog_proof;
+                result.waiting_for_tables = waiting_for_tables;
                 break :blk result;
             },
         };
@@ -5045,4 +5053,32 @@ test "storage.hot_standby http admin preserves omitted commit append shard and t
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
+
+test "storage.hot_standby primary status reports catalog readiness without creating slots" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "catalog-readiness");
+    defer paths.deinit(alloc);
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    const Catalog = struct {
+        empty: bool = true,
+        fn read(ptr: *anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.empty;
+        }
+    };
+    var catalog = Catalog{};
+    var server = Server.initWithOptions(alloc, .{ .primary = &primary, .primary_node_id = "primary-a" }, .{
+        .catalog_empty = .{ .ptr = &catalog, .read_fn = Catalog.read },
+    });
+    defer server.deinit();
+    for ([_]bool{ true, false, true }) |empty| {
+        catalog.empty = empty;
+        var response = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        try expectContains(response.body, if (empty) "\"waiting_for_tables\":true" else "\"waiting_for_tables\":false");
+        try expectContains(response.body, "\"slots\":[]");
+    }
 }
