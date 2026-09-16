@@ -428,7 +428,7 @@ pub const FileStore = struct {
             next.deinit(self.alloc);
         }
 
-        const now_ns = nowNs();
+        const now_ns = wallClockNs();
         if (next.getPtr(key)) |existing| {
             const new_value = try self.alloc.dupe(u8, value);
             self.alloc.free(existing.value);
@@ -1117,6 +1117,13 @@ fn nowNs() u64 {
     return @intCast(now.toNanoseconds());
 }
 
+fn wallClockNs() u64 {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const now = std.Io.Timestamp.now(io_impl.io(), .real);
+    return @intCast(now.toNanoseconds());
+}
+
 fn lessThanListedSecret(_: void, lhs: ListedSecret, rhs: ListedSecret) bool {
     return std.mem.order(u8, lhs.key, rhs.key) == .lt;
 }
@@ -1138,6 +1145,10 @@ test "file secret store persists values and overlays env status" {
     defer entry.deinit(alloc);
     try std.testing.expectEqual(SecretStatus.configured_file, entry.status);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", entry.env_var.?);
+    try std.testing.expect(entry.created_at != null);
+    try std.testing.expect(entry.updated_at != null);
+    try std.testing.expect(!std.mem.startsWith(u8, entry.created_at.?, "1970-"));
+    try std.testing.expect(!std.mem.startsWith(u8, entry.updated_at.?, "1970-"));
     if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
         var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_only });
         defer file.close(std.testing.io);
