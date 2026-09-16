@@ -14,6 +14,7 @@
 
 """Exercise the Zig workflow's actual Git path filter against tracked inputs."""
 
+import re
 import shlex
 import subprocess
 import tempfile
@@ -110,8 +111,6 @@ class ZigValidationScopeTests(unittest.TestCase):
             {path.decode() for path in selected.split(b"\0") if path}, inputs
         )
 
-
-import re
 
 
 def embedded_helper() -> str:
