@@ -3,7 +3,7 @@
 The retained changes enable qualified Q4_K/Q6_K matrix shapes for Qwen3-VL
 prefill, keep an eager decode frame across layers, and specialize dense causal
 attention for 128-wide heads. Other shapes and existing fallback paths remain
-available. See [Qwen3-VL support](QWEN3VL_SUPPORT.md) for serving contracts.
+available. See [Qwen3-VL support](QWEN3VL.md) for serving contracts.
 
 BF16 projections now use a 64x32x32 simdgroup matrix kernel on supported Apple
 GPUs, with exact BF16-to-F32 expansion and F32 activations/accumulation. The
@@ -17,7 +17,7 @@ panels, and embedding metadata resolution avoids unnecessary tokenizer JSON
 parsing. New BF16 vector loads and gate/up/SiLU fusion default only to the
 measured base Apple M4 shapes; other devices and shapes remain explicit-only.
 
-> **Relocated:** The dated ReleaseFast/ReleaseSafe measurement campaigns, pass counts, and validation-limit tallies that previously lived here (122 lines, 2026-09-08 and earlier) are preserved verbatim in [work-log/completed/inference/qwen-performance-evidence.md](../../../work-log/completed/inference/qwen-performance-evidence.md). Durable decisions from it are in Resource and correctness checks in this document.
+> **Relocated:** The dated ReleaseFast/ReleaseSafe measurement campaigns, pass counts, and validation-limit tallies that previously lived here (122 lines, 2026-09-08 and earlier) are preserved verbatim in [work-log/completed/inference/qwen-performance-evidence.md](../../../../../work-log/completed/inference/qwen/performance-evidence.md). Durable decisions from it are in Resource and correctness checks in this document.
 
 ## Reproduce endpoint measurements
 
@@ -31,18 +31,18 @@ making ReleaseFast claims.
 The retained endpoint tools accept separately launched resident servers and
 record model/build identities, paired timings, and output checks:
 
-- [Embedding endpoint benchmark](scripts/qwen3_embedding/benchmark_qwen3_embedding_endpoint.py)
-  follows [the embedding protocol](scripts/qwen3_embedding/BASELINE.md). The
+- [Embedding endpoint benchmark](../../scripts/qwen3_embedding/benchmark_qwen3_embedding_endpoint.py)
+  follows [the embedding protocol](../../scripts/qwen3_embedding/BASELINE.md). The
   checked-in exact-token recipe covers 20, 256, 511, 2551, 4096, and 8192 tokens
   with 24 distinct prefixes per length, enough for three warmups and 20 pairs.
-- [OCR endpoint benchmark](scripts/qwen3vl/benchmark_qwen3vl_ocr_endpoint.py)
+- [OCR endpoint benchmark](../../scripts/qwen3vl/benchmark_qwen3vl_ocr_endpoint.py)
   checks complete `/ai/v1/read` responses against the frozen
-  [fixtures](scripts/qwen3vl/fixtures/ocr/fixture.json) and
-  [Q4_K_M golden](scripts/qwen3vl/fixtures/ocr/golden_q4_k_m.json). Supply
+  [fixtures](../../scripts/qwen3vl/fixtures/ocr/fixture.json) and
+  [Q4_K_M golden](../../scripts/qwen3vl/fixtures/ocr/golden_q4_k_m.json). Supply
   `--fixture`, `--golden`, `--url`, `--model`, and candidate process provenance;
   add `--reference-url` and reference provenance for a paired Antfly comparison.
   It does not implement a llama.cpp OCR comparison.
-- [Resource guard](scripts/benchmark_resources.py) wraps the launcher so both
+- [Resource guard](../../scripts/benchmark_resources.py) wraps the launcher so both
   servers, clients, and inference workers share bounded resource accounting.
 
 Use each tool's `--help` for its full CLI. A passing endpoint report establishes
@@ -93,7 +93,7 @@ bytes unchanged for comparisons; use the endpoint tool's `--capture-golden`
 only when deliberately establishing a new baseline. The embedding fixture
 records tokenizer verification including EOS, and its loader verifies the
 expanded text/token digest. See
-[the embedding protocol](scripts/qwen3_embedding/BASELINE.md) for tokenizer,
+[the embedding protocol](../../scripts/qwen3_embedding/BASELINE.md) for tokenizer,
 pooling, normalization, and independent-reference requirements.
 
 For long CPU FP32 references, `transformers_embedding_oracle.py --attention sdpa`
@@ -118,5 +118,5 @@ other devices and shapes stay explicit-only until they clear the same gate.
 > **Relocated:** The evidence-artifact ledger (local report paths, evidence
 > archives, and executable/model SHA-256 digests) that previously lived here
 > (76 lines) is preserved verbatim in
-> [work-log/completed/inference/qwen-performance-evidence.md](../../../work-log/completed/inference/qwen-performance-evidence.md).
+> [work-log/completed/inference/qwen-performance-evidence.md](../../../../../work-log/completed/inference/qwen/performance-evidence.md).
 > Durable decisions from it are in Performance promotion gate in this document.

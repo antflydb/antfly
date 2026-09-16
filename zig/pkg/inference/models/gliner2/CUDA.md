@@ -5,7 +5,7 @@ benchmark contract used to qualify it: current dispatch behavior, the
 measurement contract, and remaining performance work. The dated
 qualification evidence (environment, measured results, correctness/route
 evidence, and the full reproduction transcript) has been relocated to
-[work-log/completed/inference/gliner2-cuda-qualification-2026-07.md](../../../../work-log/completed/inference/gliner2-cuda-qualification-2026-07.md);
+[work-log/completed/inference/gliner2-cuda-qualification-2026-07.md](../../../../../work-log/completed/inference/gliner2/cuda-qualification-2026-07.md);
 see the pointers below for what moved where.
 
 ## Current Status
@@ -89,11 +89,11 @@ requirement explicit on qualification hardware.
 
 ## Environment
 
-> **Relocated:** The dated hardware/software environment table that previously lived here (11 lines) is preserved verbatim in [work-log/completed/inference/gliner2-cuda-qualification-2026-07.md](../../../../work-log/completed/inference/gliner2-cuda-qualification-2026-07.md). The qualification target (NVIDIA L4, SM89) is captured as policy in Dispatch Architecture below.
+> **Relocated:** The dated hardware/software environment table that previously lived here (11 lines) is preserved verbatim in [work-log/completed/inference/gliner2-cuda-qualification-2026-07.md](../../../../../work-log/completed/inference/gliner2/cuda-qualification-2026-07.md). The qualification target (NVIDIA L4, SM89) is captured as policy in Dispatch Architecture below.
 
 ## Results
 
-> **Relocated:** The dated benchmark results (24 lines, 2026-07 qualification run) are preserved verbatim in [work-log/completed/inference/gliner2-cuda-qualification-2026-07.md](../../../../work-log/completed/inference/gliner2-cuda-qualification-2026-07.md). The qualitative conclusion — production materialized attention beats the Fastino reference at B8 and is the default, generated M32N16 also beats it but stays a secondary explicit route — is captured in Current Status above; the open B1 parity gap is tracked in Remaining Work below.
+> **Relocated:** The dated benchmark results (24 lines, 2026-07 qualification run) are preserved verbatim in [work-log/completed/inference/gliner2-cuda-qualification-2026-07.md](../../../../../work-log/completed/inference/gliner2/cuda-qualification-2026-07.md). The qualitative conclusion — production materialized attention beats the Fastino reference at B8 and is the default, generated M32N16 also beats it but stays a secondary explicit route — is captured in Current Status above; the open B1 parity gap is tracked in Remaining Work below.
 
 ## Dispatch Architecture
 
@@ -205,7 +205,7 @@ preparation and decode remain request-local.
 
 ## Correctness and Route Evidence
 
-> **Relocated:** The dated correctness/route qualification evidence that previously lived here (46 lines: score-delta table, benchmark CSV field list, and per-run route-counter results) is preserved verbatim in [work-log/completed/inference/gliner2-cuda-qualification-2026-07.md](../../../../work-log/completed/inference/gliner2-cuda-qualification-2026-07.md). The standing `verify_gliner2_cuda.sh` contract it exercises is in Qualified Benchmark Contract above.
+> **Relocated:** The dated correctness/route qualification evidence that previously lived here (46 lines: score-delta table, benchmark CSV field list, and per-run route-counter results) is preserved verbatim in [work-log/completed/inference/gliner2-cuda-qualification-2026-07.md](../../../../../work-log/completed/inference/gliner2/cuda-qualification-2026-07.md). The standing `verify_gliner2_cuda.sh` contract it exercises is in Qualified Benchmark Contract above.
 
 ## Reproduction
 
@@ -236,7 +236,7 @@ ANTFLY_CUDA_ARTIFACTS=sm89 \
 scripts/regen-cuda-artifacts.sh --check --all
 ```
 
-> **Relocated:** The full reproduction transcript (Fastino reference invocation, generated M32N16 variant, and device-override notes; 59 lines) is preserved verbatim in [work-log/completed/inference/gliner2-cuda-qualification-2026-07.md](../../../../work-log/completed/inference/gliner2-cuda-qualification-2026-07.md).
+> **Relocated:** The full reproduction transcript (Fastino reference invocation, generated M32N16 variant, and device-override notes; 59 lines) is preserved verbatim in [work-log/completed/inference/gliner2-cuda-qualification-2026-07.md](../../../../../work-log/completed/inference/gliner2/cuda-qualification-2026-07.md).
 
 ## Remaining Work
 

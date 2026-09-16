@@ -40,24 +40,25 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../zig/ROADMAP.md).
 | PDF | [pdf/render-control-verification-2026-09.md](completed/pdf/render-control-verification-2026-09.md) | [zig/PDF.md](../zig/PDF.md) | September 2026 render-control verification notes |
 | Status | [status/dated-e2e-observations-2026-05.md](completed/status/dated-e2e-observations-2026-05.md) | [zig/STATUS.md](../zig/STATUS.md) | 2026-05-01 E2E observations |
 | E2E | [e2e/resolved-failures-2026-05.md](completed/e2e/resolved-failures-2026-05.md) | [zig/TODO.md](../zig/TODO.md) | 2026-05-11 full-suite run and per-test resolutions |
-| Inference | [inference/gemma4-a4b-perf-ledger.md](completed/inference/gemma4-a4b-perf-ledger.md) | [CUDA.md](../zig/pkg/inference/CUDA.md), [METAL.md](../zig/pkg/inference/METAL.md) | Former PERF.md: Gemma 4 26B-A4B dated performance sessions |
-| Inference | [inference/metal-status-history.md](completed/inference/metal-status-history.md) | [METAL.md](../zig/pkg/inference/METAL.md) | Metal backend bisection narrative and dated benchmark anchors |
-| Inference | [inference/metal-slice-plans.md](completed/inference/metal-slice-plans.md) | [METAL.md](../zig/pkg/inference/METAL.md) | Four per-slice command-planner implementation plans |
-| Inference | [inference/gemma4-perf-plan-ledgers.md](completed/inference/gemma4-perf-plan-ledgers.md) | [GEMMA4_PERF_PLAN.md](../zig/pkg/inference/GEMMA4_PERF_PLAN.md) | Plan §9–16 implementation and readiness ledgers |
-| Inference | [inference/gemma4-mtp-cuda-branch-status.md](completed/inference/gemma4-mtp-cuda-branch-status.md) | [GEMMA4.md](../zig/pkg/inference/GEMMA4.md) | MTP smoke transcripts and dated CUDA branch updates |
-| Inference | [inference/gemma4-cuda-e2b-sm89-status.md](completed/inference/gemma4-cuda-e2b-sm89-status.md) | [CUDA_TUNING.md](../zig/pkg/inference/docs/CUDA_TUNING.md) | E2B SM89 optimization status and split-KV validation |
-| Inference | [inference/cuda-turboquant-l4-validation.md](completed/inference/cuda-turboquant-l4-validation.md) | [CUDA.md](../zig/pkg/inference/CUDA.md) | L4 TurboQuant qualification checklist |
+| Inference | [inference/gemma4/a4b-perf.md](completed/inference/gemma4/a4b-perf.md) | [CUDA.md](../zig/pkg/inference/CUDA.md), [METAL.md](../zig/pkg/inference/METAL.md) | Former PERF.md: Gemma 4 26B-A4B dated performance sessions |
+| Inference | [inference/metal/status-history.md](completed/inference/metal/status-history.md) | [METAL.md](../zig/pkg/inference/METAL.md) | Metal backend bisection narrative and dated benchmark anchors |
+| Inference | [inference/metal/slice-plans.md](completed/inference/metal/slice-plans.md) | [METAL.md](../zig/pkg/inference/METAL.md) | Four per-slice command-planner implementation plans |
+| Inference | [inference/gemma4/metal-perf-plan.md](completed/inference/gemma4/metal-perf-plan.md) | [GEMMA4.md](../zig/pkg/inference/models/gemma4/GEMMA4.md#metal-performance-plan) | Plan §9–16 implementation and readiness ledgers |
+| Inference | [inference/gemma4/mtp-cuda.md](completed/inference/gemma4/mtp-cuda.md) | [GEMMA4.md](../zig/pkg/inference/models/gemma4/GEMMA4.md) | MTP smoke transcripts and dated CUDA branch updates |
+| Inference | [inference/gemma4/e2b-sm89.md](completed/inference/gemma4/e2b-sm89.md) | [CUDA_TUNING.md](../zig/pkg/inference/CUDA_TUNING.md) | E2B SM89 optimization status and split-KV validation |
+| Inference | [inference/cuda/turboquant-l4.md](completed/inference/cuda/turboquant-l4.md) | [CUDA.md](../zig/pkg/inference/CUDA.md) | L4 TurboQuant qualification checklist |
 | Inference | [inference/ggml-graph-execution-history.md](completed/inference/ggml-graph-execution-history.md) | [GGML.md](../zig/pkg/inference/GGML.md) | Partition executor and quant-matmul routing history |
 | Inference | [inference/turboquant-history.md](completed/inference/turboquant-history.md) | [TURBOQUANT.md](../zig/pkg/inference/TURBOQUANT.md) | Compressed-KV history including the removed MLX provider |
 | Inference | [inference/llms-stale-sections.md](completed/inference/llms-stale-sections.md) | [LLMS.md](../zig/pkg/inference/LLMS.md) | MLX-era Phase 5 and Phase 10 narrative |
-| Inference | [inference/qwen-performance-evidence.md](completed/inference/qwen-performance-evidence.md) | [QWEN_PERFORMANCE.md](../zig/pkg/inference/QWEN_PERFORMANCE.md) | Dated campaigns, pass counts, and evidence-artifact ledger |
-| Inference | [inference/qwen3vl-qualification-2026-08.md](completed/inference/qwen3vl-qualification-2026-08.md) | [QWEN3VL_SUPPORT.md](../zig/pkg/inference/QWEN3VL_SUPPORT.md) | August 2026 qualification runs |
+| Inference | [inference/qwen/performance-evidence.md](completed/inference/qwen/performance-evidence.md) | [PERFORMANCE.md](../zig/pkg/inference/models/qwen/PERFORMANCE.md) | Dated campaigns, pass counts, and evidence-artifact ledger |
+| Inference | [inference/qwen/qwen3vl-qualification-2026-08.md](completed/inference/qwen/qwen3vl-qualification-2026-08.md) | [QWEN3VL.md](../zig/pkg/inference/models/qwen/QWEN3VL.md) | August 2026 qualification runs |
 | Inference | [inference/onnx-quantized-status-history.md](completed/inference/onnx-quantized-status-history.md) | [ONNX.md](../zig/pkg/inference/ONNX.md) | Quantized export proof runs and debugger bisection |
-| Inference | [inference/finetuning-implementation-log.md](completed/inference/finetuning-implementation-log.md) | [FINETUNING.md](../zig/pkg/inference/docs/finetuning/FINETUNING.md) | Session narrative and 37-item task changelog |
+| Inference | [inference/finetuning-implementation-log.md](completed/inference/finetuning-implementation-log.md) | [FINETUNING.md](../zig/pkg/inference/finetuning/FINETUNING.md) | Session narrative and 37-item task changelog |
 | Inference | [inference/graph-current-progress-history.md](completed/inference/graph-current-progress-history.md) | [GRAPH.md](../zig/pkg/inference/GRAPH.md) | Backend graph current-progress notes |
 | Inference | [inference/wasm-status-history.md](completed/inference/wasm-status-history.md) | [WASM.md](../zig/pkg/inference/WASM.md) | Build-profile and GPU-resident-weight status bullets |
+| Inference | [inference/ml-graph-ir-proposal.md](completed/inference/ml-graph-ir-proposal.md) | [GRAPH.md](../zig/pkg/inference/GRAPH.md) | Former ML.md: the superseded computation-graph IR proposal |
 | Inference | [inference/pjrt-status-history.md](completed/inference/pjrt-status-history.md) | [PJRT.md](../zig/pkg/inference/PJRT.md) | PJRT whole-model artifact status bullets |
-| Inference | [inference/gliner2-cuda-qualification-2026-07.md](completed/inference/gliner2-cuda-qualification-2026-07.md) | [GLINER2_CUDA.md](../zig/pkg/inference/docs/GLINER2_CUDA.md) | July 2026 GLiNER2 CUDA environment, results, and route evidence |
+| Inference | [inference/gliner2/cuda-qualification-2026-07.md](completed/inference/gliner2/cuda-qualification-2026-07.md) | [gliner2/CUDA.md](../zig/pkg/inference/models/gliner2/CUDA.md) | July 2026 GLiNER2 CUDA environment, results, and route evidence |
 | Audio | [audio/benchmark-baseline-2026-04.md](completed/audio/benchmark-baseline-2026-04.md) | [AUDIO.md](../zig/lib/audio/AUDIO.md) | 2026-04-14 single-run codec benchmark baseline |
 
 ## Planned Features

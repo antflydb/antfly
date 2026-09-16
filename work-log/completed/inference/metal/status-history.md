@@ -1,6 +1,6 @@
 # Metal Backend Status History
 
-> Relocated verbatim from `zig/pkg/inference/METAL.md` (lines 131–478 and 490–548 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`METAL.md`](../../../zig/pkg/inference/METAL.md). Durable decisions from this log were folded into that document before the move.
+> Relocated verbatim from `zig/pkg/inference/METAL.md` (lines 131–478 and 490–548 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`METAL.md`](../../../../zig/pkg/inference/METAL.md). Durable decisions from this log were folded into that document before the move.
 
 ## Current Status bullets (relocated from METAL.md)
 

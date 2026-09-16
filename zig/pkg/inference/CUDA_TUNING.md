@@ -331,7 +331,7 @@ python3 scripts/gemma4/validate_gemma4_cuda_candidate.py \
 
 > **Relocated:** The score-prework and split-KV decode validation campaign
 > that previously lived here (34 lines) is preserved verbatim in
-> [work-log/completed/inference/gemma4-cuda-e2b-sm89-status.md](../../../../work-log/completed/inference/gemma4-cuda-e2b-sm89-status.md).
+> [work-log/completed/inference/gemma4-cuda-e2b-sm89-status.md](../../../work-log/completed/inference/gemma4/e2b-sm89.md).
 > Durable decisions from it are in Model-Neutral Kernel Catalog (the generated
 > attention / split-KV promotion policy) in this document.
 
@@ -853,7 +853,7 @@ is the dominant remaining gap versus llama.cpp; decode throughput is close.
 > **Relocated:** The dated SM89/E2B benchmark campaigns and candidate
 > qualification history that previously lived here (102 lines) are preserved
 > verbatim in
-> [work-log/completed/inference/gemma4-cuda-e2b-sm89-status.md](../../../../work-log/completed/inference/gemma4-cuda-e2b-sm89-status.md).
+> [work-log/completed/inference/gemma4-cuda-e2b-sm89-status.md](../../../work-log/completed/inference/gemma4/e2b-sm89.md).
 > Durable decisions from it are in Model-Neutral Kernel Catalog and Production
 > Defaults in this document.
 

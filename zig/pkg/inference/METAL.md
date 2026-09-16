@@ -176,7 +176,7 @@ now documented in Production Architecture below.
 
 > **Relocated:** The accreted "X now does Y" status bullets that previously
 > lived here (346 lines) are preserved verbatim in
-> [work-log/completed/inference/metal-status-history.md](../../../work-log/completed/inference/metal-status-history.md)
+> [work-log/completed/inference/metal-status-history.md](../../../work-log/completed/inference/metal/status-history.md)
 > under "Current Status bullets (relocated from METAL.md)". Durable decisions
 > from them are in Command Plan Abstraction, Production Architecture, and the
 > Debug And Rollback Env Vars subsection below.
@@ -254,15 +254,15 @@ These are local directional anchors, not absolute device claims.
 
 The current Gemma 4 QAT baseline/no-MTP plan, canonical 2K+300 comparator, and
 promotion gates live in
-[GEMMA4_PERF_PLAN.md](./GEMMA4_PERF_PLAN.md). Older anchors
+[GEMMA4.md, Metal Performance Plan](models/gemma4/GEMMA4.md#metal-performance-plan). Older anchors
 below remain useful implementation history, but they are not the current
 llama.cpp gap unless rerun under that contract.
 
 > **Relocated:** The dated per-run benchmark numbers that previously lived
 > here (59 lines, 2026-05-05 through 2026-05-07) are preserved verbatim in
-> [work-log/completed/inference/metal-status-history.md](../../../work-log/completed/inference/metal-status-history.md)
+> [work-log/completed/inference/metal-status-history.md](../../../work-log/completed/inference/metal/status-history.md)
 > under "Benchmark Anchors (dated measurements)". Durable decisions from them
-> are captured in the interpretation below and in GEMMA4_PERF_PLAN.md.
+> are captured in the interpretation below and in GEMMA4.md under Metal Performance Plan.
 
 Interpretation:
 
@@ -1504,6 +1504,6 @@ Antfly inference commands or long-running Metal executions.
 > Command Planner", "Whole-Frame Metal Graph Execution Plan", "Metal Graph
 > Command-Volume Reduction Plan", and "Metal Command Reduction Implementation
 > Plan") are preserved verbatim in
-> [work-log/completed/inference/metal-slice-plans.md](../../../work-log/completed/inference/metal-slice-plans.md).
+> [work-log/completed/inference/metal-slice-plans.md](../../../work-log/completed/inference/metal/slice-plans.md).
 > Durable decisions from them are in Command Plan Abstraction near the top of
 > this document.

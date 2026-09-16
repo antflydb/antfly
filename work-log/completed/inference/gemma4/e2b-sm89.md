@@ -1,6 +1,6 @@
 # Gemma 4 E2B SM89 optimization status
 
-> Relocated verbatim from `zig/pkg/inference/docs/CUDA_TUNING.md` (lines 872–973 and 329–362 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`CUDA_TUNING.md`](../../../zig/pkg/inference/docs/CUDA_TUNING.md). Durable decisions from this log were folded into that document before the move.
+> Relocated verbatim from `zig/pkg/inference/docs/CUDA_TUNING.md` (lines 872–973 and 329–362 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`CUDA_TUNING.md`](../../../../zig/pkg/inference/CUDA_TUNING.md). Durable decisions from this log were folded into that document before the move.
 
 ## Gemma 4 E2B SM89 optimization status
 

@@ -8,8 +8,8 @@ This document has three jobs:
 - Record the ggml/llama.cpp execution shape Antfly inference should follow where it is
   useful.
 - Document the graph-execution partitioning and backend-executor design that
-  implements that shape (originally planned in a separate document; see
-  [GGML_PLAN.md](GGML_PLAN.md)).
+  implements that shape (the implementation history is in
+  [ggml-graph-execution-history.md](../../../work-log/completed/inference/ggml-graph-execution-history.md)).
 
 It fits with:
 

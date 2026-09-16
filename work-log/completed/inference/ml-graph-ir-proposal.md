@@ -1,9 +1,11 @@
-# XLA-like Computation Graph IR for antfly-inference-zig (superseded)
+# XLA-like Computation Graph IR proposal (superseded)
+
+> Relocated from `zig/pkg/inference/ML.md` on 2026-09-16 during the documentation cleanup. The proposal shipped; the living design is [`GRAPH.md`](../../../zig/pkg/inference/GRAPH.md). Kept for the original rationale.
 
 This was the original proposal for layering a computation graph IR (tracing,
 optimization passes, backend-agnostic execution, and training/autodiff) on
 top of antfly-inference-zig's eager `ComputeBackend` vtable. That design
-shipped; [GRAPH.md](GRAPH.md) describes the graph IR, tracing/cache/replay
+shipped; [GRAPH.md](../../../zig/pkg/inference/GRAPH.md) describes the graph IR, tracing/cache/replay
 architecture, op system, compiler passes, execution backends, and partitioning
 as implemented today, and is the authoritative reference. The autodiff/training
 path this proposal called for is wired into `src/finetune/` (see
@@ -44,7 +46,7 @@ from scratch:
   outside the traced graph (in `generation.zig`), and multi-GPU training
   placement was out of scope for antfly-inference-zig's single-device
   inference focus at the time this was written. See
-  [MULTIDEVICE.md](MULTIDEVICE.md) for the current multi-device design.
+  [MULTIDEVICE.md](../../../zig/pkg/inference/MULTIDEVICE.md) for the current multi-device design.
 
 ## Open work
 

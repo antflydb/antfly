@@ -1,6 +1,6 @@
 # Gemma 4 MTP and CUDA Branch Status History
 
-> Relocated verbatim from `zig/pkg/inference/GEMMA4.md` (lines 379–405, 407–625, and 649–701 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`GEMMA4.md`](../../../zig/pkg/inference/GEMMA4.md). Durable decisions from this log were folded into that document before the move.
+> Relocated verbatim from `zig/pkg/inference/GEMMA4.md` (lines 379–405, 407–625, and 649–701 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`GEMMA4.md`](../../../../zig/pkg/inference/models/gemma4/GEMMA4.md). Durable decisions from this log were folded into that document before the move.
 
 ## Gemma 4 MTP Runtime: current smoke result
 

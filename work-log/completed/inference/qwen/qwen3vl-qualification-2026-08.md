@@ -1,6 +1,6 @@
 # Qwen3-VL qualification evidence (2026-08)
 
-> Relocated verbatim from `zig/pkg/inference/QWEN3VL_SUPPORT.md` (lines 595–750 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`QWEN3VL_SUPPORT.md`](../../../zig/pkg/inference/QWEN3VL_SUPPORT.md). Durable decisions from this log were folded into that document before the move.
+> Relocated verbatim from `zig/pkg/inference/QWEN3VL_SUPPORT.md` (lines 595–750 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`QWEN3VL_SUPPORT.md`](../../../../zig/pkg/inference/models/qwen/QWEN3VL.md). Durable decisions from this log were folded into that document before the move.
 
 ## Current status
 

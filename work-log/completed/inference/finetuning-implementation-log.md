@@ -1,6 +1,6 @@
 # Fine-tuning implementation log
 
-> Relocated verbatim from `zig/pkg/inference/docs/finetuning/FINETUNING.md` (lines 373–420 and 599–649 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`FINETUNING.md`](../../../zig/pkg/inference/docs/finetuning/FINETUNING.md). Durable decisions from this log were folded into that document before the move.
+> Relocated verbatim from `zig/pkg/inference/docs/finetuning/FINETUNING.md` (lines 373–420 and 599–649 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`FINETUNING.md`](../../../zig/pkg/inference/finetuning/FINETUNING.md). Durable decisions from this log were folded into that document before the move.
 
 Same-day end-to-end run of every gate (bundle rebuilt from the HF cache)
 surfaced and fixed three further defects the gates had never executed:

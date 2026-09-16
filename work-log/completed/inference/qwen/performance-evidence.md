@@ -1,6 +1,6 @@
 # Qwen performance evidence
 
-> Relocated verbatim from `zig/pkg/inference/QWEN_PERFORMANCE.md` (lines 20–141 and 227–302 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`QWEN_PERFORMANCE.md`](../../../zig/pkg/inference/QWEN_PERFORMANCE.md). Durable decisions from this log were folded into that document before the move.
+> Relocated verbatim from `zig/pkg/inference/QWEN_PERFORMANCE.md` (lines 20–141 and 227–302 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`QWEN_PERFORMANCE.md`](../../../../zig/pkg/inference/models/qwen/PERFORMANCE.md). Durable decisions from this log were folded into that document before the move.
 
 ## Latest ReleaseFast results (2026-09-08)
 

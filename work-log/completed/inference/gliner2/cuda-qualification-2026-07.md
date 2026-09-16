@@ -1,6 +1,6 @@
 # GLiNER2 CUDA Qualification (2026-07)
 
-> Relocated verbatim from `zig/pkg/inference/docs/GLINER2_CUDA.md` (Environment/Results lines 77–113, Correctness and Route Evidence lines 223–268, and Reproduction lines 270–328, at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`GLINER2_CUDA.md`](../../../zig/pkg/inference/docs/GLINER2_CUDA.md). Durable decisions from this log were folded into that document before the move.
+> Relocated verbatim from `zig/pkg/inference/docs/GLINER2_CUDA.md` (Environment/Results lines 77–113, Correctness and Route Evidence lines 223–268, and Reproduction lines 270–328, at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`GLINER2_CUDA.md`](../../../../zig/pkg/inference/models/gliner2/CUDA.md). Durable decisions from this log were folded into that document before the move.
 
 ## Environment
 

@@ -1,4 +1,4 @@
-# Native Model Runtimes
+# LayoutDoc Native Runtime
 
 This document covers the native (non-ONNX) model runtime implementations in antfly-inference-zig: the LayoutDoc runtime for document classification.
 

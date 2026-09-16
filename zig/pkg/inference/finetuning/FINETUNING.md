@@ -366,7 +366,7 @@ Parity review notes (vs the frozen fastino-ai/GLiNER2 oracle
   component-loss parity runs by default, and the multi-step e2e gate now
   exercises decoupled AdamW weight decay (`--weight-decay 0.01`) end to end.
 
-> **Relocated:** The same-day end-to-end gate run narrative and timings that previously lived here (48 lines) are preserved verbatim in [work-log/completed/inference/finetuning-implementation-log.md](../../../../../work-log/completed/inference/finetuning-implementation-log.md).
+> **Relocated:** The same-day end-to-end gate run narrative and timings that previously lived here (48 lines) are preserved verbatim in [work-log/completed/inference/finetuning-implementation-log.md](../../../../work-log/completed/inference/finetuning-implementation-log.md).
 
 Accepted, deliberately not "fixed":
 
@@ -548,7 +548,7 @@ For Gemma4 multimodal GRPO, add `model.projector_path` and use prompt rows with 
 
 ### Remaining Task List
 
-> **Relocated:** The 37-item completed-work changelog and remaining-work list that previously lived here (51 lines) is preserved verbatim in [work-log/completed/inference/finetuning-implementation-log.md](../../../../../work-log/completed/inference/finetuning-implementation-log.md).
+> **Relocated:** The 37-item completed-work changelog and remaining-work list that previously lived here (51 lines) is preserved verbatim in [work-log/completed/inference/finetuning-implementation-log.md](../../../../work-log/completed/inference/finetuning-implementation-log.md).
 
 
 ## Architecture

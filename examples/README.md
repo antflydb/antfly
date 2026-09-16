@@ -6,7 +6,7 @@ with `GOWORK=off`.
 
 ## Ingestion Examples
 
-### [docsaf](./docsaf/)
+### [docsaf](docsaf/)
 
 Ingest documentation from local files, Git repositories, S3, Google Drive, and
 web sources into Antfly with `docsaf`, including entity extraction.
@@ -22,7 +22,7 @@ cd examples/docsaf
 ./run-demo.sh
 ```
 
-### [Postgres Real-time Sync](./postgres-sync/)
+### [Postgres Real-time Sync](postgres-sync/)
 
 Real-time synchronization from Postgres JSONB columns to Antfly using LISTEN/NOTIFY.
 
@@ -56,28 +56,28 @@ For a change-data-capture path that needs no daemon, see the
 [Stream PostgreSQL into Antfly](../docs/guides/cdc-replication.mdx) guide, which
 uses logical replication managed by Antfly itself.
 
-### [Pinecone Migration](./pinecone-migration/)
+### [Pinecone Migration](pinecone-migration/)
 
 Migrate vector embeddings from Pinecone into Antfly.
 
 ## Search Examples
 
-### [Image Search](./image-search/)
+### [Image Search](image-search/)
 
 Index images with native multimodal embeddings and search them with text or
 image queries.
 
-### [Epstein](./epstein/)
+### [Epstein](epstein/)
 
 Document corpus ingestion with entity extraction and a graph visualization.
 
-### [Screenshots](./screenshots-shots-shots/)
+### [Screenshots](screenshots-shots-shots/)
 
 Index screenshots and search them semantically.
 
 ## Embedded and Memory Examples
 
-### [Antfly Lite Go](./antfly-lite-go/)
+### [Antfly Lite Go](antfly-lite-go/)
 
 Embed Antfly Lite directly in a Go process with a live `.aflite` database and
 export a portable `.afb` backup for restore or promotion.
@@ -101,7 +101,7 @@ cd ../examples/antfly-lite-go
 GOWORK=off go run . --reset
 ```
 
-### [Antfly Lite Retrieval Template](./antfly-lite-retrieval-go/)
+### [Antfly Lite Retrieval Template](antfly-lite-retrieval-go/)
 
 Build a local-first retrieval app on Antfly Lite with a native `.aflite`
 database, caller-supplied embeddings, full-text search, dense vector search, and
@@ -128,7 +128,7 @@ cd ../examples/antfly-lite-retrieval-go
 GOWORK=off go run . --reset
 ```
 
-### [memoryaf + docsaf](./memoryaf/)
+### [memoryaf + docsaf](memoryaf/)
 
 Turn documentation into `memoryaf` records from local files, Git, S3, Google Drive, or web sources, with local watch mode for filesystem sync.
 

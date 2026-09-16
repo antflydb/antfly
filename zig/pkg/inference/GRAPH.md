@@ -491,4 +491,4 @@ Near-term graph/backend work:
 
 > **Relocated:** The item-by-item graph/backend progress narrative that previously lived here (56 lines) is preserved verbatim in [work-log/completed/inference/graph-current-progress-history.md](../../../work-log/completed/inference/graph-current-progress-history.md). The durable ModelExecutor/ModelRuntime/PartitionExecutor split it described is decision 8 above.
 
-See also: [MULTIDEVICE.md](MULTIDEVICE.md) for multi-device inference, [FINETUNING.md](docs/finetuning/FINETUNING.md) for training support.
+See also: [MULTIDEVICE.md](MULTIDEVICE.md) for multi-device inference, [FINETUNING.md](finetuning/FINETUNING.md) for training support.

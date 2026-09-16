@@ -307,7 +307,7 @@ candidate is still dev-only.
 
 The complete FP16 encoder, generated tensor-core attention, Fastino comparison,
 correctness evidence, production dispatch policy, and remaining work are
-documented in [`docs/GLINER2_CUDA.md`](docs/GLINER2_CUDA.md).
+documented in [`models/gliner2/CUDA.md`](models/gliner2/CUDA.md).
 
 CUDA GLiNER2 span-head weights use resident `Q4_K` kernels by default when the
 checked-in CUDA module exposes the required GLiNER span primitives. This avoids
@@ -769,7 +769,7 @@ singleton route. The row-two path has repeated paged-KV growth coverage but
 remains experimental because long generation may differ from singleton token
 output and the optimized singleton decoder is currently faster. Set
 `ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING=1` for the global rollback.
-See [docs/CUDA_BATCHING.md](docs/CUDA_BATCHING.md) for the canonical rollout
+See [docs/CUDA_BATCHING.md](CUDA_BATCHING.md) for the canonical rollout
 contract and promotion gate.
 
 Run the hardware gate with:
@@ -841,7 +841,7 @@ CUDA meets its minimal-usefulness bar:
 > **Relocated:** The dated L4 TurboQuant validation status and measurement
 > tables that previously lived here (32 lines, checked 2026-06-21) are
 > preserved verbatim in
-> [work-log/completed/inference/cuda-turboquant-l4-validation.md](../../../work-log/completed/inference/cuda-turboquant-l4-validation.md).
+> [work-log/completed/inference/cuda-turboquant-l4-validation.md](../../../work-log/completed/inference/cuda/turboquant-l4.md).
 > Durable decisions from it are in Gemma4 And TurboQuant KV Status in this
 > document.
 

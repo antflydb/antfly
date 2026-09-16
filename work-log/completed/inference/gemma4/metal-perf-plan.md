@@ -1,6 +1,6 @@
 # Gemma 4 Metal Performance Plan Implementation Ledgers
 
-> Relocated verbatim from `zig/pkg/inference/GEMMA4_PERF_PLAN.md` (lines 128–498 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`GEMMA4_PERF_PLAN.md`](../../../zig/pkg/inference/GEMMA4_PERF_PLAN.md) and [`GEMMA4.md`](../../../zig/pkg/inference/GEMMA4.md). Durable decisions from this log were folded into those documents before the move.
+> Relocated verbatim from `zig/pkg/inference/GEMMA4_PERF_PLAN.md` (lines 128–498 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`GEMMA4.md` (Metal Performance Plan)](../../../../zig/pkg/inference/models/gemma4/GEMMA4.md#metal-performance-plan) and [`GEMMA4.md`](../../../../zig/pkg/inference/models/gemma4/GEMMA4.md). Durable decisions from this log were folded into those documents before the move.
 
 ## 9. Implementation ledger (worktree `worktree-gemma4-perf-plan`, 2026-08-26, base M4 Air 16GB / ~120 GB/s — qualification numbers must be re-run on the M4 Pro box)
 

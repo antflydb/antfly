@@ -7,13 +7,13 @@ reports were collected; they are not the current serving admission policy.
 Current admission validates the selected artifact, tensors, serving role, and
 backend. A catalog entry or exact qualification receipt is not required. The
 split decoder/projector runtime currently requires Metal; integrated safetensors
-generation also supports CUDA. See [model compatibility](MODEL_COMPATIBILITY.md).
+generation also supports CUDA. See [model compatibility](../../MODEL_COMPATIBILITY.md).
 
 ## Historical qualification evidence
 
 > **Relocated:** The dated 2026-08-29/08-30 qualification campaign is
 > preserved verbatim in
-> [work-log/completed/inference/qwen3vl-qualification-2026-08.md](../../../work-log/completed/inference/qwen3vl-qualification-2026-08.md).
+> [work-log/completed/inference/qwen3vl-qualification-2026-08.md](../../../../../work-log/completed/inference/qwen/qwen3vl-qualification-2026-08.md).
 > See Current status below for the durable, undated summary.
 
 ## Pinned artifacts
@@ -314,7 +314,7 @@ document. Split long PDFs into page images and submit bounded batches; PDF
 rasterization is not performed by this endpoint.
 
 This route uses the current artifact and backend compatibility checks described
-in [model compatibility](MODEL_COMPATIBILITY.md); it does not require an exact
+in [model compatibility](../../MODEL_COMPATIBILITY.md); it does not require an exact
 qualification receipt or catalog entry. The reader adapter accepts split GGUF
 generation bundles on Metal. Reranker bundles and integrated safetensors models
 do not use this adapter.
@@ -648,7 +648,7 @@ tests cover their strict contracts.
 > generation, reranker, Metal kernel enablement measurements, and the
 > stale-weight-cache and tokenizer-regex fixes it found) that previously
 > lived here (150 lines) is preserved verbatim in
-> [work-log/completed/inference/qwen3vl-qualification-2026-08.md](../../../work-log/completed/inference/qwen3vl-qualification-2026-08.md).
+> [work-log/completed/inference/qwen3vl-qualification-2026-08.md](../../../../../work-log/completed/inference/qwen/qwen3vl-qualification-2026-08.md).
 > Durable decisions from it are in Runtime architecture, Metal kernel
 > enablement, and Local qualification workflow in this document.
 
