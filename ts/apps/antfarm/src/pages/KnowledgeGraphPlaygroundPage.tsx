@@ -34,7 +34,7 @@ import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
-import { isGliner25Model } from "@/lib/extraction-model";
+import { extractionUnavailableReason } from "@/lib/extraction-model";
 import { fetchWithRetry } from "@/lib/utils";
 
 // Entity and relation response types matching the Antfly extraction API.
@@ -280,9 +280,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       model.toLowerCase().includes("rebel") ? `rel:${model}` : model
     );
     setAvailableModels(models);
-    setSelectedModel((current: string) =>
-      current && (models.includes(current) || isGliner25Model(current)) ? current : models[0] || ""
-    );
+    setSelectedModel((current: string) => current || models[0] || "");
     setModelsLoaded(!modelsLoading);
   }, [connectionModels, modelsLoading]);
 
@@ -303,7 +301,11 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
 
   // Check if the selected model is a REBEL model
   const isRebelModel = selectedModel.startsWith("rel:");
-  const isGliner25 = !isRebelModel && isGliner25Model(selectedModel);
+  const unavailableReason = extractionUnavailableReason(
+    getModelName(selectedModel),
+    connectionModels,
+    modelsLoading
+  );
 
   const handleBuildGraph = useCallback(async () => {
     if (!inputText.trim()) {
@@ -313,6 +315,11 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
 
     if (!selectedModel) {
       setError("Please select a model");
+      return;
+    }
+
+    if (unavailableReason) {
+      setError(unavailableReason);
       return;
     }
 
@@ -343,36 +350,20 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         .map((t: string) => t.trim())
         .filter((t: string) => t.length > 0);
 
-      // Build a relation extraction request for the selected schema version.
+      // The current serving listing exposes the legacy extraction protocol.
       const requestBody: Record<string, unknown> = {
         model: getModelName(selectedModel),
-        inputs: texts.map((content: string, index: number) =>
-          isGliner25 ? { id: `input-${index}`, content } : { content }
-        ),
-        schema: isGliner25
-          ? {
-              joint_ie: {
-                entities: Object.fromEntries(entityLabels.map((label) => [label, label])),
-                relations: Object.fromEntries(
-                  relationLabels.map((type) => [type, { head: entityLabels, tail: entityLabels }])
-                ),
-              },
-            }
-          : {
-              relations: relationLabels.map((type) => ({ type })),
-            },
+        inputs: texts.map((content: string) => ({ content })),
+        schema: {
+          relations: relationLabels.map((type) => ({ type })),
+          ...(!isRebelModel ? { entities: entityLabels } : {}),
+        },
         options: {
           include_confidence: true,
           include_spans: true,
-          ...(isGliner25 ? { offset_unit: "utf16_codeunits" } : { resolver: config }),
+          resolver: config,
         },
       };
-
-      if (isGliner25) {
-        requestBody.schema_version = 2;
-      } else if (!isRebelModel) {
-        (requestBody.schema as Record<string, unknown>).entities = entityLabels;
-      }
 
       const response = await fetchWithRetry(inferenceUrl("extract"), {
         method: "POST",
@@ -407,7 +398,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     inputText,
     selectedModel,
     isRebelModel,
-    isGliner25,
+    unavailableReason,
     entityLabels,
     relationLabels,
     config,
@@ -678,11 +669,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
               <Combobox
                 options={availableModels.map((model) => ({
                   value: model,
-                  label: model.startsWith("rel:")
-                    ? `${model.slice(4)} (REBEL)`
-                    : isGliner25Model(model)
-                      ? `${model} (GLiNER2.5)`
-                      : `${model} (GLiNER)`,
+                  label: model.startsWith("rel:") ? `${model.slice(4)} (REBEL)` : model,
                 }))}
                 value={selectedModel}
                 onChange={setSelectedModel}
@@ -697,32 +684,28 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                   REBEL models extract 200+ relation types automatically
                 </p>
               )}
-              {isGliner25 && (
-                <p className="text-xs text-muted-foreground">
-                  GLiNER2.5 uses schema v2 JointIE with typed relation endpoints.
-                </p>
+              {unavailableReason && (
+                <p className="text-xs text-muted-foreground">{unavailableReason}</p>
               )}
             </div>
 
-            {!isGliner25 && (
-              <div className="space-y-2">
-                <Label htmlFor="similarity">Similarity Threshold</Label>
-                <Input
-                  id="similarity"
-                  type="number"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={config.similarity_threshold}
-                  onChange={(e) =>
-                    setConfig({
-                      ...config,
-                      similarity_threshold: Number.parseFloat(e.target.value) || 0.85,
-                    })
-                  }
-                />
-              </div>
-            )}
+            <div className="space-y-2">
+              <Label htmlFor="similarity">Similarity Threshold</Label>
+              <Input
+                id="similarity"
+                type="number"
+                min={0}
+                max={1}
+                step={0.05}
+                value={config.similarity_threshold}
+                onChange={(e) =>
+                  setConfig({
+                    ...config,
+                    similarity_threshold: Number.parseFloat(e.target.value) || 0.85,
+                  })
+                }
+              />
+            </div>
           </div>
 
           {/* Labels Configuration - only for GLiNER models */}
@@ -820,45 +803,43 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           )}
 
           {/* Advanced Options */}
-          {!isGliner25 && (
-            <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
-              <label htmlFor="type-must-match" className="flex items-center gap-2">
-                <Checkbox
-                  id="type-must-match"
-                  checked={config.type_must_match}
-                  onCheckedChange={(checked) =>
-                    setConfig({ ...config, type_must_match: checked === true })
-                  }
-                />
-                Type must match for merge
-              </label>
-              <label htmlFor="deduplicate-relations" className="flex items-center gap-2">
-                <Checkbox
-                  id="deduplicate-relations"
-                  checked={config.deduplicate_relations}
-                  onCheckedChange={(checked) =>
-                    setConfig({ ...config, deduplicate_relations: checked === true })
-                  }
-                />
-                Deduplicate relations
-              </label>
-              <label htmlFor="track-provenance" className="flex items-center gap-2">
-                <Checkbox
-                  id="track-provenance"
-                  checked={config.track_provenance}
-                  onCheckedChange={(checked) =>
-                    setConfig({ ...config, track_provenance: checked === true })
-                  }
-                />
-                Track provenance
-              </label>
-            </div>
-          )}
+          <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
+            <label htmlFor="type-must-match" className="flex items-center gap-2">
+              <Checkbox
+                id="type-must-match"
+                checked={config.type_must_match}
+                onCheckedChange={(checked) =>
+                  setConfig({ ...config, type_must_match: checked === true })
+                }
+              />
+              Type must match for merge
+            </label>
+            <label htmlFor="deduplicate-relations" className="flex items-center gap-2">
+              <Checkbox
+                id="deduplicate-relations"
+                checked={config.deduplicate_relations}
+                onCheckedChange={(checked) =>
+                  setConfig({ ...config, deduplicate_relations: checked === true })
+                }
+              />
+              Deduplicate relations
+            </label>
+            <label htmlFor="track-provenance" className="flex items-center gap-2">
+              <Checkbox
+                id="track-provenance"
+                checked={config.track_provenance}
+                onCheckedChange={(checked) =>
+                  setConfig({ ...config, track_provenance: checked === true })
+                }
+              />
+              Track provenance
+            </label>
+          </div>
 
           <FormActions>
             <Button
               onClick={handleBuildGraph}
-              disabled={isLoading || !inputText.trim() || !selectedModel}
+              disabled={isLoading || !inputText.trim() || !selectedModel || !!unavailableReason}
             >
               {isLoading ? (
                 <>

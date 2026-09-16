@@ -46,7 +46,7 @@ import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
-import { isGliner25Model } from "@/lib/extraction-model";
+import { extractionUnavailableReason } from "@/lib/extraction-model";
 import { fetchWithRetry } from "@/lib/utils";
 
 // Entity extraction response types matching the Antfly inference API.
@@ -379,20 +379,20 @@ const ExtractionPlaygroundPage: React.FC = () => {
   ]);
 
   const availableModels = extractorModels;
-  const usesSchemaV2 = isGliner25Model(selectedModel);
+  const unavailableReason = extractionUnavailableReason(
+    selectedModel,
+    connectionExtractors,
+    extractorsLoading
+  );
 
   useEffect(() => {
     setExtractorModels(connectionExtractors);
     setModelsLoaded(!extractorsLoading);
   }, [connectionExtractors, extractorsLoading]);
 
-  // Update selected model when mode changes
+  // Default an empty selection; preserve unavailable IDs so the user sees why they cannot run.
   useEffect(() => {
-    setSelectedModel((prev: string) =>
-      prev && (extractorModels.includes(prev) || isGliner25Model(prev))
-        ? prev
-        : extractorModels[0] || ""
-    );
+    setSelectedModel((prev: string) => prev || extractorModels[0] || "");
   }, [extractorModels]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
@@ -439,6 +439,11 @@ const ExtractionPlaygroundPage: React.FC = () => {
       return;
     }
 
+    if (unavailableReason) {
+      setError(unavailableReason);
+      return;
+    }
+
     if (mode === "entities" && labels.length === 0) {
       setError("Please add at least one entity label");
       return;
@@ -465,20 +470,16 @@ const ExtractionPlaygroundPage: React.FC = () => {
 
     try {
       if (mode === "entities") {
-        const v2Request = usesSchemaV2
-          ? { schema_version: 2, inputs: [{ id: "input-0", content: inputText }] }
-          : { inputs: [{ content: inputText }] };
         const response = await fetchWithRetry(inferenceUrl("extract"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: selectedModel,
-            ...v2Request,
+            inputs: [{ content: inputText }],
             schema: { entities: labels },
             options: {
               include_confidence: true,
               include_spans: true,
-              ...(usesSchemaV2 ? { offset_unit: "utf16_codeunits" } : {}),
             },
           }),
           signal: abortControllerRef.current.signal,
@@ -500,21 +501,17 @@ const ExtractionPlaygroundPage: React.FC = () => {
           };
         }
 
-        const v2Request = usesSchemaV2
-          ? { schema_version: 2, inputs: [{ id: "input-0", content: inputText }] }
-          : { inputs: [{ content: inputText }] };
         const response = await fetchWithRetry(inferenceUrl("extract"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: selectedModel,
-            ...v2Request,
+            inputs: [{ content: inputText }],
             schema: { structures: apiSchema },
             options: {
               threshold: extractThreshold,
               include_confidence: includeConfidence,
               include_spans: includeSpans,
-              ...(usesSchemaV2 ? { offset_unit: "utf16_codeunits" } : {}),
             },
           }),
           signal: abortControllerRef.current.signal,
@@ -551,7 +548,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
     extractThreshold,
     includeConfidence,
     includeSpans,
-    usesSchemaV2,
+    unavailableReason,
   ]);
 
   // Cmd+Enter shortcut
@@ -834,7 +831,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
         <div>
           <DashboardPageTitle>Extraction Playground</DashboardPageTitle>
           <DashboardPageDescription>
-            Extract entities and structured data from text using GLiNER2 and GLiNER2.5 models
+            Extract entities and structured data from text using available extraction models
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
@@ -885,7 +882,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
               <Combobox
                 options={availableModels.map((model) => ({
                   value: model,
-                  label: isGliner25Model(model) ? `${model} (GLiNER2.5)` : model,
+                  label: model,
                 }))}
                 value={selectedModel}
                 onChange={setSelectedModel}
@@ -895,10 +892,8 @@ const ExtractionPlaygroundPage: React.FC = () => {
                 allowCustomValue
                 disabled={!modelsLoaded}
               />
-              {usesSchemaV2 && (
-                <p className="text-xs text-muted-foreground">
-                  GLiNER2.5 uses the strict extraction schema v2 contract.
-                </p>
+              {unavailableReason && (
+                <p className="text-xs text-muted-foreground">{unavailableReason}</p>
               )}
             </div>
 
@@ -1115,7 +1110,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
           <FormActions>
             <Button
               onClick={handleExtractionSubmit}
-              disabled={isLoading || !inputText.trim() || !selectedModel}
+              disabled={isLoading || !inputText.trim() || !selectedModel || !!unavailableReason}
             >
               {isLoading ? (
                 <>
