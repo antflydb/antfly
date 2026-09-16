@@ -18344,9 +18344,16 @@ pub const ApiHttpServer = struct {
                 break;
             platform_sync.lockYielding(&self.restore_schedule_mutex);
             const scheduled_count = self.scheduled_restore_jobs.count();
+            var active: [max_concurrent_restore_jobs]u64 = undefined;
+            var active_iter = self.scheduled_restore_jobs.keyIterator();
+            var active_count: usize = 0;
+            while (active_iter.next()) |id| {
+                active[active_count] = id.*;
+                active_count += 1;
+            }
             self.restore_schedule_mutex.unlock();
             if (scheduled_count >= max_concurrent_restore_jobs) break;
-            const ids = try self.restore_job_store.takePendingIds(self.alloc, max_concurrent_restore_jobs - scheduled_count);
+            const ids = try self.restore_job_store.takePendingIdsExcluding(self.alloc, max_concurrent_restore_jobs - scheduled_count, active[0..active_count]);
             defer self.alloc.free(ids);
             for (ids) |job_id| {
                 self.submitRestoreJob(job_id) catch |err| {

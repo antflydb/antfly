@@ -96,7 +96,7 @@ pub const Progress = struct {
 
     pub fn encode(self: Progress, alloc: Allocator) ![]u8 {
         if (self.cursor.len > max_cursor_bytes or self.failure.len > 4096 or
-            (self.state == .enforced and self.cursor.len != 0) or (self.state != .invalid and self.failure.len != 0)) return error.InvalidConstraintActivation;
+            (self.state == .enforced and (self.cursor.len != 0 or self.failure.len != 0))) return error.InvalidConstraintActivation;
         const out = try alloc.alloc(u8, header_len + self.cursor.len + self.failure.len + 32);
         @memcpy(out[0..4], "AIA1");
         @memcpy(out[4..36], &self.generation_set);
@@ -136,7 +136,7 @@ pub const Progress = struct {
             .cursor = payload[0..cursor_len],
             .failure = payload[cursor_len..],
         };
-        if ((result.state == .enforced and result.cursor.len != 0) or (result.state != .invalid and result.failure.len != 0)) return error.InvalidConstraintActivation;
+        if (result.state == .enforced and (result.cursor.len != 0 or result.failure.len != 0)) return error.InvalidConstraintActivation;
         return result;
     }
 
@@ -150,6 +150,8 @@ pub const Command = struct {
     expected: ?[]const u8,
     next: []const u8,
     retry: bool = false,
+    /// Guarded, retryable diagnostic; never advances source coverage.
+    diagnostic: bool = false,
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("relational_integrity_json.zig").write(self, jw);
     }

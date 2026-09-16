@@ -131,7 +131,10 @@ pub fn prepareCommand(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catal
     // stored progress from status() above remains a storage failure.
     const after = Progress.decode(command.next) catch return error.InvalidConstraintActivationCommand;
     if (!after.matches(catalog, before.owner) or after.schema_version != catalog.schema_version) return error.ConstraintActivationChanged;
-    if (command.retry) {
+    if (command.diagnostic) {
+        if (command.retry or before.state != .validating or after.state != .validating or after.phase != before.phase or after.rows_scanned != before.rows_scanned or
+            !std.mem.eql(u8, after.cursor, before.cursor) or after.failure.len == 0) return error.InvalidConstraintActivationCommand;
+    } else if (command.retry) {
         const initial_phase = firstPhase(catalog);
         if (before.state != .invalid or after.state != .validating or after.phase != initial_phase or after.cursor.len != 0 or after.rows_scanned != 0) return error.InvalidConstraintActivationCommand;
     } else {
@@ -190,6 +193,7 @@ pub const Page = struct {
         var progress = try status(&reader.read, catalog);
         const phase = progress.phase;
         if (progress.state != .validating) return null;
+        progress.failure = "";
         // Bind the cold projection to the checkpoint in this SAME source
         // snapshot. A large CHECK column must not inflate UNIQUE/FK pages.
         const public = (reader.active.validator() orelse return error.ConstraintNotFound).schema;
@@ -232,9 +236,13 @@ pub const Page = struct {
             progress.failure = @errorName(err);
             progress.cursor = try owned.dupe(u8, progress.cursor);
             const next = try progress.encode(owned);
+            const observed = reader.failed_row orelse return error.MissingPrimaryObservation;
+            const failed_rows = try owned.alloc(rows.Row, 1);
+            failed_rows[0] = observed;
+            failed_rows[0].key = try owned.dupe(u8, observed.key);
             return .{
                 .arena = arena,
-                .rows = .{ .arena = std.heap.ArenaAllocator.init(alloc), .rows = &.{}, .more = true, .records_examined = 0, .output_bytes = 0 },
+                .rows = .{ .arena = std.heap.ArenaAllocator.init(alloc), .rows = failed_rows, .more = true, .records_examined = 0, .output_bytes = 0 },
                 .progress = progress,
                 .phase = phase,
                 .command = .{ .routing_key = routing, .expected = expected, .next = next },
@@ -259,9 +267,13 @@ test "relational integrity activation coverage binds generation owner phase and 
     try std.testing.expect(!progress.readyForReferences());
     progress.phase = .foreign_key;
     try std.testing.expect(progress.readyForReferences());
+    progress.failure = "ForeignKeyParentMissing";
     const bytes = try progress.encode(alloc);
     defer alloc.free(bytes);
     const decoded = try Progress.decode(bytes);
+    try std.testing.expectEqual(State.validating, decoded.state);
+    try std.testing.expectEqualStrings("ForeignKeyParentMissing", decoded.failure);
+    try std.testing.expect(decoded.readyForReferences());
     try std.testing.expect(decoded.matches(catalog.catalog, @splat(5)));
     try std.testing.expect(!decoded.matches(catalog.catalog, @splat(6)));
     bytes[bytes.len - 1] ^= 1;

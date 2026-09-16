@@ -1577,16 +1577,28 @@ pub const Store = struct {
     /// durable until their terminal retention expires; only the small runnable
     /// index is consumed here, avoiding a full JSON scan after every job.
     pub fn takePendingIds(self: *Store, alloc: std.mem.Allocator, limit: usize) ![]u64 {
+        return self.takePendingIdsExcluding(alloc, limit, &.{});
+    }
+
+    /// A worker may durably enqueue its successor before releasing its local
+    /// execution slot. Leave those IDs in the FIFO until completion dispatches
+    /// again; consuming and subsequently rejecting them loses the only wakeup.
+    pub fn takePendingIdsExcluding(self: *Store, alloc: std.mem.Allocator, limit: usize, active: []const u64) ![]u64 {
         self.lock();
         defer self.mutex.unlock();
         const now_ms = nowMillis();
         var ids = std.ArrayListUnmanaged(u64).empty;
         errdefer ids.deinit(alloc);
-        try ids.ensureTotalCapacity(alloc, @min(limit, self.pending.items.len - self.pending_head));
-        while (ids.items.len < limit and self.pending_head < self.pending.items.len) {
-            const pending = self.pending.items[self.pending_head];
+        const capacity = @min(limit, self.pending.items.len - self.pending_head);
+        try ids.ensureTotalCapacity(alloc, capacity);
+        const selected = try alloc.alloc(usize, capacity);
+        defer alloc.free(selected);
+        var index = self.pending_head;
+        var first_live: ?usize = null;
+        while (ids.items.len < limit and index < self.pending.items.len) {
+            const pending = self.pending.items[index];
             const encoded = self.jobs.get(pending.job_id) orelse {
-                self.pending_head += 1;
+                index += 1;
                 continue;
             };
             var parsed = std.json.parseFromSlice(JobState, alloc, encoded, .{ .ignore_unknown_fields = true }) catch return error.CorruptRestoreJobStore;
@@ -1595,15 +1607,32 @@ pub const Store = struct {
                 parsed.value.dispatch_sequence != pending.dispatch_sequence or
                 parsed.value.not_before_ms != pending.not_before_ms)
             {
-                self.pending_head += 1;
+                index += 1;
                 continue;
             }
+            if (first_live == null) first_live = index;
             if (pending.not_before_ms > now_ms) break;
-            self.pending_head += 1;
+            if (std.mem.indexOfScalar(u64, active, pending.job_id) != null) {
+                index += 1;
+                continue;
+            }
+            selected[ids.items.len] = index;
             ids.appendAssumeCapacity(pending.job_id);
+            index += 1;
+        }
+        // Do not consume work until all fallible allocation/parsing succeeds.
+        // Remove only the bounded selected slots; keep blocked entries ordered.
+        const result = try ids.toOwnedSlice(alloc);
+        self.pending_head = first_live orelse index;
+        var prefix: usize = 0;
+        while (prefix < result.len and selected[prefix] == self.pending_head) : (prefix += 1) self.pending_head += 1;
+        var remaining = result.len;
+        while (remaining != prefix) {
+            remaining -= 1;
+            _ = self.pending.orderedRemove(selected[remaining]);
         }
         self.compactPendingLocked();
-        return try ids.toOwnedSlice(alloc);
+        return result;
     }
 
     /// Returns the bounded delay until the next durable runnable job. This lets
@@ -4126,6 +4155,19 @@ test "restore job runnable queue drains incrementally and preserves insertion or
     const empty = try store.takePendingIds(std.testing.allocator, 2);
     defer std.testing.allocator.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    // A yielded worker still owns its execution slot. An expired retry must
+    // remain queued while unrelated work bypasses it, without a busy loop.
+    for (created) |id| try store.requeuePending(id);
+    const bypass = try store.takePendingIdsExcluding(std.testing.allocator, 3, created[0..1]);
+    defer std.testing.allocator.free(bypass);
+    try std.testing.expectEqualSlices(u64, created[1..], bypass);
+    const blocked = try store.takePendingIdsExcluding(std.testing.allocator, 3, created[0..1]);
+    defer std.testing.allocator.free(blocked);
+    try std.testing.expectEqual(@as(usize, 0), blocked.len);
+    const released = try store.takePendingIds(std.testing.allocator, 3);
+    defer std.testing.allocator.free(released);
+    try std.testing.expectEqualSlices(u64, created[0..1], released);
 }
 
 test "replicated restore leadership rebuild preserves FIFO and recovers running attempts" {

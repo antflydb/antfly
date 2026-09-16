@@ -1251,3 +1251,32 @@ Historical-layout validation also advances with a durable bounded cursor.
 Cancellation and restarts resume both phases without downloading the prefix or
 decoding earlier objects again. Decoder admission is bounded by the existing
 archive object/manifest limits, with at most 128 logical rows per import slice.
+
+### Review hardening: retry ownership, activation proofs, and scan bindings
+
+Restore dispatch excludes IDs whose previous execution slot has not yet been
+released. A worker may durably queue its next slice before completion, but a
+concurrent dispatcher cannot consume that successor prematurely. Unrelated
+eligible jobs still run, and completion dispatches the retained successor.
+Queue selection is failure-atomic and the ordinary FIFO path advances a head
+cursor rather than shifting the retained queue.
+
+Constraint failure publication retains physical source-row guards, including
+oversized projection failures. UNIQUE/FK rejection is revalidated after the
+failed mutation transaction: terminal failure includes an exact claim guard
+(including absent-parent guards) in the same distributed transaction as the
+activation checkpoint. A repaired observation causes a retry, not INVALID.
+Row-local MATCH FULL and CHECK failures carry their original row guards.
+MATCH PARTIAL scans cannot supply a negative point predicate for an absent
+witness; their missing-parent diagnostics therefore remain `validating`, with
+the reason exposed in range status, and are automatically rechecked. They never
+advance coverage or require an operator retry just because a parent arrived
+after the scan. Successful progress clears the diagnostic.
+
+Typed primary/fallback scans retain snapshot-local source layout, projection,
+and predicate bindings in an eight-entry LRU with a 2-MiB retention budget.
+One oversized binding may occupy the working slot alone. Layouts are loaded
+from the pinned store snapshot, never a process-wide version-number cache.
+This keeps alternating historical/current rows from recompiling a layout per
+row while bounding retention under schema churn. Work-count regressions cover
+512 alternating rows, eviction across ten epochs, and allocation-failure cleanup.

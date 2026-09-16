@@ -10,6 +10,83 @@ const primary_mod = @import("../hot_standby/primary.zig");
 const time = @import("antfly_platform").time;
 const alloc = std.testing.allocator;
 
+fn mixedScanAllocations(test_alloc: std.mem.Allocator, db: *db_mod.DB) !void {
+    var reader = try db.beginRelationalRows(test_alloc, .{ .fields = &.{"payload"} });
+    defer reader.deinit();
+    var page = try reader.nextPage(test_alloc, null, .{ .rows = 2, .time_ns = std.time.ns_per_s });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), reader.source_compilations);
+}
+
+test "relational index system historical scan evicts bounded snapshot bindings" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("historical-binding-eviction");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer db.close();
+    for (1..11) |version| {
+        try install(&db, @intCast(version), false);
+        try write(&db, version, 1);
+    }
+    var reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"id"} });
+    defer reader.deinit();
+    var count: usize = 0;
+    while (true) {
+        var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 1 });
+        defer page.deinit();
+        count += page.rows.len;
+        if (!page.more) break;
+    }
+    try std.testing.expectEqual(@as(usize, 10), count);
+    try std.testing.expectEqual(@as(usize, 10), reader.source_compilations);
+    var retained: usize = 0;
+    for (reader.bindings) |binding| if (binding != null) {
+        retained += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 8), retained);
+    try std.testing.expect(reader.binding_bytes <= 2 * 1024 * 1024);
+}
+
+test "relational index system mixed schema scan compiles each snapshot layout once" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("mixed-schema-bindings");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer db.close();
+    try install(&db, 1, false);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const writes = try owned.alloc(db_mod.types.BatchWrite, 512);
+    for (writes, 0..) |*item, i| item.* = .{ .key = try std.fmt.allocPrint(owned, "{d:0>4}", .{i}), .value = "{\"tenant\":1,\"id\":7,\"payload\":\"old\"}" };
+    try db.batch(.{ .writes = writes });
+    try install(&db, 2, false);
+    const updates = try owned.alloc(db_mod.types.BatchWrite, writes.len / 2);
+    for (updates, 0..) |*item, i| item.* = .{ .key = writes[i * 2 + 1].key, .value = "{\"tenant\":1,\"id\":7,\"payload\":\"new\"}" };
+    try db.batch(.{ .writes = updates });
+    var reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"payload"}, .conditions = &.{.{ .column = "id", .op = .gte, .value = .{ .integer = 7 } }} });
+    defer reader.deinit();
+    // Live publication must not change either the source layouts or rows in
+    // this reader; cache identity is the read snapshot, never a global epoch ID.
+    try install(&db, 3, false);
+    var count: usize = 0;
+    const started = time.monotonicNs();
+    while (true) {
+        var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 7 });
+        defer page.deinit();
+        for (page.rows) |row| {
+            try std.testing.expectEqualStrings(if (count % 2 == 0) "{\"payload\":\"old\"}" else "{\"payload\":\"new\"}", row.json);
+            count += 1;
+        }
+        if (!page.more) break;
+    }
+    try std.testing.expectEqual(@as(usize, 512), count);
+    try std.testing.expectEqual(@as(usize, 2), reader.source_compilations);
+    try std.testing.expect(reader.source_cache_hits >= 510);
+    try std.testing.expect(reader.binding_bytes <= 2 * 1024 * 1024);
+    std.debug.print("mixed schema LSM scan: rows={d} compilations={d} hits={d} elapsed_us={d}\n", .{ count, reader.source_compilations, reader.source_cache_hits, (time.monotonicNs() - started) / 1000 });
+    try std.testing.checkAllAllocationFailures(alloc, mixedScanAllocations, .{&db});
+}
+
 fn expressionKeyAllocations(test_alloc: std.mem.Allocator) !void {
     const schema_mod = @import("../schema.zig");
     const codec = @import("algebraic/relational_row_codec.zig");

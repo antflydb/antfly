@@ -134,8 +134,36 @@ pub const Reader = struct {
     /// evaluate the complete query against the authoritative row.
     implied_conditions: []const bool,
     source_conditions: []predicates.Source = &.{},
+    // Snapshot-local LRU: version numbers are not identities across restores.
+    // Retain at most eight bindings / 2 MiB, or one oversized working binding.
+    bindings: [8]?*SourceBinding = @splat(null),
+    binding_bytes: usize = 0,
+    source_compilations: usize = 0,
+    source_cache_hits: usize = 0,
+    failed_row: ?Row = null,
     after: std.ArrayList(u8) = .empty,
     done: bool = false,
+
+    const SourceBinding = struct {
+        arena: std.heap.ArenaAllocator,
+        view: registry.SchemaView,
+        projection: codec.OrdinalProjectionPlan,
+        conditions: []predicates.Source,
+
+        fn destroy(self: *SourceBinding, alloc: Allocator) void {
+            self.view.release();
+            self.arena.deinit();
+            alloc.destroy(self);
+        }
+    };
+
+    fn evictSourceBinding(self: *Reader, slot: usize) void {
+        if (self.bindings[slot]) |binding| {
+            self.binding_bytes -= binding.arena.queryCapacity();
+            binding.destroy(self.alloc);
+            self.bindings[slot] = null;
+        }
+    }
 
     /// Caller fences schema/catalog publication while this snapshot is opened.
     /// Owns request data except row_filter.context, which the caller retains
@@ -266,15 +294,13 @@ pub const Reader = struct {
     }
 
     pub fn deinit(self: *Reader) void {
+        if (self.failed_row) |row| self.alloc.free(row.key);
         if (self.covering_projection) |*plan| plan.deinit();
         for (self.covering_conditions) |*condition| condition.deinit();
         self.alloc.free(self.covering_conditions);
-        for (self.source_conditions) |*condition| condition.deinit();
-        self.alloc.free(self.source_conditions);
+        for (0..self.bindings.len) |slot| self.evictSourceBinding(slot);
         for (self.conditions) |*condition| condition.deinit();
         self.alloc.free(self.conditions);
-        if (self.selected) |*plan| plan.deinit();
-        if (self.source) |*view| view.release();
         if (self.index_plan) |*plan| plan.release();
         self.active.release();
         self.read.abort();
@@ -317,19 +343,36 @@ pub const Reader = struct {
     fn rowView(self: *Reader, raw: []const u8) !codec.OrdinalRowView {
         const version = try codec.rowSchemaVersion(raw);
         if (self.source == null or self.source.?.version() != version) {
+            for (self.bindings, 0..) |entry, slot| {
+                const binding = entry orelse continue;
+                if (binding.view.version() != version) continue;
+                std.mem.copyBackwards(?*SourceBinding, self.bindings[1 .. slot + 1], self.bindings[0..slot]);
+                self.bindings[0] = binding;
+                self.source = binding.view;
+                self.selected = binding.projection;
+                self.source_conditions = binding.conditions;
+                self.source_cache_hits += 1;
+                return if (self.authenticated)
+                    try codec.ordinalRowViewTrusted(raw, binding.view.tableSchema().*, binding.view.physicalLayout())
+                else
+                    try codec.ordinalRowViewSelective(raw, binding.view.tableSchema().*, binding.view.physicalLayout());
+            }
+            const binding = try self.alloc.create(SourceBinding);
+            errdefer self.alloc.destroy(binding);
+            binding.arena = std.heap.ArenaAllocator.init(self.alloc);
+            errdefer binding.arena.deinit();
+            const alloc = binding.arena.allocator();
             // Fault historical layouts through this read snapshot, not through
             // the live registry: a whole-store restore may reuse version IDs.
             const source = if (version == self.active.version()) self.active.clone() else blk: {
-                const key = try schema.schemaVersionKeyAlloc(self.alloc, version);
-                defer self.alloc.free(key);
+                const key = try schema.schemaVersionKeyAlloc(alloc, version);
                 const encoded = self.read.get(key) catch |err| switch (err) {
                     error.NotFound => return error.UnknownSchemaVersion,
                     else => return err,
                 };
-                const table = try schema.deserializeSchema(self.alloc, encoded);
-                errdefer schema.freeSchema(self.alloc, table);
+                const table = try schema.deserializeSchema(alloc, encoded);
                 if (table.version != version) return error.RelationalRowSchemaMismatch;
-                break :blk registry.SchemaView{ .epoch = try registry.Epoch.createOwned(self.alloc, table) };
+                break :blk registry.SchemaView{ .epoch = try registry.Epoch.createOwned(alloc, table) };
             };
             errdefer {
                 var release = source;
@@ -341,21 +384,31 @@ pub const Reader = struct {
                 if (self.active.tableSchema().relational_columns[current_ordinal].column_type != source.tableSchema().relational_columns[source_ordinal].column_type)
                     return error.RelationalIndexColumnTypeMismatch;
             }
-            const source_conditions = try self.alloc.alloc(predicates.Source, self.conditions.len);
+            const source_conditions = try alloc.alloc(predicates.Source, self.conditions.len);
             var initialized: usize = 0;
             errdefer {
                 for (source_conditions[0..initialized]) |*condition| condition.deinit();
-                self.alloc.free(source_conditions);
+                alloc.free(source_conditions);
             }
             for (source_conditions, self.conditions) |*condition, *plan| {
-                condition.* = try plan.projectSource(self.alloc, source.tableSchema().*, source.physicalLayout());
+                condition.* = try plan.projectSource(alloc, source.tableSchema().*, source.physicalLayout());
                 initialized += 1;
             }
-            const selected = try codec.OrdinalProjectionPlan.init(self.alloc, source.tableSchema().*, source.physicalLayout(), self.fields);
-            for (self.source_conditions) |*condition| condition.deinit();
-            self.alloc.free(self.source_conditions);
-            if (self.selected) |*old| old.deinit();
-            if (self.source) |*old| old.release();
+            const selected = try codec.OrdinalProjectionPlan.init(alloc, source.tableSchema().*, source.physicalLayout(), self.fields);
+            binding.view = source;
+            binding.projection = selected;
+            binding.conditions = source_conditions;
+            const bytes = binding.arena.queryCapacity();
+            self.evictSourceBinding(self.bindings.len - 1);
+            var slot = self.bindings.len - 1;
+            while (slot > 0 and self.binding_bytes + bytes > 2 * 1024 * 1024) {
+                slot -= 1;
+                self.evictSourceBinding(slot);
+            }
+            std.mem.copyBackwards(?*SourceBinding, self.bindings[1..], self.bindings[0 .. self.bindings.len - 1]);
+            self.bindings[0] = binding;
+            self.binding_bytes += bytes;
+            self.source_compilations += 1;
             self.source = source;
             self.selected = selected;
             self.source_conditions = source_conditions;
@@ -364,6 +417,16 @@ pub const Reader = struct {
             try codec.ordinalRowViewTrusted(raw, self.source.?.tableSchema().*, self.source.?.physicalLayout())
         else
             try codec.ordinalRowViewSelective(raw, self.source.?.tableSchema().*, self.source.?.physicalLayout());
+    }
+
+    fn observeFailedRow(self: *Reader, key: []const u8, raw: []const u8) !void {
+        const version = try codec.rowWriteTimestampNs(raw);
+        const schema_version = try codec.rowSchemaVersion(raw);
+        const decoded = (try internal.decodeStoredDocumentRowKeyAlloc(self.alloc, key)) orelse return error.InvalidRelationalRowsRequest;
+        if (self.failed_row) |old| self.alloc.free(old.key);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+        self.failed_row = .{ .key = decoded, .json = "{}", .version = version, .schema_version = schema_version, .semantic_hash = @splat(0), .expected_content_digest = digest };
     }
 
     /// Page continuation advances only after successful preparation. An OOM,
@@ -413,7 +476,10 @@ pub const Reader = struct {
                     error.NotFound => return error.InvalidRelationalIndexForwardKey,
                     else => return err,
                 } else kv.value;
-                const row = if (self.index_only) try self.coveringView(kv.key, raw) else try self.rowView(raw);
+                const row = if (self.index_only) try self.coveringView(kv.key, raw) else self.rowView(raw) catch |err| {
+                    if (err == error.RelationalIndexColumnTypeMismatch) try self.observeFailedRow(key, raw);
+                    return err;
+                };
                 const expired = self.active.visibilityTtlDurationNs() != 0 and row.writeTimestampNs() != 0 and
                     ttl.isExpired(row.writeTimestampNs(), self.active.visibilityTtlDurationNs(), self.now_ns);
                 var decoded_key: ?[]const u8 = null;
@@ -437,7 +503,10 @@ pub const Reader = struct {
                         break :blk try row_cursor_codec.encode(temporary, identity, kv.key[records.forward_prefix_len..]);
                     } else null;
                     const size = json.len + document.len + if (row_cursor) |encoded| encoded.len else @as(usize, 0);
-                    if (size > budget.output_bytes) return error.RelationalRowResultTooLarge;
+                    if (size > budget.output_bytes) {
+                        if (!self.index_only) try self.observeFailedRow(key, raw);
+                        return error.RelationalRowResultTooLarge;
+                    }
                     if (size > budget.output_bytes - result.output_bytes) {
                         exhausted = false;
                         break;

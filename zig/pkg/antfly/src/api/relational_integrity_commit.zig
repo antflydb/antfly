@@ -102,6 +102,9 @@ pub const Prepared = struct {
     /// CHECK activation failures retain the prepared physical source guards;
     /// the worker commits them with an invalid checkpoint, never coverage.
     validation_failure: ?[]const u8 = null,
+    /// MATCH PARTIAL can switch witnesses after preparation. One missing
+    /// attachment is not proof that the logical dependency has no witness.
+    backfill_partial: bool = false,
     pub fn deinit(self: *Prepared) void {
         self.arena.deinit();
         self.* = undefined;
@@ -1085,6 +1088,97 @@ pub fn prepareBackfill(alloc: Allocator, source: reads.TableReadSource, metadata
     return prepareBackfillControlled(alloc, source, metadata, table_name, rows, phase, .{});
 }
 
+/// Revalidate a rejected page without replaying its mutations. One witnessed
+/// violation is sufficient, but its exact claim bytes (including absence) and
+/// every original source observation must survive through the 2PC decision.
+/// Returns false when the rejected dependency is no longer invalid.
+pub fn guardBackfillFailure(prepared: *Prepared, source: reads.TableReadSource, failure: []const u8, control: RequestContext) !bool {
+    const unique = std.mem.eql(u8, failure, "UniqueConstraintViolation") or std.mem.eql(u8, failure, "unique_constraint_violation");
+    const missing = std.mem.eql(u8, failure, "ForeignKeyParentMissing") or std.mem.eql(u8, failure, "foreign_key_parent_missing");
+    if (!unique and !missing) return true;
+    const owned = prepared.arena.allocator();
+    const requests = try owned.dupe(contract.TableCommitRequest, prepared.tables);
+    prepared.tables = requests;
+    var observed_bytes: usize = 0;
+    for (requests) |*request| {
+        var proposed = std.AutoHashMap(planner.storage.Address, planner.storage.Claim).init(owned);
+        defer proposed.deinit();
+        for (request.integrity_commands) |command| {
+            try control.ensureActive();
+            if (unique) {
+                if (command.operation != .establish) continue;
+                const claim = command.operation.establish;
+                if (proposed.get(command.address)) |old| {
+                    if (!std.mem.eql(u8, old.parent_table, claim.parent_table) or !std.mem.eql(u8, old.parent_key, claim.parent_key)) return true;
+                    continue;
+                }
+                try proposed.put(command.address, claim);
+            } else if (command.operation != .attach) continue;
+            const query = try std.json.Stringify.valueAlloc(owned, .{ .kind = "references", .address = command.address, .limit = @as(u32, 1) }, .{});
+            var response = try source.lookup(owned, request.table_name, &command.address.routing, .{
+                .relational_integrity_jobs_json = query,
+                .execution_deadline_ns = control.deadline_ns,
+                .cancellation = control.cancellation,
+            }, .read_index);
+            defer if (response) |*value| value.deinit(owned);
+            var expected: ?[]const u8 = null;
+            if (response) |value| {
+                if (value.json.len > 4 * 1024 * 1024 - observed_bytes) return error.TransactionTooLarge;
+                observed_bytes += value.json.len;
+                const observed = try std.json.parseFromSliceLeaky(struct { address: planner.storage.Address, claim: planner.storage.Claim }, owned, value.json, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+                if (!std.meta.eql(observed.address, command.address)) return error.InvalidIntegrityAddress;
+                if (missing) continue;
+                const wanted = command.operation.establish;
+                if (std.mem.eql(u8, observed.claim.parent_table, wanted.parent_table) and std.mem.eql(u8, observed.claim.parent_key, wanted.parent_key)) continue;
+                expected = try observed.claim.encode(owned, command.address);
+            } else if (unique) continue;
+            const guards = try owned.alloc(types.TransactionIntegrityOperation, 1);
+            guards[0] = .{
+                .routing_key = try owned.dupe(u8, &command.address.routing),
+                .key = try owned.dupe(u8, &command.address.claimKey()),
+                .kind = .guard,
+                .expected_value = expected,
+            };
+            request.integrity = guards;
+            return true;
+        }
+    }
+    return false;
+}
+
+test "distributed txn activation failure guards absence and abandons repaired parent observations" {
+    const a = std.testing.allocator;
+    const address = try planner.storage.Address.init(@splat(1), "tuple");
+    const reference: planner.storage.Reference = .{ .child_table = "children", .child_key = "c", .constraint_name = "fk", .constraint_generation = @splat(2) };
+    const Fixture = struct {
+        present: bool,
+        address: planner.storage.Address,
+        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.present) return null;
+            return .{ .json = try std.json.Stringify.valueAlloc(allocator, .{ .address = self.address, .claim = planner.storage.Claim{ .tuple = "tuple", .parent_table = "parents", .parent_key = "p", .schema_version = 1 } }, .{}), .version = 0 };
+        }
+    };
+    for ([_]bool{ false, true }) |present| {
+        var fixture: Fixture = .{ .present = present, .address = address };
+        const source: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } };
+        var prepared: Prepared = .{ .arena = std.heap.ArenaAllocator.init(a), .tables = &.{
+            .{ .table_name = "children", .predicates = &.{.{ .key = "c", .expected_version = 7, .expected_content_digest = @splat(3) }} },
+            .{ .table_name = "parents", .integrity_commands = &.{.{ .address = address, .operation = .{ .attach = reference } }} },
+        } };
+        defer prepared.deinit();
+        try std.testing.expectEqual(!present, try guardBackfillFailure(&prepared, source, "ForeignKeyParentMissing", .{}));
+        if (!present) {
+            const guard = prepared.tables[1].integrity[0];
+            try std.testing.expectEqual(.guard, guard.kind);
+            try std.testing.expectEqual(null, guard.expected_value);
+            try std.testing.expectEqualSlices(u8, &address.claimKey(), guard.key);
+            try std.testing.expectEqualSlices(u8, &address.routing, guard.routing_key);
+            try std.testing.expectEqual(@as(usize, 1), prepared.tables[0].predicates.len);
+        }
+    }
+}
+
 fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, phase: BackfillPhase, request: RequestContext) !Prepared {
     if (rows.len > 4096) return error.TransactionTooLarge;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1099,6 +1193,7 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
     for (plan.uniques) |binding| try selected_fields.appendSlice(builder.alloc, binding.definition.columns);
     for (plan.foreign) |binding| try selected_fields.appendSlice(builder.alloc, binding.definition.child_columns);
     var validation_failure: ?[]const u8 = null;
+    var backfill_partial = false;
     for (rows) |row| {
         try builder.charge(row.key.len + row.json.len);
         if (row.expected_content_digest == null) return error.MissingPrimaryObservation;
@@ -1115,8 +1210,17 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         }
         var prepared = try mapper.PreparedRelationalProjection.init(builder.alloc, row.json, table.view.tableSchema().*, table.view.physicalLayout(), selected_fields.items);
         defer prepared.deinit();
-        const expansion = try plan.expand(builder.alloc, &.{.{ .key = row.key, .after = prepared.view }});
-        if (phase == .foreign_key) for (expansion.partials) |dependency| try builder.appendPartial(dependency);
+        const expansion = plan.expand(builder.alloc, &.{.{ .key = row.key, .after = prepared.view }}) catch |err| switch (err) {
+            error.ForeignKeyMatchFullViolation => {
+                validation_failure = @errorName(err);
+                break;
+            },
+            else => return err,
+        };
+        if (phase == .foreign_key) for (expansion.partials) |dependency| {
+            backfill_partial = true;
+            try builder.appendPartial(dependency);
+        };
         for (expansion.commands) |command| {
             const selected = switch (command.command.operation) {
                 .establish => phase == .unique,
@@ -1128,10 +1232,10 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
     }
     for (builder.output.items, builder.command_lists.items, builder.predicate_lists.items) |*table_request, commands, predicates| {
         _ = try planner.storage.validateCommandAdmission(commands.items);
-        table_request.integrity_commands = commands.items;
+        table_request.integrity_commands = if (validation_failure == null) commands.items else &.{};
         table_request.predicates = predicates.items;
     }
-    return .{ .arena = arena, .tables = try builder.output.toOwnedSlice(builder.alloc), .validation_failure = validation_failure };
+    return .{ .arena = arena, .tables = try builder.output.toOwnedSlice(builder.alloc), .validation_failure = validation_failure, .backfill_partial = backfill_partial };
 }
 
 pub fn prepareBackfillWithCoverage(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, table_name: []const u8, rows: []const BackfillRow, phase: BackfillPhase) !Prepared {

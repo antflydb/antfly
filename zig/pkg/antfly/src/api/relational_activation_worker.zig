@@ -106,7 +106,7 @@ fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.Ta
         // The native reader may diagnose an individually oversized source
         // row before projecting it. Its failure envelope retains the exact
         // original checkpoint and never advances source coverage.
-        try recordFailure(alloc, writer, table_name, parsed.value.command, progress.failure, control.cancellation);
+        try recordFailure(alloc, reader, writer, table_name, parsed.value.rows, null, parsed.value.command, progress.failure, control);
         return .progressed;
     }
     const phase: planner.BackfillPhase = switch (parsed.value.phase) {
@@ -117,7 +117,8 @@ fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.Ta
     var prepared = planner.prepareBackfillWithCoverageControlled(alloc, reader, tables, ranges, table_name, parsed.value.rows, phase, control) catch |err| {
         if (err == error.TransactionTooLarge and budget.shrink(parsed.value.rows.len)) return .shrink;
         if (err == error.TransactionTooLarge or deterministicValidationFailure(err)) {
-            try recordFailure(alloc, writer, table_name, parsed.value.command, @errorName(err), control.cancellation);
+            if (budget.shrink(parsed.value.rows.len)) return .shrink;
+            try recordFailure(alloc, reader, writer, table_name, parsed.value.rows, null, parsed.value.command, @errorName(err), control);
             return .progressed;
         }
         return err;
@@ -143,7 +144,8 @@ fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.Ta
     const outcome = writer.commitBatchWithCancellation(alloc, requests, .write, control.cancellation) catch |err| {
         if (err == error.TransactionTooLarge and budget.shrink(parsed.value.rows.len)) return .shrink;
         if (err == error.TransactionTooLarge or deterministicValidationFailure(err)) {
-            try recordFailure(alloc, writer, table_name, parsed.value.command, @errorName(err), control.cancellation);
+            if (budget.shrink(parsed.value.rows.len)) return .shrink;
+            try recordFailure(alloc, reader, writer, table_name, parsed.value.rows, &prepared, parsed.value.command, @errorName(err), control);
             return .progressed;
         }
         return err;
@@ -153,7 +155,8 @@ fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.Ta
         .conflict => |conflict| {
             if (conflict.reason) |reason| switch (reason) {
                 .unique_constraint_violation, .foreign_key_parent_missing => {
-                    try recordFailure(alloc, writer, table_name, parsed.value.command, @tagName(reason), control.cancellation);
+                    if (budget.shrink(parsed.value.rows.len)) return .shrink;
+                    try recordFailure(alloc, reader, writer, table_name, parsed.value.rows, &prepared, parsed.value.command, @tagName(reason), control);
                     return .progressed;
                 },
                 else => {},
@@ -164,24 +167,108 @@ fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.Ta
     return .progressed;
 }
 
-fn recordFailure(alloc: Allocator, writer: writes.TableWriteSource, table: []const u8, command: activation.Command, failure: []const u8, cancellation: CancellationToken) !void {
-    // Never advance past a failed page. A stale worker cannot overwrite a
-    // competing successful commit because the original expected bytes remain.
+fn recordFailure(alloc: Allocator, reader: reads.TableReadSource, writer: writes.TableWriteSource, table: []const u8, rows: []const planner.BackfillRow, prepared: ?*planner.Prepared, command: activation.Command, failure: []const u8, control: RequestContext) !void {
+    if (rows.len == 0) return error.ConstraintActivationChanged;
+    const missing_parent = std.mem.eql(u8, failure, "ForeignKeyParentMissing") or std.mem.eql(u8, failure, "foreign_key_parent_missing");
+    const diagnostic = missing_parent and (prepared == null or prepared.?.backfill_partial);
+    if (!diagnostic) if (prepared) |page| if (!try planner.guardBackfillFailure(page, reader, failure, control)) return error.ConstraintActivationChanged;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    // MATCH PARTIAL absence comes from an index-range read, not an exact
+    // claim. Without a durable negative predicate it is a retryable diagnostic,
+    // never evidence for terminal INVALID. A later parent insert can resolve it.
     var progress = try activation.Progress.decode(command.expected orelse return error.ConstraintActivationChanged);
-    progress.state = .invalid;
-    progress.failure = failure;
+    // Rechecks remain bounded by the supervisor, but an unchanged diagnostic
+    // must not generate another distributed transaction / Raft log record.
+    if (diagnostic and std.mem.eql(u8, progress.failure, "ForeignKeyParentMissing")) return;
+    progress.state = if (diagnostic) .validating else .invalid;
+    progress.failure = if (diagnostic) "ForeignKeyParentMissing" else failure;
     const encoded = try progress.encode(alloc);
     defer alloc.free(encoded);
     var failed = command;
     failed.next = encoded;
-    const outcome = (try writer.commitBatchWithCancellation(alloc, &.{.{
-        .table_name = table,
-        .relational_schema_version = progress.schema_version,
-        .relational_activation = failed,
-    }}, .write, cancellation)) orelse return error.ConstraintActivationUnavailable;
+    failed.diagnostic = diagnostic;
+    const requests = if (prepared) |page| try owned.dupe(contract.TableCommitRequest, page.tables) else try owned.alloc(contract.TableCommitRequest, 1);
+    if (prepared == null) requests[0] = .{ .table_name = table };
+    for (requests) |*request| {
+        request.integrity_commands = &.{};
+        if (std.mem.eql(u8, request.table_name, table)) {
+            const guards = try owned.alloc(@import("../storage/db/types.zig").TransactionVersionPredicate, rows.len);
+            for (guards, rows) |*guard, row| guard.* = .{ .key = row.key, .expected_version = row.version, .expected_content_digest = row.expected_content_digest orelse return error.MissingPrimaryObservation };
+            request.predicates = guards;
+            request.relational_schema_version = progress.schema_version;
+            request.relational_integrity_generation_set = progress.generation_set;
+            request.relational_activation = failed;
+        }
+    }
+    var count: usize = 0;
+    for (requests) |request| {
+        if (request.relational_activation == null and request.integrity.len == 0 and request.predicates.len == 0) continue;
+        requests[count] = request;
+        count += 1;
+    }
+    try control.ensureActive();
+    const outcome = (try writer.commitBatchWithCancellation(alloc, requests[0..count], .write, control.cancellation)) orelse return error.ConstraintActivationUnavailable;
     switch (outcome) {
         .committed => {},
         .conflict => return error.ConstraintActivationChanged,
+    }
+}
+
+test "distributed txn activation failure publication atomically guards child and missing parent" {
+    const alloc = std.testing.allocator;
+    const integrity = @import("../storage/db/relational_integrity_contract.zig");
+    const types = @import("../storage/db/types.zig");
+    const address = try integrity.Address.init(@splat(1), "parent tuple");
+    const progress: activation.Progress = .{ .generation_set = @splat(2), .owner = @splat(3), .schema_version = 7, .phase = .foreign_key };
+    const expected = try progress.encode(alloc);
+    defer alloc.free(expected);
+    const Fixture = struct {
+        race: bool,
+        partial: bool,
+        commits: usize = 0,
+        fn lookup(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            return null;
+        }
+        fn commit(ptr: *anyopaque, _: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, _: CancellationToken) !?contract.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commits += 1;
+            try std.testing.expectEqual(@as(usize, if (self.partial) 1 else 2), requests.len);
+            try std.testing.expectEqual(@as(usize, 1), requests[0].predicates.len);
+            try std.testing.expectEqual(@as(?[32]u8, @splat(4)), requests[0].predicates[0].expected_content_digest);
+            try std.testing.expectEqual(if (self.partial) activation.State.validating else activation.State.invalid, (try activation.Progress.decode(requests[0].relational_activation.?.next)).state);
+            try std.testing.expectEqual(self.partial, requests[0].relational_activation.?.diagnostic);
+            if (!self.partial) {
+                try std.testing.expectEqual(@as(usize, 1), requests[1].integrity.len);
+                try std.testing.expectEqual(.guard, requests[1].integrity[0].kind);
+                try std.testing.expectEqual(null, requests[1].integrity[0].expected_value);
+            }
+            for (requests) |request| try std.testing.expectEqual(@as(usize, 0), request.integrity_commands.len);
+            if (self.race) return .{ .conflict = .{ .table_name = "parents", .key = "claim", .message = "parent inserted after absence read" } };
+            return .{ .committed = .{ .participant_count = 2 } };
+        }
+    };
+    for (0..3) |scenario| {
+        const race = scenario == 1;
+        var fixture: Fixture = .{ .race = race, .partial = scenario == 2 };
+        const reader: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } };
+        const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = undefined, .commit_batch_with_cancellation = Fixture.commit } };
+        var prepared: planner.Prepared = .{ .arena = std.heap.ArenaAllocator.init(alloc), .backfill_partial = fixture.partial, .tables = &.{
+            .{ .table_name = "children" },
+            .{ .table_name = "parents", .integrity_commands = &.{.{ .address = address, .operation = .{ .attach = .{ .child_table = "children", .child_key = "c", .constraint_name = "fk", .constraint_generation = @splat(5) } } }} },
+        } };
+        defer prepared.deinit();
+        const result = recordFailure(alloc, reader, writer, "children", &.{.{ .key = "c", .json = "{}", .version = 11, .expected_content_digest = @splat(4) }}, &prepared, .{ .routing_key = "", .expected = expected, .next = expected }, "ForeignKeyParentMissing", .{});
+        if (race) try std.testing.expectError(error.ConstraintActivationChanged, result) else try result;
+        if (fixture.partial) {
+            var diagnosed = progress;
+            diagnosed.failure = "ForeignKeyParentMissing";
+            const unchanged = try diagnosed.encode(alloc);
+            defer alloc.free(unchanged);
+            try recordFailure(alloc, reader, writer, "children", &.{.{ .key = "c", .json = "{}", .version = 11, .expected_content_digest = @splat(4) }}, &prepared, .{ .routing_key = "", .expected = unchanged, .next = unchanged }, "ForeignKeyParentMissing", .{});
+            try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+        }
     }
 }
 
@@ -270,6 +357,7 @@ test "distributed txn activation worker adapts pages and atomically publishes na
                     .writes = request.writes,
                     .deletes = request.deletes,
                     .predicates = request.predicates,
+                    .integrity = request.integrity,
                     .integrity_commands = request.integrity_commands,
                     .relational_activation = request.relational_activation,
                 }) catch |err| {

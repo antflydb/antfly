@@ -344,9 +344,12 @@ pub fn validateSlice(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.
     var status = (try reader.integrityActivation(alloc, table.name, owner.start_key, "{\"mode\":\"status\"}")) orelse return error.IntegrityCatalogUnavailable;
     defer status.deinit(alloc);
     const State = @import("../storage/db/relational_integrity_activation_contract.zig").State;
-    var parsed = try std.json.parseFromSlice(struct { state: State, unique_covered: bool }, alloc, status.json, .{ .ignore_unknown_fields = true });
+    var parsed = try std.json.parseFromSlice(struct { state: State, unique_covered: bool, failure: []const u8 = "" }, alloc, status.json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    if (parsed.value.state == .invalid) return error.ConstraintActivationFailed;
+    // Unlike live activation, all rows of this hidden cohort have finished
+    // import and cannot acquire a new MATCH PARTIAL witness from client writes.
+    // A retryable live diagnostic therefore rejects this immutable restore.
+    if (parsed.value.state == .invalid or parsed.value.failure.len != 0) return error.ConstraintActivationFailed;
     if ((cursor.phase == .unique and parsed.value.unique_covered) or parsed.value.state == .enforced) {
         cursor.owner_index += 1;
         return false;
