@@ -752,7 +752,9 @@ def test_backup_api_restart_capability_and_session_lifecycle(monkeypatch, restar
     monkeypatch.setattr(e2e_conftest, "PublicAntflyServer", lambda *args: server)
     monkeypatch.setattr(e2e_conftest, "wait_for_server", lambda *args, **kwargs: True)
     monkeypatch.setattr(e2e_conftest.requests, "Session", Session)
-    fixture = e2e_conftest.backup_api.__wrapped__(SimpleNamespace(node=SimpleNamespace()))
+    fixture = e2e_conftest.backup_api.__wrapped__(
+        SimpleNamespace(node=SimpleNamespace())
+    )
     api = next(fixture)
     try:
         assert api.supports_restart is restartable
@@ -763,7 +765,8 @@ def test_backup_api_restart_capability_and_session_lifecycle(monkeypatch, restar
             assert api.s is sessions[1]
             assert not api.s.closed
             assert api.s.headers == {
-                "Content-Type": "application/json", "Connection": "close"
+                "Content-Type": "application/json",
+                "Connection": "close",
             }
         else:
             with pytest.raises(RuntimeError, match="restart is only available"):
