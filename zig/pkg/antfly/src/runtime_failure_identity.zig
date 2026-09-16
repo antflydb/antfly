@@ -48,8 +48,11 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_query, .err = error.InvalidQueryRequest },
     .{ .status = .unsupported_query, .err = error.UnsupportedQueryRequest },
     .{ .status = .index_not_found, .err = error.IndexNotFound },
+    .{ .status = .index_rebuilding, .err = error.IndexRebuilding },
+    .{ .status = .incomplete_published_snapshot, .err = error.IncompletePublishedSnapshot },
     .{ .status = .identity_read_generation_changed, .err = error.IdentityReadGenerationChanged },
     .{ .status = .timeout, .err = error.Timeout },
+    .{ .status = .read_index_timeout, .err = error.ReadIndexTimeout },
     .{ .status = .table_visibility_timeout, .err = error.TableVisibilityTimeout },
     .{ .status = .cancelled, .err = error.Cancelled },
     .{ .status = .canceled, .err = error.Canceled },
@@ -427,6 +430,33 @@ const mappings = [_]Mapping{
     .{ .status = .restore_dense_checkpoint_incomplete, .err = error.RestoreDenseCheckpointIncomplete },
     .{ .status = .restore_index_availability_incomplete, .err = error.RestoreIndexAvailabilityIncomplete },
     .{ .status = .provider_internal, .err = error.Internal },
+    .{ .status = .invalid_vector_migration_budget, .err = error.InvalidVectorMigrationBudget },
+    .{ .status = .invalid_vector_migration_id, .err = error.InvalidVectorMigrationId },
+    .{ .status = .invalid_vector_migration_state, .err = error.InvalidVectorMigrationState },
+    .{ .status = .unsupported_vector_migration_direction, .err = error.UnsupportedVectorMigrationDirection },
+    .{ .status = .unsupported_vector_migration_version, .err = error.UnsupportedVectorMigrationVersion },
+    .{ .status = .vector_migration_active, .err = error.VectorMigrationActive },
+    .{ .status = .vector_migration_already_exists, .err = error.VectorMigrationAlreadyExists },
+    .{ .status = .vector_migration_already_published, .err = error.VectorMigrationAlreadyPublished },
+    .{ .status = .vector_migration_configuration_changed, .err = error.VectorMigrationConfigurationChanged },
+    .{ .status = .vector_migration_coverage_mismatch, .err = error.VectorMigrationCoverageMismatch },
+    .{ .status = .vector_migration_disk_reserve, .err = error.VectorMigrationDiskReserve },
+    .{ .status = .vector_migration_idempotency_conflict, .err = error.VectorMigrationIdempotencyConflict },
+    .{ .status = .vector_migration_identity_mismatch, .err = error.VectorMigrationIdentityMismatch },
+    .{ .status = .vector_migration_inline_payload_remains, .err = error.VectorMigrationInlinePayloadRemains },
+    .{ .status = .vector_migration_not_found, .err = error.VectorMigrationNotFound },
+    .{ .status = .vector_migration_not_ready, .err = error.VectorMigrationNotReady },
+    .{ .status = .vector_migration_read_epoch_changed, .err = error.VectorMigrationReadEpochChanged },
+    .{ .status = .vector_migration_recovery_required, .err = error.VectorMigrationRecoveryRequired },
+    .{ .status = .vector_migration_row_exceeds_budget, .err = error.VectorMigrationRowExceedsBudget },
+    .{ .status = .vector_migration_temporary_budget_exceeded, .err = error.VectorMigrationTemporaryBudgetExceeded },
+    .{ .status = .vector_migration_offline_admission, .err = error.VectorMigrationOfflineAdmission },
+    .{ .status = .vector_migration_catalog_in_use, .err = error.VectorMigrationCatalogInUse },
+    .{ .status = .vector_migration_copy_mismatch, .err = error.VectorMigrationCopyMismatch },
+    .{ .status = .vector_migration_unsupported_file, .err = error.VectorMigrationUnsupportedFile },
+    .{ .status = .vector_store_requires_empty_table, .err = error.VectorStoreRequiresEmptyTable },
+    .{ .status = .vector_store_requires_local_single_shard_table, .err = error.VectorStoreRequiresLocalSingleShardTable },
+    .{ .status = .vector_store_requires_offline_command, .err = error.VectorStoreRequiresOfflineCommand },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {
@@ -556,7 +586,10 @@ fn hasRegisteredIdentity(status: abi.Status) bool {
 
 pub fn validateForTest() !void {
     @setEvalBranchQuota(100_000);
-    inline for (mappings) |mapping| {
+    // Execute the audit as loops. Expanding every mapping and pair into
+    // separate checks produces quadratic-size IR and makes LLVM optimization
+    // dominate compilation of the linked owner tests as the registry grows.
+    for (mappings) |mapping| {
         try std.testing.expectEqual(mapping.status, statusFromError(mapping.err));
         try std.testing.expectError(mapping.err, statusToError(mapping.status));
     }
@@ -567,14 +600,13 @@ pub fn validateForTest() !void {
     // The three exceptions are protocol sentinels rather than domain-error
     // identities: success, the ABI-27 compatibility status, and the explicit
     // unexpected-provider-failure sentinel.
-    inline for (std.meta.fields(abi.Status)) |field| {
-        const status: abi.Status = @enumFromInt(field.value);
+    for (std.meta.tags(abi.Status)) |status| {
         if (status == .ok or status == .backup_integrity or status == .internal) continue;
         try std.testing.expect(hasRegisteredIdentity(status));
     }
 
-    inline for (mappings, 0..) |lhs, i| {
-        inline for (mappings[i + 1 ..]) |rhs| {
+    for (mappings, 0..) |lhs, i| {
+        for (mappings[i + 1 ..]) |rhs| {
             try std.testing.expect(lhs.status != rhs.status);
             try std.testing.expect(lhs.err != rhs.err);
         }
@@ -664,5 +696,24 @@ pub fn validateForTest() !void {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    // A newly created/rebuilt ANN index has no serving generation yet. This
+    // expected state must survive both compiled query boundaries as a retry,
+    // rather than becoming an unregistered StorageKernelFailure (HTTP 500).
+    try std.testing.expectEqual(abi.Status.index_rebuilding, statusFromError(error.IndexRebuilding));
+    try std.testing.expectError(error.IndexRebuilding, statusToError(.index_rebuilding));
     try validateForTest();
+}
+
+test "index readiness survives the local query and storage owner boundary" {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |expected| {
+        // The local query provider reports readiness through the storage
+        // owner before the serving callback can return a retryable response.
+        const failure = failureFromError(expected, .local_query, abi.abi_version, 4);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        const transported = blk: {
+            statusToError(failure.status) catch |err| break :blk err;
+            return error.ExpectedReadinessFailure;
+        };
+        try std.testing.expectEqual(expected, transported);
+    }
 }

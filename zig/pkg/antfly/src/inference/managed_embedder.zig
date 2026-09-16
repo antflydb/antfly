@@ -71,6 +71,7 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 
 pub const ProviderKind = enum {
     openai,
+    openrouter,
     ollama,
     bedrock,
     cohere,
@@ -744,7 +745,7 @@ fn managedEmbeddingCredentialSourceIdentity(
 ) credential_source_identity.CredentialSourceIdentity {
     const Identity = credential_source_identity.CredentialSourceIdentity;
     return switch (entry.provider) {
-        .openai, .cohere, .gemini, .antfly => credential_source_identity.fromSecretValue(entry.api_key),
+        .openai, .openrouter, .cohere, .gemini, .antfly => credential_source_identity.fromSecretValue(entry.api_key),
         .vertex => Identity.googleAdc(if (entry.credentials_path.len > 0) entry.credentials_path else null),
         // Managed Bedrock currently exposes the process-wide AWS default
         // chain. Profile and web-identity constructors live in the shared
@@ -2555,6 +2556,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
     defer alloc.free(project_id);
     const endpoint = switch (provider) {
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
+        .openrouter => try resolveOpenRouterBaseUrl(alloc, embedder_cfg),
         .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
         .bedrock => try resolveBedrockEndpoint(alloc, embedder_cfg, region),
         .cohere => try resolveCohereBaseUrl(alloc, embedder_cfg),
@@ -3764,6 +3766,7 @@ fn validateCatalogOwnerSemanticIdentity(
     if (embedder_cfg.url.len > 0) {
         const endpoint = switch (provider) {
             .openai, .ollama => try appendPathIfMissing(alloc, embedder_cfg.url, "/v1"),
+            .openrouter => try normalizeOpenRouterBaseUrl(alloc, embedder_cfg.url),
             .cohere => try appendPathIfMissing(alloc, embedder_cfg.url, "/v2"),
             .gemini, .vertex => try alloc.dupe(u8, std.mem.trimEnd(u8, embedder_cfg.url, "/")),
             .bedrock => try alloc.dupe(u8, embedder_cfg.url),
@@ -4566,6 +4569,7 @@ fn buildManagedEmbeddingEntry(
         try alloc.dupe(u8, if (binding.embedded) "" else binding.endpoint)
     else switch (provider) {
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
+        .openrouter => try resolveOpenRouterBaseUrl(alloc, embedder_cfg),
         .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
         .bedrock => try resolveBedrockEndpoint(alloc, embedder_cfg, provider_region),
         .cohere => try resolveCohereBaseUrl(alloc, embedder_cfg),
@@ -4594,6 +4598,7 @@ fn buildManagedEmbeddingEntry(
     errdefer if (source_table.len > 0) alloc.free(source_table);
     const api_key = switch (provider) {
         .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
+        .openrouter => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
         .cohere => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
         .gemini => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
         .antfly => try common_secrets.SecretValue.initConfigOrEnv(
@@ -4662,6 +4667,7 @@ fn resolveDeclaredEmbeddingDimensions(cfg: indexes_openapi.EmbeddingsIndexConfig
         const declared = switch (embedder) {
             .ollama_embedder_config => null,
             .open_ai_embedder_config => |value| value.dimensions,
+            .open_router_embedder_config => |value| value.dimensions,
             .bedrock_embedder_config => |value| value.dimension orelse value.dimensions,
             .cohere_embedder_config => null,
             .google_embedder_config => |value| value.dimension,
@@ -4718,10 +4724,11 @@ fn resolveEmbeddingDimensionsForManagedConfigWithSemanticBinding(
     defer deinitOwnedHttpIo(alloc, owned_http_io);
     var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0, semantic_binding) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
-        error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
     };
     defer managed.deinit(alloc);
+    try attachManagedBedrockCredentialCaches(alloc, (&managed)[0..1], options.provider_runtime);
+    if (managed.provider == .bedrock) managed.provider_runtime = options.provider_runtime;
     return try resolveEmbeddingDimensionsForEntry(alloc, cfg, &managed);
 }
 
@@ -4739,11 +4746,12 @@ fn resolveEmbeddingDimensionsForManagedConfigWithValidation(
     defer deinitOwnedHttpIo(alloc, owned_http_io);
     var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, declared orelse 0, null) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
-        error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
     };
     defer managed.deinit(alloc);
     try attachProviderQuota(&managed, options);
+    try attachManagedBedrockCredentialCaches(alloc, (&managed)[0..1], options.provider_runtime);
+    if (managed.provider == .bedrock) managed.provider_runtime = options.provider_runtime;
     return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, &managed, declared, validation);
 }
 
@@ -4759,7 +4767,6 @@ fn validateSparseEmbeddingForManagedConfig(
     defer deinitOwnedHttpIo(alloc, owned_http_io);
     var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0, null) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
-        error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
     };
     defer managed.deinit(alloc);
@@ -4887,13 +4894,13 @@ fn parseEmbeddingsIndexConfigFromValue(
 fn parseEmbedderProvider(embedder: embeddings_types.Config) !ProviderKind {
     return switch (embedder.provider) {
         .openai => .openai,
+        .openrouter => .openrouter,
         .ollama => .ollama,
         .bedrock => .bedrock,
         .cohere => .cohere,
         .gemini => .gemini,
         .vertex => .vertex,
         .antfly => .antfly,
-        else => error.UnsupportedEmbeddingProvider,
     };
 }
 
@@ -4944,6 +4951,7 @@ fn envOptionalU32(name: [:0]const u8) ?u32 {
 fn providerRequestsPerMinuteEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
         .openai => "ANTFLY_OPENAI_EMBED_REQUESTS_PER_MINUTE",
+        .openrouter => "ANTFLY_OPENROUTER_EMBED_REQUESTS_PER_MINUTE",
         .ollama => "ANTFLY_OLLAMA_EMBED_REQUESTS_PER_MINUTE",
         .bedrock => "ANTFLY_BEDROCK_EMBED_REQUESTS_PER_MINUTE",
         .cohere => "ANTFLY_COHERE_EMBED_REQUESTS_PER_MINUTE",
@@ -4956,6 +4964,7 @@ fn providerRequestsPerMinuteEnv(provider: ProviderKind) [:0]const u8 {
 fn providerBurstEnv(provider: ProviderKind) [:0]const u8 {
     return switch (provider) {
         .openai => "ANTFLY_OPENAI_EMBED_BURST",
+        .openrouter => "ANTFLY_OPENROUTER_EMBED_BURST",
         .ollama => "ANTFLY_OLLAMA_EMBED_BURST",
         .bedrock => "ANTFLY_BEDROCK_EMBED_BURST",
         .cohere => "ANTFLY_COHERE_EMBED_BURST",
@@ -6204,7 +6213,7 @@ fn embedSparseBatchWithEntry(
             try validateSparseBatch(embeddings, texts.len);
             return embeddings;
         },
-        .openai, .ollama, .bedrock, .cohere, .gemini, .vertex => return error.UnsupportedEmbeddingProvider,
+        .openai, .openrouter, .ollama, .bedrock, .cohere, .gemini, .vertex => return error.UnsupportedEmbeddingProvider,
     }
 }
 
@@ -6243,6 +6252,22 @@ fn resolveOpenAiBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Con
     );
     defer alloc.free(raw);
     return try appendPathIfMissing(alloc, raw, "/v1");
+}
+
+fn resolveOpenRouterBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
+    const raw = try resolveConfigString(
+        alloc,
+        if (embedder.url.len > 0) embedder.url else null,
+        "OPENROUTER_BASE_URL",
+        embeddings_types.openrouter_default_url,
+    );
+    defer alloc.free(raw);
+    return try normalizeOpenRouterBaseUrl(alloc, raw);
+}
+
+fn normalizeOpenRouterBaseUrl(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    // Match model discovery: add /v1 only to a bare origin, preserving gateway paths.
+    return try appendPathIfMissing(alloc, std.mem.trimEnd(u8, raw, "/"), "/v1");
 }
 
 fn resolveOllamaBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
@@ -6498,7 +6523,7 @@ fn embedBatchWithEntryForTask(
         @tagName(entry.provider),
     );
     switch (entry.provider) {
-        .openai, .ollama => {
+        .openai, .openrouter, .ollama => {
             if (entry.requests_per_minute > 0 and texts.len > entry.burst) {
                 return try embedBatchWithOpenAiCompatiblePacedChunks(alloc, entry, texts, dims, task_type);
             }
@@ -8399,6 +8424,106 @@ test "managed embedder preserves chunker full text config" {
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"full_text_index\":{}") != null);
 }
 
+test "managed embedder openrouter defaults and credential identity stay separate from openai" {
+    const alloc = std.testing.allocator;
+    var managed = try ManagedEmbedder.initFromIndexesJson(alloc,
+        \\{"router":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openrouter","model":"openai/text-embedding-3-small"}},"custom":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openrouter","model":"openai/text-embedding-3-small","url":"https://gateway.example/api/v1/","api_key":"${secret:team.router}"}}}
+    );
+    defer managed.deinit();
+    const router = managed.findQueryEntry("router") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(ProviderKind.openrouter, router.provider);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", router.base_url);
+    try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.api_key.?.env_var);
+    const custom = managed.findQueryEntry("custom") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://gateway.example/api/v1", custom.base_url);
+    try std.testing.expectEqualStrings("team.router", custom.api_key.?.secret_ref);
+    const identity = managedEmbeddingEndpointIdentity(custom);
+    try std.testing.expectEqual(provider_limits.Provider.openrouter, identity.provider);
+    var openai_entry = custom.requestOverlay();
+    openai_entry.provider = .openai;
+    const router_key = try managed.queryCacheKey("custom", .principal, "alice", "same query");
+    const openai = ManagedEmbedder{ .alloc = alloc, .entries = (&openai_entry)[0..1] };
+    const openai_key = try openai.queryCacheKey("custom", .principal, "alice", "same query");
+    try std.testing.expect(!std.mem.eql(u8, &router_key, &openai_key));
+}
+
+test "managed embedder openrouter probes dimensions and embeds queries and document batches" {
+    const alloc = std.testing.allocator;
+    const FakeApp = struct {
+        fn executor() http_common.RequestExecutor {
+            return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, response_alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expectEqualStrings("/openrouter/embeddings", req.uri);
+            try std.testing.expectEqualStrings("Bearer router-test-key", req.authorization orelse req.header("authorization") orelse "");
+            var body = try std.json.parseFromSlice(std.json.Value, response_alloc, req.body, .{});
+            defer body.deinit();
+            const object = body.value.object;
+            try std.testing.expectEqualStrings("openai/text-embedding-3-small", object.get("model").?.string);
+            const inputs = object.get("input").?.array.items;
+            if (!std.mem.eql(u8, inputs[0].string, dimension_probe_text)) {
+                try std.testing.expectEqual(@as(i64, 3), object.get("dimensions").?.integer);
+            }
+            var response = std.ArrayList(u8).empty;
+            defer response.deinit(response_alloc);
+            try response.appendSlice(response_alloc, "{\"data\":[");
+            for (inputs, 0..) |_, i| {
+                if (i > 0) try response.append(response_alloc, ',');
+                try response.appendSlice(response_alloc, "{\"embedding\":[0.125,0.25,0.5]}");
+            }
+            try response.appendSlice(response_alloc, "]}");
+            return .{
+                .status = 200,
+                .content_type = try response_alloc.dupe(u8, "application/json"),
+                .body = try response.toOwnedSlice(response_alloc),
+            };
+        }
+    };
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeApp.executor());
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+    const config = try std.fmt.allocPrint(alloc,
+        \\{{"type":"embeddings","field":"body","embedder":{{"provider":"openrouter","model":"openai/text-embedding-3-small","url":"{s}/openrouter/","api_key":"router-test-key"}}}}
+    , .{base_uri});
+    defer alloc.free(config);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, config, .{});
+    defer parsed.deinit();
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(alloc, "semantic_idx", parsed.value, .{})) orelse return error.TestUnexpectedResult;
+    defer alloc.free(normalized);
+    var normalized_parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer normalized_parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 3), normalized_parsed.value.object.get("dimension").?.integer);
+    const semantic = try embeddingSemanticProducerJsonAlloc(alloc, parsed.value);
+    defer alloc.free(semantic);
+    try validateCatalogOwnerSemanticIdentity(alloc, .{
+        .sparse = false,
+        .dimensions = 3,
+        .semantic_producer_json = semantic,
+        .index_value = normalized_parsed.value,
+    });
+    var identity = try std.json.parseFromSlice(std.json.Value, alloc, semantic, .{});
+    defer identity.deinit();
+    try std.testing.expectEqualStrings("openrouter", identity.value.object.get("provider").?.string);
+    try std.testing.expect(std.mem.endsWith(u8, identity.value.object.get("endpoint").?.string, "/openrouter"));
+    const indexes = try std.fmt.allocPrint(alloc, "{{\"semantic_idx\":{s}}}", .{normalized});
+    defer alloc.free(indexes);
+    var managed = try ManagedEmbedder.initFromIndexesJson(alloc, indexes);
+    defer managed.deinit();
+    const query = try managed.embedQuery(alloc, "semantic_idx", "alpha concept");
+    defer alloc.free(query);
+    try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, query);
+    const entry = managed.findQueryEntry("semantic_idx") orelse return error.TestUnexpectedResult;
+    const documents = try embedBatchWithEntryForTask(alloc, entry, &.{ "first document", "second document" }, 3, .retrieval_document);
+    defer db_embedder.freeDenseEmbeddingBatch(alloc, documents);
+    try std.testing.expectEqual(@as(usize, 2), documents.len);
+    for (documents) |vector| try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, vector);
+    try std.testing.expectError(error.UnsupportedEmbeddingProvider, embedSparseBatchWithEntry(alloc, entry, &.{"text"}));
+}
+
 test "managed embedder calls openai compatible embeddings endpoint" {
     const FakeApp = struct {
         fn executor() http_common.RequestExecutor {
@@ -9831,4 +9956,136 @@ test "managed embedder query template supports remoteText and surfaces permanent
     const rendered_pdf = try renderQueryTemplate(std.testing.allocator, "{{remotePDF url=this}}", pdf_url);
     defer std.testing.allocator.free(rendered_pdf);
     try std.testing.expectError(QueryTemplateError.PermanentPromptFailure, validateRenderedTemplate(std.testing.allocator, rendered_pdf));
+}
+
+fn testManagedBedrockDimensionProbeCache(validation: bool) !void {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","field":"body","embedder":{"provider":"bedrock","model":"amazon.titan-embed-text-v2:0","region":"us-east-1","url":"http://127.0.0.1:1","requests_per_minute":0}}
+    , .{});
+    defer parsed.deinit();
+    var cfg = try parseEmbeddingsIndexConfigFromValue(alloc, parsed.value);
+    defer cfg.deinit();
+    var registry = provider_limits.Registry.init(alloc);
+    defer registry.deinit();
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    runtime.limits = &registry;
+    defer runtime.deinit();
+    const cache = try runtime.bedrock_credentials.cacheForRegion("us-east-1");
+    cache.deinit(alloc);
+    const options = InitOptions{ .io = std.testing.io, .provider_runtime = &runtime };
+    const embedder = parsed.value.object.get("embedder").?;
+    for (0..2) |attempt| {
+        std.debug.print("BEDROCK_PROBE_CACHE validation={} attempt={d} expects CredentialCacheClosed\n", .{ validation, attempt });
+        const result = if (validation)
+            resolveEmbeddingDimensionsForManagedConfigWithValidation(alloc, "probe", cfg.value, embedder, options, .strict)
+        else
+            resolveEmbeddingDimensionsForManagedConfig(alloc, "probe", cfg.value, embedder, options);
+        try std.testing.expectError(error.CredentialCacheClosed, result);
+        try std.testing.expect(runtime.http_client.load(.acquire) != null);
+        try std.testing.expect(cache == try runtime.bedrock_credentials.cacheForRegion("us-east-1"));
+        try std.testing.expectEqual(@as(usize, 1), runtime.bedrock_credentials.by_region.count());
+    }
+}
+
+test "managed embedder temporary dimension probe reaches borrowed Bedrock cache" {
+    try testManagedBedrockDimensionProbeCache(false);
+}
+
+test "managed embedder validating dimension probe reaches borrowed Bedrock cache" {
+    try testManagedBedrockDimensionProbeCache(true);
+}
+
+fn testManagedBedrockCacheEntry(alloc: std.mem.Allocator, region: []const u8) !ManagedEmbeddingEntry {
+    const index_name = try alloc.dupe(u8, "probe");
+    errdefer alloc.free(index_name);
+    const model = try alloc.dupe(u8, "amazon.titan-embed-text-v2:0");
+    errdefer alloc.free(model);
+    const base_url = try alloc.dupe(u8, "http://127.0.0.1:1");
+    errdefer alloc.free(base_url);
+    return .{
+        .alloc = alloc,
+        .io = std.testing.io,
+        .index_name = index_name,
+        .provider = .bedrock,
+        .model = model,
+        .base_url = base_url,
+        .region = try alloc.dupe(u8, region),
+        .dimensions = 2,
+    };
+}
+
+fn testManagedBedrockOwnedCacheCleanup(alloc: std.mem.Allocator) !void {
+    var entries = [_]ManagedEmbeddingEntry{try testManagedBedrockCacheEntry(alloc, "us-east-1")};
+    defer entries[0].deinit(alloc);
+    try attachManagedBedrockCredentialCaches(alloc, &entries, null);
+    try std.testing.expect(entries[0].owns_bedrock_credentials);
+    try std.testing.expect(!entries[0].bedrock_credentials.?.closed.load(.acquire));
+    try std.testing.expect(entries[0].provider_runtime == null);
+}
+
+fn testManagedBedrockBorrowedCacheCleanup(alloc: std.mem.Allocator) !void {
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    defer runtime.deinit();
+    var east: ?*bedrock_provider.CredentialCache = null;
+    for ([_][]const u8{ "us-east-1", "us-west-2", "us-east-1" }) |region| {
+        var entries = [_]ManagedEmbeddingEntry{try testManagedBedrockCacheEntry(alloc, region)};
+        defer entries[0].deinit(alloc);
+        try attachManagedBedrockCredentialCaches(alloc, &entries, &runtime);
+        const cache = entries[0].bedrock_credentials.?;
+        try std.testing.expect(!entries[0].owns_bedrock_credentials);
+        try std.testing.expect(!cache.closed.load(.acquire));
+        if (std.mem.eql(u8, region, "us-east-1")) {
+            if (east) |previous| try std.testing.expect(previous == cache);
+            east = cache;
+        } else {
+            try std.testing.expect(east.? != cache);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), runtime.bedrock_credentials.by_region.count());
+    try std.testing.expect(!east.?.closed.load(.acquire));
+}
+
+test "managed embedder probe cache owned allocation failures clean up" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testManagedBedrockOwnedCacheCleanup, .{});
+}
+
+test "managed embedder probe cache borrowed allocation failures preserve region ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testManagedBedrockBorrowedCacheCleanup, .{});
+}
+
+test "managed embedder probe cache attachment leaves other providers unchanged" {
+    const alloc = std.testing.allocator;
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    defer runtime.deinit();
+    var entries = [_]ManagedEmbeddingEntry{try testManagedBedrockCacheEntry(alloc, "us-east-1")};
+    defer entries[0].deinit(alloc);
+    entries[0].provider = .openai;
+    try attachManagedBedrockCredentialCaches(alloc, &entries, &runtime);
+    try std.testing.expect(entries[0].bedrock_credentials == null);
+    try std.testing.expect(!entries[0].owns_bedrock_credentials);
+    try std.testing.expect(entries[0].provider_runtime == null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.bedrock_credentials.by_region.count());
+}
+
+test "managed embedder declared dimensions skip temporary Bedrock cache construction" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","field":"body","dimension":2,"embedder":{"provider":"bedrock","model":"amazon.titan-embed-text-v2:0","region":"us-east-1","url":"http://127.0.0.1:1"}}
+    , .{});
+    defer parsed.deinit();
+    var cfg = try parseEmbeddingsIndexConfigFromValue(alloc, parsed.value);
+    defer cfg.deinit();
+    var runtime = ProviderRuntime.init(alloc, std.testing.io);
+    defer runtime.deinit();
+    const dimensions = try resolveEmbeddingDimensionsForManagedConfig(
+        alloc,
+        "probe",
+        cfg.value,
+        parsed.value.object.get("embedder").?,
+        .{ .io = std.testing.io, .provider_runtime = &runtime },
+    );
+    try std.testing.expectEqual(@as(u32, 2), dimensions);
+    try std.testing.expectEqual(@as(usize, 0), runtime.bedrock_credentials.by_region.count());
+    try std.testing.expect(runtime.http_client.load(.acquire) == null);
 }

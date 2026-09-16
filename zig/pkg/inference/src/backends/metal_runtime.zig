@@ -4227,6 +4227,173 @@ pub fn decoderRuntimeApplyAddLayerNorm(self: anytype, request: anytype, stats: a
     return null;
 }
 
+/// Unfold a conv1d input into `[batch * out_time, in_channels * kernel]`
+/// rows on the device, so the convolution runs as one dense linear.
+pub fn decoderRuntimeConv1dIm2colF32Device(self: anytype, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!request.input.isDevice()) return null;
+    if (request.batch == 0 or request.in_channels == 0 or request.time_steps == 0 or request.kernel_size == 0 or request.stride == 0) return null;
+    if (request.time_steps + 2 * request.padding < request.kernel_size) return null;
+    const out_time = (request.time_steps + 2 * request.padding - request.kernel_size) / request.stride + 1;
+    if (out_time == 0) return null;
+    if (request.input.elemCount() != request.batch * request.in_channels * request.time_steps) return null;
+    const rows = request.batch * out_time;
+    const cols = request.in_channels * request.kernel_size;
+    if (rows > std.math.maxInt(i32) or cols > std.math.maxInt(i32)) return null;
+    const out_shape = [_]i32{ @intCast(rows), @intCast(cols) };
+    var output = try MetalTensor.deviceAllocate(runtime, rows * cols * @sizeOf(f32), .private, &out_shape);
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_conv1d_im2col_f32_device(
+        runtime,
+        request.input.deviceHandle(),
+        request.input.deviceByteOffset(),
+        request.batch,
+        request.in_channels,
+        request.time_steps,
+        request.kernel_size,
+        request.stride,
+        request.padding,
+        out_time,
+        @intFromBool(request.time_major),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc == 0) return output;
+    output.deinit();
+    return null;
+}
+
+pub const AddLayerNormSumResult = struct {
+    sum: MetalTensor,
+    normed: MetalTensor,
+};
+
+/// `a + b` and `layer_norm(a + b)` from one kernel, for pre-norm residual
+/// streams that need both the new residual and its normalized view.
+pub fn decoderRuntimeApplyAddLayerNormSum(self: anytype, request: anytype, stats: anytype) !?AddLayerNormSumResult {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.hidden_size == 0 or request.slot >= decoder_runtime_layer_norm_slot_capacity) return null;
+    if (!self.raw_layer_norm_slots_prepared[request.slot]) return null;
+    if (self.raw_layer_norm_slot_hidden_sizes[request.slot] != request.hidden_size) return null;
+    if (!request.a.isDevice() or !request.b.isDevice()) return null;
+    if (request.a.ndim() != 2 or request.b.ndim() != 2) return null;
+    const rows = @as(usize, @intCast(request.a.dim(0)));
+    if (rows == 0) return null;
+    if (@as(usize, @intCast(request.a.dim(1))) != request.hidden_size) return null;
+    if (@as(usize, @intCast(request.b.dim(0))) != rows) return null;
+    if (@as(usize, @intCast(request.b.dim(1))) != request.hidden_size) return null;
+    stats.decoder_runtime_apply_layer_norm_calls += 1;
+    const shape = [_]i32{ @intCast(rows), @intCast(request.hidden_size) };
+    const bytes = rows * request.hidden_size * @sizeOf(f32);
+    var sum = try MetalTensor.deviceAllocate(runtime, bytes, .private, &shape);
+    errdefer sum.deinit();
+    var normed = try MetalTensor.deviceAllocate(runtime, bytes, .private, &shape);
+    errdefer normed.deinit();
+    const device_rc = termite_metal_decode_runtime_apply_add_layer_norm_sum_device(
+        runtime,
+        request.slot,
+        request.a.deviceHandle(),
+        request.a.deviceByteOffset(),
+        request.b.deviceHandle(),
+        request.b.deviceByteOffset(),
+        rows,
+        request.hidden_size,
+        request.eps,
+        sum.deviceHandle(),
+        sum.deviceByteOffset(),
+        normed.deviceHandle(),
+        normed.deviceByteOffset(),
+    );
+    if (device_rc == 0) return .{ .sum = sum, .normed = normed };
+    sum.deinit();
+    normed.deinit();
+    return null;
+}
+
+/// Encode the Whisper token-choice statistics over a device logits row;
+/// read them with `whisperLogitsStatsRead` after the frame is waited on.
+pub fn whisperLogitsStatsEncode(self: anytype, logits: MetalTensor, params: *const WhisperLogitsParams, suppress_ids: []const i32) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (!logits.isDevice() or logits.ndim() != 2) return false;
+    if (@as(usize, @intCast(logits.dim(0))) != 1) return false;
+    if (@as(usize, @intCast(logits.dim(1))) != params.out_dim) return false;
+    if (suppress_ids.len != params.suppress_count) return false;
+    const rc = termite_metal_decode_runtime_whisper_logits_stats_device(
+        runtime,
+        logits.deviceHandle(),
+        logits.deviceByteOffset(),
+        params,
+        if (suppress_ids.len == 0) null else suppress_ids.ptr,
+        suppress_ids.len,
+    );
+    return rc == 0;
+}
+
+pub fn whisperLogitsStatsRead(self: anytype, slot: usize, out: *[16]f32) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return termite_metal_decode_runtime_read_whisper_logits_stats(runtime, slot, out) == 0;
+}
+
+pub fn whisperGrammarWrite(self: anytype, state: *const [8]u32) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    return termite_metal_decode_runtime_write_whisper_grammar(runtime, state, state.len) == 0;
+}
+
+pub fn setWhisperPipelinedFrames(self: anytype, enabled: bool) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    return termite_metal_decode_runtime_set_whisper_pipelined_frames(runtime, @intFromBool(enabled)) == 0;
+}
+
+/// Embed the token a previous frame's Whisper reduce kernel left in the
+/// runtime token buffer, from a `[rows, dim]` f32 table (host or device;
+/// the prepared-table cache keeps it resident). Null when the runtime
+/// cannot serve it from the frame.
+pub fn decoderRuntimeEmbeddingLookupDeviceToken(self: anytype, weight: MetalTensor, token_slot: usize, dim: usize) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !hasActiveFrame(runtime)) return null;
+    if (dim == 0 or weight.ndim() != 2) return null;
+    const rows = @as(usize, @intCast(weight.dim(0)));
+    if (rows == 0 or @as(usize, @intCast(weight.dim(1))) != dim) return null;
+    if (weight.isDevice()) {
+        if (termite_metal_decode_runtime_prepare_embedding_table_device(
+            runtime,
+            weight.deviceHandle(),
+            weight.deviceByteOffset(),
+            rows,
+            dim,
+        ) != 0) return null;
+    } else {
+        var host_weight = weight;
+        if (termite_metal_decode_runtime_prepare_embedding_table(
+            runtime,
+            try tensorHostConstPtr(&host_weight),
+            rows,
+            dim,
+        ) != 0) return null;
+    }
+    const shape = [_]i32{ 1, @intCast(dim) };
+    var output = try MetalTensor.deviceAllocate(runtime, dim * @sizeOf(f32), .private, &shape);
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_embedding_lookup_prepared_device_token(
+        runtime,
+        token_slot,
+        dim,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) {
+        if (getenvBool("TERMITE_WHISPER_TRACE_PIPELINE")) std.debug.print("whisper_pipeline: device token embedding rc={d}\n", .{rc});
+        output.deinit();
+        return null;
+    }
+    return output;
+}
+
 pub fn decoderRuntimeApplyAddLayerNormInto(
     self: anytype,
     request: anytype,
@@ -18943,6 +19110,80 @@ pub extern fn termite_metal_decode_runtime_apply_add_layer_norm_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_conv1d_im2col_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    batch: usize,
+    in_channels: usize,
+    time_steps: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    out_time: usize,
+    time_major: u32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_add_layer_norm_sum_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    a_handle: ?*anyopaque,
+    a_offset: usize,
+    b_handle: ?*anyopaque,
+    b_offset: usize,
+    rows: usize,
+    hidden_size: usize,
+    eps: f32,
+    sum_handle: ?*anyopaque,
+    sum_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+/// Mirrors `termite_metal_whisper_logits_params_host`.
+pub const WhisperLogitsParams = extern struct {
+    out_dim: u32,
+    suppress_count: u32,
+    ts_begin: u32,
+    text_allowed: u32,
+    ts_min: u32,
+    ts_max: u32,
+    eot: u32,
+    probe_id: u32,
+    mode: u32 = 0,
+    token_slot: u32 = 0,
+    stats_slot: u32 = 0,
+    reserved: u32 = 0,
+};
+pub extern fn termite_metal_decode_runtime_whisper_logits_stats_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    logits_handle: ?*anyopaque,
+    logits_offset: usize,
+    params: *const WhisperLogitsParams,
+    suppress_ids: [*c]const i32,
+    suppress_count: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_read_whisper_logits_stats(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_write_whisper_grammar(
+    runtime: ?*RawMetalDecodeRuntime,
+    state: [*c]const u32,
+    count: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_set_whisper_pipelined_frames(
+    runtime: ?*RawMetalDecodeRuntime,
+    enabled: c_int,
+) c_int;
+pub extern fn termite_metal_decode_runtime_embedding_lookup_prepared_device_token(
+    runtime: ?*RawMetalDecodeRuntime,
+    token_slot: usize,
+    dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_rms_norm(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -26008,6 +26249,107 @@ pub fn tryApplyDenseRuntimeLinearPair(
         .first = MetalTensor.owned(first_out, &shape),
         .second = MetalTensor.owned(second_out, &shape),
     };
+}
+
+/// Dense linear whose output lands in a caller-provided device tensor
+/// (`rows x out_dim`), e.g. rows of a resident cache slab. False when the
+/// slot, shapes, or residency do not fit; nothing is written then.
+pub fn tryApplyDenseRuntimeLinearInto(
+    self: anytype,
+    slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    out: MetalTensor,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or in_dim == 0 or out_dim == 0) return false;
+    if (rows > std.math.maxInt(i32) or in_dim > std.math.maxInt(i32) or out_dim > std.math.maxInt(i32)) return false;
+    if (!self.raw_linear_slots_prepared[slot] or self.raw_linear_slot_kinds[slot] != .dense) return false;
+    if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return false;
+    if (!input.isDevice() or !out.isDevice()) return false;
+    if (input.ndim() != 2 or @as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return false;
+    if (out.ndim() != 2 or @as(usize, @intCast(out.dim(0))) != rows or @as(usize, @intCast(out.dim(1))) != out_dim) return false;
+    const rc = if (rows == 1)
+        termite_metal_decode_runtime_apply_linear_device(
+            runtime,
+            slot,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            in_dim,
+            out_dim,
+            out.deviceHandle(),
+            out.deviceByteOffset(),
+        )
+    else
+        termite_metal_decode_runtime_apply_linear_multi_row_device(
+            runtime,
+            slot,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            rows,
+            in_dim,
+            out_dim,
+            out.deviceHandle(),
+            out.deviceByteOffset(),
+        );
+    return rc == 0;
+}
+
+/// Single-row fused Q/K/V projection whose K and V land in caller-provided
+/// device tensors (rows of a resident cache slab), so the cache append needs
+/// no copy. Returns the freshly allocated Q, or null when the slots, shapes,
+/// or residency do not fit.
+pub fn tryApplyDenseRuntimeLinearQkvInto(
+    self: anytype,
+    q_slot: usize,
+    k_slot: usize,
+    v_slot: usize,
+    input: MetalTensor,
+    in_dim: usize,
+    q_out_dim: usize,
+    kv_out_dim: usize,
+    k_out: MetalTensor,
+    v_out: MetalTensor,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (q_slot >= decoder_runtime_linear_slot_capacity or k_slot >= decoder_runtime_linear_slot_capacity or v_slot >= decoder_runtime_linear_slot_capacity) return null;
+    if (in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0 or in_dim > std.math.maxInt(i32) or q_out_dim > std.math.maxInt(i32) or kv_out_dim > std.math.maxInt(i32)) return null;
+    if (!self.raw_linear_slots_prepared[q_slot] or !self.raw_linear_slots_prepared[k_slot] or !self.raw_linear_slots_prepared[v_slot]) return null;
+    if (self.raw_linear_slot_kinds[q_slot] != .dense or self.raw_linear_slot_kinds[k_slot] != .dense or self.raw_linear_slot_kinds[v_slot] != .dense) return null;
+    if (self.raw_linear_slot_in_dims[q_slot] != in_dim or self.raw_linear_slot_in_dims[k_slot] != in_dim or self.raw_linear_slot_in_dims[v_slot] != in_dim or
+        self.raw_linear_slot_out_dims[q_slot] != q_out_dim or self.raw_linear_slot_out_dims[k_slot] != kv_out_dim or self.raw_linear_slot_out_dims[v_slot] != kv_out_dim) return null;
+    if (!input.isDevice() or !k_out.isDevice() or !v_out.isDevice()) return null;
+    if (input.ndim() != 2 or @as(usize, @intCast(input.dim(0))) != 1 or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
+    if (k_out.ndim() != 2 or @as(usize, @intCast(k_out.dim(0))) != 1 or @as(usize, @intCast(k_out.dim(1))) != kv_out_dim) return null;
+    if (v_out.ndim() != 2 or @as(usize, @intCast(v_out.dim(0))) != 1 or @as(usize, @intCast(v_out.dim(1))) != kv_out_dim) return null;
+    const q_shape = [_]i32{ 1, @intCast(q_out_dim) };
+    var q_device = try MetalTensor.deviceAllocate(runtime, q_out_dim * @sizeOf(f32), .private, &q_shape);
+    errdefer q_device.deinit();
+    const device_rc = termite_metal_decode_runtime_apply_linear_qkv_slots_device(
+        runtime,
+        q_slot,
+        k_slot,
+        v_slot,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        1,
+        in_dim,
+        q_out_dim,
+        kv_out_dim,
+        q_device.deviceHandle(),
+        q_device.deviceByteOffset(),
+        k_out.deviceHandle(),
+        k_out.deviceByteOffset(),
+        v_out.deviceHandle(),
+        v_out.deviceByteOffset(),
+    );
+    if (device_rc == 0) return q_device;
+    q_device.deinit();
+    return null;
 }
 
 pub fn tryApplyDenseRuntimeLinearQkv(

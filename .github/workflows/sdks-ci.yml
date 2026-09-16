@@ -1,9 +1,24 @@
 name: SDK CI
 
 on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        default: ''
+      head_sha:
+        type: string
+        default: ''
+      base_sha:
+        type: string
+        default: ''
+      check_id:
+        type: string
+        default: ''
+      comment_id:
+        type: string
+        default: ''
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   merge_group:
     types: [checks_requested]
@@ -11,16 +26,35 @@ on:
 
 permissions:
   contents: read
+  checks: read
+  pull-requests: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: sdks-${{ inputs.pr_number || github.ref }}
   cancel-in-progress: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  admission:
+    uses: ./.github/workflows/pr-ci-admission.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+      suite: sdks
+
   sdks:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) }}
+    needs: admission
     name: sdks-ci
     runs-on: arc-antfly-standard
     timeout-minutes: 60
@@ -29,19 +63,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Classify validation scopes
         id: scopes
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          BASE_SHA: ${{ inputs.base_sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          if [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "workflow_dispatch" ]]; then
             python3 scripts/ci/classify_validation.py --all --github-output "$GITHUB_OUTPUT"
           else
             python3 scripts/ci/classify_validation.py \
               --base "$BASE_SHA" \
-              --head "$GITHUB_SHA" \
+              --head "${{ inputs.head_sha || github.sha }}" \
               --github-output "$GITHUB_OUTPUT"
           fi
 
@@ -175,15 +211,21 @@ jobs:
         if: steps.scopes.outputs.antfarm_e2e == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: antfarm-linux-node-${{ github.sha }}
+          name: antfarm-linux-node-${{ inputs.head_sha || github.sha }}
           path: ts/apps/antfarm/dist
           if-no-files-found: error
           retention-days: 7
 
   playwright:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      (needs.sdks.outputs.antfarm_e2e == 'true') }}
     name: Antfarm Playwright
-    needs: sdks
-    if: needs.sdks.outputs.antfarm_e2e == 'true'
+    needs: [admission, sdks]
     timeout-minutes: 60
     runs-on: arc-antfly-heavy
     env:
@@ -208,6 +250,9 @@ jobs:
         working-directory: .
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -227,7 +272,7 @@ jobs:
       - name: Download canonical Antfarm bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: antfarm-linux-node-${{ github.sha }}
+          name: antfarm-linux-node-${{ inputs.head_sha || github.sha }}
           path: ts/apps/antfarm/dist
 
       - name: Install Playwright OS Dependencies

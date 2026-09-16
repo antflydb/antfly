@@ -7155,6 +7155,152 @@ pub fn getComputeBackend(session: Session, allocator: std.mem.Allocator) !ops.Co
     return cb;
 }
 
+/// Incremental native Whisper decoder bound to one session for the duration
+/// of one transcription. Holds the compute backend (and on shared GPU
+/// backends its execution lease) and the session's execution gate, so it
+/// serializes with other users of the model exactly like `Session.run`.
+pub const WhisperNativeDecoder = struct {
+    allocator: std.mem.Allocator,
+    cb: ManagedComputeBackend,
+    config: whisper_mod.Config,
+    encoder_hidden: ops.CT,
+    cache: whisper_arch.DecodeCache,
+    gate: ?*std.atomic.Mutex,
+
+    /// Logits (`[vocab_size]` f32) for the last of `tokens`, which must be
+    /// the tokens not yet decoded (`tokens.len >= 1`).
+    pub fn step(self: *WhisperNativeDecoder, tokens: []const i64) ![]f32 {
+        if (self.cb.backend.execution_control) |control| try control.check();
+        return whisper_arch.decoderStepCachedLogits(&self.cb.backend, self.allocator, self.config, tokens, &self.cache);
+    }
+
+    /// Like `step`, choosing what the last token yields: the logits row, or
+    /// the device-side token statistics (which fall back to logits when the
+    /// backend cannot produce them).
+    pub fn stepWith(self: *WhisperNativeDecoder, tokens: []const i64, output: whisper_arch.StepOutput) !whisper_arch.StepResult {
+        if (self.cb.backend.execution_control) |control| try control.check();
+        return whisper_arch.decoderStepCached(&self.cb.backend, self.allocator, self.config, tokens, &self.cache, output);
+    }
+
+    /// Enter or leave pipelined decoding (`.pipelined` steps); false when
+    /// the backend cannot keep a step in flight.
+    pub fn setPipelined(self: *WhisperNativeDecoder, enabled: bool) bool {
+        return whisper_arch.setPipelinedDecode(&self.cb.backend, &self.cache, enabled);
+    }
+
+    /// Seed the device timestamp-grammar state before pipelined steps.
+    pub fn seedGrammar(self: *WhisperNativeDecoder, state: *const ops.WhisperGrammarState) bool {
+        return self.cb.backend.whisperGrammarWrite(state);
+    }
+
+    /// Submit the step the last `.pipelined` call encoded.
+    pub fn submit(self: *WhisperNativeDecoder) !void {
+        return whisper_arch.decoderStepSubmit(&self.cb.backend);
+    }
+
+    /// Drop the step the last `.pipelined` call encoded without running it.
+    pub fn discard(self: *WhisperNativeDecoder) void {
+        whisper_arch.decoderStepDiscard(&self.cb.backend);
+    }
+
+    /// Collect the statistics of the step in flight from `slot`.
+    pub fn awaitStats(self: *WhisperNativeDecoder, slot: usize) !?ops.WhisperLogitsStatsRaw {
+        return whisper_arch.decoderStepAwait(&self.cb.backend, slot);
+    }
+
+    /// Wait for any step still in flight and drop any step still encoded;
+    /// safe to call when there is neither.
+    pub fn drain(self: *WhisperNativeDecoder) void {
+        self.cb.backend.decoderRuntimeWaitSubmittedFrame() catch {};
+        whisper_arch.decoderStepDiscard(&self.cb.backend);
+    }
+
+    pub fn positions(self: *const WhisperNativeDecoder) usize {
+        return self.cache.positions;
+    }
+
+    pub fn deinit(self: *WhisperNativeDecoder) void {
+        self.cache.deinit(&self.cb.backend);
+        self.cb.backend.free(self.encoder_hidden);
+        self.cb.deinit();
+        if (self.gate) |gate| gate.unlock();
+        self.* = undefined;
+    }
+};
+
+/// Open an incremental decoder over `encoder_hidden` (host f32,
+/// `[enc_seq, d_model]`). Returns null for sessions that are not native
+/// Whisper (ONNX bundles keep their own incremental path).
+pub fn whisperNativeDecoder(
+    session: Session,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+    encoder_hidden: []const f32,
+    enc_seq: usize,
+) !?WhisperNativeDecoder {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const cfg = switch (self.arch_config) {
+        .whisper => |cfg| cfg,
+        else => return null,
+    };
+    if (encoder_hidden.len != enc_seq * cfg.d_model) return error.InvalidInputShape;
+    const gate = session.execution_gate;
+    if (gate) |mutex| {
+        if (control) |active| try active.lock(mutex) else while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    errdefer if (gate) |mutex| mutex.unlock();
+    var cb = try getComputeBackendWithControl(session, allocator, control);
+    errdefer cb.deinit();
+    const shape = [_]i32{ 1, @intCast(enc_seq), @intCast(cfg.d_model) };
+    const encoder_host = try cb.backend.fromFloat32Shape(encoder_hidden, &shape);
+    // Upload once so the cross-attention projections run on the device and
+    // their outputs are born resident.
+    const encoder_ct = if (try cb.backend.ensureDeviceResident(encoder_host)) |device| blk: {
+        cb.backend.free(encoder_host);
+        break :blk device;
+    } else encoder_host;
+    errdefer cb.backend.free(encoder_ct);
+    const cache = try whisper_arch.DecodeCache.init(&cb.backend, allocator, cfg, encoder_ct, enc_seq);
+    return .{
+        .allocator = allocator,
+        .cb = cb,
+        .config = cfg,
+        .encoder_hidden = encoder_ct,
+        .cache = cache,
+        .gate = gate,
+    };
+}
+
+/// Compute backend for a long-lived runtime cached on the loaded model (the
+/// Metal whole-model executor). On Metal it borrows the store's shared
+/// provider instead of taking the per-request execution lease, because the
+/// runtime is only driven by requests that already hold that lease; see
+/// `MetalCompute.initBorrowingSharedProvider`. Other backends behave as
+/// `getComputeBackend`.
+pub fn getComputeBackendBorrowingSharedProvider(session: Session, allocator: std.mem.Allocator) !ops.ComputeBackend {
+    if (session.vtable != &arch_vtable) return error.NotArchSession;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal) return getComputeBackend(session, allocator);
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    const compute = try allocator.create(MetalCompute);
+    errdefer allocator.destroy(compute);
+    compute.* = try MetalCompute.initBorrowingSharedProvider(
+        allocator,
+        gpuBackendData(self),
+        self.io,
+        .{
+            .config = self.kernel_jit_config,
+            .scope = self.metal_jit_scope,
+            .load_context = self.kernel_jit_load_context,
+        },
+    );
+    var cb = compute.ownedComputeBackend();
+    errdefer cb.deinit();
+    try cb.beginRequest();
+    return cb;
+}
+
 /// Direct compute paths bypass Session.runWithControl. This owner binds their
 /// cooperative checks and holds process protection from backend creation until
 /// backend cleanup completes, including on cancellation and constructor errors.

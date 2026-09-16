@@ -683,7 +683,7 @@ pub const DerivedWorkflowScenario = struct {
 };
 
 pub const BackupRestoreScenario = struct {
-    pub const name: []const u8 = "backup-restore-ha-seed-lifecycle";
+    pub const name: []const u8 = "backup-restore-standby-seed-lifecycle";
     pub const version: u32 = 2;
     const atomic_id = propertyId(name, "restore_is_atomic_and_fail_closed");
     const pin_id = propertyId(name, "active_generation_remains_pinned");

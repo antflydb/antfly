@@ -5319,7 +5319,10 @@ pub const HBCIndex = struct {
     // deliberately volatile: reopen verifies the durable postings again.
     posting_refresh_next_node: u64 = 1,
     posting_refresh_observed_epoch: ?u64 = null,
-    posting_refresh_clean_epoch: ?u64 = null,
+    // Odd epochs are never clean. This atomic certificate lets operational
+    // status observe bounded maintenance without traversing the tree or
+    // racing the mutation owner's scan cursor. Reopen starts uncertified.
+    posting_refresh_clean_epoch: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     posting_refresh_scan_changed: bool = false,
     /// Publication commits may include durable I/O. Readers of an odd
     /// generation retain the active flight and sleep on its runtime event
@@ -6890,6 +6893,8 @@ pub const HBCIndex = struct {
         // IndexManager binds this during construction/startup, before requests
         // are admitted. Direct library users retain the threaded fallback.
         self.runtime_io = io;
+        self.published_snapshot_mu.io = io;
+        self.cache_mu.io = io;
     }
 
     fn runtimeIo(self: *const HBCIndex) std.Io {
@@ -19443,6 +19448,15 @@ pub const HBCIndex = struct {
         return true;
     }
 
+    /// A clean sweep certifies one committed mutation epoch. Subsequent
+    /// writes (including aborts) invalidate it without touching scan state.
+    /// This is an optimization/convergence signal, not query readiness.
+    pub fn postingRefreshPending(self: *const HBCIndex) bool {
+        const clean = self.posting_refresh_clean_epoch.load(.acquire);
+        const current = self.published_mutation_epoch.load(.acquire);
+        return current & 1 != 0 or clean != current;
+    }
+
     pub fn refreshPostingPayloadPage(self: *HBCIndex, max_nodes: usize, max_postings: usize) !PostingRefreshProgress {
         return try self.refreshPostingPayloadPageWithOptions(max_nodes, max_postings, false, true);
     }
@@ -19453,7 +19467,7 @@ pub const HBCIndex = struct {
     pub fn refreshPostingPayloadPageWithOptions(self: *HBCIndex, max_nodes: usize, max_postings: usize, allow_query_traffic: bool, allow_mutation: bool) !PostingRefreshProgress {
         var context: PostingRefreshContext = .{ .index = self, .allow_query_traffic = allow_query_traffic };
         const epoch = self.published_mutation_epoch.load(.acquire);
-        if (self.posting_refresh_clean_epoch == epoch) return .{};
+        if (!self.postingRefreshPending()) return .{};
         if (!PostingRefreshContext.shouldContinue(&context)) return .{ .pending = true };
         if (self.posting_refresh_observed_epoch) |observed| {
             if (observed != epoch and self.posting_refresh_next_node != 1) self.posting_refresh_scan_changed = true;
@@ -19510,7 +19524,7 @@ pub const HBCIndex = struct {
         var pending = true;
         if (result.next_node == 0 and !result.limit_reached) {
             pending = self.posting_refresh_scan_changed;
-            if (!pending) self.posting_refresh_clean_epoch = self.posting_refresh_observed_epoch;
+            if (!pending) self.posting_refresh_clean_epoch.store(self.posting_refresh_observed_epoch.?, .release);
             self.posting_refresh_scan_changed = false;
         }
         return .{
@@ -31153,9 +31167,11 @@ test "posting refresh resumes bounded scans and rechecks mutations behind cursor
     _ = try idx.repairDirtyPostings();
     try std.testing.expect(idx.metadata.node_count > 4);
 
+    try std.testing.expect(idx.postingRefreshPending());
     const first = try idx.refreshPostingPayloadPage(2, 1);
     try std.testing.expectEqual(@as(usize, 2), first.scanned);
     try std.testing.expect(first.pending);
+    try std.testing.expect(idx.postingRefreshPending());
     try std.testing.expectEqual(@as(u64, 3), idx.posting_refresh_next_node);
     // This includes postings already visited. The following sweep must not
     // certify the old clean prefix after a mutation between pages.
@@ -31173,13 +31189,48 @@ test "posting refresh resumes bounded scans and rechecks mutations behind cursor
         }
     }
     try std.testing.expect(settled);
+    try std.testing.expect(!idx.postingRefreshPending());
+    // Even an aborted write invalidates the previously published certificate.
+    var aborted = try idx.beginWriteTxn();
+    try std.testing.expect(idx.postingRefreshPending());
+    aborted.abort();
+    try std.testing.expect(idx.postingRefreshPending());
+    for (0..512) |_| {
+        if (!(try idx.refreshPostingPayloadPage(2, 1)).pending) break;
+    }
+    try std.testing.expect(!idx.postingRefreshPending());
     try std.testing.expect(total_repaired > 0);
     try std.testing.expectEqual(@as(u64, 0), (try idx.postingBacklogStats()).dirty_postings);
     const idle = try idx.refreshPostingPayloadPage(2, 1);
     try std.testing.expectEqual(@as(usize, 0), idle.scanned);
     try std.testing.expect(!idle.pending);
     _ = try idx.markAllLeafPostingsDirtyForTest();
+    try std.testing.expect(idx.postingRefreshPending());
     try std.testing.expect((try idx.refreshPostingPayloadPage(2, 1)).pending);
+}
+
+test "posting refresh certificate must be reverified after reopen" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const config: HBCConfig = .{ .dims = 2, .use_quantization = false };
+    {
+        var idx = try HBCIndex.open(alloc, path, config);
+        defer idx.close();
+        try idx.insert(1, &.{ 1.0, 0.0 });
+        for (0..8) |_| {
+            if (!(try idx.refreshPostingPayloadPage(1, 1)).pending) break;
+        }
+        try std.testing.expect(!idx.postingRefreshPending());
+    }
+    var reopened = try HBCIndex.open(alloc, path, config);
+    defer reopened.close();
+    try std.testing.expect(reopened.postingRefreshPending());
+    for (0..8) |_| {
+        if (!(try reopened.refreshPostingPayloadPage(1, 1)).pending) break;
+    }
+    try std.testing.expect(!reopened.postingRefreshPending());
 }
 
 test "posting refresh deferral retains cursor and pending debt" {

@@ -73,6 +73,12 @@ pub const SegmentSizing = struct {
 };
 
 pub const Store = struct {
+    /// Candidate references are protected by the durable migration job until
+    /// all primary rows and their final reference coverage have been verified.
+    migration_retention: std.atomic.Value(bool) = .init(false),
+    migration_disk_reserve: std.atomic.Value(u64) = .init(0),
+    migration_temporary_limit: std.atomic.Value(u64) = .init(0),
+
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     publication_mutex: std.atomic.Mutex = .unlocked,
@@ -259,6 +265,20 @@ pub const Store = struct {
         self.lockPublication();
         self.published_poisoned = poisoned;
         self.publication_mutex.unlock();
+    }
+
+    pub fn beginMigrationRetention(self: *Store) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        // A collector may be staging outside the mutex. Admit only after its
+        // owner retires; atomic publication then prevents the next collector.
+        if (self.marking != null or self.collection != null or self.retiring != null or self.checkpoint_running)
+            return error.StorageBusy;
+        self.migration_retention.store(true, .release);
+    }
+
+    pub fn setMigrationRetention(self: *Store, active: bool) void {
+        self.migration_retention.store(active, .release);
     }
 
     pub fn poison(self: *Store) void {
@@ -1632,6 +1652,13 @@ pub const Store = struct {
 
     fn prepareBatch(self: *Store, prepared: []const payload.Prepared) !void {
         if (self.read_only) return error.ReadOnly;
+        const reserve = self.migration_disk_reserve.load(.acquire);
+        if (reserve != 0) {
+            var bytes: u64 = 0;
+            for (prepared) |item| bytes +|= @as(u64, item.artifact.len) *| 8;
+            const capacity = try @import("antfly_platform").filesystem.capacity(self.opened.store.root_dir);
+            if (capacity.available_bytes < reserve +| bytes) return error.VectorMigrationDiskReserve;
+        }
         // Decode independent artifact envelopes before entering source writer
         // exclusion. Each request has its own allocator reservation.
         var local_budget: ?resources.BudgetedAllocator = if (self.group_commit and self.preparation_manager != null)
@@ -1651,6 +1678,12 @@ pub const Store = struct {
         defer self.mutex.unlock();
         self.waitWriteAdmissionLocked();
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        const limit = self.migration_temporary_limit.load(.acquire);
+        if (limit != 0) {
+            var retained = self.stats.retained_payload_bytes;
+            for (prepared) |item| retained +|= item.artifact.len;
+            if (retained > limit / 8) return error.VectorMigrationTemporaryBudgetExceeded;
+        }
         const started = time.monotonicNs();
         self.stats.prepare_lock_wait_ns += started -| lock_started;
         if (self.group_commit) self.stats.decode_outside_lock_ns += lock_started -| decode_started;
@@ -2233,6 +2266,7 @@ pub const Store = struct {
     fn collectStepLocked(self: *Store, primary: *erased.Store, budget_bytes: u64, background: bool) !bool {
         if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        if (self.migration_retention.load(.acquire)) return false;
         if (self.checkpoint_running or self.retiring != null) {
             self.stats.collection_deferrals += 1;
             return false;
@@ -3292,6 +3326,82 @@ test "source vector payloads collect obsolete versions only after readers retire
     try txn.commit();
     try std.testing.expect(try source.collect(&raw));
     try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().live_payloads_at_collection);
+}
+
+test "source vector payloads retain accounting across reopen before collection observations" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    const key_a = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "model-a");
+    defer alloc.free(key_a);
+    const key_b = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "model-b");
+    defer alloc.free(key_b);
+    const obsolete = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 0, 0 });
+    defer alloc.free(obsolete);
+    const current_a = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 0, 0, 1 });
+    defer alloc.free(current_a);
+    const current_b = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 1, 0 });
+    defer alloc.free(current_b);
+
+    // Complete reclamation before restart. There are no optional workers or
+    // persisted collection receipts to race with the first reopened snapshot.
+    {
+        var source = try Store.openWithPolicy(alloc, memory.storage(), "/source-reopen-observation", false, .float32, .{});
+        defer source.deinit();
+        store.payload_store = source.interface();
+        defer store.payload_store = null;
+        try store.put(key_a, obsolete);
+        try store.put(key_b, current_b);
+        try store.put(key_a, current_a);
+        try std.testing.expect(try source.collect(&raw));
+        const stats = source.statsSnapshot();
+        try std.testing.expect(stats.collections > 0);
+        try std.testing.expectEqual(@as(u64, 2), stats.retained_payloads);
+        try std.testing.expectEqual(@as(u64, 20), stats.retained_payload_bytes);
+        try std.testing.expectEqual(@as(u64, 2), stats.live_payloads_at_collection);
+    }
+    // Status inspection can use a read-only owner; foreground activation can
+    // subsequently open a writer. Neither inherits process-local GC counters.
+    for ([_]bool{ true, false }) |read_only| {
+        var source = try Store.openWithPolicy(alloc, memory.storage(), "/source-reopen-observation", read_only, .float32, .{});
+        defer source.deinit();
+        store.payload_store = source.interface();
+        defer store.payload_store = null;
+        const before = source.statsSnapshot();
+        try std.testing.expectEqual(@as(u64, 2), before.retained_payloads);
+        try std.testing.expectEqual(@as(u64, 20), before.retained_payload_bytes);
+        try std.testing.expectEqual(@as(u64, 0), before.collection_pending_bytes);
+        try std.testing.expectEqual(@as(u64, 0), before.collections);
+        try std.testing.expectEqual(@as(u64, 0), before.live_payloads_at_collection);
+        try std.testing.expectEqual(@as(u64, 0), before.live_payload_bytes_at_collection);
+        const value_a = try store.get(alloc, key_a);
+        defer alloc.free(value_a);
+        const value_b = try store.get(alloc, key_b);
+        defer alloc.free(value_b);
+        try std.testing.expectEqualSlices(u8, current_a, value_a);
+        try std.testing.expectEqualSlices(u8, current_b, value_b);
+        if (!read_only) {
+            const generation = source.opened.store.manifest.?.latest_generation;
+            try std.testing.expect(try source.collect(&raw));
+            const after = source.statsSnapshot();
+            try std.testing.expectEqual(@as(u64, 1), after.collections);
+            try std.testing.expectEqual(@as(u64, 2), after.live_payloads_at_collection);
+            try std.testing.expectEqual(@as(u64, 20), after.live_payload_bytes_at_collection);
+            try std.testing.expectEqual(@as(u64, 0), after.collection_pending_bytes);
+            // Verification of an already reclaimed corpus need not rewrite it.
+            try std.testing.expectEqual(generation, source.opened.store.manifest.?.latest_generation);
+            try std.testing.expectEqual(@as(u64, 0), after.collection_bytes_written);
+        }
+    }
 }
 
 test "source vector payloads fence ambiguous durable preparations and recover retries" {

@@ -161,8 +161,8 @@ pub const GetOptions = struct {
     /// the response body and response-derived metadata. Defaults to false so
     /// existing callers retain complete metadata semantics.
     skip_metadata_probe: bool = false,
-    /// Bound bytes buffered by transports for this request. Implementations
-    /// must enforce this before returning a response body.
+    /// Bound successful body bytes buffered by transports for this request.
+    /// Provider error responses may use a separate bounded transport ceiling.
     max_response_bytes: ?usize = null,
     /// Borrowed for the duration of this operation. Remote providers interrupt
     /// their active transport; local providers check between bounded chunks.

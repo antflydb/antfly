@@ -16,7 +16,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
 const platform_sync = @import("antfly_platform").sync;
-const platform_time = @import("antfly_platform").time;
 const common_http = @import("../../common/http/mod.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
@@ -63,7 +62,6 @@ pub const HttpSnapshotConfig = struct {
 
 pub const max_parallel_chunk_workers: usize = 32;
 
-var snapshot_fetch_sequence = std.atomic.Value(u64).init(1);
 const snapshot_fetch_staging_prefix = ".antfly-snapshot-fetch-";
 const snapshot_fetch_staging_suffix = ".part";
 
@@ -451,12 +449,12 @@ pub const HttpSnapshotTransport = struct {
     }
 
     fn transferDeadlineNs(self: *const HttpSnapshotTransport) u64 {
-        return platform_time.monotonicNs() +|
+        return self.nowNs() +|
             @as(u64, self.cfg.transfer_timeout_ms) * std.time.ns_per_ms;
     }
 
     fn requestTimeoutUntil(self: *const HttpSnapshotTransport, deadline_ns: u64) !u32 {
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.nowNs();
         if (now_ns >= deadline_ns) return error.SnapshotTransferTimeout;
         const remaining_ns = deadline_ns - now_ns;
         const remaining_ms_u64 = @max(
@@ -940,7 +938,11 @@ pub const HttpSnapshotTransport = struct {
     }
 
     fn snapshotNowMs(self: *const HttpSnapshotTransport) u64 {
-        return @intCast(@divTrunc(@max(0, std.Io.Clock.now(.awake, self.artifact_io).nanoseconds), std.time.ns_per_ms));
+        return self.nowNs() / std.time.ns_per_ms;
+    }
+
+    fn nowNs(self: *const HttpSnapshotTransport) u64 {
+        return @intCast(@max(0, std.Io.Clock.now(.awake, self.artifact_io).nanoseconds));
     }
 
     fn snapshotRetryDelayMs(self: *const HttpSnapshotTransport, job: QueuedSnapshot) u64 {
@@ -1765,16 +1767,16 @@ pub const HttpSnapshotTransport = struct {
         defer if (staging_reservation_owned) self.staging_budget.release(data_len);
         const file_io = self.artifact_io;
         try fs_paths.createDirPathPortable(file_io, self.cfg.root_dir);
-        const sequence = snapshot_fetch_sequence.fetchAdd(1, .monotonic);
+        var nonce: [16]u8 = undefined;
+        file_io.random(&nonce);
         const staging_path = try std.fmt.allocPrint(
             self.alloc,
-            "{s}/{s}{d}-{d}-{d}{s}",
+            "{s}/{s}{d}-{s}{s}",
             .{
                 self.cfg.root_dir,
                 snapshot_fetch_staging_prefix,
                 req.group_id,
-                platform_time.monotonicNs(),
-                sequence,
+                std.fmt.bytesToHex(&nonce, .lower),
                 snapshot_fetch_staging_suffix,
             },
         );
@@ -2245,6 +2247,34 @@ test "http snapshot transport module compiles" {
     _ = SnapshotTargetResolver;
     _ = SnapshotFetch;
     _ = HttpSnapshotTransport;
+}
+
+test "http snapshot transfer deadline follows the borrowed monotonic clock" {
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{
+        .monotonic_ns = std.time.ns_per_s,
+    });
+    defer clock.deinit();
+    const Unused = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedRequest;
+        }
+    };
+    var transport = try HttpSnapshotTransport.initShared(std.testing.allocator, .{
+        .root_dir = "/snapshot-clock",
+        .request_timeout_ms = 10,
+        .transfer_timeout_ms = 25,
+    }, .{ .ptr = undefined, .vtable = &.{ .execute = Unused.execute } }, null, clock.io());
+    defer transport.deinit();
+    const deadline = transport.transferDeadlineNs();
+    try std.testing.expectEqual(@as(u64, 1025 * std.time.ns_per_ms), deadline);
+    try clock.advanceClocks(0, 100 * std.time.ns_per_s, true);
+    try std.testing.expectEqual(@as(u32, 10), try transport.requestTimeoutUntil(deadline));
+    try clock.advance(20 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 5), try transport.requestTimeoutUntil(deadline));
+    try clock.advance(4500 * std.time.ns_per_us);
+    try std.testing.expectEqual(@as(u32, 1), try transport.requestTimeoutUntil(deadline));
+    try clock.advance(500 * std.time.ns_per_us);
+    try std.testing.expectError(error.SnapshotTransferTimeout, transport.requestTimeoutUntil(deadline));
 }
 
 test "snapshot transport validates direct-construction resource limits" {

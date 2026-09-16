@@ -200,7 +200,7 @@ const BackendState = struct {
         state.execution = execution;
         state.request_context = request_context;
         state.provider = switch (cfg.provider) {
-            .openai, .ollama => blk: {
+            .openai, .openrouter, .ollama => blk: {
                 const provider = openai_provider.Provider.init(alloc, http, cfg.url);
                 break :blk .{ .openai = provider };
             },

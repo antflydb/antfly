@@ -3991,9 +3991,7 @@ pub const HAStandbyReplicationConfig = struct {
     executor: ?antfly.common.http.RequestExecutor = null,
 };
 
-/// A previously-live upstream/slot pair retired by `setHAStandbyUpstream`.
-/// Owned by `DataServer` and freed only at `deinit`; see
-/// `ha_standby_upstream_retired`.
+/// A server-owned upstream/slot pair retained until replication quiesces.
 const HAStandbyUpstreamRetired = struct {
     upstream_url: []u8,
     slot_name: []u8,
@@ -4021,6 +4019,10 @@ const HAStandbyReplicationErrorCode = enum(u8) {
     ConnectionRefused,
     BrokenPipe,
     EndOfStream,
+    InvalidResponse,
+    InvalidSocketOption,
+    RecvFailed,
+    SendFailed,
     NoAddressReturned,
     Timeout,
     ConnectionTimedOut,
@@ -4075,6 +4077,10 @@ fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
         error.ConnectionRefused => .ConnectionRefused,
         error.BrokenPipe => .BrokenPipe,
         error.EndOfStream => .EndOfStream,
+        error.InvalidResponse => .InvalidResponse,
+        error.InvalidSocketOption => .InvalidSocketOption,
+        error.RecvFailed => .RecvFailed,
+        error.SendFailed => .SendFailed,
         error.NoAddressReturned => .NoAddressReturned,
         error.Timeout => .Timeout,
         error.ConnectionTimedOut => .ConnectionTimedOut,
@@ -4131,6 +4137,10 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
         .ConnectionRefused => "ConnectionRefused",
         .BrokenPipe => "BrokenPipe",
         .EndOfStream => "EndOfStream",
+        .InvalidResponse => "InvalidResponse",
+        .InvalidSocketOption => "InvalidSocketOption",
+        .RecvFailed => "RecvFailed",
+        .SendFailed => "SendFailed",
         .NoAddressReturned => "NoAddressReturned",
         .Timeout => "Timeout",
         .ConnectionTimedOut => "ConnectionTimedOut",
@@ -4190,6 +4200,13 @@ fn isRetryableControlPlaneTransportError(err: anyerror) bool {
         .ConnectionRefused,
         .BrokenPipe,
         .EndOfStream,
+        // httpx reports a peer closing mid-response this way. No incomplete
+        // replication frame is applied or acknowledged; retry from durable progress.
+        .InvalidResponse,
+        // A retired pooled socket can fail timeout setup before dispatch.
+        .InvalidSocketOption,
+        .RecvFailed,
+        .SendFailed,
         .NoAddressReturned,
         .Timeout,
         .ConnectionTimedOut,
@@ -5053,6 +5070,9 @@ pub const DataServer = struct {
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
     ha_cfg: DataServerHAConfig = .{},
+    /// Standalone owns its durable catalog; apply before routing later WAL records.
+    ha_catalog_apply_ctx: ?*anyopaque = null,
+    ha_catalog_apply_fn: ?*const fn (*anyopaque, antfly.hot_standby.replication_record.RecordView) anyerror!void = null,
     ha_state_mutex: std.atomic.Mutex = .unlocked,
     /// Global primary mutation/capture ordering point. All DB/catalog writers
     /// share this instance through their HA mirror configuration.
@@ -5076,11 +5096,10 @@ pub const DataServer = struct {
     ha_standby_replication_last_attempt_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_next_attempt_ns: std.atomic.Value(u64) = .init(0),
-    /// True once `setHAStandbyUpstream` has swapped `ha_cfg.standby_replication`
-    /// at least once. Distinguishes the initial caller-owned upstream/slot
-    /// strings (not ours to free) from later swaps' self-allocated
-    /// replacements (retired below and freed at `deinit`).
-    ha_standby_upstream_swapped: bool = false,
+    /// Owned independently of the active config: promotion clears that
+    /// config while a replication round can still be reading these strings.
+    /// The initial caller-owned pair is never stored here or freed by us.
+    ha_standby_upstream_owned: ?HAStandbyUpstreamRetired = null,
     /// Strings replaced by `setHAStandbyUpstream`. A replication round may
     /// still be holding an unlocked copy of the old config mid-fetch (see
     /// `runHAStandbyReplicationRound`), so a swap must never free the
@@ -5770,6 +5789,11 @@ pub const DataServer = struct {
     }
 
     pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView) !void {
+        if (record.kind == .metadata_mutation and record.table_id == 0 and record.shard_id == 0) {
+            const apply = self.ha_catalog_apply_fn orelse return error.HACatalogReplicationUnavailable;
+            try apply(self.ha_catalog_apply_ctx orelse return error.HACatalogReplicationUnavailable, record);
+            return;
+        }
         if (isWholeInstanceHAControlRecord(record)) return;
 
         var snapshot = try self.write_source.catalog.adminSnapshot();
@@ -5791,6 +5815,68 @@ pub const DataServer = struct {
             route.table_name,
             record,
         );
+    }
+
+    pub const HACatalogCommit = struct {
+        mirror: antfly.db.HAAsyncEffectMirror,
+        generation: u64,
+        lsn: u64,
+    };
+
+    /// Caller holds the shared mutation barrier and catalog lock. An append
+    /// failure can have an uncertain durable outcome, so fence until replay.
+    pub fn appendHACatalogCreate(self: *DataServer, payload: []const u8) !HACatalogCommit {
+        platform_sync.lockYielding(&self.ha_state_mutex);
+        defer self.ha_state_mutex.unlock();
+        const generation = self.ha_public_gate_state.currentGeneration();
+        try self.ha_public_gate_state.checkWrite(generation);
+        const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
+        if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+            return error.HACatalogRequiresWholeInstance;
+        errdefer self.ha_public_gate_state.publishPrimaryFence(true);
+        const lsn = try mirror.primary.append(.{
+            .kind = .metadata_mutation,
+            .payload_codec = .json,
+            .table_id = 0,
+            .shard_id = 0,
+            .payload = payload,
+        });
+        try mirror.primary.log.wal.sync(true);
+        self.ha_primary_mirror_last_lsn.store(lsn, .release);
+        return .{ .mirror = mirror, .generation = generation, .lsn = lsn };
+    }
+
+    /// Caller holds the catalog lock and shared mutation barrier, so every
+    /// visible catalog record is already in this log frontier. Reuse the normal
+    /// RemoteApply wait rather than treating a primary-local lookup as proof.
+    pub fn acknowledgeHAExistingCatalog(self: *DataServer) !void {
+        const commit: HACatalogCommit = blk: {
+            platform_sync.lockYielding(&self.ha_state_mutex);
+            defer self.ha_state_mutex.unlock();
+            const generation = self.ha_public_gate_state.currentGeneration();
+            try self.ha_public_gate_state.checkWrite(generation);
+            const mirror = self.haPrimaryMirror() orelse return error.HACatalogReplicationUnavailable;
+            if (mirror.primary.identity.table_id != 0 or mirror.primary.identity.shard_id != 0)
+                return error.HACatalogRequiresWholeInstance;
+            break :blk .{ .mirror = mirror, .generation = generation, .lsn = mirror.primary.lastLsn() };
+        };
+        try self.acknowledgeHACatalogCreate(commit);
+    }
+
+    /// Local catalog publication has completed. A remote timeout leaves an
+    /// uncertain client outcome, but must not undo committed catalog state or
+    /// require a process restart when the standby becomes available again.
+    pub fn acknowledgeHACatalogCreate(self: *DataServer, commit: HACatalogCommit) !void {
+        const mirror = commit.mirror;
+        // Do not hold the transition mutex while waiting for receiver acks.
+        if (mirror.sync_wait_fn) |wait| {
+            try wait(mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.primary, commit.lsn, mirror.sync_policy);
+        }
+        platform_sync.lockYielding(&self.ha_state_mutex);
+        defer self.ha_state_mutex.unlock();
+        try self.ha_public_gate_state.checkWrite(commit.generation);
+        const gate = try antfly.hot_standby.commit_gate.evaluate(mirror.primary, commit.lsn, mirror.sync_policy);
+        if (!gate.shouldAcknowledge()) return error.SyncPolicyUnsatisfied;
     }
 
     pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: antfly.hot_standby.replication_record.RecordView) anyerror!void {
@@ -6023,7 +6109,7 @@ pub const DataServer = struct {
 
     /// Repoints this standby's continuous-replication puller at a new
     /// upstream primary and slot, without a restart. This is the runtime
-    /// side of `antfly ha follow` / `POST /admin/v1/ha/standby/upstream`.
+    /// side of `antfly standby follow` / `POST /admin/v1/standby/upstream`.
     ///
     /// Must be called with `ha_state_mutex` already held by the caller
     /// (the HTTP admin dispatch loop holds it for the whole request; see
@@ -6031,7 +6117,6 @@ pub const DataServer = struct {
     /// reentrant, so this method must never try to lock it itself.
     pub fn setHAStandbyUpstream(
         self: *DataServer,
-        alloc: std.mem.Allocator,
         upstream_url: []const u8,
         slot_name: []const u8,
         expected: antfly.hot_standby.standby.Identity,
@@ -6060,10 +6145,10 @@ pub const DataServer = struct {
             return .{ .identity = current_identity, .previous = previous, .changed = false };
         }
 
-        const owned_upstream = try alloc.dupe(u8, upstream_url);
-        errdefer alloc.free(owned_upstream);
-        const owned_slot = try alloc.dupe(u8, slot_name);
-        errdefer alloc.free(owned_slot);
+        const owned_upstream = try self.alloc.dupe(u8, upstream_url);
+        errdefer self.alloc.free(owned_upstream);
+        const owned_slot = try self.alloc.dupe(u8, slot_name);
+        errdefer self.alloc.free(owned_slot);
 
         // The strings this swap replaces may still be in use by a
         // replication round that copied `cfg` before this swap took the
@@ -6072,13 +6157,13 @@ pub const DataServer = struct {
         // previously allocated ourselves; the very first pair belongs to
         // whoever configured continuous replication (standalone runtime
         // config, CLI flags, etc.) and is never ours to free.
-        if (self.ha_standby_upstream_swapped) {
-            try self.ha_standby_upstream_retired.append(self.alloc, .{
-                .upstream_url = @constCast(cfg.upstream_base_uri),
-                .slot_name = @constCast(cfg.slot_name),
-            });
+        if (self.ha_standby_upstream_owned) |owned| {
+            try self.ha_standby_upstream_retired.append(self.alloc, owned);
         }
-        self.ha_standby_upstream_swapped = true;
+        self.ha_standby_upstream_owned = .{
+            .upstream_url = owned_upstream,
+            .slot_name = owned_slot,
+        };
 
         self.ha_cfg.standby_replication.?.upstream_base_uri = owned_upstream;
         self.ha_cfg.standby_replication.?.slot_name = owned_slot;
@@ -6094,13 +6179,13 @@ pub const DataServer = struct {
 
     fn setHAStandbyUpstreamCallback(
         ptr: *anyopaque,
-        alloc: std.mem.Allocator,
+        _: std.mem.Allocator,
         upstream_url: []const u8,
         slot_name: []const u8,
         expected: antfly.hot_standby.standby.Identity,
     ) anyerror!antfly.hot_standby.http_admin.Server.StandbyUpstreamResult {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        return self.setHAStandbyUpstream(alloc, upstream_url, slot_name, expected);
+        return self.setHAStandbyUpstream(upstream_url, slot_name, expected);
     }
 
     fn openPromotedPrimaryFromStandbyIfReady(self: *DataServer, cfg: HAStandbyReplicationConfig) !bool {
@@ -6151,18 +6236,8 @@ pub const DataServer = struct {
         self.ha_promoted_primary = promoted_primary;
         const promoted_primary_handle = &self.ha_promoted_primary.?;
         self.ha_cfg.internal_primary = promoted_primary_handle;
-        // If `setHAStandbyUpstream` ever swapped this standby's upstream,
-        // the currently active pair is our own allocation (see
-        // `ha_standby_upstream_swapped`) and must be retired rather than
-        // dropped, since a replication round may still be reading it.
-        if (self.ha_cfg.standby_replication) |active_cfg| {
-            if (self.ha_standby_upstream_swapped) {
-                self.ha_standby_upstream_retired.append(self.alloc, .{
-                    .upstream_url = @constCast(active_cfg.upstream_base_uri),
-                    .slot_name = @constCast(active_cfg.slot_name),
-                }) catch {};
-            }
-        }
+        // Keep the owned pair independently of this config. Promotion cannot
+        // allocate or drop strings still borrowed by a replication round.
         self.ha_cfg.standby_replication = null;
         const promoted_node_id = self.ha_cfg.admin_context.?.standby_node_id;
         self.ha_cfg.admin_context.?.primary = promoted_primary_handle;
@@ -6426,8 +6501,7 @@ pub const DataServer = struct {
         std.mem.sort(u64, group_ids, {}, std.sort.asc(u64));
 
         if (metadata_snapshot.status.metadata_epoch == 0 or
-            metadata_snapshot.tables.len == 0 or
-            metadata_snapshot.ranges.len == 0 or
+            (metadata_snapshot.tables.len == 0) != (metadata_snapshot.ranges.len == 0) or
             group_ids.len != metadata_snapshot.ranges.len)
             return error.HASeedSnapshotIncompleteTopology;
         std.mem.sort(antfly.metadata.TableRecord, metadata_snapshot.tables, {}, struct {
@@ -6598,7 +6672,7 @@ pub const DataServer = struct {
     fn prepareDefaultHASeedSnapshotMaintenance(self: *DataServer) !void {
         var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
-        if (metadata_snapshot.tables.len == 0 or metadata_snapshot.ranges.len == 0)
+        if ((metadata_snapshot.tables.len == 0) != (metadata_snapshot.ranges.len == 0))
             return error.HASeedSnapshotIncompleteTopology;
 
         const now_ns = if (self.write_source.backend_runtime) |backend_runtime|
@@ -6670,7 +6744,10 @@ pub const DataServer = struct {
         }
 
         var store_dir = std.Io.Dir.cwd().openDir(io, store_root, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return error.HASeedExtensionCatalogMismatch,
+            // A fresh instance has no package directory until its first
+            // extension is installed. The catalog/store match above already
+            // rejects missing packages; an absent empty store needs no copy.
+            error.FileNotFound => if (packages.len == 0) return else return error.HASeedExtensionCatalogMismatch,
             else => return err,
         };
         defer store_dir.close(io);
@@ -6801,9 +6878,6 @@ pub const DataServer = struct {
         ) catch return error.InvalidHASeedSnapshotTopology;
         defer parsed.deinit();
         const topology = parsed.value;
-        if (topology.format_version != ha_seed_snapshot_format_version or
-            !std.mem.eql(u8, topology.generation, generation) or topology.replicas.len == 0)
-            return error.InvalidHASeedSnapshotTopology;
         antfly.hot_standby.seed_topology.validate(
             alloc,
             io,
@@ -7170,7 +7244,10 @@ pub const DataServer = struct {
         self.next_metadata_bootstrap_retry_at_ms = 0;
     }
 
-    fn deferMetadataBootstrapRetry(self: *DataServer, now_ms: u64) void {
+    fn deferMetadataBootstrapRetry(self: *DataServer) void {
+        // Metadata I/O may suspend longer than the entire backoff interval.
+        // Start the delay when the failure is observed, never at round entry.
+        const now_ms = self.backgroundMonotonicMs();
         lockAtomic(&self.metadata_bootstrap_retry_mutex);
         defer self.metadata_bootstrap_retry_mutex.unlock();
         self.metadata_bootstrap_retry_attempts = self.metadata_bootstrap_retry_attempts +| 1;
@@ -7182,15 +7259,15 @@ pub const DataServer = struct {
         self.next_metadata_bootstrap_retry_at_ms = now_ms +| delay_ms;
     }
 
-    fn recordMetadataBootstrapError(self: *DataServer, err: anyerror, now_ms: u64) !void {
+    fn recordMetadataBootstrapError(self: *DataServer, err: anyerror) !void {
         if (!isRetryableMetadataBootstrapError(err)) return err;
-        self.deferMetadataBootstrapRetry(now_ms);
+        self.deferMetadataBootstrapRetry();
     }
 
-    fn recordProvisionedRootRefreshMetadataError(self: *DataServer, err: anyerror, now_ms: u64) !void {
+    fn recordProvisionedRootRefreshMetadataError(self: *DataServer, err: anyerror) !void {
         if (!isRetryableMetadataBootstrapError(err)) return err;
         self.provisioned_root_refresh_dirty.store(true, .release);
-        self.deferMetadataBootstrapRetry(now_ms);
+        self.deferMetadataBootstrapRetry();
     }
 
     fn metadataBootstrapRetryAttemptsForTest(self: *DataServer) u32 {
@@ -7252,10 +7329,44 @@ pub const DataServer = struct {
     /// ownership rules.
     pub fn runStoreStatusRoundOnly(self: *DataServer) !void {
         if (self.remote_metadata == null or self.store_registration == null) return;
-        if (!self.store_registration_confirmed) try self.registerNodeIfConfigured();
-        _ = self.store_status_ticks.fetchAdd(1, .monotonic);
+        const now_ms = self.backgroundMonotonicMs();
+        if (!self.metadataBootstrapRetryDue(now_ms)) return;
+        if (!self.store_registration_confirmed) {
+            self.registerNodeIfConfigured() catch |err| {
+                try self.recordMetadataBootstrapError(err);
+                return;
+            };
+        }
         self.store_status_ticks.store(0, .release);
-        try self.reportStoreStatus();
+        try self.reportStoreStatusWithRetry(.full);
+    }
+
+    // Keep independently scheduled publication and the managed control loop
+    // on one error policy. A metadata election must yield to other owners
+    // until the shared retry deadline, while permanent failures still escape.
+    fn reportStoreStatusWithRetry(self: *DataServer, report_kind: StoreStatusReportKind) !void {
+        const result = switch (report_kind) {
+            .full => self.reportStoreStatus(),
+            .heartbeat => self.reportStoreStatusHeartbeat(),
+            .none => unreachable,
+        };
+        result catch |err| switch (err) {
+            // Split runtime can briefly observe placement before the
+            // local replica root is fully provisioned on disk.
+            error.LsmRootWriterAlreadyOpen,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.FileNotFound,
+            error.UnknownGroup,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            error.StaleLocalGroupStatusGeneration,
+            => {},
+            error.UnknownStore => {
+                self.store_registration_confirmed = false;
+                self.registerNodeIfConfigured() catch |register_err| try self.recordMetadataBootstrapError(register_err);
+            },
+            else => |retry_err| try self.recordMetadataBootstrapError(retry_err),
+        };
     }
 
     /// Schedules only the production maintenance lanes that can turn newly
@@ -7385,7 +7496,7 @@ pub const DataServer = struct {
                 const registration_ready = blk: {
                     if (!self.store_registration_confirmed) {
                         self.registerNodeIfConfigured() catch |err| {
-                            try self.recordMetadataBootstrapError(err, now_ms);
+                            try self.recordMetadataBootstrapError(err);
                             break :blk false;
                         };
                     }
@@ -7414,28 +7525,7 @@ pub const DataServer = struct {
                     );
                     if (report_kind != .none) {
                         self.store_status_ticks.store(0, .release);
-                        const result = switch (report_kind) {
-                            .full => self.reportStoreStatus(),
-                            .heartbeat => self.reportStoreStatusHeartbeat(),
-                            .none => unreachable,
-                        };
-                        result catch |err| switch (err) {
-                            // Split runtime can briefly observe placement before the
-                            // local replica root is fully provisioned on disk.
-                            error.LsmRootWriterAlreadyOpen,
-                            error.PersistentDescriptorAdmissionExhausted,
-                            error.FileNotFound,
-                            error.UnknownGroup,
-                            error.LmdbUnexpected,
-                            error.Corrupted,
-                            error.StaleLocalGroupStatusGeneration,
-                            => {},
-                            error.UnknownStore => {
-                                self.store_registration_confirmed = false;
-                                self.registerNodeIfConfigured() catch |register_err| try self.recordMetadataBootstrapError(register_err, now_ms);
-                            },
-                            else => |retry_err| try self.recordMetadataBootstrapError(retry_err, now_ms),
-                        };
+                        try self.reportStoreStatusWithRetry(report_kind);
                     }
                 }
 
@@ -7454,7 +7544,7 @@ pub const DataServer = struct {
                             error.LmdbUnexpected,
                             error.Corrupted,
                             => {},
-                            else => |retry_err| try self.recordProvisionedRootRefreshMetadataError(retry_err, now_ms),
+                            else => |retry_err| try self.recordProvisionedRootRefreshMetadataError(retry_err),
                         };
                     }
                 }
@@ -7559,6 +7649,10 @@ pub const DataServer = struct {
         self.write_source.quiesce();
         if (self.data_raft_apply) |apply_sm| apply_sm.write_source.quiesce();
         self.provisioned_storage.detachWriteSourceRuntimeHooks();
+        if (comptime linked_storage) {
+            if (self.kernel_owner_source) |owner_source|
+                try owner_source.quiesce(self.dataRaftIo() orelse std.Io.Threaded.global_single_threaded.io());
+        }
         try self.provisioned_storage.quiesceExternalProviderUsers();
         self.external_provider_users_quiesced = true;
     }
@@ -7585,11 +7679,9 @@ pub const DataServer = struct {
         // Safe only now: every replication round has been quiesced above, so
         // no in-flight round can still hold an unlocked copy of a retired
         // upstream/slot pair. See `ha_standby_upstream_retired`.
-        if (self.ha_cfg.standby_replication) |cfg| {
-            if (self.ha_standby_upstream_swapped) {
-                self.alloc.free(@constCast(cfg.upstream_base_uri));
-                self.alloc.free(@constCast(cfg.slot_name));
-            }
+        if (self.ha_standby_upstream_owned) |owned| {
+            self.alloc.free(owned.upstream_url);
+            self.alloc.free(owned.slot_name);
         }
         for (self.ha_standby_upstream_retired.items) |retired| {
             self.alloc.free(retired.upstream_url);
@@ -7995,12 +8087,13 @@ pub const DataServer = struct {
     fn lsmMaintenanceWorkerMain(self: *DataServer) void {
         var consecutive_lock_deferrals: usize = 0;
         while (!self.lsm_maintenance_stop.load(.acquire)) {
-            const woke = self.lsm_maintenance_wake.swap(false, .acq_rel);
             const now_ns = self.backgroundMonotonicNs();
             if (now_ns < self.lsm_maintenance_next_eligible_ns.load(.monotonic)) {
                 self.sleepLsmMaintenanceWorker();
                 continue;
             }
+            // Consume accepted work only when its retry boundary is eligible.
+            const woke = self.lsm_maintenance_wake.swap(false, .acq_rel);
             if (!woke and !self.backgroundMaintenanceDue(now_ns)) {
                 self.sleepLsmMaintenanceWorker();
                 continue;
@@ -8015,7 +8108,7 @@ pub const DataServer = struct {
             // allocation-accounted build lane, and commonly frees a larger
             // decoded-vector cache when it publishes. Attempt it before the
             // soft-pressure gate that protects optional LSM maintenance.
-            const vector_now_ns = platform_time.monotonicNs();
+            const vector_now_ns = self.backgroundMonotonicNs();
             if (self.vectorBlockMaintenanceDue(vector_now_ns)) {
                 // Projection publication is part of dense-index readiness.
                 // Invalidate the cached status before entering a potentially
@@ -8155,11 +8248,22 @@ pub const DataServer = struct {
                 self.dense_posting_maintenance_next_eligible_ns.store(posting_now_ns +| next_delay_ns, .release);
                 if (posting.repaired > 0) {
                     std.log.info("dense posting maintenance repaired steps={d} scanned={d} pending={}", .{ posting.repaired, posting.scanned, posting.pending });
+                }
+                // A read-only sweep can certify refresh completion without
+                // repairing anything (especially after reopen). Publish that
+                // status transition too; certified idle rounds scan zero rows.
+                if (posting.repaired > 0 or posting.scanned > 0) {
                     self.runtime_status_dirty.store(true, .release);
                     self.markStoreStatusDirtyImmediate();
                 }
             }
             self.lsm_maintenance_active.store(false, .release);
+            // Due hints and pending wakes are advisory: a selected round can
+            // still make no progress or fail admission. Bound the outer loop
+            // as well as its inner batch so clocks, cancellation, and other
+            // owners can run before the next attempt. The iteration releases
+            // its reservation before the next loop sleeps on this deadline.
+            self.deferLsmMaintenance(self.backgroundMonotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
         }
         self.lsm_maintenance_active.store(false, .release);
     }
@@ -12576,10 +12680,10 @@ pub const DataServer = struct {
         );
         const metadata: antfly.public_api.table_writes.StartupCatchUpMetadata = .{
             .indexes_json = table_contract.indexes_json,
-            .schema_json = if (table_contract.schema_json.len == 0)
-                null
-            else
-                table_contract.schema_json,
+            // A transition carries a complete table contract. Its empty
+            // schema denotes the default schema, not permission to omit the
+            // durable manifest required by subsequent catalog-free Raft apply.
+            .schema_json = antfly.public_api.tables.effectiveSchemaJson(table_contract.schema_json),
             .identity_namespace = identity_namespace,
             .identity_validation = identity_validation,
         };
@@ -12849,10 +12953,7 @@ pub const DataServer = struct {
                     null
                 else
                     table_contract.indexes_json,
-                .schema_json = if (table_contract.schema_json.len == 0)
-                    null
-                else
-                    table_contract.schema_json,
+                .schema_json = antfly.public_api.tables.effectiveSchemaJson(table_contract.schema_json),
                 .identity_namespace = identityNamespaceFromTransitionContract(
                     table_contract,
                     .source,
@@ -18376,8 +18477,7 @@ pub const DataServer = struct {
         defer self.provisioned_root_refresh_last_duration_ns.store(self.backgroundMonotonicNs() -| started_ns, .monotonic);
 
         self.refreshProvisionedReplicaRoot() catch |err| {
-            const now_ms = self.backgroundMonotonicMs();
-            self.recordProvisionedRootRefreshMetadataError(err, now_ms) catch {
+            self.recordProvisionedRootRefreshMetadataError(err) catch {
                 self.provisioned_root_refresh_dirty.store(true, .release);
             };
             _ = self.provisioned_root_refresh_failed.fetchAdd(1, .monotonic);
@@ -19799,10 +19899,30 @@ const RemoteMetadataSource = struct {
         snapshot: antfly.metadata_api.AdminSnapshot,
         ticket: LinearizableSnapshotTicket,
     ) !LinearizableSnapshotAcceptance {
+        return self.acceptLinearizableSnapshotWithBudget(snapshot, ticket, .{}, null);
+    }
+
+    fn acceptLinearizableSnapshotWithBudget(
+        self: *RemoteMetadataSource,
+        snapshot: antfly.metadata_api.AdminSnapshot,
+        ticket: LinearizableSnapshotTicket,
+        request: antfly.public_api.operation.RequestContext,
+        budget: ?antfly.metadata_http_client.RequestBudget,
+    ) !LinearizableSnapshotAcceptance {
         const incarnation = try requireValidMetadataIncarnation(snapshot.status.metadata_incarnation);
         const now_ms = self.awakeMs();
         var retired_snapshot: ?antfly.metadata_api.AdminSnapshot = null;
         lockAtomic(&self.cache_mutex);
+        request.ensureActive() catch |err| {
+            self.cache_mutex.unlock();
+            return err;
+        };
+        if (budget) |value| {
+            if (value.nowNs() >= value.deadline_ns) {
+                self.cache_mutex.unlock();
+                return error.MetadataLinearizableReadTimeout;
+            }
+        }
         if (self.snapshot_invalidation_generation != ticket.invalidation_generation) {
             self.cache_mutex.unlock();
             return error.MetadataSnapshotHeadMismatch;
@@ -20230,7 +20350,15 @@ const RemoteMetadataSource = struct {
     ) !?antfly.metadata_api.AdminSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         try request.ensureActive();
-        const now_ns = self.awakeNs();
+        const deadline_borrow = if (request.deadline_ns != null) request.deadline_io else null;
+        var deadline_receiver = if (deadline_borrow) |borrow| try borrow.receive() else null;
+        const deadline_io: ?std.Io = if (deadline_receiver) |*receiver|
+            receiver.io()
+        else if (request.deadline_ns != null)
+            null
+        else
+            self.io;
+        const now_ns = (antfly.metadata_http_client.RequestBudget{ .deadline_ns = 0, .io = deadline_io }).nowNs();
         const local_deadline = now_ns +| remote_metadata_linearizable_snapshot_timeout_ns;
         const deadline_ns = if (request.deadline_ns) |request_deadline|
             @min(local_deadline, request_deadline)
@@ -20244,7 +20372,7 @@ const RemoteMetadataSource = struct {
         const budget = antfly.metadata_http_client.RequestBudget{
             .deadline_ns = deadline_ns,
             .cancellation = &transport_cancellation,
-            .io = self.io,
+            .io = deadline_io,
         };
         var last_err: anyerror = error.MissingMetadataApi;
         var unsupported_count: usize = 0;
@@ -20273,7 +20401,7 @@ const RemoteMetadataSource = struct {
                     }
                     if (err == error.Timeout) {
                         if (request.deadline_ns) |request_deadline| {
-                            if (self.awakeNs() >= request_deadline) return error.DeadlineExceeded;
+                            if (budget.nowNs() >= request_deadline) return error.DeadlineExceeded;
                         }
                         return error.MetadataLinearizableReadTimeout;
                     }
@@ -20296,17 +20424,23 @@ const RemoteMetadataSource = struct {
                     last_err = err;
                     continue :endpoint_attempts;
                 };
-                var cache_ownership_transferred = false;
-                defer if (!cache_ownership_transferred) freeAdminSnapshotOwned(self.alloc, &cached);
-                const acceptance = self.acceptLinearizableSnapshot(cached, ticket) catch |err| {
+                var cached_owned = true;
+                defer if (cached_owned) freeAdminSnapshotOwned(self.alloc, &cached);
+                try request.ensureActive();
+                if (budget.nowNs() >= deadline_ns) return error.MetadataLinearizableReadTimeout;
+                const acceptance = self.acceptLinearizableSnapshotWithBudget(cached, ticket, request, budget) catch |err| {
+                    if (err == error.Canceled or err == error.DeadlineExceeded or err == error.MetadataLinearizableReadTimeout) return err;
                     if (err == error.MetadataSnapshotHeadMismatch and snapshot_attempt == 0) {
                         continue :snapshot_attempts;
                     }
                     last_err = err;
                     continue :endpoint_attempts;
                 };
-                cache_ownership_transferred = acceptance == .published;
+                if (acceptance == .superseded) freeAdminSnapshotOwned(self.alloc, &cached);
+                cached_owned = false;
                 self.noteMetadataReadSuccess(index);
+                try request.ensureActive();
+                if (budget.nowNs() >= deadline_ns) return error.MetadataLinearizableReadTimeout;
                 result_owned = false;
                 return result;
             }
@@ -22396,7 +22530,7 @@ fn hasSingleRoleStore(
 ) bool {
     var matching_store_id: ?u64 = null;
     for (stores) |store| {
-        if (!std.mem.eql(u8, store.role, role)) continue;
+        if (!std.mem.eql(u8, store.role, role)) return false;
         if (matching_store_id == null) {
             matching_store_id = store.store_id;
             continue;
@@ -26776,6 +26910,24 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "data ownership fallback requires a single store across all roles" {
+            const stores = [_]antfly.metadata.table_manager.StoreRecord{
+                .{ .store_id = 1, .node_id = 1, .role = "hot" },
+                .{ .store_id = 2, .node_id = 2, .role = "cold" },
+            };
+            std.debug.print("DATA_OWNERSHIP_FALLBACK excludes cross-role stores\n", .{});
+            try std.testing.expect(!hasSingleRoleStore(&stores, "hot", 1));
+            try std.testing.expect(!hasSingleRoleStore(&stores, "cold", 2));
+            try std.testing.expect(hasSingleRoleStore(stores[0..1], "hot", 1));
+            try std.testing.expect(!hasSingleRoleStore(stores[0..1], "cold", 1));
+            try std.testing.expect(!hasSingleRoleStore(stores[0..1], "hot", 2));
+            try std.testing.expect(!hasSingleRoleStore(&.{}, "hot", 1));
+
+            var same_role = stores;
+            same_role[1].role = "hot";
+            try std.testing.expect(!hasSingleRoleStore(&same_role, "hot", 1));
+        }
+
         test "data raft stable placement refreshes changed peer transport endpoints" {
             const alloc = std.testing.allocator;
 
@@ -27681,6 +27833,10 @@ fn consumerTests() type {
                 error.ConnectionRefused,
                 error.BrokenPipe,
                 error.EndOfStream,
+                error.InvalidResponse,
+                error.InvalidSocketOption,
+                error.RecvFailed,
+                error.SendFailed,
                 error.NoAddressReturned,
                 error.Timeout,
                 error.ConnectionTimedOut,
@@ -34587,7 +34743,7 @@ fn consumerTests() type {
                 defer unconfigured.deinit();
                 try std.testing.expectError(
                     error.HAStandbyNotConfigured,
-                    unconfigured.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-a", identity),
+                    unconfigured.setHAStandbyUpstream("http://primary-b.internal.test", "standby-a", identity),
                 );
             }
 
@@ -34606,7 +34762,7 @@ fn consumerTests() type {
                 defer promoted.deinit();
                 try std.testing.expectError(
                     error.HAStandbyAlreadyPromoted,
-                    promoted.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-a", identity),
+                    promoted.setHAStandbyUpstream("http://primary-b.internal.test", "standby-a", identity),
                 );
             }
 
@@ -34616,18 +34772,20 @@ fn consumerTests() type {
             wrong_identity.shard_id = identity.shard_id + 1;
             try std.testing.expectError(
                 error.WrongShard,
-                server.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-a", wrong_identity),
+                server.setHAStandbyUpstream("http://primary-b.internal.test", "standby-a", wrong_identity),
             );
 
             // Idempotent retry: requesting the already-effective upstream and
             // slot reports changed=false without mutating anything.
-            const unchanged = try server.setHAStandbyUpstream(alloc, "http://primary-a.internal.test", "standby-a", identity);
+            const unchanged = try server.setHAStandbyUpstream("http://primary-a.internal.test", "standby-a", identity);
             try std.testing.expect(!unchanged.changed);
             try std.testing.expectEqualStrings("http://primary-a.internal.test", server.ha_cfg.standby_replication.?.upstream_base_uri);
 
             // A real swap changes the URL/slot the next replication round
             // will use and reports the previous pair.
-            const swapped = try server.setHAStandbyUpstream(alloc, "http://primary-b.internal.test", "standby-b", identity);
+            // The HTTP allocator may differ from the server owner and must
+            // never own strings retained beyond this callback.
+            const swapped = try DataServer.setHAStandbyUpstreamCallback(&server, std.testing.failing_allocator, "http://primary-b.internal.test", "standby-b", identity);
             try std.testing.expect(swapped.changed);
             try std.testing.expectEqualStrings("http://primary-a.internal.test", swapped.previous.?.upstream_url);
             try std.testing.expectEqualStrings("standby-a", swapped.previous.?.slot_name);
@@ -34637,10 +34795,17 @@ fn consumerTests() type {
             // A second swap must retire (not free) the first swap's owned
             // strings, since a round may still be reading them; see
             // `ha_standby_upstream_retired`.
-            const swapped_again = try server.setHAStandbyUpstream(alloc, "http://primary-c.internal.test", "standby-c", identity);
+            const swapped_again = try server.setHAStandbyUpstream("http://primary-c.internal.test", "standby-c", identity);
             try std.testing.expect(swapped_again.changed);
             try std.testing.expectEqualStrings("http://primary-b.internal.test", swapped_again.previous.?.upstream_url);
             try std.testing.expectEqual(@as(usize, 1), server.ha_standby_upstream_retired.items.len);
+
+            // Promotion clears the active replication config. Both current
+            // and retired strings must remain live until server teardown;
+            // the testing allocator also checks that teardown frees them.
+            server.ha_cfg.standby_replication = null;
+            try std.testing.expectEqualStrings("http://primary-c.internal.test", server.ha_standby_upstream_owned.?.upstream_url);
+            try std.testing.expectEqualStrings("http://primary-b.internal.test", swapped_again.previous.?.upstream_url);
         }
 
         test "data server resumes HA standby replication from durable progress after restart" {
@@ -35346,6 +35511,486 @@ fn consumerTests() type {
             try std.testing.expect(server.backgroundMaintenanceDue(100));
             try std.testing.expect(server.backgroundMaintenanceDue(101));
             try std.testing.expect(!server.backgroundMaintenanceDue(99));
+        }
+
+        const SnapshotDeadlineTest = struct {
+            const VoprIo = @import("vopr").vopr_io.VoprIo;
+            const RequestContext = antfly.public_api.operation.RequestContext;
+            const Mutation = struct {
+                phase: enum { none, allocate, free } = .none,
+                clock: ?*VoprIo = null,
+                advance_ns: u64 = 0,
+                cancellation: ?*std.atomic.Value(bool) = null,
+                fired: bool = false,
+                advance_failed: bool = false,
+                publication_clock: ?*SnapshotPublicationClock = null,
+
+                fn fire(self: *@This(), phase: @TypeOf(self.phase)) void {
+                    if (self.phase != phase or self.fired) return;
+                    self.fired = true;
+                    if (self.publication_clock) |clock| clock.armed = true;
+                    if (self.clock) |clock| clock.advance(self.advance_ns) catch {
+                        self.advance_failed = true;
+                    };
+                    if (self.cancellation) |signal| signal.store(true, .release);
+                }
+            };
+
+            const ActivityAllocator = struct {
+                inner: std.mem.Allocator = std.testing.allocator,
+                mutation: Mutation = .{},
+
+                fn allocator(self: *@This()) std.mem.Allocator {
+                    return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+                }
+                fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.mutation.fire(.allocate);
+                    return self.inner.rawAlloc(len, alignment, ret_addr);
+                }
+                fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    return self.inner.rawResize(memory, alignment, len, ret_addr);
+                }
+                fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    return self.inner.rawRemap(memory, alignment, len, ret_addr);
+                }
+                fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.mutation.fire(.free);
+                    self.inner.rawFree(memory, alignment, ret_addr);
+                }
+            };
+
+            calls: usize = 0,
+            timeout_ms: ?u32 = null,
+            clock: ?*VoprIo = null,
+            advance_ns: u64 = 0,
+            cancellation: ?*std.atomic.Value(bool) = null,
+            injected_error: ?anyerror = null,
+            activity_allocator: ?*ActivityAllocator = null,
+            clone_mutation: Mutation = .{},
+            supersede_source: ?*RemoteMetadataSource = null,
+
+            fn snapshot(epoch: u64) antfly.metadata_api.AdminSnapshot {
+                return .{
+                    .status = .{
+                        .metadata_group_id = 9,
+                        .metadata_incarnation = .{'1'} ** 32,
+                        .metadata_epoch = epoch,
+                        .metadata_raft_role = "leader",
+                        .metrics = .{},
+                    },
+                    .tables = &.{},
+                    .ranges = &.{},
+                    .stores = &.{},
+                    .placement_intents = &.{},
+                    .split_transitions = &.{},
+                    .merge_transitions = &.{},
+                };
+            }
+
+            fn initSource(self: *@This(), allocator: std.mem.Allocator, io: std.Io) !RemoteMetadataSource {
+                var source = try RemoteMetadataSource.initWithRequestExecutors(allocator, &.{"http://metadata.invalid"}, &.{.{
+                    .ptr = self,
+                    .vtable = &.{ .execute = execute },
+                }}, io);
+                errdefer source.deinit();
+                try source.acceptMetadataIdentity(9, .{'1'} ** 32);
+                source.cached_snapshot = try cloneAdminSnapshotOwned(allocator, snapshot(7));
+                source.cached_snapshot_at_ms = 1;
+                return source;
+            }
+
+            fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (request.method != .POST or !std.mem.endsWith(u8, request.uri, "/internal/v1/catalog/linearizable-snapshot"))
+                    return error.UnexpectedSnapshotDeadlineRequest;
+                self.calls += 1;
+                self.timeout_ms = request.timeout_ms;
+                if (self.clock) |clock| try clock.advance(self.advance_ns);
+                if (self.cancellation) |signal| {
+                    signal.store(true, .release);
+                    if (!(request.cancellation orelse return error.MissingSnapshotCancellation).isCancelled())
+                        return error.SnapshotCancellationNotForwarded;
+                }
+                if (self.injected_error) |err| return err;
+                if (self.supersede_source) |source| {
+                    const ticket = source.beginLinearizableSnapshot();
+                    var newer = try cloneAdminSnapshotOwned(source.alloc, snapshot(9));
+                    var newer_owned = true;
+                    defer if (newer_owned) freeAdminSnapshotOwned(source.alloc, &newer);
+                    const acceptance = try source.acceptLinearizableSnapshot(newer, ticket);
+                    newer_owned = acceptance != .published;
+                    try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, acceptance);
+                }
+                const body = try std.json.Stringify.valueAlloc(allocator, snapshot(8), .{});
+                if (self.activity_allocator) |owner| owner.mutation = self.clone_mutation;
+                return .{ .status = 200, .body = body };
+            }
+
+            fn expectUnpublished(source: *RemoteMetadataSource) !void {
+                try std.testing.expectEqual(@as(u64, 7), source.cached_snapshot.?.status.metadata_epoch);
+                try std.testing.expectEqual(@as(u64, 1), source.cached_snapshot_at_ms);
+                try std.testing.expectEqual(@as(u64, 0), source.snapshot_fence_generation);
+                try std.testing.expectEqual(@as(u64, 0), source.published_linearizable_snapshot_sequence);
+            }
+
+            fn expectErrorOwned(source: *RemoteMetadataSource, request: RequestContext, expected: anyerror, marker: []const u8) !void {
+                const result = RemoteMetadataSource.remoteLinearizableSnapshot(source, request);
+                defer if (result) |optional| {
+                    if (optional) |value| {
+                        var owned = value;
+                        freeAdminSnapshotOwned(source.alloc, &owned);
+                    }
+                } else |_| {};
+                std.debug.print("\nSNAPSHOT_DEADLINE_RED {s}\n", .{marker});
+                try std.testing.expectError(expected, result);
+            }
+
+            fn distinctClock(source_seconds: u64) !void {
+                var source_clock = try VoprIo.init(.{ .monotonic_ns = @intCast(source_seconds * std.time.ns_per_s) });
+                defer source_clock.deinit();
+                var caller_clock = try VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+                defer caller_clock.deinit();
+                const caller_io = caller_clock.io();
+                var fixture: SnapshotDeadlineTest = .{};
+                var source = try fixture.initSource(std.testing.allocator, source_clock.io());
+                defer source.deinit();
+                std.debug.print("\nSNAPSHOT_DEADLINE_RED distinct source_seconds={d} caller_seconds=10 budget_ms=10\n", .{source_seconds});
+                var result = (try RemoteMetadataSource.remoteLinearizableSnapshot(&source, .{
+                    .deadline_ns = 10 * std.time.ns_per_s + 10 * std.time.ns_per_ms,
+                    .deadline_io = runtime_io_abi.Borrow.init(&caller_io),
+                })) orelse return error.ExpectedLinearizableSnapshot;
+                defer freeAdminSnapshotOwned(source.alloc, &result);
+                try std.testing.expectEqual(@as(?u32, 10), fixture.timeout_ms);
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+                try std.testing.expectEqual(@as(u64, 8), result.status.metadata_epoch);
+                try std.testing.expectEqual(@as(u64, 8), source.cached_snapshot.?.status.metadata_epoch);
+            }
+
+            fn cloneActivity(kind: enum { deadline, cancellation, local_timeout, after_publication }) !void {
+                var source_clock = try VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+                defer source_clock.deinit();
+                const caller_io = source_clock.io();
+                var signal = std.atomic.Value(bool).init(false);
+                var owner: ActivityAllocator = .{};
+                var fixture: SnapshotDeadlineTest = .{
+                    .activity_allocator = &owner,
+                    .clone_mutation = .{
+                        .phase = if (kind == .after_publication) .free else .allocate,
+                        .clock = if (kind == .deadline or kind == .local_timeout) &source_clock else null,
+                        .advance_ns = if (kind == .local_timeout) remote_metadata_linearizable_snapshot_timeout_ns + 1 else 20 * std.time.ns_per_ms,
+                        .cancellation = if (kind == .cancellation or kind == .after_publication) &signal else null,
+                    },
+                };
+                var source = try fixture.initSource(owner.allocator(), source_clock.io());
+                defer source.deinit();
+                const request: RequestContext = .{
+                    .deadline_ns = if (kind == .local_timeout) null else 10 * std.time.ns_per_s + 10 * std.time.ns_per_ms,
+                    .deadline_io = if (kind == .local_timeout) null else runtime_io_abi.Borrow.init(&caller_io),
+                    .cancellation = .fromAtomic(&signal),
+                };
+                const result = RemoteMetadataSource.remoteLinearizableSnapshot(&source, request);
+                defer if (result) |optional| {
+                    if (optional) |value| {
+                        var owned = value;
+                        freeAdminSnapshotOwned(source.alloc, &owned);
+                    }
+                } else |_| {};
+                try std.testing.expect(owner.mutation.fired);
+                try std.testing.expect(!owner.mutation.advance_failed);
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+                const expected: anyerror = switch (kind) {
+                    .deadline => error.DeadlineExceeded,
+                    .local_timeout => error.MetadataLinearizableReadTimeout,
+                    .cancellation, .after_publication => error.Canceled,
+                };
+                std.debug.print("\nSNAPSHOT_DEADLINE_RED clone_activity={s} expects={s}\n", .{ @tagName(kind), @errorName(expected) });
+                try std.testing.expectError(expected, result);
+                if (kind == .after_publication) {
+                    try std.testing.expectEqual(@as(u64, 8), source.cached_snapshot.?.status.metadata_epoch);
+                    try std.testing.expectEqual(@as(u64, 1), source.snapshot_fence_generation);
+                } else try expectUnpublished(&source);
+            }
+        };
+
+        test "remote metadata deadline preserves a caller clock ahead of source" {
+            try SnapshotDeadlineTest.distinctClock(2);
+        }
+
+        test "remote metadata deadline preserves a caller clock behind source" {
+            try SnapshotDeadlineTest.distinctClock(100);
+        }
+
+        test "remote metadata deadline preserves an explicit clockless platform budget" {
+            var source_clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 2 * std.time.ns_per_s });
+            defer source_clock.deinit();
+            var fixture: SnapshotDeadlineTest = .{};
+            var source = try fixture.initSource(std.testing.allocator, source_clock.io());
+            defer source.deinit();
+            var result = (try RemoteMetadataSource.remoteLinearizableSnapshot(&source, .{
+                .deadline_ns = platform_time.monotonicNs() +| 500 * std.time.ns_per_ms,
+            })) orelse return error.ExpectedLinearizableSnapshot;
+            defer freeAdminSnapshotOwned(source.alloc, &result);
+            std.debug.print("\nSNAPSHOT_DEADLINE_RED clockless expects_http_timeout_le_500 actual={?d}\n", .{fixture.timeout_ms});
+            try std.testing.expect(fixture.timeout_ms.? > 0 and fixture.timeout_ms.? <= 500);
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            try std.testing.expectEqual(@as(u64, 8), result.status.metadata_epoch);
+        }
+
+        test "remote metadata deadline expires in the caller clock during the response" {
+            var source_clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 2 * std.time.ns_per_s });
+            defer source_clock.deinit();
+            var caller_clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+            defer caller_clock.deinit();
+            const caller_io = caller_clock.io();
+            var fixture: SnapshotDeadlineTest = .{ .clock = &caller_clock, .advance_ns = 20 * std.time.ns_per_ms };
+            var source = try fixture.initSource(std.testing.allocator, source_clock.io());
+            defer source.deinit();
+            try SnapshotDeadlineTest.expectErrorOwned(&source, .{
+                .deadline_ns = 10 * std.time.ns_per_s + 10 * std.time.ns_per_ms,
+                .deadline_io = runtime_io_abi.Borrow.init(&caller_io),
+            }, error.DeadlineExceeded, "response_expiry expects=DeadlineExceeded");
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            try SnapshotDeadlineTest.expectUnpublished(&source);
+        }
+
+        test "remote metadata deadline classifies transport timeout in the caller clock" {
+            var source_clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 2 * std.time.ns_per_s });
+            defer source_clock.deinit();
+            var caller_clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+            defer caller_clock.deinit();
+            const caller_io = caller_clock.io();
+            var fixture: SnapshotDeadlineTest = .{
+                .clock = &caller_clock,
+                .advance_ns = 20 * std.time.ns_per_ms,
+                .injected_error = error.Timeout,
+            };
+            var source = try fixture.initSource(std.testing.allocator, source_clock.io());
+            defer source.deinit();
+            try SnapshotDeadlineTest.expectErrorOwned(&source, .{
+                .deadline_ns = 10 * std.time.ns_per_s + 10 * std.time.ns_per_ms,
+                .deadline_io = runtime_io_abi.Borrow.init(&caller_io),
+            }, error.DeadlineExceeded, "transport_timeout expects=DeadlineExceeded");
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            try SnapshotDeadlineTest.expectUnpublished(&source);
+        }
+
+        test "remote metadata deadline rejects expiry during owned snapshot cloning" {
+            try SnapshotDeadlineTest.cloneActivity(.deadline);
+        }
+
+        test "remote metadata deadline rejects cancellation during owned snapshot cloning" {
+            try SnapshotDeadlineTest.cloneActivity(.cancellation);
+        }
+
+        test "remote metadata deadline enforces its local cap during owned snapshot cloning" {
+            try SnapshotDeadlineTest.cloneActivity(.local_timeout);
+        }
+
+        test "remote metadata deadline rechecks cancellation after authoritative publication" {
+            try SnapshotDeadlineTest.cloneActivity(.after_publication);
+        }
+
+        test "remote metadata deadline rejects inactive calls before dispatch" {
+            var clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+            defer clock.deinit();
+            const io = clock.io();
+            var fixture: SnapshotDeadlineTest = .{};
+            var source = try fixture.initSource(std.testing.allocator, io);
+            defer source.deinit();
+            try std.testing.expectError(error.DeadlineExceeded, RemoteMetadataSource.remoteLinearizableSnapshot(&source, .{
+                .deadline_ns = 10 * std.time.ns_per_s,
+                .deadline_io = runtime_io_abi.Borrow.init(&io),
+            }));
+            var signal = std.atomic.Value(bool).init(true);
+            try std.testing.expectError(error.Canceled, RemoteMetadataSource.remoteLinearizableSnapshot(&source, .{
+                .deadline_ns = 10 * std.time.ns_per_s,
+                .deadline_io = runtime_io_abi.Borrow.init(&io),
+                .cancellation = .fromAtomic(&signal),
+            }));
+            try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+            try SnapshotDeadlineTest.expectUnpublished(&source);
+        }
+
+        test "remote metadata deadline forwards cancellation into an active response" {
+            var clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+            defer clock.deinit();
+            var signal = std.atomic.Value(bool).init(false);
+            var fixture: SnapshotDeadlineTest = .{ .cancellation = &signal };
+            var source = try fixture.initSource(std.testing.allocator, clock.io());
+            defer source.deinit();
+            try SnapshotDeadlineTest.expectErrorOwned(&source, .{
+                .cancellation = .fromAtomic(&signal),
+            }, error.Canceled, "control_active_cancellation");
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            try SnapshotDeadlineTest.expectUnpublished(&source);
+        }
+
+        test "remote metadata deadline retains the source clock without a caller budget" {
+            var clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 100 * std.time.ns_per_s });
+            defer clock.deinit();
+            var fixture: SnapshotDeadlineTest = .{};
+            var source = try fixture.initSource(std.testing.allocator, clock.io());
+            defer source.deinit();
+            var result = (try RemoteMetadataSource.remoteLinearizableSnapshot(&source, .{})) orelse return error.ExpectedLinearizableSnapshot;
+            defer freeAdminSnapshotOwned(source.alloc, &result);
+            try std.testing.expectEqual(@as(?u32, 10_000), fixture.timeout_ms);
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            try std.testing.expectEqual(@as(u64, 8), source.cached_snapshot.?.status.metadata_epoch);
+        }
+
+        const SnapshotPublicationClock = struct {
+            clock: SnapshotDeadlineTest.VoprIo,
+            base_io: std.Io = undefined,
+            vtable: std.Io.VTable = undefined,
+            armed: bool = false,
+            entered: std.atomic.Value(bool) = .init(false),
+            release: std.atomic.Value(bool) = .init(false),
+            departed: std.atomic.Value(bool) = .init(false),
+            wait_failed: std.atomic.Value(bool) = .init(false),
+
+            fn io(self: *@This()) std.Io {
+                self.base_io = self.clock.io();
+                self.vtable = self.base_io.vtable.*;
+                self.vtable.now = now;
+                return .{ .userdata = self.base_io.userdata, .vtable = &self.vtable };
+            }
+
+            fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+                const clock_ptr: *SnapshotDeadlineTest.VoprIo = @ptrCast(@alignCast(userdata.?));
+                const self: *@This() = @fieldParentPtr("clock", clock_ptr);
+                const timestamp = self.base_io.vtable.now(userdata, clock);
+                if (self.armed and !self.entered.load(.acquire)) {
+                    self.entered.store(true, .release);
+                    wait(&self.release) catch self.wait_failed.store(true, .release);
+                    self.departed.store(true, .release);
+                }
+                return timestamp;
+            }
+
+            fn wait(signal: *const std.atomic.Value(bool)) !void {
+                const watchdog = platform_time.monotonicNs() +| 2 * std.time.ns_per_s;
+                while (!signal.load(.acquire)) {
+                    if (platform_time.monotonicNs() >= watchdog) return error.SnapshotPublicationHandshakeTimeout;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
+            }
+
+            fn publicationActivity(cancel: bool) !void {
+                var source_clock: @This() = .{ .clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s }) };
+                defer source_clock.clock.deinit();
+                var caller_clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+                defer caller_clock.deinit();
+                const caller_io = caller_clock.io();
+                var cancellation = std.atomic.Value(bool).init(false);
+                var owner: SnapshotDeadlineTest.ActivityAllocator = .{};
+                var fixture: SnapshotDeadlineTest = .{
+                    .activity_allocator = &owner,
+                    .clone_mutation = .{ .phase = .allocate, .publication_clock = &source_clock },
+                };
+                var source = try fixture.initSource(owner.allocator(), source_clock.io());
+                defer source.deinit();
+                const Worker = struct {
+                    source: *RemoteMetadataSource,
+                    request: SnapshotDeadlineTest.RequestContext,
+                    result: anyerror!?antfly.metadata_api.AdminSnapshot = error.SnapshotPublicationWorkerNotRun,
+
+                    fn run(self: *@This()) void {
+                        self.result = RemoteMetadataSource.remoteLinearizableSnapshot(self.source, self.request);
+                    }
+                };
+                var worker: Worker = .{
+                    .source = &source,
+                    .request = .{
+                        .deadline_ns = 10 * std.time.ns_per_s + 10 * std.time.ns_per_ms,
+                        .deadline_io = runtime_io_abi.Borrow.init(&caller_io),
+                        .cancellation = .fromAtomic(&cancellation),
+                    },
+                };
+                var task = try std.testing.io.concurrent(Worker.run, .{&worker});
+                var joined = false;
+                var cache_locked = false;
+                defer {
+                    source_clock.release.store(true, .release);
+                    if (cache_locked) source.cache_mutex.unlock();
+                    if (!joined) task.await(std.testing.io);
+                    if (worker.result) |optional| {
+                        if (optional) |value| {
+                            var owned = value;
+                            freeAdminSnapshotOwned(source.alloc, &owned);
+                        }
+                    } else |_| {}
+                }
+                try wait(&source_clock.entered);
+                try std.testing.expect(source.cache_mutex.tryLock());
+                cache_locked = true;
+                source_clock.release.store(true, .release);
+                try wait(&source_clock.departed);
+                if (cancel) cancellation.store(true, .release) else try caller_clock.advance(20 * std.time.ns_per_ms);
+                source.cache_mutex.unlock();
+                cache_locked = false;
+                task.await(std.testing.io);
+                joined = true;
+                try std.testing.expect(!source_clock.wait_failed.load(.acquire));
+                try std.testing.expect(owner.mutation.fired);
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+                const expected: anyerror = if (cancel) error.Canceled else error.DeadlineExceeded;
+                std.debug.print("\nSNAPSHOT_DEADLINE_RED publication_lock={s} expects={s} cache_epoch=7\n", .{ if (cancel) "cancellation" else "deadline", @errorName(expected) });
+                try std.testing.expectError(expected, worker.result);
+                try SnapshotDeadlineTest.expectUnpublished(&source);
+            }
+        };
+
+        test "remote metadata deadline rejects cancellation at publication lock admission" {
+            try SnapshotPublicationClock.publicationActivity(true);
+        }
+
+        test "remote metadata deadline rejects expiry at publication lock admission" {
+            try SnapshotPublicationClock.publicationActivity(false);
+        }
+
+        test "remote metadata deadline rechecks cancellation after superseded clone cleanup" {
+            var clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+            defer clock.deinit();
+            var cancellation = std.atomic.Value(bool).init(false);
+            var owner: SnapshotDeadlineTest.ActivityAllocator = .{};
+            var fixture: SnapshotDeadlineTest = .{
+                .activity_allocator = &owner,
+                .clone_mutation = .{ .phase = .free, .cancellation = &cancellation },
+            };
+            var source = try fixture.initSource(owner.allocator(), clock.io());
+            defer source.deinit();
+            fixture.supersede_source = &source;
+            try SnapshotDeadlineTest.expectErrorOwned(&source, .{
+                .cancellation = .fromAtomic(&cancellation),
+            }, error.Canceled, "superseded_cleanup expects=Canceled cache_epoch=9");
+            try std.testing.expect(owner.mutation.fired);
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            try std.testing.expectEqual(@as(u64, 9), source.cached_snapshot.?.status.metadata_epoch);
+            try std.testing.expectEqual(@as(u64, 1), source.snapshot_fence_generation);
+            try std.testing.expectEqual(@as(u64, 2), source.published_linearizable_snapshot_sequence);
+        }
+
+        test "remote metadata deadline ignores a clock-only borrow for the source cap" {
+            var source_clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+            defer source_clock.deinit();
+            var caller_clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 100 * std.time.ns_per_s });
+            defer caller_clock.deinit();
+            const caller_io = caller_clock.io();
+            var fixture: SnapshotDeadlineTest = .{
+                .clock = &source_clock,
+                .advance_ns = remote_metadata_linearizable_snapshot_timeout_ns + 1,
+            };
+            var source = try fixture.initSource(std.testing.allocator, source_clock.io());
+            defer source.deinit();
+            try SnapshotDeadlineTest.expectErrorOwned(&source, .{
+                .deadline_io = runtime_io_abi.Borrow.init(&caller_io),
+            }, error.MetadataLinearizableReadTimeout, "clock_only_borrow expects=MetadataLinearizableReadTimeout");
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            try SnapshotDeadlineTest.expectUnpublished(&source);
         }
 
         test "remote metadata source pins one cluster incarnation across cache invalidation" {
@@ -36299,6 +36944,328 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "DataServer LSM maintenance yields with idle work and failed attempts beyond host uptime" {
+            const vopr = @import("vopr");
+            const alloc = std.testing.allocator;
+            for ([_]bool{ false, true }) |fail_attempt| {
+                // Keep the borrowed clock far ahead of host uptime. Readiness checks
+                // and renewed deadlines must remain in this same clock domain.
+                const initial_ns: i64 = 100 * 365 * 24 * 60 * 60 * std.time.ns_per_s;
+                var runtime = try vopr.vopr_io.VoprIo.init(.{ .monotonic_ns = initial_ns });
+                defer runtime.deinit();
+                const io = runtime.io();
+                var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+                    .backend = .manual,
+                    .borrowed_io = .{
+                        .general = io,
+                        .raft_inbound = io,
+                        .raft_outbound = io,
+                        .api = io,
+                        .inference = io,
+                        .control = io,
+                    },
+                });
+                defer backend_runtime.deinit();
+
+                const Attempts = struct {
+                    server: *DataServer = undefined,
+                    fail: bool,
+                    count: usize = 0,
+                    times: [2]u64 = undefined,
+                    yielded: bool = false,
+                    reservation_held_while_waiting: bool = false,
+
+                    fn charge(ptr: *anyopaque, _: DataServerWorkKind, _: u64) !void {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        self.times[self.count] = self.server.backgroundMonotonicNs();
+                        self.count += 1;
+                        // Bound even the broken busy loop so the regression reports
+                        // a failure rather than hanging the test process.
+                        if (self.count == self.times.len) self.server.lsm_maintenance_stop.store(true, .release);
+                        if (self.fail) {
+                            // Work can remain requested while its resource/cost
+                            // admission fails; a pending wake must not bypass retry.
+                            self.server.lsm_maintenance_wake.store(true, .release);
+                            return error.TestMaintenanceAttemptFailed;
+                        }
+                    }
+                };
+                var attempts = Attempts{ .fail = fail_attempt };
+                var server: DataServer = .{
+                    .alloc = alloc,
+                    .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+                    .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+                        "/vopr/maintenance-retry-boundary",
+                        antfly.public_api.table_catalog.emptyCatalogSource(),
+                        antfly.raft.read_gate.alreadyReadSafeBarrier(),
+                    ),
+                    .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+                        "/vopr/maintenance-retry-boundary",
+                        antfly.public_api.table_catalog.emptyCatalogSource(),
+                    ),
+                    .status_source = undefined,
+                    .api_server_cfg = undefined,
+                    .query_async_limit = .limited(8),
+                    .work_cost_port = .{ .ptr = &attempts, .charge_fn = Attempts.charge },
+                    .listener_cfg = undefined,
+                    .backend_runtime = backend_runtime.ptr(),
+                };
+                defer server.deinit();
+                attempts.server = &server;
+
+                const Lifecycle = struct {
+                    fn run(target: *DataServer, observations: *Attempts) !void {
+                        try target.startLsmMaintenanceWorker();
+                        defer target.stopLsmMaintenanceBackground();
+                        const worker_io = target.backend_runtime.?.io().?;
+                        while (observations.count < observations.times.len) {
+                            try worker_io.sleep(.fromMilliseconds(10), .awake);
+                            if (observations.count == 1) {
+                                observations.yielded = true;
+                                observations.reservation_held_while_waiting = observations.reservation_held_while_waiting or
+                                    target.provisioned_storage.resource_manager.sliceStats(.lsm_compaction_work).used_bytes != 0;
+                            }
+                        }
+                    }
+                };
+                var future = io.async(Lifecycle.run, .{ &server, &attempts });
+                defer {
+                    server.lsm_maintenance_stop.store(true, .release);
+                    _ = runtime.cancelAndDrainTasksForTeardown(alloc, 10_000) catch @panic("maintenance test cleanup failed");
+                    _ = future.cancel(io) catch {};
+                }
+                var enabled: vopr.transition.List = .{};
+                defer enabled.deinit(alloc);
+                var events: vopr.event.Sink = .{};
+                defer events.deinit(alloc);
+                for (0..1_000) |_| {
+                    if (runtime.scheduler().quiescent()) break;
+                    enabled.items.clearRetainingCapacity();
+                    try runtime.scheduler().enumerateReady(&enabled, alloc);
+                    try enabled.canonicalize();
+                    if (enabled.items.items.len == 0) return error.VoprMaintenanceRetryDeadlock;
+                    var selected = enabled.items.items[0];
+                    for (enabled.items.items) |candidate| {
+                        if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
+                            selected = candidate;
+                            break;
+                        }
+                    }
+                    try runtime.scheduler().executeReady(selected.id, &events, alloc);
+                }
+                try std.testing.expect(runtime.scheduler().quiescent());
+                try future.await(io);
+                try std.testing.expectEqual(@as(usize, 2), attempts.count);
+                try std.testing.expect(attempts.times[1] > attempts.times[0]);
+                try std.testing.expect(attempts.yielded);
+                try std.testing.expect(!attempts.reservation_held_while_waiting);
+                try std.testing.expectEqual(
+                    attempts.times[if (fail_attempt) 0 else 1] + DataServer.vector_block_maintenance_interval_ns,
+                    server.vector_block_maintenance_next_eligible_ns.load(.acquire),
+                );
+                try std.testing.expect(server.lsm_maintenance_future == null);
+                try std.testing.expect(server.dense_publication_future == null);
+                try runtime.ensureNoCapabilityViolation();
+            }
+        }
+
+        test "DataServer store status retries leadership changes on borrowed VoprIo" {
+            const alloc = std.testing.allocator;
+
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+
+            const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-store-status-backoff", .{tmp.sub_path});
+            defer alloc.free(replica_root_dir);
+
+            var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{
+                .required = .of(&.{ .clock_read, .synchronization }),
+                .monotonic_ns = 100 * 365 * 24 * 60 * 60 * std.time.ns_per_s,
+            });
+            defer vopr_io.deinit();
+            var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+                .backend = .manual,
+                .borrowed_io = .{ .general = vopr_io.io() },
+            });
+            defer backend_runtime.deinit();
+            const remote_metadata = try alloc.create(RemoteMetadataSource);
+            const metadata_api_urls = [_][]const u8{"http://metadata.test"};
+            const Metadata = struct {
+                vopr_io: *@import("vopr").vopr_io.VoprIo,
+                requests: usize = 0,
+                reports: usize = 0,
+                delayed_error: ?anyerror = null,
+
+                fn executor(self: *@This()) antfly.common.http.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, response_alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.requests += 1;
+                    if (self.delayed_error) |err| {
+                        self.vopr_io.monotonic_ns += 2 * std.time.ns_per_s;
+                        return err;
+                    }
+                    if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.head)) {
+                        try std.testing.expectEqual(antfly.common.http.Method.GET, request.method);
+                        return .{
+                            .status = 200,
+                            .body = try std.json.Stringify.valueAlloc(response_alloc, antfly.metadata_api.MetadataHead{
+                                .metadata_group_id = 1,
+                                .metadata_incarnation = "11111111111111111111111111111111".*,
+                                .metadata_epoch = 0,
+                            }, .{}),
+                        };
+                    }
+                    try std.testing.expectEqual(antfly.common.http.Method.POST, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/status"));
+                    self.reports += 1;
+                    return .{ .status = 200 };
+                }
+            };
+            var metadata_transport = Metadata{ .vopr_io = &vopr_io };
+            remote_metadata.* = try RemoteMetadataSource.initWithRequestExecutors(
+                alloc,
+                &metadata_api_urls,
+                &.{metadata_transport.executor()},
+                vopr_io.io(),
+            );
+            remote_metadata.test_faults.fetch_head_error = error.NotLeader;
+
+            var server: DataServer = .{
+                .alloc = alloc,
+                .remote_metadata = remote_metadata,
+                .store_registration = .{
+                    .node_id = 9,
+                    .store_id = 19,
+                    .role = "data",
+                    .failure_domain = "test",
+                    .api_url = "http://store.test",
+                },
+                .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+                .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+                    replica_root_dir,
+                    antfly.public_api.table_catalog.emptyCatalogSource(),
+                    antfly.raft.read_gate.alreadyReadSafeBarrier(),
+                ),
+                .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+                    replica_root_dir,
+                    antfly.public_api.table_catalog.emptyCatalogSource(),
+                ),
+                .status_source = remote_metadata.statusSource(),
+                .api_server_cfg = undefined,
+                .query_async_limit = .limited(8),
+                .backend_runtime = backend_runtime.ptr(),
+                .listener_cfg = undefined,
+                .reporter_incarnation = 1,
+            };
+            defer server.deinit();
+            server.store_registration_confirmed = true;
+            server.store_status_dirty.store(true, .release);
+            server.embedding_activity_status_dirty.store(true, .release);
+
+            // A transient election failure must preserve the publication and yield,
+            // even when the borrowed clock is far beyond host uptime.
+            try server.runStoreStatusRoundOnly();
+            try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+            try std.testing.expect(server.store_status_dirty.load(.acquire));
+            try std.testing.expect(server.embedding_activity_status_dirty.load(.acquire));
+            const retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+            try std.testing.expect(retry_at_ms > server.backgroundMonotonicMs());
+
+            // Make an accidental early attempt observable as a permanent error.
+            server.setRemoteMetadataFetchErrorForTest(error.MetadataIncarnationMismatch);
+            vopr_io.monotonic_ns = @as(i96, retry_at_ms - 1) * std.time.ns_per_ms;
+            try server.runStoreStatusRoundOnly();
+            try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+            vopr_io.monotonic_ns += std.time.ns_per_ms;
+            try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
+            try std.testing.expect(server.store_status_dirty.load(.acquire));
+
+            server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
+            try server.runStoreStatusRoundOnly();
+            try std.testing.expectEqual(@as(u32, 2), server.metadataBootstrapRetryAttemptsForTest());
+            try std.testing.expectEqual(@as(usize, 0), metadata_transport.reports);
+
+            // Once authority recovers, publish through the real collector and HTTP
+            // client and clear the retry state only after successful publication.
+            vopr_io.monotonic_ns = @as(i96, server.nextMetadataBootstrapRetryAtMsForTest()) * std.time.ns_per_ms;
+            server.setRemoteMetadataFetchErrorForTest(null);
+            remote_metadata.cached_snapshot = try cloneAdminSnapshotOwned(alloc, .{
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metadata_incarnation = "11111111111111111111111111111111".*,
+                    .metrics = .{},
+                },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            });
+            remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
+            try server.runStoreStatusRoundOnly();
+            try std.testing.expectEqual(@as(usize, 1), metadata_transport.reports);
+            try std.testing.expectEqual(@as(u32, 0), server.metadataBootstrapRetryAttemptsForTest());
+            try std.testing.expectEqual(@as(u64, 0), server.nextMetadataBootstrapRetryAtMsForTest());
+            // The manual runtime completes the cold local-status refresh during
+            // collection. Its new wake must survive this successful report.
+            try std.testing.expect(server.store_status_dirty.load(.acquire));
+            try std.testing.expect(!server.embedding_activity_status_dirty.load(.acquire));
+            try server.runStoreStatusRoundOnly();
+            try std.testing.expectEqual(@as(usize, 2), metadata_transport.reports);
+            try std.testing.expect(!server.store_status_dirty.load(.acquire));
+            try std.testing.expectEqual(server.backgroundMonotonicMs(), server.last_store_status_report_at_ms);
+
+            // Registration uses the same backoff before the status collector runs.
+            server.store_registration_confirmed = false;
+            server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
+            try server.runStoreStatusRoundOnly();
+            try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+            server.setRemoteMetadataFetchErrorForTest(error.MetadataIncarnationMismatch);
+            try server.runStoreStatusRoundOnly();
+            vopr_io.monotonic_ns = @as(i96, server.nextMetadataBootstrapRetryAtMsForTest()) * std.time.ns_per_ms;
+            try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
+            try std.testing.expectEqual(@as(usize, 2), metadata_transport.reports);
+            // Cover actual transport failures that complete after the old deadline
+            // would already have elapsed, for both publication and registration.
+            server.setRemoteMetadataFetchErrorForTest(null);
+            for ([_]bool{ true, false }) |registered| {
+                server.clearMetadataBootstrapRetry();
+                server.store_registration_confirmed = registered;
+                server.store_status_dirty.store(true, .release);
+                remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
+                metadata_transport.delayed_error = error.NotLeader;
+                const started_at_ms = server.backgroundMonotonicMs();
+                const requests_before = metadata_transport.requests;
+                try server.runStoreStatusRoundOnly();
+                const failed_at_ms = server.backgroundMonotonicMs();
+                try std.testing.expectEqual(started_at_ms + 2000, failed_at_ms);
+                try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
+                try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+                const delayed_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+                try std.testing.expect(delayed_retry_at_ms >= failed_at_ms + metadata_bootstrap_retry_base_ms);
+                try std.testing.expect(delayed_retry_at_ms <= failed_at_ms + metadata_bootstrap_retry_base_ms + metadata_bootstrap_retry_jitter_ms);
+                try std.testing.expect(server.store_status_dirty.load(.acquire));
+
+                // No new transport call may start until the delay after completion
+                // expires. A permanent failure at that boundary must still escape.
+                metadata_transport.delayed_error = error.MetadataIncarnationMismatch;
+                try server.runStoreStatusRoundOnly();
+                vopr_io.monotonic_ns = @as(i96, delayed_retry_at_ms - 1) * std.time.ns_per_ms;
+                try server.runStoreStatusRoundOnly();
+                try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
+                vopr_io.monotonic_ns += std.time.ns_per_ms;
+                try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
+                try std.testing.expectEqual(requests_before + 2, metadata_transport.requests);
+                try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+                try std.testing.expectEqual(delayed_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+            }
+            try vopr_io.ensureNoCapabilityViolation();
+        }
+
         test "data runtime local merge fallback uses its durable table contract" {
             try exerciseLocalMergeFallback(.finalized);
         }
@@ -37869,11 +38836,19 @@ fn implementationTests() type {
                 );
                 defer transition_lease.release();
                 try std.testing.expect(transition_lease.db.core.identity_namespace.eql(source_namespace));
+                const local_schema = (try transition_lease.db.getSchemaJson(alloc)) orelse
+                    return error.TestUnexpectedResult;
+                defer alloc.free(local_schema);
+                try std.testing.expectEqualStrings(antfly.public_api.tables.default_schema_json, local_schema);
                 try std.testing.expect(server.backend_runtime != null);
                 try std.testing.expect(
                     transition_lease.db.backend_runtime == server.backend_runtime.?,
                 );
                 try std.testing.expect(transition_lease.db.owned_backend_runtime == null);
+                const schema = (try transition_lease.db.getSchemaJson(alloc)) orelse
+                    return error.TestExpectedLocalTableManifest;
+                defer alloc.free(schema);
+                try std.testing.expectEqualStrings(antfly.public_api.tables.default_schema_json, schema);
             }
 
             // Replica replacement can preserve this DB while a new Raft generation
@@ -37908,6 +38883,19 @@ fn implementationTests() type {
 
             // The uncached path must release its maintenance writer before the scoped
             // operation returns. A direct authoritative open proves no owner escaped.
+            try server.write_source.clearWriteCache();
+            {
+                // The destination is absent from the catalog. Reopening it from the
+                // persisted contract must work after its original writer is retired.
+                var reopened = (try server.write_source.leasePreparedTransitionGroupWriter(
+                    alloc,
+                    181,
+                    "docs",
+                    source_namespace,
+                )) orelse return error.TestUnexpectedResult;
+                defer reopened.deinit(alloc);
+                try std.testing.expectEqualStrings(antfly.public_api.tables.default_schema_json, reopened.schema_json.?);
+            }
             try server.write_source.clearWriteCache();
             server.write_source.write_cache = null;
             try server.ensureSplitSourceApplyStoreSeeded(

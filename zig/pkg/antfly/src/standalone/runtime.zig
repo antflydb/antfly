@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ha_wal = @import("../storage/wal_runtime.zig");
 const inference_provider = @import("inference_provider.zig");
 const lease_executor = @import("lease_executor.zig");
 const builtin = @import("builtin");
@@ -731,6 +732,7 @@ const UnifiedServerLifecycle = antfly.common.runtime_lifecycle.HttpServerLifecyc
 const LocalStandaloneMetadata = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
+    vector_migration_commands: @import("../common/vector_migration.zig").CommandAdmissions = .{},
     manager: antfly.metadata.TableManager,
     extension_catalog: antfly.extensions.ExtensionCatalog,
     local_node_id: u64,
@@ -738,13 +740,23 @@ const LocalStandaloneMetadata = struct {
     api_url: []const u8,
     replica_root_dir: []const u8,
     catalog_path: []const u8,
+    operator_lock: ?std.Io.File = null,
     catalog_store: ?*antfly.storage_backend_erased.Store,
     backend_runtime: *antfly.db.background_runtime.BackendRuntime,
     storage_engine: antfly.common.config.StorageEngine = .local,
     vector_source_storage_allowed: bool = true,
+    ha_catalog_server: ?*antfly.data.runtime.DataServer = null,
+
     epoch: u64 = 1,
     last_schema_migration_finalize_at_ms: u64 = 0,
     local_schema_progress_provider: ?LocalSchemaProgressProvider = null,
+
+    const CatalogCreate = struct {
+        schema_version: u32 = 3,
+        kind: enum { table_create } = .table_create,
+        table: antfly.metadata.TableRecord,
+        ranges: []const antfly.metadata.RangeRecord,
+    };
 
     const PersistedCatalog = struct {
         epoch: u64 = 1,
@@ -830,11 +842,18 @@ const LocalStandaloneMetadata = struct {
         owned_replica_root_dir = null;
         owned_catalog_path = null;
         errdefer self.deinit();
+        if (catalog_store == null) self.operator_lock = try @import("../common/migration_files.zig").lockCatalog(
+            alloc,
+            backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo,
+            catalog_path,
+        );
         try self.loadPersistedCatalog();
         return self;
     }
 
     fn deinit(self: *LocalStandaloneMetadata) void {
+        self.vector_migration_commands.deinit(self.alloc);
+        if (self.operator_lock) |file| file.close(self.backend_runtime.filesystemIo().?);
         self.extension_catalog.deinit();
         self.manager.deinit();
         self.alloc.free(self.catalog_path);
@@ -880,6 +899,9 @@ const LocalStandaloneMetadata = struct {
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
+                .publish_vector_migration_table = publishVectorMigrationTable,
+                .begin_vector_migration_command = beginVectorMigrationCommand,
+                .end_vector_migration_command = endVectorMigrationCommand,
                 .restore_table = restoreTable,
                 .drop_table = dropTable,
                 .drop_table_exact = dropTableExact,
@@ -1137,6 +1159,11 @@ const LocalStandaloneMetadata = struct {
 
     fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (self.ha_catalog_server != null) {
+            if (req.replication_sources_json) |sources| {
+                if (!std.mem.eql(u8, sources, "[]")) return error.HACatalogReplicationSourcesUnsupported;
+            }
+        }
         const replicated = !self.vector_source_storage_allowed or
             (if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
         var resolved_req = req;
@@ -1148,15 +1175,91 @@ const LocalStandaloneMetadata = struct {
             alloc.free(ranges);
         }
 
+        var lease = if (self.ha_catalog_server) |server| server.ha_mutation_barrier.acquireShared() else null;
+        defer if (lease) |*value| value.release();
+        if (self.ha_catalog_server) |server| {
+            // Standby apply takes the HA transition lock before this catalog
+            // lock. Reject non-writers through the lock-free role gate before
+            // taking either lock; append/ack still recheck primary authority.
+            try server.ha_public_gate_state.checkWrite(server.ha_public_gate_state.currentGeneration());
+        }
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
+        if (self.findTableByNameLocked(table_name) != null) {
+            if (self.ha_catalog_server) |server| {
+                // A retry may observe a catalog whose original RemoteApply wait
+                // timed out. Existence is safe to acknowledge only after the
+                // required standby has applied the current catalog frontier.
+                server.acknowledgeHAExistingCatalog() catch return error.MetadataMutationOutcomeUnknown;
+            }
+            return error.TableAlreadyExists;
+        }
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try self.manager.upsertTable(table);
         for (ranges) |range| try self.manager.upsertRange(range);
         self.epoch +|= 1;
+        if (self.ha_catalog_server) |server| {
+            const payload = try std.json.Stringify.valueAlloc(alloc, CatalogCreate{ .table = table, .ranges = ranges }, .{});
+            defer alloc.free(payload);
+            const commit = try server.appendHACatalogCreate(payload);
+            {
+                // The WAL now owns the mutation. Failure to publish the local
+                // catalog fences this process until startup can replay it.
+                errdefer server.ha_public_gate_state.publishPrimaryFence(true);
+                lockAtomic(&server.ha_state_mutex);
+                defer server.ha_state_mutex.unlock();
+                try server.ha_public_gate_state.checkWrite(commit.generation);
+                try mutation.commit(self);
+            }
+            server.acknowledgeHACatalogCreate(commit) catch return error.MetadataMutationOutcomeUnknown;
+        } else {
+            try mutation.commit(self);
+        }
+    }
+
+    fn applyHACatalogCreate(ptr: *anyopaque, record: antfly.hot_standby.replication_record.RecordView) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (record.kind != .metadata_mutation or record.payload_codec != .json or
+            record.table_id != 0 or record.shard_id != 0) return error.InvalidHACatalogRecord;
+        var parsed = try std.json.parseFromSlice(CatalogCreate, self.alloc, record.payload, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const value = parsed.value;
+        if (value.schema_version != 3 or value.ranges.len == 0) return error.InvalidHACatalogRecord;
+        for (value.ranges) |range| {
+            if (range.table_id != value.table.table_id) return error.InvalidHACatalogRecord;
+        }
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.findTableByNameLocked(value.table.name)) |existing| {
+            const encoded = try std.json.Stringify.valueAlloc(self.alloc, existing.*, .{});
+            defer self.alloc.free(encoded);
+            const expected = try std.json.Stringify.valueAlloc(self.alloc, value.table, .{});
+            defer self.alloc.free(expected);
+            if (!std.mem.eql(u8, encoded, expected)) return error.HACatalogReplayConflict;
+            return;
+        }
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
+        try self.manager.upsertTable(value.table);
+        for (value.ranges) |range| try self.manager.upsertRange(range);
+        self.epoch +|= 1;
         try mutation.commit(self);
+    }
+
+    fn replayHACatalog(self: *LocalStandaloneMetadata, primary: *antfly.hot_standby.primary.Primary) !void {
+        // Scan one record at a time; document WAL can be much larger than the
+        // catalog and must not be materialized in memory during startup.
+        try primary.log.wal.iterateFromStreamingWithContext(1, self, replayHACatalogEntry);
+    }
+
+    fn replayHACatalogEntry(self: *LocalStandaloneMetadata, entry: ha_wal.WalEntry) !ha_wal.WAL.ScanAction {
+        const record = try antfly.hot_standby.replication_record.decode(entry.data);
+        if (record.lsn != entry.lsn or record.lsn == 0 or record.previous_lsn != record.lsn - 1)
+            return error.InvalidHACatalogRecord;
+        if (record.kind == .metadata_mutation and record.table_id == 0 and record.shard_id == 0)
+            try applyHACatalogCreate(self, record);
+        return .@"continue";
     }
 
     fn adoptEmbeddedLiteRootIfNeeded(self: *LocalStandaloneMetadata, backend: *antfly.lite.backend.Handle) !void {
@@ -1248,6 +1351,8 @@ const LocalStandaloneMetadata = struct {
 
         const current = self.findTableByNameLocked(replacement.name) orelse return error.TableNotFound;
         if (!antfly.metadata.table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+        if (current.storage_migration != null and !antfly.metadata.table_manager.tableDefinitionsEqual(current.*, replacement))
+            return error.TableTransitionActive;
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(self.alloc, replacement.indexes_json);
         try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(self.alloc, replacement.indexes_json);
         const previous = try antfly.metadata.table_manager.cloneTable(self.alloc, current.*);
@@ -1263,6 +1368,29 @@ const LocalStandaloneMetadata = struct {
             self.epoch = previous_epoch;
             return err;
         };
+    }
+
+    fn publishVectorMigrationTable(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (!self.vector_source_storage_allowed or self.storage_engine != .local)
+            return error.VectorStoreRequiresLocalSingleShardTable;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
+        try self.manager.publishVectorMigrationTable(expected, replacement);
+        self.epoch +|= 1;
+        try mutation.commit(self);
+    }
+
+    fn beginVectorMigrationCommand(ptr: *anyopaque, table_name: []const u8) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try self.vector_migration_commands.begin(self.alloc, table_name);
+    }
+
+    fn endVectorMigrationCommand(ptr: *anyopaque, table_name: []const u8) void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        self.vector_migration_commands.end(self.alloc, table_name);
     }
 
     fn restoreTable(
@@ -1321,6 +1449,7 @@ const LocalStandaloneMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
+        if (table.storage_migration != null) return error.VectorMigrationActive;
         const table_id = table.table_id;
         const ranges = try self.manager.listRanges(alloc);
         defer self.manager.freeRanges(alloc, ranges);
@@ -1774,6 +1903,9 @@ const LocalStandaloneMetadata = struct {
         });
         defer parsed.deinit();
 
+        for (parsed.value.tables) |table| if (table.storage_migration) |admission| {
+            if (admission.request.mode == .offline) return error.VectorMigrationOfflineAdmission;
+        };
         _ = try self.manager.replaceProjectedTopology(parsed.value.tables, parsed.value.ranges);
         try self.extension_catalog.loadProjectedRows(
             parsed.value.extension_packages,
@@ -2395,6 +2527,9 @@ pub fn runFromIterator(
         return err;
     };
     defer local_metadata.deinit();
+    // An empty instance has a real catalog too. Publish it before readiness so
+    // stopped-volume inspection can distinguish empty state from missing state.
+    if (local_metadata.manager.tables.count() == 0) try local_metadata.persistLocked();
     local_metadata.vector_source_storage_allowed = !ha_role_requested;
     // Reject persisted experimental tables before HA can snapshot or mirror
     // primary roots whose references need a separate source-store lifecycle.
@@ -2517,6 +2652,7 @@ pub fn runFromIterator(
         return err;
     };
     defer if (ha_primary) |*primary| primary.close();
+    if (ha_primary) |*primary| try local_metadata.replayHACatalog(primary);
     var ha_standby = openHAStandbyFromCli(alloc, setup_io.io(), cli) catch |err| {
         std.log.err("standalone startup failed step=open_ha_standby err={}", .{err});
         return err;
@@ -2582,6 +2718,7 @@ pub fn runFromIterator(
         .api_server_cfg = .{
             .ha_failover_safe_mutations_only = ha_mutation_guard_enabled,
             .ha_remote_apply_mutations_enabled = haRemoteApplyMutationsEnabled(ha_sync_policy.policy),
+            .ha_catalog_create_enabled = ha_role_requested and cli.ha_table_id == 0 and cli.ha_shard_id == 0,
             .auth_enabled = auth_enabled,
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
@@ -2761,6 +2898,11 @@ pub fn runFromIterator(
         null);
 
     // Initialize API server (wires caches + sources) without binding a listener.
+    if (ha_role_requested and cli.ha_table_id == 0 and cli.ha_shard_id == 0) {
+        local_metadata.ha_catalog_server = &data_server;
+        data_server.ha_catalog_apply_ctx = &local_metadata;
+        data_server.ha_catalog_apply_fn = LocalStandaloneMetadata.applyHACatalogCreate;
+    }
     try data_server.initApiServer();
     local_metadata.local_schema_progress_provider = localSchemaProgressProvider(&data_server);
     const api_server = &data_server.http_server.?;
@@ -8690,6 +8832,41 @@ test "standalone runtime data dir overrides common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/from-cli/data/catalog.txt", resolved.replica_catalog_path);
     try std.testing.expectEqualStrings("/tmp/from-cli/metadata/local-metadata.json", resolved.local_metadata_catalog_path);
     try std.testing.expectEqualStrings("/tmp/from-cli/data/snapshots", resolved.snapshot_root_dir);
+}
+
+test "standalone standby catalog create rejects before contended locks" {
+    const alloc = std.testing.allocator;
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server: antfly.data.runtime.DataServer = undefined;
+    server.ha_public_gate_state = .{};
+    server.ha_public_gate_state.configureStandby(.{ .received_lsn = 1, .applied_lsn = 1, .safe_read_lsn = 1 });
+    server.ha_mutation_barrier = .{};
+    server.ha_state_mutex = .unlocked;
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, "unused-catalog"),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+        .ha_catalog_server = &server,
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(antfly.public_api.tables.deriveTableRecord("existing", .{}));
+    // Model apply owning the HA lock while another catalog operation owns the
+    // catalog lock. Neither new nor repeated creates may wait for either lock.
+    lockAtomic(&server.ha_state_mutex);
+    defer server.ha_state_mutex.unlock();
+    lockAtomic(&metadata.mutex);
+    defer metadata.mutex.unlock();
+    for ([_][]const u8{ "new_table", "existing" }) |name| {
+        try std.testing.expectError(error.HAReadOnlyStandby, LocalStandaloneMetadata.createTable(&metadata, alloc, name, .{}));
+    }
 }
 
 test "standalone metadata rolls back an undurable catalog mutation" {

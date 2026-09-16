@@ -73,9 +73,16 @@ pub const ProvisionedKernelOwnerSource = struct {
     context: client.Context = .{},
     owns_context: bool = true,
     mutex: std.atomic.Mutex = .unlocked,
+    quiescing: bool = false,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    publications: std.ArrayListUnmanaged(*PendingPublication) = .empty,
     owner_cache_hits: std.atomic.Value(u64) = .init(0),
     owner_cache_misses: std.atomic.Value(u64) = .init(0),
+
+    const PendingPublication = struct {
+        group_id: u64,
+        table_name: []u8,
+    };
 
     const Identity = descriptor_contract.Identity;
 
@@ -295,10 +302,31 @@ pub const ProvisionedKernelOwnerSource = struct {
             entry.retired = true;
         }
         self.drainRetiredLocked(null, null);
+        std.debug.assert(self.publications.items.len == 0);
+        self.publications.deinit(self.alloc);
         self.entries.deinit(self.alloc);
         self.entries = .empty;
         self.mutex.unlock();
         if (self.owns_context) self.context.deinit();
+    }
+
+    /// Close admission and join every DB-owned worker while its Raft,
+    /// candidate, sink, and provider callback contexts are still alive.
+    /// Attached request/apply sources must already be stopped. Keep the
+    /// registry and context valid until their ordinary final deinit.
+    pub fn quiesce(self: *ProvisionedKernelOwnerSource, io: std.Io) !void {
+        while (true) {
+            const drained = blk: {
+                lock(&self.mutex);
+                defer self.mutex.unlock();
+                self.quiescing = true;
+                for (self.entries.items) |entry| entry.retired = true;
+                self.drainRetiredLocked(null, null);
+                break :blk self.entries.items.len == 0;
+            };
+            if (drained) return;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
     }
 
     pub fn readSource(self: *ProvisionedKernelOwnerSource) table_read_source.TableReadSource {
@@ -359,6 +387,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .vector_migration_group_local = vectorMigrationGroupLocal,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
@@ -382,7 +411,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{
             .ptr = self,
             .vtable = &.{
-                .retire_group_for_publication = retireGroupForPublication,
+                .begin_publication = beginPublication,
+                .end_publication = endPublication,
                 .prepare = prepareSnapshot,
                 .prepare_restore = prepareRestore,
                 .reconcile_restore = reconcileRestore,
@@ -629,18 +659,73 @@ pub const ProvisionedKernelOwnerSource = struct {
         return count;
     }
 
-    fn retireGroupForPublication(ptr: *anyopaque, group_id: u64, table_name: []const u8) !void {
-        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+    fn publicationPendingLocked(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) bool {
+        for (self.publications.items) |publication| {
+            if (publication.group_id == group_id and std.mem.eql(u8, publication.table_name, table_name)) return true;
+        }
+        return false;
+    }
+
+    fn registerPublication(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !*PendingPublication {
         lock(&self.mutex);
         defer self.mutex.unlock();
-        for (self.entries.items) |entry| {
-            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.active_users != 0 or entry.closing) return error.StorageBusy;
-        }
+        if (self.publicationPendingLocked(group_id, table_name)) return error.StorageBusy;
+        const publication = try self.alloc.create(PendingPublication);
+        errdefer self.alloc.destroy(publication);
+        publication.* = .{ .group_id = group_id, .table_name = try self.alloc.dupe(u8, table_name) };
+        errdefer self.alloc.free(publication.table_name);
+        try self.publications.append(self.alloc, publication);
+        // Close admission before observing users or dropping the registry lock.
+        // The gate outlives the last Entry, including an initially cold group.
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name)) entry.retired = true;
         }
-        self.drainRetiredLocked(group_id, table_name);
+        return publication;
+    }
+
+    fn publicationDrained(self: *ProvisionedKernelOwnerSource, publication: *PendingPublication) bool {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        self.drainRetiredLocked(publication.group_id, publication.table_name);
+        for (self.entries.items) |entry| {
+            // Closing entries remain registered while owner workers drain.
+            if (entry.group_id == publication.group_id and std.mem.eql(u8, entry.table_name, publication.table_name)) return false;
+        }
+        return true;
+    }
+
+    fn beginPublication(ptr: *anyopaque, request: storage_snapshot_source.PublicationRequest) !*anyopaque {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try request.cancellation.check();
+        const publication = try self.registerPublication(request.group_id, request.table_name);
+        errdefer endPublication(ptr, publication);
+        const deadline = std.Io.Clock.awake.now(request.io).nanoseconds + request.drain_timeout_ns;
+        while (true) {
+            try request.cancellation.check();
+            if (self.publicationDrained(publication)) {
+                try request.cancellation.check();
+                return publication;
+            }
+            if (std.Io.Clock.awake.now(request.io).nanoseconds >= deadline) return error.StorageBusy;
+            // Borrow the operation's I/O: cancellation and simulated time must
+            // remain on the same runtime as the work whose leases are draining.
+            try request.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    fn endPublication(ptr: *anyopaque, handle: *anyopaque) void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const publication: *PendingPublication = @ptrCast(@alignCast(handle));
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.publications.items, 0..) |candidate, index| {
+            if (candidate != publication) continue;
+            _ = self.publications.orderedRemove(index);
+            self.alloc.free(publication.table_name);
+            self.alloc.destroy(publication);
+            return;
+        }
+        unreachable;
     }
 
     fn drainRetiredLocked(self: *ProvisionedKernelOwnerSource, group_id: ?u64, table_name: ?[]const u8) void {
@@ -1968,7 +2053,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// The registry mutex and a validated descriptor pin this entry. Borrowing
     /// must neither adopt residency nor admit new work after transient cleanup.
     fn borrowEntryLocked(self: *ProvisionedKernelOwnerSource, entry: *Entry) !Lease {
-        if (entry.transient_retirement_pending or !tryReserveEntryLeaseLocked(entry, .shared))
+        if (entry.retired or entry.closing or entry.transient_retirement_pending or !tryReserveEntryLeaseLocked(entry, .shared))
             return error.StorageReadTemporarilyUnavailable;
         _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
         return .{ .source = self, .entry = entry };
@@ -2107,6 +2192,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         const exclusive = admission != .shared;
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
         defer self.mutex.unlock();
+        if (self.quiescing) return error.Canceled;
+        // Return to the caller rather than waiting with a descriptor captured
+        // before publication; a retry must acquire the new catalog descriptor.
+        if (self.publicationPendingLocked(group_id, table_name)) return error.StorageReadTemporarilyUnavailable;
         var stale_index: ?usize = null;
         for (self.entries.items, 0..) |entry, index| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
@@ -2984,6 +3073,19 @@ pub const ProvisionedKernelOwnerSource = struct {
         return kernel_error_identity.statusFromError(err);
     }
 
+    fn vectorMigrationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = lease.owner().vectorMigrationJson(table_name, request_json) catch |err| {
+            if (err == error.VectorMigrationRecoveryRequired or err == error.VectorPayloadStorePoisoned)
+                lease.retireAfterConfigurationFailure();
+            return err;
+        };
+        defer response.deinit();
+        return try alloc.dupe(u8, response.bytes());
+    }
+
     fn executeArtifactOperation(
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
@@ -3848,6 +3950,102 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 };
 
+test "storage owner quiesce drains leases and promotion callbacks before context destruction" {
+    const alloc = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-quiesce");
+    defer directory.cleanup();
+    const path = std.mem.span(directory.path().ptr);
+    var source = ProvisionedKernelOwnerSource.init(alloc, path, table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.deinit();
+    const Callback = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        released: std.atomic.Value(bool) = .init(false),
+        fn isLeader(ptr: *anyopaque, _: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.released.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            return false;
+        }
+    };
+    var callback = Callback{};
+    // Release on any failed assertion before source.deinit joins the worker.
+    defer callback.released.store(true, .release);
+    _ = source.withRuntimeHooks(null, null, .{ .ptr = &callback, .vtable = &.{ .is_local_leader = Callback.isLeader } });
+    const descriptor = descriptor_contract.Descriptor{
+        .lsm_root_generation = 0,
+        .identity = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+        .indexes_json =
+        \\{"relations_graph":{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"},"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","config_generation":1,"_antfly_destination_authorization_v1":{"principal":"service:auth-disabled","signature":"auth-disabled","destinations":["entities"]}}]}}
+        ,
+    };
+    var lease = try source.acquireDescriptor(7001, "docs", path, descriptor);
+    var lease_active = true;
+    defer if (lease_active) lease.deinit();
+    errdefer callback.released.store(true, .release);
+    var response = try lease.owner().batchJson("docs",
+        \\{"inserts":{"a":{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada"}]}}},"sync_level":"write"}
+    );
+    response.deinit();
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!callback.entered.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline) return error.PromotionCallbackDidNotStart;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const Shutdown = struct {
+        source: *ProvisionedKernelOwnerSource,
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.source.quiesce(std.testing.io) catch |err| {
+                self.err = err;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    var shutdown = Shutdown{ .source = &source };
+    var shutdown_task = try std.testing.io.concurrent(Shutdown.run, .{&shutdown});
+    defer {
+        callback.released.store(true, .release);
+        if (lease_active) {
+            lease.deinit();
+            lease_active = false;
+        }
+        shutdown_task.await(std.testing.io);
+    }
+    while (true) {
+        ProvisionedKernelOwnerSource.lock(&source.mutex);
+        const quiescing = source.quiescing;
+        source.mutex.unlock();
+        if (quiescing) break;
+        if (platform_time.monotonicNs() >= deadline) return error.QuiesceDidNotStart;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(!shutdown.done.load(.acquire));
+    try std.testing.expectError(error.Canceled, source.acquireDescriptor(7001, "docs", path, descriptor));
+    // Closing the last lease must wait for the autonomous callback as well.
+    var release_task = try std.testing.io.concurrent(ProvisionedKernelOwnerSource.Lease.deinit, .{&lease});
+    lease_active = false;
+    defer {
+        callback.released.store(true, .release);
+        release_task.await(std.testing.io);
+    }
+    while (true) {
+        ProvisionedKernelOwnerSource.lock(&source.mutex);
+        const closing = source.entries.items.len == 1 and source.entries.items[0].closing;
+        source.mutex.unlock();
+        if (closing) break;
+        if (platform_time.monotonicNs() >= deadline) return error.OwnerCloseDidNotStart;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(!shutdown.done.load(.acquire));
+    callback.released.store(true, .release);
+    while (!shutdown.done.load(.acquire)) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    if (shutdown.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 0), source.ownerCountForTest());
+    try source.quiesce(std.testing.io);
+    try std.testing.expectError(error.Canceled, source.acquireDescriptor(7001, "docs", path, descriptor));
+}
+
 test "pending exclusive storage owner lease blocks new readers until drain" {
     var entry: ProvisionedKernelOwnerSource.Entry = undefined;
     entry.active_users = 1;
@@ -3968,5 +4166,141 @@ test "transient storage owner retirement drains borrowers and permits foreground
         transient.deinit();
         try std.testing.expectEqual(@as(usize, 1), source.ownerCountForTest());
         try std.testing.expectEqual(@as(u64, if (history == .foreground_adoption or history == .prepared_adoption) 1 else 2), misses);
+    }
+}
+
+// The fake clock controls only the publication wait. Owners below use the real
+// compiled storage kernel, including worker shutdown and registry removal.
+const PublicationWaitTest = struct {
+    now_ns: i96 = 0,
+    sleeps: usize = 0,
+    lease: ?*ProvisionedKernelOwnerSource.Lease = null,
+    cancel: ?*std.atomic.Value(bool) = null,
+
+    fn now(ptr: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+        const self: *@This() = @ptrCast(@alignCast(ptr.?));
+        return .{ .nanoseconds = self.now_ns };
+    }
+
+    fn sleep(ptr: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr.?));
+        self.sleeps += 1;
+        self.now_ns += std.time.ns_per_ms;
+        if (self.lease) |lease| {
+            lease.deinit();
+            self.lease = null;
+        }
+        if (self.cancel) |signal| signal.store(true, .release);
+    }
+
+    fn io(self: *@This(), vtable: *std.Io.VTable) std.Io {
+        vtable.* = std.testing.io.vtable.*;
+        vtable.now = now;
+        vtable.sleep = sleep;
+        return .{ .userdata = self, .vtable = vtable };
+    }
+};
+
+test "publication drains existing readers status and maintenance before reopening admission" {
+    const alloc = std.testing.allocator;
+    const Source = ProvisionedKernelOwnerSource;
+    for ([_]enum { reader, status, maintenance }{ .reader, .status, .maintenance }) |history| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owner", .{tmp.sub_path});
+        defer alloc.free(path);
+        var source = Source.init(alloc, path, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer source.deinit();
+        const descriptor: descriptor_contract.Descriptor = .{
+            .lsm_root_generation = table_reads.backend_current_root_generation,
+            .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        };
+        var original = try source.acquireDescriptor(1, "docs", path, descriptor);
+        defer original.deinit();
+        var held: Source.Lease = undefined;
+        var maintenance: ?[]Source.Lease = null;
+        defer if (maintenance) |leases| source.releaseMaintenanceLeases(leases);
+        switch (history) {
+            .reader => held = try source.acquireDescriptor(1, "docs", path, descriptor),
+            .status => {
+                Source.lock(&source.mutex);
+                held = source.borrowEntryLocked(original.entry) catch |err| {
+                    source.mutex.unlock();
+                    return err;
+                };
+                source.mutex.unlock();
+            },
+            .maintenance => {
+                maintenance = (try source.snapshotOwnerLeases(false, false)).?;
+                try std.testing.expectEqual(@as(usize, 1), maintenance.?.len);
+            },
+        }
+        const borrower = if (maintenance) |leases| &leases[0] else &held;
+        defer borrower.deinit();
+        original.deinit();
+        // Force publication to see a live user, then release it at the first
+        // cooperative wait. The old implementation returned StorageBusy here.
+        var wait = PublicationWaitTest{ .lease = borrower };
+        var vtable: std.Io.VTable = undefined;
+        var publication = try source.snapshotSource().beginPublication(.{
+            .io = wait.io(&vtable),
+            .group_id = 1,
+            .table_name = "docs",
+        });
+        defer publication.deinit();
+        try std.testing.expectEqual(@as(usize, 1), wait.sleeps);
+        try std.testing.expectEqual(@as(usize, 0), source.ownerCountForTest());
+        // With no Entry remaining, the independent gate still excludes open
+        // and prepared apply until the publisher completes commit/rollback.
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.acquireDescriptor(1, "docs", path, descriptor));
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.acquirePreparedOwner(1, "docs"));
+        try std.testing.expectError(error.StorageBusy, source.snapshotSource().beginPublication(.{
+            .io = wait.io(&vtable),
+            .group_id = 1,
+            .table_name = "docs",
+        }));
+        const excluded = (try source.snapshotOwnerLeases(false, false)).?;
+        defer source.releaseMaintenanceLeases(excluded);
+        try std.testing.expectEqual(@as(usize, 0), excluded.len);
+        publication.deinit();
+        var replacement = try source.acquireDescriptor(1, "docs", path, descriptor);
+        defer replacement.deinit();
+        try std.testing.expectEqual(@as(u64, 2), source.cacheStats().miss_count);
+    }
+}
+
+test "publication cancellation and timeout release admission without invalidating borrowers" {
+    const alloc = std.testing.allocator;
+    const Source = ProvisionedKernelOwnerSource;
+    for ([_]bool{ false, true }) |cancel| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owner", .{tmp.sub_path});
+        defer alloc.free(path);
+        var source = Source.init(alloc, path, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer source.deinit();
+        const descriptor: descriptor_contract.Descriptor = .{
+            .lsm_root_generation = table_reads.backend_current_root_generation,
+            .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        };
+        var borrower = try source.acquireDescriptor(1, "docs", path, descriptor);
+        defer borrower.deinit();
+        var signal = std.atomic.Value(bool).init(false);
+        var wait = PublicationWaitTest{ .cancel = if (cancel) &signal else null };
+        var vtable: std.Io.VTable = undefined;
+        try std.testing.expectError(if (cancel) error.Canceled else error.StorageBusy, source.snapshotSource().beginPublication(.{
+            .io = wait.io(&vtable),
+            .group_id = 1,
+            .table_name = "docs",
+            .cancellation = .fromAtomic(&signal),
+            .drain_timeout_ns = std.time.ns_per_ms,
+        }));
+        try std.testing.expectEqual(@as(usize, 1), wait.sleeps);
+        try std.testing.expectEqual(@as(usize, 0), source.publications.items.len);
+        try std.testing.expectEqual(@as(usize, 1), source.ownerCountForTest());
+        try std.testing.expectEqual(@as(usize, 1), borrower.entry.active_users);
+        borrower.deinit();
+        var replacement = try source.acquireDescriptor(1, "docs", path, descriptor);
+        defer replacement.deinit();
     }
 }

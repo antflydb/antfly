@@ -1,13 +1,13 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 
-//! HA owners borrowed by the production cluster history. Replication applies
+//! Standby owners borrowed by the production cluster history. Replication applies
 //! through DataServer into actual DBs; promotion crosses the authenticated
 //! production admin surface and consumes the standby's durable WAL owner.
 const std = @import("std");
 const runtime = @import("../data/runtime.zig");
 const admin_api = @import("../admin/mod.zig");
-const ha = @import("../storage/hot_standby/mod.zig");
+const hot_standby = @import("../storage/hot_standby/mod.zig");
 const storage_io = @import("../storage/lsm_backend/storage_io.zig");
 const wal = @import("../storage/wal.zig");
 const http = @import("../common/http/http_common.zig");
@@ -19,28 +19,28 @@ const api_client = @import("../api/http_client.zig");
 const background = @import("../storage/background_runtime.zig");
 
 pub const Owners = struct {
-    pub const token = "vopr-ha-scaling-admin";
-    const identity: ha.primary.Identity = .{ .cluster_id = 6840, .shard_id = 0, .table_id = 0, .timeline_id = 1, .epoch = 1 };
-    const log_path: [:0]const u8 = "/production-ha/receive";
-    const progress_path: [:0]const u8 = "/production-ha/progress";
-    const fence_path: [:0]const u8 = "/production-ha/fence";
+    pub const token = "vopr-standby-scaling-admin";
+    const identity: hot_standby.primary.Identity = .{ .cluster_id = 6840, .shard_id = 0, .table_id = 0, .timeline_id = 1, .epoch = 1 };
+    const log_path: [:0]const u8 = "/production-standby/receive";
+    const progress_path: [:0]const u8 = "/production-standby/progress";
+    const fence_path: [:0]const u8 = "/production-standby/fence";
 
     alloc: std.mem.Allocator,
     io: std.Io,
     storage: storage_io.IoStorage,
     replica_root: []u8,
     options: wal.WalOptions = .{},
-    primary: ?ha.primary.Primary = null,
+    primary: ?hot_standby.primary.Primary = null,
     promoted_lsn: u64 = 0,
     primary_server: ?runtime.DataServer = null,
     primary_uri: ?[]u8 = null,
     primary_root: []u8,
-    standby: ?ha.standby.Standby = null,
-    fences: ?ha.fencing.Store = null,
+    standby: ?hot_standby.standby.Standby = null,
+    fences: ?hot_standby.fencing.Store = null,
     server: ?runtime.DataServer = null,
     uri: ?[]u8 = null,
     boundary: u64 = 0,
-    observed_progress: ha.standby.Progress = .{},
+    observed_progress: hot_standby.standby.Progress = .{},
     promoted_sound: bool = false,
 
     pub fn create(alloc: std.mem.Allocator, io: std.Io, primary_root: []const u8) !*Owners {
@@ -49,7 +49,7 @@ pub const Owners = struct {
             alloc.destroy(self);
             return err;
         };
-        const owned_primary_root = std.fmt.allocPrint(alloc, "{s}-ha-primary", .{primary_root}) catch |err| {
+        const owned_primary_root = std.fmt.allocPrint(alloc, "{s}-standby-primary", .{primary_root}) catch |err| {
             alloc.free(replica_root);
             alloc.destroy(self);
             return err;
@@ -60,16 +60,16 @@ pub const Owners = struct {
             .storage = self.storage.storage(),
             .clock = .{ .ctx = self, .now_ns_fn = nowNs, .sleep_ns_fn = sleepNs },
         };
-        self.primary = try ha.primary.Primary.open(alloc, "/production-ha/primary", "/production-ha/slots", identity, .{
+        self.primary = try hot_standby.primary.Primary.open(alloc, "/production-standby/primary", "/production-standby/slots", identity, .{
             .replication_log_options = .{ .wal_options = self.options },
             .slot_store_options = .{ .wal_options = self.options },
         });
         try self.primary.?.createSlot("standby", 0);
-        self.standby = try ha.standby.Standby.open(alloc, log_path, progress_path, identity, .{
+        self.standby = try hot_standby.standby.Standby.open(alloc, log_path, progress_path, identity, .{
             .receive_log_options = .{ .wal_options = self.options },
             .progress_wal_options = self.options,
         });
-        self.fences = try ha.fencing.Store.open(alloc, fence_path, .{ .wal_options = self.options });
+        self.fences = try hot_standby.fencing.Store.open(alloc, fence_path, .{ .wal_options = self.options });
         return self;
     }
 
@@ -91,10 +91,10 @@ pub const Owners = struct {
         };
     }
 
-    // Standalone HA and quorum Raft are distinct production ownership modes.
-    // Both participate in one scheduler history without stacking HA over a
-    // Raft apply path, which deliberately bypasses primary HA publication.
-    const tables = [_]table_manager.TableRecord{.{ .table_id = 6850, .name = "ha_docs", .placement_role = "data" }};
+    // Standalone hot standby and quorum Raft are distinct production ownership modes.
+    // Both participate in one scheduler history without stacking hot standby over a
+    // Raft apply path, which deliberately bypasses primary standby publication.
+    const tables = [_]table_manager.TableRecord{.{ .table_id = 6850, .name = "standby_docs", .placement_role = "data" }};
     const ranges = [_]table_manager.RangeRecord{.{ .table_id = 6850, .group_id = 6851, .range_id = 6851, .start_key = "", .end_key = null }};
 
     fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -126,20 +126,20 @@ pub const Owners = struct {
     }
     pub fn write(self: *Owners, executor: http.RequestExecutor, uri: []const u8, body: []const u8) !void {
         var client = api_client.ApiHttpClient.init(self.alloc, executor);
-        var response = try client.fetchBatchResponse(uri, "ha_docs", body);
+        var response = try client.fetchBatchResponse(uri, "standby_docs", body);
         defer response.deinit(self.alloc);
-        if (response.status != 201 and response.status != 202) return error.ProductionHAPublicWriteRejected;
+        if (response.status != 201 and response.status != 202) return error.ProductionStandbyPublicWriteRejected;
     }
     pub fn verify(self: *Owners, executor: http.RequestExecutor, uri: []const u8, key: []const u8, value: []const u8) !void {
         // Standby reads explicitly request the supported stale-read policy;
         // their visible boundary is checked against durable apply progress.
-        const path = try std.fmt.allocPrint(self.alloc, "{s}/db/v1/tables/ha_docs/documents/{s}?consistency=stale", .{ uri, key });
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/db/v1/tables/standby_docs/documents/{s}?consistency=stale", .{ uri, key });
         defer self.alloc.free(path);
         var response = try executor.execute(self.alloc, .{ .method = .GET, .uri = path });
         defer response.deinit(self.alloc);
         if (response.status != 200 or std.mem.indexOf(u8, response.body, value) == null) {
-            std.debug.print("HA lookup key={s} status={d} body={s}\n", .{ key, response.status, response.body });
-            return error.ProductionHALostAcknowledgedWrite;
+            std.debug.print("standby lookup key={s} status={d} body={s}\n", .{ key, response.status, response.body });
+            return error.ProductionStandbyLostAcknowledgedWrite;
         }
     }
 
@@ -161,11 +161,11 @@ pub const Owners = struct {
 
     pub fn catchUp(self: *Owners, executor: http.RequestExecutor, upstream: []const u8) !void {
         _ = try self.server.?.replicateHAStandbyUntilCaughtUp(executor, upstream, "standby", .{ .max_records = 8 });
-        if (self.primary.?.lastLsn() == 0) return error.ProductionHAEmptyReplicationStream;
+        if (self.primary.?.lastLsn() == 0) return error.ProductionStandbyEmptyReplicationStream;
         const progress = self.standby.?.currentProgress();
         self.observed_progress = progress;
         if (progress.applied_lsn != self.primary.?.lastLsn() or progress.safe_read_lsn != progress.applied_lsn)
-            return error.ProductionHAStandbyNotSafe;
+            return error.ProductionStandbyNotSafe;
     }
 
     pub fn admin(self: *Owners, executor: http.RequestExecutor, uri: []const u8, body: []const u8, expected_status: u16) !void {
@@ -178,8 +178,8 @@ pub const Owners = struct {
         });
         defer response.deinit(self.alloc);
         if (response.status != expected_status) {
-            std.log.err("production HA admin {s}: status={} body={s}", .{ uri, response.status, response.body });
-            return error.ProductionHAAdminStatusMismatch;
+            std.log.err("production standby admin {s}: status={} body={s}", .{ uri, response.status, response.body });
+            return error.ProductionStandbyAdminStatusMismatch;
         }
     }
 
@@ -201,7 +201,7 @@ pub const Owners = struct {
         defer self.alloc.free(body);
         try self.admin(executor, uri, body, 200);
         self.boundary = self.primary.?.lastLsn();
-        if (self.boundary == 0) return error.ProductionHAEmptyPromotionBoundary;
+        if (self.boundary == 0) return error.ProductionStandbyEmptyPromotionBoundary;
     }
 
     pub fn standbyAdmin(self: *Owners, executor: http.RequestExecutor, expected_status: u16) !void {
@@ -215,15 +215,15 @@ pub const Owners = struct {
         // ownership over. Both server contexts borrow this stable optional slot.
         self.fences.?.close();
         self.fences = null;
-        self.fences = try ha.fencing.Store.open(self.alloc, fence_path, .{ .wal_options = self.options });
+        self.fences = try hot_standby.fencing.Store.open(self.alloc, fence_path, .{ .wal_options = self.options });
         try self.standbyAdmin(executor, 200);
         if (self.standby != null or self.server.?.ha_promoted_primary == null)
-            return error.ProductionHAPromotionNotAdopted;
+            return error.ProductionStandbyPromotionNotAdopted;
         const promoted = &self.server.?.ha_promoted_primary.?;
         self.promoted_lsn = promoted.lastLsn();
         self.promoted_sound = promoted.identity.timeline_id == 2 and
             promoted.identity.epoch == 2 and promoted.lastLsn() > self.boundary;
-        if (!self.promoted_sound) return error.ProductionHAInvalidPromotion;
+        if (!self.promoted_sound) return error.ProductionStandbyInvalidPromotion;
     }
 
     pub fn stopPrimary(self: *Owners) void {
@@ -259,11 +259,11 @@ pub const Owners = struct {
     }
 };
 
-test "production HA owners stream and promote through public HTTP on VoprIo" {
+test "production standby owners stream and promote through public HTTP on VoprIo" {
     try testProductionOwners(false);
 }
 
-test "production HA owners cancel after promotion and drain all borrowed tasks" {
+test "production standby owners cancel after promotion and drain all borrowed tasks" {
     try testProductionOwners(true);
 }
 
@@ -274,7 +274,7 @@ fn testProductionOwners(cancel_after_promotion: bool) !void {
     const alloc = allocator.allocator();
     var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) namespace for unused ancillary API stores; modeled replication uses VoprIo
     defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ha", .{tmp.sub_path});
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standby", .{tmp.sub_path});
     defer alloc.free(root);
     var vopr_io = try vopr.vopr_io.VoprIo.init(.{ .tasks = .{ .stack_size = 8 * 1024 * 1024 } });
     defer vopr_io.deinit();
@@ -320,33 +320,33 @@ fn testProductionOwners(cancel_after_promotion: bool) !void {
             }
             var client = @import("../common/http/io_http_executor.zig").IoHttpExecutor.init(self.alloc, self.io, .{ .keep_alive = false });
             defer client.deinit();
-            std.debug.print("HA owner: start primary\n", .{});
+            std.debug.print("standby owner: start primary\n", .{});
             try owners.startPrimary(self.backend.ptr());
             try owners.write(client.executor(), owners.primary_uri.?,
                 \\{"inserts":{"before":{"title":"before-promotion"}},"sync_level":"write"}
             );
-            std.debug.print("HA owner: start standby\n", .{});
+            std.debug.print("standby owner: start standby\n", .{});
             try owners.startStandby(self.standby_backend.ptr());
             try owners.catchUp(client.executor(), owners.primary_uri.?);
-            std.debug.print("HA owner: verify replicated document\n", .{});
+            std.debug.print("standby owner: verify replicated document\n", .{});
             try owners.verify(client.executor(), owners.uri.?, "before", "before-promotion");
             try owners.standbyAdmin(client.executor(), 409);
-            std.debug.print("HA owner: fence primary\n", .{});
+            std.debug.print("standby owner: fence primary\n", .{});
             try owners.fence(client.executor(), owners.primary_uri.?);
             try owners.catchUp(client.executor(), owners.primary_uri.?);
-            std.debug.print("HA owner: stop primary\n", .{});
+            std.debug.print("standby owner: stop primary\n", .{});
             owners.stopPrimary();
-            std.debug.print("HA owner: promote standby\n", .{});
+            std.debug.print("standby owner: promote standby\n", .{});
             try owners.promote(client.executor());
             self.promotion_complete = true;
             if (self.cancel_after_promotion) try self.io.sleep(.fromSeconds(3600), .awake);
             try owners.write(client.executor(), owners.uri.?,
                 \\{"inserts":{"after":{"title":"after-promotion"}},"sync_level":"write"}
             );
-            std.debug.print("HA owner: verify replicated document\n", .{});
+            std.debug.print("standby owner: verify replicated document\n", .{});
             try owners.verify(client.executor(), owners.uri.?, "before", "before-promotion");
             try owners.verify(client.executor(), owners.uri.?, "after", "after-promotion");
-            std.debug.print("HA owner: cleanup\n", .{});
+            std.debug.print("standby owner: cleanup\n", .{});
         }
     };
     var worker = Worker{ .alloc = alloc, .io = vopr_io.io(), .backend = &backend, .standby_backend = &standby_backend, .backend_live = &backend_live, .root = root, .cancel_after_promotion = cancel_after_promotion };
@@ -368,17 +368,17 @@ fn testProductionOwners(cancel_after_promotion: bool) !void {
         events.deinit(alloc);
         try vopr_io.scheduler().enumerateReady(&enabled, alloc);
         try enabled.canonicalize();
-        if (enabled.items.items.len == 0) return error.ProductionHADeadlock;
+        if (enabled.items.items.len == 0) return error.ProductionStandbyDeadlock;
         const selected = try choices.source().choose(.{
-            .site_id = vopr.id.stable("choice", "production-ha.scheduler"),
-            .site_name = "production-ha.scheduler",
+            .site_id = vopr.id.stable("choice", "production-standby.scheduler"),
+            .site_name = "production-standby.scheduler",
             .occurrence = step,
             .enabled = enabled.items.items,
         });
         try vopr_io.scheduler().executeReady(selected, &events, alloc);
     } else {
-        std.debug.print("HA owner budget done={} resources={any}\n", .{ worker.done, vopr_io.resourceSnapshot() });
-        return error.ProductionHATransitionBudgetExceeded;
+        std.debug.print("standby owner budget done={} resources={any}\n", .{ worker.done, vopr_io.resourceSnapshot() });
+        return error.ProductionStandbyTransitionBudgetExceeded;
     }
     if (cancel_after_promotion) {
         try std.testing.expectEqual(error.Canceled, worker.failure.?);

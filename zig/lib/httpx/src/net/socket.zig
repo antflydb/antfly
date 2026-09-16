@@ -432,8 +432,11 @@ pub const Socket = struct {
         var operation_result: net.Stream.Reader.Error!usize = undefined;
         var outcomes: [2]Outcome = undefined;
         var select = Io.Select(Outcome).init(self.io, &outcomes);
-        select.async(.operation, netReadTask, .{ self, buffer, &operation_result });
-        select.async(.timer, timeoutTask, .{ self.io, timeout });
+        try select.concurrent(.timer, timeoutTask, .{ self.io, timeout });
+        select.concurrent(.operation, netReadTask, .{ self, buffer, &operation_result }) catch |err| {
+            select.cancelDiscard();
+            return err;
+        };
         const outcome = select.await() catch |err| {
             select.cancelDiscard();
             return err;
@@ -461,8 +464,11 @@ pub const Socket = struct {
         var operation_result: net.Stream.Writer.Error!usize = undefined;
         var outcomes: [2]Outcome = undefined;
         var select = Io.Select(Outcome).init(self.io, &outcomes);
-        select.async(.operation, netWriteTask, .{ self, data, &operation_result });
-        select.async(.timer, timeoutTask, .{ self.io, timeout });
+        try select.concurrent(.timer, timeoutTask, .{ self.io, timeout });
+        select.concurrent(.operation, netWriteTask, .{ self, data, &operation_result }) catch |err| {
+            select.cancelDiscard();
+            return err;
+        };
         const outcome = select.await() catch |err| {
             select.cancelDiscard();
             return err;
@@ -662,6 +668,7 @@ pub const IoReaderHelpers = struct {
 pub const SocketIoReader = struct {
     socket: *Socket,
     reader_iface: Io.Reader,
+    last_read_error: ?anyerror = null,
 
     pub fn init(socket: *Socket, buffer: []u8) SocketIoReader {
         return .{
@@ -687,7 +694,11 @@ pub const SocketIoReader = struct {
         if (dest.len == 0 or dest[0].len == 0) return 0;
         // Route TLS transport reads through Socket.recv so absolute request
         // deadlines and per-request kernel timeout resets apply consistently.
-        const n = p.socket.recv(dest[0]) catch return error.ReadFailed;
+        p.last_read_error = null;
+        const n = p.socket.recv(dest[0]) catch |err| {
+            p.last_read_error = err;
+            return error.ReadFailed;
+        };
         if (n == 0) return error.EndOfStream;
         if (n > data_size) {
             r.end += n - data_size;
@@ -1718,4 +1729,128 @@ test "ChunkedBodyReader handles inner reader that buffers before producing bytes
     const got = try chunked.reader_iface.readSliceShort(out[0..5]);
     try std.testing.expectEqual(@as(usize, 5), got);
     try std.testing.expectEqualStrings("hello", out[0..got]);
+}
+
+const TimedFallbackTest = struct {
+    fn pair(io: Io) ![2]Socket {
+        var handles: [2]posix.fd_t = undefined;
+        const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &handles);
+        if (posix.errno(rc) != .SUCCESS) return error.FixtureSocketPair;
+        return .{ Socket.fromHandle(handles[0], io), Socket.fromHandle(handles[1], io) };
+    }
+
+    fn elapsed(io: Io, start: Io.Timestamp) i64 {
+        return @intCast(@divTrunc(start.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds(), std.time.ns_per_ms));
+    }
+
+    fn healthy(comptime write: bool) !void {
+        var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
+        defer lane.deinit();
+        const io = lane.io();
+        var sockets = try pair(io);
+        defer for (&sockets) |*socket| socket.close();
+        sockets[0].native_timeouts = false;
+        try sockets[0].setRecvTimeout(250);
+        try sockets[0].setSendTimeout(250);
+        if (!write) try sockets[1].sendAll("r");
+        var byte: [1]u8 = undefined;
+        const start = Io.Timestamp.now(io, .awake);
+        const count = if (write) try sockets[0].send("w") else try sockets[0].recv(&byte);
+        const ms = elapsed(io, start);
+        std.debug.print("HEALTHY direction={s} elapsed_ms={d} timeout_ms=250 count={d}\n", .{ if (write) "write" else "read", ms, count });
+        try std.testing.expectEqual(@as(usize, 1), count);
+        if (write) {
+            try std.testing.expectEqual(@as(usize, 1), try sockets[1].recv(&byte));
+            try std.testing.expectEqual(@as(u8, 'w'), byte[0]);
+        } else try std.testing.expectEqual(@as(u8, 'r'), byte[0]);
+        try std.testing.expect(ms < 125);
+    }
+
+    fn fill(handle: posix.fd_t) !void {
+        var data: [65536]u8 = @splat(0x61);
+        var iov: posix.iovec_const = .{ .base = &data, .len = data.len };
+        var message: posix.msghdr_const = .{ .name = null, .namelen = 0, .iov = @ptrCast(&iov), .iovlen = 1, .control = null, .controllen = 0, .flags = 0 };
+        for (0..1024) |_| {
+            const rc = posix.system.sendmsg(handle, &message, posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL);
+            switch (posix.errno(rc)) {
+                .SUCCESS, .INTR => {},
+                .AGAIN => return,
+                else => return error.FixtureBackpressure,
+            }
+        }
+        return error.FixtureBufferDidNotFill;
+    }
+
+    fn stalled(comptime write: bool) !void {
+        var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
+        defer lane.deinit();
+        const io = lane.io();
+        var sockets = try pair(io);
+        defer for (&sockets) |*socket| socket.close();
+        sockets[0].native_timeouts = false;
+        try sockets[0].setRecvTimeout(250);
+        try sockets[0].setSendTimeout(250);
+        if (write) try fill(sockets[0].handle);
+        var byte: [1]u8 = undefined;
+        std.debug.print("STALLED_WAIT direction={s}\n", .{if (write) "write" else "read"});
+        const start = Io.Timestamp.now(io, .awake);
+        if (write) try std.testing.expectError(error.Timeout, sockets[0].send("x")) else try std.testing.expectError(error.Timeout, sockets[0].recv(&byte));
+        const ms = elapsed(io, start);
+        std.debug.print("STALLED_TIMEOUT direction={s} elapsed_ms={d}\n", .{ if (write) "write" else "read", ms });
+        try std.testing.expect(ms >= 125 and ms < 750);
+    }
+
+    fn denied(comptime write: bool, limit: usize) !void {
+        var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(limit) });
+        defer lane.deinit();
+        const io = lane.io();
+        var sockets = try pair(io);
+        defer for (&sockets) |*socket| socket.close();
+        sockets[0].native_timeouts = false;
+        try sockets[0].setRecvTimeout(250);
+        try sockets[0].setSendTimeout(250);
+        if (!write) try sockets[1].sendAll("r");
+        var byte: [1]u8 = undefined;
+        std.debug.print("RESIDUAL_RED admission direction={s} limit={d}\n", .{ if (write) "write" else "read", limit });
+        const start = Io.Timestamp.now(io, .awake);
+        if (write) try std.testing.expectError(error.SendFailed, sockets[0].send("w")) else try std.testing.expectError(error.RecvFailed, sockets[0].recv(&byte));
+        const ms = elapsed(io, start);
+        std.debug.print("ADMISSION_DENIED direction={s} limit={d} elapsed_ms={d}\n", .{ if (write) "write" else "read", limit, ms });
+        try std.testing.expect(ms < 125);
+        if (write) {
+            try sockets[1].setRecvTimeout(25);
+            try std.testing.expectError(error.Timeout, sockets[1].recv(&byte));
+        } else {
+            sockets[0].native_timeouts = true;
+            try std.testing.expectEqual(@as(usize, 1), try sockets[0].recv(&byte));
+            try std.testing.expectEqual(@as(u8, 'r'), byte[0]);
+        }
+    }
+};
+
+test "timed fallback healthy read never runs timer eagerly" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.healthy(false);
+}
+test "timed fallback healthy write never runs timer eagerly" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.healthy(true);
+}
+test "timed fallback stalled read remains bounded at zero async allowance" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.stalled(false);
+}
+test "timed fallback stalled write remains bounded at zero async allowance" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.stalled(true);
+}
+test "timed fallback denied read preserves bytes" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.denied(false, 0);
+    try TimedFallbackTest.denied(false, 1);
+}
+test "timed fallback denied write sends no bytes" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try TimedFallbackTest.denied(true, 0);
+    try TimedFallbackTest.denied(true, 1);
 }
