@@ -19675,11 +19675,17 @@ pub const DB = struct {
         options: types.ArtifactRepairRunOptions,
         durable_repair_id: ?u128,
     ) !ShadowIndexReplacementResult {
-        return self.rebuildIndexWithShadowReplacementOwned(alloc, cfg, options, durable_repair_id) catch |err| switch (err) {
+        var yield_progress = ShadowIndexReplacementResult{};
+        return self.rebuildIndexWithShadowReplacementOwned(alloc, cfg, options, durable_repair_id, &yield_progress) catch |err| switch (err) {
             // A bounded activation pause yielding to readers/writers is not
             // a storage failure. Keep the durable candidate runnable instead
             // of imposing failure backoff on ordinary scheduler contention.
-            error.RepairActivationBudgetExhausted => .{ .yielded = true },
+            // Snapshot work already completed in this turn still belongs in
+            // its result: a resumed candidate will not scan or count it again.
+            error.RepairActivationBudgetExhausted => blk: {
+                yield_progress.yielded = true;
+                break :blk yield_progress;
+            },
             else => return err,
         };
     }
@@ -19690,6 +19696,7 @@ pub const DB = struct {
         cfg: types.IndexConfig,
         options: types.ArtifactRepairRunOptions,
         durable_repair_id: ?u128,
+        yield_progress: *ShadowIndexReplacementResult,
     ) !ShadowIndexReplacementResult {
         try checkArtifactRepairCancelled(options);
         const working_set_plan = if (self.core.index_manager.resource_manager) |manager|
@@ -19881,6 +19888,7 @@ pub const DB = struct {
             (cfg.kind == .dense_vector or cfg.kind == .algebraic) and
             effective_options.yield_check != null;
         var repair_issue_counter: AtomicU64 = .init(0);
+        defer yield_progress.unresolved_artifacts = repair_issue_counter.load(.monotonic);
         var shadow_ctx = AsyncContext{
             .alloc = alloc,
             .io = self.backend_runtime.io(),
@@ -20035,6 +20043,7 @@ pub const DB = struct {
             rebuilt -| persisted_build_reprocessed
         else
             rebuilt;
+        yield_progress.reprocessed = reprocessed_this_pass;
 
         const index_ref = index_manager_mod.ManagedIndexRef{
             .name = cfg.name,
@@ -77905,7 +77914,11 @@ test "db resolver workers recover pending journal targets after reopen without n
         try db.activateResolverReplayRuntimes();
         const io = db.backend_runtime.controlIo() orelse db.backend_runtime.io().?;
         for (0..1000) |_| {
-            if (sink.count() == 2 and !db.promotionStageStats().catch_up_required) break;
+            // Publishing promotion output does not certify the independent
+            // resolution checkpoint/backfill worker has finished its turn.
+            if (sink.count() == 2 and
+                !db.resolutionStageStats().catch_up_required and
+                !db.promotionStageStats().catch_up_required) break;
             try io.sleep(.fromMilliseconds(5), .awake);
         }
         try std.testing.expectEqual(@as(usize, 2), sink.count());
@@ -86392,11 +86405,14 @@ test "db index repair streams graph artifact rebuild in batches" {
         errdefer alloc.free(value);
         try writes.append(alloc, .{ .key = key, .value = value });
     }
-    const other_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "other:a", "graph_other", "links", "other:b");
-    errdefer alloc.free(other_key);
-    const other_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, db.core.index_manager.graphIndex("graph_other").?.config.coverage_generation, 1.0, 0, 0, "");
-    errdefer alloc.free(other_value);
-    try writes.append(alloc, .{ .key = other_key, .value = other_value });
+    {
+        const other_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "other:a", "graph_other", "links", "other:b");
+        errdefer alloc.free(other_key);
+        const other_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, db.core.index_manager.graphIndex("graph_other").?.config.coverage_generation, 1.0, 0, 0, "");
+        errdefer alloc.free(other_value);
+        // After append the list owns both allocations, including on failure.
+        try writes.append(alloc, .{ .key = other_key, .value = other_value });
+    }
     try db.core.store.putBatch(writes.items, &.{});
 
     // The restore/split entry point uses the same bounded streaming path as
@@ -86414,19 +86430,45 @@ test "db index repair streams graph artifact rebuild in batches" {
     try std.testing.expectEqualStrings("other:b", other_edges[0].target);
 
     test_graph_repair_stream_flushes.store(0, .monotonic);
-    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+    // Force an activation yield independently of host speed: one millisecond
+    // cannot cover the five-millisecond publication reserve. The completed
+    // snapshot work must still be reported and remain reusable after reopen.
+    var repair = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
         .target = .index,
         .artifact_kind = .graph,
         .index_name = "graph_stream",
         .limit = 1,
         .force = true,
-    });
+    }, .{ .max_activation_pause_ms = 1 });
     defer repair.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
     try std.testing.expectEqual(@as(u64, @intCast(total_edges)), repair.reprocessed);
-    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
-    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 0), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 0), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 1), repair.in_progress);
+    try std.testing.expectEqual(@as(u64, 0), repair.failed);
+    try std.testing.expect(repair.debt_remaining);
     try std.testing.expectEqual(@as(u64, 2), test_graph_repair_stream_flushes.load(.monotonic));
+
+    const repair_id = (try db.indexRepairIdForIndex(alloc, "graph_stream")) orelse return error.TestUnexpectedResult;
+    var pending = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, total_edges), pending.intent.build_reprocessed);
+    try std.testing.expectEqual(@as(u32, 0), pending.intent.failure_streak);
+    try std.testing.expectEqual(@as(u64, 0), pending.intent.next_retry_at_ms);
+    try std.testing.expect(pending.intent.last_error == null);
+    try std.testing.expect(pending.intent.candidate_relative_path != null);
+
+    db.close();
+    db = try DB.open(alloc, std.mem.span(path), .{});
+    test_graph_repair_stream_flushes.store(0, .monotonic);
+    const resumed = try db.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
+    try std.testing.expect(resumed.repaired);
+    try std.testing.expectEqual(@as(u64, 1), resumed.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 0), resumed.documents_reprocessed);
+    try std.testing.expectEqual(@as(u64, 0), test_graph_repair_stream_flushes.load(.monotonic));
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+    try std.testing.expect(try db.core.index_manager.isRepairCandidateActive("graph_stream", pending.intent.candidate_relative_path.?));
 
     const last_source = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{total_edges - 1});
     defer alloc.free(last_source);

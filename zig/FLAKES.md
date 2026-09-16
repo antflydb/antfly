@@ -4,6 +4,52 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-15: graph repair yield accounting and independent resolver completion
+
+PR #704's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35044256661/job/104631027746)
+at `95b0e74334` failed `db index repair streams graph artifact rebuild in batches`
+with `expected 2051, found 0`, then aborted while freeing the fixture's writes.
+The separate DB-core partition failed
+`db resolver workers recover pending journal targets after reopen without new writes`
+because resolution still required catch-up. The previous replay-truncation
+regression completed; this run did not hit the idle watchdog.
+
+The graph repair wrapper converted activation-budget exhaustion into an empty
+`yielded` result, dropping the work count even after durable snapshot construction.
+A one-millisecond activation budget deterministically forces this path because it
+cannot cover the five-millisecond publication reserve. The graph batching
+regression now exercises that yield, checks retained work and candidate state,
+reopens the DB, and verifies activation reuses the same candidate without another
+batch flush or recounting previously completed work. The wrapper retains the
+current turn's completed-work and discovered-artifact-debt counts on a deadline
+yield. This adds no scans or storage I/O. Production pause limits and retry policy
+remain unchanged. The original CI log did not retain repair state,
+so it cannot independently prove which early-return path produced its zero count.
+
+The fixture also left function-scoped `errdefer` frees armed after handing its
+last key/value pair to the writes list. A later assertion error freed that pair
+twice. Allocation-to-list transfer now has a local scope, so assertion failures
+report normally and the list remains the sole owner after append.
+
+Resolver output publication and resolution checkpoint/backfill completion are
+independent. The test waited for promotion and two sink writes, then immediately
+asserted resolution was idle. Its completion condition now checks both stages;
+it keeps the existing bounded wait and still tests automatic recovery without
+new writes for both pending-resolution and pending-promotion reopen cases.
+
+Before the production accounting fix, the forced graph-yield test failed with
+`expected 2051, found 0`; the corrected fixture cleanup reported that assertion
+normally, without an abort or leaks. Repeating the two original tests against
+`95b0e74334` reproduced the resolver failure in fresh process 75 (74 prior passes).
+
+After the fix, all 20 focused repair/resolver tests passed in ReleaseSafe,
+including graph and full-text replacement, corrupt-artifact debt, activation
+budget yielding, and dense candidate yield/reopen accounting. The graph-yield
+and resolver-reopen cases passed **200/200 fresh processes (400 selected test
+executions)** with four concurrent processes, no skips, failures, or leaks.
+Formatting and diff checks passed. These are local regression results; standard
+CI and full-soak qualification must be checked separately for the pushed commit.
+
 ## 2026-09-15: merged runtime-lane assertions and replay fixture deadlock
 
 PR #704's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35025324900/job/104571966002)
