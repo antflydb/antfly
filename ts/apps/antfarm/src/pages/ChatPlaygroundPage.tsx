@@ -123,6 +123,14 @@ const ChatPlaygroundPage: React.FC = () => {
     () => typeof window !== "undefined" && window.innerWidth >= 1024
   );
   const effectiveGenerator = generatorOverride ?? dashboardGenerator ?? null;
+  const requestGenerator =
+    effectiveGenerator?.provider === "openrouter"
+      ? {
+          ...effectiveGenerator,
+          url: "https://openrouter.ai/api/v1",
+          api_key: "${secret:openrouter.api_key}",
+        }
+      : effectiveGenerator;
   const { label: inheritedGeneratorLabel, description: inheritedGeneratorDescription } =
     getInheritedGeneratorLabels(dashboardGenerator);
 
@@ -418,11 +426,11 @@ const ChatPlaygroundPage: React.FC = () => {
               <CardTitle className="text-lg">Chat</CardTitle>
             </CardHeader>
             <CardContent className="flex-1 overflow-hidden flex flex-col p-0">
-              {effectiveGenerator ? (
+              {requestGenerator ? (
                 <ChatBar
                   key={chatKey}
                   id="chat-playground"
-                  generator={effectiveGenerator}
+                  generator={requestGenerator}
                   table={selectedTable}
                   semanticIndexes={chatIndexes.length > 0 ? chatIndexes : undefined}
                   agentKnowledge={agentKnowledge || undefined}

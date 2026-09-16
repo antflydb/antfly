@@ -14,6 +14,7 @@ components:
         - vertex
         - ollama
         - openai
+        - openrouter
         - antfly
       description: "Generator providers implemented by Antfly's generation runtime."
 
@@ -27,6 +28,7 @@ components:
             - $ref: "#/components/schemas/OllamaGeneratorConfig"
             - $ref: "#/components/schemas/AntflyGeneratorConfig"
             - $ref: "#/components/schemas/OpenAIGeneratorConfig"
+            - $ref: "#/components/schemas/OpenRouterGeneratorConfig"
         - properties:
             rate_limit:
               x-go-type-skip-optional-pointer: false

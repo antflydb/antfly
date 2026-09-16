@@ -20108,6 +20108,52 @@ components:
       required:
         - provider
         - model
+    OpenRouterGeneratorConfig:
+      type: object
+      description: >
+        Configuration for the OpenRouter generative AI provider.
+      properties:
+        model:
+          type: string
+          description: Single model identifier. Either model or models must be provided.
+          example: openai/gpt-4.1
+        models:
+          type: array
+          items:
+            type: string
+          description: >
+            Array of model identifiers for fallback routing. Either model or models must be provided.
+        api_key:
+          type: string
+          writeOnly: true
+          description: The OpenRouter API key.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-2.0).
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate in the response.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter (0.0-1.0).
+          minimum: 0.0
+          maximum: 1.0
+        frequency_penalty:
+          type: number
+          format: float
+          description: Penalty for token frequency (-2.0 to 2.0).
+          minimum: -2.0
+          maximum: 2.0
+        presence_penalty:
+          type: number
+          format: float
+          description: Penalty for token presence (-2.0 to 2.0).
+          minimum: -2.0
+          maximum: 2.0
     GeneratorProvider:
       type: string
       enum:
@@ -20115,6 +20161,7 @@ components:
         - vertex
         - ollama
         - openai
+        - openrouter
         - antfly
       description: Generator providers implemented by Antfly's generation runtime.
     GeneratorConfig:
@@ -20127,6 +20174,7 @@ components:
             - $ref: '#/components/schemas/OllamaGeneratorConfig'
             - $ref: '#/components/schemas/AntflyGeneratorConfig'
             - $ref: '#/components/schemas/OpenAIGeneratorConfig'
+            - $ref: '#/components/schemas/OpenRouterGeneratorConfig'
         - properties:
             rate_limit:
               x-go-type-skip-optional-pointer: false
