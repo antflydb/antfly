@@ -165,7 +165,9 @@ pub const Job = struct {
                         return;
                     }
                     const output = &outputs[self.index];
-                    if (self.requested_gc and (output.tombstone_count orelse 0) != 0) output.gc_requested = true;
+                    // A full overlap rewrite discharges both tombstones and
+                    // superseded-value requests. Partial outputs keep the intent.
+                    output.gc_requested = !self.plan.tombstone_gc and (self.requested_gc or output.gc_requested);
                     const names = (if (output.path) |path| path.len else 0) + output.smallest_key.len + output.largest_key.len +
                         (if (output.smallest_namespace_name) |name| name.len else 0) + (if (output.largest_namespace_name) |name| name.len else 0);
                     try self.admitNames(names + (if (output.state) |*state| state.estimatedMemoryBytes() else 0));

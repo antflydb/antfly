@@ -8155,6 +8155,11 @@ pub const DataServer = struct {
                 self.dense_posting_maintenance_next_eligible_ns.store(posting_now_ns +| next_delay_ns, .release);
                 if (posting.repaired > 0) {
                     std.log.info("dense posting maintenance repaired steps={d} scanned={d} pending={}", .{ posting.repaired, posting.scanned, posting.pending });
+                }
+                // A read-only sweep can certify refresh completion without
+                // repairing anything (especially after reopen). Publish that
+                // status transition too; certified idle rounds scan zero rows.
+                if (posting.repaired > 0 or posting.scanned > 0) {
                     self.runtime_status_dirty.store(true, .release);
                     self.markStoreStatusDirtyImmediate();
                 }

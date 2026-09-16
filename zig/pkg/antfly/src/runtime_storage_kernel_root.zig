@@ -37,6 +37,14 @@ fn liteEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "lite", runLite);
 }
 
+fn runStorage(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
+    return @import("cmd/storage.zig").runFromIterator(init, args);
+}
+
+fn storageEntry(context: *const bridge.Context) callconv(.c) c_int {
+    return runtimeEntry(context, "storage", runStorage);
+}
+
 comptime {
     // The kernel owns physical DB and local-query compilation plus
     // the C API. Product-mode orchestration stays in the distributed
@@ -45,6 +53,7 @@ comptime {
     _ = storage_kernel_exports;
     exportInternal(&storage_kernel_exports.storageOwnerMergeArtifactsPage, "antfly_storage_owner_merge_artifacts_page");
     exportInternal(&liteEntry, "antfly_runtime_lite");
+    exportInternal(&storageEntry, "antfly_runtime_storage");
     exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
     exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
     exportInternal(&@import("storage/db/enrichment/enrichment_types.zig").interactiveActivity, "antfly_storage_interactive_activity");
@@ -154,6 +163,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerGraphEdgesJson, "antfly_storage_owner_graph_edges_json");
     exportInternal(&storage_kernel_exports.storageOwnerDocumentArtifactManifestJson, "antfly_storage_owner_document_artifact_manifest_json");
     exportInternal(&storage_kernel_exports.storageOwnerDocumentArtifactManifestsJson, "antfly_storage_owner_document_artifact_manifests_json");
+    exportInternal(&storage_kernel_exports.storageOwnerVectorMigrationJson, "antfly_storage_owner_vector_migration_json");
     exportInternal(&storage_kernel_exports.storageOwnerArtifactOperationJson, "antfly_storage_owner_artifact_operation_json");
     exportInternal(&storage_kernel_exports.storageOwnerRuntimeStatusJson, "antfly_storage_owner_runtime_status_json");
     exportInternal(&storage_kernel_exports.storageOwnerObservedDynamicFieldCapabilitySetsJson, "antfly_storage_owner_observed_dynamic_field_capability_sets_json");

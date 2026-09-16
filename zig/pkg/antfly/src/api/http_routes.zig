@@ -551,6 +551,22 @@ pub const Routes = struct {
         return matchTableArtifactRepairWithSuffix(path, artifact_repair_suffix);
     }
 
+    pub fn matchTableStorageMigration(path: []const u8) ?TableArtifactRepair {
+        return matchTableArtifactRepairWithSuffix(path, "/storage/migrations");
+    }
+
+    pub const TableStorageMigrationJob = struct { table_name: []const u8, job_id: []const u8 };
+    pub fn matchTableStorageMigrationJob(path: []const u8) ?TableStorageMigrationJob {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        const tail = path[tables_prefix.len..];
+        const separator = std.mem.indexOfScalar(u8, tail, '/') orelse return null;
+        const suffix = "/storage/migrations/";
+        if (separator == 0 or !std.mem.startsWith(u8, tail[separator..], suffix)) return null;
+        const job_id = tail[separator + suffix.len ..];
+        if (job_id.len == 0 or std.mem.indexOfScalar(u8, job_id, '/') != null) return null;
+        return .{ .table_name = tail[0..separator], .job_id = job_id };
+    }
+
     pub fn matchTableArtifactRepairRun(path: []const u8) ?TableArtifactRepair {
         return matchTableArtifactRepairWithSuffix(path, artifact_repair_run_suffix);
     }

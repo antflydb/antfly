@@ -6088,6 +6088,7 @@ pub const BoundTableWriteSource = struct {
                 .repair_artifact_issues = repairArtifactIssues,
                 .repair_artifact_issues_controlled = repairArtifactIssuesControlled,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .vector_migration_group_local = vectorMigrationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
@@ -6182,6 +6183,15 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
         return try (try self.activeDb()).repairArtifactIssuesWithRequestOptions(alloc, req, options);
+    }
+
+    fn vectorMigrationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        _ = group_id;
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        var command = try std.json.parseFromSlice(@import("../common/vector_migration.zig").Command, alloc, request_json, .{});
+        defer command.deinit();
+        return try (try self.activeDb()).vectorMigrationCommand(alloc, command.value);
     }
 
     fn listArtifactRepairIssuesGroupLocal(
@@ -20628,6 +20638,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .vector_migration_group_local = vectorMigrationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
@@ -24887,6 +24898,19 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
+    fn vectorMigrationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime !control_only_storage_sources) {
+            if (self.localWriteOwnerSource()) |owner_source| return try owner_source.vectorMigrationGroupLocal(alloc, group_id, table_name, request_json);
+        }
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+        const owner_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+        return try owner_source.vectorMigrationGroupLocal(alloc, group_id, table_name, request_json);
+    }
+
     fn listArtifactRepairIssuesGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -25744,6 +25768,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .vector_migration_group_local = vectorMigrationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
@@ -27463,6 +27488,12 @@ pub const HostedProvisionedTableWriteSource = struct {
             self.invalidateManagedCache(table_name);
         }
         return result;
+    }
+
+    fn vectorMigrationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+        return try owner_source.vectorMigrationGroupLocal(alloc, group_id, table_name, request_json);
     }
 
     fn listArtifactRepairIssuesGroupLocal(

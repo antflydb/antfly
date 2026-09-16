@@ -73,6 +73,12 @@ pub const SegmentSizing = struct {
 };
 
 pub const Store = struct {
+    /// Candidate references are protected by the durable migration job until
+    /// all primary rows and their final reference coverage have been verified.
+    migration_retention: std.atomic.Value(bool) = .init(false),
+    migration_disk_reserve: std.atomic.Value(u64) = .init(0),
+    migration_temporary_limit: std.atomic.Value(u64) = .init(0),
+
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     publication_mutex: std.atomic.Mutex = .unlocked,
@@ -259,6 +265,20 @@ pub const Store = struct {
         self.lockPublication();
         self.published_poisoned = poisoned;
         self.publication_mutex.unlock();
+    }
+
+    pub fn beginMigrationRetention(self: *Store) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        // A collector may be staging outside the mutex. Admit only after its
+        // owner retires; atomic publication then prevents the next collector.
+        if (self.marking != null or self.collection != null or self.retiring != null or self.checkpoint_running)
+            return error.StorageBusy;
+        self.migration_retention.store(true, .release);
+    }
+
+    pub fn setMigrationRetention(self: *Store, active: bool) void {
+        self.migration_retention.store(active, .release);
     }
 
     pub fn poison(self: *Store) void {
@@ -1632,6 +1652,13 @@ pub const Store = struct {
 
     fn prepareBatch(self: *Store, prepared: []const payload.Prepared) !void {
         if (self.read_only) return error.ReadOnly;
+        const reserve = self.migration_disk_reserve.load(.acquire);
+        if (reserve != 0) {
+            var bytes: u64 = 0;
+            for (prepared) |item| bytes +|= @as(u64, item.artifact.len) *| 8;
+            const capacity = try @import("antfly_platform").filesystem.capacity(self.opened.store.root_dir);
+            if (capacity.available_bytes < reserve +| bytes) return error.VectorMigrationDiskReserve;
+        }
         // Decode independent artifact envelopes before entering source writer
         // exclusion. Each request has its own allocator reservation.
         var local_budget: ?resources.BudgetedAllocator = if (self.group_commit and self.preparation_manager != null)
@@ -1651,6 +1678,12 @@ pub const Store = struct {
         defer self.mutex.unlock();
         self.waitWriteAdmissionLocked();
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        const limit = self.migration_temporary_limit.load(.acquire);
+        if (limit != 0) {
+            var retained = self.stats.retained_payload_bytes;
+            for (prepared) |item| retained +|= item.artifact.len;
+            if (retained > limit / 8) return error.VectorMigrationTemporaryBudgetExceeded;
+        }
         const started = time.monotonicNs();
         self.stats.prepare_lock_wait_ns += started -| lock_started;
         if (self.group_commit) self.stats.decode_outside_lock_ns += lock_started -| decode_started;
@@ -2233,6 +2266,7 @@ pub const Store = struct {
     fn collectStepLocked(self: *Store, primary: *erased.Store, budget_bytes: u64, background: bool) !bool {
         if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        if (self.migration_retention.load(.acquire)) return false;
         if (self.checkpoint_running or self.retiring != null) {
             self.stats.collection_deferrals += 1;
             return false;
