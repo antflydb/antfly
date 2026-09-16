@@ -114,8 +114,15 @@ The small controller/admission jobs consume some GitHub-hosted minutes, includin
 on draft PR events. No ARC, GPU, or test job starts from those events without a
 valid approval. The controller does not keep a runner waiting for a person.
 
-PR execution is restricted to same-repository PRs because these workflows use
-self-hosted runners. Ordinary test suites do not inherit repository secrets.
+Antfly accepts both same-repository and fork PRs through this approval flow.
+Approval requires write access to the target repository, not merely the fork.
+Trusted workflow definitions come from the default branch; test checkouts fetch
+the approved head SHA through the target repository and do not persist Git
+credentials. New commits require fresh approval.
+
+Approving a fork commit authorizes that code to execute on self-hosted runners.
+Review the code before approving; this gate does not sandbox approved code.
+Ordinary test suites do not inherit repository secrets.
 Colony's approved infrastructure and benchmark previews retain the credentials
 they need; approving these suites also approves running that PR code with those
 credentials. Review those changes before authorizing them.

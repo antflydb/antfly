@@ -31,9 +31,13 @@ function selectSuites(files, pr, config) {
 
 function validatePR(pr, repo) {
   if (pr.state !== 'open' || pr.draft) throw new Error('PR must be open and non-draft.');
-  if (pr.head.repo?.full_name !== repo || pr.base.repo.full_name !== repo) {
-    throw new Error('Self-hosted PR CI supports same-repository PRs only.');
+  if (pr.base.repo?.full_name !== repo) {
+    throw new Error('PR must target this repository.');
   }
+  if (!pr.head.repo?.full_name) throw new Error('PR head repository is unavailable.');
+  // Fork commits are fetched by immutable SHA through the base repository's
+  // PR object graph. Approval grants execution of that exact commit, regardless
+  // of its source repository; workflow definitions still come from main.
 }
 
 function validateSnapshot(pr, approval, config) {
