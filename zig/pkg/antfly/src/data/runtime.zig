@@ -37756,8 +37756,13 @@ fn consumerTests() type {
 
             fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
-                if (request.method != .POST or !std.mem.endsWith(u8, request.uri, "/internal/v1/catalog/linearizable-snapshot"))
+                if (request.method != .POST or !std.mem.endsWith(u8, request.uri, @import("../metadata/snapshot_transfer.zig").path))
                     return error.UnexpectedSnapshotDeadlineRequest;
+                var transfer = try std.json.parseFromSlice(@import("../metadata/snapshot_transfer.zig").Request, allocator, request.body, .{});
+                defer transfer.deinit();
+                if (transfer.value.release) return .{ .status = 204 };
+                try std.testing.expect(transfer.value.control and transfer.value.linearizable);
+                try std.testing.expectEqual(@as(u64, 0), transfer.value.token);
                 self.calls += 1;
                 self.timeout_ms = request.timeout_ms;
                 if (self.clock) |clock| try clock.advance(self.advance_ns);
@@ -37777,8 +37782,20 @@ fn consumerTests() type {
                     try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, acceptance);
                 }
                 const body = try std.json.Stringify.valueAlloc(allocator, snapshot(8), .{});
+                errdefer allocator.free(body);
+                var response: antfly.common.http.HttpResponse = .{ .status = 200, .body = body };
+                response.headers = try allocator.alloc(antfly.common.http.Header, 2);
+                @memset(response.headers, .{ .name = &.{}, .value = &.{} });
+                errdefer {
+                    response.body = &.{};
+                    response.deinit(allocator);
+                }
+                response.headers[0].name = try allocator.dupe(u8, "X-Antfly-Snapshot-Token");
+                response.headers[0].value = try allocator.dupe(u8, "2");
+                response.headers[1].name = try allocator.dupe(u8, "X-Antfly-Snapshot-Bytes");
+                response.headers[1].value = try std.fmt.allocPrint(allocator, "{d}", .{body.len});
                 if (self.activity_allocator) |owner| owner.mutation = self.clone_mutation;
-                return .{ .status = 200, .body = body };
+                return response;
             }
 
             fn expectUnpublished(source: *RemoteMetadataSource) !void {
@@ -37988,7 +38005,8 @@ fn consumerTests() type {
             defer source.deinit();
             var result = (try RemoteMetadataSource.remoteLinearizableSnapshot(&source, .{})) orelse return error.ExpectedLinearizableSnapshot;
             defer freeAdminSnapshotOwned(source.alloc, &result);
-            try std.testing.expectEqual(@as(?u32, 10_000), fixture.timeout_ms);
+            // Each transfer page has a five-second transport cap within the ten-second read budget.
+            try std.testing.expectEqual(@as(?u32, 5_000), fixture.timeout_ms);
             try std.testing.expectEqual(@as(usize, 1), fixture.calls);
             try std.testing.expectEqual(@as(u64, 8), source.cached_snapshot.?.status.metadata_epoch);
         }
