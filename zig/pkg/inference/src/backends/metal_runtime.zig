@@ -32139,6 +32139,186 @@ test "metal native decoderRuntimeApplyLinear tl2 matches trivial reference" {
     try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(in_dim)), actual[out_dim - 1], 1e-3);
 }
 
+fn testQ8Rows(comptime rows: usize, comptime dim: usize, seed: i16) [rows * (2 + dim)]u8 {
+    var raw: [rows * (2 + dim)]u8 = undefined;
+    for (0..rows) |row| {
+        const base = row * (2 + dim);
+        raw[base + 0] = 0x00;
+        raw[base + 1] = 0x3C; // f16 1.0
+        for (0..dim) |col| {
+            const signed = @as(i16, @intCast((row * 5 + col * 3) % 13)) - 6 + seed;
+            raw[base + 2 + col] = @bitCast(@as(i8, @intCast(signed)));
+        }
+    }
+    return raw;
+}
+
+fn testQ8Value(raw: []const u8, dim: usize, row: usize, col: usize) f32 {
+    const v: i8 = @bitCast(raw[row * (2 + dim) + 2 + col]);
+    return @floatFromInt(v);
+}
+
+/// q4_0 rows of one 32-wide block: f16 scale 1.0 then 16 bytes holding
+/// element j in the low nibble and j + 16 in the high nibble, value = nibble - 8.
+fn testQ4Rows(comptime rows: usize, seed: i16) [rows * 18]u8 {
+    var raw: [rows * 18]u8 = undefined;
+    for (0..rows) |row| {
+        const base = row * 18;
+        raw[base + 0] = 0x00;
+        raw[base + 1] = 0x3C;
+        for (0..16) |j| {
+            const lo = @as(i16, @intCast((row * 7 + j * 5) % 15)) - 7 + seed;
+            const hi = @as(i16, @intCast((row * 3 + j * 11) % 15)) - 7 + seed;
+            raw[base + 2 + j] = @as(u8, @intCast(lo + 8)) | (@as(u8, @intCast(hi + 8)) << 4);
+        }
+    }
+    return raw;
+}
+
+fn testQ4Value(raw: []const u8, row: usize, col: usize) f32 {
+    const byte = raw[row * 18 + 2 + (col % 16)];
+    const nibble: i16 = if (col < 16) @intCast(byte & 0x0F) else @intCast(byte >> 4);
+    return @floatFromInt(nibble - 8);
+}
+
+test "metal native quantized projections write in place into slab rows" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const dim: usize = 32;
+    const q_raw = testQ8Rows(dim, dim, 0);
+    const k_raw = testQ8Rows(dim, dim, 2);
+    const v_raw = testQ8Rows(dim, dim, -3);
+    const k4_raw = testQ4Rows(dim, 1);
+    const shape = [_]i64{ 1, @intCast(dim), @intCast(dim) };
+    const q_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &q_raw, .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator };
+    const k_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &k_raw, .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator };
+    const v_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &v_raw, .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator };
+    const k4_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q4_0 }, .raw_bytes = &k4_raw, .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator };
+
+    // Nonzero biases so the in-place epilogue is exercised, not elided.
+    var q_bias_data: [dim]f32 = undefined;
+    var k_bias_data: [dim]f32 = undefined;
+    var v_bias_data: [dim]f32 = undefined;
+    var k4_bias_data: [dim]f32 = undefined;
+    for (0..dim) |i| {
+        q_bias_data[i] = 0.25 * @as(f32, @floatFromInt(i));
+        k_bias_data[i] = 0.5 - 0.125 * @as(f32, @floatFromInt(i));
+        v_bias_data[i] = -0.75 + 0.0625 * @as(f32, @floatFromInt(i));
+        k4_bias_data[i] = 1.5 * @as(f32, @floatFromInt(i % 4));
+    }
+    var q_bias = try MetalTensor.ownedCloneFrom(&q_bias_data, &[_]i32{@intCast(dim)});
+    defer q_bias.deinit();
+    var k_bias = try MetalTensor.ownedCloneFrom(&k_bias_data, &[_]i32{@intCast(dim)});
+    defer k_bias.deinit();
+    var v_bias = try MetalTensor.ownedCloneFrom(&v_bias_data, &[_]i32{@intCast(dim)});
+    defer v_bias.deinit();
+    var k4_bias = try MetalTensor.ownedCloneFrom(&k4_bias_data, &[_]i32{@intCast(dim)});
+    defer k4_bias.deinit();
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var stats: ops.NativeQuantTimingStats = .{};
+    const slots = [_]struct { slot: usize, storage: *const QuantizedStorage, bias: MetalTensor }{
+        .{ .slot = 0, .storage = &q_storage, .bias = q_bias },
+        .{ .slot = 1, .storage = &k_storage, .bias = k_bias },
+        .{ .slot = 2, .storage = &v_storage, .bias = v_bias },
+        .{ .slot = 3, .storage = &k4_storage, .bias = k4_bias },
+    };
+    for (slots) |entry| {
+        try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+            .weight = dummy_weight,
+            .bias = entry.bias,
+            .quantized_storage = @as(?*const QuantizedStorage, entry.storage),
+            .slot = entry.slot,
+            .in_dim = dim,
+            .out_dim = dim,
+            .retain_dense_fallback = false,
+        }, &stats));
+    }
+
+    var x_data: [dim]f32 = undefined;
+    for (&x_data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 11)) - 5)) / 4.0;
+    var x = try testDeviceTensorFromSlice(runtime, &x_data, &[_]i32{ 1, @intCast(dim) });
+    defer x.deinit();
+
+    const Ref = struct {
+        fn dot(raw: []const u8, dim_: usize, row: usize, input: []const f32, q4: bool) f32 {
+            var acc: f32 = 0;
+            for (0..dim_) |col| {
+                const w = if (q4) testQ4Value(raw, row, col) else testQ8Value(raw, dim_, row, col);
+                acc += w * input[col];
+            }
+            return acc;
+        }
+    };
+
+    // A four-row slab filled with a sentinel; K lands in row 2 and V in row 1.
+    const slab_rows: usize = 4;
+    const sentinel: f32 = 7.0;
+    const sentinel_data = [_]f32{sentinel} ** (slab_rows * dim);
+    var slab = try testDeviceTensorFromSlice(runtime, &sentinel_data, &[_]i32{ @intCast(slab_rows), @intCast(dim) });
+    defer slab.deinit();
+    const row_bytes = dim * @sizeOf(f32);
+    var k_view = try slab.retainedView(2 * row_bytes, row_bytes, &[_]i32{ 1, @intCast(dim) });
+    defer k_view.deinit();
+    var v_view = try slab.retainedView(1 * row_bytes, row_bytes, &[_]i32{ 1, @intCast(dim) });
+    defer v_view.deinit();
+
+    // Uniform q8_0: the fused kernel.
+    var q = (try tryApplyQuantizedRuntimeLinearQkvInto(&provider, 0, 1, 2, x, dim, dim, dim, k_view, v_view)) orelse return error.UnexpectedNull;
+    defer q.deinit();
+    {
+        var q_mut = q;
+        const q_host = try tensorHostSlice(&q_mut);
+        var slab_mut = slab;
+        const slab_host = try tensorHostSlice(&slab_mut);
+        try std.testing.expectEqual(@as(usize, slab_rows * dim), slab_host.len);
+        for (0..dim) |col| {
+            try std.testing.expectApproxEqAbs(Ref.dot(&q_raw, dim, col, &x_data, false) + q_bias_data[col], q_host[col], 1e-3);
+            try std.testing.expectApproxEqAbs(Ref.dot(&k_raw, dim, col, &x_data, false) + k_bias_data[col], slab_host[2 * dim + col], 1e-3);
+            try std.testing.expectApproxEqAbs(Ref.dot(&v_raw, dim, col, &x_data, false) + v_bias_data[col], slab_host[1 * dim + col], 1e-3);
+            try std.testing.expectEqual(sentinel, slab_host[0 * dim + col]);
+            try std.testing.expectEqual(sentinel, slab_host[3 * dim + col]);
+        }
+    }
+
+    // Mixed formats (q8_0 Q, q4_0 K, q8_0 V) take the separate-kernel path,
+    // still in place. Row 3 is overwritten by a single in-place projection.
+    var slab2 = try testDeviceTensorFromSlice(runtime, &sentinel_data, &[_]i32{ @intCast(slab_rows), @intCast(dim) });
+    defer slab2.deinit();
+    var k2_view = try slab2.retainedView(2 * row_bytes, row_bytes, &[_]i32{ 1, @intCast(dim) });
+    defer k2_view.deinit();
+    var v2_view = try slab2.retainedView(1 * row_bytes, row_bytes, &[_]i32{ 1, @intCast(dim) });
+    defer v2_view.deinit();
+    var row3_view = try slab2.retainedView(3 * row_bytes, row_bytes, &[_]i32{ 1, @intCast(dim) });
+    defer row3_view.deinit();
+    var q2 = (try tryApplyQuantizedRuntimeLinearQkvInto(&provider, 0, 3, 2, x, dim, dim, dim, k2_view, v2_view)) orelse return error.UnexpectedNull;
+    defer q2.deinit();
+    try std.testing.expect(try tryApplyQuantizedRuntimeLinearInto(&provider, 2, x, 1, dim, dim, row3_view));
+    {
+        var q_mut = q2;
+        const q_host = try tensorHostSlice(&q_mut);
+        var slab_mut = slab2;
+        const slab_host = try tensorHostSlice(&slab_mut);
+        for (0..dim) |col| {
+            try std.testing.expectApproxEqAbs(Ref.dot(&q_raw, dim, col, &x_data, false) + q_bias_data[col], q_host[col], 1e-3);
+            try std.testing.expectApproxEqAbs(Ref.dot(&k4_raw, dim, col, &x_data, true) + k4_bias_data[col], slab_host[2 * dim + col], 1e-3);
+            try std.testing.expectApproxEqAbs(Ref.dot(&v_raw, dim, col, &x_data, false) + v_bias_data[col], slab_host[1 * dim + col], 1e-3);
+            try std.testing.expectApproxEqAbs(Ref.dot(&v_raw, dim, col, &x_data, false) + v_bias_data[col], slab_host[3 * dim + col], 1e-3);
+            try std.testing.expectEqual(sentinel, slab_host[0 * dim + col]);
+        }
+    }
+
+    // Dense slots are declined so the caller can try the dense path.
+    try std.testing.expect(!(try tryApplyQuantizedRuntimeLinearInto(&provider, 9, x, 1, dim, dim, row3_view)));
+}
+
 test "metal native quant row ops q8_0 linear slot match reference" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
