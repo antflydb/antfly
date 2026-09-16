@@ -213,20 +213,27 @@ pub const Session = struct {
 
             const first = segments[0];
             const closed = segments.len > 1 or (self.buffer.items.len - first.end >= min_silence);
-            if (closed or commit) {
-                try self.finalize(transcriber, events, first.start, first.end);
-                self.drop(first.end);
-                continue;
-            }
+            const settled = closed or commit;
 
-            // Open segment reaching the buffer end.
-            const speech_len = self.buffer.items.len - first.start;
-            if (speech_len >= max_segment) {
+            // Speech longer than one decode window is cut at the quietest
+            // point in the window's last quarter, whether it is still open
+            // or already settled (a long utterance followed by silence, or
+            // a commit): a decode covers at most max_segment, so a longer
+            // span would lose its tail.
+            const span_end = if (settled) first.end else self.buffer.items.len;
+            const span_len = span_end - first.start;
+            if (if (settled) span_len > max_segment else span_len >= max_segment) {
                 const search_lo = first.start + (max_segment / 4) * 3;
                 var split = vad.quietestSplit(self.buffer.items, rate, search_lo, first.start + max_segment, self.config.vad);
                 if (split <= first.start) split = first.start + max_segment;
                 try self.finalize(transcriber, events, first.start, split);
                 self.drop(split);
+                continue;
+            }
+
+            if (settled) {
+                try self.finalize(transcriber, events, first.start, first.end);
+                self.drop(first.end);
                 continue;
             }
 
@@ -552,6 +559,50 @@ test "streaming session force-splits speech longer than max_segment" {
     }
     try std.testing.expectEqual(events.items[0].end_ms, events.items[1].start_ms);
     try std.testing.expect(session.stats().buffered_ms >= 900);
+}
+
+test "streaming session splits settled speech longer than max_segment" {
+    const allocator = std.testing.allocator;
+    const speech = try toneChunk(allocator, 7000, 0.2);
+    defer allocator.free(speech);
+    const silence = try toneChunk(allocator, 1000, 0.0);
+    defer allocator.free(silence);
+
+    // Closed by trailing silence: the whole utterance arrives before the
+    // session runs, so it is one settled segment of 7 s.
+    {
+        var session = try Session.init(allocator, .{ .max_segment_ms = 3000, .emit_partials = false });
+        defer session.deinit();
+        var fake = FakeTranscriber{ .allocator = allocator };
+        var events = std.ArrayListUnmanaged(Event).empty;
+        defer freeEvents(allocator, &events);
+        try session.append(speech, test_rate);
+        try session.append(silence, test_rate);
+        try session.process(&fake, &events, false);
+        try std.testing.expectEqual(@as(usize, 3), events.items.len);
+        for (events.items) |event| {
+            try std.testing.expectEqual(EventKind.final, event.kind);
+            try std.testing.expect(event.end_ms - event.start_ms <= 3000);
+        }
+        try std.testing.expectEqual(events.items[0].end_ms, events.items[1].start_ms);
+        try std.testing.expectEqual(events.items[1].end_ms, events.items[2].start_ms);
+        try std.testing.expect(events.items[2].end_ms >= 6900);
+    }
+
+    // Committed while still open.
+    {
+        var session = try Session.init(allocator, .{ .max_segment_ms = 3000, .emit_partials = false });
+        defer session.deinit();
+        var fake = FakeTranscriber{ .allocator = allocator };
+        var events = std.ArrayListUnmanaged(Event).empty;
+        defer freeEvents(allocator, &events);
+        try session.append(speech, test_rate);
+        try session.process(&fake, &events, true);
+        try std.testing.expectEqual(@as(usize, 3), events.items.len);
+        for (events.items) |event| try std.testing.expect(event.end_ms - event.start_ms <= 3000);
+        try std.testing.expect(events.items[2].end_ms >= 6900);
+        try std.testing.expectEqual(@as(u64, 0), session.stats().buffered_ms);
+    }
 }
 
 test "streaming session resamples appends and enforces the buffer cap" {

@@ -182,6 +182,10 @@ pub const Registry = struct {
             .created_mono_ns = params.now_mono_ns,
             .last_used_mono_ns = params.now_mono_ns,
         };
+        // Everything that can fail happens before the entry is visible, so
+        // a failure never leaves a freed entry in the map.
+        var created = try entry.snapshot(allocator);
+        errdefer created.deinit(allocator);
 
         self.lock();
         defer self.mutex.unlock();
@@ -190,7 +194,7 @@ pub const Registry = struct {
         const slot = try self.entries.getOrPut(self.allocator, &entry.id);
         if (slot.found_existing) return error.DuplicateSessionId;
         slot.value_ptr.* = entry;
-        return entry.snapshot(allocator);
+        return created;
     }
 
     pub fn contains(self: *Registry, id: []const u8) bool {
@@ -225,8 +229,12 @@ pub const Registry = struct {
 
     /// Whether `entry` (held by the caller) may buffer `add_ms` more audio
     /// without pushing the node past `max_total_buffered_ms`. Other sessions
-    /// are counted at their last published size.
-    pub fn canBuffer(self: *Registry, entry: *const Entry, add_ms: u64) bool {
+    /// are counted at their published size. Passing reserves the room: the
+    /// entry's published size becomes its size after the append, so a
+    /// session appending concurrently sees it at once rather than at the
+    /// next `release`. A failed append leaves the reservation in place
+    /// until `release` publishes the real size, which only errs safe.
+    pub fn canBuffer(self: *Registry, entry: *Entry, add_ms: u64) bool {
         const own_ms = entry.session.stats().buffered_ms;
         self.lock();
         defer self.mutex.unlock();
@@ -236,7 +244,9 @@ pub const Registry = struct {
             if (candidate.* == entry) continue;
             total += candidate.*.published_stats.buffered_ms;
         }
-        return total <= self.max_total_buffered_ms;
+        if (total > self.max_total_buffered_ms) return false;
+        entry.published_stats.buffered_ms = own_ms + add_ms;
+        return true;
     }
 
     pub fn release(self: *Registry, entry: *Entry, now_mono_ns: u64) void {
@@ -448,6 +458,50 @@ test "registry caps audio buffered across sessions" {
     try std.testing.expect(registry.canBuffer(entry_b, 500));
     try std.testing.expect(!registry.canBuffer(entry_b, 501));
     registry.release(entry_b, 4);
+}
+
+test "registry counts a concurrent session's reservation before it releases" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    registry.max_total_buffered_ms = 1000;
+    defer registry.deinit();
+
+    var a = try registry.create(allocator, .{ .id = testId(1), .model = "m", .now_wall_s = 0, .now_mono_ns = 0, .io = std.testing.io });
+    defer a.deinit(allocator);
+    var b = try registry.create(allocator, .{ .id = testId(2), .model = "m", .now_wall_s = 0, .now_mono_ns = 0, .io = std.testing.io });
+    defer b.deinit(allocator);
+
+    // Both sessions are mid-append: a has been cleared for 600 ms but has
+    // not released yet, so b may only take the remaining 400 ms.
+    const entry_a = try registry.acquire(&a.id, 1, std.testing.io);
+    const entry_b = try registry.acquire(&b.id, 1, std.testing.io);
+    try std.testing.expect(registry.canBuffer(entry_a, 600));
+    try std.testing.expect(!registry.canBuffer(entry_b, 401));
+    try std.testing.expect(registry.canBuffer(entry_b, 400));
+    try std.testing.expect(!registry.canBuffer(entry_a, 601));
+
+    // A smaller append after a larger reservation shrinks it.
+    try std.testing.expect(registry.canBuffer(entry_a, 100));
+    try std.testing.expect(registry.canBuffer(entry_b, 900));
+    registry.release(entry_a, 2);
+    registry.release(entry_b, 2);
+}
+
+test "registry does not keep an entry whose creation failed" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    // The response snapshot is the last allocation of `create`; failing it
+    // must not leave the (freed) entry registered.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, registry.create(failing.allocator(), .{ .id = testId(1), .model = "m", .now_wall_s = 0, .now_mono_ns = 0, .io = std.testing.io }));
+    try std.testing.expect(!registry.contains(&testId(1)));
+    try std.testing.expectEqual(@as(usize, 0), registry.count());
+
+    var a = try registry.create(allocator, .{ .id = testId(1), .model = "m", .now_wall_s = 0, .now_mono_ns = 0, .io = std.testing.io });
+    defer a.deinit(allocator);
+    try std.testing.expect(registry.contains(&a.id));
 }
 
 test "registry expires idle sessions and enforces the cap" {
