@@ -325,7 +325,11 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
     }
     const checkouts=text.match(/uses: actions\/checkout@[^\n]+\n[\s\S]*?(?=\n      -|$)/g)||[];
     for (const checkout of checkouts) {
-      assert.match(checkout,/ref: \$\{\{ inputs.head_sha \|\| github.sha \}\}/);
+      if (suite.id === 'policy' && /path: trusted-ci\n/.test(checkout)) {
+        assert.match(checkout,/ref: \$\{\{ github.workflow_sha \}\}/);
+      } else {
+        assert.match(checkout,/ref: \$\{\{ inputs.head_sha \|\| github.sha \}\}/);
+      }
       assert.match(checkout,/persist-credentials: false/);
     }
   }
@@ -337,6 +341,13 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
       assert.doesNotMatch(text,/secrets: inherit/,file);
     }
   }
+});
+
+test('policy validates the executing workflow even when a release predates the controller', () => {
+  const text=fs.readFileSync(path.resolve(__dirname,'../workflows/pr-ci-policy.yml'),'utf8');
+  assert.match(text,/ref: \$\{\{ github.workflow_sha \}\}\n\s+path: trusted-ci/);
+  assert.match(text,/name: Test executing CI policy\n\s+working-directory: trusted-ci\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
+  assert.match(text,/name: Test proposed CI policy when present\n\s+if: \$\{\{ hashFiles\('\.github\/scripts\/pr-ci.test.cjs'\) != '' \}\}\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
 });
 
 // The live rollout first creates an action_required check before an approval.
