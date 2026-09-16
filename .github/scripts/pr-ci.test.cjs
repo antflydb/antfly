@@ -299,6 +299,9 @@ test('path selection matches repository CI owners and does not enable optional t
   if (config.suites.some(s=>s.id==='zig')) {
     assert.deepEqual(selectSuites(['go/pkg/proxy/test.go'],f.pr,config),['policy','zig','sdks','proxy']);
     assert.ok(selectSuites(['specs/openapi/new.yaml'],f.pr,config).includes('operator'));
+    assert.ok(selectSuites(['go/pkg/operator/api/types.go'],f.pr,config).includes('operator'));
+    assert.ok(!selectSuites(['go/pkg/operator/work-log/README.md'],f.pr,config).includes('operator'));
+    assert.ok(!selectSuites(['go/pkg/proxy/docs/notes.mdx'],f.pr,config).includes('proxy'));
   } else {
     assert.deepEqual(selectSuites(['infra/src/test.go'],f.pr,config),['policy','infra']);
     assert.deepEqual(selectSuites(['ts/apps/dashboard/test.ts'],f.pr,config),['policy','vitest','playwright']);
