@@ -1,0 +1,31 @@
+{
+  "add_prefix_space": true,
+  "backend": "tokenizers",
+  "bos_token": "[CLS]",
+  "cls_token": "[CLS]",
+  "do_lower_case": false,
+  "eos_token": "[SEP]",
+  "extra_special_tokens": [
+    "[SEP_STRUCT]",
+    "[SEP_TEXT]",
+    "[P]",
+    "[C]",
+    "[E]",
+    "[R]",
+    "[L]",
+    "[EXAMPLE]",
+    "[OUTPUT]",
+    "[DESCRIPTION]"
+  ],
+  "is_local": true,
+  "local_files_only": false,
+  "mask_token": "[MASK]",
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "[PAD]",
+  "sep_token": "[SEP]",
+  "split_by_punct": false,
+  "tokenizer_class": "DebertaV2Tokenizer",
+  "unk_id": 3,
+  "unk_token": "[UNK]",
+  "vocab_type": "spm"
+}

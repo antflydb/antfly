@@ -1049,6 +1049,7 @@ fn formatGlinerBundleDryRunReport(
 ) ![]u8 {
     var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
     defer manifest.deinit();
+    try requireLegacyGlinerExportProfile(manifest);
 
     var access = try tensor_access_mod.openFromManifest(allocator, manifest);
     defer access.deinit();
@@ -1097,6 +1098,7 @@ fn exportGlinerBundleToGguf(
 ) !void {
     var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
     defer manifest.deinit();
+    try requireLegacyGlinerExportProfile(manifest);
 
     var access = try tensor_access_mod.openFromManifest(allocator, manifest);
     defer access.deinit();
@@ -1106,6 +1108,22 @@ fn exportGlinerBundleToGguf(
     defer allocator.free(head_output_path);
     try writeGlinerHeadGguf(allocator, head_output_path, access, quantization, filter);
     try copyGlinerBundleAssets(allocator, model_dir, output_path);
+}
+
+/// Boundary artifacts need their own versioned bundle and precision policy:
+/// the legacy exporter parses wrapper config.json as a DeBERTa config, writes
+/// a span-head family marker, and quantizes arbitrary head matrices. Reject
+/// before opening output files until the boundary converter is qualified.
+fn requireLegacyGlinerExportProfile(manifest: manifest_mod.ModelManifest) !void {
+    if (manifest.gliner_architecture == .boundary or std.mem.eql(u8, manifest.gliner_model_type, "gliner2.5"))
+        return error.UnsupportedGlinerBoundaryExport;
+}
+
+test "gliner boundary export cannot write a legacy span bundle" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryExport, requireLegacyGlinerExportProfile(.{ .allocator = a, .gliner_architecture = .boundary }));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryExport, requireLegacyGlinerExportProfile(.{ .allocator = a, .gliner_model_type = "gliner2.5" }));
+    try requireLegacyGlinerExportProfile(.{ .allocator = a, .gliner_model_type = "gliner2" });
 }
 
 fn defaultGlinerHeadOutputPath(allocator: std.mem.Allocator, output_path: []const u8) ![]u8 {

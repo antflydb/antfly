@@ -30,6 +30,8 @@ from antfly.client_generated.models import (
     CreateFullTextIndexRequest,
     CreateGraphIndexRequest,
     Error,
+    ExtractionRequest,
+    ExtractionResponse,
     GraphKShortestPathsQuery,
     GraphMatchQuery,
     GraphQueries,
@@ -69,6 +71,7 @@ INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES = frozenset(
 )
 MAX_INFERENCE_ERROR_BYTES = 1 << 20
 MAX_GENERATION_RESPONSE_BYTES = 16 << 20
+MAX_EXTRACTION_RESPONSE_BYTES = 16 << 20
 MAX_GENERATION_SSE_EVENT_BYTES = 16 << 20
 MAX_GENERATION_SSE_LINE_BYTES = 16 << 20
 MAX_GRAPH_EDGE_TYPES = 64
@@ -365,10 +368,30 @@ def _read_limited_response(response: Response, max_bytes: int) -> tuple[bytes, b
     return bytes(body), False
 
 
+def _validate_extraction_v2_response(payload: dict[str, Any], request: dict[str, Any]) -> None:
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != 2:
+        raise ValueError("version 2 response has an invalid schema version")
+    if not isinstance(payload.get("model"), str) or payload["model"] != request.get("model"):
+        raise ValueError("version 2 response model does not match the request")
+    inputs = request.get("inputs", [])
+    rows = payload.get("data")
+    if not isinstance(rows, list) or len(rows) != len(inputs):
+        raise ValueError("version 2 response has an invalid item cardinality")
+    for index, (item, row) in enumerate(zip(inputs, rows, strict=True)):
+        if not isinstance(row, dict):
+            raise ValueError(f"version 2 response item {index} must be an object")
+        if "id" in row and not isinstance(row["id"], str):
+            raise ValueError(f"version 2 response item {index} id must be a string")
+        if row.get("id") != item.get("id"):
+            raise ValueError(f"version 2 response item {index} id does not match the request")
+
+
 def _raise_inference_error(response: Response) -> None:
     body, truncated = _read_limited_response(response, MAX_INFERENCE_ERROR_BYTES)
     code: str | None = None
     retryable: bool | None = None
+    input_index: int | None = None
+    stage: str | None = None
     capacity: tuple[str, str, int] | None = None
     message = body.decode("utf-8", errors="replace").strip()
     if not truncated:
@@ -383,6 +406,10 @@ def _raise_inference_error(response: Response) -> None:
                     message = code
                 if isinstance(payload.get("retryable"), bool):
                     retryable = payload["retryable"]
+                if type(payload.get("input_index")) is int and payload["input_index"] >= 0:
+                    input_index = payload["input_index"]
+                if isinstance(payload.get("stage"), str):
+                    stage = payload["stage"]
                 reason = payload.get("reason")
                 retry_after_ms = payload.get("retry_after_ms")
                 if (
@@ -403,7 +430,7 @@ def _raise_inference_error(response: Response) -> None:
     if capacity is not None:
         capacity_code, reason, retry_after_ms = capacity
         raise InferenceCapacityError(capacity_code, message, reason, retry_after_ms)
-    raise InferenceAPIError(response.status_code, code, message, retryable)
+    raise InferenceAPIError(response.status_code, code, message, retryable, input_index, stage)
 
 
 def _iter_bounded_response_lines(response: Response, max_line_bytes: int) -> Iterator[bytes]:
@@ -734,6 +761,43 @@ class AntflyClient:
                 f"{self.max_write_request_bytes}"
             )
         return encoded
+
+    def extract(self, request: ExtractionRequest | Mapping[str, Any]) -> ExtractionResponse:
+        """Run canonical atomic extraction, preserving explicit schema versions.
+
+        Mapping input preserves omitted options, explicit null and empty
+        replacements. For generated model inputs, use ``from_dict`` or UNSET
+        for omitted fields so legacy constructor defaults remain explicit.
+        """
+        body = request.to_dict() if isinstance(request, ExtractionRequest) else dict(request)
+        with self._client.get_httpx_client().stream(
+            "POST", "/ai/v1/extract", json=body, headers={"Accept": "application/json"}
+        ) as response:
+            if response.status_code < 200 or response.status_code >= 300:
+                _raise_inference_error(response)
+            limit = min(self.max_json_response_bytes, MAX_EXTRACTION_RESPONSE_BYTES)
+            raw, truncated = _read_limited_response(response, limit)
+            if truncated:
+                raise AntflyException(f"extraction response exceeded {limit} bytes")
+            try:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict) or payload.get("object") != "extraction":
+                    raise ValueError("response must be a canonical extraction object")
+                if body.get("schema_version") == 2:
+                    _validate_extraction_v2_response(payload, body)
+                return ExtractionResponse.from_dict(payload)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise AntflyException(f"extraction returned invalid JSON: {exc}") from exc
+
+    def extract_v2(self, request: Mapping[str, Any]) -> ExtractionResponse:
+        """Run strict mixed-task extraction with whole per-input replacements.
+
+        Plain mappings retain omitted fields without injecting the legacy
+        generated classifier's NLI template or mode defaults.
+        """
+        body = dict(request)
+        body["schema_version"] = 2
+        return self.extract(body)
 
     def generate(self, request: InferenceGenerateRequest) -> InferenceGenerateResponse:
         """Generate one non-streaming chat completion."""

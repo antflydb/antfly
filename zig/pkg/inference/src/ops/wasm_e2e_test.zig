@@ -30,12 +30,12 @@ const model_dir = "models/BAAI/bge-small-en-v1.5";
 
 fn loadSafetensorsModel(allocator: std.mem.Allocator) !struct { compute: wasm_compute.WasmCompute, config: bert_arch.Config } {
     // Read config
-    const config_bytes = try std.fs.cwd().readFileAlloc(allocator, model_dir ++ "/config.json", 1024 * 1024);
+    const config_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, model_dir ++ "/config.json", allocator, .limited(1024 * 1024));
     defer allocator.free(config_bytes);
     const config = try bert_config_mod.parseConfig(allocator, config_bytes);
 
     // Read SafeTensors
-    const st_bytes = try std.fs.cwd().readFileAlloc(allocator, model_dir ++ "/model.safetensors", 256 * 1024 * 1024);
+    const st_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, model_dir ++ "/model.safetensors", allocator, .limited(256 * 1024 * 1024));
     defer allocator.free(st_bytes);
 
     const result = try safetensors.parseHeader(allocator, st_bytes);
@@ -80,17 +80,13 @@ test "e2e: bge-small-en-v1.5 SafeTensors forward pass" {
     const loaded = loadSafetensorsModel(allocator) catch |err| {
         if (err == error.FileNotFound) {
             // Model not downloaded — skip test gracefully
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
     var compute = loaded.compute;
     const config = loaded.config;
-    defer {
-        var it = compute.weights.valueIterator();
-        while (it.next()) |buf| buf.*.deinit();
-        compute.weights.deinit();
-    }
+    defer compute.computeBackend().deinit();
 
     // Verify config
     try std.testing.expectEqual(@as(usize, 384), config.hidden_size);
@@ -142,16 +138,12 @@ test "e2e: bge-small-en-v1.5 forward pass seq_len=16" {
     const allocator = std.testing.allocator;
 
     const loaded = loadSafetensorsModel(allocator) catch |err| {
-        if (err == error.FileNotFound) return;
+        if (err == error.FileNotFound) return error.SkipZigTest;
         return err;
     };
     var compute = loaded.compute;
     const config = loaded.config;
-    defer {
-        var it = compute.weights.valueIterator();
-        while (it.next()) |buf| buf.*.deinit();
-        compute.weights.deinit();
-    }
+    defer compute.computeBackend().deinit();
 
     var cb = compute.computeBackend();
 

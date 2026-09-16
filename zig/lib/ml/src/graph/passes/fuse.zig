@@ -4111,7 +4111,12 @@ test "fuse detects SDPA pattern: 4D dynamic additive bias is preserved" {
             try std.testing.expectEqual(@as(u32, 64), attrs.head_dim);
             const node = result.graph.node(@intCast(idx));
             try std.testing.expectEqual(@as(u8, 4), node.num_inputs);
-            try std.testing.expectEqual(bias_bcast, node.inputs[3]);
+            // Fusion compacts reachable nodes; compare the remapped semantic
+            // value rather than the input graph's allocation index.
+            try std.testing.expectEqual(result.id_map[bias_bcast], node.inputs[3]);
+            const retained_bias = result.graph.node(node.inputs[3]);
+            try std.testing.expect(retained_bias.op == .broadcast_in_dim);
+            try std.testing.expectEqualStrings("mask_bias", result.graph.parameterName(result.graph.node(retained_bias.inputs[0])));
             found_sdpa = true;
             break;
         }
