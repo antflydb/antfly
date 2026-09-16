@@ -58,7 +58,7 @@ fn snapshotRecord(source: Source) backups.ShardSnapshot {
 /// Build a source decoder once per scope, using the existing generation
 /// staging/publish protocol. Replays open the same immutable decoder; they do
 /// not download or hash the corpus for each 128-row import page.
-fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owner_range: db.types.ByteRange, context: operation.RequestContext, source_next_offset: *u64) !bool {
+fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owner_range: db.types.ByteRange, context: operation.RequestContext, source_next_offset: *u64, program: ?*const @import("db/relational_rewrite_program.zig").ProgramSet) !bool {
     const source = input.source.?;
     source_next_offset.* = if (source.peer_descriptor) |descriptor| descriptor.total_bytes else 0;
     const marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{env.cache_path});
@@ -117,15 +117,13 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
         var decoder = try db.DB.open(alloc, files, .{ .backend_runtime = env.runtime, .identity_namespace = input.scope.source_namespace, .prefer_existing_identity_namespace = false, .primary_backend = .{ .lsm = .{} }, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
         {
             defer decoder.close();
-            if (input.rewrite) |intent| {
+            if (program) |compiled| {
                 var scratch = std.heap.ArenaAllocator.init(alloc);
                 defer scratch.deinit();
-                var program = try @import("db/relational_rewrite_program.zig").ProgramSet.initIntent(alloc, intent);
-                defer program.deinit();
                 var read = try decoder.core.store.beginReadTxn();
                 defer read.abort();
                 const manifest = try @import("db/relational_rewrite_manifest.zig").read(scratch.allocator(), &read, context.cancellation);
-                try program.requireSourceManifest(alloc, manifest, try read.get("\x00\x00__metadata__:schema_json"));
+                try compiled.requireSourceManifest(alloc, manifest, try read.get("\x00\x00__metadata__:schema_json"));
             }
         }
         const portable_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{files});
@@ -302,6 +300,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         else => null,
     };
     if (desired) |phase| if (before.value.phase == phase) {
+        target.rewrite_program_cache.evict(env.io);
         target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
         target.rewrite_tail_cache.clear();
         target.rewrite_tail_cache.mutex.unlock(env.io);
@@ -319,8 +318,15 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 var page = try @import("db/relational_rewrite_staging.zig").prepareFinish(target, alloc, input.scope, receipt.cut);
                 defer page.deinit();
                 if (page.batch) |batch| try env.proposer.propose(env.proposer.ptr, batch, context);
+                target.rewrite_program_cache.evict(env.io);
                 break :import;
             }
+            // Compile once outside generation/frame locks; the lease protects
+            // immutable programs across source certification and either page path.
+            var program_lease = if (input.rewrite) |intent| try target.rewrite_program_cache.acquire(env.io, target.alloc, target.core.index_manager.resource_manager, input.scope, intent, context.cancellation) else null;
+            defer if (program_lease) |*lease| lease.deinit();
+            const program = if (program_lease) |lease| lease.program() else null;
+            try context.ensureActive();
             if (input.rewrite_tail) |chunk| {
                 const progress = before.value.rewrite orelse return error.InvalidRestoreStagingCommand;
                 if (!progress.snapshot_complete or progress.final_cut != null) return error.RestoreStagingInProgress;
@@ -335,9 +341,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 const assembled = try @import("rewrite_tail_spool.zig").receive(alloc, env.io, env.cache_path, input.scope, progress.sequence, chunk, cache, target.alloc, target.core.index_manager.resource_manager);
                 tail_next = assembled.next;
                 if (assembled.frame) |frame| {
-                    var program = try @import("db/relational_rewrite_staging.zig").ProgramSet.initIntent(alloc, input.rewrite.?);
-                    defer program.deinit();
-                    var page = try @import("db/relational_rewrite_staging.zig").prepareTailVerified(target, alloc, input.scope, frame, &program, input.max_rows, context.cancellation);
+                    var page = try @import("db/relational_rewrite_staging.zig").prepareTailVerified(target, alloc, input.scope, frame, program.?, input.max_rows, context.cancellation);
                     defer page.deinit();
                     if (page.batch) |batch| {
                         try env.proposer.propose(env.proposer.ptr, batch, context);
@@ -348,12 +352,10 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 }
                 break :import;
             }
-            if (!try ensureSource(alloc, env, input, target.core.byteRange(), context, &source_next_offset)) return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite, .source_next_offset = source_next_offset };
+            if (!try ensureSource(alloc, env, input, target.core.byteRange(), context, &source_next_offset, program)) return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite, .source_next_offset = source_next_offset };
             var decoder = try db.DB.open(alloc, env.cache_path, .{ .backend_runtime = env.runtime, .identity_namespace = input.scope.source_namespace, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
             defer decoder.close();
-            var program = if (input.rewrite) |intent| try @import("db/relational_rewrite_staging.zig").ProgramSet.initIntent(alloc, intent) else null;
-            defer if (program) |*compiled| compiled.deinit();
-            var page = if (program) |*compiled| try target.prepareRewriteStagingPage(alloc, input.scope, &decoder, input.max_rows, context.cancellation, compiled) else try target.prepareRestoreStagingPage(alloc, input.scope, &decoder, input.max_rows, context.cancellation);
+            var page = if (program) |compiled| try target.prepareRewriteStagingPage(alloc, input.scope, &decoder, input.max_rows, context.cancellation, compiled) else try target.prepareRestoreStagingPage(alloc, input.scope, &decoder, input.max_rows, context.cancellation);
             defer page.deinit();
             if (page.batch) |batch| try env.proposer.propose(env.proposer.ptr, batch, context);
         },
@@ -369,12 +371,146 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     var after = (try target.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
     defer after.deinit();
     if (after.value.phase == .published or after.value.phase == .canceled) {
+        target.rewrite_program_cache.evict(env.io);
         target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
         target.rewrite_tail_cache.clear();
         target.rewrite_tail_cache.mutex.unlock(env.io);
         try releaseSource(alloc, env, input.scope);
     }
     return .{ .phase = after.value.phase, .rows = after.value.rows, .receipt = after.value.receipt(), .rewrite = after.value.rewrite, .tail_next = tail_next, .source_next_offset = source_next_offset };
+}
+
+test "restore owner verified decoder rewrite history compiles once across production tail pages" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const rewrite = @import("db/relational_rewrite_contract.zig");
+    const ProgramSet = @import("db/relational_rewrite_program.zig").ProgramSet;
+    const keys = @import("internal_keys.zig");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try directory.dir.realPathFileAlloc(io, ".", a);
+    var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = io });
+    defer runtime.deinit();
+    const source_ns: @import("db/doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = 12, .range_id = 12 };
+    const target_ns: @import("db/doc_identity_namespace.zig").Namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 22 };
+    var definitions: [65][]const u8 = undefined;
+    for (&definitions, 1..) |*definition, version| definition.* = try std.fmt.allocPrint(a, "{{\"version\":{d},\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"x\":{{\"type\":\"integer\"}}}},\"additionalProperties\":false}}}}}}}}", .{version});
+    var reference = try ProgramSet.init(alloc, definitions[0..64], definitions[64], .{});
+    defer reference.deinit();
+    const intent: rewrite.Intent = .{ .source_schemas = definitions[0..64], .target_schema = definitions[64], .program_digest = reference.identity };
+    const scope: staging.Scope = .{
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .source_artifact_digest = @splat(3),
+        .source_namespace = source_ns,
+        .target_namespace = target_ns,
+        .target_schema_digest = reference.target_runtime_digest,
+        .rewrite = .{ .program_digest = reference.identity, .retained_pin = @splat(6), .snapshot_certificate = @splat(7), .retained_epoch = 1, .retained_start = 0, .source_applied_index = 1 },
+    };
+    const source_path = try std.fmt.allocPrint(a, "{s}/source", .{root});
+    var source = try db.DB.open(alloc, source_path, .{ .backend_runtime = &runtime, .identity_namespace = source_ns, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+    defer source.close();
+    try source.setSchemaJson(alloc, definitions[63]);
+    var rows: [256]db.types.BatchWrite = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{ .key = try std.fmt.allocPrint(a, "row:{d:0>8}", .{i}), .value = "{\"x\":7}" };
+    try source.batchRaftReplicatedApply(.{ .timestamp_ns = 42, .writes = &rows }, .{ .term = 1, .index = 1 });
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(alloc);
+    var header: [16]u8 = undefined;
+    @memcpy(header[0..4], "REF3");
+    std.mem.writeInt(u64, header[4..12], 1, .little);
+    std.mem.writeInt(u32, header[12..16], rows.len, .little);
+    try frame.appendSlice(alloc, &header);
+    {
+        var read = try source.core.store.beginReadTxn();
+        defer read.abort();
+        for (rows) |row| {
+            const key = try keys.relationalRowKeyAlloc(a, row.key);
+            const value = try read.get(key);
+            std.mem.writeInt(u32, header[0..4], @intCast(key.len), .little);
+            std.mem.writeInt(u32, header[4..8], @intCast(value.len), .little);
+            std.mem.writeInt(u64, header[8..16], 42, .little);
+            try frame.appendSlice(alloc, &header);
+            try frame.appendSlice(alloc, key);
+            try frame.appendSlice(alloc, value);
+        }
+    }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(frame.items, &digest, .{});
+    try frame.appendSlice(alloc, &digest);
+    std.crypto.hash.sha2.Sha256.hash(frame.items, &digest, .{});
+    const target_path = try std.fmt.allocPrint(a, "{s}/target", .{root});
+    var target = try db.DB.open(alloc, target_path, .{ .backend_runtime = &runtime, .identity_namespace = target_ns, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+    defer target.close();
+    try target.setSchemaJson(alloc, definitions[64]);
+    try target.reserveRestoreStagingScoped(alloc, scope);
+    const Apply = struct {
+        target: *db.DB,
+        scope: [32]u8,
+        index: u64 = 0,
+        lose_reply: bool = false,
+        fn propose(ptr: *anyopaque, request: db.types.BatchRequest, context: operation.RequestContext) !void {
+            try context.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var batch = request;
+            batch.restore_staging_scope = self.scope;
+            self.index += 1;
+            try self.target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = self.index });
+            if (self.lose_reply) {
+                self.lose_reply = false;
+                return error.InjectedReplyLoss;
+            }
+        }
+    };
+    var apply: Apply = .{ .target = &target, .scope = scope.digest() };
+    const env: Environment = .{ .io = io, .runtime = &runtime, .location_options = .{}, .cache_path = try std.fmt.allocPrint(a, "{s}/decoder", .{root}), .proposer = .{ .ptr = &apply, .propose = Apply.propose } };
+    _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .begin }, .{});
+    // Seed the durable boundary after an empty snapshot; every measured tail
+    // page below uses the production owner handler and real LSM apply path.
+    {
+        var status = (try target.restoreStagingStatus(alloc)).?;
+        defer status.deinit();
+        status.value.rewrite.?.snapshot_complete = true;
+        const encoded = try status.value.encode(alloc);
+        defer alloc.free(encoded);
+        var txn = try target.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(@import("db/restore_staging_contract.zig").key, encoded);
+        try txn.commit();
+    }
+    var chunk: rewrite.TailChunk = .{ .pin = scope.rewrite.?.retained_pin, .sequence = 1, .frame_digest = digest, .total = @intCast(frame.items.len), .offset = 0, .data = frame.items[0..@min(frame.items.len, 64 * 1024)] };
+    const started = std.Io.Clock.awake.now(io);
+    var requests: usize = 0;
+    while (true) {
+        requests += 1;
+        if (requests > 64) return error.TestUnexpectedResult;
+        apply.lose_reply = requests == 3;
+        const response = executeResident(alloc, &target, env, .{ .scope = scope, .action = .import_page, .rewrite = intent, .rewrite_tail = chunk, .max_rows = 8 }, .{}) catch |err| switch (err) {
+            error.InjectedReplyLoss => continue,
+            else => return err,
+        };
+        if (response.rewrite.?.sequence == 1) break;
+        chunk.offset = if (response.tail_next == chunk.total) chunk.total - 1 else response.tail_next;
+        chunk.data = frame.items[chunk.offset..@min(frame.items.len, chunk.offset + 64 * 1024)];
+    }
+    const elapsed = started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+    try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
+    try std.testing.expect(target.rewrite_program_cache.hits >= 31);
+    var status = (try target.restoreStagingStatus(alloc)).?;
+    defer status.deinit();
+    try std.testing.expectEqual(@as(u64, rows.len), status.value.rows);
+    const control_start = std.Io.Clock.awake.now(io);
+    for (0..32) |_| {
+        var control = try ProgramSet.initIntent(alloc, intent);
+        control.deinit();
+    }
+    const control_ns = control_start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+    std.debug.print("\nrewrite production handler: 64 historical schemas, 256 effects / 32 pages, {} compilations / {} hits, {}ms including LSM apply; uncached 32 compilations alone {}ms\n", .{ target.rewrite_program_cache.compilations, target.rewrite_program_cache.hits, @divTrunc(elapsed, std.time.ns_per_ms), @divTrunc(control_ns, std.time.ns_per_ms) });
+    _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .cancel }, .{});
+    try std.testing.expect(target.rewrite_program_cache.entry == null);
 }
 
 test "restore owner verified decoder is reused across pages and terminal cleanup revokes import" {
@@ -487,6 +623,7 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
     wrong.source.?.peer_descriptor.?.certificate.cut.applied_index += 1;
     try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, wrong, .{}));
     var response = try executeResident(alloc, &target, env, request, .{});
+    try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
     try std.testing.expectEqual(@as(u64, 0), response.source_next_offset);
     var chunk_count: usize = 0;
     while (response.source_next_offset < descriptor.total_bytes) {
@@ -510,6 +647,7 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
         response = try executeResident(alloc, &target, env, decoded.value, .{});
         try std.testing.expectEqual(bytes.offset + bytes.data.len, response.source_next_offset);
         const replay = try executeResident(alloc, &target, env, decoded.value, .{});
+        try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
         try std.testing.expectEqual(response.source_next_offset, replay.source_next_offset);
         try std.testing.expectEqual(@as(u64, 0), response.rows);
         if (chunk_count == 0) {
@@ -547,6 +685,7 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
             target_open = true;
             continue;
         };
+        try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
         if (response.rewrite.?.snapshot_complete) break;
     } else return error.TestUnexpectedResult;
     try std.testing.expect(saw_publication_crash);
@@ -555,6 +694,7 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
     try std.testing.expectEqualSlices(u8, document, copied);
     try std.testing.expectEqual(descriptor.total_bytes, response.source_next_offset);
     _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .cancel }, .{});
+    try std.testing.expect(target.rewrite_program_cache.entry == null);
     try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, request, .{}));
 }
 

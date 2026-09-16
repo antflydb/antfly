@@ -117,6 +117,28 @@ reloads. Warm page access allocates nothing for the frame and boundary lookup.
 Separate checks cover both slice-local and aggregate pressure eviction, leased
 frame protection, allocation-failure retries, and corrupt persisted spool bytes.
 
+Snapshot certification, snapshot pages, and tail pages share one immutable
+compiled rewrite-program set per resident target owner. Its cache key binds the
+complete restore scope and a length-framed digest of the supplied schema bytes
+and policies, not just the caller's claimed program identity. Cold compilation
+is single-flight under a `std.Io.Mutex`, before acquiring source-generation or
+frame locks. Every compiler/retained allocation is admitted through the shared
+relational preparation budget; pressure can reclaim idle programs but never a
+leased program. Restart and eviction recompile from the authenticated intent;
+final-tail completion, terminal cleanup, and owner close release retained state.
+Requests still validate/hash their bounded intent; warm pages do not rebuild
+schema validators, layouts, or expression programs.
+
+The production-owner regression uses 64 historical schemas and 256 effects over
+32 committed tail pages, including an accepted write with a lost reply. It
+asserts one compilation and 31 hits, instead of 32 compilations (2,048 historical
+schema bindings). One local Debug run took about 5.0 seconds including LSM apply,
+versus 12.8 seconds for the uncached control's compilation alone; these timings
+are diagnostic, not throughput guarantees. Snapshot transfer/reopen tests also
+assert one compilation per resident owner. Fault coverage includes every
+compiler allocation failure, slice/aggregate pressure, cancellation, input
+ownership, changed policies, and eight concurrent callers sharing one compile.
+
 The shared restore worker now drives source publication, bounded authenticated
 peer-artifact push, snapshot transformation, retained catchup, all-source
 fence/drain, exact final tails, shared validation and atomic cohort publication.
