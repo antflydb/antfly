@@ -4720,10 +4720,51 @@ fn appendHfTokenizerMetadata(
     try appendMetadataArrayEntry(allocator, entries, "tokenizer.ggml.tokens", .string, tokens);
     try appendMetadataArrayEntry(allocator, entries, "tokenizer.ggml.scores", .f32, scores);
     try appendMetadataArrayEntry(allocator, entries, "tokenizer.ggml.token_type", .i32, token_types);
+    try appendHfBpeMergesMetadata(allocator, entries, tokenizer_json);
     try appendTokenizerIdMetadata(allocator, entries, "tokenizer.ggml.bos_token_id", hf.special.cls_id);
     try appendTokenizerIdMetadata(allocator, entries, "tokenizer.ggml.eos_token_id", hf.special.sep_id);
     try appendTokenizerIdMetadata(allocator, entries, "tokenizer.ggml.unknown_token_id", hf.special.unk_id);
     try appendTokenizerIdMetadata(allocator, entries, "tokenizer.ggml.padding_token_id", hf.special.pad_id);
+}
+
+/// Byte-level BPE tokenizers (GPT-2, Whisper) cannot be rebuilt from the
+/// vocabulary alone: the loader's `tokenizer.ggml.merges` is required to
+/// segment text. Merges are copied in the tokenizer.json form ("Ġ t"), the
+/// same encoding the exported token strings use.
+fn appendHfBpeMergesMetadata(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayListUnmanaged(gguf_mod.format.MetadataEntry),
+    tokenizer_json: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, tokenizer_json, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const model = parsed.value.object.get("model") orelse return;
+    if (model != .object) return;
+    const merges_value = model.object.get("merges") orelse return;
+    if (merges_value != .array or merges_value.array.items.len == 0) return;
+
+    var merges = std.ArrayListUnmanaged(gguf_mod.format.MetadataValue).empty;
+    errdefer {
+        for (merges.items) |*value| value.deinit(allocator);
+        merges.deinit(allocator);
+    }
+    for (merges_value.array.items) |item| {
+        const merge = switch (item) {
+            .string => |value| try allocator.dupe(u8, value),
+            .array => |pair| blk: {
+                if (pair.items.len < 2 or pair.items[0] != .string or pair.items[1] != .string) continue;
+                break :blk try std.fmt.allocPrint(allocator, "{s} {s}", .{ pair.items[0].string, pair.items[1].string });
+            },
+            else => continue,
+        };
+        errdefer allocator.free(merge);
+        try merges.append(allocator, .{ .string = merge });
+    }
+    if (merges.items.len == 0) return;
+    const owned = try merges.toOwnedSlice(allocator);
+    errdefer freeMetadataValueArray(allocator, owned);
+    try appendMetadataArrayEntry(allocator, entries, "tokenizer.ggml.merges", .string, owned);
 }
 
 fn hfTokenType(hf: *const hf_tokenizer_mod.HfTokenizer, token_id: i32, token: []const u8) i32 {
@@ -6514,6 +6555,39 @@ test "dense siglip text export preserves siglip family metadata" {
     const view = gguf_mod.metadata.View.init(&parsed);
     try std.testing.expectEqualStrings("clip", view.getString("general.architecture").?);
     try std.testing.expectEqualStrings("siglip", view.getString("clip.family").?);
+}
+
+test "hf byte-level bpe tokenizer export carries merges" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "native-export-gguf-bpe-merges");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    try writeTestFileInDir(
+        allocator,
+        dir_path,
+        "tokenizer.json",
+        \\{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2,"Ġ":3,"Ġab":4},"merges":["a b","Ġ ab"]},"pre_tokenizer":{"type":"ByteLevel"},"decoder":{"type":"ByteLevel"},"added_tokens":[]}
+        ,
+    );
+
+    var entries = std.ArrayListUnmanaged(gguf_mod.format.MetadataEntry).empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(allocator);
+        entries.deinit(allocator);
+    }
+    try appendHfTokenizerMetadata(allocator, &entries, dir_path);
+
+    var merges: ?gguf_mod.format.MetadataValue = null;
+    for (entries.items) |entry| {
+        if (std.mem.eql(u8, entry.key, "tokenizer.ggml.merges")) merges = entry.value;
+    }
+    const array = merges.?.array;
+    try std.testing.expectEqual(gguf_mod.format.MetadataValueType.string, array.element_type);
+    try std.testing.expectEqual(@as(usize, 2), array.values.len);
+    try std.testing.expectEqualStrings("a b", array.values[0].string);
+    try std.testing.expectEqualStrings("Ġ ab", array.values[1].string);
 }
 
 test "dense whisper export writes whisper metadata and tensors" {

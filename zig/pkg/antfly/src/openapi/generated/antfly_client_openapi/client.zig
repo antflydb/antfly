@@ -34,6 +34,15 @@ pub fn ApiResponse(comptime T: type) type {
     };
 }
 
+pub const StreamTranscriptionAudioParams = struct {
+    /// Raw sample format. Default pcm16.
+    format: ?[]const u8 = null,
+    /// Sample rate of the raw stream. Default 16000.
+    sample_rate: ?[]const u8 = null,
+    /// Finalize open speech at end of body. Default true.
+    commit: ?[]const u8 = null,
+};
+
 pub const GetSubjectRowFilterParams = struct {
     /// Explicit database; defaults to default when namespace is supplied.
     database: ?[]const u8 = null,
@@ -234,6 +243,18 @@ pub const Client = struct {
         return ApiResponse(types.InferenceChunkResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Dictate speech into clean written text
+    /// POST /ai/v1/dictate
+    pub fn dictate(self: *@This(), body: types.InferenceDictateRequest) !RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/dictate", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
     /// Create embeddings (alias of `/embeddings`)
     /// POST /ai/v1/embed
     pub fn generateEmbeddings(self: *@This(), body: types.InferenceEmbedRequest) !ApiResponse(types.InferenceEmbedResponse) {
@@ -352,6 +373,108 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceTranscribeResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Open a streaming transcription session
+    /// POST /ai/v1/transcription/sessions
+    pub fn createTranscriptionSession(self: *@This(), body: types.InferenceTranscriptionSessionRequest) !ApiResponse(types.InferenceTranscriptionSession) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/transcription/sessions", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceTranscriptionSession).fromResponse(self.allocator, &resp);
+    }
+
+    /// Inspect a streaming transcription session
+    /// GET /ai/v1/transcription/sessions/{session_id}
+    pub fn getTranscriptionSession(self: *@This(), session_id: []const u8) !ApiResponse(types.InferenceTranscriptionSession) {
+        const encoded_session_id = try httpx.PercentEncoding.encode(self.allocator, session_id);
+        defer self.allocator.free(encoded_session_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/transcription/sessions/{s}", .{ self.base_url, encoded_session_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceTranscriptionSession).fromResponse(self.allocator, &resp);
+    }
+
+    /// Close a streaming transcription session
+    /// DELETE /ai/v1/transcription/sessions/{session_id}
+    pub fn deleteTranscriptionSession(self: *@This(), session_id: []const u8) !ApiResponse(types.InferenceTranscriptionSessionDeleted) {
+        const encoded_session_id = try httpx.PercentEncoding.encode(self.allocator, session_id);
+        defer self.allocator.free(encoded_session_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/transcription/sessions/{s}", .{ self.base_url, encoded_session_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceTranscriptionSessionDeleted).fromResponse(self.allocator, &resp);
+    }
+
+    /// Append audio to a streaming transcription session
+    /// POST /ai/v1/transcription/sessions/{session_id}/audio
+    pub fn appendTranscriptionAudio(self: *@This(), session_id: []const u8, body: types.InferenceTranscriptionAudioAppend) !ApiResponse(types.InferenceTranscriptionEventList) {
+        const encoded_session_id = try httpx.PercentEncoding.encode(self.allocator, session_id);
+        defer self.allocator.free(encoded_session_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/transcription/sessions/{s}/audio", .{ self.base_url, encoded_session_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceTranscriptionEventList).fromResponse(self.allocator, &resp);
+    }
+
+    /// Subscribe to a session's transcript events
+    /// GET /ai/v1/transcription/sessions/{session_id}/events
+    pub fn streamTranscriptionSessionEvents(self: *@This(), session_id: []const u8) !RawResponse {
+        const encoded_session_id = try httpx.PercentEncoding.encode(self.allocator, session_id);
+        defer self.allocator.free(encoded_session_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/transcription/sessions/{s}/events", .{ self.base_url, encoded_session_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
+    /// Stream raw audio into a session and receive events as they occur
+    /// POST /ai/v1/transcription/sessions/{session_id}/stream
+    pub fn streamTranscriptionAudio(self: *@This(), session_id: []const u8, body: []const u8, params: StreamTranscriptionAudioParams) !RawResponse {
+        const encoded_session_id = try httpx.PercentEncoding.encode(self.allocator, session_id);
+        defer self.allocator.free(encoded_session_id);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/transcription/sessions/{s}/stream", .{ self.base_url, encoded_session_id });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.format) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "format=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.sample_rate) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "sample_rate=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.commit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "commit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.post(url, .{ .body = body, .headers = self.authHeaders() });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// Get current authenticated user

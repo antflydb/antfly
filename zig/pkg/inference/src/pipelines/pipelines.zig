@@ -91,6 +91,12 @@ test {
     _ = @import("ctc_decode.zig");
     _ = @import("connected_components.zig");
     _ = @import("transcription.zig");
+    _ = @import("vad.zig");
+    _ = @import("whisper_timestamps.zig");
+    _ = @import("silero_vad.zig");
+    _ = @import("long_transcription.zig");
+    _ = @import("streaming_transcription.zig");
+    _ = @import("dictation.zig");
     _ = @import("image.zig");
     _ = @import("audio.zig");
     _ = @import("grammar.zig");

@@ -3328,6 +3328,82 @@ test "source vector payloads collect obsolete versions only after readers retire
     try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().live_payloads_at_collection);
 }
 
+test "source vector payloads retain accounting across reopen before collection observations" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    const key_a = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "model-a");
+    defer alloc.free(key_a);
+    const key_b = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "model-b");
+    defer alloc.free(key_b);
+    const obsolete = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 0, 0 });
+    defer alloc.free(obsolete);
+    const current_a = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 0, 0, 1 });
+    defer alloc.free(current_a);
+    const current_b = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 1, 0 });
+    defer alloc.free(current_b);
+
+    // Complete reclamation before restart. There are no optional workers or
+    // persisted collection receipts to race with the first reopened snapshot.
+    {
+        var source = try Store.openWithPolicy(alloc, memory.storage(), "/source-reopen-observation", false, .float32, .{});
+        defer source.deinit();
+        store.payload_store = source.interface();
+        defer store.payload_store = null;
+        try store.put(key_a, obsolete);
+        try store.put(key_b, current_b);
+        try store.put(key_a, current_a);
+        try std.testing.expect(try source.collect(&raw));
+        const stats = source.statsSnapshot();
+        try std.testing.expect(stats.collections > 0);
+        try std.testing.expectEqual(@as(u64, 2), stats.retained_payloads);
+        try std.testing.expectEqual(@as(u64, 20), stats.retained_payload_bytes);
+        try std.testing.expectEqual(@as(u64, 2), stats.live_payloads_at_collection);
+    }
+    // Status inspection can use a read-only owner; foreground activation can
+    // subsequently open a writer. Neither inherits process-local GC counters.
+    for ([_]bool{ true, false }) |read_only| {
+        var source = try Store.openWithPolicy(alloc, memory.storage(), "/source-reopen-observation", read_only, .float32, .{});
+        defer source.deinit();
+        store.payload_store = source.interface();
+        defer store.payload_store = null;
+        const before = source.statsSnapshot();
+        try std.testing.expectEqual(@as(u64, 2), before.retained_payloads);
+        try std.testing.expectEqual(@as(u64, 20), before.retained_payload_bytes);
+        try std.testing.expectEqual(@as(u64, 0), before.collection_pending_bytes);
+        try std.testing.expectEqual(@as(u64, 0), before.collections);
+        try std.testing.expectEqual(@as(u64, 0), before.live_payloads_at_collection);
+        try std.testing.expectEqual(@as(u64, 0), before.live_payload_bytes_at_collection);
+        const value_a = try store.get(alloc, key_a);
+        defer alloc.free(value_a);
+        const value_b = try store.get(alloc, key_b);
+        defer alloc.free(value_b);
+        try std.testing.expectEqualSlices(u8, current_a, value_a);
+        try std.testing.expectEqualSlices(u8, current_b, value_b);
+        if (!read_only) {
+            const generation = source.opened.store.manifest.?.latest_generation;
+            try std.testing.expect(try source.collect(&raw));
+            const after = source.statsSnapshot();
+            try std.testing.expectEqual(@as(u64, 1), after.collections);
+            try std.testing.expectEqual(@as(u64, 2), after.live_payloads_at_collection);
+            try std.testing.expectEqual(@as(u64, 20), after.live_payload_bytes_at_collection);
+            try std.testing.expectEqual(@as(u64, 0), after.collection_pending_bytes);
+            // Verification of an already reclaimed corpus need not rewrite it.
+            try std.testing.expectEqual(generation, source.opened.store.manifest.?.latest_generation);
+            try std.testing.expectEqual(@as(u64, 0), after.collection_bytes_written);
+        }
+    }
+}
+
 test "source vector payloads fence ambiguous durable preparations and recover retries" {
     const alloc = std.testing.allocator;
     const keys = @import("internal_keys.zig");
