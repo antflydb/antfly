@@ -1,0 +1,55 @@
+{
+  "suites": [
+    {
+      "id": "policy",
+      "workflow": "pr-ci-policy.yml"
+    },
+    {
+      "id": "zig",
+      "workflow": "zig-tests.yml"
+    },
+    {
+      "id": "sdks",
+      "workflow": "sdks-ci.yml"
+    },
+    {
+      "id": "proxy",
+      "workflow": "antfly-proxy-go.yml",
+      "paths": [
+        "^(?:go/pkg/proxy/.*)$",
+        "^(?:scripts/ci/toolchain\\-policy\\.json)$",
+        "^(?:\\.github/actions/load\\-toolchain\\-policy/action\\.yml)$",
+        "^(?:\\.github/workflows/antfly\\-proxy\\-go\\.yml)$"
+      ]
+    },
+    {
+      "id": "operator",
+      "workflow": "antfly-operator-go.yml",
+      "paths": [
+        "^(?:go/pkg/operator/.*)$",
+        "^(?:go/pkg/sdk/admin/.*)$",
+        "^(?:go/pkg/sdk/go\\.mod)$",
+        "^(?:go/pkg/sdk/go\\.sum)$",
+        "^(?:specs/openapi/.*)$",
+        "^(?:scripts/ci/toolchain\\-policy\\.json)$",
+        "^(?:\\.github/actions/load\\-toolchain\\-policy/action\\.yml)$",
+        "^(?:\\.github/workflows/antfly\\-operator\\-go\\.yml)$"
+      ]
+    },
+    {
+      "id": "scale",
+      "workflow": "zig-scale-tests.yml",
+      "label": "ci:scale-tests"
+    },
+    {
+      "id": "gpu",
+      "workflow": "zig-inference-l4-spot.yml",
+      "label": "ci:gpu"
+    },
+    {
+      "id": "darwin",
+      "workflow": "diagnose-zig-arm64-bad-alloc.yml",
+      "label": "ci:darwin-release"
+    }
+  ]
+}

@@ -6,3 +6,14 @@ self-hosted-runner:
     - arc-antfly-docker
     - arc-antfly-publish
     - arc-antfly-publish-arm64
+
+# GitHub supports concurrency.queue: max; actionlint 1.7.12 predates it.
+# Keep controller/admission events queued instead of replacing pending events.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency
+paths:
+  .github/workflows/pr-ci-controller.yml:
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section\.'
+  .github/workflows/pr-ci.yml:
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section\.'

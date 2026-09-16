@@ -1,19 +1,31 @@
 name: Zig Scale Tests
 
-# Keep corpus-scale correctness gates isolated from required E2E latency and
-# resource accounting. Run them continuously on the default branch, manually,
-# or before merging a same-repository PR by applying `ci:scale-tests`.
+# Scale labels select suites; /ci run <sha> approves each PR run.
 on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        default: ''
+      head_sha:
+        type: string
+        default: ''
+      base_sha:
+        type: string
+        default: ''
+      check_id:
+        type: string
+        default: ''
+      comment_id:
+        type: string
+        default: ''
   schedule:
     - cron: "30 9 * * *"
   workflow_dispatch:
-  pull_request:
-    # A label opts the PR into this gate until it is removed. Re-run for every
-    # new head, and use the unlabeled event to cancel an in-flight scale run.
-    types: [labeled, unlabeled, synchronize, reopened]
-
 permissions:
   contents: read
+  checks: read
+  pull-requests: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -21,18 +33,29 @@ env:
   ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-global-cache-scale
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: scale-${{ inputs.pr_number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  admission:
+    uses: ./.github/workflows/pr-ci-admission.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+      suite: scale
+
   artifact-full-text:
-    name: Artifact full-text / >1M chunks
     if: >-
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       contains(github.event.pull_request.labels.*.name, 'ci:scale-tests') &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) }}
+    needs: admission
+    name: Artifact full-text / >1M chunks
     runs-on: arc-antfly-heavy
     timeout-minutes: 60
     env:
@@ -43,7 +66,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
 
       - name: Load pinned toolchain policy
