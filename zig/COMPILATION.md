@@ -216,36 +216,17 @@ selects those sources without giving overlapping files a second Zig module
 identity. Some shared storage leaf files remain lexically reachable by control;
 the source-mutation matrix does not prove independence for every leaf file.
 
-### Cold x86_64 Linux release scheduling (2026-09-12)
+### Runtime compilation memory reservations
 
-Two fresh-cache builds used source `83cd076bf` on the same isolated build pod,
-with only runtime compilation reservations changed. The pod used the Actions
-runner image, an AMD EPYC 7B13 host, a 7.5 CPU request, a 24 GiB memory limit,
-and the normal 22 GiB Zig admission budget. Both builds used Zig 0.16.0,
-`-Dcpu=baseline -Doptimize=ReleaseFast -Dstrip=true -Dcuda=false
--Dcuda-artifacts=fatbin -Dantfly-version=release-measure -j8`, and built
-`antfly capi capi-smoke`. Local and global Zig caches were empty and separate
-for each run. This measures scheduling on one fixed source revision, not the
-cumulative effect of the PR's other changes.
+> **Relocated:** The 2026-09-12 cold x86_64 Linux release-scheduling comparison
+> and the boundary-runtime-cost sample that previously lived here are
+> preserved verbatim in
+> [COMPILATION_EXPERIMENTS.md](COMPILATION_EXPERIMENTS.md#2026-09-12-cold-x86_64-linux-release-scheduling-and-boundary-runtime-cost).
 
-| Measurement | Conservative reservations | Measured reservations |
-| --- | ---: | ---: |
-| Elapsed build time | 72m44s | 27m01s |
-| Process-tree CPU time | 87m52s | 78m15s |
-| Sampled peak process-tree RSS | 5.93 GiB | 13.08 GiB |
-| Storage compilation begins | 29m26s | 45s |
-| Inference compilation begins | 56m28s | 45s |
-| Antfly executable size | 115,997,560 bytes | 115,997,560 bytes |
-
-Both builds passed all 43 steps, including C API smoke execution, and produced
-the same executable SHA-256:
-`2d5b4d04edc973a7356863a657b46be1068816511d5c515a1572c1f882eee9fe`.
-The elapsed reduction was 62.9%. This is one paired measurement on a shared
-node; CPU frequency and other tenants were not controlled, and total CPU time
-also varied. The directly observed scheduling improvement is that storage and
-inference overlap instead of being serialized by a combined 36 GiB claim.
-RSS was sampled every 0.5 seconds by summing build descendants; shared pages
-can be counted more than once and this is not the cgroup's total memory use.
+These per-archive reservations, adopted from that measurement, apply only to
+native x86_64 Linux hosts building baseline x86_64 GNU, stripped ReleaseFast,
+with CPU inference and no thread sanitizer; other profiles keep their
+previous claims.
 
 | Runtime archive | Largest sampled compiler RSS across the pair | New claim |
 | --- | ---: | ---: |
@@ -256,46 +237,6 @@ can be counted more than once and this is not the cgroup's total memory use.
 | Serverless | 2.65 GiB | 4 GiB |
 | CLI | 1.25 GiB | 2 GiB |
 | Enrichment | 0.80 GiB | 2 GiB |
-
-These claims apply only to native x86_64 Linux hosts building baseline x86_64
-GNU, stripped ReleaseFast, with CPU inference and no thread sanitizer. Other
-profiles keep their previous claims. Reservations remain admission estimates,
-not hard per-process memory limits. After installing the final policy helper,
-a warm build reused every compiler output and reran the C API smoke test; the
-policy itself also passed its native Linux unit test.
-
-The Actions unit job at `8e67d155f` completed its build/test step in 34m38s
-([job 103640717903](https://github.com/antflydb/antfly/actions/runs/34726182022/job/103640717903)),
-after the previous run hit its 60-minute watchdog. That run failed in two
-obsolete restore fixture setups, so it is not a passing full-suite benchmark.
-Its build-tool tests took six seconds; the expensive cache matrix remains in
-`zig-full`. Test execution still contributes materially to the base job:
-`storage-support-tests` alone ran for approximately ten minutes.
-
-### Boundary runtime cost
-
-The existing `antfly-storage-bench` installs `storage_boundary_bench`. Run it
-with a new directory, which it creates and removes itself:
-
-```sh
-zig build antfly-storage-bench -Doptimize=Debug
-./zig-out/bin/storage_boundary_bench /tmp/antfly-boundary-benchmark-new
-```
-
-It compares the actual internal batch encoder/parser with the production
-owner's batch operation, and the typed query-result parser with the production
-owner's query operation. Document bodies are about 500 bytes. Each JSON line
-reports ten iterations, payload size, and separate timings.
-
-In the local Debug sample, a 1,000-document batch spent 8.9 ms per iteration
-encoding and parsing; the separately measured owner batch took 46.7 ms. A
-1,000-hit query took 20.9 ms in the owner, with another 11.2 ms for consumer
-decoding. These are separate measurements, not additive phases captured from
-one request or production throughput claims. JSON transport is a material
-remaining cost. This change removes a redundant owned query-response copy;
-it does not replace the internal JSON transport. A future compact or borrowed
-transport must preserve complete-operation calls, provider-owned result
-lifetimes, request validation, and exact error/cancellation semantics.
 
 ### C API composition
 

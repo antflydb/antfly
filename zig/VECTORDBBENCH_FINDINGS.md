@@ -4130,170 +4130,20 @@ pass.
 
 ## Versioned physical-index lifecycle and rolling upgrades
 
-Native HBC is now a physical vector-index version rather than an in-place
-reinterpretation of the logical index directory. The logical catalog name and
-configuration remain stable. In managed deployments, committed store records
-advertise the native-v2 recovery capability through the rolling metadata
-protocol. Authority remains closed until every table-serving store advertises
-that capability. The Raft apply transaction that observes the complete capable
-set records a monotonic activation version alongside the metadata incarnation;
-data stores open their local authority gates only from that durable value, not
-from an observed membership snapshot. The state machine then makes any stale
-legacy store registration a deterministic no-op, closing the proposal/apply
-race during the pre-promotion shadow-build window. Activation survives leader
-changes, restart, and snapshot restore.
-
-A legacy index continues serving while the durable index-repair state machine
-builds a native shadow, replays it to a bounded activation gap, validates
-coverage and structure, and atomically publishes it. Generation-manifest v2
-records `dense_native_v2`, and the active-root pointer uses a deliberately
-incompatible v2 header. Reopen requires the checksummed manifest and the
-crash-sticky HBC `AUTHORITY` marker. This means an older binary fails closed
-instead of silently opening stale compatibility LSM state. Manifest v1 remains
-readable as `legacy_lsm`, so existing indexes need no offline rewrite.
-
-Physical retirement is a separate catalog phase. Initial v1 files remain on
-disk after v2 promotion and can be selected by the captured rollback pointer;
-native reopen no longer deletes them. An explicit catalog-fenced retirement
-call reclaims them only after the downgrade/rollback window advances. The same
-shadow/pointer machinery applies to newly created managed indexes, avoiding a
-special migration-only serving path. Standalone/Lite databases, which own their
-entire compatibility domain, may still authorize local native publication.
-
-Fresh dense admission now selects that end state directly once the durable
-capability floor permits it. Creation stages an unpublished private root with a
-checksummed construction manifest, establishes an O(1) empty native authority,
-rewrites the root pointer with the incompatible v2 header, and commits the
-logical catalog last. Managed/public admission therefore never builds a corpus
-in the compatibility HBC LSM before scheduling its durable rebuild outbox; the
-first user mutation is WAL-native. The construction capability is immutable and
-scoped to that one entry, so building a new index cannot authorize native
-transition on an unrelated live v1 index.
-
-The synchronous standalone path uses the same lifecycle but backfills through
-one pinned primary read transaction. The native capture records exactly that
-transaction's replay sequence, writes the applied-sequence checkpoint, and
-certifies the v2 generation at the same boundary; rows committed afterward stay
-ordinary replay debt. A construction marker remains until the logical catalog
-is durable, and explicit re-creation can reclaim a broken orphan pointer after a
-crash. Before capability activation, fresh managed indexes remain v1, while all
-pre-existing v1 indexes continue to use online shadow migration.
-
-A follow-up fresh-backfill failure exposed that the posting and exact-vector
-halves still established authority in the wrong order. Posting backfill could
-see a direct document vector while the later vector-block snapshot searched only
-for an index-managed embedding artifact which backfill had never materialized.
-That both failed readiness and attempted a second primary scan. Fresh v2
-construction now establishes the shared exact-vector base before capture:
-
-- the first managed index publishes a real empty generation at source sequence
-  zero with no physical shard files or primary scan;
-- an existing exact table-wide generation adds a new zero-count artifact scope
-  through a checksummed `CURRENT`-only transaction, preserving immutable blocks
-  and the committed WAL prefix;
-- synchronous backfill materializes the same index-managed source artifact as
-  foreground direct-field writes, appends its exact vector to the native WAL,
-  and builds HBC postings from that one pinned source transaction; and
-- stable-tip publication compacts the captured native delta instead of
-  rescanning primary artifacts. The wider snapshot sequence is accepted only
-  while the generation is unpublished; promotion permanently closes that
-  construction capability.
-
-The regressions require zero primary vector snapshot builds for both managed
-empty admission and standalone backfill, verify exact scoped coverage after a
-second index joins a shared generation, reopen the metadata-only scope update
-without changing WAL generation/bytes, and reject reuse of the construction
-sequence override after v2 publication.
-
-The managed corruption/recreate E2E then exposed a separate publication race:
-repair-shadow orphan collection derived liveness only from one manager's
-in-memory catalog. A catalog-lagging cleanup worker could therefore delete a
-new native generation after its construction marker was cleared even though a
-durable canonical `ACTIVE_ROOT` pointer already selected it. Cleanup now scans
-all canonical pointers before orphan collection and treats their targets as
-live without using payload health as deletion authority. The construction
-marker protects a unique root before pointer publication; the durable pointer
-protects it afterward. The exact public API corruption/delete/recreate test and
-a catalog-lagging cleanup regression both pass with this rule.
-
-The natural extension for reusable embeddings and other source artifacts is a
-catalog-managed immutable artifact identity. Indexes should hold references,
-not ownership by convention. Index-created artifacts remain scoped to their
-producer; an explicit user promotion changes their lifecycle to managed/shared,
-after which another index can reference the same artifact ID. Promotion must
-verify schema/model/dimensions/source-generation identity and add a durable
-reference before producer-index deletion can release its ownership. Physical
-HBC posting/tree generations are index-specific and are not promoted as shared
-source artifacts.
-
-These controls add heartbeat/status fields, maintenance-time migration checks,
-and O(1) manifest/pointer reads on open or promotion. They do not add work to
-candidate routing, scoring, exact completion, or foreground mutation loops, so
-the qualified r124-r126 latency and throughput measurements remain applicable.
+> **Relocated:** The physical-index versioning, activation/retirement, rollback,
+> and artifact-identity/promotion protocol that previously lived here (~100
+> lines) is preserved near-verbatim in
+> [DENSE_INDEXING_LIFECYCLE.md](DENSE_INDEXING_LIFECYCLE.md#physical-index-versioning-and-rolling-upgrades)
+> under "Physical index versioning and rolling upgrades".
 
 ## Native generation lifecycle hardening
 
-The post-r126 PR review found three lifecycle gaps and the implementation now
-uses the durable shape rather than benchmark-only workarounds:
-
-- Native backup manifest v5 authenticates both the portable snapshot path and
-  an explicit runtime `install_path`. Shared vector acceleration remains under
-  the snapshot ownership namespace `indexes/vector-blocks`, but installs at
-  the runtime-owned `vector-blocks` root. Duplicate or noncanonical install
-  targets are rejected before any generated state is admitted.
-- Snapshot admission acquires stable file-descriptor leases for exact committed
-  posting/vector WAL prefixes. WAL copying, hashing, and fsync now happen after
-  apply, replay, and structural mutation admission reopen. A deterministic test
-  unlinks and replaces the live WAL before materialization and still recovers
-  the selected committed prefix.
-- Posting and vector generation directories reconcile strict native filenames
-  against `CURRENT` at startup and publication boundaries. Known retirees are
-  still deleted directly for storage-provider compatibility; inventory sweeps
-  recover crash-before-publication orphans and retry failed unlinks. Cleanup
-  reports `observed_debt`, `removed`, and `remaining_debt`, preserves unrelated
-  files, and ordinary observational opens never reclaim concurrently staged
-  generations.
-
-These changes are outside the query and mutation hot paths. Snapshot fence work
-is reduced from O(committed WAL bytes) to descriptor acquisition plus immutable
-hardlink metadata. Publication adds one flat, filename-only inventory scan; it
-does not read segment contents or recurse through the database tree.
-
-The subsequent upgrade/restore review closed the remaining physical-generation
-ownership gaps:
-
-- Native authority can no longer appear as a side effect of an ordinary v1
-  mutation. HBC requires an explicit authority-transition capability, and the
-  catalog grants it only to an inactive candidate or an already-selected v2
-  generation. Standalone storage skips distributed capability negotiation but
-  still uses the same manifest plus incompatible pointer publication as a
-  provisioned table.
-- An authenticated native restore is rehomed into a deterministic v2 generation
-  with an atomic directory rename, checksummed ready manifest, directory fsyncs,
-  and pointer publication last. Retry validates or completes the same generation;
-  it neither copies vector/index files nor replays the corpus.
-- Compatibility LSM files inside the active v2 generation are restart-stable
-  cleanup debt. The existing durable cleanup lane removes them only after native
-  authority and the catalog capability floor are both proven (or, for standalone
-  storage, after the v2 pointer has made downgrade fail closed).
-
-The public serving and mutation loops are unchanged. Authority gating adds no
-steady-state branch after the persisted-authority fast return; restore work is
-O(index count) metadata plus directory renames; legacy retirement runs in the
-background cleanup lane. A full DB lifecycle test now proves v1 remains
-queryable during shadow construction, v2 promotion precedes retirement, native
-backup/restore needs no embedder, and the restored read-only index has neither
-format-migration nor repair debt.
-
-A fresh post-merge r128 50K public-API lifecycle qualified correctness under
-heavy host contention: recall was 0.9876 live, cold-reopened, and warm-reopened;
-the published generation covered all 50,000 vectors; and no capture, generation,
-recovery, or cleanup error was emitted. Restart RSS peaked at 350.8 MB and the
-restart physical-footprint ledger at 124.2 MB. The host simultaneously ran two
-unrelated CPU-saturating Zig test jobs, inflating insert to 207.68 seconds and
-profiled server query time to 24.60 ms, so r128 is deliberately not timing
-evidence. The uncontended r126 30.09-second lifecycle and 3.23 ms mean server
-time remain the applicable performance baseline.
+> **Relocated:** The backup-manifest-v5, snapshot-admission-fencing, and
+> generation-directory-reconciliation durable bullets that previously lived
+> here are now in
+> [DENSE_INDEXING_LIFECYCLE.md](DENSE_INDEXING_LIFECYCLE.md#physical-index-versioning-and-rolling-upgrades)
+> under "Physical index versioning and rolling upgrades" ->
+> "Native generation lifecycle hardening".
 
 ### Post-CI-fix performance qualification (r129)
 
@@ -4340,26 +4190,9 @@ rerank semantics.
 
 ## Memory methodology
 
-Use Circus's native `footprint_sampler.py` against the Antfly server process
-tree and capture the wired-memory baseline immediately before server start.
-Datasets must already be cached. A valid publication number requires three
-fresh lifecycles and reports mean plus range.
-
-For native macOS runs, the primary demand number is the process tree's
-`phys_footprint` ledger high-water. System-wide wired growth is reported as a
-separate conservative diagnostic because unrelated host activity cannot be
-attributed to Antfly. RSS remains the cache-inclusive point-in-time view. Do not
-poll native `vmmap` during a timed phase: invoke the sampler once immediately
-afterward and use the kernel-maintained footprint high-water for the phase peak.
-The qualification runner captures live and restarted processes separately.
-Historical scripts invoked `vmmap` every 200--300 ms and materially contaminated
-both load throughput and query tails; those timings are not publication data.
-
-The first partial 1M sample is diagnostic only: dataset download occurred after
-the wired baseline, contaminating the system-wide wired delta. Its
-cache-inclusive process-tree peak was about 1.18 GiB and its physical-footprint
-ledger peak was about 785 MiB, but its wired-demand headline must not be
-published.
+> **Relocated:** The memory-measurement methodology that previously lived here
+> is now in [DENSE_INDEXING_LIFECYCLE.md](DENSE_INDEXING_LIFECYCLE.md#phase-3-performance-qualification)
+> (Phase 3: Performance qualification).
 
 ## V1 mirror versus native-v2 authority
 
