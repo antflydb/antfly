@@ -16,7 +16,6 @@ const std = @import("std");
 const raft_engine = @import("raft_engine");
 const common = @import("http_common.zig");
 const common_http = @import("../../common/http/mod.zig");
-const platform_time = @import("antfly_platform").time;
 const routes = @import("routes.zig");
 
 pub const HttpDriverConfig = struct {
@@ -302,7 +301,7 @@ pub const HttpFrameDriver = struct {
             return false;
         }
         const delay_ms = self.retryDelayMs(frame.*);
-        frame.not_before_ms = nowMs() + delay_ms;
+        frame.not_before_ms = self.nowMs() +| delay_ms;
         if (frame.attempts == 1 or frame.attempts % 16 == 0) {
             std.log.debug("raft http async send failed peer_id={d} attempts={d} retry_delay_ms={d} err={}", .{
                 frame.peer_id,
@@ -376,7 +375,7 @@ pub const HttpFrameDriver = struct {
                 self.mutex.unlock(self.io);
                 return null;
             }
-            if (self.popReadyFrameLocked(nowMs())) |frame| {
+            if (self.popReadyFrameLocked(self.nowMs())) |frame| {
                 self.mutex.unlock(self.io);
                 return frame;
             }
@@ -430,7 +429,7 @@ pub const HttpFrameDriver = struct {
     fn nextSleepMs(self: *HttpFrameDriver) u64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const now_ms = nowMs();
+        const now_ms = self.nowMs();
         var next_ready_ms: ?u64 = null;
         for (self.queue.items[self.queue_head..]) |frame| {
             if (frame.not_before_ms <= now_ms) return 1;
@@ -450,7 +449,12 @@ pub const HttpFrameDriver = struct {
         if (capped <= 1) return capped;
         const low = capped - capped / 4;
         const span = capped - low + 1;
-        return low + pseudoJitter(frame.peer_id, frame.attempts, nowMs()) % span;
+        return low + pseudoJitter(frame.peer_id, frame.attempts, self.nowMs()) % span;
+    }
+
+    fn nowMs(self: *const HttpFrameDriver) u64 {
+        // Retry readiness, jitter and sleep must share one clock authority.
+        return @intCast(@divTrunc(@max(0, std.Io.Clock.now(.awake, self.io).nanoseconds), std.time.ns_per_ms));
     }
 
     fn compactQueueIfNeededLocked(self: *HttpFrameDriver) void {
@@ -474,10 +478,6 @@ pub const HttpFrameDriver = struct {
     }
 };
 
-fn nowMs() u64 {
-    return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-}
-
 fn pseudoJitter(peer_id: u64, attempts: u32, now_ms: u64) u64 {
     var x = peer_id ^ (@as(u64, attempts) << 32) ^ now_ms;
     x ^= x >> 33;
@@ -492,6 +492,56 @@ test "http driver module compiles" {
     _ = HttpDriverConfig;
     _ = SendBatch;
     _ = HttpFrameDriver;
+}
+
+test "http frame retry readiness and jitter use the borrowed clock" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    var retry_at: ?u64 = null;
+    for (0..2) |iteration| {
+        var clock = try vopr.vopr_io.VoprIo.init(.{
+            .monotonic_ns = 100 * std.time.ns_per_ms,
+            .realtime_ns = @intCast(iteration * 100 * std.time.ns_per_s),
+        });
+        defer clock.deinit();
+        const Unused = struct {
+            fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+                return error.UnexpectedRequest;
+            }
+        };
+        var driver = HttpFrameDriver.init(alloc, .{}, .{
+            .ptr = undefined,
+            .vtable = &.{ .execute = Unused.execute },
+        }, clock.io());
+        defer driver.deinit();
+        try driver.in_flight_peers.ensureTotalCapacity(alloc, 1);
+        var frame: HttpFrameDriver.QueuedFrame = .{
+            .peer_id = 2,
+            .base_uri = try alloc.dupe(u8, "http://peer"),
+            .body = try alloc.dupe(u8, "frame"),
+            .content_type = try alloc.dupe(u8, "application/octet-stream"),
+            .attempts = 1,
+        };
+        if (!driver.retryQueuedFrame(&frame, error.Timeout)) {
+            frame.deinit(alloc);
+            return error.ExpectedQueuedRetry;
+        }
+        const deadline_ms = driver.queue.items[0].not_before_ms;
+        try std.testing.expect(deadline_ms >= 138 and deadline_ms <= 150);
+        if (retry_at) |previous| try std.testing.expectEqual(previous, deadline_ms);
+        retry_at = deadline_ms;
+        try std.testing.expect(driver.popReadyFrameLocked(driver.nowMs()) == null);
+        try clock.advance((deadline_ms - 101) * std.time.ns_per_ms);
+        try std.testing.expectEqual(@as(u64, 1), driver.nextSleepMs());
+        try std.testing.expect(driver.popReadyFrameLocked(driver.nowMs()) == null);
+        try clock.advance(std.time.ns_per_ms);
+        var ready = driver.popReadyFrameLocked(driver.nowMs()) orelse return error.RetryDidNotBecomeReady;
+        defer ready.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 2), ready.attempts);
+        try std.testing.expectEqualStrings("frame", ready.body);
+        driver.finishInFlightPeer(ready.peer_id);
+        try std.testing.expectEqual(@as(usize, 0), driver.queue.items.len);
+    }
 }
 
 test "http frame driver posts batch frames to raft batch route" {
@@ -650,8 +700,8 @@ test "http frame driver isolates blocked peers without reordering a peer lane" {
         },
     });
 
-    const deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-    while (executor.callCount() < 2 and platform_time.monotonicNs() < deadline_ns) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    const deadline_ns = std.Io.Clock.now(.awake, io).nanoseconds + 5 * std.time.ns_per_s;
+    while (executor.callCount() < 2 and std.Io.Clock.now(.awake, io).nanoseconds < deadline_ns) try io.sleep(.fromMilliseconds(1), .awake);
     // One worker may block per peer. The second peer-2 frame stays queued while
     // peer 3 progresses independently.
     try std.testing.expectEqual(@as(usize, 2), executor.callCount());

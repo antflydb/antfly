@@ -16,7 +16,6 @@ const std = @import("std");
 const Ledger = @import("obsolete_ledger.zig").Ledger;
 const Account = @import("memory_account.zig").Account;
 const runtime = @import("runtime.zig");
-const clock = @import("antfly_platform").time;
 
 /// Stack-owned continuation: registration and retirement never allocate.
 /// Only these immutable fields are visible to concurrent accounting; the
@@ -86,11 +85,11 @@ pub fn reclaimSliceLocked(backend: anytype) void {
     if (backend.retired_ledger_snapshots == null) return;
     backend.ledger_reclaim_in_flight = true;
     backend.retainReaderKind(.other);
-    const deadline = clock.monotonicNs() +| 2 * std.time.ns_per_ms;
+    const deadline = runtime.workNowNs(backend) +| 2 * std.time.ns_per_ms;
     var units: usize = 0;
     for (0..64) |_| {
         const pending = backend.retired_ledger_snapshots orelse break;
-        if (units >= 2048 or clock.monotonicNs() >= deadline) break;
+        if (units >= 2048 or runtime.workNowNs(backend) >= deadline) break;
         backend.mu.unlock();
         const result = step(backend, &pending.reclaimer.?, 2048 - units, deadline);
         _ = runtime.lockBackend(@TypeOf(backend.*), backend);
@@ -112,17 +111,17 @@ pub fn reclaimSliceLocked(backend: anytype) void {
 const Slice = struct { done: bool, units: usize, ns: u64 };
 
 fn step(backend: anytype, reclaimer: *Ledger.Reclaimer, limit: usize, deadline: u64) Slice {
-    const started = clock.monotonicNs();
+    const started = runtime.workNowNs(backend);
     var credits = limit;
     var done = false;
-    while (credits != 0 and clock.monotonicNs() < deadline) {
+    while (credits != 0 and runtime.workNowNs(backend) < deadline) {
         var part: usize = @min(credits, 64);
         const before = part;
         done = reclaimer.step(backend.allocator, &part);
         credits -= before - part;
         if (done) break;
     }
-    const elapsed = clock.monotonicNs() -| started;
+    const elapsed = runtime.workNowNs(backend) -| started;
     if (@import("builtin").is_test) if (test_slice_hook) |hook| hook(backend);
     if (!done) if (backend.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) catch {};
     return .{ .done = done, .units = limit - credits, .ns = elapsed };
@@ -374,7 +373,7 @@ pub fn drainLocked(backend: anytype, ledger: *Ledger) void {
         // Do not invoke general unlock reclamation here: its callbacks can
         // recursively publish while our caller still owns the manifest lane.
         backend.mu.unlock();
-        const result = step(backend, &reclaimer, 2048, clock.monotonicNs() +| 2 * std.time.ns_per_ms);
+        const result = step(backend, &reclaimer, 2048, runtime.workNowNs(backend) +| 2 * std.time.ns_per_ms);
         _ = runtime.lockBackend(@TypeOf(backend.*), backend);
         note(backend, result);
         if (result.done) break;

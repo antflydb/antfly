@@ -363,7 +363,7 @@ pub const OpenedCoreResources = struct {
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
     snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
-    repair_replay_mutex: *std.atomic.Mutex,
+    repair_replay_mutex: *std.Io.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
     table_catalog: table_catalog_mod.Catalog,
@@ -405,7 +405,7 @@ pub const AsyncResources = struct {
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
-    repair_replay_mutex: *std.atomic.Mutex,
+    repair_replay_mutex: *std.Io.Mutex,
 };
 
 pub const BatchExecutionResources = struct {
@@ -419,7 +419,7 @@ pub const BatchExecutionResources = struct {
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
     snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
-    repair_replay_mutex: *std.atomic.Mutex,
+    repair_replay_mutex: *std.Io.Mutex,
     log_mutex: *std.atomic.Mutex,
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: *std.atomic.Value(bool),
@@ -495,7 +495,7 @@ pub const DBCore = struct {
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
     snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
-    repair_replay_mutex: *std.atomic.Mutex,
+    repair_replay_mutex: *std.Io.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
     schema_registry: *schema_registry_mod.Registry,
@@ -2676,7 +2676,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     var owned_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null;
     var owned_snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null;
     var owned_snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null;
-    var owned_repair_replay_mutex: ?*std.atomic.Mutex = null;
+    var owned_repair_replay_mutex: ?*std.Io.Mutex = null;
     var owned_log_mutex: ?*std.atomic.Mutex = null;
     errdefer {
         if (owned_log_mutex) |ptr| alloc.destroy(ptr);
@@ -2716,8 +2716,8 @@ pub fn openCoreResourcesFromPrimaryStore(
     const snapshot_replay_admission = try alloc.create(snapshot_admission_mod.SnapshotAdmission);
     snapshot_replay_admission.* = .{};
     owned_snapshot_replay_admission = snapshot_replay_admission;
-    const repair_replay_mutex = try alloc.create(std.atomic.Mutex);
-    repair_replay_mutex.* = .unlocked;
+    const repair_replay_mutex = try alloc.create(std.Io.Mutex);
+    repair_replay_mutex.* = .init;
     owned_repair_replay_mutex = repair_replay_mutex;
     const log_mutex = try alloc.create(std.atomic.Mutex);
     log_mutex.* = .unlocked;

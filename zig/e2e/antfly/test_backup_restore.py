@@ -20,10 +20,12 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
@@ -35,6 +37,7 @@ from conftest import (
     _read_log_tail,
     antfly_public_api_url,
     maybe_preserve_tempdir,
+    publication_retry_delay,
     resolve_binary_path,
     wait_for_server,
 )
@@ -1853,7 +1856,100 @@ def test_cluster_backup_restore_round_trip_remote_backend(backup_api, backend: s
         assert restored_doc["title"] == expected_title
 
 
+@contextmanager
+def _concurrent_restore_observers(backup_api, expected_titles):
+    """Keep independent HTTP sessions active across real owner publication.
+
+    The standalone process keeps its normal background maintenance enabled;
+    the compiled-owner suite separately forces maintenance lease overlap.
+    """
+    stop = threading.Event()
+    targets = [
+        (table, suffix)
+        for table in expected_titles
+        for suffix in ("/documents/doc%3A1", "/indexes")
+    ]
+    ready = [threading.Event() for _ in targets]
+    counts = [0] * len(targets)
+
+    def observe(index, table, suffix):
+        # The fixture serializes its own session, so sharing that API here
+        # would accidentally serialize all reads behind the restore request.
+        with requests.Session() as session:
+            session.headers["Connection"] = "close"
+            try:
+                while not stop.is_set():
+                    response = session.get(
+                        f"{backup_api.url}/tables/{table}{suffix}", timeout=10
+                    )
+                    if response.status_code == 503:
+                        assert publication_retry_delay(response, 0.01) is not None, (
+                            response.url,
+                            response.status_code,
+                            response.text,
+                        )
+                    else:
+                        assert response.status_code == 200, (
+                            response.url,
+                            response.status_code,
+                            response.text,
+                        )
+                        payload = response.json()
+                        if suffix.startswith("/documents/"):
+                            assert payload["title"] in expected_titles[table], payload
+                        counts[index] += 1
+                        ready[index].set()
+                    stop.wait(0.01)
+            finally:
+                ready[index].set()  # Propagate a startup failure through future.result.
+
+    with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        futures = [
+            pool.submit(observe, index, table, suffix)
+            for index, (table, suffix) in enumerate(targets)
+        ]
+        try:
+            for event, future in zip(ready, futures):
+                assert event.wait(15), "restore observer failed to start"
+                if future.done():
+                    future.result()
+            assert all(counts), counts
+            before = counts.copy()
+            yield
+        finally:
+            failure = sys.exception()
+            stop.set()
+            observer_failures = []
+            for future in futures:
+                try:
+                    future.result(timeout=15)
+                except Exception as error:  # noqa: BLE001 - retain worker errors without masking restore failure
+                    observer_failures.append(error)
+            print(
+                f"restore concurrent observer successes: {dict(zip(targets, counts))}"
+            )
+            if failure is not None:
+                for error in observer_failures:
+                    failure.add_note(
+                        f"Concurrent restore observer also failed: {error}"
+                    )
+            elif observer_failures:
+                raise observer_failures[0]
+            else:
+                assert all(after > prior for after, prior in zip(counts, before)), (
+                    counts
+                )
+
+
 def test_cluster_restore_modes(backup_api):
+    _cluster_restore_modes(backup_api)
+
+
+def test_cluster_restore_modes_with_concurrent_observers(backup_api):
+    _cluster_restore_modes(backup_api, concurrent_observers=True)
+
+
+def _cluster_restore_modes(backup_api, *, concurrent_observers=False):
     table_a = f"cluster_modes_a_{time.time_ns()}"
     table_b = f"cluster_modes_b_{time.time_ns()}"
     backup_id = f"cluster-modes-{time.time_ns()}"
@@ -1936,16 +2032,28 @@ def test_cluster_restore_modes(backup_api):
         assert skipped_a is not None and skipped_a["title"] == "Mutated Alpha"
         assert skipped_b is not None and skipped_b["title"] == "Mutated Beta"
 
-        overwrite_restore = backup_api.cluster_restore(
-            backup_id=backup_id,
-            location=location,
-            restore_mode="overwrite",
+        observers = (
+            _concurrent_restore_observers(
+                backup_api,
+                {
+                    table_a: {"Mutated Alpha", "Original Alpha"},
+                    table_b: {"Mutated Beta", "Original Beta"},
+                },
+            )
+            if concurrent_observers
+            else nullcontext()
         )
-        assert overwrite_restore["status"] == "completed", overwrite_restore
-        assert overwrite_restore["committed_table_count"] == 2, overwrite_restore
-        assert overwrite_restore["triggered_table_count"] == 0, overwrite_restore
-        assert overwrite_restore["skipped_table_count"] == 0, overwrite_restore
-        assert overwrite_restore["failed_table_count"] == 0, overwrite_restore
+        with observers:
+            overwrite_restore = backup_api.cluster_restore(
+                backup_id=backup_id,
+                location=location,
+                restore_mode="overwrite",
+            )
+            assert overwrite_restore["status"] == "completed", overwrite_restore
+            assert overwrite_restore["committed_table_count"] == 2, overwrite_restore
+            assert overwrite_restore["triggered_table_count"] == 0, overwrite_restore
+            assert overwrite_restore["skipped_table_count"] == 0, overwrite_restore
+            assert overwrite_restore["failed_table_count"] == 0, overwrite_restore
 
         restored_docs = wait_until(
             lambda: _lookup_docs(backup_api, (table_a, table_b), "doc:1"),
